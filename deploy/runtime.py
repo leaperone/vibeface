@@ -100,25 +100,18 @@ def guard(info):
     require(epoch == {'data_epoch': info['data_epoch']} and type(epoch['data_epoch']) is int,
             'data epoch differs; no migration or initialization is allowed')
     config = json.loads(regular(DATA / 'config.json'))
-    role = expected['VIBEFACE_ROLE']
-    network = config['network']
-    require(role in ('discovery', 'entry', 'relay') and config['public_entry'] is True
-            and config.get('manager') is None and config['roots'] == [] and network.get('entry') is None,
-            'official infrastructure must run outside personal networks')
+    network, forwarding = config['network'], config['forwarding']
+    require(expected['VIBEFACE_ROLE'] == 'node' and config.get('manager') is None and config['roots'] == [],
+            'the official node must run outside personal networks')
     require(config['listen'] == expected['VIBEFACE_LISTEN'], 'existing HTTP listen address differs')
-    if role == 'discovery':
-        require(network['relay_mode'] == 'discovery-only', 'Discovery role requires discovery-only mode')
-    else:
-        require(network.get('relay_mode', 'forward') == 'forward'
-                and network['relay_admission']['policy'] == ('grants' if role == 'entry' else 'operator-token'),
-                'relay admission does not match the selected role')
-        require(APP_ORIGIN in config.get('allowed_origins', []),
-                'browser access needs the App origin in allowed_origins')
-    if role == 'entry':
-        # Tickets name the target only by device ID; the entry finds its relay through the grant issuer's Discovery.
-        issuer = network['relay_admission'].get('issuer')
-        require(any(url.startswith(f'vibeface://{issuer}@') for url in network.get('discovery', [])),
-                'Entry role needs the grant issuer Discovery in network.discovery')
+    # Any device may use the official node, so every service it offers them is bounded.
+    require(network['serve_discovery'] is True and network.get('relay_listen') is not None
+            and network.get('relay_operator_token') is None and network.get('relay_rate')
+            and network.get('relay_max_clients') and forwarding['any'] is True and forwarding.get('rate'),
+            'the official node needs discovery, an open relay and browser forwarding, each within limits')
+    require(config['web_enabled'] is True and config['public_url'] == APP_ORIGIN
+            and APP_ORIGIN in config.get('allowed_origins', []),
+            'browser access needs the App origin as public_url and in allowed_origins')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
@@ -157,7 +150,7 @@ def health(info):
         result = inspect()
         require(result['status'] == 'running' and result['version'] == info['version']
                 and result['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE']
-                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] != 'discovery'),
+                and result['web_enabled'] is True,
                 'Core health, version, identity or browser mode differs')
         return {key: result[key] for key in ('status', 'version', 'device_id')}
     request = urllib.request.Request('http://127.0.0.1:8080/')
@@ -184,10 +177,13 @@ def self_test():
         for name in ('identity.json', 'node.lock'):
             (data / name).write_text('fixture')
         (data / 'data-epoch.json').write_text('{"data_epoch":1}')
-        config = {'listen': '127.0.0.1:4900', 'public_entry': True, 'roots': [], 'manager': None,
-                  'network': {'relay_mode': 'discovery-only', 'entry': None}}
+        config = {'listen': '0.0.0.0:4792', 'public_url': APP_ORIGIN, 'allowed_origins': [APP_ORIGIN],
+                  'web_enabled': True, 'roots': [], 'manager': None,
+                  'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144},
+                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_operator_token': None,
+                              'relay_rate': 65536, 'relay_max_clients': 512}}
         (data / 'config.json').write_text(json.dumps(config))
-        env = {'VIBEFACE_ROLE': 'discovery', 'VIBEFACE_LISTEN': config['listen'],
+        env = {'VIBEFACE_ROLE': 'node', 'VIBEFACE_LISTEN': config['listen'],
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',
                'VIBEFACE_EXPECTED_SOURCE': 'a' * 40}
         module = sys.modules[__name__]
@@ -212,31 +208,22 @@ def self_test():
                 raise AssertionError('missing identity accepted')
             assert not (data / 'identity.json').exists()
             (data / 'identity.json').write_text('fixture')
-            relay = dict(config, network={'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'operator-token'}})
-            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'relay'}):
-                (data / 'config.json').write_text(json.dumps(relay))
+            network = config['network']
+            for change in ({'allowed_origins': []}, {'public_url': 'https://other.example.invalid'},
+                           {'web_enabled': False}, {'forwarding': dict(config['forwarding'], any=False)},
+                           {'forwarding': dict(config['forwarding'], rate=None)},
+                           {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
+                           {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
+                           {'network': dict(network, relay_operator_token='c' * 64)}):
+                (data / 'config.json').write_text(json.dumps(dict(config, **change)))
                 try:
                     guard(info)
                 except ValueError:
                     pass
                 else:
-                    raise AssertionError('Relay without the App origin accepted')
-                (data / 'config.json').write_text(json.dumps(dict(relay, allowed_origins=[APP_ORIGIN])))
-                assert guard(info)['device_id'] == 'b' * 64
-            issuer = 'c' * 64
-            entry = dict(config, allowed_origins=[APP_ORIGIN], network={
-                'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'grants', 'issuer': issuer}})
-            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'entry'}):
-                (data / 'config.json').write_text(json.dumps(entry))
-                try:
-                    guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError('Entry without Discovery accepted')
-                entry['network']['discovery'] = [f'vibeface://{issuer}@discovery.example.invalid:4792']
-                (data / 'config.json').write_text(json.dumps(entry))
-                assert guard(info)['device_id'] == 'b' * 64
+                    raise AssertionError(f'unbounded or private official node accepted: {change}')
+            (data / 'config.json').write_text(json.dumps(config))
+            assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')
 
 
@@ -259,8 +246,6 @@ def main():
             with (DATA / 'node.lock').open('rb') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
-            if os.environ['VIBEFACE_ROLE'] == 'discovery':
-                args.append('--no-web')
             os.execv(args[0], args)
     else:
         with maintenance('acquire'):

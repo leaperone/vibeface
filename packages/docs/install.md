@@ -144,16 +144,16 @@ vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example   
 vibeface init --relay https://relay.example                                      # 其他 Node，可重复
 ```
 
-显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认公共 Relay 由发现服务的签名目录提供，也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
+显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认还会使用官方公共节点在发现服务登记时提供的开放 Relay，也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
-自建并使用运营者令牌限制接入时，在公网机器上运行入口，个人设备上的 Node 指向它：
+不带 `--relay-operator-token` 的 relay 对任何设备开放。只给自己和熟人用时，运行 relay 的 Node 加令牌，个人网络以外的 Node 带上同一令牌：
 
 ```sh
-vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340 --relay-url https://vb.example.com   # 公网机器
-vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-token             # 个人设备上的 Node
+vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example --relay-operator-token /path/to/relay-token   # 运行 relay 的公网 Node
+vibeface init --relay https://relay.example --relay-token 'https://relay.example=/path/to/relay-token'                     # 其他人的 Node
 ```
 
-反向代理和令牌的处理见 [配置公共入口](node.md#配置公共入口)。
+自建公共节点、反向代理和令牌的处理见 [从外网访问](node.md#从外网访问)。
 
 前台运行时日志同时写到数据目录的 `node.log`，用 `vibeface logs` 查看。`vibeface status` 显示写入状态和每台对端最近一次同步，出问题时先看 [排障](troubleshooting.md)。
 

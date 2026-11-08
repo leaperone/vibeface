@@ -20,8 +20,10 @@ import time
 import uuid
 
 
-CORE_ROLES = ('discovery', 'entry', 'relay')
+CORE_ROLES = ('node',)
 ROLES = (*CORE_ROLES, 'app', 'www')
+# The App's browser API belongs to the official node; the App host forwards these routes there.
+NODE_ROUTES = ('/api/info', '/api/client', '/api/decision')
 IMAGE = r'sha256:[0-9a-f]{64}'
 VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-nightly\.[0-9]{8}\.[1-9][0-9]*)?'
 DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
@@ -47,13 +49,15 @@ def validate_config(config):
     require(isinstance(config, dict) and config.get('role') in ROLES, 'invalid service role')
     required = common | ({'data_dir', 'device_id', 'uid', 'gid', 'legacy_service', 'maintenance_socket'}
                          if config['role'] in CORE_ROLES else {'nginx_config', 'server_name'})
-    if config['role'] == 'relay':
-        required |= {'nginx_config', 'server_name'}
+    if config['role'] == 'app':
+        required |= {'node_url'}
     require(required <= config.keys() and config.keys() <= required | {'public_url'},
             'unsupported or missing deployment configuration fields')
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', config['project']), 'invalid Compose project')
-    require(re.fullmatch(r'127\.0\.0\.1:[1-9][0-9]{0,4}', config['listen'])
-            and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit IPv4 loopback port')
+    # The official node takes the App host's forwarded routes; a static container only its own host's.
+    host = '0.0.0.0' if config['role'] in CORE_ROLES else '127.0.0.1'
+    require(re.fullmatch(re.escape(host) + r':[1-9][0-9]{0,4}', config['listen'])
+            and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit port on ' + host)
     for name in ('deploy_dir', 'data_dir', 'nginx_config', 'maintenance_socket'):
         if name in config:
             canonical_path(config[name])
@@ -67,6 +71,9 @@ def validate_config(config):
                 'deployment files and Node data must be separate')
     if 'nginx_config' in config:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', config['server_name']), 'invalid nginx server name')
+    if 'node_url' in config:
+        require(re.fullmatch(r'http://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{0,4}', config['node_url']),
+                'node_url must be the official node\'s HTTP IPv4 address and port')
     if 'public_url' in config:
         require(re.fullmatch(r'https://[a-zA-Z0-9][a-zA-Z0-9.:-]*(?::[0-9]+)?', config['public_url']),
                 'public_url must be an HTTPS origin without credentials')
@@ -294,53 +301,55 @@ def transform_nginx(text, config):
                if any(n['words'][0] == 'server_name' and config['server_name'] in n['words'][1:] for n in server['children'])
                and any(n['words'][0] == 'listen' and 'ssl' in n['words'][1:] for n in server['children'])]
     require(len(targets) == 1, 'nginx config must contain one matching TLS server')
-    edits = []
-    catchall = 0
-    relay_routes = 0
+    def indent(start):
+        return text[text.rfind('\n', 0, start) + 1:start]
+    def location(selector, body, start):
+        return 'location ' + selector + ' {\n' + indent(start) + '    ' + body + '\n' + indent(start) + '}'
+    def node_route(route):
+        # The official node serves only the App's Host, and the browser socket outlives nginx's default timeout.
+        body = 'proxy_pass ' + config['node_url'] + ';\n        proxy_set_header Host ' + config['server_name'] + ';'
+        if route == '/api/client':
+            body += ('\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;'
+                     '\n        proxy_set_header Connection "upgrade";\n        proxy_read_timeout 1h;')
+        return body
+    edits, routes, catchall = [], set(), []
     for node in targets[0]['children']:
         words = node['words']
         if words[0] != 'location':
             require(words[0] != 'include', 'target nginx server must not include unverified routes')
-            if words[0] in ('root', 'index') or config['role'] in ('app', 'www') and (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
+            if words[0] in ('root', 'index') or (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
                 edits.append((node['start'], node['end'], ''))
             continue
         selector = ' '.join(words[1:])
-        relay_routes += int(words[-1].strip('"\'') == '^/(relay|ping|generate_204)$')
         is_catchall = words == ['location', '/']
-        catchall += int(is_catchall)
-        if config['role'] == 'relay':
-            require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                    or len(words) == 3 and words[1] == '=' and words[2] in ('/api/info', '/api/client'),
-                    'Relay refuses frontend and non-browser API routes')
-            if not is_catchall:
-                continue
-            body = 'return 404;'
-        else:
-            is_static = is_catchall or (len(words) == 3 and words[1] in ('=', '^~') and words[2] in (
-                '/assets/', '/generated/', '/manifest.webmanifest', '/vibeface_secure_bg.wasm',
-                '/vibeface_secure.js', '/_shell.html', '/index.html', '/icon.svg', '/sw.js')) \
-                or len(words) == 3 and words[1] in ('~', '~*') and words[2] == STATIC_REGEX
-            directives = {n['words'][0] for n in node['children'] or []}
-            require('try_files' not in directives or is_static, 'unrecognized static nginx location')
-            if not is_static:
-                infra = (len(words) == 3 and words[1] == '=' and words[2] in
-                         ('/api/info', '/api/client', '/api/relay/grant', '/api/decision')) \
-                        or words == ['location', '^~', '/bootstrap/'] \
-                        or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                denied = bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children'])
-                require((infra and not directives & {'try_files', 'alias', 'root', 'index', 'include'}) or denied,
-                        'unrecognized static or gateway nginx location')
-                continue
+        if is_catchall:
+            catchall.append(node['start'])
+        is_static = is_catchall or (len(words) == 3 and words[1] in ('=', '^~') and words[2] in (
+            '/assets/', '/generated/', '/manifest.webmanifest', '/vibeface_secure_bg.wasm',
+            '/vibeface_secure.js', '/_shell.html', '/index.html', '/icon.svg', '/sw.js')) \
+            or len(words) == 3 and words[1] in ('~', '~*') and words[2] == STATIC_REGEX
+        directives = {n['words'][0] for n in node['children'] or []}
+        require('try_files' not in directives or is_static, 'unrecognized static nginx location')
+        if is_static:
             require(directives <= {'try_files', 'types', 'default_type', 'add_header', 'expires', 'access_log',
                                    'root', 'index', 'proxy_pass', 'proxy_set_header', 'proxy_http_version',
                                    'proxy_intercept_errors', 'proxy_cache'}, 'unsupported static nginx directives')
             body = ('proxy_pass http://' + config['listen'] + ';\n'
                     '        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n'
                     '        proxy_set_header Connection "";\n        proxy_intercept_errors off;\n        proxy_cache off;')
-        indent = text[text.rfind('\n', 0, node['start']) + 1:node['start']]
-        replacement = 'location ' + selector + ' {\n' + indent + '    ' + body + '\n' + indent + '}'
-        edits.append((node['start'], node['end'], replacement))
-    require(catchall == 1 and (config['role'] != 'relay' or relay_routes == 1), 'expected nginx routes are missing')
+        elif config['role'] == 'app' and len(words) == 3 and words[1] == '=' and words[2] in NODE_ROUTES:
+            routes.add(words[2])
+            body = node_route(words[2])
+        else:
+            require(bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children']),
+                    'unrecognized static or node nginx location')
+            continue
+        edits.append((node['start'], node['end'], location(selector, body, node['start'])))
+    require(len(catchall) == 1, 'expected nginx routes are missing')
+    if config['role'] == 'app':
+        edits.append((catchall[0], catchall[0], ''.join(
+            location('= ' + route, node_route(route), catchall[0]) + '\n' + indent(catchall[0])
+            for route in NODE_ROUTES if route not in routes)))
     for start, end, replacement in sorted(edits, reverse=True):
         text = text[:start] + replacement + text[end:]
     nginx_nodes(text)
@@ -638,14 +647,20 @@ def self_test():
                     pass
                 else:
                     raise AssertionError('accepted an ambiguous imported image')
-    config = {'project': 'official-entry', 'role': 'entry', 'deploy_dir': '/srv/service-control/entry',
-              'listen': '127.0.0.1:4900', 'data_dir': '/var/lib/official-entry', 'device_id': 'a' * 64,
-              'uid': 1001, 'gid': 1001, 'legacy_service': 'official-entry.service',
+    config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
+              'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'device_id': 'a' * 64,
+              'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
               'maintenance_socket': '/tmp/private-node/maintenance.sock'}
-    validate_config(config)
-    for field, value in (('data_dir', '/var/lib/../other'), ('uid', 0), ('listen', '0.0.0.0:80'),
-                         ('device_id', 'wrong'), ('legacy_service', '--help')):
-        bad = dict(config, **{field: value})
+    app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
+           'listen': '127.0.0.1:8088', 'nginx_config': '/etc/nginx/conf.d/app.conf',
+           'server_name': 'app.example.invalid', 'node_url': 'http://203.0.113.7:4792'}
+    validate_config(config); validate_config(app)
+    for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
+                               (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
+                               (config, 'legacy_service', '--help'), (config, 'node_url', app['node_url']),
+                               (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://node.example.invalid'),
+                               (app, 'node_url', None)):
+        bad = {key: item for key, item in dict(base, **{field: value}).items() if item is not None}
         try:
             validate_config(bad)
         except ValueError:
@@ -655,7 +670,7 @@ def self_test():
     runtime = compose_runtime(config, 'sha256:' + 'b' * 64, '1.0.0', 'c' * 40, 'd' * 64)['services']['service']
     assert runtime['network_mode'] == 'host' and runtime['user'] == '1001:1001'
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
-    assert runtime['environment']['VIBEFACE_ROLE'] == 'entry'
+    assert runtime['environment']['VIBEFACE_ROLE'] == 'node'
     nginx = '''server { listen 80; server_name app.example.invalid; return 301 https://$host$request_uri; }
 server {
     listen 443 ssl;
@@ -664,39 +679,33 @@ server {
     add_header Content-Security-Policy "old policy" always;
     add_header X-Vibeface-Source old;
     location = /api/client { proxy_pass http://127.0.0.1:4900; }
-    location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }
-    location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3900; }
+    location = /api/info { return 404; }
+    location = /sdk.v1.js { return 404; }
     location = /manifest.webmanifest { types {} default_type application/manifest+json; try_files $uri =404; }
     location ^~ /assets/ { try_files $uri =404; }
     location ~* \\.(?:js|wasm|css|woff2?|svg|png|ico|json|webmanifest)$ { try_files $uri =404; }
     location / { try_files $uri $uri/ /_shell.html; }
 }
 '''
-    app = {'role': 'app', 'server_name': 'app.example.invalid', 'listen': '127.0.0.1:8088'}
     updated = transform_nginx(nginx, app)
     assert 'old policy' not in updated and 'X-Vibeface-Source old' not in updated and 'try_files' not in updated
-    for node in nginx_nodes(nginx)[1]['children']:
-        if node['words'][0] == 'location' and any(token in ' '.join(node['words']) for token in ('api/client', 'bootstrap', 'relay|')):
-            assert nginx[node['start']:node['end']] in updated
+    assert '127.0.0.1:4900' not in updated and 'location = /sdk.v1.js { return 404; }' in updated
+    for route in NODE_ROUTES:
+        block = updated.split('location = ' + route + ' {', 1)[1].split('}', 1)[0]
+        assert 'proxy_pass http://203.0.113.7:4792;' in block and 'proxy_set_header Host app.example.invalid;' in block
+        assert ('Upgrade $http_upgrade' in block) == (route == '/api/client')
+    assert updated.index('location = /api/decision') < updated.index('location / {')
     assert transform_nginx(updated, app) == updated
-    relay_source = '''server { listen 443 ssl; server_name app.example.invalid; root /old;
-    location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }
-    location = /api/client { proxy_pass http://127.0.0.1:4900; }
-    location / { proxy_pass http://127.0.0.1:4900; }
-}'''
-    relay = transform_nginx(relay_source, dict(app, role='relay'))
-    assert 'location / {\n        return 404;' in relay and 'location ~ ^/(relay|ping|generate_204)$' in relay
-    assert 'location = /api/client { proxy_pass http://127.0.0.1:4900; }' in relay
-    for selector in ('location = /index.html { try_files $uri =404; }',
-                     'location ^~ /assets/ { alias /old/; }'):
-        try:
-            transform_nginx(relay_source.replace('root /old;', 'root /old; ' + selector), dict(app, role='relay'))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('Relay kept a frontend route')
+    try:
+        transform_nginx(nginx, dict(app, role='www'))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('WWW forwarded the node routes')
     for selector in ('location = /favicon.ico { alias /old/icon.ico; }',
-                     'location /old/ { include /old/static.conf; }', 'location /old/ {}'):
+                     'location /old/ { include /old/static.conf; }', 'location /old/ {}',
+                     'location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }',
+                     'location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }'):
         try:
             transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
         except ValueError:
@@ -769,7 +778,7 @@ server {
         def restored_legacy(*args):
             yield {'version': '1.0.0'}
         legacy_state = dict(state, previous=None, legacy_version='1.0.0', legacy_enabled=False,
-                            config={'role': 'entry', 'legacy_service': 'fixture.service'})
+                            config={'role': 'node', 'legacy_service': 'fixture.service'})
         with patch(__name__ + '.legacy_channel', side_effect=restored_legacy), \
                 patch(__name__ + '.command', return_value=subprocess.CompletedProcess([], 0, '', '')), \
                 patch(__name__ + '.stopped', side_effect=lambda *a: events.append('verify-target-stopped')), \

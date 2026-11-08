@@ -124,43 +124,9 @@ pub struct NodeStatus {
     pub write_state: Option<WriteState>,
     pub peers: Option<Vec<PeerStatus>>,
     pub error: Option<String>,
-    #[serde(default)]
-    pub bootstrap: Option<BootstrapStatus>,
-}
-
-/// How this Node stands with the public infrastructure.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct BootstrapStatus {
     /// `off`, `public` or `custom`.
     #[serde(default)]
-    pub mode: String,
-    /// The running Node's report: `state` is `seeking`, `admitted` or `degraded`.
-    #[serde(default)]
-    pub status: Option<Value>,
-}
-
-impl BootstrapStatus {
-    pub fn summary(&self) -> String {
-        if self.mode == "off" || self.mode.is_empty() {
-            return "off".into();
-        }
-        let Some(status) = &self.status else {
-            return format!("{} · status unavailable", self.mode);
-        };
-        let state = status["state"].as_str().unwrap_or("unknown");
-        let gateway = status["admitted"]["gateway_url"]
-            .as_str()
-            .or_else(|| status["gateway_url"].as_str());
-        let reason = status["reason"].as_str();
-        let mut summary = format!("{} · {state}", self.mode);
-        if let Some(gateway) = gateway {
-            summary.push_str(&format!(" · {gateway}"));
-        }
-        if let Some(reason) = reason {
-            summary.push_str(&format!(" · {reason}"));
-        }
-        summary
-    }
+    pub bootstrap: Option<String>,
 }
 
 impl NodeStatus {
@@ -282,9 +248,7 @@ pub fn print_status(node: &NodeStatus) -> io::Result<()> {
         ("Version", node.version().into()),
         (
             "Bootstrap",
-            node.bootstrap
-                .as_ref()
-                .map_or_else(|| "off".into(), BootstrapStatus::summary),
+            node.bootstrap.clone().unwrap_or_else(|| "off".into()),
         ),
         ("Data", node.data_dir.to_string_lossy().into_owned()),
     ] {

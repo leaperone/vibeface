@@ -23,15 +23,15 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 
 ```json
 {
-  "project": "official-entry",
-  "role": "entry",
-  "deploy_dir": "/srv/service-control/entry",
-  "listen": "127.0.0.1:4900",
-  "data_dir": "/var/lib/official-entry",
+  "project": "official-node",
+  "role": "node",
+  "deploy_dir": "/srv/service-control/node",
+  "listen": "0.0.0.0:4792",
+  "data_dir": "/var/lib/official-node",
   "device_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "uid": 1001,
   "gid": 1001,
-  "legacy_service": "official-entry.service",
+  "legacy_service": "official-node.service",
   "maintenance_socket": "/tmp/private-node/maintenance.sock"
 }
 ```
@@ -40,13 +40,23 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 
 | role | 运行方式 | 额外配置 |
 | --- | --- | --- |
-| discovery | Core host network，discovery-only，`--no-web` | 上例全部 Core 字段 |
-| entry | Core host network，forward/grants，保留 API，无静态 App | 上例全部 Core 字段 |
-| relay | Core host network，forward/operator-token，保留浏览器接入 API，无静态 App | 全部 Core 字段，另加 `nginx_config`、`server_name` |
-| app | 静态 App，bridge network | 通用字段，另加 `nginx_config`、`server_name` |
+| node | Core host network，官方公共节点：发现服务、开放 relay 和浏览器接入，各有限额；无静态 App、无 Nginx | 上例全部 Core 字段 |
+| app | 静态 App，bridge network，宿主 Nginx 把浏览器接入接口反代到公共节点 | 通用字段，另加 `nginx_config`、`server_name`、`node_url` |
 | www | 静态 WWW，bridge network | 通用字段，另加 `nginx_config`、`server_name`，tag 使用 `www-v` 前缀 |
 
-通用字段是 `project`、`role`、`deploy_dir`、`listen`。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，API、bootstrap 和 relay location 原文保留，旧 App 的服务器级 CSP、缓存和版本头会移除。Relay 只将该 TLS server 的 `location /` 改为 404，原有 `/relay`、`/ping`、`/generate_204` 共用路由和浏览器接入的 `= /api/client`、`= /api/info` 保留；`/api/client` 需由运营者自行配置 WebSocket 升级头。Relay 与 Entry 的 Core 配置须在 `allowed_origins` 中包含 `https://app.vibeface.dev`，否则 App 页面跨源接入会被拒绝，guard 会停止激活。浏览器接入接口不必与 relay 同源。邀请票据只携带设备编号，Entry 按编号经发现服务找到目标的 relay，所以 Entry 的 `network.discovery` 须包含 `relay_admission.issuer` 对应的官方发现服务，否则 guard 会停止激活。未知静态规则会拒绝激活。
+通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，公共节点没有域名，网页接口的 TCP 端口只对 App 主机开放，同号 UDP 端口对外提供发现服务。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。App 的 `= /api/client`、`= /api/info`、`= /api/decision` 改写为反代到 `node_url`（公共节点网页接口的 `http://<IPv4>:<端口>`），缺少的补在 `location /` 前；反代透传 `Host <server_name>`，因为公共节点只接受 App 的 Host，`/api/client` 另带 WebSocket 升级头并保持 1 小时。Cloudflare 须开启 WebSocket。其余非静态 location 只能是 `return 404`，旧的 `/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除，未知规则会拒绝激活。
+
+公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.serve_discovery` 开启；`relay_listen` 已设且没有 `relay_operator_token`，`relay_rate`、`relay_max_clients` 已设；`forwarding.any` 开启且设了 `forwarding.rate`；网页开启，`public_url` 为 `https://app.vibeface.dev` 且 `allowed_origins` 包含它；没有 `manager` 和项目根目录。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 64 KiB/s、最多 512 个连接，同时转发 32 个浏览器会话、另有 192 个排队、每会话 256 KiB/s。数据目录在首次激活前按下面初始化，并先以 `legacy_service` 运行：
+
+```sh
+vibeface init --data-dir /var/lib/official-node --listen 0.0.0.0:4792 \
+  --public-url https://app.vibeface.dev --allowed-origin https://app.vibeface.dev \
+  --serve-discovery --relay-listen 0.0.0.0:3340 --relay-url http://8.217.72.118:3340 \
+  --relay-rate 65536 --relay-max-clients 512 \
+  --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144
+```
+
+`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP 和上面的端口。
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。脚本使用只读挂载校验身份、配置、epoch 和制品信息。维护租约成功后才停旧进程，取 `node.lock` 并离线备份到私有 `deploy_dir`。容器的 bind mount 禁止自动创建源目录。整个过程不执行 init、不修改配置、不迁移 epoch、不重置数据。
 

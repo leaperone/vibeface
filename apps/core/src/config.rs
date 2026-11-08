@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
     net::SocketAddr,
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 use vibeface_bridge::platform::privatefs;
@@ -49,6 +50,44 @@ impl SchedulingLimits {
         ensure!(
             (1..=self.machine_slots).contains(&self.task_limit),
             "task_limit must be between 1 and machine_slots"
+        );
+        Ok(())
+    }
+}
+
+/// How this Node forwards browser sessions to other devices.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Forwarding {
+    /// Forward to any device, not only this network's Nodes, as a public node does.
+    pub any: bool,
+    /// Sessions forwarded at once.
+    pub sessions: usize,
+    /// Sessions waiting for a slot; one more is refused as busy.
+    pub queue: usize,
+    /// Bytes a second each session carries, both ways together; unlimited when unset.
+    pub rate: Option<NonZeroU32>,
+}
+
+impl Default for Forwarding {
+    fn default() -> Self {
+        Self {
+            any: false,
+            sessions: 256,
+            queue: 0,
+            rate: None,
+        }
+    }
+}
+
+impl Forwarding {
+    pub fn validate(&self) -> Result<()> {
+        // Waiting sessions hold their browser sockets too.
+        ensure!(
+            self.sessions >= 1
+                && self.sessions.saturating_add(self.queue) <= crate::api::MAX_CLIENT_SOCKETS,
+            "forwarded and waiting sessions must fit the {} browser sockets",
+            crate::api::MAX_CLIENT_SOCKETS
         );
         Ok(())
     }
@@ -105,8 +144,8 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
-    /// Serves only the web app, the relay and ciphertext forwarding; never joins a network.
-    pub public_entry: bool,
+    #[serde(default)]
+    pub forwarding: Forwarding,
     pub roots: Vec<PathBuf>,
     pub network: crate::net::NetworkConfig,
     pub manager: Option<ManagerSettings>,
@@ -144,7 +183,7 @@ impl Config {
             allowed_origins: vec![],
             allow_insecure_lan,
             local_auto_access: true,
-            public_entry: false,
+            forwarding: Default::default(),
             roots,
             network: crate::net::NetworkConfig::default(),
             manager: None,
@@ -187,6 +226,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.scheduling.validate()?;
         self.network.validate()?;
+        self.forwarding.validate()?;
         let url = http_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
@@ -214,29 +254,6 @@ impl Config {
             ensure!(
                 root.is_absolute() && root.is_dir(),
                 "project root must be an existing absolute directory"
-            );
-        }
-        ensure!(
-            self.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly
-                || self.public_entry,
-            "discovery-only runs as a public entry outside personal networks"
-        );
-        if self.public_entry {
-            ensure!(
-                self.network.relay_listen.is_some()
-                    && self.network.entry.is_none()
-                    && self.manager.is_none()
-                    && self.roots.is_empty(),
-                "a public entry runs a relay and nothing else"
-            );
-            ensure!(
-                self.network.bootstrap.is_off(),
-                "a public entry is the infrastructure Nodes bootstrap from and does not bootstrap"
-            );
-        } else {
-            ensure!(
-                !self.network.relay_admission.is_grants(),
-                "grant admission belongs to a public entry's relay"
             );
         }
         self.triage.validate()?;

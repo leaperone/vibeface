@@ -39,7 +39,7 @@ async function stopFixture() {
   });
 }
 async function startFixture(kind) {
-  assert(['single', 'delivery', 'workspace', 'bootstrap', 'bootstrap-http'].includes(kind), 'Unknown fixture kind');
+  assert(['single', 'delivery', 'workspace', 'bootstrap'].includes(kind), 'Unknown fixture kind');
   await stopFixture();
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];

@@ -71,7 +71,7 @@ function validateRenderer(event: IpcMainInvokeEvent | IpcMainEvent, getContents:
 function selectedTarget(value: SelectedLocalNode | null): LocalTarget | null {
   if (value === null) return null
   const { inspect, access } = value
-  if (!DEVICE_ID.test(inspect.deviceId) || inspect.status !== 'running' || !inspect.webEnabled || inspect.publicEntry
+  if (!DEVICE_ID.test(inspect.deviceId) || inspect.status !== 'running' || !inspect.webEnabled
       || access.kind !== 'local' || access.deviceId !== inspect.deviceId) return null
   const privateOrigin = parsePrivateOrigin(inspect.localListen)
   try {

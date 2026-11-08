@@ -21,6 +21,7 @@ const BROWSER_REMOVED = removedText(webPlatform.self)
 import { PasswordStrength, RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
 import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
+import { APP_ORIGIN } from '@vibeface/client/lib/entrances.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -121,20 +122,20 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /**
- * The computer that served this page. A public entry only forwards to people's own devices, so its page only opens join links.
- * Its `deviceId` fills in a manual address that is this page's own, which the page already trusts by running its code.
+ * The device ID of the computer that served this page: it fills in a manual address that is this page's own, which the
+ * page already trusts by running its code.
  */
 function usePageNode() {
-  const [node, setNode] = useState<{ publicEntry: boolean; deviceId: string }>({ publicEntry: false, deviceId: '' })
+  const [deviceId, setDeviceId] = useState('')
   useEffect(() => {
     let live = true
     if (typeof fetch === 'function') fetch('/api/info', { cache: 'no-store', credentials: 'omit' })
       .then(response => response.ok ? response.json() : null)
-      .then(info => { if (live) setNode({ publicEntry: info?.public_entry === true, deviceId: typeof info?.device_id === 'string' ? info.device_id : '' }) })
+      .then(info => { if (live) setDeviceId(typeof info?.device_id === 'string' ? info.device_id : '') })
       .catch(() => {})
     return () => { live = false }
   }, [])
-  return node
+  return deviceId
 }
 
 const sameOrigin = (address: string) => { try { return new URL(address).origin === location.origin } catch { return false } }
@@ -146,7 +147,8 @@ const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('
 export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const device = useDevice()
   const pageNode = usePageNode()
-  const publicEntry = pageNode.publicEntry
+  // The official page's Node forwards to people's own devices and is none of them, so that page only opens join links.
+  const official = globalThis.location?.origin === APP_ORIGIN
   const generation = device.connectionGeneration()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
@@ -295,9 +297,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else {
     alertInBody = true
-    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这个节点加入我的网络' : removed ? '重新加入' : '加入我的设备'}>
+    body = <Panel icon={official ? QrCode : Link2} title={official ? '扫码加入' : thisComputer ? '把这个节点加入我的网络' : removed ? '重新加入' : '加入我的设备'}>
       {/* A failure or the removal notice already says where to go next. */}
-      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(publicEntry && !thisComputer ? '你的节点' : undefined)}</p>}
+      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(official && !thisComputer ? '你的节点' : undefined)}</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
@@ -324,23 +326,23 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
     {step ? <Steps step={step} /> : null}
   </>}>
-    {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
+    {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.queued ? `排队中，第 ${device.queued} 位` : device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
     {alertInBody ? null : alert}
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
     {device.identity && !focused && step !== 2 ? <Details key={step ?? active}>
-      {alertInBody && !publicEntry && !thisComputer ? <p>在新节点的电脑或服务器上运行 <code>vibeface join</code> 加这条链接。</p> : null}
+      {alertInBody && !official && !thisComputer ? <p>在新节点的电脑或服务器上运行 <code>vibeface join</code> 加这条链接。</p> : null}
       <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
       {usable ? <Details label="手动填写地址">
         <form className="grid gap-3" noValidate onSubmit={(event) => {
           event.preventDefault()
           const form = event.currentTarget, address = value(form, 'address')
-          const deviceId = value(form, 'device_id').trim() || (!publicEntry && sameOrigin(address) ? pageNode.deviceId : '')
+          const deviceId = value(form, 'device_id').trim() || (!official && sameOrigin(address) ? pageNode : '')
           void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
             <Field label="访问地址"><Input type="url" name="address" defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={publicEntry ? undefined : manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={official ? undefined : manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <p className="-mt-1 text-muted-foreground">{manualCopy.where}</p>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>

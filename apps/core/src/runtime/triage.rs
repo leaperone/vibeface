@@ -2454,13 +2454,10 @@ impl Runtime {
     }
 
     fn decision_url(&self) -> String {
-        let base = self
-            .config
-            .network
-            .entry
-            .as_ref()
-            .map_or(self.config.public_url.as_str(), |entry| entry.url.as_str());
-        format!("{}/api/decision", base.trim_end_matches('/'))
+        format!(
+            "{}/api/decision",
+            self.config.public_url.trim_end_matches('/')
+        )
     }
 
     fn webhook_secret(&self) -> Result<Option<Vec<u8>>> {
@@ -2806,16 +2803,14 @@ impl Runtime {
         Ok(("answered", answered.message, answered.receipt))
     }
 
-    /// `POST /api/decision`: a public entry forwards to the device; a member Node handles its
-    /// own sessions and forwards the rest; the target alone checks the token.
+    /// `POST /api/decision`: a Node handles its own sessions and forwards the rest; the target
+    /// alone checks the token.
     pub(crate) async fn decision_http(self: &Arc<Self>, token: &str, body: Value) -> Result<Value> {
         let input: DecisionInput =
             serde_json::from_value(body.clone()).context("invalid decision")?;
         net::endpoint_id(&input.device_id)?;
         let forwarded = json!({"token":token,"decision":body});
-        if self.config.public_entry {
-            crate::client::reach_through_entry(self, &input.device_id).await?;
-        } else if input.device_id == self.identity.device_id()? {
+        if input.device_id == self.identity.device_id()? {
             return self.local_decision(token, input).await;
         }
         self.net()?

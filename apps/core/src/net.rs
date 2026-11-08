@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::{NonZeroU32, NonZeroUsize},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -34,7 +35,8 @@ pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";
 pub const SERVICE: &[u8] = b"vibeface/service/1";
-pub const ALPNS: [&[u8]; 7] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE];
+/// Every Node answers discovery probes; registrations and lookups only with `serve_discovery`.
+pub const ALPNS: [&[u8]; 8] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE, DISCOVERY];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
@@ -73,61 +75,48 @@ pub struct NetworkConfig {
     pub bind: Option<SocketAddr>,
     /// Extra iroh relays besides the ones the personal network's Nodes run.
     #[serde(default)]
-    pub relays: Vec<String>,
+    pub relays: Vec<Relay>,
     /// Also use n0's public relays.
     #[serde(default)]
     pub n0_relays: bool,
     /// Infrastructure this Node uses for address discovery and simultaneous direct probes.
     #[serde(default)]
     pub discovery: Vec<String>,
+    /// Answer other devices' discovery registrations and lookups on this Node's UDP endpoint.
     #[serde(default)]
-    pub relay_mode: RelayServiceMode,
-    /// Run an iroh relay or a UDP discovery service on this address.
+    pub serve_discovery: bool,
+    /// Run an iroh relay on this address.
     #[serde(default)]
     pub relay_listen: Option<SocketAddr>,
     /// The relay's URL as other Nodes reach it; defaults to `http://<relay_listen>`.
     #[serde(default)]
     pub relay_url: Option<String>,
-    /// A public entry outside the personal network that browsers come through. Its operator
-    /// token is the data directory's `entry-token` file.
+    /// What the relay requires of devices outside the personal network; without it the relay
+    /// admits anyone, within `relay_rate` and `relay_max_clients`.
     #[serde(default)]
-    pub entry: Option<PublicEntry>,
+    pub relay_operator_token: Option<String>,
+    /// Bytes a second the relay reads from each connection; unlimited when unset.
+    #[serde(default)]
+    pub relay_rate: Option<NonZeroU32>,
+    /// Connections the relay holds at once; unlimited when unset.
+    #[serde(default)]
+    pub relay_max_clients: Option<NonZeroUsize>,
+    /// Device IDs the relay refuses.
+    #[serde(default)]
+    pub relay_blocked: Vec<String>,
     /// How this Node finds public infrastructure. Off in `default()`, so fixtures stay offline;
     /// initialization turns the public service on for ordinary Nodes.
     #[serde(default)]
     pub bootstrap: bootstrap::Bootstrap,
-    /// How a public entry's relay admits Nodes.
-    #[serde(default)]
-    pub relay_admission: RelayAdmission,
-    /// The service catalogue a discovery-only entry signs and serves.
-    #[serde(default)]
-    pub catalog: Option<bootstrap::CatalogConfig>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum RelayServiceMode {
-    #[default]
-    Forward,
-    DiscoveryOnly,
-}
-
-/// How a public entry's relay admits Nodes: the operator's token, the explicit private choice,
-/// or grants signed by one pinned Discovery.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "policy", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum RelayAdmission {
-    #[default]
-    OperatorToken,
-    Grants {
-        issuer: String,
-    },
-}
-
-impl RelayAdmission {
-    pub fn is_grants(&self) -> bool {
-        matches!(self, Self::Grants { .. })
-    }
+/// A relay this Node uses, with the token it requires of devices outside its personal network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Relay {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,38 +126,20 @@ pub enum PathKind {
     Relay,
 }
 
-pub fn alpns(config: &NetworkConfig) -> Vec<&'static [u8]> {
-    if config.relay_mode == RelayServiceMode::DiscoveryOnly {
-        vec![DISCOVERY]
-    } else {
-        ALPNS
-            .into_iter()
-            .chain(std::iter::once(DISCOVERY))
-            .collect()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublicEntry {
-    /// Web origin browsers open; this Node's signed address names it as its Gateway.
-    pub url: String,
-    /// The entry's relay; the same origin when a reverse proxy routes `/relay` to it.
-    pub relay: String,
-}
-
-/// File holding the operator token of a public entry's relay, on the entry and on its Nodes.
-pub const ENTRY_TOKEN_FILE: &str = "entry-token";
-
+/// A relay token file holds 64 hex characters.
 pub fn read_token_file(path: &std::path::Path) -> Result<String> {
-    let token =
-        std::fs::read_to_string(path).context("the public entry token file is unreadable")?;
+    let token = std::fs::read_to_string(path).context("the relay token file is unreadable")?;
     let token = token.trim();
+    valid_token(token)?;
+    Ok(token.to_owned())
+}
+
+fn valid_token(token: &str) -> Result<()> {
     ensure!(
         token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
-        "the public entry token file is invalid"
+        "a relay token is 64 hex characters"
     );
-    Ok(token.to_owned())
+    Ok(())
 }
 
 /// Compares in time independent of where the inputs differ.
@@ -188,58 +159,35 @@ impl NetworkConfig {
             discovery::validate_server(server)?;
         }
         self.bootstrap.validate()?;
-        if let Some(catalog) = &self.catalog {
+        let mut urls = HashSet::new();
+        for relay in &self.relays {
             ensure!(
-                self.relay_mode == RelayServiceMode::DiscoveryOnly,
-                "a service catalogue is published by a discovery-only entry"
+                urls.insert(relay_url(&relay.url)?),
+                "a relay is listed once"
             );
-            catalog.validate()?;
+            if let Some(token) = &relay.token {
+                valid_token(token)?;
+            }
         }
-        if let RelayAdmission::Grants { issuer } = &self.relay_admission {
-            vibeface_secure::validate_device_id(issuer)?;
-            ensure!(
-                self.relay_mode == RelayServiceMode::Forward && self.relay_listen.is_some(),
-                "grant admission needs a running relay"
-            );
-        }
-        if self.relay_mode == RelayServiceMode::DiscoveryOnly {
-            ensure!(
-                self.relay_listen.is_some_and(|listen| listen.port() != 0)
-                    && self.relay_url.is_none()
-                    && self.entry.is_none()
-                    && self.relays.is_empty()
-                    && !self.n0_relays
-                    && self.bind.is_none()
-                    && self.discovery.is_empty()
-                    && self.bootstrap.is_off(),
-                "discovery-only needs relay_listen and cannot configure data relay paths, another bind address or public bootstrap"
-            );
-        }
-        for url in self.relays.iter().chain(&self.relay_url) {
+        if let Some(url) = &self.relay_url {
             relay_url(url)?;
         }
-        if let Some(entry) = &self.entry {
-            relay_url(&entry.relay)?;
-            let url = reqwest::Url::parse(&entry.url).context("invalid public entry URL")?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.path() == "/"
-                    && url.query().is_none()
-                    && url.fragment().is_none(),
-                "the public entry URL must be an HTTP(S) origin"
-            );
-        }
         ensure!(
-            self.relay_url.is_none() || self.relay_listen.is_some(),
-            "relay_url requires relay_listen"
+            self.relay_listen.is_some()
+                || (self.relay_url.is_none()
+                    && self.relay_operator_token.is_none()
+                    && self.relay_rate.is_none()
+                    && self.relay_max_clients.is_none()
+                    && self.relay_blocked.is_empty()),
+            "relay_url and the relay's admission and limits require relay_listen"
         );
-        if let Some(listen) = self
-            .relay_listen
-            .filter(|_| self.relay_mode == RelayServiceMode::Forward)
-        {
+        if let Some(token) = &self.relay_operator_token {
+            valid_token(token)?;
+        }
+        for device in &self.relay_blocked {
+            vibeface_secure::validate_device_id(device)?;
+        }
+        if let Some(listen) = self.relay_listen {
             ensure!(
                 self.relay_url.is_some() || !listen.ip().is_unspecified(),
                 "a relay on all interfaces needs relay_url"
@@ -249,9 +197,6 @@ impl NetworkConfig {
     }
     /// The URL other Nodes use for this Node's relay.
     pub fn own_relay(&self) -> Result<Option<RelayUrl>> {
-        if self.relay_mode == RelayServiceMode::DiscoveryOnly {
-            return Ok(None);
-        }
         match (&self.relay_url, self.relay_listen) {
             (Some(url), _) => relay_url(url).map(Some),
             (None, Some(listen)) => relay_url(&format!("http://{listen}")).map(Some),
@@ -260,13 +205,13 @@ impl NetworkConfig {
     }
 
     /// Every discovery service this Node registers with: the configured ones and the bootstrap
-    /// source's, once each.
+    /// one, once each.
     pub fn discovery_servers(&self) -> Result<Vec<String>> {
         let mut servers = self.discovery.clone();
-        if let Some(source) = self.bootstrap.source()?
-            && !servers.contains(&source.discovery)
+        if let Some(discovery) = self.bootstrap.discovery()?
+            && !servers.contains(&discovery)
         {
-            servers.push(source.discovery);
+            servers.push(discovery);
         }
         Ok(servers)
     }
@@ -368,9 +313,6 @@ pub struct Net {
     lan: OnceLock<lan::Lan>,
     relays: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
-    bootstrap: bootstrap::Bootstrapper,
-    issuer: Option<Arc<bootstrap::Issuer>>,
-    admission: Option<Arc<bootstrap::GrantAdmission>>,
 }
 impl std::fmt::Debug for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -407,13 +349,10 @@ impl Net {
         let seed: [u8; 32] = hex::decode(secret_key_hex)?
             .try_into()
             .map_err(|_| anyhow!("invalid device key"))?;
-        let identity = crate::crypto::LocalIdentity {
-            secret_key_hex: secret_key_hex.to_owned(),
-        };
         let map = RelayMap::empty();
         let mut urls: Vec<(RelayUrl, Option<String>)> = relays;
-        for url in &config.relays {
-            urls.push((relay_url(url)?, None));
+        for relay in &config.relays {
+            urls.push((relay_url(&relay.url)?, relay.token.clone()));
         }
         if let Some(own) = config.own_relay()? {
             urls.push((own, None));
@@ -432,27 +371,10 @@ impl Net {
             map.insert(url.clone(), Arc::new(relay_config(url, token)));
         }
         let known = Arc::new(tokio::sync::Mutex::new(known));
-        let issuer = match (&config.catalog, config.relay_mode) {
-            (Some(catalog), RelayServiceMode::DiscoveryOnly) => Some(Arc::new(
-                bootstrap::Issuer::new(identity.clone(), catalog.clone())?,
-            )),
-            _ => None,
-        };
-        let admission = match (&config.relay_admission, config.own_relay()?) {
-            (RelayAdmission::Grants { issuer }, Some(own)) => Some(Arc::new(
-                bootstrap::GrantAdmission::new(issuer.clone(), own)?,
-            )),
-            _ => None,
-        };
         let lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(&seed))
-            .alpns(
-                alpns(config)
-                    .into_iter()
-                    .map(|alpn| alpn.to_vec())
-                    .collect(),
-            )
+            .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
         for url in &config.pkarr.urls {
@@ -474,29 +396,11 @@ impl Net {
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
         // A router mapping would publish an address the user did not configure.
-        let bind = if config.relay_mode == RelayServiceMode::DiscoveryOnly {
-            config.relay_listen
-        } else {
-            config.bind
-        };
-        if bind.is_some() {
+        if config.bind.is_some() {
             builder = builder.portmapper_config(PortmapperConfig::Disabled);
         }
         let invalid = |error| anyhow!("invalid QUIC bind address: {error}");
-        builder = match bind {
-            Some(bind)
-                if config.relay_mode == RelayServiceMode::DiscoveryOnly
-                    && bind.ip().is_unspecified() =>
-            {
-                builder
-                    .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), bind.port()))
-                    .map_err(invalid)?
-                    .bind_addr_with_opts(
-                        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), bind.port()),
-                        BindOpts::default().set_is_required(false),
-                    )
-                    .map_err(invalid)?
-            }
+        builder = match config.bind {
             Some(bind) => builder.bind_addr(bind).map_err(invalid)?,
             None => builder
                 .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port))
@@ -511,25 +415,23 @@ impl Net {
             .bind()
             .await
             .context("QUIC endpoint failed to start")?;
+        // Registrants may make an open relay their home relay; one that asks for a token is
+        // for those who were given it.
+        let offered = if config.relay_operator_token.is_none() {
+            config.own_relay()?
+        } else {
+            None
+        };
+        // Registration runs in the background: the local API, maintenance and LAN start
+        // whether or not the public infrastructure answers.
         let discovery = discovery::Discovery::new(
             &endpoint,
             &config.discovery_servers()?,
-            config.relay_mode == RelayServiceMode::DiscoveryOnly,
-            issuer.clone(),
+            config.serve_discovery,
+            offered,
             config.own_relay()?,
+            known.clone(),
         )?;
-        // Bootstrapping runs in the background: the local API, maintenance and LAN start
-        // whether or not the public infrastructure answers.
-        let bootstrap = match config.bootstrap.source()? {
-            Some(source) => bootstrap::Bootstrapper::spawn(
-                endpoint.clone(),
-                identity,
-                source.clone(),
-                discovery.client_for(&source.discovery),
-                known.clone(),
-            )?,
-            None => bootstrap::Bootstrapper::off(),
-        };
         Ok(Self {
             endpoint,
             lookup,
@@ -537,29 +439,11 @@ impl Net {
             lan: OnceLock::new(),
             relays: known,
             connections: Mutex::new(HashMap::new()),
-            bootstrap,
-            issuer,
-            admission,
         })
     }
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
-    }
-
-    /// The public bootstrap of this endpoint; other modules read its snapshot.
-    pub fn bootstrap(&self) -> &bootstrap::Bootstrapper {
-        &self.bootstrap
-    }
-
-    /// Set when this endpoint is a discovery-only entry publishing a catalogue.
-    pub fn issuer(&self) -> Option<&Arc<bootstrap::Issuer>> {
-        self.issuer.as_ref()
-    }
-
-    /// Set when this endpoint's relay admits Nodes by Discovery grants.
-    pub fn grant_admission(&self) -> Option<&Arc<bootstrap::GrantAdmission>> {
-        self.admission.as_ref()
     }
 
     /// Remembers where a peer is and adds relays it uses that this Node does not know yet.
@@ -784,7 +668,6 @@ impl Net {
     }
 
     pub async fn close(&self) {
-        self.bootstrap.shutdown().await;
         self.endpoint.close().await;
     }
 }
@@ -875,14 +758,16 @@ where
     }
 }
 
-/// The relay this Node runs for its personal network. It admits current member Nodes and
-/// joiners whose token matches an open invite registered here.
+/// The relay this Node runs; `access` decides who it admits, and `rate` caps the bytes a second
+/// it reads from each connection.
 pub async fn spawn_relay(
     listen: SocketAddr,
     access: Arc<dyn iroh_relay::server::DynAccessControl>,
+    rate: Option<NonZeroU32>,
 ) -> Result<iroh_relay::server::Server> {
     let mut relay = iroh_relay::server::RelayConfig::new(listen);
     relay.access = access;
+    relay.limits.client_rx = rate.map(iroh_relay::server::ClientRateLimit::new);
     let mut config = iroh_relay::server::ServerConfig::default();
     config.relay = Some(relay);
     iroh_relay::server::Server::spawn(config)
@@ -896,13 +781,28 @@ mod tests {
 
     #[test]
     fn relay_settings_are_validated() {
+        let relay = |url: &str, token: Option<&str>| Relay {
+            url: url.into(),
+            token: token.map(Into::into),
+        };
+        let token = "ab".repeat(32);
         let mut config = NetworkConfig {
-            relays: vec!["https://relay.example".into()],
+            relays: vec![
+                relay("https://relay.example", None),
+                relay("https://private.example", Some(&token)),
+            ],
             ..Default::default()
         };
         config.validate().unwrap();
-        config.relays = vec!["https://user:secret@relay.example".into()];
+        config.relays = vec![relay("https://user:secret@relay.example", None)];
         assert!(config.validate().is_err());
+        config.relays = vec![relay("https://relay.example", Some("short"))];
+        assert!(config.validate().is_err(), "tokens are 64 hex characters");
+        config.relays = vec![
+            relay("https://relay.example", None),
+            relay("https://relay.example/", Some(&token)),
+        ];
+        assert!(config.validate().is_err(), "a relay is listed once");
         config.relays.clear();
         config.relay_url = Some("https://relay.example".into());
         assert!(config.validate().is_err(), "relay_url alone runs nothing");
@@ -915,6 +815,23 @@ mod tests {
             config.own_relay().unwrap().unwrap().to_string(),
             "http://127.0.0.1:3340/"
         );
+        config.relay_operator_token = Some(token.clone());
+        config.relay_rate = NonZeroU32::new(65536);
+        config.relay_max_clients = NonZeroUsize::new(512);
+        config.relay_blocked = vec![
+            crate::crypto::LocalIdentity::generate()
+                .device_id()
+                .unwrap(),
+        ];
+        config.validate().unwrap();
+        config.relay_blocked = vec!["not-a-device".into()];
+        assert!(config.validate().is_err());
+        config.relay_blocked.clear();
+        config.relay_listen = None;
+        assert!(
+            config.validate().is_err(),
+            "admission and limits belong to a running relay"
+        );
     }
 
     #[test]
@@ -925,7 +842,6 @@ mod tests {
 
     #[test]
     fn bootstrap_settings_are_validated() -> Result<()> {
-        let issuer = crate::crypto::LocalIdentity::generate().device_id()?;
         let mut config = NetworkConfig {
             bootstrap: bootstrap::Bootstrap::Public,
             ..Default::default()
@@ -938,60 +854,18 @@ mod tests {
         assert_eq!(
             config.discovery_servers()?.len(),
             1,
-            "the bootstrap source is not registered twice"
+            "the bootstrap Discovery is not registered twice"
         );
         assert!(NetworkConfig::default().discovery_servers()?.is_empty());
-        let discovery = NetworkConfig {
-            relay_mode: RelayServiceMode::DiscoveryOnly,
-            relay_listen: Some("0.0.0.0:4792".parse()?),
-            catalog: Some(bootstrap::CatalogConfig {
-                entries: vec![bootstrap::CatalogEntry {
-                    gateway_url: "https://app.example".into(),
-                    relay_url: "https://app.example".into(),
-                }],
-                grant_ttl_ms: bootstrap::DEFAULT_GRANT_TTL_MS,
-            }),
+        // The public node: Discovery and an open relay on one Node.
+        let public = NetworkConfig {
+            serve_discovery: true,
+            relay_listen: Some("0.0.0.0:3340".parse()?),
+            relay_url: Some("http://203.0.113.7:3340".into()),
+            relay_rate: NonZeroU32::new(65536),
             ..Default::default()
         };
-        discovery.validate()?;
-        let mut forward = discovery.clone();
-        forward.relay_mode = RelayServiceMode::Forward;
-        forward.relay_url = Some("https://relay.example".into());
-        assert!(
-            forward.validate().is_err(),
-            "catalogues belong to discovery-only entries"
-        );
-        let mut public = discovery.clone();
-        public.bootstrap = bootstrap::Bootstrap::Public;
-        assert!(
-            public.validate().is_err(),
-            "a discovery entry does not bootstrap itself"
-        );
-        let entry = NetworkConfig {
-            relay_listen: Some("127.0.0.1:3340".parse()?),
-            relay_url: Some("https://app.example".into()),
-            relay_admission: RelayAdmission::Grants {
-                issuer: issuer.clone(),
-            },
-            ..Default::default()
-        };
-        entry.validate()?;
-        let mut unpinned = entry.clone();
-        unpinned.relay_admission = RelayAdmission::Grants {
-            issuer: "not-a-device".into(),
-        };
-        assert!(unpinned.validate().is_err());
-        let mut no_relay = entry.clone();
-        no_relay.relay_listen = None;
-        no_relay.relay_url = None;
-        assert!(
-            no_relay.validate().is_err(),
-            "grants need a relay to admit to"
-        );
-        assert_eq!(
-            serde_json::to_value(RelayAdmission::default())?,
-            serde_json::json!({"policy":"operator-token"})
-        );
+        public.validate()?;
         Ok(())
     }
 
@@ -1050,14 +924,17 @@ mod tests {
             token: token.clone(),
             attempts,
         };
-        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy)).await?;
+        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy), None).await?;
         let url = format!(
             "http://{}",
             relay.http_addr().context("relay listener missing")?
         );
         let config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
-            relays: vec![url.clone()],
+            relays: vec![Relay {
+                url: url.clone(),
+                token: None,
+            }],
             ..Default::default()
         };
         let identity = crate::crypto::LocalIdentity::generate();

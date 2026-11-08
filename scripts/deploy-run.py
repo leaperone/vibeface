@@ -87,9 +87,12 @@ def core_smoke(identity, info):
     container = None
     base = ['--platform', 'linux/amd64', '--network', 'none', '-v', volume + ':/data']
     try:
-        options = {'data_dir': '/data', 'public_entry': True, 'listen': '127.0.0.1:4793',
-                   'public_url': 'http://127.0.0.1:4793', 'relay_mode': 'discovery-only',
-                   'relay_listen': '127.0.0.1:4792', 'bootstrap': 'off', 'no_web': True}
+        # The official node's shape, offline; the runtime guard refuses anything less bounded.
+        origin = 'https://app.vibeface.dev'
+        options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': origin,
+                   'allowed_origins': [origin], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
+                   'relay_rate': 65536, 'relay_max_clients': 512, 'forward_any': True, 'forward_sessions': 32,
+                   'forward_queue': 192, 'forward_rate': 262144, 'bootstrap': 'off'}
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
@@ -101,7 +104,7 @@ def core_smoke(identity, info):
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
         device = result['result']['device_id']
-        environment = ['-e', 'VIBEFACE_ROLE=discovery', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
+        environment = ['-e', 'VIBEFACE_ROLE=node', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
                        '-e', 'VIBEFACE_EXPECTED_VERSION=' + info['version'],
                        '-e', 'VIBEFACE_EXPECTED_SOURCE=' + info['source_sha'],
                        '-e', 'VIBEFACE_EXPECTED_DEVICE=' + device]
@@ -189,8 +192,7 @@ def activate(service, output):
     release.require(re.fullmatch(r'sha256:[0-9a-f]{64}', identity), 'invalid prepared image ID')
     host, user, port = transport(os.environ)
     config = json.loads(os.environ['DEPLOY_CONFIG'])
-    role = {'discovery': 'discovery', 'relay': 'entry', 'relay-cn': 'relay', 'app': 'app', 'www': 'www'}[service]
-    release.require(config['role'] == role, 'environment role does not match selected service')
+    release.require(config['role'] == service, 'environment role does not match selected service')
     with tempfile.TemporaryDirectory(dir=output, prefix='ssh-') as temporary:
         temporary = Path(temporary)
         os.chmod(temporary, 0o700)

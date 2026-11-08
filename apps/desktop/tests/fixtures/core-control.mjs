@@ -74,7 +74,6 @@ if (request.command === 'inspect') {
       listen: LISTEN,
       local_listen: LOCAL_LISTEN,
       public_url: `http://${LISTEN}`,
-      public_entry: false,
       web_enabled: true,
       version: running() ? '0.0.1-fixture' : null,
       write_state: null,

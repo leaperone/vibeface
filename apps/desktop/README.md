@@ -16,7 +16,7 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 但 `/api/local/exchange` 和本机会话 Cookie 只存在于 `local_listen` 监听器，并且它按字面 `Host` 匹配。
 `src/main/business-url.ts` 因此把 `access` 的路径与一次性 `#local=` / `#bootstrap=` 片段原样搬到
 `inspect.local_listen` 报告的私有 origin 上，并校验回环地址与 `node=` 对应的设备。
-片段不写入设置、不打日志。公网入口节点按其发布的 HTTPS 地址直接打开，不做改写。
+片段不写入设置、不打日志。
 
 ## 生命周期
 

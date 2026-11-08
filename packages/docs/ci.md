@@ -167,8 +167,8 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
 | 跨设备协作、换负责人与附件验收 | Linux x64 一次，使用 `--phase4` |
-| 公共入口与 relay 令牌验收 | Linux x64 一次，使用 `--public-entry` |
-| 仅发现、普通 relay 回退与无网页验收 | Linux x64 一次，使用 `--discovery` |
+| 公共节点、排队与私有 relay 令牌验收 | Linux x64 一次，使用 `--public-node` |
+| 发现服务、普通 relay 回退与无网页验收 | Linux x64 一次，使用 `--discovery` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
 | Nightly npm 包 | 组装四个原生包，四个平台分别安装并检查版本，POSIX 平台另执行 `--web-only` 冒烟 |
 
@@ -237,7 +237,7 @@ python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto
 python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
 python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-memory --memory-sync
 python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-phase4 --phase4
-python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-public-entry --public-entry
+python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-public-node --public-node
 python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-discovery --discovery
 python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-phase5 --phase5
 ```
@@ -260,7 +260,7 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 跨设备派发与停止、负责人切换、撤销后结果待确认、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B、C 都带夹具协调 Agent 和 App Server，P 是运行 relay 的公网角色。跨设备工作是 Agent 交给 Agent：目标设备的 Agent 自己开 Codex 线程；目标上的服务端请求变成拥有该线程的聊天里的提问，在 A 回答后由 A 的 Bot 经 `respond --node` 转发应答一次。C 接任务后离线并被撤销。
 
-公共入口、relay 准入和成员 Node 指向入口的改动跑 `--public-entry`。P 是不入网的公共入口，M 只经 P 的 relay 可达，X 持错误令牌；覆盖浏览器经 P 加入 M 并对话、P 重启后重连、错误令牌被拒、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 回答 M 上的提问一次、回答经 M 的 Bot 送达线程一次且错误 token 得 401，以及 P 不存事件和附件。
+公共节点、relay 准入、浏览器转发排队和公共引导的改动跑 `--public-node`。P 是不入网的公共节点，提供发现服务、开放 relay 和面向任何设备的浏览器转发，转发名额和队列各为 1；M 只配置 P 的发现服务。覆盖浏览器经 P 加入 M 并对话、P 重启后重连、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 回答 M 上的提问一次、回答经 M 的 Bot 送达线程一次且错误 token 得 401、名额占满时第二个浏览器排队并在轮到后接通、带运营者令牌的私有 relay R 在 A 与只有 IPv6 的 X 之间转发且 X 换成错误令牌后不可达，以及 P 不存事件、会话、日志和附件。
 
 发现协议、连接协助或 Web 开关改动另跑 `--discovery`。它覆盖没有地址提示的 CLI 邀请加入、清空地址缓存后经重启的发现服务直连、协议族不兼容时发现服务不转发业务、配置普通成员 relay 后自动回退，以及无网页模式下 hook、工具鉴权、维护和同步仍可用。真实公网 NAT 与真实 Agent 工具执行另行验收。
 

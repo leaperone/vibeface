@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { joinLink, joinTicket, unreachableText, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
@@ -15,18 +15,8 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { candidates, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import { APP_ORIGIN, candidates, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
-import {
-  catalogConnectionEntries,
-  createBootstrapPrefetch,
-  getPublicBootstrapMode,
-  publicBootstrapDefaults,
-  readCachedCatalog,
-  setPublicBootstrapMode as persistPublicBootstrapMode,
-  type PublicBootstrapMode,
-  type VerifiedCatalog,
-} from '../lib/bootstrap.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
 
@@ -109,9 +99,8 @@ type DeviceContextValue = {
   beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
   replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
-  /** Public discovery catalogue: default HTTPS, custom base, or off (no fetch, no fallback gateways from catalogue). */
-  publicBootstrap: PublicBootstrapMode
-  setPublicBootstrapMode(mode: PublicBootstrapMode): void
+  /** This connection's place in line at a busy Gateway, 1 next; null when it is not waiting. */
+  queued: number | null
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 export type UnsavedRecovery = { name: string; code: string; attempted: boolean }
@@ -243,12 +232,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return kept.current && { name: kept.current.name, code: kept.current.code, attempted: kept.current.attempted }
   })
   const [, setDismissals] = useState(0)
-  const [publicBootstrap, setPublicBootstrapState] = useState<PublicBootstrapMode>(() => getPublicBootstrapMode(platform.storage))
-  const [bootstrap] = useState(createBootstrapPrefetch)
-  const setPublicBootstrapMode = useCallback((mode: PublicBootstrapMode) => {
-    setPublicBootstrapState(mode)
-    persistPublicBootstrapMode(platform.storage, mode)
-  }, [platform.storage])
+  const [queued, setQueued] = useState<number | null>(null)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
@@ -284,7 +268,6 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const leaderRef = useRef(true)
   const tabChannel = useRef<{ post(message: TabMessage): void; close(): void } | null>(null)
   const tabListeners = useRef(new Set<(message: TabMessage) => void>())
-  const bootstrapCatalogRef = useRef<VerifiedCatalog | null>(null)
 
   function step(...events: LinkEvent[]) {
     const next = events.reduce(nextLink, linkRef.current)
@@ -442,64 +425,6 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     return seen
   }
-  function currentBootstrapCatalog(): VerifiedCatalog | null {
-    const mode = getPublicBootstrapMode(platform.storage)
-    if (mode.kind === 'off') return null
-    const expected = mode.kind === 'custom' ? mode : publicBootstrapDefaults
-    const catalog = bootstrapCatalogRef.current
-    if (catalog && catalog.issuer === expected.issuer && catalog.defaults.https_base === expected.https_base && catalog.expires_at_ms > Date.now()) return catalog
-    return readCachedCatalog(platform.storage, mode, platform.secure, Date.now())
-  }
-  async function refreshBootstrapCatalog() {
-    await bootstrap.refresh({ secure: platform.secure, storage: platform.storage })
-    bootstrapCatalogRef.current = bootstrap.snapshot()
-  }
-  const reconnectBootstrapAllowed = useMemo(() => {
-    const allowed = new Set<string>()
-    if (directory) {
-      const revoked = new Set(directory.revoked.map(item => item.device_id))
-      for (const member of directory.members) {
-        if (member.kind === 'node' && !revoked.has(member.device_id)) allowed.add(member.device_id)
-      }
-    }
-    for (const saved of savedEntries()) {
-      const pinned = load(`network-for.${saved.device_id}`)
-      if (typeof pinned === 'string') {
-        try {
-          validTarget(pinned)
-          allowed.add(saved.device_id)
-        } catch { /* ignore invalid */ }
-      }
-    }
-    return allowed
-  }, [directory, load, entries])
-  useEffect(() => {
-    if (publicBootstrap.kind === 'off') {
-      bootstrapCatalogRef.current = null
-      return
-    }
-    void refreshBootstrapCatalog()
-  }, [publicBootstrap, bootstrap, platform.secure, platform.storage])
-  function mergeReconnectWays(base: ConnectionEntry[], target: Reconnect, allowed: ReadonlySet<string>): ConnectionEntry[] {
-    const catalog = currentBootstrapCatalog()
-    if (!catalog || !allowed.has(target.entry.device_id)) return base
-    const targetWeb = target.entry.kind === 'gateway' || target.entry.kind === 'local' ? target.entry.address : undefined
-    const extra = catalogConnectionEntries(catalog, allowed).filter(item => {
-      if (item.kind !== 'gateway') return false
-      if (item.device_id !== target.entry.device_id) return false
-      if (targetWeb === undefined) return true
-      return item.address !== targetWeb
-    })
-    const seen = new Set(base.map(item => entryKey(item)))
-    return [...base, ...extra.filter(item => !seen.has(entryKey(item)))]
-  }
-  function mergeJoinWays(base: ConnectionEntry[], entryId: string, allowed: ReadonlySet<string>): ConnectionEntry[] {
-    const catalog = currentBootstrapCatalog()
-    if (!catalog || !allowed.has(entryId)) return base
-    const extra = catalogConnectionEntries(catalog, allowed).filter(item => item.device_id === entryId)
-    const seen = new Set(base.map(item => entryKey(item)))
-    return [...base, ...extra.filter(item => !seen.has(entryKey(item)))]
-  }
   /**
    * On a Gateway while a new LAN advert names the same Node: once a direct channel to it opens, this one is dropped and
    * the reconnect, LAN first, takes over. One that does not open leaves this channel alone, and so does one that never
@@ -538,16 +463,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const entrances = loadEntrances(target.networkId)
     const list = target.entry.kind === 'local'
       ? [target.entry]
-      : mergeReconnectWays(
-        candidates(
-          entrances,
-          target.entry,
-          lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]),
-          { catalog: currentBootstrapCatalog(), allowedDeviceIds: reconnectBootstrapAllowed },
-        ),
-        target,
-        reconnectBootstrapAllowed,
-      )
+      : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]))
+    // The official Gateway is the way left when the Node's own are gone; a page of another origin it refuses.
+    const official: ConnectionEntry = { kind: 'gateway', address: APP_ORIGIN, device_id: target.entry.device_id }
+    if (target.entry.kind !== 'local' && (!page || page.origin === APP_ORIGIN) && !list.some(way => entryKey(way) === entryKey(official))) list.push(official)
     for (const candidate of list) {
       let active: Session | null = null
       // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
@@ -584,16 +503,17 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (active && session.current === active) { generation.current += 1; session.current = null; active.channel.close() }
       }
     }
-    if (publicBootstrap.kind !== 'off') void refreshBootstrapCatalog()
     return false
   }
   async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000) {
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
+    setQueued(null)
     try {
       const channel = await connectDevice(parsed, {
         signal: controller.signal, timeoutMs,
+        onQueued(position) { if (version === generation.current) setQueued(position || null) },
         onEvent(value) {
           if (version !== generation.current || session.current?.generation !== version || !session.current.networkId) return
           if (!value || typeof value !== 'object' || Array.isArray(value)) return
@@ -613,7 +533,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
             setReady(null); setDirectory(null); setJoins([]); setPhase('disconnected'); setError(messageOf(reason))
           }
         },
-      })
+      }).finally(() => { if (version === generation.current) setQueued(null) })
       if (version !== generation.current) { channel.close(); throw changed() }
       const infoValue = await channel.request('info')
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -973,12 +893,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: this page's own
-   * entry, then the catalogue's. The device key is the check.
+   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: this page's own,
+   * or for an app the official one. The device key is the check.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    const base = page ? [{ kind: 'gateway' as const, address: page.origin, device_id: link.entryId }] : []
-    return mergeJoinWays(base, link.entryId, new Set([link.entryId]))
+    return [{ kind: 'gateway', address: page ? page.origin : APP_ORIGIN, device_id: link.entryId }]
   }
   /**
    * One question on a channel of its own, so the screen's connection stays as it is. The secret goes only to the
@@ -1014,25 +933,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
       const ways = joinWays(link)
-      let refreshed = false
-      const refreshWays = async () => {
-        if (refreshed || publicBootstrap.kind === 'off') return
-        refreshed = true
-        const version = generation.current
-        await refreshBootstrapCatalog()
-        if (version !== generation.current) throw changed()
-        const seen = new Set(ways.map(entryKey))
-        ways.push(...joinWays(link).filter(way => !seen.has(entryKey(way))))
-      }
-      if (!ways.length) await refreshWays()
       let active: Session | null = null
       for (const [index, way] of ways.entries()) {
         const last = index === ways.length - 1
         try { active = await open(way, false, way.kind === 'lan' && !last ? LAN_MS : 10000) }
         catch (cause) {
-          if (cause instanceof AuthenticationError) { link.secret = ''; throw cause }
-          if (last) await refreshWays()
-          if (index === ways.length - 1) { link.secret = ''; throw cause }
+          if (cause instanceof AuthenticationError || last) { link.secret = ''; throw cause }
         }
         if (active) break
       }
@@ -1515,8 +1421,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效。重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效。重新选择恢复文件。'); await sensitive.current.recover(members) },
-    cancelSensitive,
-    publicBootstrap, setPublicBootstrapMode,
+    cancelSensitive, queued,
     pendingRecovery, vetoRecovery, approveRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },

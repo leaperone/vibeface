@@ -20,8 +20,6 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 pub(crate) mod agent_tools;
-#[cfg(test)]
-mod bootstrap_tests;
 mod bots;
 mod chat_controls;
 pub mod claude;
@@ -504,8 +502,8 @@ pub struct Runtime {
     /// When reconciliation last read every running or unverified work's turn.
     live_probe_at: std::sync::atomic::AtomicI64,
     pub local_access: Arc<crate::local_access::LocalAccess>,
-    /// Operator token of the public entry's relay: this entry's own, or the one it serves.
-    pub(crate) entry_token: Option<String>,
+    /// Browser sessions this Node forwards to other devices, and those waiting.
+    pub(crate) forwards: crate::client::Forwards,
     pub(crate) write_state: tokio::sync::watch::Sender<WriteState>,
     /// Bumped on every membership change, so open sessions and connections recheck their peer.
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
@@ -579,13 +577,7 @@ impl Runtime {
         ] {
             config::private_dir(directory)?;
         }
-        // A public entry admitting by Discovery grants holds no operator token at all.
-        let entry_token = ((config.public_entry
-            && config.network.relay_mode == crate::net::RelayServiceMode::Forward
-            && !config.network.relay_admission.is_grants())
-            || config.network.entry.is_some())
-        .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
-        .transpose()?;
+        let forwards = crate::client::Forwards::new(&config.forwarding);
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.recover_triage()?;
@@ -785,7 +777,7 @@ impl Runtime {
             stop_retries: std::sync::Mutex::new(HashMap::new()),
             live_probe_at: std::sync::atomic::AtomicI64::new(now_ms()),
             local_access,
-            entry_token,
+            forwards,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
             membership: tokio::sync::watch::Sender::new(0),
             _process_lock: process_lock,
@@ -795,7 +787,7 @@ impl Runtime {
             rejoin: tokio::sync::Notify::new(),
             log_intake: Default::default(),
         };
-        if let Some(token) = &node.entry_token {
+        for token in node.relay_tokens() {
             crate::logging::add_credential(token);
         }
         Ok(node)
@@ -877,29 +869,16 @@ impl Runtime {
         self.store.lock().await.recovery_since_ms(recovery_key)
     }
     pub fn info(&self) -> Value {
-        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"public_entry":self.config.public_entry})
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION")})
     }
-    /// Where this Node stands with the public infrastructure; `None` when bootstrap is off.
-    pub fn bootstrap_state(&self) -> Option<crate::net::bootstrap::BootstrapState> {
-        if self.config.network.bootstrap.is_off() {
-            return None;
-        }
-        Some(self.net.get().map(|net| net.bootstrap().state()).unwrap_or(
-            crate::net::bootstrap::BootstrapState::Seeking {
-                since_ms: now_ms(),
-                reason: None,
-            },
-        ))
-    }
-    /// Whether this Node answers bootstrap HTTP: the catalogue and grants of a discovery entry,
-    /// or grant registrations of a public entry's relay.
-    pub fn serves_bootstrap_http(&self) -> bool {
-        use crate::net::RelayServiceMode;
-        self.config.public_entry
-            && match self.config.network.relay_mode {
-                RelayServiceMode::DiscoveryOnly => self.config.network.catalog.is_some(),
-                RelayServiceMode::Forward => self.config.network.relay_admission.is_grants(),
-            }
+    /// The relay tokens in this Node's configuration, kept out of logs and diagnostics.
+    pub(crate) fn relay_tokens(&self) -> impl Iterator<Item = &String> {
+        self.config
+            .network
+            .relays
+            .iter()
+            .filter_map(|relay| relay.token.as_ref())
+            .chain(&self.config.network.relay_operator_token)
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
@@ -908,9 +887,6 @@ impl Runtime {
             .await
             .take()
             .context("runtime already started")?;
-        if self.config.public_entry {
-            return self.start_network().await;
-        }
         self.start_recovery_timer();
         if self.align_on_start().await? {
             self.start_writers(events);

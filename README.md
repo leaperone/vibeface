@@ -78,18 +78,18 @@ Compare the six-digit code on both devices before approving. Join the existing n
 
 ## Public discovery service
 
-The default public discovery service provides address hints, signed connection entries, and short-lived Relay admission:
+The official public node is an ordinary Node outside every personal network. It serves discovery, an open relay and browser access, each with small limits. Its device ID and UDP address are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
 
 ```text
-vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
+vibeface://<issuer>@8.217.72.118:4792
 ```
 
-New personal Nodes connect by default to obtain address hints, a signed catalogue of public entries and relays, and short-lived admission grants. Mobile and browser clients use the same discovery service through HTTPS, while LAN connections remain preferred. Discovery does not relay application data; the public entry forwards ciphertext, without distributing its operator token. Use `--bootstrap off` during first initialization to disable public bootstrap, or configure a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
+New personal Nodes register with it by default, and use its open relay when no direct path works. `https://app.vibeface.dev` reaches your Node through it by device ID, and LAN connections remain preferred. It forwards only ciphertext. Use `--bootstrap off` during first initialization to disable public bootstrap, or point a Node at a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 
 - You approve each device that joins your private network. Only add devices you trust.
-- Connections are encrypted. A public entry point forwards encrypted traffic without becoming a member of your network.
+- Connections are encrypted. A public node forwards encrypted traffic without becoming a member of your network.
 - Configured credentials stay on the computer. A secret sent in chat becomes part of the shared conversation.
 - Approved computers and your chosen model service process task content. Connection encryption does not encrypt files on disk.
 - Agents can run commands and change files. Project folder settings are not an operating system sandbox.
