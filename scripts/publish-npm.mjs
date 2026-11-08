@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const repository = 'leaperone/vibeface';
 const workflow = '.github/workflows/release.yml';
 const producerJob = 'collect';
-const publisherJob = 'publish';
+const publisherJob = 'publish-product';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
 
@@ -147,8 +147,9 @@ async function selfTest() {
     size_in_bytes: 100, workflow_run: { id: 7, head_sha: sha } };
   const context = { tag, sha, runId: '7', artifactId: '11', workflowRef: `${repository}/${workflow}@refs/tags/${tag}` };
   const manual = { ...context, artifactId: '', workflowRef: `${repository}/.github/workflows/npm-publish.yml@refs/tags/${tag}` };
-  const jobs = [{ name: producerJob, status: 'completed', conclusion: 'success' },
-    { name: publisherJob, status: 'completed', conclusion: 'success' },
+  const jobs = [{ name: 'collect', status: 'completed', conclusion: 'success' },
+    { name: 'publish-product', status: 'completed', conclusion: 'success' },
+    { name: 'publish', status: 'completed', conclusion: 'skipped' },
     { name: 'npm / npm', status: 'completed', conclusion: 'failure' }];
   const api = (endpoint, key) => key === 'workflow_runs' ? [{ ...run, status: 'completed', conclusion: 'failure' }]
     : key === 'jobs' ? jobs : key === 'artifacts' ? [artifact] : endpoint.includes('/artifacts/') ? artifact : run;
@@ -169,7 +170,15 @@ async function selfTest() {
   assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { ...jobs[1], conclusion: 'failure' }])), /published before npm/);
   assert.throws(() => resolveArtifact(context, withJobs([jobs[1]])), /exactly one collect job/);
   assert.throws(() => resolveArtifact(context, withJobs([jobs[0], jobs[0], jobs[1]])), /exactly one collect job/);
-  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { name: 'publish-native', status: 'completed', conclusion: 'success' }])), /exactly one publish job/);
+  for (const request of [context, manual]) {
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0]])), /exactly one publish-product job/);
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], jobs[1], jobs[1]])), /exactly one publish-product job/);
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { name: 'publish', status: 'completed', conclusion: 'success' }])), /exactly one publish-product job/);
+    for (const conclusion of ['failure', 'skipped']) {
+      assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { ...jobs[1], conclusion }])), /published before npm/);
+    }
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { ...jobs[1], status: 'in_progress', conclusion: null }])), /published before npm/);
+  }
   assert.throws(() => resolveArtifact(manual, () => []), /one completed release run/);
   assert.throws(() => resolveArtifact(manual, (endpoint, key) => key === 'workflow_runs'
     ? [api(endpoint, key)[0], api(endpoint, key)[0]] : api(endpoint, key)), /one completed release run/);
