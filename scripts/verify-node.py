@@ -6496,6 +6496,8 @@ def delivery_channel_run(options, run, source, receiver, provider, first_order, 
         identifier = opened["channel_id"]
         require(balance(chain["channel_escrow"]) == 100, "deposit is locked independently in channel escrow")
         before = balance(provider.wallet_address)
+        redeem_fields = {"channel_id":identifier,"intent_id":str(uuid.uuid4()),"gas_cap":cap}
+        transaction_id = "channel-" + redeem_fields["intent_id"] + "/execute"
         fees = []
         for index, fee in enumerate((7, 11, 13)):
             if index == 0:
@@ -6538,7 +6540,61 @@ def delivery_channel_run(options, run, source, receiver, provider, first_order, 
             voucher_path = run / ("channel-voucher-" + str(index) + ".json")
             cli(source,["channel","export","--channel-id",identifier,str(voucher_path)])
             cli(provider,["channel","import",str(voucher_path)])
-            if index != 1:
+            if index == 0:
+                snapshot = rpc("evm_snapshot", [])
+                settled(provider,"redeem",**redeem_fields)
+                original_transaction = delivery_rows(provider,
+                    "SELECT intent,nonce,raw,hash FROM transactions WHERE id=?", (transaction_id,))
+                original_reservations = delivery_rows(provider, "SELECT id,nonce FROM transactions ORDER BY id")
+                require(len(original_transaction) == 1 and original_transaction[0][2] is not None,
+                        "first redemption durably preserves its signed original transaction")
+            elif index == 1:
+                settled(provider,"redeem",**redeem_fields)
+                require(delivery_rows(provider, "SELECT intent,nonce,raw,hash FROM transactions WHERE id=?",
+                    (transaction_id,)) == original_transaction
+                    and delivery_rows(provider, "SELECT id,nonce FROM transactions ORDER BY id") == original_reservations
+                    and balance(provider.wallet_address) - before == 7,
+                    "higher imported voucher retry reconciles original calldata, nonce and hash without another payment")
+                for action, fields in (("redeem", {"gas_cap":str(int(cap) + 1)}),
+                        ("redeem", {"channel_id":"99" * 32}), ("refund", {})):
+                    changed = {**redeem_fields, **fields}
+                    args = ["channel", action]
+                    for key, value in changed.items():
+                        args += ["--" + key.replace("_", "-"), value]
+                    cli(provider, args, success=False, error_contains="intent changed")
+                provider.stop(crash=True)
+                require(rpc("evm_revert", [snapshot]), "dedicated local EVM restores the pre-redemption reservation fixture")
+                reserved_intent = json.loads(original_transaction[0][0])
+                original_fee = reserved_intent["max_fee_per_gas"]
+                # Ganache retains reverted hashes; use another valid unsigned fee quote for this reservation fixture.
+                reserved_intent["max_fee_per_gas"] = str(int(original_fee) + 1)
+                require(int(reserved_intent["max_fee_per_gas"]) * reserved_intent["gas_limit"] <= int(cap),
+                        "reservation fixture preserves the original authorized gas cap")
+                reserved_encoded = json.dumps(reserved_intent, separators=(",", ":"))
+                require(reserved_encoded.replace('"max_fee_per_gas":"' + reserved_intent["max_fee_per_gas"] + '"',
+                    '"max_fee_per_gas":"' + original_fee + '"', 1) == original_transaction[0][0],
+                    "unsigned fixture changes only its fee quote and preserves every other reserved intent byte")
+                reserved_transaction = (reserved_encoded, original_transaction[0][1], None, None)
+                with sqlite3.connect(provider.directory / "delivery/service.sqlite3") as database:
+                    database.execute("UPDATE transactions SET intent=?,raw=NULL,hash=NULL,phase='reserved',block_number=NULL,block_hash=NULL,error=NULL WHERE id=?",
+                                     (reserved_transaction[0], transaction_id))
+                require(delivery_rows(provider, "SELECT intent,nonce,raw,hash FROM transactions WHERE id=?",
+                    (transaction_id,)) == [reserved_transaction],
+                    "stopped test-only Provider models a crash after nonce reservation before signing")
+                provider.start()
+                cli(provider,["channel","redeem","--channel-id",identifier,"--intent-id",redeem_fields["intent_id"],"--gas-cap",cap],
+                    success=False,error_contains="unlock")
+                cli(provider,["unlock"],password=passwords[provider.name])
+                settled(provider,"redeem",**redeem_fields)
+                recovered = delivery_rows(provider, "SELECT intent,nonce,raw,hash FROM transactions WHERE id=?", (transaction_id,))
+                require(len(recovered) == 1 and recovered[0][:2] == reserved_transaction[:2]
+                    and delivery_rows(provider, "SELECT id,nonce FROM transactions ORDER BY id") == original_reservations
+                    and recovered[0][2] is not None and recovered[0][3] is not None and balance(provider.wallet_address) - before == 7,
+                    "reserved redemption retry restores the original voucher and nonce after a higher import")
+                settled(provider,"redeem",channel_id=identifier,intent_id=str(uuid.uuid4()),gas_cap=cap)
+                require(balance(provider.wallet_address) - before == 18,
+                        "fresh redemption UUID selects the higher voucher and pays only its delta")
+            else:
                 settled(provider,"redeem",channel_id=identifier,intent_id=str(uuid.uuid4()),gas_cap=cap)
             fees.append({"order_id":order,"amount":fee,"sequence":voucher["sequence"],"receipt_commitment":voucher["receipt_commitment"]})
         require(balance(provider.wallet_address) - before == 31, "actual Provider independently redeems only cumulative delta")
@@ -6581,12 +6637,15 @@ def delivery_channel_run(options, run, source, receiver, provider, first_order, 
         path = run / "channel-disabled.json"; private_json(path,disabled); cli(source,["configure",str(path)])
         cli(provider,["configure",str(path)])
         cli(provider,["channel","import",str(voucher_path)],success=False,error_contains="disabled")
+        cli(provider,["channel","redeem","--channel-id",identifier,"--intent-id",redeem_fields["intent_id"],"--gas-cap",cap],
+            success=False,error_contains="disabled")
         cli(source,["channel","open","--intent-id",str(uuid.uuid4()),"--payee",provider.wallet_address,
             "--provider-peer",provider.device_id,"--budget","1","--gas-cap",cap],success=False,error_contains="disabled")
         public = run / "channel-voucher-while-disabled.json"
         cli(source,["channel","export","--channel-id",identifier,str(public)])
         passed("actual-source-receipt-cumulative-channel", channel_id=identifier, fees=fees, redeemed="31", refunded="69",
                restart_same_voucher=True, cross_channel_double_charge_rejected=True, closed=True,
+               retry_original_voucher=True, reserved_nonce_recovered=True, changed_retry_intent_rejected=True,
                wrong_payee_import_rejected=True, locked_public_import=True, disabled_import_rejected=True,
                chain_deployment=chain["channel_escrow"], scope="real Node charity receipts plus local test-token settlement; no ZK fairness")
     finally:

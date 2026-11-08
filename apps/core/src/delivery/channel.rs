@@ -936,10 +936,25 @@ impl Delivery {
                 intent_id,
                 gas_cap,
             } => {
-                let voucher = self
-                    .channel_record(&channel_id)?
-                    .latest
-                    .context("import a signed voucher before redemption")?;
+                intent(&intent_id)?;
+                let existing = self
+                    .with_store(|store| store.value(&format!("local-spend:channel-{intent_id}")))?;
+                let voucher = if let Some(bytes) = existing {
+                    let ChannelAction::Redeem { voucher } =
+                        serde_json::from_slice::<ChannelSpend>(&bytes)?.action
+                    else {
+                        bail!("channel owner intent changed across retry");
+                    };
+                    ensure!(
+                        voucher.terms.channel_id == channel_id,
+                        "channel owner intent changed across retry"
+                    );
+                    voucher
+                } else {
+                    self.channel_record(&channel_id)?
+                        .latest
+                        .context("import a signed voucher before redemption")?
+                };
                 let config = self.channel_config()?;
                 voucher.terms.matches_config(&config)?;
                 let wallet =
