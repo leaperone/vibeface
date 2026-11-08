@@ -692,6 +692,141 @@ async fn recover_with_service(
     Ok(())
 }
 
+fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
+    Ok(Policy {
+        channel: Channel::Nightly,
+        automatic: false,
+        install_root: fs::canonicalize(managed_root)?,
+    })
+}
+
+/// Reconcile an interrupted App-managed release journal before status or another update attempt.
+pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) -> Result<()> {
+    recover(&desktop_managed_policy(managed_root)?, data).await
+}
+
+pub(crate) struct DesktopManagedRelease<'a> {
+    pub managed_root: &'a Path,
+    pub previous: PathBuf,
+    pub candidate: PathBuf,
+    pub device_id: String,
+    pub resume_service: bool,
+}
+
+async fn activate_stopped(
+    policy: &Policy,
+    data: &Path,
+    journal: &mut Journal,
+) -> Result<()> {
+    let lock = lock_data_dir(data).context("stop the Node before updating")?;
+    backup(data, &journal.backup)?;
+    switch(&policy.install_root, &journal.candidate)?;
+    drop(lock);
+    journal.phase = Phase::Confirmed;
+    persist(&data.join("update-pending.json"), journal)?;
+    Ok(())
+}
+
+/// Drop a confirmed App-managed journal after the service registration reflects the new package.
+pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
+    let pending = data.join("update-pending.json");
+    if !pending.exists() {
+        return Ok(());
+    }
+    let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+    ensure!(
+        journal.phase == Phase::Confirmed,
+        "managed release was not confirmed"
+    );
+    fs::remove_file(pending)?;
+    privatefs::sync_dir(data)?;
+    Ok(())
+}
+
+/// Stage, switch, and confirm an App-managed runtime using the same journal as the CLI updater.
+pub(crate) async fn apply_desktop_managed_release(
+    data: &Path,
+    release: DesktopManagedRelease<'_>,
+) -> Result<()> {
+    let policy = desktop_managed_policy(release.managed_root)?;
+    recover(&policy, data).await?;
+    let service = Service::load(data).await?;
+    let root = fs::canonicalize(release.managed_root)?;
+    ensure!(
+        !root.starts_with(data),
+        "managed runtime must not live inside node data"
+    );
+    let backups = root.join("backups");
+    if !backups.exists() {
+        fs::create_dir(&backups)?;
+    }
+    ensure!(
+        fs::symlink_metadata(&backups)?.is_dir(),
+        "backup directory must not be a symlink"
+    );
+    private_dir(&backups)?;
+    manifest(&release.previous)?;
+    manifest(&release.candidate)?;
+    let mut journal = Journal {
+        phase: Phase::Prepared,
+        previous: release.previous.clone(),
+        candidate: release.candidate.clone(),
+        device_id: release.device_id.clone(),
+        backup: backups.join(uuid::Uuid::new_v4().to_string()),
+    };
+    persist(&data.join("update-pending.json"), &journal)?;
+    if release.resume_service {
+        let core = release.previous.join(PROGRAMS[1]);
+        let inspected = inspect(data, &core).await?;
+        ensure!(
+            inspected.device_id == release.device_id,
+            "running node identity changed"
+        );
+        ensure!(
+            inspected.status == "running",
+            "registered service and Core health disagree"
+        );
+        let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
+            Ok(lease) => lease,
+            Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                bail!("update deferred; the node could not become idle: {error:#}");
+            }
+            Err(error) => return Err(error.context("request node maintenance")),
+        };
+        let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
+            .context("maintenance response has invalid health")?;
+        ensure!(
+            health.version == manifest(&release.previous)?.core_version.to_string(),
+            "running node does not match current package"
+        );
+        ensure!(
+            health.device_id == release.device_id,
+            "running node identity changed"
+        );
+        let applied = activate(&policy, data, &service, &mut journal).await;
+        drop(lease);
+        if let Err(error) = applied {
+            match recover(&policy, data).await {
+                Ok(()) if installed(&root)? == journal.candidate => {
+                    maintenance_commit(data)
+                        .await
+                        .context("confirmed update must reopen admission")?;
+                    healthy(data, &journal.candidate, &journal.device_id).await?;
+                }
+                Ok(()) => {
+                    bail!("update failed; previous program restored, data was kept: {error:#}")
+                }
+                Err(rollback) => bail!(
+                    "update failed: {error:#}; recovery also failed: {rollback:#}; keep update-pending.json and run update again"
+                ),
+            }
+        }
+    } else {
+        activate_stopped(&policy, data, &mut journal).await?;
+    }
+    Ok(())
+}
+
 async fn wait_for_node_lock(data: &Path) -> Result<File> {
     for _ in 0..150 {
         if let Ok(lock) = lock_data_dir(data) {
@@ -1109,7 +1244,9 @@ fn task_data_matches(line: &str, data: &Path) -> bool {
 impl ServiceControl for Service {
     async fn stop(&self) -> Result<()> {
         if let Some(desktop) = &self.desktop {
-            return crate::desktop_node::run_managed_service(desktop, "stop").await;
+            let current = crate::desktop_node::managed_service_for_data(&desktop.data_dir)?
+                .context("Desktop Node service registration is missing")?;
+            return crate::desktop_node::run_managed_service(&current, "stop").await;
         }
         #[cfg(target_os = "macos")]
         {
@@ -1156,7 +1293,9 @@ impl ServiceControl for Service {
 
     async fn start(&self) -> Result<()> {
         if let Some(desktop) = &self.desktop {
-            return crate::desktop_node::run_managed_service(desktop, "start").await;
+            let current = crate::desktop_node::managed_service_for_data(&desktop.data_dir)?
+                .context("Desktop Node service registration is missing")?;
+            return crate::desktop_node::run_managed_service(&current, "start").await;
         }
         #[cfg(target_os = "macos")]
         {
@@ -1857,6 +1996,27 @@ mod tests {
         );
         drop(lock);
         assert!(update_lock(&data).is_ok());
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_stopped_managed_release_switches_without_service_restart() {
+        let (policy, data, journal) = activation_fixture();
+        fs::remove_file(data.join("update-pending.json")).unwrap();
+        let release = super::DesktopManagedRelease {
+            managed_root: &policy.install_root,
+            previous: journal.previous.clone(),
+            candidate: journal.candidate.clone(),
+            device_id: journal.device_id.clone(),
+            resume_service: false,
+        };
+        super::apply_desktop_managed_release(&data, release)
+            .await
+            .unwrap();
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
+        assert!(data.join("update-pending.json").exists());
+        super::complete_desktop_managed_release(&data).unwrap();
+        assert!(!data.join("update-pending.json").exists());
         fs::remove_dir_all(policy.install_root).unwrap();
     }
 

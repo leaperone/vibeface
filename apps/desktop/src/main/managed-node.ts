@@ -90,34 +90,61 @@ function runtimeUpdate(value: unknown): ManagedNodeRuntimeUpdate {
   }
 }
 
-function isStatus(value: unknown): value is ManagedNodeStatus {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  if (!('ok' in value) || !('state' in value) || !('device_id' in value) || !('data_dir' in value) ||
-      !('service_id' in value) || !('managed_root' in value) || !('service_running' in value) || !('core_status' in value) ||
-      !('runtime_update' in value)) return false
-  if (Object.keys(value).length !== 9 || value.ok !== true) return false
-  let update: ManagedNodeRuntimeUpdate
-  try { update = runtimeUpdate((value as { runtime_update: unknown }).runtime_update) } catch { return false }
-  if (value.state === 'not_installed') {
-    return value.device_id === null && value.data_dir === null && value.service_id === null &&
-      value.managed_root === null && value.service_running === null && value.core_status === null &&
-      update.availability === 'not_installed'
+export function parseManagedNodeStatus(value: unknown): ManagedNodeStatus {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('desktop Node returned an unsupported result')
   }
-  const identityValid = typeof value.device_id === 'string' && typeof value.data_dir === 'string' &&
-    typeof value.service_id === 'string' && typeof value.managed_root === 'string'
-  const coreStatusValid = value.core_status === null || value.core_status === 'running' ||
-    value.core_status === 'stopped' || value.core_status === 'unavailable'
-  if (!identityValid || !coreStatusValid) return false
-  switch (value.state) {
-    case 'installed':
-    case 'installed_stopped':
-    case 'partial':
-      return typeof value.service_running === 'boolean'
-    case 'conflict':
-    case 'unavailable':
-      return value.service_running === null || typeof value.service_running === 'boolean'
-    default:
-      return false
+  const raw = value as Record<string, unknown>
+  if (Object.keys(raw).length !== 9 || raw.ok !== true || typeof raw.state !== 'string') {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const runtime = runtimeUpdate(raw.runtime_update)
+  const state = raw.state
+  if (state === 'not_installed') {
+    if (raw.device_id !== null || raw.data_dir !== null || raw.service_id !== null || raw.managed_root !== null ||
+        raw.service_running !== null || raw.core_status !== null || runtime.availability !== 'not_installed') {
+      throw new Error('desktop Node returned an unsupported result')
+    }
+    return {
+      ok: true,
+      state,
+      device_id: null,
+      data_dir: null,
+      service_id: null,
+      managed_root: null,
+      service_running: null,
+      core_status: null,
+      runtime_update: runtime,
+    }
+  }
+  if (typeof raw.device_id !== 'string' || typeof raw.data_dir !== 'string' || typeof raw.service_id !== 'string' ||
+      typeof raw.managed_root !== 'string') {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const coreStatus = raw.core_status
+  if (!(coreStatus === null || coreStatus === 'running' || coreStatus === 'stopped' || coreStatus === 'unavailable')) {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const serviceRunning = raw.service_running
+  if (state === 'installed' || state === 'installed_stopped' || state === 'partial') {
+    if (typeof serviceRunning !== 'boolean') throw new Error('desktop Node returned an unsupported result')
+  } else if (state === 'conflict' || state === 'unavailable') {
+    if (!(serviceRunning === null || typeof serviceRunning === 'boolean')) {
+      throw new Error('desktop Node returned an unsupported result')
+    }
+  } else {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  return {
+    ok: true,
+    state: state as ManagedNodeStatus['state'],
+    device_id: raw.device_id,
+    data_dir: raw.data_dir,
+    service_id: raw.service_id,
+    managed_root: raw.managed_root,
+    service_running: serviceRunning as boolean | null,
+    core_status: coreStatus as CoreStatus,
+    runtime_update: runtime,
   }
 }
 
@@ -207,8 +234,8 @@ export class ManagedNodeController {
     if (expectedNodeId !== undefined) args.push('--expected-device-id', expectedNodeId)
     args.push(action)
     const result = await invoke(this.#bundledCli, args)
-    if (!isStatus(result)) throw new Error('desktop Node returned an unsupported result')
-    this.#onChange?.(result)
-    return result
+    const status = parseManagedNodeStatus(result)
+    this.#onChange?.(status)
+    return status
   }
 }
