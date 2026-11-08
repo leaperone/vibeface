@@ -217,6 +217,50 @@ jobs:
           subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
+      - name: Apply the local simslim profile to this simulator
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          umask 077
+          printf '%s\n' simulator-profile > .artifacts/native/private/stage.txt
+          export GOPATH="$PWD/.artifacts/native/simslim/go"
+          export GOMODCACHE="$PWD/.artifacts/native/simslim/mod"
+          export GOCACHE="$PWD/.artifacts/native/simslim/cache"
+          export GOBIN="$PWD/.artifacts/native/simslim/bin"
+          go install github.com/mobai-app/simslim/cmd/simslim@v0.13.0 > .artifacts/native/private/simslim-install.log 2>&1
+          python3 - <<'PY' > .artifacts/native/private/simslim.log 2>&1
+          import json, os, pathlib, re, subprocess
+          simulator = pathlib.Path(".artifacts/native/simulator.txt").read_text().strip()
+          assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator) and simulator == os.environ["VIBEFACE_E2E_SIMULATOR"]
+          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"]))["devices"]
+          matches = [row for rows in devices.values() for row in rows if row["udid"] == simulator]
+          expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          assert len(matches) == 1 and matches[0]["name"] == expected and matches[0]["state"] == "Booted"
+          tool = str(pathlib.Path(os.environ["GOBIN"]) / "simslim")
+          build = subprocess.check_output(["go", "version", "-m", tool], text=True)
+          pathlib.Path(".artifacts/native/private/simslim-build.txt").write_text(build)
+          version = re.search(r": go1\.(\d+)(?:\.\d+)?\n", build)
+          assert version and int(version[1]) >= 26
+          profile = {"name": "provider-ci", "except": ["siri", "icloud", "store", "pim", "web", "family", "health",
+                     "photos", "apps", "messaging", "connectivity", "telemetry", "other"], "keep": []}
+          profiles = json.loads(subprocess.run([tool, "profiles", "--json"], check=True, capture_output=True, text=True).stdout)
+          categories = [row["id"] for row in profiles]
+          assert len(categories) == len(set(categories)) and set(profile["except"]) <= set(categories)
+          assert set(categories) - set(profile["except"]) == {"widgets", "search"}
+          profile_path = pathlib.Path(".artifacts/native/private/simslim-profile.json")
+          profile_path.write_text(json.dumps(profile) + "\n")
+          subprocess.run([tool, "on", simulator, "--profile", str(profile_path)], check=True)
+          verified = json.loads(subprocess.run([tool, "verify", simulator, "--profile", str(profile_path), "--json"], check=True, capture_output=True, text=True).stdout)
+          assert verified["udid"] == simulator and verified["ok"] is True
+          assert verified.get("missing", []) == [] and verified.get("extra", []) == []
+          required = ("universal-links", "push", "photos", "contacts", "calendar", "siri")
+          doctor = json.loads(subprocess.run([tool, "doctor", simulator, "--requires", ",".join(required), "--json"], check=True, capture_output=True, text=True).stdout)
+          assert doctor["udid"] == simulator and doctor["ok"] is True
+          features = doctor["features"]
+          assert len(features) == len(required) and {row["id"] for row in features} == set(required)
+          assert all(row["ok"] is True and row.get("disabled", []) == [] for row in features)
+          PY
+          printf '%s\n' '{"stage":"simulator-profile","profile_verified":true,"required_services_passed":true,"siri_kept":true}'
       - name: Verify Provider settings and cancellation in the installed iOS app
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -257,7 +301,7 @@ jobs:
           removed, fixture_stopped, selected_passed, private_removed = not simulator_file.exists(), False, False, False
           stage_path = root / "private/stage.txt"
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
-          stages = {"host-source", "host-build", "simulator-create", "typecheck", "selection", "ui-run"}
+          stages = {"host-source", "host-build", "simulator-create", "simulator-profile", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
           ui_log = root / "private/ui.log"
           if ui_log.exists():
