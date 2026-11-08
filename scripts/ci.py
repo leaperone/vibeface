@@ -526,6 +526,11 @@ def self_test():
         for result in ("failure", "cancelled", "skipped", "missing"):
             expect_failure(lambda: mobile_gate(dict(mobile, **{job: {"result": result}}), False))
         expect_failure(lambda: mobile_gate({key: value for key, value in mobile.items() if key != job}, False))
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-activate.py"), "--self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/runtime.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/static-config.py"), "--self-test"], check=True)
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "native-linux", "package-linux"]

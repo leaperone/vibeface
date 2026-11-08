@@ -3,7 +3,7 @@ base_branch = "main"
 [[scope]]
 prefix = ""
 name = "CI policy and Python syntax"
-check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && python3 scripts/daily-nightly.py --self-test && actionlint"
+check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && python3 scripts/daily-nightly.py --self-test && python3 -B scripts/test_progressive_publication.py && actionlint"
 build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/release.py\", \"scripts/daily-nightly.py\")]'"
 
 [[domain_check]]
@@ -51,3 +51,8 @@ extra_checklist = "Check command deduplication, uncertain write results, device 
 
 [report]
 language = "zh"
+
+[[domain_check]]
+name = "Official deployment command"
+trigger_paths = ["scripts/deploy.py", "scripts/deploy-run.py", "scripts/deploy-activate.py", "deploy/**", ".github/workflows/deploy-services.yml", ".github/workflows/release.yml", "scripts/check-release-workflow.py"]
+command = "python3 -B scripts/deploy.py self-test && python3 -B scripts/deploy-run.py self-test && python3 -B scripts/deploy-activate.py --self-test && python3 -B deploy/runtime.py self-test && python3 -B deploy/static-config.py --self-test && python3 -B scripts/check-release-workflow.py --self-test"

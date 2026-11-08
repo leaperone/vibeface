@@ -18,7 +18,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对
 | 发布组 | Tag | 版本来源 | 交付结果 |
 | --- | --- | --- | --- |
 | product | `v<version>` | CLI Cargo 版本；各产品组件的发行版本必须与之完全一致 | 一个 Release 包含四个原生目标的电脑完整包、macOS/Windows/Linux 桌面 App、Web App、Android APK、iOS 设备归档及配置签名后的 IPA |
-| www | `www-v<version>` | `apps/www/package.json` | 独立官网归档，Stable 还请求部署 |
+| www | `www-v<version>` | `apps/www/package.json` | 独立官网归档，不触发部署 |
 
 版本只使用 `X.Y.Z`、`X.Y.Z-rc.N` 或 `X.Y.Z-nightly.YYYYMMDD.N`。Nightly 日期取 UTC，N 是该发布组、基准版本和日期下远端已有序号的最大值加一。先获取远端 tags，再计算；产品与官网独立计数。产品只使用 `v`，官网只使用 `www-v`；不新增旧应用前缀别名，不使用可变 `nightly` Tag、build metadata 或重复版本。
 
@@ -28,12 +28,12 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对
 
 协调器将原 run 的 `created_at` 转为 UTC，向下取整到 00、04、08、12、16、20 时的批次，用 `bot/daily-nightly/YYYYMMDDHH` 恢复该批次唯一 PR、版本和真实 squash SHA。发布版本日期仍取原 run 的 `YYYYMMDD`，不同批次独立创建 PR 并递增同日序号、Android versionCode 与 iOS buildNumber。即使业务源码未变化，每个批次仍递增产品组和官网 Nightly；各产品组件使用同一版本，保留 marketing version 和依赖解析结果，Android versionCode 与 iOS buildNumber 各递增一次。协调器保持全局串行。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本，以及这两个原生构建号。iOS 递增 CFBundleVersion 的末段数字，超出 Apple 分段上限时停止，不重置或自动进位。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
 
-合并后仅实际 SHA 的 main push CI success 放行。产品内部并行构建并完整汇总后公开一个 Release，产品与官网运行可并行。产品 Nightly 自动发布 npm，Nightly 不发站，也不上传 TestFlight 或 App Store；仍构建 iOS 设备归档，签名配置完整时导出 IPA。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败不能当作成功；原产品与 npm artifact 完整时，协调器可重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。延迟启动或跨日重跑原 schedule run 仍恢复原批次任务，不另建版本 PR，不重新分配版本。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则停止初始化，避免版本倒退。不要在人工发版会话中无授权调用此自动协调入口。
+合并后仅实际 SHA 的 main push CI success 放行。产品先创建标明构建中的公开 Release；各平台独立完成校验后追加自己的附件，产品与官网运行可并行。`collect` 在后台继续完整审计，最终 `publish-product` 核对全套已公开字节并最后追加 `release.json`，之后才放行自动消费。产品 Nightly 自动发布 npm，Nightly 不发站，也不上传 TestFlight 或 App Store；仍构建 iOS 设备归档，签名配置完整时导出 IPA。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败不能当作成功；原产品与 npm artifact 完整时，协调器可重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。延迟启动或跨日重跑原 schedule run 仍恢复原批次任务，不另建版本 PR，不重新分配版本。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则停止初始化，避免版本倒退。不要在人工发版会话中无授权调用此自动协调入口。
 
 ## 准备并验证版本
 
 1. 在任务 worktree 中同步各产品组件版本及 `Cargo.lock` 的本仓包版本，或只修改独立官网版本。Mobile marketing version 和原生 build number 按目标分发规则处理。准备好的精确版本可直接发布，不为打 tag 再自动递增一次。
-2. Web、macOS、Windows、Linux x64、Linux ARM64 原生程序、Android 和 iOS 在同一运行并行构建。桌面 App 只等待本平台完整运行包。每个平台组包只等自己的原生输入和 Web，以不可变 artifact ID 验证同一源码、版本与目标。不得等待或拉取独立公开组件 Release；只有完整产品集通过才公开一个 Release。
+2. Web、macOS、Windows、Linux x64、Linux ARM64 原生程序、Android 和 iOS 在同一运行并行构建。桌面 App 只等待本平台完整运行包。每个平台组包只等自己的原生输入和 Web，以不可变 artifact ID 验证同一源码、版本与目标。不得等待或拉取独立公开组件 Release。每组校验通过即可追加并供手动下载；完整产品集通过才追加全局 `release.json`，标记整套发布完成。
 3. 在同一 PR 完成相关检查和独立审查，再按已有授权合并。不得直接在 main 上修改、commit 或 push 版本。
 4. 固定包含版本修改的完整 `SOURCE_SHA`。在指向该提交的干净 worktree 中验证；保留主 checkout 的无关修改。提交必须已进入远端 main，版本必须与 tag 完全一致。
 5. 核对该 SHA 的必要检查与 main CI 均已通过。`pending`、缺少检查或只有其他 SHA 的成功记录均不能放行。失败先修复，不用打 tag 探测构建是否能过。
@@ -69,20 +69,20 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 
 - 同名本地或远端 tag 已存在：解析 annotated tag 的最终 commit 并核对 SHA。不同提交立即停止，禁止覆盖、强推、删除重建或改保护规则。同一提交的本地 tag 可直接推送；远端已存在则检查已有 Release 和关联 runs，已成功就报告已有结果。
 - 相同 tag、相同源码的构建因基础设施失败时，先对账并保留已有制品，再重跑失败任务。需要重新派发时使用 `gh workflow run release.yml --repo leaperone/vibeface --ref "$TAG" -f app="$APP" -f tag="$TAG" -F publish=true`。不重新打 tag，不覆盖已上传字节；若重建结果与已上传制品不同，停止重试并使用新版本。
-- 修复源码必须走新 PR 和新版本、新 tag。公开 Release 和 tag 不覆盖、不删除；回滚也通过新版本交付修正。
+- 修复源码必须走新 PR 和新版本、新 tag。构建中的同一 Release 允许追加其他已校验平台的附件；已公开字节和 tag 不覆盖、不删除。回滚也通过新版本交付修正。
 - 推送或发布返回结果未知时，先查询远端 tag、Release 和 Actions 对账，再决定下一步。不要直接重发。
 
 ## 跟踪实际发布结果
 
 每次推送 tag 后立即按完整 `SOURCE_SHA`、`TAG` 和事件核对 [release.yml](../../../.github/workflows/release.yml) 的 runs。使用 `gh-run-watch` 持续跟踪所有本次关联 runs 到终态。不要用“最新一条”猜 run，也不要把 API 观察超时当作构建失败后重复发布。
 
-发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
+公开附件不代表整套发布已完成。缺少全局 `release.json` 时，报告为构建中，用户可手动下载已校验平台；新版安装器和自动更新器跳过它。已安装旧客户端无法追溯修改，可能更新已具备完整电脑包和校验文件的平台，缺少目标时失败并保留现版。完整发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
 
-App 的公网入口是 `https://app.vibeface.dev`。Stable 产品 Tag 的完整 Release 发布成功后自动请求站点部署，RC 和 Nightly 只生成归档；部署后须核对线上资源的源码身份、SPA 路由、API 404 和首次连接页面。
+产品发布不更新 App、Discovery 或 Relay。用户要求部署这些服务时，使用相邻的 [deploy skill](../deploy/SKILL.md)，显式选择已经完整发布的产品 Tag。不得由 `release product` 自动派发部署。
 
-www Stable 还要跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
+官网发布同样不自动部署。部署官方站点时，在本仓库执行 `deploy www <精确官网 Tag>`，与产品服务使用相同的独立部署流水线。核对实际运行版本、镜像和线上页面，不能把 workflow 启动当作上线。
 
-npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在 产品 `publish` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
+npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在产品 `publish-product` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
 
 iOS 默认使用 `app-store-connect` 分发方式，先通过 TestFlight 内测，再准备 App Store 发布。签名 IPA 的 `testflight_eligible=true` 只代表导出方式和描述文件通过校验，不代表 Apple 已接收或内测已可安装。TestFlight 上传、Apple 处理、内部测试组分配、App Store 提交和真机验收另行完成；不能把未签名设备归档或 CI 成功报告成可安装的 iOS App。
 
@@ -92,6 +92,6 @@ iOS 默认使用 `app-store-connect` 分发方式，先通过 TestFlight 内测�
 
 手动 `release.yml` 默认 `publish=false`，可从开发分支执行产品或官网完整构建，不要求真实 Tag。该结果只证明构建与验收，不代表公开发布、部署、npm registry 写入或升级已发生。使用 `gh workflow run release.yml --ref <branch> -f app=product -F publish=false` 验证实际并行与最终完整 artifact。
 
-真正发布必须使用现存精确 Tag 作为 workflow ref，显式 `publish=true`；身份检查还要求该源码的 main push CI success。只有 `publish` 任务能写 GitHub Release，所有生产者和汇总任务只上传 Actions 制品。
+真正发布必须使用现存精确 Tag 作为 workflow ref，显式 `publish=true`；身份检查还要求该源码的 main push CI success。`release-start` 只负责创建或确认一个公开 Release，各平台发布任务仅写自己独占的附件名称，最终 `publish-product` 最后写入全局 `release.json` 和完成状态；生产者与 `collect` 仍只上传 Actions 制品。
 
 旧 CLI 只识别旧 `cli-v` 格式，首次切换按安装说明手动安装新版完整包，之后由新版跟踪产品 `v`。不创建兼容 Tag、不自动覆盖已有安装或迁移数据。

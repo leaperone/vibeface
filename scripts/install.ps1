@@ -73,6 +73,60 @@ function Select-Release {
     return ($ordered | Sort-Object Major, Minor, Patch, Day, Build)
 }
 
+function Get-OptionalDownload {
+    param([string] $Url, [string] $Path, [int64] $Limit)
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -MaximumRedirection 5 `
+            -UserAgent 'vibeface-installer' -TimeoutSec 180
+    } catch {
+        $status = 0
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        if ($status -eq 404) { return $false }
+        Fail 'completion manifest download failed (network or GitHub API limit)'
+    }
+    if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { Fail 'release completion manifest exceeds limit' }
+    return $true
+}
+
+function Confirm-Completion {
+    param([object] $Release, [string] $Tag, [string] $Version, [string] $Archive, [string] $Target)
+    $marker = @($Release.assets | Where-Object { $_.name -eq 'release.json' })
+    if ($marker.Count -eq 0) { return $false }
+    if ($marker.Count -ne 1) { Fail 'release contains duplicate completion markers' }
+    if ($marker[0].size -gt 1MB) { Fail 'release completion manifest exceeds limit' }
+    $manifestPath = Join-Path $script:Scratch 'completion.json'
+    if (-not (Get-OptionalDownload -Url "$Downloads/$Tag/release.json" -Path $manifestPath -Limit 1MB)) {
+        return $false
+    }
+    if ((Get-Item -LiteralPath $manifestPath).Length -gt 1MB) { Fail 'release completion manifest exceeds limit' }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { Fail 'invalid release completion manifest JSON' }
+    $props = @($manifest.PSObject.Properties.Name | Sort-Object)
+    if (($props -join ',') -ne 'app,assets,channel,schema,source_commit,tag,version') { Fail 'invalid release completion manifest fields' }
+    $channel = if ($Tag -match '-nightly\.') { 'nightly' } else { 'stable' }
+    if ($manifest.app -ne 'product' -or
+        ($manifest.schema -isnot [int] -and $manifest.schema -isnot [long]) -or $manifest.schema -ne 1 -or
+        $manifest.tag -cne $Tag -or $manifest.version -cne $Version -or $manifest.channel -cne $channel -or
+        $manifest.source_commit -notmatch '^[0-9a-f]{40}$') { Fail 'release completion manifest identity mismatch' }
+    $targetItems = @($manifest.assets | Where-Object { $_.name -eq $Archive -or $_.name -eq "$Archive.sha256" })
+    if ($targetItems.Count -ne 2 -or @($targetItems | Where-Object { $_.name -eq $Archive }).Count -ne 1 -or
+        @($targetItems | Where-Object { $_.name -eq "$Archive.sha256" }).Count -ne 1) { Fail 'completion manifest target assets are missing or duplicated' }
+    foreach ($entry in $targetItems) {
+        if ($entry.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            ($entry.size -isnot [long] -and $entry.size -isnot [int])) {
+            Fail 'invalid completion manifest target asset metadata'
+        }
+    }
+    $asset = @($Release.assets | Where-Object { $_.name -eq $Archive })
+    $checksum = @($Release.assets | Where-Object { $_.name -eq "$Archive.sha256" })
+    if ($asset.Count -ne 1 -or $checksum.Count -ne 1) { Fail 'complete release is missing or duplicates its target assets' }
+    $archiveEntry = $targetItems | Where-Object { $_.name -eq $Archive }
+    $checksumEntry = $targetItems | Where-Object { $_.name -eq "$Archive.sha256" }
+    if ([int64]$archiveEntry.size -ne [int64]$asset[0].size -or
+        [int64]$checksumEntry.size -ne [int64]$checksum[0].size) { Fail 'completion manifest target asset sizes mismatch' }
+    return $manifest
+}
+
 function Get-Json {
     param([string] $Url)
     $file = Join-Path $script:Scratch ('json-' + [guid]::NewGuid().ToString('N'))
@@ -244,12 +298,22 @@ function Install-Release {
         }
         Fail 'no published Nightly release'
     }
-    $tag = $selected[-1].Tag
-    $version = $tag.Substring(1)
-    $package = "vibeface-$version-$Target"
-    $archive = "$package.tar.gz"
+    $chosen = $null
+    for ($index = $selected.Count - 1; $index -ge 0; $index--) {
+        $candidateTag = $selected[$index].Tag
+        $candidateVersion = $candidateTag.Substring(1)
+        $candidatePackage = "vibeface-$candidateVersion-$Target"
+        $candidateManifest = Confirm-Completion -Release ($releases | Where-Object tag_name -CEQ $candidateTag | Select-Object -First 1) `
+            -Tag $candidateTag -Version $candidateVersion -Archive "$candidatePackage.tar.gz" -Target $Target
+        if ($candidateManifest) {
+            $tag = $candidateTag; $version = $candidateVersion; $package = $candidatePackage
+            $archive = "$package.tar.gz"; $manifest = $candidateManifest; $chosen = $true; break
+        }
+    }
+    if (-not $chosen) { Fail 'no complete published release in the selected channel' }
     $commit = [string] (Get-Json -Url "$Api/commits/$tag").sha
     if ($commit -notmatch '^[0-9a-f]{40}$') { Fail 'release tag has no valid source commit' }
+    if ($manifest.source_commit -cne $commit) { Fail 'release completion manifest source does not match the tag' }
 
     "Downloading $tag ($Target)..."
     $archivePath = Join-Path $script:Scratch $archive
@@ -261,6 +325,14 @@ function Install-Release {
     $found = [regex]::Match($lines[0], '^([a-fA-F0-9]{64})  \*?(\S+)$')
     if (-not $found.Success -or $found.Groups[2].Value -ne $archive) {
         Fail 'checksum must name exactly the downloaded archive'
+    }
+    $checksumEntry = @($manifest.assets | Where-Object { $_.name -eq "$archive.sha256" })[0]
+    $archiveEntry = @($manifest.assets | Where-Object { $_.name -eq $archive })[0]
+    if ((Get-Sha256 -Path $checksumPath) -cne $checksumEntry.sha256 -or
+        [int64]$archiveEntry.size -ne [int64](Get-Item -LiteralPath $archivePath).Length -or
+        [int64]$checksumEntry.size -ne [int64](Get-Item -LiteralPath $checksumPath).Length -or
+        $found.Groups[1].Value.ToLowerInvariant() -cne $archiveEntry.sha256) {
+        Fail 'release completion manifest digest does not match the target payload'
     }
     if ((Get-Sha256 -Path $archivePath) -ne $found.Groups[1].Value.ToLowerInvariant()) {
         Fail 'SHA256 mismatch; nothing was installed'
@@ -361,6 +433,96 @@ function Invoke-SelfTest {
         }
     } finally {
         Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Mock the HTTP command only inside this self-test; production downloads stay unchanged.
+    function Fail { param([string] $Message) throw $Message }
+    Add-Type -TypeDefinition @'
+public class VibefaceInstallerTestResponse : System.Net.WebResponse {
+    public System.Net.HttpStatusCode StatusCode { get; private set; }
+    public VibefaceInstallerTestResponse(int code) { StatusCode = (System.Net.HttpStatusCode)code; }
+}
+'@
+    $responses = @{}
+    $requests = New-Object 'System.Collections.Generic.List[string]'
+    function Invoke-WebRequest {
+        param([string] $Uri, [string] $OutFile, [switch] $UseBasicParsing,
+              [int] $MaximumRedirection, [hashtable] $Headers, [string] $UserAgent, [int] $TimeoutSec)
+        $requests.Add($Uri)
+        if (-not $responses.ContainsKey($Uri)) { throw [System.Net.WebException]::new('fixture transport failure') }
+        $response = $responses[$Uri]
+        if ($response.Code -ne 200) {
+            throw [System.Net.WebException]::new('fixture HTTP error', $null,
+                [System.Net.WebExceptionStatus]::ProtocolError, [VibefaceInstallerTestResponse]::new($response.Code))
+        }
+        [System.IO.File]::WriteAllText($OutFile, $response.Body, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    function Assert-InstallerError {
+        param([scriptblock] $Action, [string] $Message)
+        $observed = $null
+        try { & $Action | Out-Null } catch { $observed = $_.Exception.Message }
+        if (-not $observed -or -not $observed.Contains($Message)) {
+            throw "self-test: expected '$Message', observed '$observed'"
+        }
+    }
+    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/product-release-completion.json') -Raw | ConvertFrom-Json
+    $tag = $manifest.tag
+    $archive = "vibeface-$($manifest.version)-$Target.tar.gz"
+    $complete = [pscustomobject]@{
+        tag_name = $tag; draft = $false; prerelease = $true
+        assets = @($manifest.assets) + @([pscustomobject]@{ name = 'release.json'; size = 10000 })
+    }
+    $building = [pscustomobject]@{
+        tag_name = 'v0.0.1-nightly.20261108.99'; draft = $false; prerelease = $true
+        assets = @([pscustomobject]@{ name = 'release.json'; size = 10000 })
+    }
+    $markerUrl = "$Downloads/$tag/release.json"
+    $buildingUrl = "$Downloads/$($building.tag_name)/release.json"
+    $responses[$markerUrl] = @{ Code = 200; Body = ($manifest | ConvertTo-Json -Depth 10 -Compress) }
+    $accepted = Confirm-Completion -Release $complete -Tag $tag -Version $manifest.version -Archive $archive -Target $Target
+    if ($accepted.source_commit -cne '7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a') {
+        throw 'self-test: canonical manifest source mismatch'
+    }
+    $responses[$buildingUrl] = @{ Code = 404; Body = '' }
+    if (Confirm-Completion -Release $building -Tag $building.tag_name -Version '0.0.1-nightly.20261108.99' `
+            -Archive "vibeface-0.0.1-nightly.20261108.99-$Target.tar.gz" -Target $Target) {
+        throw 'self-test: HTTP 404 marker was treated as complete'
+    }
+    $responses["$Api/releases?per_page=100&page=1"] = @{
+        Code = 200; Body = (@($building, $complete) | ConvertTo-Json -Depth 10 -Compress)
+    }
+    $responses["$Api/commits/$tag"] = @{ Code = 200; Body = '{"sha":"7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a"}' }
+    $install = Join-Path $script:Scratch 'install'
+    $bin = Join-Path $script:Scratch 'bin'
+    $requests.Clear()
+    # Stop at the chosen archive's mocked transport boundary, before any installation.
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'download failed'
+    if ($requests[$requests.Count - 1] -cne "$Downloads/$tag/$archive") {
+        throw 'self-test: newest Building did not select the older complete archive'
+    }
+    foreach ($code in @(403, 503)) {
+        $responses[$buildingUrl] = @{ Code = $code; Body = '' }
+        $requests.Clear()
+        Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
+        if ($requests.Contains($markerUrl)) { throw 'self-test: HTTP failure silently selected an older release' }
+    }
+    $responses.Remove($buildingUrl)
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
+    $responses[$buildingUrl] = @{ Code = 200; Body = '{bad-json' }
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'invalid release completion manifest JSON'
+    $responses[$buildingUrl] = @{ Code = 200; Body = ($manifest | ConvertTo-Json -Depth 10 -Compress) }
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'release completion manifest identity mismatch'
+    $responses[$buildingUrl] = @{ Code = 404; Body = '' }
+    $responses["$Api/commits/$tag"] = @{ Code = 200; Body = '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' }
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'release completion manifest source does not match the tag'
+    if (Test-Path -LiteralPath (Join-Path $install 'current')) { throw 'self-test: failed validation installed a release' }
+    New-Item -ItemType Directory -Path (Join-Path $install 'current') -Force | Out-Null
+    $sentinel = Join-Path $install 'current/retained.txt'
+    Set-Content -LiteralPath $sentinel -Value 'retained'
+    $requests.Clear()
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'current already exists'
+    if ($requests.Count -ne 0 -or (Get-Content -LiteralPath $sentinel) -cne 'retained') {
+        throw 'self-test: an existing installation was changed'
     }
     'Installer self-test passed.'
 }
