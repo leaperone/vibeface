@@ -31,7 +31,7 @@ Main、稳定业务 Task、已登记 Work 和 Routine 分别解析到真实执�
 
 活动补充使用完整 `SteerInput`，包含正文和已验证的附件。Codex 使用 `turn/steer`，Claude 使用持续 stdin，pi 使用原生 steer，OpenCode 使用 steer delivery。Provider 接受与原生回合归属分别保存；缺少逐条消费证据时不显示已读。同目标保持顺序，不同目标的投递与旧输入回读分别推进。发送结果未知时只核对原消息编号。
 
-Cursor 的新版 TypeScript SDK 提供文本 `Run.steer`，当前官方独立 SDK Bridge 尚未暴露该方法。本地 Bridge 配置不能完成活动补充，不用第二次普通 Send、停止重开或强制覆盖冒充原生 steer。此能力仍未满足，不能将其他 Provider 的验收推广到 Cursor。
+当前 Cursor ACP 适配器未提供原生 steer，活动补充明确拒绝。不用第二次普通 prompt、停止重开或强制覆盖冒充原生 steer。此能力仍未满足，不能将其他 Provider 的验收推广到 Cursor。
 
 ## 工具和重试
 
