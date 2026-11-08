@@ -169,7 +169,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     Date: class extends Date { static now = now },
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
-    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
+    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto, atob,
     async fetch(path: string, options: RequestInit) {
       if (path.endsWith('/catalog')) { calls.push(`catalog:${path}`); return { ok: false, status: 503 } }
       if (path === '/api/local/info') calls.push('local-info')
@@ -373,8 +373,10 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   } finally { app.close() }
 })
 
-test('fresh localhost discovers its one-time capability and creates the network through recover', async () => {
-  const app = deviceHarness({ local: 'fresh', saved: true })
+test('an owner bootstrap link creates the network through recover without HTTP credential issuance', async () => {
+  const fragment = `#bootstrap=${Buffer.from(JSON.stringify(localInvitation)).toString('base64url')}`
+  const app = deviceHarness({ local: 'fresh', saved: true, fragment })
+  app.localState.setup = { kind: 'owner_required', initialized: false }
   try {
     app.render(); await settle()
     assert.equal(app.render().localSetup?.kind, 'uninitialized')
@@ -397,6 +399,21 @@ test('fresh localhost discovers its one-time capability and creates the network 
     assert.equal(recover[0].params.capability, localCapability)
     assert.deepEqual(plain(recover[0].params.genesis), genesis)
   } finally { app.close() }
+})
+
+test('anonymous localhost status cannot initialize a node or obtain a local launch', async () => {
+  for (const fragment of ['', '#bootstrap=not-json', `#bootstrap=${Buffer.from(JSON.stringify({ ...localInvitation, url: 'https://remote.example' })).toString('base64url')}`]) {
+    const app = deviceHarness({ local: 'fresh', fragment })
+    app.localState.setup = { kind: 'owner_required', initialized: false }
+    try {
+      app.render(); await settle()
+      assert.equal(app.render().localSetup, null)
+      assert.equal(app.render().ready, null)
+      assert.equal(app.calls.includes('local-exchange'), false)
+      assert.equal(app.calls.includes('recover'), false)
+      assert.equal(app.navigations.length, 0)
+    } finally { app.close() }
+  }
 })
 
 test('initialized localhost requires member authorization and cannot create a second network', async () => {

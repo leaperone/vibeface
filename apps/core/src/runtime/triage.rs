@@ -1967,6 +1967,28 @@ impl Runtime {
         )?)
     }
 
+    pub(super) async fn respond_unclaimed_request(
+        &self,
+        request_id: &str,
+        result: Value,
+    ) -> Result<Value> {
+        let _mutations = self.triage.mutations.lock().await;
+        if let Some(done) = lock(&self.triage.answered).get(request_id) {
+            return Ok(done.clone());
+        }
+        ensure!(
+            self.store
+                .lock()
+                .await
+                .triage_events(None)?
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some(request_id)),
+            "request is not available to this triage attempt"
+        );
+        self.answer_request(request_id, Some(Ok(result)), "agent")
+            .await
+    }
+
     /// `/api/triage`, the Agents' side: `requests`, `respond`, `events`, `raise` and `dismiss`.
     pub(crate) async fn triage_command(&self, input: Value) -> Result<Value> {
         let network = self.network_id().await?;
@@ -1975,6 +1997,22 @@ impl Runtime {
             .get("_attempt")
             .map(|value| value.as_str().context("invalid triage attempt context"))
             .transpose()?;
+        if action == "respond" && attempt.is_none() {
+            let request_id = super::field(&input, "request_id")?;
+            let result = input.get("result").cloned().context("result is required")?;
+            if let Some(node) = input["node"].as_str()
+                && node != self.identity.device_id()?
+            {
+                return self
+                    .peer_request(
+                        &network,
+                        node,
+                        json!({"type":"respond","request_id":request_id,"result":result}),
+                    )
+                    .await;
+            }
+            return self.respond_unclaimed_request(request_id, result).await;
+        }
         let _mutations = if matches!(action, "respond" | "raise" | "dismiss") {
             Some(self.triage.mutations.lock().await)
         } else {
@@ -2075,34 +2113,19 @@ impl Runtime {
                 return Ok(done.clone());
             }
             ensure!(current, "triage attempt is no longer active");
-            if let Some(node) = input["node"].as_str()
-                && node != self.identity.device_id()?
-            {
-                ensure!(
-                    attempt.is_none(),
-                    "a triage attempt only answers its local requests"
-                );
-                return self
-                    .peer_request(
-                        &network,
-                        node,
-                        json!({"type":"respond","request_id":request_id,"result":result}),
-                    )
-                    .await;
-            }
-            let human_question = attempt.is_none()
-                && lock(&self.triage.requests)
-                    .get(request_id)
-                    .is_some_and(|request| request.question_id.is_some());
             ensure!(
-                human_question
-                    || self
-                        .store
-                        .lock()
-                        .await
-                        .triage_events(context)?
-                        .iter()
-                        .any(|event| event.request_id.as_deref() == Some(request_id)),
+                input["node"]
+                    .as_str()
+                    .is_none_or(|node| self.identity.device_id().is_ok_and(|local| node == local)),
+                "a triage attempt only answers its local requests"
+            );
+            ensure!(
+                self.store
+                    .lock()
+                    .await
+                    .triage_events(context)?
+                    .iter()
+                    .any(|event| event.request_id.as_deref() == Some(request_id)),
                 "request is not available to this triage attempt"
             );
             return self
@@ -2808,6 +2831,12 @@ impl Runtime {
             crate::client::reach_through_entry(self, &input.device_id).await?;
         } else if input.device_id == self.identity.device_id()? {
             return self.local_decision(token, input).await;
+        } else {
+            let network = self.network_id().await?;
+            self.store
+                .lock()
+                .await
+                .authorize_node(&network, &input.device_id)?;
         }
         self.net()?
             .request(
@@ -4216,8 +4245,8 @@ pub(super) mod tests {
                             (node.clone(), request_id.clone(), start.clone());
                         tokio::spawn(async move {
                             start.wait().await;
-                            let result = Some(Ok(json!({"behavior":"allow"})));
-                            node.answer_request(&request_id, result, "agent").await
+                            node.respond_unclaimed_request(&request_id, json!({"behavior":"allow"}))
+                                .await
                         })
                     })
                     .collect();
@@ -4229,6 +4258,65 @@ pub(super) mod tests {
         }
         .await;
         cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_respond_uses_the_unclaimed_queue_and_preserves_the_first_answer() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let target = ib.device_id()?;
+        let membership = ia.sign_network_fixture(1, vec![ia.device_id()?, target.clone()])?;
+        let admin = ia.fixture_admin();
+        let networked = || crate::net::NetworkConfig {
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let (a, dir_a) = node_at(ia, networked()).await?;
+        let (b, dir_b) = node_at(ib, networked()).await?;
+        let stranger = LocalIdentity::generate();
+        let outsider =
+            crate::net::Net::bind(&stranger.secret_key_hex, &networked(), 0, vec![]).await?;
+        let result = async {
+            for node in [&a, &b] { node.install_membership(membership.clone()).await?; }
+            with_agent(&b);
+            bot(&b, &admin, "c", "前端", &[]).await?;
+            for node in [&a, &b] { node.start_network().await?; }
+            a.net()?.learn(&b.net()?.addr()).await;
+            b.net()?.learn(&a.net()?.addr()).await;
+            outsider.learn(&b.net()?.addr()).await;
+            let network = b.network_id().await?;
+            let respond = |request: &Value| json!({"action":"respond","node":target,
+                "request_id":request["request_id"],"result":{"behavior":"allow"}});
+            let pending = b.ingest_agent_event(asks_permission("remote-pending")).await?;
+            let denied = outsider.request(&target, net::RPC,
+                &json!({"network_id":network,"type":"respond","request_id":pending["request_id"],"result":{"behavior":"allow"}}), Duration::from_secs(5)).await;
+            assert!(denied.is_err(), "a nonmember cannot answer a pending request");
+            let first = a.triage_command(respond(&pending)).await?;
+            assert_eq!(first["answered"], true);
+            let mut repeated = respond(&pending); repeated["result"] = json!({"behavior":"deny"});
+            assert_eq!(a.triage_command(repeated).await?, first, "a retry reads the first response without sending another answer");
+            for state in ["claimed", "dismissed", "unknown", "question"] {
+                let held = b.ingest_agent_event(asks_permission(state)).await?;
+                match state {
+                    "dismissed" => { b.triage_command(json!({"action":"dismiss","event_id":held["event_id"]})).await?; }
+                    "question" => { lock(&b.triage.requests).get_mut(held["request_id"].as_str().unwrap()).unwrap().question_id = Some("standing-user-question".into()); }
+                    _ => {
+                        let TriageAdmission::Claimed(attempt) = b.store.lock().await.admit_triage(&network, &b.boot, BATCH, 100, now_ms())? else { bail!("claim fixture request"); };
+                        if state == "unknown" { b.store.lock().await.finish_triage(attempt, &Err(anyhow::anyhow!("response outcome unknown")))?; }
+                    }
+                }
+                assert!(a.triage_command(respond(&held)).await.is_err(), "peer cannot answer {state}");
+                assert!(b.triage_command(json!({"action":"respond","request_id":held["request_id"],"result":{"behavior":"allow"}})).await.is_err(), "local caller cannot answer {state}");
+                assert!(!lock(&b.triage.answered).contains_key(held["request_id"].as_str().unwrap()));
+            }
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        outsider.close().await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        cleanup(a, dir_a).await?;
+        cleanup(b, dir_b).await?;
         result
     }
 
@@ -7677,6 +7765,57 @@ pub(super) mod tests {
             let device = node.identity.device_id()?;
             let question = raised["question_id"].as_str().unwrap().to_owned();
             let decision = json!({"device_id":device,"question_id":question,"choice":0});
+            let stranger = LocalIdentity::generate().device_id()?;
+            let refused = tokio::time::timeout(
+                Duration::from_secs(1),
+                node.decision_http(
+                    "not-the-target-token",
+                    json!({"device_id":stranger,"question_id":question,"choice":0}),
+                ),
+            )
+            .await
+            .context("a nonmember is refused before any dial")?
+            .unwrap_err();
+            let network = node.network_id().await?;
+            let expected = node
+                .store
+                .lock()
+                .await
+                .authorize_node(&network, &stranger)
+                .unwrap_err();
+            assert_eq!(refused.to_string(), expected.to_string());
+            let removed = LocalIdentity::generate();
+            let removed_id = removed.device_id()?;
+            let mut state = node.membership_state().await?;
+            state.append(crate::identity::GovernanceEvent::grant(
+                &admin,
+                &state.project()?,
+                Member::node(&removed, "removed")?,
+            )?)?;
+            state.append(crate::identity::GovernanceEvent::revoke(
+                &admin,
+                &state.project()?,
+                crate::identity::Revocation::new(&removed_id, None)?,
+            )?)?;
+            node.install_membership(state).await?;
+            let refused = node
+                .decision_http(
+                    "not-the-target-token",
+                    json!({"device_id":removed_id,"question_id":question,"choice":0}),
+                )
+                .await
+                .unwrap_err();
+            let expected = node
+                .store
+                .lock()
+                .await
+                .authorize_node(&network, &removed_id)
+                .unwrap_err();
+            assert_eq!(
+                refused.to_string(),
+                expected.to_string(),
+                "a revoked target is rejected before dialing"
+            );
             let refused = node
                 .decision_http("vfd_wrong", decision.clone())
                 .await

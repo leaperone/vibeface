@@ -569,7 +569,7 @@ impl Runtime {
             }
             "respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
-                self.answer_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                self.respond_unclaimed_request(field(input, "request_id")?, result)
                     .await
             }
             "hand_over_session" => {

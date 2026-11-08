@@ -800,6 +800,18 @@ pub async fn send_to_node(mut record: Value) {
     let Ok(url) = std::env::var(crate::runtime::TRIAGE_URL_ENV) else {
         return;
     };
+    let credential = std::env::var_os("VIBEFACE_DATA_DIR")
+        .map(PathBuf::from)
+        .and_then(|dir| vibeface_control::LocalHttpCredential::read(&dir).ok());
+    let Some(credential) = credential else {
+        return;
+    };
+    let Ok(url) = reqwest::Url::parse(&url) else {
+        return;
+    };
+    if credential.require_origin(&url).is_err() {
+        return;
+    }
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .no_proxy()
@@ -810,7 +822,8 @@ pub async fn send_to_node(mut record: Value) {
     };
     let body = serde_json::json!({"source":"agent","records":[record]});
     let _ = client
-        .post(format!("{}/api/log", url.trim_end_matches('/')))
+        .post(format!("{}/api/log", credential.origin))
+        .bearer_auth(credential.capability)
         .json(&body)
         .send()
         .await;

@@ -22,13 +22,8 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::mpsc;
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_secure::{
     Channel,
@@ -501,6 +496,7 @@ async fn serve_session(
                                 Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
                             };
                             send_value(&mut socket, &mut channel, &response).await?;
+                            received = Instant::now();
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
                     Message::Ping(_) | Message::Pong(_) => {},
@@ -2064,6 +2060,128 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    #[tokio::test]
+    async fn slow_dispatch_resets_idle_but_idle_and_partial_messages_still_expire() -> Result<()> {
+        use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::Role};
+
+        async fn connect(
+            node: Arc<Runtime>,
+            admin: &LocalIdentity,
+        ) -> Result<(Client, tokio::task::JoinHandle<Result<()>>)> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let (client, accepted) = tokio::join!(
+                tokio::net::TcpStream::connect(listener.local_addr()?),
+                listener.accept()
+            );
+            let client = WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(client?),
+                Role::Client,
+                None,
+            )
+            .await;
+            let server = WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(accepted?.0),
+                Role::Server,
+                None,
+            )
+            .await;
+            let target = node.identity.device_id()?;
+            let serving = tokio::spawn(serve_session(
+                node,
+                ClientSocket::Client(Box::new(server)),
+                None,
+            ));
+            Ok((
+                Client::from_socket(ClientSocket::Client(Box::new(client)), admin, &target).await?,
+                serving,
+            ))
+        }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("client-idle-{}", uuid::Uuid::new_v4()));
+        crate::control::prepare_start(&dir)?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let admin = LocalIdentity::generate();
+        node.install_membership(NetworkState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?)
+        .await?;
+        let result = async {
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let save = node.config_save.lock().await;
+            send_value(
+                &mut client.socket,
+                &mut client.channel,
+                &Request {
+                    id: "slow".into(),
+                    method: "configure_node".into(),
+                    params: json!({"roots":[],"manager":null}),
+                },
+            )
+            .await?;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::pause();
+            tokio::time::advance(IDLE_TIMEOUT + HEARTBEAT).await;
+            drop(save);
+            let reply: Value = serde_json::from_slice(
+                &receive_value(&mut client.socket, &mut client.channel).await?,
+            )?;
+            assert_eq!(reply["id"], "slow");
+            assert!(reply["error"].is_null(), "{reply}");
+            tokio::time::advance(HEARTBEAT).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !serving.is_finished(),
+                "a completed slow dispatch starts a fresh idle interval"
+            );
+            client.call("authenticate", json!({})).await?;
+            tokio::time::advance(IDLE_TIMEOUT + HEARTBEAT).await;
+            assert!(
+                serving
+                    .await?
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client channel idle")
+            );
+            tokio::time::resume();
+
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let records = client.channel.seal_message(&vec![b'x'; 70_000])?;
+            assert!(records.len() > 1);
+            send_frame(&mut client.socket, records[0].clone()).await?;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::pause();
+            for _ in 0..4 {
+                tokio::time::advance(HEARTBEAT).await;
+                client.socket.send(Message::Ping(Vec::new().into())).await?;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::advance(HEARTBEAT * 2).await;
+            let error = serving.await?.unwrap_err().to_string();
+            assert!(error.contains("fragmented message timed out"), "{error}");
+            tokio::time::resume();
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 
     #[test]
     fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {

@@ -12,10 +12,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    io::Read,
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::net::TcpListener;
 
@@ -25,6 +25,9 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The Cursor SDK posts tool calls to this path; `vibeface tool` posts the same shape.
 pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CLIENT_SOCKETS: usize = 256;
+const MAX_DECISIONS: usize = 16;
+const DECISIONS_PER_MINUTE: u32 = 12;
+const MAX_DECISION_SOURCES: usize = 256;
 const HOOKS: &str = "/api/hooks";
 /// A hook whose event holds a request waits here for the answer.
 const HOOKS_WAIT: &str = "/api/hooks/wait";
@@ -42,7 +45,9 @@ struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
     clients: Arc<tokio::sync::Semaphore>,
+    decisions: Arc<DecisionLimit>,
     assets: Option<Arc<StaticAssets>>,
+    local: bool,
 }
 
 impl App {
@@ -51,8 +56,51 @@ impl App {
             node,
             sites,
             clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+            decisions: Arc::new(DecisionLimit::default()),
             assets,
+            local: false,
         }
+    }
+}
+
+struct DecisionLimit {
+    active: Arc<tokio::sync::Semaphore>,
+    sources: Mutex<HashMap<IpAddr, (i64, u32)>>,
+}
+
+impl Default for DecisionLimit {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(tokio::sync::Semaphore::new(MAX_DECISIONS)),
+            sources: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl DecisionLimit {
+    fn enter(&self, source: IpAddr, now_ms: i64) -> ApiResult<tokio::sync::OwnedSemaphorePermit> {
+        let denied = || {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many decision requests".into(),
+            )
+        };
+        let permit = self
+            .active
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| denied())?;
+        let mut sources = self.sources.lock().map_err(|_| denied())?;
+        sources.retain(|_, (start, _)| now_ms.saturating_sub(*start) < 60_000);
+        if !sources.contains_key(&source) && sources.len() >= MAX_DECISION_SOURCES {
+            return Err(denied());
+        }
+        let (_, used) = sources.entry(source).or_insert((now_ms, 0));
+        if *used >= DECISIONS_PER_MINUTE {
+            return Err(denied());
+        }
+        *used += 1;
+        Ok(permit)
     }
 }
 
@@ -166,10 +214,8 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         )
     })?;
     let local_url = format!("http://{local_listen}");
-    if node.config.web_enabled {
-        node.local_access
-            .publish_listener(local_url.clone(), node.identity.device_id()?)?;
-    }
+    node.local_access
+        .publish_listener(local_url.clone(), node.identity.device_id()?)?;
     let local = browser_router_with_assets(
         node.clone(),
         vec![Site::parse(&local_url)?],
@@ -268,7 +314,8 @@ fn browser_router_with_assets(
     local: bool,
     assets: Option<Arc<StaticAssets>>,
 ) -> Router {
-    let app = App::new(node, sites, assets);
+    let mut app = App::new(node, sites, assets);
+    app.local = local;
     let mut routes = Router::new();
     if app.node.serves_bootstrap_http() {
         // Bootstrap bodies are small by contract; the limit is enforced per request below too.
@@ -331,8 +378,17 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         ip,
     )
     .await
-    {
-        Ok(()) => {
+    .and_then(|()| {
+        // Admission comes before maintenance or any discovery and dial work.
+        if request.uri().path() == "/api/decision" && *request.method() == Method::POST {
+            app.decisions
+                .enter(client_ip(&request), crate::runtime::now_ms())
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }) {
+        Ok(_decision) => {
             let work = if matches!(
                 *request.method(),
                 Method::GET | Method::HEAD | Method::OPTIONS
@@ -420,6 +476,10 @@ async fn check_boundary(
     }
     if path == HOOKS || path == HOOKS_WAIT || path == TRIAGE || path == LOG {
         check_hook(headers, ip)?;
+        if app.local && !bearer(headers).is_some_and(|token| app.node.local_access.is_owner(token))
+        {
+            return Err(ApiError::auth());
+        }
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if unsafe_method {
@@ -733,6 +793,9 @@ struct LocalSetupRequest {}
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LocalSetup {
+    OwnerRequired {
+        initialized: bool,
+    },
     Uninitialized {
         invitation: BootstrapInvitation,
     },
@@ -778,20 +841,27 @@ async fn local_setup(
     }
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
-    if app.node.has_membership().await.map_err(ApiError::bad)? {
+    let initialized = app.node.has_membership().await.map_err(ApiError::bad)?;
+    let owner =
+        app.local && bearer(&headers).is_some_and(|token| app.node.local_access.is_owner(token));
+    if initialized {
         let state = app.node.membership_state().await.map_err(ApiError::bad)?;
         let removed = state
             .project()
             .map_err(ApiError::bad)?
             .revocation(&device_id)
             .is_some();
-        let local_launch = if app.node.local_access.enabled() {
+        let local_launch = if owner && app.node.local_access.enabled() {
             match app.node.local_access.origin() {
                 Ok(url) => {
                     let token = app
                         .node
                         .local_access
-                        .issue_from_local_setup(&device_id, &state.genesis.network_id)
+                        .issue(
+                            bearer(&headers).ok_or_else(ApiError::auth)?,
+                            &device_id,
+                            &state.genesis.network_id,
+                        )
                         .map_err(ApiError::bad)?;
                     Some(LocalLaunch {
                         url,
@@ -813,15 +883,15 @@ async fn local_setup(
             local_launch,
         }));
     }
+    if !owner {
+        return Ok(Json(LocalSetup::OwnerRequired { initialized }));
+    }
     let capability = async {
-        let mut bytes = Vec::new();
-        std::fs::File::open(app.node.data_dir.join("bootstrap.json"))?
-            .take(4097)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= 4096,
-            "local bootstrap capability exceeds size limit"
-        );
+        let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
+            &app.node.data_dir.join("bootstrap.json"),
+            4096,
+            "the bootstrap capability",
+        )?;
         let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
         app.node
             .store
@@ -1032,6 +1102,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decision_admission_bounds_concurrency_sources_and_rate_without_leaking_slots() -> Result<()>
+    {
+        let limit = DecisionLimit::default();
+        let mut permits = Vec::new();
+        for source in 0..MAX_DECISIONS {
+            permits.push(
+                limit
+                    .enter(IpAddr::V4(Ipv4Addr::new(192, 0, 2, source as u8)), 0)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            limit.enter("198.51.100.1".parse()?, 0).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(permits);
+        let source = "203.0.113.1".parse()?;
+        for _ in 0..DECISIONS_PER_MINUTE {
+            drop(limit.enter(source, 0).unwrap());
+        }
+        assert_eq!(
+            limit.enter(source, 0).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(limit.active.available_permits(), MAX_DECISIONS);
+        drop(limit.enter(source, 60_000).unwrap());
+        for source in 0..MAX_DECISION_SOURCES - 1 {
+            drop(
+                limit
+                    .enter(IpAddr::V4(Ipv4Addr::new(198, 51, source as u8, 1)), 60_000)
+                    .unwrap(),
+            );
+        }
+        assert!(limit.sources.lock().unwrap().len() <= MAX_DECISION_SOURCES);
+        assert_eq!(
+            limit.enter("203.0.113.2".parse()?, 60_000).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(limit.enter("203.0.113.2".parse()?, 120_000).unwrap());
+        Ok(())
+    }
+
+    #[test]
     fn static_cache_policy_keeps_shell_crypto_and_assets_distinct() {
         for path in [
             "/",
@@ -1214,7 +1327,10 @@ mod tests {
         )?;
         drop(store);
         let node = Arc::new(Runtime::open(&dir).await?);
-        let app = router(node.clone());
+        node.local_access
+            .publish_listener(origin.clone(), node.identity.device_id()?)?;
+        let launcher = crate::local_access::Launcher::read(&dir)?;
+        let app = browser_router(node.clone(), vec![Site::parse(&origin)?], true);
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1223,10 +1339,29 @@ mod tests {
             .await
             .unwrap();
         });
+        let public_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let public_origin = format!("http://{}", public_listener.local_addr()?);
+        let public_app = browser_router(node.clone(), vec![Site::parse(&public_origin)?], false);
+        let public_server = tokio::spawn(async move {
+            axum::serve(
+                public_listener,
+                public_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
         let client = reqwest::Client::builder().no_proxy().build()?;
         let endpoint = format!("{origin}/api/local/setup");
         let result = async {
-            let request = || client.post(&endpoint).header(header::ORIGIN, &origin).json(&json!({}));
+            let request = || client.post(&endpoint).header(header::ORIGIN, &origin).bearer_auth(&launcher.capability).json(&json!({}));
+            let anonymous: Value = client.post(&endpoint).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
+            assert_eq!(anonymous, json!({"kind":"owner_required","initialized":false}));
+            for owner in [None, Some(&launcher.capability)] {
+                let mut proxy = client.post(format!("{public_origin}/api/local/setup")).header(header::ORIGIN, &public_origin).json(&json!({}));
+                if let Some(owner) = owner { proxy = proxy.bearer_auth(owner); }
+                assert_eq!(proxy.send().await?.json::<Value>().await?, anonymous,
+                    "a public listener never issues owner credentials, including hidden-source loopback proxies");
+            }
             let response = request().send().await?;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
@@ -1254,12 +1389,13 @@ mod tests {
                 Member::node(&node.identity, "node")?,
             )?)?;
             node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
+            node.local_access.set_enabled(false)?;
             let initialized: Value = request().send().await?.json().await?;
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
-            let local_origin = "http://127.0.0.1:4791";
-            node.local_access.publish_listener(local_origin.into(), node.identity.device_id()?)?;
+            let local_origin = &origin;
+            node.local_access.set_enabled(true)?;
             let launched: Value = request().send().await?.json().await?;
             assert_eq!(launched["entry"], initialized["entry"]);
             assert_eq!(launched["local_launch"]["url"], local_origin);
@@ -1284,6 +1420,8 @@ mod tests {
         }.await;
         server.abort();
         let _ = server.await;
+        public_server.abort();
+        let _ = public_server.await;
         node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1316,6 +1454,10 @@ mod tests {
             for local in [true, false] {
                 let listener = TcpListener::bind("127.0.0.1:0").await?;
                 let origin = format!("http://{}", listener.local_addr()?);
+                if local {
+                    node.local_access
+                        .publish_listener(origin.clone(), node.identity.device_id()?)?;
+                }
                 let app = browser_router(node.clone(), vec![Site::parse(&origin)?], local);
                 origins.push(origin);
                 servers.push(tokio::spawn(async move {
@@ -1328,6 +1470,14 @@ mod tests {
                 }));
             }
             let client = reqwest::Client::builder().no_proxy().build()?;
+            let launcher = crate::local_access::Launcher::read(&dir)?;
+            node.local_access.set_enabled(false)?;
+            assert!(node.local_access.is_owner(&launcher.capability));
+            assert!(
+                node.local_access
+                    .issue(&launcher.capability, &launcher.node_id, "network")
+                    .is_err()
+            );
             let result = async {
                 if !web_enabled {
                     for origin in &origins {
@@ -1362,6 +1512,20 @@ mod tests {
                     };
                     assert_eq!(
                         status(client.post(&url).json(&body)).await?,
+                        StatusCode::UNAUTHORIZED
+                    );
+                    assert_eq!(
+                        status(client.post(&url).bearer_auth("wrong-owner").json(&body)).await?,
+                        StatusCode::UNAUTHORIZED
+                    );
+                    assert_eq!(
+                        status(
+                            client
+                                .post(&url)
+                                .bearer_auth(&launcher.capability)
+                                .json(&body)
+                        )
+                        .await?,
                         StatusCode::BAD_REQUEST
                     );
                     assert_eq!(
@@ -1388,6 +1552,7 @@ mod tests {
                         status(
                             client
                                 .post(&url)
+                                .bearer_auth(&launcher.capability)
                                 .header(header::CONTENT_TYPE, "text/plain")
                                 .body(body.to_string())
                         )

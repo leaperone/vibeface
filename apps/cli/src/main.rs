@@ -1619,17 +1619,13 @@ async fn hook(options: Hook) -> Result<()> {
         body["_request"] = json!({"provider":event.agent,"session_id":event.session_id,
             "turn_id":event.turn_id,"kind":kind,"questions":questions});
     }
-    let sent = async {
-        let url = local_node_url(&options.local).await?;
-        post_local(&url, "/api/hooks", &body, Duration::from_secs(5)).await
-    }
-    .await;
+    let sent = post_local(&options.local, "/api/hooks", &body, Duration::from_secs(5)).await;
     match sent {
         Ok(result) if options.test => println!("{result}"),
         Ok(result) => {
             if let Some(request_id) = result["request_id"].as_str() {
                 let answer = post_local(
-                    &local_node_url(&options.local).await?,
+                    &options.local,
                     "/api/hooks/wait",
                     &json!({"request_id":request_id}),
                     Duration::from_secs(triage::HOOK_ANSWER_WITHIN_SECS + 10),
@@ -1665,7 +1661,7 @@ async fn hook(options: Hook) -> Result<()> {
 
 async fn hooks(options: Hooks) -> Result<()> {
     if matches!(options.action, HooksAction::Test) {
-        let result = post_local(&local_node_url(&options.local).await?, "/api/hooks", &json!({"source":"test","session_id":"test","turn_id":uuid::Uuid::new_v4().to_string(),"test":true}), Duration::from_secs(5)).await?;
+        let result = post_local(&options.local, "/api/hooks", &json!({"source":"test","session_id":"test","turn_id":uuid::Uuid::new_v4().to_string(),"test":true}), Duration::from_secs(5)).await?;
         ensure!(
             result["status"] == "accepted",
             "unexpected answer: {result}"
@@ -1869,13 +1865,7 @@ async fn log_record(options: LogRecord) -> Result<()> {
         "--source is agent or cli"
     );
     let body = json!({"source":source,"records":[{"level":options.level,"message":options.message,"event":options.event,"conversation_id":options.conversation,"work_id":options.work,"thread_id":options.thread}]});
-    post_local(
-        &local_node_url(&options.local).await?,
-        "/api/log",
-        &body,
-        Duration::from_secs(10),
-    )
-    .await?;
+    post_local(&options.local, "/api/log", &body, Duration::from_secs(10)).await?;
     Ok(())
 }
 
@@ -2079,13 +2069,7 @@ async fn triage_post(local: &LocalNode, mut body: Value) -> Result<()> {
     if let Ok(attempt) = std::env::var("VIBEFACE_TRIAGE_ATTEMPT") {
         body["_attempt"] = json!(attempt);
     }
-    let result = post_local(
-        &local_node_url(local).await?,
-        "/api/triage",
-        &body,
-        Duration::from_secs(30),
-    )
-    .await?;
+    let result = post_local(local, "/api/triage", &body, Duration::from_secs(30)).await?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -2094,38 +2078,10 @@ async fn post_triage(local: &LocalNode, body: Value) -> Result<()> {
     triage_post(local, body).await
 }
 
-async fn local_node_url(local: &LocalNode) -> Result<Url> {
-    let value = match local
-        .node_url
-        .clone()
-        .or_else(|| std::env::var("VIBEFACE_TRIAGE_URL").ok())
-    {
-        Some(value) => value,
-        None => {
-            let info = control(
-                &local.data_dir,
-                ControlRequest::Inspect {
-                    data_dir: local.data_dir.clone(),
-                },
-            )
-            .await?;
-            format!(
-                "http://{}",
-                info["local_listen"]
-                    .as_str()
-                    .context("core did not return a local listener")?
-            )
-        }
-    };
-    let url = origin(&value)?;
-    ensure!(
-        is_loopback(&url),
-        "the local Node URL must be a loopback address"
-    );
-    Ok(url)
-}
-
-async fn post_local(url: &Url, path: &str, body: &Value, total: Duration) -> Result<Value> {
+async fn post_local(local: &LocalNode, path: &str, body: &Value, total: Duration) -> Result<Value> {
+    let credential = vibeface_control::LocalHttpCredential::read(&local.data_dir)?;
+    let url = origin(local.node_url.as_deref().unwrap_or(&credential.origin))?;
+    credential.require_origin(&url)?;
     let response = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(total)
@@ -2133,6 +2089,7 @@ async fn post_local(url: &Url, path: &str, body: &Value, total: Duration) -> Res
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .post(url.join(path.trim_start_matches('/'))?)
+        .bearer_auth(credential.capability)
         .json(body)
         .send()
         .await

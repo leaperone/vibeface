@@ -47,3 +47,6 @@ vibeface-secure = { path = "../../crates/secure" }
 vibeface-secure-ffi = { path = "../../crates/secure-ffi" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
