@@ -87,8 +87,7 @@ struct ObjectResponse {
 pub async fn check(channel: Channel) -> Result<Option<Release>> {
     let client = client()?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let mut selected: Option<GithubRelease> = None;
-    let mut selected_version = current;
+    let mut candidates: Vec<(Version, GithubRelease)> = Vec::new();
     for page in 1..=MAX_PAGES {
         let releases: Vec<GithubRelease> =
             get_json(&client, &format!("{API}/releases?per_page=100&page={page}")).await?;
@@ -99,20 +98,21 @@ pub async fn check(channel: Channel) -> Result<Option<Release>> {
             };
             if release.draft
                 || release.prerelease != (channel == Channel::Nightly)
-                || version <= selected_version
+                || version <= current
             {
                 continue;
             }
-            selected_version = version;
-            selected = Some(release);
+            candidates.push((version, release));
         }
         if complete {
-            return match selected {
-                Some(release) => resolve_release(&client, release, selected_version)
-                    .await
-                    .map(Some),
-                None => Ok(None),
-            };
+            candidates.sort_by(|a, b| b.0.cmp(&a.0));
+            for (version, release) in candidates {
+                match resolve_release(&client, release, version).await? {
+                    Some(release) => return Ok(Some(release)),
+                    None => continue,
+                }
+            }
+            return Ok(None);
         }
     }
     bail!("release listing reached {MAX_PAGES} pages; cannot confirm a complete listing")
@@ -183,11 +183,60 @@ async fn resolve_release(
     client: &Client,
     release: GithubRelease,
     version: Version,
-) -> Result<Release> {
+) -> Result<Option<Release>> {
     let target = host_target()?;
     let name = format!("vibeface-{version}-{target}.tar.gz");
-    let asset = unique_asset(&release.assets, &name)?;
-    let checksum = unique_asset(&release.assets, &format!("{name}.sha256"))?;
+    let Some(marker_asset) = optional_unique_asset(&release.assets, "release.json")? else {
+        return Ok(None);
+    };
+    ensure!(
+        marker_asset.size <= 1024 * 1024,
+        "release completion manifest exceeds limit"
+    );
+    let manifest_url = asset_url(&release.tag_name, "release.json");
+    ensure!(
+        marker_asset.browser_download_url == manifest_url,
+        "unexpected completion manifest URL"
+    );
+    let Some(body) = get_optional_bytes(client, &manifest_url, 1024 * 1024).await? else {
+        return Ok(None);
+    };
+    let manifest = parse_completion_manifest(&body, &release.tag_name, &version)?;
+    let asset = optional_unique_asset(&release.assets, &name)?
+        .context("complete release is missing target archive")?;
+    let checksum = optional_unique_asset(&release.assets, &format!("{name}.sha256"))?
+        .context("complete release is missing target checksum")?;
+    let source_commit = tag_commit(client, &release.tag_name).await?;
+    ensure!(
+        source_commit == manifest.source_commit,
+        "completion manifest source does not match the release tag"
+    );
+    let archive_record = manifest
+        .assets
+        .iter()
+        .find(|item| item.name == name)
+        .context("completion manifest omits target archive")?;
+    let checksum_record = manifest
+        .assets
+        .iter()
+        .find(|item| item.name == format!("{name}.sha256"))
+        .context("completion manifest omits target checksum")?;
+    ensure!(
+        manifest
+            .assets
+            .iter()
+            .filter(|item| item.name == name || item.name == format!("{name}.sha256"))
+            .count()
+            == 2,
+        "completion manifest contains duplicate target assets"
+    );
+    ensure!(
+        archive_record.size == asset.size
+            && checksum_record.size == checksum.size
+            && valid_digest(&archive_record.sha256)
+            && valid_digest(&checksum_record.sha256),
+        "completion manifest target asset metadata mismatch"
+    );
     ensure!(
         (1..=MAX_ARCHIVE).contains(&asset.size),
         "release archive size exceeds limit"
@@ -204,8 +253,16 @@ async fn resolve_release(
         checksum.browser_download_url == asset_url(&release.tag_name, &format!("{name}.sha256")),
         "unexpected release checksum URL"
     );
-    let source_commit = tag_commit(client, &release.tag_name).await?;
-    Ok(Release {
+    let checksum_body = get_bytes(client, &checksum.browser_download_url, 4096).await?;
+    ensure!(
+        hex::encode(Sha256::digest(&checksum_body)) == checksum_record.sha256,
+        "completion manifest checksum asset digest mismatch"
+    );
+    ensure!(
+        checksum_digest(&checksum_body, &name)? == hex::decode(&archive_record.sha256)?,
+        "completion manifest archive digest differs from checksum"
+    );
+    Ok(Some(Release {
         version,
         tag: release.tag_name,
         target: target.to_owned(),
@@ -213,19 +270,70 @@ async fn resolve_release(
         archive_url: asset.browser_download_url.clone(),
         checksum_url: checksum.browser_download_url.clone(),
         archive_size: asset.size,
-    })
+    }))
 }
 
-fn unique_asset<'a>(assets: &'a [Asset], name: &str) -> Result<&'a Asset> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionManifest {
+    app: String,
+    version: String,
+    tag: String,
+    source_commit: String,
+    channel: String,
+    schema: u32,
+    assets: Vec<CompletionAsset>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionAsset {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn parse_completion_manifest(
+    body: &[u8],
+    tag: &str,
+    version: &Version,
+) -> Result<CompletionManifest> {
+    let manifest: CompletionManifest =
+        serde_json::from_slice(body).context("decode release completion manifest")?;
+    let expected_channel = if version.pre.is_empty() {
+        "stable"
+    } else {
+        "nightly"
+    };
+    ensure!(
+        manifest.app == "product"
+            && manifest.schema == 1
+            && manifest.version == version.to_string()
+            && manifest.tag == tag
+            && manifest.channel == expected_channel
+            && valid_commit(&manifest.source_commit),
+        "release completion manifest identity mismatch"
+    );
+    Ok(manifest)
+}
+
+fn optional_unique_asset<'a>(assets: &'a [Asset], name: &str) -> Result<Option<&'a Asset>> {
     let mut matches = assets.iter().filter(|asset| asset.name == name);
-    let asset = matches
-        .next()
-        .with_context(|| format!("release is missing {name}"))?;
+    let Some(asset) = matches.next() else {
+        return Ok(None);
+    };
     ensure!(
         matches.next().is_none(),
         "release contains duplicate asset {name}"
     );
-    Ok(asset)
+    Ok(Some(asset))
 }
 
 fn asset_url(tag: &str, name: &str) -> String {
@@ -338,6 +446,36 @@ async fn get_bytes(client: &Client, url: &str, limit: u64) -> Result<Vec<u8>> {
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+async fn get_optional_bytes(client: &Client, url: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let url = Url::parse(url)?;
+    ensure!(trusted_url(&url), "update URL is not approved");
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let response = request(client, url, token.as_deref())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("fetch release completion manifest")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let mut response = response
+        .error_for_status()
+        .context("fetch release completion manifest")?;
+    ensure!(
+        response.content_length().is_none_or(|size| size <= limit),
+        "release response exceeds limit"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= limit as usize,
+            "release response exceeds limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 /// Download and verify the complete package, then atomically publish its directory.
@@ -958,6 +1096,46 @@ mod tests {
         );
         assert!(
             Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-nightly.20260102.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn completion_manifest_requires_exact_identity_and_unique_fields() {
+        let source = "a".repeat(40);
+        let good = format!(
+            r#"{{"app":"product","version":"1.2.3","tag":"v1.2.3","source_commit":"{source}","channel":"stable","schema":1,"assets":[]}}"#
+        );
+        assert!(
+            parse_completion_manifest(good.as_bytes(), "v1.2.3", &Version::new(1, 2, 3)).is_ok()
+        );
+        assert!(
+            parse_completion_manifest(good.as_bytes(), "v1.2.4", &Version::new(1, 2, 3)).is_err()
+        );
+        assert!(
+            parse_completion_manifest(
+                good.replace("product", "www").as_bytes(),
+                "v1.2.3",
+                &Version::new(1, 2, 3)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_completion_manifest(
+                good.replace("\"schema\":1", "\"schema\":1,\"schema\":1")
+                    .as_bytes(),
+                "v1.2.3",
+                &Version::new(1, 2, 3)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_completion_manifest(
+                good.replace("\"schema\":1", "\"schema\":1,\"extra\":true")
+                    .as_bytes(),
+                "v1.2.3",
+                &Version::new(1, 2, 3)
+            )
+            .is_err()
         );
     }
 
