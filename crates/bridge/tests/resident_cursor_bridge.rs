@@ -397,6 +397,22 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
         .filter_map(|r| r["text"].as_str())
         .collect::<String>();
     assert!(!joined.contains("synthetic-sensitive-token"));
+    {
+        let updates = updates.lock().unwrap();
+        let snapshot = updates.last().context("final reply snapshot")?;
+        assert_eq!(snapshot["type"], "text_snapshot");
+        assert_eq!(snapshot["text"], result.output);
+        assert!(
+            updates
+                .iter()
+                .filter(|update| matches!(
+                    update["type"].as_str(),
+                    Some("text_delta" | "text_snapshot")
+                ))
+                .all(|update| update["item_id"] == snapshot["item_id"]),
+            "the final snapshot replaces the streamed item instead of rendering a second reply"
+        );
+    }
     for entry in std::fs::read_dir(turn.local_store_root.join("prompts"))? {
         assert!(!std::fs::read_to_string(entry?.path())?.contains("synthetic-sensitive-token"));
     }
@@ -587,9 +603,9 @@ async fn orphan_recovery_checks_the_recorded_process_before_ending_its_tree() ->
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified()).await?;
     let file = root.join("agent.pid");
-    let recorded = std::fs::read(&file)?;
     #[cfg(unix)]
     {
+        let recorded = std::fs::read(&file)?;
         let mut wrong: Value = serde_json::from_slice(&recorded)?;
         wrong[0]["identity"]["value"] = serde_json::json!("another-process-start");
         vibeface_bridge::platform::privatefs::write_atomic(&file, &serde_json::to_vec(&wrong)?)?;

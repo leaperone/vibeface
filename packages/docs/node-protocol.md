@@ -102,7 +102,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-agent.pid` | 受管 Cursor Agent CLI 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
 | `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务 owner 的私有目录；`config/`、`data/` 是官方 CLI 根，`sessions/` 记录归属，`prompts/` 保存发送前及终态 journal，目录 0700，不进入共享 DAG |
-| `providers/codex/local-login.json`、`providers/claude/local-login.json` | 首次导入的 CLI 凭据文件摘要标记，不含认证值；用户独立修改后不再借用本机登录 |
+| `providers/codex/local-login.json` | 首次导入的私有 auth.json 摘要标记，不含认证值；用户独立修改该文件后不再借用本机登录 |
+| `providers/claude/local-login.json` | 当前 Node access 快照的摘要标记，不含认证值；每次启动前先检查私有登录，只有确认未登录时才重新建立借用标记 |
 | `providers/codex/local-login-access.json`、`providers/claude/local-login-access.json` | Node 专属访问令牌快照，0600，不含源刷新令牌；后续更新不写入 CLI 的 auth.json 或 .credentials.json |
 | `providers/pi/sessions/` | pi 原生会话文件，Node 的 `pi/` 仍保存恢复指针 |
 | `providers/opencode/` | OpenCode 私有 XDG 数据、配置、状态、缓存及数据库，不复制用户认证 |

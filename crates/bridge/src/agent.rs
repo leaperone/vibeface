@@ -946,7 +946,10 @@ impl CursorAgent {
             if let PromptStatus::Failed { detail } = &receipt.status {
                 bail!("{detail}");
             }
-            progress(json!({"type":"text_snapshot","item_id":id,"text":receipt.output})).await?;
+            progress(
+                json!({"type":"text_snapshot","item_id":"cursor-answer","text":receipt.output}),
+            )
+            .await?;
             Ok(AgentResult {
                 session_id: Some(session_id),
                 output: receipt.output,
