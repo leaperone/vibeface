@@ -776,7 +776,13 @@ pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) ->
         inspected.device_id == journal.device_id,
         "update journal belongs to another node"
     );
-    let service = Service::load(data).await?;
+    let descriptor = crate::desktop_node::managed_service_for_data(data)?
+        .context("stopped recovery requires this Desktop profile's managed Node receipt")?;
+    ensure!(
+        inspected.device_id == descriptor.device_id,
+        "Desktop Node identity changed since service installation"
+    );
+    let service = Service::desktop(descriptor);
     recover_with_service(&policy, data, &service, RecoveryMode::KeepStopped).await
 }
 
@@ -1249,6 +1255,16 @@ trait ServiceControl {
 }
 
 impl Service {
+    fn desktop(desktop: crate::desktop_node::ManagedService) -> Self {
+        Self {
+            desktop: Some(desktop),
+            #[cfg(target_os = "macos")]
+            domain: String::new(),
+            #[cfg(target_os = "macos")]
+            plist: PathBuf::new(),
+        }
+    }
+
     async fn load(data: &Path) -> Result<Self> {
         if let Some(desktop) = crate::desktop_node::managed_service_for_data(data)? {
             let binary = core_binary()?;
@@ -1260,16 +1276,7 @@ impl Service {
                 crate::desktop_node::managed_service_registered(&desktop).await?,
                 "Desktop Node service registration is missing"
             );
-            #[cfg(target_os = "macos")]
-            return Ok(Self {
-                desktop: Some(desktop),
-                domain: String::new(),
-                plist: PathBuf::new(),
-            });
-            #[cfg(not(target_os = "macos"))]
-            return Ok(Self {
-                desktop: Some(desktop),
-            });
+            return Ok(Self::desktop(desktop));
         }
         #[cfg(target_os = "macos")]
         {
