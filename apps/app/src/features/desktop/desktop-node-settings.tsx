@@ -16,11 +16,24 @@ export function DesktopNodeSettings() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
+  const reload = () => {
+    if (!api || busy) return
+    setError(null)
+    setStatus(null)
+    setBusy(true)
+    void api.getStatus()
+      .then((value) => setStatus(value))
+      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : '无法读取本机节点状态。'))
+      .finally(() => setBusy(false))
+  }
+
   useEffect(() => {
     if (!api) return
     let live = true
-    void api.getStatus().then((value) => { if (live) setStatus(value) }, () => { if (live) setError('无法读取本机节点状态。') })
-    const stop = api.onStatus((value) => setStatus(value))
+    void api.getStatus()
+      .then((value) => { if (live) { setStatus(value); setError(null) } })
+      .catch((cause: unknown) => { if (live) setError(cause instanceof Error ? cause.message : '无法读取本机节点状态。') })
+    const stop = api.onStatus((value) => { setStatus(value); setError(null) })
     return () => { live = false; stop() }
   }, [api])
 
@@ -73,6 +86,14 @@ export function DesktopNodeSettings() {
         {error ? <p className="px-4 text-body text-danger" role="alert">{error}</p> : null}
         {view.discoveryMessage ? <p className="px-4 text-meta text-muted-foreground">{view.discoveryMessage}</p> : null}
         <ActionList actions={view.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId))} />
+      </> : error ? <>
+        <p className="px-4 text-body text-danger" role="alert">{error}</p>
+        <div className="px-4 pb-4">
+          <Button type="button" size="sm" variant="outline" disabled={busy} onClick={reload}>
+            {busy ? <BusyIcon busy /> : null}
+            重试
+          </Button>
+        </div>
       </> : <SettingsRow icon={RefreshCw} label="正在读取本机节点状态…"><BusyIcon busy /></SettingsRow>}
     </SettingsGroup>
 

@@ -35,9 +35,9 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 ## 命令
 
 ```
-pnpm --dir apps/desktop typecheck   # tsconfig.json（主进程/preload/测试）+ tsconfig.launcher.json（渲染层）
+pnpm --dir apps/desktop typecheck   # tsconfig.json（主进程/preload/测试）
 pnpm --dir apps/desktop test        # vitest
-pnpm --dir apps/desktop build       # dist/main/index.cjs, dist/preload/launcher.cjs, dist/launcher/**
+pnpm --dir apps/desktop build       # dist/main/index.cjs, dist/preload/client.cjs
 pnpm --dir apps/desktop package     # scripts/build-desktop.mjs（由交付侧拥有）
 node apps/desktop/scripts/make-icons.mjs   # 仅 macOS：从品牌矢量重新生成已提交的图标
 ```
