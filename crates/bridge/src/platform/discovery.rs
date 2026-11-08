@@ -191,8 +191,7 @@ mod macos {
                     0,
                 )
             } != 0
-                || size < 4
-                || size > MAX_COMMAND_LINE
+                || !(4..=MAX_COMMAND_LINE).contains(&size)
             {
                 continue;
             }
