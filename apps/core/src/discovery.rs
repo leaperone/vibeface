@@ -64,25 +64,39 @@ pub(crate) async fn complete_local(
     if !local.launches(connect.provider) {
         return Ok(false);
     }
+    let mut next = local.clone();
+    let bin = local.bin(connect.provider);
+    if !local.bins.contains_key(&connect.provider)
+        && !local.env.get(connect.provider).contains_key("PATH")
+        && !connect.explicit_env_names.contains("PATH")
+        && !host.installed(&bin)
+        && let Some(name) = bare(&bin)
+        && let Some(path) = environment::program_path(host).await?
+        && let Some(found) = (Host {
+            path: Some(path),
+            ..host.clone()
+        })
+        .program(name)
+    {
+        next.bins.insert(connect.provider, found);
+    }
     let names = connect.names(local, codex_config)?;
     let values = environment::missing(&names, host).await?;
-    if values.is_empty() {
-        return Ok(false);
-    }
     for value in values.values() {
         crate::logging::add_credential(value);
     }
-    let mut next = local.env.clone();
-    next.apply(
-        connect.provider,
-        values
-            .into_iter()
-            .map(|(name, value)| (name, Some(value)))
-            .collect(),
-    )
-    .map_err(|_| LocalSourceError)?;
-    local.env = next;
-    Ok(true)
+    next.env
+        .apply(
+            connect.provider,
+            values
+                .into_iter()
+                .map(|(name, value)| (name, Some(value)))
+                .collect(),
+        )
+        .map_err(|_| LocalSourceError)?;
+    let changed = next.bins != local.bins || next.env != local.env;
+    *local = next;
+    Ok(changed)
 }
 
 pub const CODEX_HOME: &str = "CODEX_HOME";
@@ -128,7 +142,7 @@ impl Host {
         };
         Self {
             codex_home: dir(CODEX_HOME),
-            home: dir("HOME"),
+            home: dir("HOME").or_else(|| dir("USERPROFILE")),
             nvm_dir: dir("NVM_DIR"),
             path: std::env::var_os("PATH"),
             #[cfg(test)]
@@ -154,20 +168,21 @@ impl Host {
         let home = |dir: &str| self.home.as_ref().map(|home| home.join(dir));
         dirs.extend(home(".local/bin"));
         // Where Claude Code's and opencode's own installers put them.
-        // ponytail: pi comes from npm, found here only in Homebrew's or the official Node's
-        // global folder; another one (nvm, a custom prefix) needs PATH or a chosen path.
         dirs.extend(match name {
             "claude" => home(".claude/local"),
             "opencode" => home(".opencode/bin"),
             _ => None,
         });
+        for directory in [".npm-global/bin", ".volta/bin", "AppData/Roaming/npm"] {
+            dirs.extend(home(directory));
+        }
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
         if name == "codex" {
             dirs.push("/Applications/Codex.app/Contents/Resources".into());
-            dirs.extend(self.nvm_bins());
         }
+        dirs.extend(self.nvm_bins());
         dirs.into_iter()
-            .map(|dir| dir.join(name))
+            .flat_map(|dir| vibeface_bridge::platform::program::candidates(&dir.join(name)))
             .find(|path| executable_file(path))
     }
 
@@ -748,6 +763,42 @@ exec /bin/sh -c "$2"
         Ok(())
     }
 
+    #[tokio::test]
+    async fn local_program_uses_login_path_only_when_no_saved_program_or_path_exists() -> Result<()>
+    {
+        let (dir, mut host, _) = environment_fixture("program-path", "exit 1");
+        let program_path = dir.join("custom/bin/claude");
+        program(&program_path);
+        host.inherited_env
+            .insert("PATH".into(), dir.join("custom/bin").display().to_string());
+        let connect = LocalConnect {
+            provider: Provider::Claude,
+            explicit_env_names: BTreeSet::new(),
+        };
+        let mut local = local();
+        assert!(complete_local(&mut local, &connect, None, &host).await?);
+        assert_eq!(local.bin(Provider::Claude), program_path);
+        assert!(local.env.get(Provider::Claude).is_empty());
+        assert!(local.switches.execution.is_empty());
+        local
+            .bins
+            .insert(Provider::Claude, dir.join("chosen/claude"));
+        assert!(!complete_local(&mut local, &connect, None, &host).await?);
+        assert_eq!(local.bin(Provider::Claude), dir.join("chosen/claude"));
+        local.bins.clear();
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([(
+                "PATH".into(),
+                Some(dir.join("chosen/bin").display().to_string()),
+            )]),
+        )?;
+        assert!(!complete_local(&mut local, &connect, None, &host).await?);
+        assert!(!local.bins.contains_key(&Provider::Claude));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn requested_local_service_is_discovered_without_enabling_a_use() -> Result<()> {
         let (dir, host, _) = environment_fixture("disabled", "exit 1");
@@ -1033,6 +1084,13 @@ exec /bin/sh -c "$2"
             host.program("codex"),
             Some(custom.join("versions/node/v20.10.0/bin/codex"))
         );
+        for provider in Provider::ALL {
+            let selected = custom
+                .join("versions/node/v20.10.0/bin")
+                .join(provider.default_bin());
+            program(&selected);
+            assert_eq!(host.program(provider.default_bin()), Some(selected));
+        }
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

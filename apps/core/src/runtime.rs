@@ -665,6 +665,10 @@ impl Runtime {
         if completed_env {
             local.env.save(dir)?;
         }
+        if config.bins != local.bins {
+            config.bins = local.bins.clone();
+            config.save(dir)?;
+        }
         if let Some(projected) = codex_config {
             provider_roots.publish_codex_config(&projected)?;
         }
@@ -689,7 +693,7 @@ impl Runtime {
         let opencode = Arc::new(opencode::Opencode::open(
             dir,
             local.bin(Provider::Opencode),
-            local.env.get(Provider::Opencode).clone(),
+            local.launch_env(Provider::Opencode),
         )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,

@@ -208,7 +208,7 @@ impl Runtime {
             Provider::Codex => self.codex.configuration_pending(&local.codex_target(true)),
             Provider::Opencode => self
                 .opencode
-                .configuration_pending(&local.bin(provider), local.env.get(provider)),
+                .configuration_pending(&local.bin(provider), &local.launch_env(provider)),
             Provider::Cursor | Provider::Claude | Provider::Pi => false,
         }
     }
@@ -290,7 +290,7 @@ impl Runtime {
                 bin: local.bin(Provider::Opencode),
                 launch: Some(std::sync::Arc::new(self.opencode.lease(
                     &local.bin(Provider::Opencode),
-                    local.env.get(Provider::Opencode),
+                    &local.launch_env(Provider::Opencode),
                 )?)),
             },
         };
@@ -754,7 +754,7 @@ impl Runtime {
         self.codex.retarget(local.codex_target(codex_agent));
         self.opencode.set_launch(
             local.bin(Provider::Opencode),
-            local.env.get(Provider::Opencode).clone(),
+            local.launch_env(Provider::Opencode),
         );
         self.refresh_cursor();
         self.pending_provider_launches.store(false, SeqCst);

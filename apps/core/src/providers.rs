@@ -1321,13 +1321,10 @@ impl Local {
             .unwrap_or_else(|| provider.default_bin().into())
     }
 
-    /// npm's Codex wrapper uses `env node`; keep its selected installation's Node ahead of
+    /// npm wrappers use `env node`; keep the selected installation's Node ahead of
     /// any inherited version without changing the saved environment.
     pub fn launch_env(&self, provider: Provider) -> BTreeMap<String, String> {
         let mut env = self.env.get(provider).clone();
-        if provider != Provider::Codex {
-            return env;
-        }
         let path = env
             .get("PATH")
             .map(std::ffi::OsString::from)
@@ -1623,10 +1620,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn selected_codex_wrapper_launches_with_its_sibling_node() -> Result<()> {
+    fn selected_npm_wrappers_launch_with_their_sibling_node() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("vibeface-codex-node-{}", uuid::Uuid::new_v4()));
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("provider-node-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("versions/node/v20.10.0/bin");
         let module = bin.join("../lib/node_modules/@openai/codex/bin/codex.js");
         std::fs::create_dir_all(module.parent().unwrap())?;
@@ -1679,6 +1677,21 @@ mod tests {
         );
         assert_eq!(local.launch_env(Provider::Codex), launch.env);
         assert!(local.launch_env(Provider::Cursor).is_empty());
+        for provider in Provider::ALL.into_iter().filter(|p| *p != Provider::Codex) {
+            let program = bin.join(provider.default_bin());
+            std::os::unix::fs::symlink(&module, &program)?;
+            local.bins.insert(provider, program.clone());
+            let output = std::process::Command::new(&program)
+                .env_clear()
+                .envs(local.launch_env(provider))
+                .output()?;
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout)?,
+                format!("fixture-node:{}\n", program.display())
+            );
+            assert!(!local.env.get(provider).contains_key("PATH"));
+        }
         local.bins.remove(&Provider::Codex);
         local.env.apply(
             Provider::Codex,
