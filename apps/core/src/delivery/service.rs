@@ -126,7 +126,7 @@ impl Delivery {
                         .is_empty(),
                     "unexpected service handshake payload"
                 );
-                handshake.finish()
+                Ok::<Channel, anyhow::Error>(handshake.finish()?)
             })
             .await
             .context("service handshake deadline exceeded")??;
