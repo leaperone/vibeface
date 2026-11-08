@@ -7,7 +7,7 @@ test('portal serves docs and searches Chinese content', async ({ app, screen, br
   await expect(screen.getByRole('heading', { name: /Your computers\.\s*One conversation\./ })).toBeVisible()
   expect(await browser.evaluate(() => document.documentElement.lang)).toBe('en')
 
-  await screen.getByRole('link', { name: 'Start with one computer', exact: true }).first().click()
+  await screen.getByRole('link', { name: 'Start with one computer', exact: true }).click()
   await expect(screen.getByRole('heading', { name: '快速上手', exact: true })).toBeVisible()
   expect(await browser.evaluate(() => document.documentElement.lang)).toBe('zh-CN')
   await app.screenshot('quick-start')

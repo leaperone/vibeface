@@ -21,7 +21,7 @@ function HomePage() {
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
             <h1 id="hero-title">Your computers.<br />One conversation.</h1>
-            <p className="hero-lede">Ask a bot to work on your Mac or Linux. Choose where it runs and read the result in the same chat.</p>
+            <p className="hero-lede">Ask a bot to work on your Mac or Linux machine. Choose where it runs and read the result in the same chat.</p>
             <div className="hero-actions">
               <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
@@ -30,8 +30,7 @@ function HomePage() {
 
           <figure className="hero-figure" aria-label="A visual map of a conversation, the selected computer, and shared history">
             <div className="hero-visual">
-              <div className="visual-grid" aria-hidden="true" />
-              <div className="visual-glow" aria-hidden="true" />
+              <div className="visual-backdrop" aria-hidden="true"><div className="visual-grid" /><div className="visual-glow" /></div>
               <div className="orbit orbit-one" aria-hidden="true" />
               <div className="orbit orbit-two" aria-hidden="true" />
               <div className="orbit orbit-three" aria-hidden="true" />
@@ -43,9 +42,9 @@ function HomePage() {
               <div className="hero-logo"><img src="/logo.svg" width="136" height="136" alt="" /></div>
               <a className="visual-node visual-node-top" href="/docs/bot-and-execution"><span>Conversation</span><small>Shape the request, then hand it off</small></a>
               <a className="visual-node visual-node-left" href="/docs/bot-and-execution#工作如何回到原聊天"><span>Selected computer</span><small>Your Agent uses local tools</small></a>
-              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Stages and results return</small></a>
+              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Progress and results come back here</small></a>
             </div>
-            <figcaption>One thread from request to result.</figcaption>
+            <figcaption>From request to result, in one conversation.</figcaption>
           </figure>
         </section>
 
@@ -59,9 +58,9 @@ function HomePage() {
           <ol className="loop-steps" role="list">
             <li><span className="loop-num" aria-hidden="true">01</span><div><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot uses the thread to plan the work.</p></div></li>
             <li><span className="loop-num" aria-hidden="true">02</span><div><h3>Choose a computer</h3><p>An approved computer runs the work with its local Agent, files, and tools.</p></div></li>
-            <li><span className="loop-num" aria-hidden="true">03</span><div><h3>Read the result</h3><p>Updates and saved results return to the same chat. Check an unknown result before retrying.</p></div></li>
+            <li><span className="loop-num" aria-hidden="true">03</span><div><h3>Read the result</h3><p>Updates and saved results return to the same chat. If a result is unknown, check it before you retry.</p></div></li>
           </ol>
-          <p className="loop-note">Live progress is temporary and does not sync.</p>
+          <p className="loop-note">Live progress is not saved or synced.</p>
           </div>
         </section>
 
@@ -76,7 +75,7 @@ function HomePage() {
 
         <section className="landing-section landing-choice" aria-labelledby="choice-title">
           <h2 id="choice-title">Already have an Agent?</h2>
-          <p className="section-copy">Choose the layer that matches how you work.</p>
+          <p className="section-copy">Choose the tool that matches how you work.</p>
           <div className="choice-grid">
             <article className="choice-card choice-card-lead"><h3>Choose Vibeface</h3><p>You want one thread that can send work to your own computers and show the result back.</p><a className="text-link" href="/docs/comparison">Compare the options <ArrowRight size={16} aria-hidden="true" /></a></article>
             <article className="choice-card"><h3>Use Codex or Claude Code</h3><p>You only need the product's own terminal, editor, or hosted flow.</p></article>
@@ -89,9 +88,9 @@ function HomePage() {
             <h2 id="trust-title">Know where your work goes.</h2>
             <div className="trust-grid">
               <dl className="trust-facts">
-                <div><dt>Every device has its own identity</dt><dd>Each device has its own key. You approve new devices before they join.</dd></div>
-                <div><dt>Connections are encrypted</dt><dd>A public entry point can relay ciphertext without joining your private network.</dd></div>
-                <div><dt>Credentials stay local</dt><dd>AI service settings do not sync. A secret you send in chat becomes part of the shared conversation.</dd></div>
+                <div><dt>Every device has its own identity</dt><dd>Each device holds a separate key. You approve new devices before they join.</dd></div>
+                <div><dt>Connections are encrypted</dt><dd>A public entry point can relay encrypted traffic without joining your private network.</dd></div>
+                <div><dt>Credentials stay local</dt><dd>AI service settings never sync. A secret you send in chat does become part of the shared conversation.</dd></div>
               </dl>
               <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
                 <p>Approved computers and the model service you choose handle your task content. Use devices and websites you trust.</p>
@@ -103,16 +102,16 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-start" aria-labelledby="start-title">
-          <h2 id="start-title">Begin with one computer.</h2>
-          <p className="section-copy">A supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
+          <h2 id="start-title">Start with one computer.</h2>
+          <p className="section-copy">You need a supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
           <div className="hero-actions start-actions">
-            <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
+            <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Open the quick start <ArrowRight size={16} aria-hidden="true" /></Link>
           </div>
           <ul className="start-links" role="list">
             <li><a className="text-link" href="/docs/onboarding">Set up a device <ArrowUpRight size={16} aria-hidden="true" /></a></li>
             <li><a className="text-link" href="/docs/user-guide">Read the user guide <ArrowUpRight size={16} aria-hidden="true" /></a></li>
           </ul>
-          <p className="nightly-note">Vibeface is in Nightly. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases</a></p>
+          <p className="nightly-note">Vibeface ships as Nightly builds. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases</a></p>
         </section>
       </div>
     </SiteLayout>

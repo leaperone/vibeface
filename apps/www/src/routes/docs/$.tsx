@@ -3,7 +3,6 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from 'fumadocs-ui/layo
 import { DocsLayout } from 'fumadocs-ui/layouts/docs'
 import { useFumadocsLoader } from 'fumadocs-core/source/client'
 import { Suspense, use } from 'react'
-import { Link } from '@tanstack/react-router'
 import { docs, source } from '@/lib/source'
 import { useMDXComponents } from '@/components/mdx'
 
@@ -63,10 +62,10 @@ function DocsRoute() {
       <DocsLayout
         nav={{
           title: (
-            <Link className="brand docs-brand" to="/">
+            <span className="brand docs-brand">
               <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
               <span>Vibeface</span>
-            </Link>
+            </span>
           ),
           url: '/',
         }}
