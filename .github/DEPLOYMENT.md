@@ -1,6 +1,5 @@
-# Static app deployment
+# Artifact publication and service deployment
 
-Stable `app-v<major>.<minor>.<patch>` releases publish the verified app archive before requesting deployment in `leaperone/leaperone-releases`.
-Prereleases do not request production deployment. The receiver uses the exact tag and source commit and checks HTTP entry points after deployment.
+Product and website tags publish immutable artifacts only. Official services use the explicit commands in [service deployments](../packages/docs/service-deployments.md), selecting a complete published product tag. Deployment does not rebuild or republish product artifacts.
 
-The producer requires `VIBEFACE_RELEASE_DISPATCH_TOKEN` with permission to dispatch to the release repository.
+The request workflow needs `VIBEFACE_RELEASE_DISPATCH_TOKEN` with permission to dispatch to the deployment repository. Runtime credentials and target configuration stay in the deployment environment. An accepted request is not proof that deployment succeeded.

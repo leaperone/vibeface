@@ -18,7 +18,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对
 | 发布组 | Tag | 版本来源 | 交付结果 |
 | --- | --- | --- | --- |
 | product | `v<version>` | CLI Cargo 版本；各产品组件的发行版本必须与之完全一致 | 一个 Release 包含四个原生目标的电脑完整包、macOS/Windows/Linux 桌面 App、Web App、Android APK、iOS 设备归档及配置签名后的 IPA |
-| www | `www-v<version>` | `apps/www/package.json` | 独立官网归档，Stable 还请求部署 |
+| www | `www-v<version>` | `apps/www/package.json` | 独立官网归档，不触发部署 |
 
 版本只使用 `X.Y.Z`、`X.Y.Z-rc.N` 或 `X.Y.Z-nightly.YYYYMMDD.N`。Nightly 日期取 UTC，N 是该发布组、基准版本和日期下远端已有序号的最大值加一。先获取远端 tags，再计算；产品与官网独立计数。产品只使用 `v`，官网只使用 `www-v`；不新增旧应用前缀别名，不使用可变 `nightly` Tag、build metadata 或重复版本。
 
@@ -78,9 +78,9 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 
 发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
 
-App 的公网入口是 `https://app.vibeface.dev`。Stable 产品 Tag 的完整 Release 发布成功后自动请求站点部署，RC 和 Nightly 只生成归档；部署后须核对线上资源的源码身份、SPA 路由、API 404 和首次连接页面。
+产品发布不更新 App、Discovery 或 Relay。用户要求部署这些服务时，使用相邻的 [deploy skill](../deploy/SKILL.md)，显式选择已经完整发布的产品 Tag。不得由 `release product` 自动派发部署。
 
-www Stable 还要跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
+官网发布同样不自动部署。只有另行执行 `deploy-www.yml` 时才跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
 
 npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在 产品 `publish` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
 

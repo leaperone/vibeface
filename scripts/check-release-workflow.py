@@ -59,6 +59,8 @@ def evaluate(expression, results, scope='product', publishing=True, cancelled=Fa
 
 def check(source, helpers):
     workflow = jobs(source)
+    require(not any('deploy' in name or 'dispatches' in block or 'scripts/deploy.py' in block
+                    for name, block in workflow.items()), 'artifact publication must not deploy services')
     require('release-${{ inputs.tag || github.ref_name }}-' in source,
             'tag pushes and manual publication must share the same concurrency group')
     producers = ['static', 'android', 'ios', *('native-' + target for target in TARGETS)]
@@ -110,6 +112,7 @@ def check(source, helpers):
 def self_test(source, helpers):
     check(source, helpers)
     broken = [
+        source + '\n  deploy-app:\n    uses: ./.github/workflows/deploy-services.yml\n',
         source.replace('needs: [identity, static, native-macos]', 'needs: [identity, static, native-macos, native-linux-x64]'),
         source.replace('needs: [identity, compose-macos]', 'needs: [identity, compose-macos, compose-windows]'),
         source.replace("needs.android.result == 'success'", "True"),
@@ -140,7 +143,7 @@ def main():
     source = (directory / 'release.yml').read_text()
     helpers = {name: (directory / name).read_text()
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml',
-                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-app.yml', 'deploy-www.yml')}
+                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml', 'deploy-www.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
           'exact artifacts and complete-only publication')

@@ -15,7 +15,8 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
 | PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
 | 合并后检查 | 经明确授权合并，再核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
-| 发布与上线 | 显式应用 tag、`release.yml` 及对应部署 workflow | 分别核对目标应用制品、发布记录和真实部署 |
+| 制品发布 | 显式应用 tag 与 `release.yml` | 校验产品制品和发布记录，不更新线上服务 |
+| 服务部署 | 独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
 
 ## main 与 merge queue 的核心检查
 

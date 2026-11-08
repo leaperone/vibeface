@@ -5,7 +5,7 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户仅在 www 正式版 Tag 时由 `deploy-www.yml` 请求部署，网页 App 在产品正式版 Tag 时由 `deploy-app.yml` 请求部署。版本号含 `-` 时不自动发站。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。制品发布不触发线上部署。官方服务使用独立的部署命令选择已发布产品 Tag，见[官方服务部署](service-deployments.md)。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 按产品组合发布
 
@@ -36,9 +36,11 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 网络响应未知时先查询 PR、ref 或原 run 对账。发布恢复复用原运行的完整产品 artifact，禁止重建后覆盖公开字节。npm 失败单独报告失败；核对 registry 后恢复原 npm artifact，不把 GitHub Release 成功当作 npm 成功。缺失、过期或字节冲突的原制品阻止恢复。
 
-## Stable App 的站点部署
+## 独立部署发布
 
-仅 Stable `vX.Y.Z` 的完整产品发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
+产品和官网发布只交付制品，不推送线上服务。Discovery、Relay 与 App 使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
+
+官网使用独立命令 `gh workflow run deploy-www.yml --repo leaperone/vibeface --ref www-v<version>`，当前官网部署仅接受 Stable。请求成功不代表上线，必须跟踪部署仓库运行到终态并验证线上版本。
 
 ## 可下载的包
 
@@ -111,7 +113,7 @@ pnpm --filter vibeface-www run build
 pnpm --filter vibeface-www run check:static
 ```
 
-产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；成功发布 www 正式版 tag 后才调用 `deploy-www.yml`，向 `leaperone/leaperone-releases` 发送部署请求。请求成功不代表站点已经上线，仍需检查目标仓库的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
+产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；官网制品发布后，由独立的 `deploy-www.yml` 命令向部署仓库发送部署请求。请求成功不代表站点已经上线，仍需检查目标仓库的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
 
 ## 显式发布版本
 

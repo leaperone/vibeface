@@ -420,6 +420,7 @@ def run_check(packages, msrv=None):
 def self_test():
     from unittest.mock import patch
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]

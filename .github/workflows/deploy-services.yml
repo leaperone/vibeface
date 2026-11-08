@@ -1,0 +1,42 @@
+name: deploy-services
+run-name: Deploy ${{ inputs.service }} from ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Official service to deploy
+        type: choice
+        options: [all, discovery, relay, app]
+        required: true
+      tag:
+        description: Exact published product tag
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-service-deployment-requests
+  cancel-in-progress: false
+
+jobs:
+  request:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout deployment command
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify published release and request deployment
+        env:
+          GH_TOKEN: ${{ secrets.VIBEFACE_RELEASE_DISPATCH_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          python3 -B scripts/deploy.py dispatch --service "$SERVICE" --tag "$RELEASE_TAG"
