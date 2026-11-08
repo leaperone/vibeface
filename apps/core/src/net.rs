@@ -516,6 +516,7 @@ impl Net {
             &config.discovery_servers()?,
             config.relay_mode == RelayServiceMode::DiscoveryOnly,
             issuer.clone(),
+            config.own_relay()?,
         )?;
         // Bootstrapping runs in the background: the local API, maintenance and LAN start
         // whether or not the public infrastructure answers.
@@ -575,6 +576,15 @@ impl Net {
                     .await;
             }
         }
+    }
+
+    /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
+    /// relay, so this comes before the first dial through it.
+    pub async fn insert_relay(&self, url: RelayUrl, token: Option<String>) {
+        self.relays.lock().await.insert(url.clone());
+        self.endpoint
+            .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
+            .await;
     }
 
     /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears

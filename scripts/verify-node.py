@@ -538,7 +538,7 @@ class Client:
         self.call("invite", {"record": tampered}, status=400)
         self.call("invite", {"record": made["record"]})
         ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id)
-        return f"{self.url}/join#{ticket}"
+        return f"vibeface://join/{ticket}"
 
     def directory_state(self):
         return self.call("directory")["state"]
@@ -573,8 +573,8 @@ class Client:
         """Joins through a ticket from `owner` (a Node or a managing Client); approval follows matching short codes."""
         owner = getattr(owner, "client", owner)
         link = owner.invite()
-        ticket = self.command("ticket", ticket=link.split("#", 1)[1])
-        self.url = via or link.split("/join#", 1)[0]
+        ticket = self.command("ticket", ticket=link.removeprefix("vibeface://join/"))
+        self.url = via or owner.url
         self.connect(ticket["entry_id"])
         me = self.own_id()
         nonce = uuid.uuid4().hex + uuid.uuid4().hex
@@ -722,7 +722,7 @@ class Node:
         require(self.process is None, f"{self.name}: joins while stopped")
         owner = getattr(owner, "client", owner)
         link = owner.invite()
-        encoded = link.split("#vibeface1", 1)[1].upper()
+        encoded = link.removeprefix("vibeface://join/vibeface1").upper()
         ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
         require(len(ticket) == 65 and ticket[0] == 1, "CLI join ticket holds only the entry device ID and secret")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
@@ -4899,6 +4899,9 @@ def phase4_acceptance(options):
                     joining.wait(timeout=5)
         c.start()
         members = (a, p, b, c)
+        # A Node that started while another member was still joining stays read-only until it reaches that member.
+        wait_for("every member Node is writable", lambda: all(
+            node_status(node).get("write_state") == "writable" for node in members), timeout=60)
         passed("join-across-entrances", holder="P", approved_at="A")
 
         conversation = "p4-conversation"
@@ -5942,7 +5945,7 @@ def auto_route_acceptance(options):
 
         rejected = fresh(target.url)
         link = target.client.invite()
-        ticket = rejected.command("ticket", ticket=link.split("#", 1)[1])
+        ticket = rejected.command("ticket", ticket=link.removeprefix("vibeface://join/"))
         rejected.connect(ticket["entry_id"])
         nonce = uuid.uuid4().hex * 2
         request = rejected.call("join", {"secret": ticket["secret"], "public_key": rejected.own_id(), "kind": "client",
@@ -8760,7 +8763,7 @@ def e2e_fixture(options):
             member.bootstrap()
             member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
                               name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
-            bootstrap_invitation = member.client.invite().split("#", 1)[1]
+            bootstrap_invitation = member.client.invite().removeprefix("vibeface://join/")
             bootstrap_site = BootstrapSite(options.fixture_port, entry, discovery)
         for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
             args = delivery_entry_args() if role == "provider" else []

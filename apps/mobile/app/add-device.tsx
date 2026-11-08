@@ -82,7 +82,7 @@ export default function AddDevice() {
       <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(null) }} />
       {kind === 'phone' ? <>
         <Text className="text-meta text-muted-foreground">{addDeviceCopy.clientHint}</Text>
-        <QrCode value={result.qr} label={result.publicEntry ? '用手机相机扫码打开' : '用手机 App 扫码'} />
+        <QrCode value={result.link} label="用手机 App 扫码" />
         <View className="flex-row flex-wrap justify-center gap-2">
           {copyLink}
           <Button variant="outline" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>

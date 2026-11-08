@@ -161,9 +161,9 @@ Node 把每个事件作为 JSON 正文 POST 到该地址，附带 `X-Vibeface-Ev
 
 每个 Node 和每个浏览器有独立密钥，设备编号就是设备公钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
 
-在管理设备打开**添加设备**，页面随即生成一条 `https://app.vibeface.dev/join#vibeface1…` 加入链接和一个二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。链接前缀只负责打开 App，怎样连到发出邀请的 Node 由链接里的票据决定：票据只含发出邀请的 Node 的设备编号和一次性 secret，浏览器经本页、链接地址和服务目录里的入口按设备编号转发过去。只有本机或局域网入口时，链接保留该入口地址，因为 App 站点连不到它。入口有公网 HTTPS 地址时，二维码就是这条链接，手机相机扫码即可打开；只有本机或局域网地址时，二维码是 `vibeface://join?link=vibeface1…`，下方提示“用手机 App 扫码”，用 Vibeface App 扫码加入。链接含一次性 secret，只交给自己的设备。新浏览器打开链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
+在管理设备打开**添加设备**，页面随即生成一条 `vibeface://join/vibeface1…` 加入链接和同一链接的二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。链接只由桌面端和手机 App 打开，二维码下方提示“用手机 App 扫码”；只有浏览器的设备在 `https://app.vibeface.dev` 或自己的入口网页上粘贴链接或单独的 `vibeface1…` 票据加入。票据只含发出邀请的 Node 的设备编号和一次性 secret，不含地址，浏览器经本页和服务目录里的入口按设备编号转发过去。链接含一次性 secret，只交给自己的设备。新浏览器填入链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
 
-App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀请的 Node，手机要和这台电脑在同一局域网，见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
+票据里没有局域网地址，App 扫码后按设备编号经服务目录里的入口转发到发出邀请的 Node；局域网直连见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
 
 添加另一个节点时，不要在新机器的本机网页上建网。先在电脑或服务器上安装 Vibeface，见[安装](install.md)。管理设备的**添加设备**选**节点**，有两种方式：
 
@@ -171,12 +171,12 @@ App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀�
 - 终端方式：点**复制命令**，在新机器的终端执行，Node 运行与否都可以。Node 正在运行时，命令交给它加入，加入后它直接开始同步，不用重启。数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。命令的完整写法：
 
 ```sh
-vibeface join 'https://app.vibeface.dev/join#vibeface1…' --name '<设备显示名称>'
+vibeface join 'vibeface://join/vibeface1…' --name '<设备显示名称>'
 ```
 
-链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`。CLI 解码邀请票据，按其中的设备编号通过 iroh 连接目标：向配置的发现服务查询它的 relay 和 IP，再用配置的 relay、入口 relay 和公共许可 relay。链接前面的网页地址用于浏览器打开页面，不决定 CLI 的连接地址。没有配置任何 relay 或发现服务时，`vibeface join` 直接报错。
+链接也可以是单独的 `vibeface1…` 票据。CLI 解码邀请票据，按其中的设备编号通过 iroh 连接目标：向配置的发现服务查询它的 relay 和 IP，再用配置的 relay、入口 relay 和公共许可 relay。没有配置任何 relay 或发现服务时，`vibeface join` 直接报错。
 
-邀请中的 relay 缺失或不可达时，Node 会复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 还要求匹配的 `entry-token`。发现服务只提供地址提示，不授予私有 relay 使用权。
+发现服务查到的入口 Node relay 会带上邀请令牌加入，让入口 Node 自己的 relay 认得新 Node；此外 Node 复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 还要求匹配的 `entry-token`。发现服务只提供地址提示，不授予私有 relay 使用权。
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入。Node 原本没在运行时，再启动它（后台服务用 `vibeface service start`）。`--name` 必须明确指定设备名，不读取系统主机名。设备名和已有设备或进行中的请求重名时，Node 自动加序号，例如“我的电脑 2”，重试同一请求沿用该名称。连接中断或按了 Ctrl-C 时，用同一链接、名称和目录重跑，命令先核对原请求，不重新创建；Node 正在运行时，按 Ctrl-C 不会取消加入，批准后照样完成。链接已用过、过期或被拒绝时，命令说明原因，请在管理设备上重新生成链接。
 
@@ -210,7 +210,7 @@ vibeface join 'https://app.vibeface.dev/join#vibeface1…' --name '<设备显示
 - App 在前台时收听 Node 的 mDNS 广播；iOS 每分钟重新解析一次地址，Android 14 及以上跟随地址变化，更早的 Android 等 Node 整点换标签时更新（见 [Node 之间的连接](#node-之间的连接) 的“局域网发现”），用个人网络编号和已知 Node 的设备编号比对标签，认出本人的 Node 和它当前的地址；退到后台就停止。
 - 重连顺序：当前 Node 的局域网直连、当前网页入口、局域网里看到的其他本人 Node、其他网页入口。局域网直连每次最多等 2 秒，只剩一种可试时等 10 秒。拨号会在 TLS 里明文带上对方的设备编号，所以 App 不盲拨没看到的地址；只有没有任何网页入口可试时，才按上次连上或 Node 签名记录里的地址试一次。
 - 已经经网页入口在线时，一发现当前连着的这台 Node 出现在局域网，就先试连一次；退出网络或恢复出厂时，试连随即取消。成功后最多等 30 秒让进行中的请求返回，再切到直连；仍有请求未返回、正在做需要确认的操作或试连失败时，保持当前连接。
-- 扫码加入时，App 先按邀请里 Node 的直连地址（局域网地址在前）连，连不上再试邀请里的网页入口。
+- 扫码加入时，票据只有 Node 的设备编号，App 试链接地址和服务目录里的网页入口，由它们按设备编号转发。
 - 直连时连接状态显示“局域网直连”。
 
 Node 不需要额外配置，只要已加入个人网络、不是公共入口、`bind` 不是具体地址，防火墙放行局域网内 UDP 5353 组播和 iroh 的 UDP 端口。
@@ -237,7 +237,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 目录只是地址提示：公共入口看不到对话内容，个人网络仍按邀请和成员目录授权。公共入口的 relay 只接纳持有效许可的设备，一台入口服务多个人的 Node，各人的网络互不相通。
 
-不想使用官方服务时，初始化加 `--bootstrap off`；指定了自建入口 `--entry` 时默认就是关闭，不会悄悄回退到官方服务。自建一套同样协议的发现服务和入口后，用 `--bootstrap 'vibeface://<发现服务设备编号>@<主机>:<UDP 端口>'` 指向它，可选 `--bootstrap-https https://<入口>/bootstrap` 作为 UDP 不通时的第二路径；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`）再启动。
+不想使用官方服务时，初始化加 `--bootstrap off`；指定了自建入口 `--entry` 时默认也是关闭，不会悄悄回退到官方服务的 relay 许可，但仍向官方发现服务登记（写入 `network.discovery`），让别人按设备编号找到它；同时给了 `--bootstrap` 或 `--discovery` 时按显式配置，不再自动添加。自建一套同样协议的发现服务和入口后，用 `--bootstrap 'vibeface://<发现服务设备编号>@<主机>:<UDP 端口>'` 指向它，可选 `--bootstrap-https https://<入口>/bootstrap` 作为 UDP 不通时的第二路径；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`）再启动。
 
 ### 自建公共入口：Linux 服务器加 nginx
 
@@ -325,7 +325,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `$VIBEFACE_RELAY_TOKEN_FILE` 指向的临时文件。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
 
-6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码加入**扫描**添加设备**里的二维码。
+6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成 `vibeface://join/…` 链接和二维码。手机 App 扫码后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。只用手机浏览器时，打开 `https://vb.example.com`，点**扫码加入**扫描**添加设备**里的二维码，或粘贴链接。
 
 默认公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
 
@@ -371,7 +371,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay <URL>` | `relays` | 个人网络中另一台 Node 的 relay，可重复，最多 16 个 |
 | `--relay-listen <ADDR>` | `relay_listen` | 普通模式运行 TCP relay，`discovery-only` 模式提供 UDP 发现服务 |
 | `--relay-mode <MODE>` | `relay_mode` | 默认 `forward`；`discovery-only` 只提供连接协助，需要 `--public-entry` |
-| `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
+| `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个；有 `--entry` 而没给 `--bootstrap` 和 `--discovery` 的新 Node 默认写官方发现服务 |
 | `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
 | `--bootstrap <MODE\|URL>` | `bootstrap` | `public`（无 `--entry` 的新 Node 默认值）、`off`，或自建发现服务的 `vibeface://` 地址 |
 | `--bootstrap-https <URL>` | `bootstrap.https` | 自建发现服务的 HTTPS 接入基址，UDP 不通时使用 |

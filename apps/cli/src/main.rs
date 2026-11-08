@@ -2508,7 +2508,7 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "join",
-                "https://node.example/join#vibeface1abc",
+                "vibeface://join/vibeface1abc",
                 "--name",
                 "Build Node",
                 "--data-dir",
@@ -2520,7 +2520,7 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "join",
-                "https://node.example/join#vibeface1abc",
+                "vibeface://join/vibeface1abc",
                 "--data-dir",
                 TEST_DATA_NODE
             ])

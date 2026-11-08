@@ -3,7 +3,7 @@ import type { LocalSetup } from '@vibeface/client/lib/node.ts'
 import type { LocalPage } from '@vibeface/client/lib/platform.ts'
 import { localBrowserEntry } from './local-access'
 
-const invitationIn = () => location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.href : ''
+const invitationIn = () => location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.hash.slice(1) : ''
 
 /** Only a page on localhost may set up, launch or join the computer serving it. */
 export const localPage: LocalPage = {

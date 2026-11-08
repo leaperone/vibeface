@@ -531,9 +531,20 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         options.public_entry,
         options.entry.is_some(),
     )?;
+    let mut discovery = options.discovery;
+    // A private entry's Node still registers with the official Discovery, so others find it by
+    // device ID. Bootstrap stays off: an official relay grant could become its home relay in
+    // place of the entry's.
+    if options.entry.is_some()
+        && !options.public_entry
+        && options.bootstrap.is_none()
+        && discovery.is_empty()
+    {
+        discovery.push(net::bootstrap::PublicDefaults::load()?.discovery_url());
+    }
     configuration.network = NetworkConfig {
         relays: options.relays,
-        discovery: options.discovery,
+        discovery,
         relay_mode,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
@@ -960,6 +971,43 @@ mod tests {
         .unwrap();
         let error = initialize_from_options(options).unwrap_err().to_string();
         assert!(error.contains("relay-token-file"), "{error}");
+    }
+
+    #[test]
+    fn a_private_entry_node_registers_with_the_official_discovery_without_its_bootstrap() {
+        let official = net::bootstrap::PublicDefaults::load()
+            .unwrap()
+            .discovery_url();
+        let own = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
+        for (extra, discovery, bootstrap) in [
+            (json!({}), vec![official.clone()], "off"),
+            (json!({"discovery": [own]}), vec![own.to_owned()], "off"),
+            (json!({"bootstrap": "off"}), vec![], "off"),
+            (json!({"bootstrap": "public"}), vec![], "public"),
+        ] {
+            let dir = temp_dir("private-entry");
+            let token = dir.with_extension("token");
+            fs::write(&token, "ab".repeat(32)).unwrap();
+            let mut options = json!({
+                "data_dir": dir,
+                "no_web": true,
+                "listen": free_addr(),
+                "local_listen": free_addr(),
+                "entry": "https://entry.example",
+                "relay_token_file": token,
+            });
+            options
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = initialize_from_options(serde_json::from_value(options).unwrap()).unwrap();
+            assert_eq!(result["bootstrap"], bootstrap, "{extra}");
+            let saved = Config::load(&dir).unwrap();
+            assert_eq!(saved.network.discovery, discovery, "{extra}");
+            assert_eq!(saved.network.bootstrap.label(), bootstrap, "{extra}");
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_file(token).unwrap();
+        }
     }
 
     #[test]

@@ -605,7 +605,7 @@ test('receives a charity file through a real native pairing and verifies the sav
   await device.installApp(undefined, { reinstall: true });
   await device.clearKeychain();
   await app.open();
-  await device.openLink(`vibeface://join?link=${encodeURIComponent(network.invitation)}`);
+  await device.openLink(network.invitation);
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible({ timeout: 30000 });
   const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
   await deviceName.fill('VDP native receiver');

@@ -9,7 +9,7 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
-import { joinTicket } from '@vibeface/client/lib/transport.ts'
+import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
 import { setPublicBootstrapMode, type PublicBootstrapMode } from '@vibeface/client/lib/bootstrap.ts'
 import bootstrapFixture from '../../../../../tests/fixtures/bootstrap-catalog.json' with { type: 'json' }
 
@@ -112,10 +112,10 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   let key = subject
   let initialized = !bootstrap && local !== 'fresh'
   const transport = {
-    validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket,
+    validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
-    parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
+    parseJoinLink: async () => ({ entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
@@ -535,7 +535,7 @@ test('an invitation in the page URL takes precedence over local discovery', asyn
   const app = deviceHarness({ local: 'fresh', invitation: 'vibeface1ticket' })
   try {
     app.render(); await settle()
-    assert.equal(app.render().initialInvitation, `${localEntry.address}/join#vibeface1ticket`)
+    assert.equal(app.render().initialInvitation, 'vibeface1ticket')
     assert.equal(app.render().localSetup, null)
     assert.deepEqual(app.calls, [])
     assert.equal(app.location.hash, '')
@@ -577,11 +577,11 @@ test('unmounting aborts pending local discovery without publishing setup state',
   assert.equal(app.render().localSetup, null)
 })
 
-test('a join asks the link origin to forward to the entry Node by its device ID', async () => {
+test('a join asks this page\'s Gateway to forward to the entry Node by its device ID', async () => {
   const app = deviceHarness()
   try {
     app.render(); await settle()
-    await app.render().join('https://app.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.deepEqual(plain(app.sockets.map(socket => socket.entry)), [{ kind: 'gateway', address: entry.address, device_id: target }])
     assert.ok(app.requests.some(request => request.method === 'join'))
   } finally { app.close() }
@@ -591,7 +591,7 @@ test('joining commits first, reveals only after the manager nonce, then shows th
   const app = deviceHarness()
   try {
     app.render(); await settle()
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     const join = app.requests.find(request => request.method === 'join')
     assert.deepEqual(plain(join?.params), { secret: 'one-time-secret', public_key: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64) })
     assert.equal(app.render().joining?.status, 'pending')
@@ -620,13 +620,13 @@ test('opening a used link says so before 加入, on its own channel, and sends n
     app.render(); await settle()
     const phase = app.render().phase
     app.inviteState.value = 'used'
-    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'used')
+    assert.equal(await app.render().checkInvite('vibeface://join/vibeface1ticket'), 'used')
     assert.deepEqual(plain(app.requests.filter(request => request.method === 'join_check').map(request => request.params)), [{ secret: 'one-time-secret' }])
     assert.equal(app.requests.some(request => request.method === 'join'), false, 'checking takes nothing')
     assert.equal(app.sockets.length, 1)
     assert.equal(app.render().phase, phase, 'the screen keeps its connection state')
     app.inviteState.value = 'open'
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.equal(app.render().joining?.status, 'pending', 'an open link still goes through the approval')
   } finally { app.close() }
 })
@@ -636,9 +636,9 @@ test('this computer asks its own Node about a link, with the page capability, an
   try {
     app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
     app.inviteState.value = 'expired'
-    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'expired')
+    assert.equal(await app.render().checkInvite('vibeface://join/vibeface1ticket'), 'expired')
     const check = app.requests.find(request => request.method === 'node_join_check')
-    assert.deepEqual(plain(check?.params), { capability: localCapability, link: 'https://node.example/join#vibeface1ticket' })
+    assert.deepEqual(plain(check?.params), { capability: localCapability, link: 'vibeface://join/vibeface1ticket' })
     assert.equal(app.requests.some(request => request.method === 'node_join'), false)
   } finally { app.close() }
 })
@@ -648,7 +648,7 @@ test('this computer\'s join asks again after a lost answer and explains a failur
   try {
     app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
     const lost = deferred(); app.holds.set('node_join', lost)
-    const joining = app.render().joinThisComputer('https://node.example/join#vibeface1ticket', '工作室 Mac')
+    const joining = app.render().joinThisComputer('vibeface://join/vibeface1ticket', '工作室 Mac')
     await until(() => app.requests.some(request => request.method === 'node_join'))
     const before = new Set(app.timers.keys())
     app.holds.set('node_join', { promise: Promise.resolve({ status: 'failed', reason: 'join request Rejected: rejected' }), resolve() {}, reject() {} })
@@ -692,7 +692,7 @@ test('a removed browser joins again as a new device and never offers its revoked
   try {
     app.render(); await settle()
     app.joinStatus.value = joinRequest('pending', { device_id: freshKey })
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.deepEqual(app.requests.filter(request => request.method === 'join').map(request => request.params.public_key), [freshKey])
     assert.equal(app.render().identity?.deviceId, freshKey)
     assert.equal(app.render().joining?.status, 'pending')
@@ -720,7 +720,7 @@ test('a join link opened in the same tab after a rejection replaces the spent on
     app.openHash('/join', '#local=token')
     assert.equal(app.location.hash, '#local=token')
     app.openHash('/join', '#vibeface1fresh')
-    assert.equal(app.render().initialInvitation, `${entry.address}/join#vibeface1fresh`)
+    assert.equal(app.render().initialInvitation, 'vibeface1fresh')
     assert.equal(app.render().error, '')
     assert.equal(app.location.hash, '')
   } finally { app.close() }
@@ -739,7 +739,7 @@ test('a joiner keeps the manager nonce it saw before revealing and stops when th
   const app = deviceHarness()
   try {
     app.render(); await settle()
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     const nonce = JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').nonce
     app.joinStatus.value = joinRequest('confirming', { admin_id: target, admin_nonce: '2'.repeat(64) })
     await app.render().checkJoin()
@@ -776,7 +776,7 @@ test('a join receipt for another invite or device is refused', async () => {
     try {
       app.render(); await settle()
       app.holds.set('join', { promise: Promise.resolve(joinRequest('pending', mismatch)), resolve() {}, reject() {} })
-      await assert.rejects(app.render().join('https://node.example/join#vibeface1ticket', 'browser'), /对不上/)
+      await assert.rejects(app.render().join('vibeface://join/vibeface1ticket', 'browser'), /对不上/)
       assert.equal(app.render().joining, null)
     } finally { app.close() }
   }
@@ -1342,7 +1342,7 @@ test('断开 revokes this browser\'s own key, and the next join offers a new one
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     app.sockets[0].drop(); assert.equal(app.timers.size, 0, 'the closed channel of a left device does not reconnect')
     app.joinStatus.value = joinRequest('pending', { device_id: freshKey })
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.deepEqual(app.requests.filter(request => request.method === 'join').map(request => request.params.public_key), [freshKey])
     assert.equal(app.calls.filter(call => call === 'replace-key').length, 1)
   } finally { app.close() }

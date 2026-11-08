@@ -50,8 +50,8 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
       if (!live || !video.current) return
       try {
         for (const code of await detector.detect(video.current)) {
-          const found = joinTicket(code.rawValue)
-          if (found) { onTicket(found.ticket); return }
+          const ticket = joinTicket(code.rawValue)
+          if (ticket) { onTicket(ticket); return }
         }
       } catch {}
       timer = setTimeout(() => void tick(), 250)

@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use iroh::{
-    EndpointAddr, TransportAddr,
+    EndpointAddr, RelayUrl, TransportAddr,
     endpoint::{Connection, ReadExactError, RecvStream, SendStream},
 };
 use serde::{Deserialize, Serialize};
@@ -1480,33 +1480,15 @@ fn client_url(origin: &str) -> Result<String> {
     Ok(url.into())
 }
 
-/// The ticket in an invite: `https://origin/join#vibeface1…`, the app's
-/// `vibeface://join?link=…` around either form, or `vibeface1…` alone. A Node joins over iroh,
-/// so the Gateway origin is not needed.
+/// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
-    parse_join_link_within(link.trim(), true)
-}
-
-fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
-    const SHAPE: &str = "invite link must look like https://host/join#vibeface1…";
-    if link.starts_with("vibeface1") {
-        return Ok(Ticket::decode(link)?);
-    }
-    let url = reqwest::Url::parse(link).context(SHAPE)?;
-    if nest && url.scheme() == "vibeface" && url.host_str() == Some("join") {
-        let (_, inner) = url
-            .query_pairs()
-            .find(|(key, _)| key == "link")
-            .context(SHAPE)?;
-        return parse_join_link_within(&inner, false);
-    }
+    let link = link.trim();
+    let ticket = link.strip_prefix("vibeface://join/").unwrap_or(link);
     ensure!(
-        matches!(url.scheme(), "http" | "https") && url.path() == "/join",
-        SHAPE
+        ticket.starts_with("vibeface1"),
+        "invite link must look like vibeface://join/vibeface1…"
     );
-    Ok(Ticket::decode(
-        url.fragment().context("invite link has no ticket")?,
-    )?)
+    Ok(Ticket::decode(ticket)?)
 }
 
 /// Saved so an interrupted join, from the terminal or the local page, resumes with the same
@@ -1555,17 +1537,6 @@ impl JoinLink {
                 .map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
-        // The entry Node's own relay knows the invite and admits its token. A relay's credential
-        // is read when the endpoint first connects to it, so it is found before binding.
-        if !config.discovery.is_empty() {
-            let probe = Net::bind(&node.identity.secret_key_hex, &config, 0, vec![]).await?;
-            let found = probe.discovered_relays(&entry, net::DIAL_TIMEOUT).await;
-            probe.close().await;
-            for url in found? {
-                relays.retain(|(known, _)| *known != url);
-                relays.push((url, Some(token.clone())));
-            }
-        }
         if let (Some(entry), Some(token)) = (&node.config.network.entry, &node.entry_token) {
             let url = net::relay_url(&entry.relay)?;
             relays.retain(|(known, _)| *known != url);
@@ -1576,7 +1547,7 @@ impl JoinLink {
             relays.retain(|(known, _)| *known != url);
             relays.push((url, Some(grant)));
         }
-        let addrs: Vec<TransportAddr> = relays
+        let mut addrs: Vec<TransportAddr> = relays
             .iter()
             .map(|(url, _)| TransportAddr::Relay(url.clone()))
             .collect();
@@ -1584,7 +1555,25 @@ impl JoinLink {
             !addrs.is_empty() || !config.discovery.is_empty(),
             "no relay or discovery server is configured to find the invite's entry Node"
         );
+        let credentialed: Vec<RelayUrl> = relays
+            .iter()
+            .filter(|(_, token)| token.is_some())
+            .map(|(url, _)| url.clone())
+            .collect();
         let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?);
+        // The entry Node's own relay knows the invite and admits its token; it goes in before
+        // the first dial through it.
+        if !config.discovery.is_empty() {
+            for url in link.discovered_relays(&entry, net::DIAL_TIMEOUT).await? {
+                if !credentialed.contains(&url) {
+                    link.insert_relay(url.clone(), Some(token.clone())).await;
+                }
+                let addr = TransportAddr::Relay(url);
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        }
         let router = link.discovery_router();
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
@@ -2052,17 +2041,17 @@ mod tests {
     fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
         let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
         let text = ticket.encode().unwrap();
-        let web = format!("http://192.168.1.10:4790/join#{text}");
-        let app = |link: &str| {
-            reqwest::Url::parse_with_params("vibeface://join", [("link", link)])
-                .unwrap()
-                .to_string()
-        };
-        for link in [web.clone(), text.clone(), app(&text), app(&web)] {
+        for link in [format!("vibeface://join/{text}"), format!(" {text} ")] {
             assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
         }
-        assert!(parse_join_link(&app(&app(&text))).is_err());
-        assert!(parse_join_link(&format!("http://h/other#{text}")).is_err());
+        for link in [
+            format!("http://192.168.1.10:4790/join#{text}"),
+            format!("vibeface://join?link={text}"),
+            format!("vibeface://join/{text}?x=1"),
+            format!("vibeface://other/{text}"),
+        ] {
+            assert!(parse_join_link(&link).is_err(), "{link}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3464,7 +3453,7 @@ mod tests {
             let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
             let params = json!({
                 "capability": capability.capability,
-                "link": format!("http://127.0.0.1:4793/join#{}", ticket.encode()?),
+                "link": format!("vibeface://join/{}", ticket.encode()?),
                 "name": "工作室 Mac",
             });
             let mut page = Session {
@@ -3579,7 +3568,7 @@ mod tests {
             // No address and no discovery: the join fails after it committed, before reaching anyone.
             let link = |secret: u8| -> Result<String> {
                 let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
-                Ok(format!("http://127.0.0.1:4795/join#{}", ticket.encode()?))
+                Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
             let mut page = Session {

@@ -1,5 +1,6 @@
-/** The join link a `vibeface://join?link=` address carries; the raw URL keeps the ticket after `#`, which router params drop. */
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
+
+/** The `vibeface://join/<ticket>` link the app was opened with, if it is one. */
 export function openedLink(url: string | null): string | null {
-  if (!url) return null
-  try { return new URL(url).searchParams.get('link') } catch { return null }
+  return url?.startsWith('vibeface://join/') && joinTicket(url) ? url : null
 }
