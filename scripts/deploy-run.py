@@ -95,8 +95,9 @@ def core_smoke(identity, info):
                                   input=json.dumps({'command': 'init', 'options': options})))
         release.require(result.get('ok') is True, 'isolated Core fixture initialization failed')
         docker('run', '--rm', *base, '--entrypoint', 'python3', identity, '-c',
-               "from pathlib import Path; import os; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch()")
-        result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
+               "from pathlib import Path; import os; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch(); "
+               "[os.chown(x,1001,1001) for x in [p,*p.rglob('*')]]")
+        result = json.loads(docker('run', '--rm', '-i', *base, '--user', '1001:1001', '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
         device = result['result']['device_id']
@@ -104,7 +105,9 @@ def core_smoke(identity, info):
                        '-e', 'VIBEFACE_EXPECTED_VERSION=' + info['version'],
                        '-e', 'VIBEFACE_EXPECTED_SOURCE=' + info['source_sha'],
                        '-e', 'VIBEFACE_EXPECTED_DEVICE=' + device]
-        container = docker('run', '-d', *base, *environment, identity).strip()
+        container = docker('run', '-d', *base, '--init', '--read-only', '--user', '1001:1001',
+                           '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+                           '--tmpfs', '/tmp:rw,nosuid,noexec,size=64m,mode=1777', *environment, identity).strip()
         for _ in range(30):
             health = subprocess.run(['docker', 'exec', container, 'python3', '/opt/vibeface/runtime.py', 'health'],
                                     capture_output=True, text=True)
@@ -132,8 +135,9 @@ def core_smoke(identity, info):
 
 
 def static_smoke(identity, component, role, sha):
-    container = subprocess.check_output(['docker', 'run', '-d', '--platform', 'linux/amd64',
-                                         '-p', '127.0.0.1::8080', identity], text=True).strip()
+    container = subprocess.check_output(['docker', 'run', '-d', '--platform', 'linux/amd64', '--init', '--read-only',
+                                         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+                                         '--tmpfs', '/tmp:rw,nosuid,noexec,size=64m,mode=1777', '-p', '127.0.0.1::8080', identity], text=True).strip()
     try:
         binding = subprocess.check_output(['docker', 'port', container, '8080/tcp'], text=True).strip()
         release.require(re.fullmatch(r'127\.0\.0\.1:[0-9]+', binding), 'invalid smoke binding')
