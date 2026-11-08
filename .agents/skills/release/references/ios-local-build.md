@@ -11,7 +11,7 @@
 
 ## 创建独立命令任务
 
-为本任务生成唯一 label，将 plist 放在用户的 `Library/LaunchAgents` 中，使用绝对路径。已验证的配置如下，路径和 label 按本次任务生成：
+为本任务生成唯一 label，将 plist 放在用户的 `Library/LaunchAgents` 中，使用绝对路径。任务配置如下，路径和 label 按本次任务生成：
 
 | 键 | 值 |
 | --- | --- |
@@ -36,7 +36,7 @@ launchctl print "gui/$USER_UID/$LABEL"
 
 ## 构建脚本
 
-脚本使用 `set -euo pipefail`，固定工作目录，显式提供 Node、pnpm、CocoaPods 的 PATH 和 UTF-8 locale。本地打包使用 `CI=1 EXPO_OFFLINE=1 EXPO_NO_TELEMETRY=1`；依赖下载另行完成，避免把 Expo 的外部连接等待当成签名失败。
+脚本使用 `set -euo pipefail`，固定工作目录，显式提供 Node、pnpm、Rust 与 CocoaPods 的 PATH 和 UTF-8 locale。本地打包使用 `CI=1 EXPO_OFFLINE=1 EXPO_NO_TELEMETRY=1`；依赖下载另行完成，避免把 Expo 的外部连接等待当成签名失败。
 
 1. 校验目标源码和输入摘要，为本次运行生成唯一标识并清除旧成功回执。
 2. 在仓库根执行 `pnpm install --frozen-lockfile`，并用 [原生加密模块构建脚本](../../../../scripts/build-mobile-secure.sh)准备 iOS XCFramework。只有来源 SHA、输入和文件摘要完全匹配的已验证产物才可复用。
