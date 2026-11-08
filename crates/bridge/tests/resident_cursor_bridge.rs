@@ -13,7 +13,9 @@ use vibeface_bridge::agent::{
 };
 
 #[cfg(windows)]
-fn fixture_process_handle(log: &Path) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+fn fixture_process_handle(
+    log: &std::path::Path,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 

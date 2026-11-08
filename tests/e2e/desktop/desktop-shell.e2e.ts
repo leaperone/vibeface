@@ -66,7 +66,10 @@ async function noPath(path: string, message: string) {
 
 async function openNodePanel(page: Page) {
   await evaluate(page, 'window.vibefaceClient.showNodePanel()');
-  await expect.poll(() => evaluate(page, 'location.pathname'), { timeout: 30000 }).toBe('/settings/desktop-node');
+  await expect.poll(() => evaluate(page, `(() => {
+    const clear = [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === '清除');
+    return clear && !clear.disabled ? location.pathname : null;
+  })()`), { timeout: 30000 }).toBe('/settings/desktop-node');
 }
 
 async function connectButtons(page: Page) {
