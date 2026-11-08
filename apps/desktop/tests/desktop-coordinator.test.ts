@@ -351,7 +351,7 @@ describe('Desktop coordinator', () => {
 
   it('requires an explicit stop before recovering the same bundled version and keeps it stopped', async () => {
     const profile = await temp(), dataDir = await temp()
-    let observed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: dataDir,
+    let observed: Extract<ManagedNodeStatus, { state: 'installed' | 'installed_stopped' | 'partial' }> = { ok: true, state: 'installed', device_id: deviceId, data_dir: dataDir,
       service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running',
       runtime_update: runtime('current', { recoveryRequired: true, installedVersion: '0.0.1-nightly.20261108.1', runningVersion: '0.0.1-nightly.20261108.1' }) }
     const managed = {
