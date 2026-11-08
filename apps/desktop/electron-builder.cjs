@@ -8,6 +8,12 @@ const path = require('node:path');
 
 const desktop = __dirname;
 const ELECTRON_VERSION = '45.2.3';
+const electronChecksums = require('./build/electron-checksums.json');
+assert.equal(electronChecksums.version, ELECTRON_VERSION, 'Electron checksum pins must match the runtime version');
+for (const platform of ['darwin-arm64', 'win32-x64', 'linux-x64', 'linux-arm64']) {
+  assert.match(electronChecksums.files[`electron-v${ELECTRON_VERSION}-${platform}.zip`] ?? '', /^[a-f0-9]{64}$/, 'Every supported Electron archive needs its official SHA-256');
+}
+
 const PLATFORMS = {
   'aarch64-apple-darwin': { os: 'mac', arch: 'arm64' },
   'x86_64-pc-windows-msvc': { os: 'win', arch: 'x64' },
@@ -37,6 +43,7 @@ module.exports = {
   protocols: [{ name: 'Vibeface', schemes: ['vibeface'] }],
   copyright: 'LEAPER ONE',
   electronVersion: ELECTRON_VERSION,
+  electronDownload: { isVerifyChecksum: true, checksums: electronChecksums.files },
   directories: { output, buildResources: path.join(desktop, 'build') },
   // Only the compiled host ships inside the asar; business UI comes from the bundled Core.
   files: ['package.json', 'dist/main/**', 'dist/preload/**'],
