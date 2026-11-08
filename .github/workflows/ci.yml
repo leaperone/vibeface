@@ -114,6 +114,7 @@ jobs:
           python3 scripts/run-delivery-live.py --self-test
           python3 scripts/daily-nightly.py --self-test
           python3 scripts/release.py self-test
+          python3 -B scripts/test_progressive_publication.py
           python3 scripts/package-node-windows.py --self-test
           python3 scripts/windows-diagnostic-input.py --self-test
           python3 scripts/checksum.py --self-test
