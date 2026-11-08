@@ -311,7 +311,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const secret = invites.get(input.invite_hash);
         if (!secret) throw new Error('unknown invite');
         invites.delete(input.invite_hash);
-        result = ticketEncode(input.entry_id, hex(secret), input.relay_url ?? undefined, input.direct_addrs ?? []);
+        result = ticketEncode(input.entry_id, hex(secret));
         secret.fill(0);
         break;
       }
@@ -530,16 +530,14 @@ class Client:
             require(observed == status, f"{path}: expected HTTP {status}, received {observed}")
             return json.loads(encoded) if encoded and "application/json" in response.headers.get("Content-Type", "") else encoded or None
 
-    def invite(self, *, discovery_only=False):
+    def invite(self):
         """A one-time ticket link to the entry this manager is connected to."""
         made = self.command("invite", network_id=self.network_id, entry_id=self.device_id)
         tampered = copy.deepcopy(made["record"])
         tampered["expires_at_ms"] += 1
         self.call("invite", {"record": tampered}, status=400)
-        entry = self.call("invite", {"record": made["record"]}).get("entry") or {}
-        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id,
-                              relay_url=None if discovery_only else entry.get("relay_url"),
-                              direct_addrs=[] if discovery_only else entry.get("direct_addrs") or [])
+        self.call("invite", {"record": made["record"]})
+        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id)
         return f"{self.url}/join#{ticket}"
 
     def directory_state(self):
@@ -719,17 +717,14 @@ class Node:
             self.log = None
             return returncode
 
-    def pair(self, owner, *, discovery_only=False):
+    def pair(self, owner):
         """`vibeface join <link>` on this stopped Node; the owner approves once the short codes match."""
         require(self.process is None, f"{self.name}: joins while stopped")
         owner = getattr(owner, "client", owner)
-        link = owner.invite(discovery_only=discovery_only)
-        if discovery_only:
-            encoded = link.split("#vibeface1", 1)[1].upper()
-            ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
-            # The browser decoder hides transport fields, so inspect this fixture's postcard entry.
-            require(len(ticket) == 67 and ticket[0] == 1 and ticket[33:35] == b"\x00\x00",
-                    "discovery-only CLI join ticket contains no relay or direct address")
+        link = owner.invite()
+        encoded = link.split("#vibeface1", 1)[1].upper()
+        ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
+        require(len(ticket) == 65 and ticket[0] == 1, "CLI join ticket holds only the entry device ID and secret")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
@@ -779,6 +774,19 @@ class Node:
         self.client.principal = result["principal"]
         require(self.client.principal["can_manage"], "creating the network makes this browser a manager")
         return self.client.network_id
+
+
+def local_discovery(run, binary, workspace, helper, cleanup, name="DISCOVERY"):
+    """A started discovery-only Node on loopback. Invites carry only the entry's device ID, so a CLI join
+    finds its entry here; give `discovery_address` to the joiner and the entry before they start."""
+    port = available_port()
+    node = Node(run, name, binary, workspace, helper, init_args=[
+        "--public-entry", "--relay-mode", "discovery-only", "--relay-listen", f"0.0.0.0:{port}"])
+    cleanup.append(node)
+    node.discovery_port = port
+    node.discovery_address = f"vibeface://{node.device_id}@localhost:{port}"
+    node.start()
+    return node
 
 
 def invocations(run, label=None):
@@ -3425,10 +3433,12 @@ def phase1_acceptance(options):
         wait_for("A receives its client grant", lambda: a.client.authenticate())
 
     try:
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
         a = Node(run, "A", binary, workspace, helper)
         nodes.append(a)
         a.configure(timeout_secs=600, manager=manager, bins={"codex": str(codex)}, app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
+        a.configure_network(discovery=[discovery])
         a.start()
         network = a.bootstrap()
         a.client.call("subscribe")
@@ -3764,6 +3774,7 @@ def phase1_acceptance(options):
         b.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(child_fixture, child_workspace),
                     bins={"codex": str(fixture_wrapper(child_fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
+        b.configure_network(discovery=[discovery])
         b.pair(a)
         b.start()
         root_workspace = run / "delegate-root-workspace"
@@ -3777,6 +3788,7 @@ def phase1_acceptance(options):
                             manager=fixture_manager_settings(root_fixture, root_workspace),
                             bins={"codex": str(fixture_wrapper(root_fixture, "fixture-codex", "--fixture-codex"))},
                             app_server=SPAWN_APP_SERVER)
+        root_node.configure_network(discovery=[discovery])
         root_node.pair(a)
         root_node.start()
         root_node.client = Client(root_node.url, helper, identity_file=a.client.identity_file)
@@ -4191,6 +4203,7 @@ def memory_sync_acceptance(options):
         return rows
 
     try:
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
         for name in ("A", "B"):
             node = Node(run, name, binary, workspace, helper)
             nodes.append(node)
@@ -4199,8 +4212,8 @@ def memory_sync_acceptance(options):
             node.configure(timeout_secs=600, daily_decision_limit=100, app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace),
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))})
-            node.configure_network(relays=[], n0_relays=False, discovery=[])
-        a, b = nodes
+            node.configure_network(relays=[], n0_relays=False, discovery=[discovery])
+        _, a, b = nodes
         a.start()
         network = a.bootstrap()
         b.pair(a)
@@ -4217,7 +4230,7 @@ def memory_sync_acceptance(options):
         agent("memory-seed", [{"name": "remember", "arguments": {
             "call_ref": memory_id, "memory_id": memory_id, "text": "Original Agent note " + memory_id}}
             for memory_id in protected])
-        wait_for("both Nodes receive the Agent seed", lambda: converged(nodes, network), timeout=60)
+        wait_for("both Nodes receive the Agent seed", lambda: converged((a, b), network), timeout=60)
         seeds = {memory_id: state(a.client, memory_id)["current"] for memory_id in protected}
         for memory_id, current in seeds.items():
             rows = memory_events(a, memory_id=memory_id)
@@ -4309,7 +4322,7 @@ def memory_sync_acceptance(options):
         b.configure_network(bind=f"127.0.0.1:{b.quic_port}")
         b.start()
         reconnect(b, at_b)
-        wait_for("opposite-order Memory histories converge", lambda: converged(nodes, network), timeout=60)
+        wait_for("opposite-order Memory histories converge", lambda: converged((a, b), network), timeout=60)
         expected[carrier_request["memory_id"]] = {**carrier_a, "metadata": {**carrier_a["metadata"],
             "source_event_hash": min(carrier_a["metadata"]["source_event_hash"], carrier_b["metadata"]["source_event_hash"])}}
         for memory_id, current in expected.items():
@@ -4348,7 +4361,7 @@ def memory_sync_acceptance(options):
              "accepted": False, "rejection": "user-controlled"}])
         require(len([row for row in protected_attempts if row["name"] == "remember" and not row["accepted"]]) == 2,
                 "the real Agent tool refuses both protected live and deleted notes")
-        wait_for("the valid nonrepresentative-base edit synchronizes", lambda: converged(nodes, network), timeout=60)
+        wait_for("the valid nonrepresentative-base edit synchronizes", lambda: converged((a, b), network), timeout=60)
         require(conflicts(a.client) == conflicts(at_b) == page,
                 "duplicate carriers and the normal user base chain introduce no false sync conflict")
         projection_provenance = provenance(a)
@@ -4371,7 +4384,7 @@ def memory_sync_acceptance(options):
         b.start()
         reconnect(a, a.client)
         reconnect(b, at_b)
-        wait_for("the restored old Node reimports the actual signed Memory log", lambda: converged(nodes, network), timeout=90)
+        wait_for("the restored old Node reimports the actual signed Memory log", lambda: converged((a, b), network), timeout=90)
         for node, client in ((a, a.client), (b, at_b)):
             require(all(state(client, memory_id) == {"current": current, "receipt": None}
                         and state(client, memory_id, current["metadata"]["revision"]) == {"current": current, "receipt": "recorded"}
@@ -4389,7 +4402,7 @@ def memory_sync_acceptance(options):
                            for scope in (conversation, other_scope)} == memory_hashes)
         passed("restart-and-signed-log-replay-without-agent-effects", memories=len(expected),
                memory_events=sum(len(hashes) for hashes in memory_hashes.values()), manager_invocations=invocation_count,
-               dag={node.name: verify_dag(node, network) for node in nodes})
+               dag={node.name: verify_dag(node, network) for node in (a, b)})
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"
@@ -4523,6 +4536,9 @@ def acceptance(options):
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        for node in (a, p, b, c):
+            node.configure_network(discovery=[discovery])
         a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
@@ -4843,6 +4859,7 @@ def phase4_acceptance(options):
         for name in ("A", "P", "B", "C"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c = nodes
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
         for node in (a, b, c):
             root = roots[node.name] = run / ("fixture-" + node.name)
             root.mkdir(mode=0o700)
@@ -4850,8 +4867,8 @@ def phase4_acceptance(options):
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))},
                            app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
-            node.configure_network(relays=[relay_url])
-        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+            node.configure_network(relays=[relay_url], discovery=[discovery])
+        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -5509,12 +5526,9 @@ def discovery_acceptance(options):
         return node_status(node)
 
     try:
-        discovery_port = available_port()
-        d = Node(run, "D", binary, workspace, helper, init_args=[
-            "--public-entry", "--relay-mode", "discovery-only", "--relay-listen", f"0.0.0.0:{discovery_port}"])
-        nodes.append(d)
+        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
+        discovery_port = d.discovery_port
         require(not (d.directory / "entry-token").exists(), "discovery has no data-relay operator token")
-        d.start()
         require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
         for path in ("/api/client", "/api/decision", "/api/local/setup"):
             d.client.request(path, status=404)
@@ -5524,14 +5538,14 @@ def discovery_acceptance(options):
         except ConnectionRefusedError:
             pass
         passed("discovery-has-no-business-relay-or-http-proxy")
-        address = f"vibeface://{d.device_id}@localhost:{discovery_port}"
+        address = d.discovery_address
         a, b = [Node(run, name, binary, workspace, helper) for name in ("A", "B")]
         nodes += [a, b]
         for node in (a, b):
             node.configure_network(discovery=[address])
         a.start()
         network = a.bootstrap()
-        b.pair(a, discovery_only=True)
+        b.pair(a)
         b.start()
         wait_for("discovery establishes A-to-B direct sync", lambda: peer(a, b).get("path") == "direct", timeout=60)
         a.client.rpc("create_conversation", conversation_id="discovery-first", title="Discovery direct sync")
@@ -5575,6 +5589,7 @@ def discovery_acceptance(options):
         r = Node(run, "R", binary, workspace, helper, init_args=[
             "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
         nodes.append(r)
+        r.configure_network(discovery=[address])
         r.pair(a)
         r.start()
         for node in (a, b):
@@ -5692,8 +5707,9 @@ def phase5_acceptance(options):
         nodes += [a, b]
         for node in nodes:
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
-        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
-        a.configure_network(relays=[relay_url])
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
+        a.configure_network(relays=[relay_url], discovery=[discovery])
         a.start()
         network = a.bootstrap()
         b.pair(a)
@@ -5703,7 +5719,7 @@ def phase5_acceptance(options):
         clients.append(browser)
         wait_for("the browser is known at B", at_b)
         write(a.client)
-        wait_for("A and B converge", lambda: converged(nodes, network), timeout=60)
+        wait_for("A and B converge", lambda: converged((a, b), network), timeout=60)
         shown = wait_for("A's status shows B synced", lambda: (lambda s: s if s["peers"] and s["peers"][0]["synced_ms"] else None)(node_status(a)))
         require(shown["write_state"] == "writable" and shown["peers"][0]["device_id"] == b.device_id
                 and shown["peers"][0]["reachable"] is True, "status reports writes and the reachable peer")
@@ -5718,7 +5734,7 @@ def phase5_acceptance(options):
         until(a, "writable")
         write(a.client)
         write(a.client)
-        ahead = wait_for("B holds A's newer events", lambda: converged(nodes, network), timeout=60)[a.device_id]
+        ahead = wait_for("B holds A's newer events", lambda: converged((a, b), network), timeout=60)[a.device_id]
         a.stop()
         b.stop()
         shutil.rmtree(a.directory)
@@ -5732,7 +5748,7 @@ def phase5_acceptance(options):
         until(a, "writable")
         require(heads(a, network)[a.device_id] >= ahead, "A took back the events it wrote after the backup")
         write(a.client)
-        wait_for("A and B converge after the restore", lambda: converged(nodes, network), timeout=60)
+        wait_for("A and B converge after the restore", lambda: converged((a, b), network), timeout=60)
         require(not state(a.client)["conflicts"] and not state(at_b())["conflicts"], "no fork after the restore")
         passed("restored-backup-refuses-writes-until-aligned", before=before, refused=refused[:120], own_seq_from_peer=ahead)
 
@@ -5753,7 +5769,7 @@ def phase5_acceptance(options):
         until(a, "writable")
         original = f"p5-{next(created)}"
         a.client.rpc("create_conversation", conversation_id=original, title=original)
-        wait_for("B holds A's newest event", lambda: converged(nodes, network), timeout=60)
+        wait_for("B holds A's newest event", lambda: converged((a, b), network), timeout=60)
         a.stop()
         b.stop()
         twin = copy.copy(a)
@@ -5868,6 +5884,8 @@ def auto_route_acceptance(options):
         nodes.append(target)
         target.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
+        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        target.configure_network(discovery=[discovery])
         target.start()
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)
@@ -5995,6 +6013,7 @@ def auto_route_acceptance(options):
 
         joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
+        joining.configure_network(discovery=[discovery])
         code = joining.pair(target)
         listed = target.client.call("directory")["view"]["members"]
         require(any(row["device_id"] == joining.device_id and row["kind"] == "node" for row in listed),
@@ -8741,7 +8760,7 @@ def e2e_fixture(options):
             member.bootstrap()
             member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
                               name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
-            bootstrap_invitation = member.client.invite(discovery_only=True).split("#", 1)[1]
+            bootstrap_invitation = member.client.invite().split("#", 1)[1]
             bootstrap_site = BootstrapSite(options.fixture_port, entry, discovery)
         for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
             args = delivery_entry_args() if role == "provider" else []

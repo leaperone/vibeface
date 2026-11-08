@@ -173,8 +173,7 @@ export const secure: NativeSecure = {
     call(() => ffi.shortCode(networkId, inviteId, joiner, admin, adminNonce, joinerNonce)),
   signingMessage: (domain, payload) => new Uint8Array(call(() => ffi.signingMessage(domain, toBuffer(payload)))),
   ticketDecode: (text) => call(() => ffi.ticketDecode(text)),
-  ticketEncode: (entryId, secretHex, relayUrl, directAddrs) =>
-    call(() => ffi.ticketEncode(entryId, secretHex, relayUrl ?? undefined, directAddrs)),
+  ticketEncode: (entryId, secretHex) => call(() => ffi.ticketEncode(entryId, secretHex)),
   verify: (deviceId, domain, payload, signature) =>
     call(() => ffi.verify(deviceId, domain, toBuffer(payload), signature)),
   verifyMembership: (stateJson, expectedNetwork) =>

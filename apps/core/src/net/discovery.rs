@@ -5,7 +5,7 @@ use super::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -29,6 +29,7 @@ const MAX_REQUESTS: usize = 60;
 const LEASE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_HOME_RELAYS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Server {
@@ -85,7 +86,11 @@ pub(super) fn validate_server(value: &str) -> Result<()> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Register {},
+    /// The relays the connecting device is reachable through; the QUIC handshake proved the
+    /// device, and a wrong relay only makes it unreachable.
+    Register {
+        relays: Vec<RelayUrl>,
+    },
     Lookup {
         device_id: EndpointId,
     },
@@ -107,6 +112,7 @@ enum Reply {
     Peer {
         device_id: EndpointId,
         address: SocketAddr,
+        relays: Vec<RelayUrl>,
     },
     Notice {
         device_id: EndpointId,
@@ -128,6 +134,7 @@ enum Reply {
 struct Registration {
     generation: usize,
     address: SocketAddr,
+    relays: Vec<RelayUrl>,
     notices: mpsc::Sender<(EndpointId, SocketAddr)>,
     last_notice: Option<Instant>,
 }
@@ -286,13 +293,20 @@ impl Discovery {
             let observations = observations.clone();
             tasks.push(tokio::spawn(async move {
                 while !endpoint.is_closed() {
-                    if let Err(error) =
-                        register(&endpoint, &server, &client, &probes, &observations).await
-                    {
-                        tracing::debug!(%error, "discovery registration ended");
-                    }
+                    let moved =
+                        match register(&endpoint, &server, &client, &probes, &observations).await {
+                            Ok(moved) => moved,
+                            Err(error) => {
+                                tracing::debug!(%error, "discovery registration ended");
+                                false
+                            }
+                        };
                     *client.connection.lock().expect("discovery connection") = None;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // A new home relay registers at once: until then, joiners that can only
+                    // come through a relay find none.
+                    if !moved {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }));
         }
@@ -315,9 +329,10 @@ impl Discovery {
             .map(|(_, client)| DiscoveryClient(client.clone()))
     }
 
-    pub async fn resolve(&self, device_id: EndpointId) -> Option<SocketAddr> {
+    /// Where `device_id` is registered, waiting up to `wait` for this endpoint's own sessions.
+    pub async fn resolve(&self, device_id: EndpointId, wait: Duration) -> Option<Located> {
         let queries = self.clients.iter().map(|(_, client)| async move {
-            let connection = client.connection_or_wait(Duration::from_secs(1)).await?;
+            let connection = client.connection_or_wait(wait).await?;
             tokio::time::timeout(CONTROL_TIMEOUT, async {
                 let (mut send, mut recv) = connection.open_bi().await?;
                 write(&mut send, &Request::Lookup { device_id }, MAX_REQUEST).await?;
@@ -326,9 +341,11 @@ impl Discovery {
                     Reply::Peer {
                         device_id: found,
                         address,
+                        relays,
                     } if found == device_id => {
                         validate_address(address)?;
-                        Ok::<_, anyhow::Error>(Some(address))
+                        validate_relays(&relays)?;
+                        Ok::<_, anyhow::Error>(Some(Located { address, relays }))
                     }
                     Reply::Missing {} => Ok(None),
                     _ => bail!("invalid discovery lookup reply"),
@@ -339,11 +356,14 @@ impl Discovery {
             .ok()
             .flatten()
         });
-        futures_util::future::join_all(queries)
-            .await
-            .into_iter()
-            .flatten()
-            .next()
+        // The first answer wins, so a server that is down costs no more than its own wait.
+        let mut queries = queries.collect::<futures_util::stream::FuturesUnordered<_>>();
+        while let Some(found) = futures_util::StreamExt::next(&mut queries).await {
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     pub async fn serve(&self, connection: Connection) -> Result<()> {
@@ -421,7 +441,8 @@ impl Discovery {
                             write(&mut send, &reply, MAX_REPLY).await?;
                             send.finish()?;
                         }
-                        Request::Register {} if self.server && !registered => {
+                        Request::Register { relays } if self.server && !registered => {
+                            validate_relays(&relays)?;
                             registered = true;
                             let (notices, mut incoming) = mpsc::channel(8);
                             let device_id = connection.remote_id();
@@ -435,6 +456,7 @@ impl Discovery {
                                 .push(Registration {
                                     generation,
                                     address,
+                                    relays,
                                     notices,
                                     last_notice: None,
                                 });
@@ -476,11 +498,15 @@ impl Discovery {
                                         {
                                             entry.last_notice = Some(Instant::now());
                                         }
-                                        entry.address
+                                        (entry.address, entry.relays.clone())
                                     })
                             };
                             let reply = match found {
-                                Some(address) => Reply::Peer { device_id, address },
+                                Some((address, relays)) => Reply::Peer {
+                                    device_id,
+                                    address,
+                                    relays,
+                                },
                                 None => Reply::Missing {},
                             };
                             write(&mut send, &reply, MAX_REPLY).await?;
@@ -499,6 +525,24 @@ impl Discovery {
         connection.close(0u32.into(), b"discovery session ended");
         result?
     }
+}
+
+/// Where Discovery last saw a device: its observed UDP address and the relays it registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Located {
+    pub address: SocketAddr,
+    pub relays: Vec<RelayUrl>,
+}
+
+fn validate_relays(relays: &[RelayUrl]) -> Result<()> {
+    ensure!(
+        relays.len() <= MAX_HOME_RELAYS,
+        "too many relays in a discovery record"
+    );
+    for url in relays {
+        super::relay_url(url.as_str())?;
+    }
+    Ok(())
 }
 
 fn validate_address(address: SocketAddr) -> Result<()> {
@@ -529,10 +573,25 @@ async fn register(
     client: &Client,
     probes: &Arc<Semaphore>,
     observations: &tokio::sync::Mutex<HashMap<SocketAddr, usize>>,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut addr = endpoint.watch_addr();
+    let home = |addr: &EndpointAddr| {
+        addr.relay_urls()
+            .take(MAX_HOME_RELAYS)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let relays = home(&addr.get());
     let connection = server.connect(endpoint).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    write(&mut send, &Request::Register {}, MAX_REQUEST).await?;
+    write(
+        &mut send,
+        &Request::Register {
+            relays: relays.clone(),
+        },
+        MAX_REQUEST,
+    )
+    .await?;
     send.finish()?;
     let Reply::Registered { address } =
         tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REPLY)).await??
@@ -552,9 +611,15 @@ async fn register(
     client.ready.notify_waiters();
     let mut work = JoinSet::new();
     let result = async {
-        loop {
+        let moved = loop {
             let reply: Reply = tokio::select! {
-                _ = connection.closed() => break,
+                _ = connection.closed() => break false,
+                // A new home relay ends this session, so the next one registers it.
+                changed = addr.updated() => match changed {
+                    Ok(changed) if home(&changed) != relays => break true,
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                },
                 reply = read(&mut recv, MAX_REPLY) => reply?,
             };
             let Reply::Notice { device_id, address } = reply else {
@@ -589,8 +654,8 @@ async fn register(
                 });
             }
             while work.try_join_next().is_some() {}
-        }
-        Ok(())
+        };
+        Ok(moved)
     }
     .await;
     {
@@ -727,10 +792,23 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<Request>(
-                json!({"type":"register","address":"127.0.0.1:1234"})
+                json!({"type":"register","relays":[],"address":"127.0.0.1:1234"})
             )
             .is_err()
         );
+        assert!(serde_json::from_value::<Request>(json!({"type":"register"})).is_err());
+        let relays = |count: usize| -> Vec<RelayUrl> {
+            (0..count)
+                .map(|i| {
+                    format!("https://relay{i}.example/")
+                        .parse()
+                        .expect("relay URL")
+                })
+                .collect()
+        };
+        validate_relays(&relays(MAX_HOME_RELAYS))?;
+        assert!(validate_relays(&relays(MAX_HOME_RELAYS + 1)).is_err());
+        assert!(validate_relays(&["ftp://relay.example/".parse()?]).is_err());
         Ok(())
     }
 
@@ -744,6 +822,7 @@ mod tests {
             vec![Registration {
                 generation: 2,
                 address: "127.0.0.1:1234".parse()?,
+                relays: vec![],
                 notices,
                 last_notice: None,
             }],
@@ -879,7 +958,7 @@ mod tests {
         ];
         let a_id = LocalIdentity::generate();
         let b_id = LocalIdentity::generate();
-        let mut a_config = NetworkConfig {
+        let a_config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
             discovery: discovery.clone(),
             ..Default::default()
@@ -915,20 +994,37 @@ mod tests {
             "http://{}",
             relay.http_addr().context("relay listener missing")?
         );
-        a_config.relays = vec![relay_url.clone()];
+        // Only B uses the relay: A dials it as Discovery names it, outside its own relay map.
         b_config.relays = vec![relay_url];
         let a = net(&a_id, &a_config).await?;
         let b = net(&b_id, &b_config).await?;
         let a_router = router(&a);
         let b_router = router(&b);
         registered(&service, 2).await?;
+        let b_endpoint = b.endpoint.id();
+        // B registers again once its home relay is up; A learns that relay only from Discovery.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while b.addr().relay_urls().next().is_none() {
+            loop {
+                let relays = service
+                    .discovery
+                    .registry
+                    .lock()
+                    .expect("registry")
+                    .entries
+                    .get(&b_endpoint)
+                    .and_then(|entries| entries.last())
+                    .map(|entry| entry.relays.clone());
+                if relays.is_some_and(|relays| {
+                    !relays.is_empty() && relays.iter().eq(b.addr().relay_urls())
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await?;
-        a.learn(&b.addr()).await;
+        .await
+        .context("B's home relay was not registered")?;
+        assert!(a.lookup.get_endpoint_info(b_endpoint).is_none());
         let peer = b_id.device_id()?;
         assert_eq!(
             a.request(&peer, SYNC, &json!({"fallback":true}), CONTROL_TIMEOUT)

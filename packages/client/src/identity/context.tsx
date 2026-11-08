@@ -768,11 +768,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const configured = typeof result.gateway_url === 'string' && isPublicUrl(result.gateway_url) ? result.gateway_url : undefined
     const used = route.kind !== 'lan' && route.device_id === entryId ? route : connection.entry
     const origin = configured ?? reachable?.gateway_url ?? (used.kind === 'lan' ? null : used.address)
-    const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
-    const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined
-    // Where the entry Node listens, so the app can join it on the LAN.
-    const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
-    const ticket = ticketEncode(entryId, hex(secret), relay, direct)
+    const ticket = ticketEncode(entryId, hex(secret))
     secret.fill(0)
     const app = `vibeface://join?link=${encodeURIComponent(ticket)}`
     // A public entrance is reachable from the App site; a LAN or loopback one only from its own page.
@@ -994,15 +990,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The app tries the entry Node where the ticket says it listens on the LAN, then the entry Node's relay from the
-   * ticket, then this page's own entry: a scanned code's address is only a hint, the device key is the check.
+   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: this page's own
+   * entry, the link's origin, then the catalogue's. A scanned code's address is only a hint, the device key is the check.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    const addresses = [...new Set([...link.relay ? [link.relay] : [], ...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
-    const base = [
-      ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
-      ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
-    ]
+    const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
+    const base = addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId }))
     return mergeJoinWays(base, link.entryId, new Set([link.entryId]))
   }
   /**

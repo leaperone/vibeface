@@ -193,16 +193,17 @@ test("the app's join QR code, a bare ticket and the web link name the same ticke
   assert.equal(joinTicket('https://node.example/#vibeface1test'), null)
 })
 
-test('a join link keeps the App origin apart from the relay origin its ticket names', async () => {
+test('a join link names the entry Node by device ID and the Gateway only by its origin', async () => {
   const app = await harness()
-  const ticket = wasm.ticketEncode(app.target, '1'.repeat(64), 'https://relay.example/', [])
+  const ticket = wasm.ticketEncode(app.target, '1'.repeat(64))
   const link = await app.parseJoinLink(`https://app.vibeface.dev/join#${ticket}`)
+  assert.deepEqual(Object.keys(link).sort(), ['entryId', 'inviteHash', 'inviteId', 'origin', 'secret'])
   assert.equal(link.origin, 'https://app.vibeface.dev')
-  assert.equal(link.relay, 'https://relay.example')
   assert.equal(link.entryId, app.target)
-  const bare = await app.parseJoinLink(wasm.ticketEncode(app.target, '1'.repeat(64), undefined, []))
+  assert.equal(link.secret, '1'.repeat(64))
+  const bare = await app.parseJoinLink(ticket)
   assert.equal(bare.origin, null)
-  assert.equal(bare.relay, null)
+  assert.equal(bare.entryId, app.target)
 })
 
 test('the device key cannot be exported', async () => {
