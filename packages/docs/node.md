@@ -139,14 +139,14 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 `vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。Codex 默认写入 `<data-dir>/providers/codex/hooks.json`，Claude 默认写入 `<data-dir>/providers/claude/settings.json`；pi 和 opencode 的扩展仍写入本机用户目录。给 `--home <目录>` 时，这四种产品的文件全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
-| 产品 | 写入 | Bot 能回答 |
+| 产品 | 写入 | 协调 Agent 能回答 |
 |---|---|---|
-| Codex | `<Codex 目录>/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
+| Codex | `<Codex 目录>/hooks.json` | 只上报 `Stop` 和 `PermissionRequest`，不挂起；App Server 上的请求由 Node 挂起，协调 Agent 用 `vibeface respond` 回答，需要本人决定时提问，答案经私有回答控制递交 |
 | Claude Code | `.claude/settings.json` 的 hooks | 权限请求和提问 |
 | pi | `.pi/agent/extensions/vibeface.ts` | 一轮结束后替本人发下一条消息；本人已接着输入时丢弃 |
 | opencode | `.config/opencode/plugins/vibeface.ts` | 权限请求和提问 |
 
-Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端处理。
+hook 挂起的请求由协调 Agent 经 `vibeface requests` 和 `vibeface respond` 处理；30 秒内既没回答也没提问时，请求交回原程序，由本人在终端处理。
 
 ### 转发到外部聊天
 
