@@ -310,7 +310,7 @@ def transform_nginx(text, config):
         catchall += int(is_catchall)
         if config['role'] == 'relay':
             require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                    or len(words) == 3 and words[1] == '=' and words[2] in ('/api/info', '/api/client', '/api/decision'),
+                    or len(words) == 3 and words[1] == '=' and words[2] in ('/api/info', '/api/client'),
                     'Relay refuses frontend and non-browser API routes')
             if not is_catchall:
                 continue

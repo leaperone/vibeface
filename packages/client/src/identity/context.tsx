@@ -775,7 +775,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const ticket = ticketEncode(entryId, hex(secret), relay, direct)
     secret.fill(0)
     const app = `vibeface://join?link=${encodeURIComponent(ticket)}`
-    const link = `${APP_ORIGIN}/join#${ticket}`, publicEntry = origin !== null && isPublicUrl(origin)
+    // A public entrance is reachable from the App site; a LAN or loopback one only from its own page.
+    const publicEntry = origin !== null && isPublicUrl(origin)
+    const link = publicEntry ? `${APP_ORIGIN}/join#${ticket}` : origin ? `${origin}/join#${ticket}` : app
     return { link, qr: publicEntry ? link : app, publicEntry, expiresAt }
   }
   async function startApproval(joinId: string) {
