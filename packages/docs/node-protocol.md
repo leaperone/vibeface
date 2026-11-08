@@ -74,9 +74,9 @@
 
 `provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机适配器能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、Claude Code、pi 与 opencode 支持活动补充，分别使用原生 steer 或持续输入；当前 Cursor ACP 适配器未提供原生 steer，活动补充明确拒绝。接纳与回合归属分别记录，不代表模型已读。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
 
-Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。任务也使用独立进程和存储，续接同一本机任务会话时复用原有 owner。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
+Cursor 每轮启动官方 CLI ACP 进程，按个人网络、Bot 会话、任务或设备协调会话隔离 owner 和私有存储。同一个 owner 串行运行，不同 Bot 可同时运行。`CURSOR_CONFIG_DIR` 保存私有 ACP 会话，`CURSOR_DATA_DIR` 保存私有项目数据，真实 HOME 留给 CLI 已有登录。Node 仅新建或加载自己记录归属的会话，忽略加载阶段回放，不扫描或导入个人历史。CLI 仍可能加载用户或项目 MCP、规则与 hooks，这两个私有目录不表示全部个人配置隔离。退出时停止全部受管进程组。
 
-Cursor 执行器在发送前保存 Agent ID，流首次给出 Run ID 时记录该运行。工作进度和结果使用既有工作状态与事件；取消只在 Provider 终态确认后结算。断流或重启后按已知 Agent ID、Run ID 和原有私有存储调用 `GetRun`；缺少运行 ID 或读取失败时保持待核对，绝不按最新运行猜测或重新发送。任务回读不改变 Bot 的 `run_reconcile=false` 能力声明。
+Cursor 执行器先保存 Node 自己的 session 归属和 prompt receipt，再发送提示；终态先写本机 journal，再报告完成。receipt 是 Node 的读回定位，不是 Cursor 原生 Run ID。ACP 没有持久运行查询或幂等 prompt 契约，断流、重启或缺少终态时保持 Unknown，只读回已有 journal，不重发 prompt，也不以历史内容猜测完成。取消只有原 prompt 返回 cancelled 才确认，进程退出不作为取消证据。Bot 的 `run_reconcile=false` 能力声明不变。
 
 pi 的实际会话保存在 `<data-dir>/providers/pi/sessions`，真实启动同时固定 `--session-dir` 与 `PI_CODING_AGENT_SESSION_DIR`。原有 pi 认证配置不变。OpenCode 的数据、配置、状态和缓存分别使用 `<data-dir>/providers/opencode/{data,config,state,cache}`，`OPENCODE_DB` 固定为该 data 根中的 `opencode/opencode.db`。Node 强制私有 `OPENCODE_CONFIG_DIR`，忽略外部 `OPENCODE_CONFIG`、额外 CLI 配置和项目配置覆盖，Shell 工具继承相同私有根。
 
@@ -280,7 +280,7 @@ job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`re
 
 逐条 receipt 分开保存 Provider 接受与实际原生回合归属。Codex 以稳定 `clientUserMessageId` 回读，Claude 以已登记 UUID 和持续输入组恢复，pi 与 OpenCode 读取各自原生记录。输入可能属于实际后续回合，必须记录其真实 turn。工具调用中的中间 assistant 消息不证明整个回答完成。只有原生证据证明输入及其终态才能结算为 `answered` 或 `unfinished`；仅有提交或接收不能显示模型已读。不可读与宿主结束后持续 Pending 分别计时，不能解释成一个固定的总等待期限。确认未到达才允许后续调度，持续无法核定则保留 `unknown`。
 
-steer 状态只在本机调度日志保存，同步和恢复不重放输入。结算为 `answered` 时同事务写入 `message_steered`，避免新 owner 把它当未回复。当前 Cursor 独立 Bridge 没有暴露新版 SDK 的文本 steer，不能声称活动补充已支持。
+steer 状态只在本机调度日志保存，同步和恢复不重放输入。结算为 `answered` 时同事务写入 `message_steered`，避免新 owner 把它当未回复。当前 Cursor ACP 适配器没有提供原生文本 steer，不能声称活动补充已支持。
 
 跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合。Bot 回答与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断保留已输出部分。`failed` 与 `interrupted` 带失败类别，原始错误留在本机 job 与 `node.log`，客户端按类别说明。
 

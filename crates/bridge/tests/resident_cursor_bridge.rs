@@ -304,6 +304,7 @@ async fn scoped_permissions_and_blocking_extensions_always_receive_safe_response
     let root = root()?;
     let agent = agent(&root)?;
     let turn = turn(&root, "interactions");
+    let mut updates = Vec::new();
     let result = agent
         .run(
             &turn,
@@ -311,10 +312,20 @@ async fn scoped_permissions_and_blocking_extensions_always_receive_safe_response
             None,
             |_| async { Ok(()) },
             watch::channel(false).1,
-            |_| async { Ok(()) },
+            |update| {
+                updates.push(update);
+                async { Ok(()) }
+            },
         )
         .await?;
     assert_eq!(result.output, "done: interactions");
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|update| update["status"] == "interaction_declined")
+            .count(),
+        2
+    );
     let replies = lines(&root.join("replies.jsonl"));
     for (id, selected) in [("permission", "allow"), ("unknown-permission", "reject")] {
         assert!(

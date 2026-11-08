@@ -130,7 +130,7 @@ for raw in sys.stdin:
                 send({"id": identifier, "method": "session/request_permission", "params": {"sessionId": session, "toolCall": {"kind": kind}, "options": [{"kind": "allow_once", "optionId": "allow"}, {"kind": "reject_once", "optionId": "reject"}]}})
             for identifier, method in [("ask", "cursor/ask_question"), ("plan", "cursor/create_plan"), ("unknown", "future/request")]:
                 interactions.add(identifier)
-                send({"id": identifier, "method": method, "params": {"sessionId": session}})
+                send({"id": identifier, "method": method, "params": {}})
         else:
             complete()
     elif method == "session/cancel":

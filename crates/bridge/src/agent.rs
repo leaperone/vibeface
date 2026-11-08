@@ -1219,7 +1219,10 @@ where
         };
         rpc.send(json!({"jsonrpc":"2.0","id":id,"result":result}))
             .await?;
-        if current && matches!(method, "cursor/ask_question" | "cursor/create_plan") {
+        if running
+            && session.is_some()
+            && matches!(method, "cursor/ask_question" | "cursor/create_plan")
+        {
             progress(json!({"type":"status","status":"interaction_declined","text":"Cursor 请求的交互已取消；需要本人决定时请通过节点提问。"})).await?;
         }
     } else if method == "session/update" && current {

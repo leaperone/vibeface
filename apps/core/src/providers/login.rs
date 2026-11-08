@@ -203,10 +203,8 @@ impl ProviderRoots {
                 // The official external-auth loader requires this mode and a String field;
                 // an empty refresh token in managed ChatGPT mode would be unsafe.
                 let mut credential = json!({"auth_mode":"chatgptAuthTokens","tokens":tokens});
-                for name in ["last_refresh"] {
-                    if let Some(value) = source.get(name) {
-                        credential[name] = value.clone();
-                    }
+                if let Some(value) = source.get("last_refresh") {
+                    credential["last_refresh"] = value.clone();
                 }
                 credential
             }
