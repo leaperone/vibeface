@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { registerHooks } from 'node:module'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
+import type { Platform } from '../lib/platform.ts'
 import { createDeliveryClient } from './client.ts'
 import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
@@ -93,6 +95,70 @@ const file = { name: 'example.txt', size: content.length, arrayBuffer: async () 
 function connection(request: ReadyConnection['request']): ReadyConnection {
   return { generation: 1, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: source }, principal: { source: 'membership', can_manage: true, network_id: 'network', device_id: 'client', epoch: 1 }, info: { device_id: source, name: 'own Node', version: 'test', initialized: true, network_id: 'network' }, request, rpc: async () => { throw new Error('delivery must not use private RPC') }, subscribe: () => () => {}, isCurrent: () => true }
 }
+
+test('delivery refresh keeps read-only history and file access without requesting manager budgets', async () => {
+  const identity = { network_id: 'network', device_id: 'client', epoch: 1 }
+  const principals: ReadyConnection['principal'][] = [
+    { ...identity, source: 'membership', can_manage: false },
+    { ...identity, source: 'local_session', can_manage: false },
+    { ...identity, source: 'membership', can_manage: true },
+  ]
+  const budget = { budget_id: '88'.repeat(32), payer: `0x${'66'.repeat(20)}`, payee: `0x${'77'.repeat(20)}`, provider_peer: provider,
+    asset: `0x${'55'.repeat(20)}`, deposit: '10', free: '10', locked: '0', earned: '0', withdrawn: '0', refunded: '0', state: 'open', gas_cap: '0', ready_windows: [] }
+  const react = `
+    export const effects = [], updates = [];
+    export const useMemo = create => create();
+    export const useRef = current => ({ current });
+    export const useState = initial => [initial, value => updates.push(value)];
+    export const useEffect = effect => effects.push(effect);
+  `
+  for (const principal of principals) for (const history of [false, true]) {
+    const managing = principal.source === 'membership' && principal.can_manage
+    const key = `${principal.source}-${managing}-${history}`
+    const subject = new URL('./client.ts', import.meta.url); subject.searchParams.set('refresh-permissions', key)
+    const reactUrl = `data:text/javascript,${encodeURIComponent(react)}#${key}`
+    const hooks: { effects: (() => void | (() => void))[]; updates: unknown[] } = await import(reactUrl)
+    const loader = registerHooks({ resolve(specifier, context, nextResolve) {
+      return specifier === 'react' && context.parentURL === subject.href ? { url: reactUrl, shortCircuit: true } : nextResolve(specifier, context)
+    } })
+    let loaded: typeof import('./client.ts')
+    try { loaded = await import(subject.href) }
+    finally { loader.deregister() }
+    const calls: Record<string, unknown>[] = []
+    const readable = { ...order(), order_id: 'aa'.repeat(32) }
+    const nextStatus = { ...status, paid_enabled: !history }, nextOrders = history ? [paidOrder(), readable] : [readable]
+    const transport = connection(async (method, params = {}) => {
+      assert.equal(method, 'delivery'); calls.push(params)
+      switch (params.op) {
+        case 'status': return nextStatus
+        case 'list': return { orders: nextOrders }
+        case 'budgets': if (!managing) throw new Error('budget permission denied'); return { budgets: [budget] }
+        case 'get': assert.equal(params.order_id, readable.order_id); return readable
+        case 'read': assert.equal(params.order_id, readable.order_id); return { name: readable.name, bytes: content.length, content_base64: toBase64(content), sha256: digest }
+        default: throw new Error('unexpected delivery request')
+      }
+    })
+    transport.principal = principal
+    const platform: Platform = {
+      storage: { getItem: () => null, setItem: () => { throw new Error('a read must not write storage') } },
+      onForeground: () => () => {}, foreground: () => false, self: 'test', saveRecovery: () => { throw new Error('unexpected recovery') },
+      get secure(): never { throw new Error('unexpected secure API') }, get transport(): never { throw new Error('unexpected transport') },
+      get outbox(): never { throw new Error('unexpected outbox') }, get notifier(): never { throw new Error('unexpected notifier') },
+      files: { pick: async () => null, save: async (bytes, name) => { assert.deepEqual(bytes, content); assert.equal(name, readable.name); return 'saved' } },
+    }
+    assert.equal(loaded.useDelivery(transport, platform).canManage, managing)
+    const cleanups = hooks.effects.map(effect => effect())
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(calls, managing ? [{ op: 'status' }, { op: 'list' }, { op: 'budgets' }] : [{ op: 'status' }, { op: 'list' }])
+      assert.deepEqual(hooks.updates.slice(-4), [nextStatus, nextOrders, managing ? [budget] : [], ''])
+      const client = createDeliveryClient(transport, platform.storage)
+      assert.deepEqual(await client.get(readable.order_id), readable)
+      assert.equal(await client.save(readable, platform), 'saved')
+      assert.deepEqual(calls.slice(-2), [{ op: 'get', order_id: readable.order_id }, { op: 'read', order_id: readable.order_id }])
+    } finally { for (const cleanup of cleanups) cleanup?.() }
+  }
+})
 
 test('a lost prepare response reuses its persisted intent and confirm submits only that original id', async () => {
   const records = new Map<string, string>(), calls: Record<string, unknown>[] = []

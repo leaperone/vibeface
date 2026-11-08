@@ -142,6 +142,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
 
 export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const client = useMemo(() => createDeliveryClient(connection, platform.storage), [connection, platform.storage])
+  const canManage = connection.principal.source === 'membership' && connection.principal.can_manage
   const [status, setStatus] = useState<DeliveryStatus | null>(null)
   const [orders, setOrders] = useState<DeliveryOrder[]>([])
   const [budgets, setBudgets] = useState<DeliveryBudget[]>([])
@@ -170,7 +171,7 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
       if (ordersResult.status === 'rejected') throw ordersResult.reason
       const nextStatus = statusResult.value, nextOrders = ordersResult.value
       let nextBudgets: DeliveryBudget[] = [], budgetError = ''
-      try { if (nextStatus.paid_enabled || nextOrders.some(order => order.mode === 'paid')) nextBudgets = await client.budgets() }
+      try { if (canManage && (nextStatus.paid_enabled || nextOrders.some(order => order.mode === 'paid'))) nextBudgets = await client.budgets() }
       catch (cause) { budgetError = messageOf(cause) }
       if (!current() || owner !== sequence.current) return
       setStatus(nextStatus); setOrders(nextOrders); setBudgets(nextBudgets); setReadError(budgetError)
@@ -202,7 +203,7 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const selected = orders.find(order => order.order_id === selectedId) ?? null
   return {
     status, orders, budgets, selected, busy, error: error || readError, notice,
-    canManage: connection.principal.source === 'membership' && connection.principal.can_manage,
+    canManage,
     select: setSelectedId,
     refresh: () => run('refresh', refresh),
     configure: (settings: DeliverySettings) => run('configure', async () => { const result = await client.configure(settings); if (current()) { sequence.current += 1; setStatus(result) } }),
