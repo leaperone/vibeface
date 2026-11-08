@@ -18,7 +18,7 @@ const TRANSIENT_CODES = new Set([
 /** Classify errors retriable for the main Electron ZIP GET only. */
 export function isTransientDownloadError(error) {
   const status = error?.response?.statusCode ?? error?.statusCode;
-  if (typeof status === 'number' && TRANSIENT_HTTP.has(status)) return true;
+  if (typeof status === 'number') return TRANSIENT_HTTP.has(status);
   const code = error?.code;
   if (typeof code === 'string' && TRANSIENT_CODES.has(code)) return true;
   if (error?.name === 'TimeoutError') return true;
@@ -81,6 +81,8 @@ export async function prefetchElectronArchive({
     platformName,
     arch,
   });
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  fs.mkdirSync(tempDirectory ?? cacheRoot, { recursive: true });
   assert.deepEqual(downloadConfig.checksums, pins.files);
   assert.notEqual(downloadConfig.unsafelyDisableChecksums, true);
 
@@ -96,7 +98,9 @@ export async function prefetchElectronArchive({
   let lastError;
   for (let attempt = 0; attempt < PREFETCH_ATTEMPTS; attempt++) {
     try {
-      return await downloadArtifact(options);
+      const archive = await downloadArtifact(options);
+      logStatus('verified archive is ready in the shared cache');
+      return archive;
     } catch (error) {
       if (!isTransientDownloadError(error)) throw error;
       lastError = error;
