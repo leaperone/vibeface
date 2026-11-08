@@ -116,7 +116,9 @@ def check(source, helpers):
     require(needs(workflow['publish']) == {'identity', 'collect'},
             'independent WWW publisher must consume its complete collection')
     www_guard = guard(workflow['publish'])
-    require("needs.identity.outputs.app == 'www'" in www_guard
+    require('always()' in www_guard and '!cancelled()' in www_guard
+            and "needs.identity.result == 'success'" in www_guard
+            and "needs.identity.outputs.app == 'www'" in www_guard
             and "needs.identity.outputs.publish == 'true'" in www_guard
             and "needs.collect.result == 'success'" in www_guard,
             'WWW publication must require a successful collection and explicit publish identity')
@@ -186,12 +188,14 @@ def check(source, helpers):
     require(not evaluate(collect, good, cancelled=True), 'cancelled product must not be collected')
     portal = {name: ('success' if name in ('identity', 'static') else 'skipped') for name in collection_needs}
     require(evaluate(collect, portal, scope='www'), 'website must be independently releasable')
-    require(evaluate(www_guard, {'collect': 'success'}, scope='www', publishing=True)
-            and not evaluate(www_guard, {'collect': 'success'}, scope='product', publishing=True)
-            and not evaluate(www_guard, {'collect': 'success'}, scope='www', publishing=False),
+    website_success = {'identity': 'success', 'collect': 'success'}
+    require(evaluate(www_guard, website_success, scope='www', publishing=True)
+            and not evaluate(www_guard, website_success, scope='product', publishing=True)
+            and not evaluate(www_guard, website_success, scope='www', publishing=False)
+            and not evaluate(www_guard, website_success, scope='www', cancelled=True),
             'WWW publication must be independent from product and disabled for build-only runs')
     for failure in ('failure', 'cancelled', 'skipped'):
-        require(not evaluate(www_guard, {'collect': failure}, scope='www'),
+        require(not evaluate(www_guard, {**website_success, 'collect': failure}, scope='www'),
                 'incomplete website collection may publish publicly')
     require(not evaluate(guard(creator), {}, scope='www')
             and not evaluate(guard(creator), {}, publishing=False),
@@ -218,6 +222,7 @@ def check(source, helpers):
             and "needs.publish-product.result == 'success'" in guard(workflow['deploy-app']),
             'product deployment must wait for final release completion')
     require(needs(workflow['deploy-www']) == {'identity', 'publish'}
+            and 'always()' in guard(workflow['deploy-www']) and '!cancelled()' in guard(workflow['deploy-www'])
             and "needs.publish.result == 'success'" in guard(workflow['deploy-www']),
             'website deployment must wait for its completed website release')
     return workflow
@@ -242,6 +247,10 @@ def self_test(source, helpers):
         source.replace('needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android, publish-ios]',
                        'needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android]'),
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
+        source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www'",
+                       "if: needs.identity.outputs.app == 'www'"),
+        source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.publish.result",
+                       'if: needs.publish.result'),
     ]
     broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
                       helper.replace('actions: read', 'contents: read'),

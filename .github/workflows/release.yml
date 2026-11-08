@@ -491,7 +491,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: [identity, collect]
-    if: needs.identity.outputs.app == 'www' && needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
+    if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www' && needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -560,6 +560,6 @@ jobs:
     secrets: inherit
   deploy-www:
     needs: [identity, publish]
-    if: needs.publish.result == 'success' && needs.identity.outputs.app == 'www' && !contains(needs.identity.outputs.version, '-')
+    if: always() && !cancelled() && needs.identity.result == 'success' && needs.publish.result == 'success' && needs.identity.outputs.app == 'www' && !contains(needs.identity.outputs.version, '-')
     uses: ./.github/workflows/deploy-www.yml
     secrets: inherit
