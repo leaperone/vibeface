@@ -49,7 +49,7 @@ export function parseStatus(value: unknown): DeliveryStatus {
 function payment(value: unknown): DeliveryPayment {
   const v = record(value)
   const result: DeliveryPayment = {
-    state: member(v.state, ['free', 'prepared', 'submitted', 'included', 'confirmed', 'earned', 'withdrawn', 'refunded', 'unknown', 'failed']),
+    state: member(v.state, ['free', 'prepared', 'confirmed', 'earned', 'withdrawn', 'refunded', 'unknown', 'failed']),
     chain_id: nullable(v.chain_id, amount), asset: nullable(v.asset, address), payer: nullable(v.payer, address), provider_wallet: nullable(v.provider_wallet, address),
     delivery_fee: amount(v.delivery_fee), reservation_fee: amount(v.reservation_fee), priority_fee: amount(v.priority_fee), total: amount(v.total), gas_cap: amount(v.gas_cap),
     earned: amount(v.earned), withdrawn: amount(v.withdrawn), refunded: amount(v.refunded),
@@ -75,7 +75,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
   const order: DeliveryOrder = {
     order_id: peer(v.order_id), intent_id: intentId(v.intent_id), role: member(v.role, ['sender', 'receiver', 'provider']), mode: member(v.mode, ['charity', 'paid']), acceptance: member(v.acceptance, ['recoverable', 'strict']),
     source_peer: peer(v.source_peer), receiver_peer: peer(v.receiver_peer), provider_peer: peer(v.provider_peer), name: nullable(v.name, fileName), bytes: integer(v.bytes, protocolMaxBytes), sha256: nullable(v.sha256, peer),
-    phase: member(v.phase, ['prepared', 'funding_pending', 'proving', 'funded', 'transferring', 'cipher_held', 'key_published', 'recoverable', 'paid', 'partial', 'refundable', 'refunded', 'reconciling', 'key_unavailable', 'failed']),
+    phase: member(v.phase, ['prepared', 'funding_pending', 'proving', 'funded', 'transferring', 'cipher_held', 'key_published', 'recoverable', 'paid', 'partial', 'refunded', 'reconciling', 'key_unavailable', 'failed']),
     evidence: member(v.evidence, ['none', 'charity_receipt', 'ciphertext_held', 'recoverable', 'decryption_proven']), payment: payment(v.payment), deadlines: deadlines(v.deadlines),
     windows: windows.map((item, index) => {
       const w = record(item), bytes = integer(w.bytes, 65_536)
@@ -158,11 +158,11 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
 
 export const phaseLabels: Record<DeliveryPhase, string> = {
   prepared: '待确认', funding_pending: '正在付款', proving: '正在确认付款条件', funded: '已付款', transferring: '传输中', cipher_held: '对方已收到，等待解锁', key_published: '正在解锁',
-  recoverable: '已送达', paid: '已完成', partial: '部分完成', refundable: '可以退款', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
+  recoverable: '已送达', paid: '已完成', partial: '部分完成', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
 }
 export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '还没送达', charity_receipt: '对方已收到', ciphertext_held: '对方已收到，还没解锁', recoverable: '对方可以打开', decryption_proven: '对方已打开' }
 export const paymentLabels: Record<PaymentState, string> = {
-  free: '免费', prepared: '未付款', submitted: '付款已提交', included: '付款处理中', confirmed: '已付款', earned: '服务费已结算', withdrawn: '服务费已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
+  free: '免费', prepared: '未付款', confirmed: '已付款', earned: '服务费已结算', withdrawn: '服务费已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
 }
 export function settlementAmountsLabel(order: DeliveryOrder): string {
   return order.payment.state === 'unknown' || order.payment.state === 'failed' || order.phase === 'reconciling' || order.phase === 'failed'

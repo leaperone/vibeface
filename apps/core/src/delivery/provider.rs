@@ -9,6 +9,9 @@ impl Delivery {
         request: ServiceRequest,
     ) -> Result<Value> {
         ensure!(self.config().enabled, "object delivery service is disabled");
+        if !matches!(&request, ServiceRequest::Charity { .. }) {
+            self.ensure_mode(Mode::Paid)?;
+        }
         let _maintenance = node.maintenance.enter()?;
         let _provider = if matches!(&request, ServiceRequest::Charity { .. }) {
             None
@@ -55,7 +58,7 @@ impl Delivery {
                     .context("receiving Node requires a trusted local prover")?
                     .readiness()?;
                 let binding = self.key_binding(mode)?;
-                if mode == Mode::Paid {
+                {
                     let current = self
                         .chain()
                         .await?
@@ -77,7 +80,10 @@ impl Delivery {
                 file_bytes,
                 intent_id,
             } => {
-                self.ensure_mode(mode)?;
+                ensure!(
+                    mode == Mode::Paid,
+                    "charity uses its independent signed protocol"
+                );
                 ensure!(
                     Amount::from_decimal_str(&self.config().provider_gas_cap)? != Amount::ZERO,
                     "paid provider requires an explicit settlement gas budget"
@@ -123,15 +129,11 @@ impl Delivery {
                         && terms.priority_deadline - terms.quote_expires_at == 3600,
                     "service deadlines differ from its signed policy"
                 );
-                let (delivery, reservation, bonus) = if mode == Mode::Paid {
-                    (
-                        Amount::from_decimal_str(&config.delivery_fee_per_window)?,
-                        Amount::from_decimal_str(&config.reservation_fee_per_window)?,
-                        Amount::from_decimal_str(&config.priority_fee)?,
-                    )
-                } else {
-                    (Amount::ZERO, Amount::ZERO, Amount::ZERO)
-                };
+                let (delivery, reservation, bonus) = (
+                    Amount::from_decimal_str(&config.delivery_fee_per_window)?,
+                    Amount::from_decimal_str(&config.reservation_fee_per_window)?,
+                    Amount::from_decimal_str(&config.priority_fee)?,
+                );
                 ensure!(terms.whole_order_bonus==bonus && order.windows.iter().all(|w|w.delivery_fee==delivery && w.reservation_fee==reservation),"quote fees differ from service policy");
                 let id = hex::encode(terms.order_id()?);
                 if let Some(prior) = self.with_store(|store| store.find_order(&id))? {
@@ -145,7 +147,7 @@ impl Delivery {
                         grants: prior.grants,
                     })?);
                 }
-                let wallet_signature = if mode == Mode::Paid {
+                let wallet_signature = {
                     let chain = config.chain.as_ref().context("paid deployment missing")?;
                     ensure!(
                         terms.asset == address_bytes(&chain.asset)?
@@ -174,8 +176,6 @@ impl Delivery {
                         order.quote_digest()?,
                         terms.provider_peer,
                     )?
-                } else {
-                    Vec::new()
                 };
                 let quote_signature = signature(
                     self.identity
@@ -207,34 +207,17 @@ impl Delivery {
                     confirmed: false,
                     resume_requested: false,
                     request_hash: String::new(),
-                    view: view(&intent_id, Role::Provider, mode, &placeholder, file_bytes)?,
+                    view: view(&intent_id, Role::Provider, &placeholder, file_bytes)?,
                     order: placeholder,
                     wallet_signature: wallet_signature.clone(),
                     source_seals: Vec::new(),
                     grants: grants.clone(),
                     accepted: false,
                     notified: false,
+                    chain_observed_at_ms: 0,
+                    settlement_complete: false,
                 };
-                self.with_store(|store| {
-                    store.save_order(&stored)?;
-                    for window in &stored.order.unsigned.windows {
-                        store.reserve_object(
-                            &id,
-                            window.index,
-                            "ciphertext",
-                            &hex::encode(window.ciphertext_hash),
-                            window.ciphertext_bytes,
-                        )?;
-                        store.reserve_object(
-                            &id,
-                            window.index,
-                            "capsule",
-                            &hex::encode(window.capsule_hash),
-                            80,
-                        )?;
-                    }
-                    Ok(())
-                })?;
+                self.with_store(|store| store.save_order(&stored))?;
                 Ok(serde_json::to_value(Quotation {
                     signature: quote_signature,
                     wallet_signature,
@@ -248,7 +231,10 @@ impl Delivery {
                 intent_id,
                 wallet_signature,
             } => {
-                self.ensure_mode(mode)?;
+                ensure!(
+                    mode == Mode::Paid,
+                    "charity uses its independent signed protocol"
+                );
                 order.verify()?;
                 ensure!(
                     hex::encode(order.unsigned.terms.source_peer) == remote
@@ -264,6 +250,10 @@ impl Delivery {
                 };
                 if role == Role::Receiver {
                     ensure!(
+                        now() <= order.unsigned.terms.hold_deadline,
+                        "delivery acceptance deadline expired"
+                    );
+                    ensure!(
                         hex::encode(order.unsigned.terms.binding.receiver_peer) == own,
                         "delivery offer belongs to another receiver"
                     );
@@ -273,9 +263,7 @@ impl Delivery {
                         "receiving key changed before offer was accepted"
                     );
                 }
-                if mode == Mode::Paid {
-                    self.paid_state(&order).await?;
-                }
+                self.paid_state(&order).await?;
                 if let Some(mut prior) = self.with_store(|store| store.find_order(&id))? {
                     ensure!(
                         prior.order.unsigned == order.unsigned,
@@ -299,13 +287,15 @@ impl Delivery {
                     confirmed: false,
                     resume_requested: false,
                     request_hash: String::new(),
-                    view: view(&intent_id, role, mode, &order, file_bytes)?,
+                    view: view(&intent_id, role, &order, file_bytes)?,
                     order,
                     wallet_signature,
                     source_seals: Vec::new(),
                     grants: Vec::new(),
                     accepted: false,
                     notified: false,
+                    chain_observed_at_ms: 0,
+                    settlement_complete: false,
                 };
                 stored.view.phase = Phase::Funded;
                 self.save(&mut stored)?;
@@ -417,7 +407,11 @@ impl Delivery {
                     &consent,
                 )?;
                 self.with_store(|store| store.object(&order_id, index, "ciphertext"))?;
-                if stored.view.mode == Mode::Paid {
+                ensure!(
+                    stored.view.mode == Mode::Paid,
+                    "hold requires the paid protocol"
+                );
+                {
                     let chain = self.chain().await?;
                     let observed = chain
                         .execute(
@@ -457,19 +451,6 @@ impl Delivery {
                     }
                     self.update_paid_view(&mut stored).await?;
                     self.withdraw_earned(&mut stored, index).await?;
-                } else {
-                    ensure!(
-                        seal.is_empty(),
-                        "charity receipts cannot claim a paid proof"
-                    );
-                    stored
-                        .view
-                        .windows
-                        .get_mut(index as usize)
-                        .context("invalid window")?
-                        .state = WindowState::Held;
-                    stored.view.evidence = Evidence::CharityReceipt;
-                    stored.view.phase = Phase::CipherHeld;
                 }
                 self.save(&mut stored)?;
                 Ok(serde_json::to_value(stored.view)?)
@@ -513,10 +494,12 @@ impl Delivery {
                     remote == stored.view.source_peer || remote == stored.view.receiver_peer,
                     "delivery order belongs to another peer"
                 );
-                if stored.view.mode == Mode::Paid {
-                    self.update_paid_view(&mut stored).await?;
-                    self.save(&mut stored)?;
-                }
+                ensure!(
+                    stored.view.mode == Mode::Paid,
+                    "order requires the paid protocol"
+                );
+                self.update_paid_view(&mut stored).await?;
+                self.save(&mut stored)?;
                 Ok(serde_json::to_value(stored.view)?)
             }
         }
@@ -617,12 +600,16 @@ impl Delivery {
                 },
             "service grant client has the wrong role"
         );
-        let window = stored
+        stored
             .view
             .windows
             .get(index as usize)
             .context("invalid delivery window")?;
-        if stored.view.mode == Mode::Paid {
+        ensure!(
+            stored.view.mode == Mode::Paid,
+            "charity uses its independent object protocol"
+        );
+        {
             let chain = self.chain().await?;
             let state = self.paid_state(&stored.order).await?;
             let state = state
@@ -647,14 +634,6 @@ impl Delivery {
                     "key capsule is unavailable until its publication is confirmed"
                 );
             }
-        } else if matches!(operation, GrantOperation::GetCapsule) {
-            ensure!(
-                matches!(
-                    window.state,
-                    WindowState::Held | WindowState::KeyPublished | WindowState::Earned
-                ),
-                "charity capsule requires the receiver's signed receipt"
-            );
         }
         Ok(())
     }
@@ -689,27 +668,99 @@ impl Delivery {
         let Ok(_provider) = self.provider_operations.try_lock() else {
             return Ok(());
         };
-        let mut orders = self.with_store(|store| store.orders(None))?;
-        orders.retain(|order| {
-            order.view.role == Role::Provider && order.view.mode == Mode::Paid && order.accepted
-        });
+        let mut orders = self.with_store(|store| store.progress_orders(None))?;
+        orders.retain(|order| order.view.role == Role::Provider && order.view.mode == Mode::Paid);
         let transaction = self.with_store(|store| store.next_transaction_for_reconcile())?;
         if orders.is_empty() && transaction.is_none() {
             return Ok(());
         }
         let chain = self.chain().await?;
         if let Some(transaction) = transaction {
-            let observed = chain
-                .reconcile_transaction(self, &transaction.intent.id)
-                .await?;
+            let observed = if transaction.phase == "confirmed" {
+                let observed = chain.observe(&transaction).await.unwrap_or_else(|_| chain::TxObservation {
+                    phase: "unknown".into(), tx_hash: transaction.tx_hash.clone(),
+                    block_number: transaction.block_number, block_hash: transaction.block_hash.clone(),
+                    error: Some("historical transaction observation is unknown; original bytes were preserved".into()),
+                });
+                self.with_store(|store| {
+                    store.observe_transaction(
+                        &transaction.intent.id,
+                        &observed.phase,
+                        observed.block_number,
+                        observed.block_hash.as_deref(),
+                        observed.error.as_deref(),
+                    )
+                })?;
+                observed
+            } else {
+                chain
+                    .reconcile_transaction(self, &transaction.intent.id)
+                    .await?
+            };
             self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
                 .await?;
         }
-        if orders.is_empty() {
-            return Ok(());
-        }
         orders.sort_by_key(|order| order.view.updated_at_ms);
-        let mut order = orders.remove(0);
+        if let Some(order) = orders
+            .iter()
+            .find(|order| order.accepted && !order.historical())
+            .cloned()
+        {
+            self.advance_provider(&chain, order).await?;
+        }
+        if let Some(mut order) = orders
+            .iter()
+            .filter(|order| {
+                order.historical()
+                    && crate::runtime::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
+            })
+            .min_by_key(|order| order.chain_observed_at_ms)
+            .cloned()
+        {
+            if let Err(error) = self.update_paid_view(&mut order).await {
+                order.view.chain_unknown();
+                order.view.error = Some(error.to_string());
+            }
+            self.save(&mut order)?;
+            if order.historical() && now() > order.order.unsigned.terms.retain_until {
+                self.with_store(|store| store.release_provider_objects(&order.view.order_id))?;
+            }
+        }
+        if let Some(mut order) = orders
+            .into_iter()
+            .filter(|order| {
+                !order.accepted
+                    && now() > order.order.unsigned.terms.retain_until
+                    && crate::runtime::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
+            })
+            .min_by_key(|order| order.chain_observed_at_ms)
+        {
+            match chain
+                .unfunded_after(
+                    order.order.unsigned.terms.order_id()?,
+                    order.order.unsigned.terms.retain_until,
+                )
+                .await
+            {
+                Ok(true) => {
+                    self.with_store(|store| store.reclaim_unfunded_quote(&order))?;
+                }
+                Ok(false) => {
+                    order.chain_observed_at_ms = crate::runtime::now_ms();
+                    self.save(&mut order)?;
+                }
+                Err(error) => {
+                    order.chain_observed_at_ms = crate::runtime::now_ms();
+                    order.view.error = Some(format!(
+                        "expired quotation funding remains unknown: {error}"
+                    ));
+                    self.save(&mut order)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn advance_provider(&self, chain: &chain::Chain, mut order: StoredOrder) -> Result<()> {
         match self.update_paid_view(&mut order).await {
             Ok(()) => order.view.error = None,
             Err(error) => {
@@ -719,16 +770,16 @@ impl Delivery {
                 return Ok(());
             }
         }
-        if let Some(window) = order
+        if let Some(index) = order
             .view
             .windows
             .iter()
             .find(|window| window.state == WindowState::Held)
+            .map(|window| window.index)
         {
-            let index = window.index;
             let capsule =
                 self.with_store(|store| store.object(&order.view.order_id, index, "capsule"))?;
-            let result = chain
+            if let Err(error) = chain
                 .execute(
                     self,
                     &format!("{}/publish-{index}", order.view.order_id),
@@ -739,19 +790,19 @@ impl Delivery {
                     },
                     &self.config().provider_gas_cap,
                 )
-                .await;
-            if let Err(error) = result {
+                .await
+            {
                 order.view.error = Some(error.to_string());
             }
         } else if order.view.payment.earned != order.view.payment.withdrawn
-            && let Some(window) = order
+            && let Some(index) = order
                 .view
                 .windows
                 .iter()
                 .rev()
                 .find(|window| window.state == WindowState::Earned)
+                .map(|window| window.index)
         {
-            let index = window.index;
             if let Err(error) = self.withdraw_earned(&mut order, index).await {
                 order.view.error = Some(error.to_string());
             }
@@ -783,7 +834,15 @@ impl Delivery {
     }
     pub(super) async fn update_paid_view(&self, stored: &mut StoredOrder) -> Result<()> {
         let state = self.paid_state(&stored.order).await?;
-        apply_paid_snapshot(&mut stored.view, &state)
+        apply_paid_snapshot(&mut stored.view, &state)?;
+        stored.chain_observed_at_ms = crate::runtime::now_ms();
+        stored.settlement_complete = state
+            .windows
+            .iter()
+            .all(|window| matches!(window.phase, 3 | 4))
+            && state.earned == state.withdrawn
+            && (state.bonus_earned || state.bonus_refunded);
+        Ok(())
     }
 }
 
@@ -940,6 +999,129 @@ mod tests {
             bonus_refunded: false,
             windows,
         }
+    }
+    #[tokio::test]
+    async fn disabled_paid_requests_make_no_chain_calls_or_new_store_and_keep_local_history()
+    -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut chain = chain::tests::config();
+        chain.rpc_url = format!("http://{}", listener.local_addr()?);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        axum::Json(json!({"error":"disabled requests must not reach RPC"}))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/delivery-disabled-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Runtime::open(&dir).await?;
+        node.delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            paid_enabled: false,
+            chain: Some(chain),
+            ..Default::default()
+        })?;
+        let id = "ab".repeat(32);
+        for request in [
+            ServiceRequest::Hold {
+                order_id: id.clone(),
+                index: 0,
+                consent: vibeface_delivery::PeerSignature {
+                    r: [0; 32],
+                    s: [0; 32],
+                },
+                seal: Vec::new(),
+            },
+            ServiceRequest::Open {
+                order_id: id.clone(),
+                index: 0,
+                seal: Vec::new(),
+            },
+            ServiceRequest::Order { order_id: id },
+        ] {
+            let error = node
+                .delivery
+                .handle_service(&node, &"11".repeat(32), request)
+                .await
+                .err()
+                .context("paid request must be disabled")?;
+            assert!(error.to_string().contains("disabled"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(!dir.join("delivery/service.sqlite3").exists());
+        let order = super::super::store::tests::paid_order(Role::Sender);
+        node.delivery.with_store(|store| store.save_order(&order))?;
+        let history = node
+            .delivery
+            .client_request(
+                &node,
+                "owner-network",
+                "owner",
+                json!({"op":"get","order_id":order.view.order_id}),
+            )
+            .await?;
+        assert_eq!(history["order_id"], order.view.order_id);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        node.shutdown().await;
+        drop(node);
+        server.abort();
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn paid_and_refunded_history_requires_complete_money_and_receiver_recovery() {
+        let mut order = super::super::store::tests::paid_order(Role::Receiver);
+        order.accepted = true;
+        order.view = view();
+        order.settlement_complete = true;
+        assert!(
+            !order.historical(),
+            "Paid does not prove local file recovery"
+        );
+        order.view.name = Some("original.bin".into());
+        order.view.sha256 = Some("11".repeat(32));
+        assert!(order.historical());
+        order.view.windows[0].decryption_proven = false;
+        assert!(
+            !order.historical(),
+            "ordinary Earned windows still need their open proof"
+        );
+        order.view.windows[0].decryption_proven = true;
+        order.view.payment.withdrawn = "0".into();
+        assert!(!order.historical(), "unwithdrawn income remains active");
+        order.view.payment.withdrawn = order.view.payment.earned.clone();
+        order.settlement_complete = false;
+        assert!(
+            !order.historical(),
+            "pending bonus settlement remains active"
+        );
+        order.settlement_complete = true;
+        order.view.chain_unknown();
+        assert!(
+            !order.historical(),
+            "Unknown and reorg facts retract completion"
+        );
     }
     #[test]
     fn a_reorg_to_funded_rebuilds_money_and_proof_state_without_old_completion() {
