@@ -1380,6 +1380,7 @@ impl Local {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use super::*;
 
     #[test]
