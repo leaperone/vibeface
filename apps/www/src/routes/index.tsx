@@ -20,106 +20,98 @@ function HomePage() {
       <div className="landing">
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
-            <p className="hero-kicker">Your devices <span aria-hidden="true">/</span> Your agents <span aria-hidden="true">/</span> Nightly</p>
             <h1 id="hero-title">Your computers.<br />One conversation.</h1>
-            <p className="hero-lede">Ask a bot to work on your Mac or Linux computer. Choose where it runs and read the result in the same chat.</p>
+            <p className="hero-lede">Ask a bot to work on your Mac or Linux machine. Choose where it runs and read the result in the same chat.</p>
             <div className="hero-actions">
               <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
-            <ul className="hero-proof" aria-label="Vibeface foundations">
-              <li><span>01</span><strong>Local execution</strong><small>Your Agent runs on your computer</small></li>
-              <li><span>02</span><strong>Shared context</strong><small>Keep the work in one thread</small></li>
-              <li><span>03</span><strong>Approved devices</strong><small>Choose who can connect</small></li>
-            </ul>
           </div>
 
           <figure className="hero-figure" aria-label="A visual map of a conversation, the selected computer, and shared history">
             <div className="hero-visual">
-              <div className="visual-grid" aria-hidden="true" />
-              <div className="visual-glow" aria-hidden="true" />
-              <div className="visual-readout" aria-hidden="true"><span>PRIVATE NETWORK / 01</span><strong>READY TO HAND OFF</strong></div>
+              <div className="visual-backdrop" aria-hidden="true"><div className="visual-grid" /><div className="visual-glow" /></div>
               <div className="orbit orbit-one" aria-hidden="true" />
               <div className="orbit orbit-two" aria-hidden="true" />
               <div className="orbit orbit-three" aria-hidden="true" />
-              <div className="hero-logo"><img src="/logo.svg" width="144" height="144" alt="" /></div>
+              <svg className="visual-path" viewBox="0 0 100 100" aria-hidden="true">
+                <path id="signal-route" d="M 66 21 C 46 14 18 38 34 66 C 42 86 56 96 64 83 C 80 70 86 42 66 21 Z" />
+                <circle className="visual-signal-glow" r="2.6"><animateMotion dur="9s" repeatCount="indefinite" begin="-0.3s"><mpath href="#signal-route" /></animateMotion></circle>
+                <circle className="visual-signal" r="1.1"><animateMotion dur="9s" repeatCount="indefinite"><mpath href="#signal-route" /></animateMotion></circle>
+              </svg>
+              <div className="hero-logo"><img src="/logo.svg" width="136" height="136" alt="" /></div>
               <a className="visual-node visual-node-top" href="/docs/bot-and-execution"><span>Conversation</span><small>Shape the request, then hand it off</small></a>
               <a className="visual-node visual-node-left" href="/docs/bot-and-execution#工作如何回到原聊天"><span>Selected computer</span><small>Your Agent uses local tools</small></a>
-              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Stages and results return</small></a>
+              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Stages and results return here</small></a>
             </div>
-            <figcaption>One thread from request to result.</figcaption>
+            <figcaption>From request to result, in one conversation.</figcaption>
           </figure>
         </section>
 
-        <section className="landing-section landing-story" aria-labelledby="story-title">
-          <p className="section-eyebrow">The loop</p>
-          <h2 id="story-title">The work stays together.</h2>
-          <p className="story-prompt"><span>Example request</span>“Check the failing tests and tell me what to change.”</p>
-          <div className="story-frame">
-            <div className="story-frame-meta"><span>WORK LOOP / 01</span><span>PRIVATE NETWORK</span></div>
-            <ol className="work-story" role="list">
-              <li><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot uses the thread to plan the work.</p></li>
-              <li><h3>Choose a computer</h3><p>An approved computer runs the work with its local Agent, files, and tools.</p></li>
-              <li><h3>Read the result</h3><p>Updates and saved results return to the same chat. Check an unknown result before retrying.</p></li>
-            </ol>
-            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>Your request and result, together.</strong><small>Live progress is temporary and does not sync.</small></div>
+        <section className="landing-section landing-loop" aria-labelledby="loop-title">
+          <div className="loop-intro">
+            <h2 id="loop-title">The work stays together.</h2>
+            <p className="section-copy">One request, one computer you choose, one thread that holds the result.</p>
+            <p className="loop-prompt"><span>Example request</span>“Check the failing tests and tell me what to change.”</p>
+          </div>
+          <div className="loop-flow">
+          <ol className="loop-steps" role="list">
+            <li><span className="loop-num" aria-hidden="true">01</span><div><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot uses the thread to plan the work.</p></div></li>
+            <li><span className="loop-num" aria-hidden="true">02</span><div><h3>Choose a computer</h3><p>An approved computer runs the work with its local Agent, files, and tools.</p></div></li>
+            <li><span className="loop-num" aria-hidden="true">03</span><div><h3>Read the result</h3><p>Updates and saved results return to the same chat. If a result is unknown, check it before you retry.</p></div></li>
+          </ol>
+          <p className="loop-note">Live progress is not saved or synced.</p>
           </div>
         </section>
 
-        <section className="landing-system" id="system" aria-labelledby="system-title">
-          <div className="system-intro">
-            <p className="section-eyebrow">The system</p>
-            <h2 id="system-title">Keep the context.<br />Keep your tools.</h2>
-            <p>Keep a bot's conversation across your computers. Work runs with the tools installed on each one.</p>
-            <a className="text-link" href="/docs/bot-and-execution">See how work is split <ArrowRight size={16} aria-hidden="true" /></a>
-          </div>
-          <p className="system-manifesto">Continue the conversation elsewhere. <em>Choose where the work runs.</em></p>
-          <div className="system-details">
-            <article><h3>Conversation and execution</h3><p>Use a bot to coordinate work while Codex, Claude Code, pi, opencode, or Cursor runs it on the computer you choose.</p></article>
-            <article><h3>Shared history</h3><div><p>Approved devices share conversations, settings, task updates, and saved results. Project files, logins, and Agent sessions stay on each computer.</p><a className="text-link" href="/docs/history-sync">See what syncs <ArrowRight size={16} aria-hidden="true" /></a></div></article>
-            <article><h3>Continue elsewhere</h3><p>Open a synchronized thread on another computer and hand off the next turn. Replaying history never starts old work.</p></article>
-          </div>
-        </section>
-
-        <section className="landing-section landing-comparison" aria-labelledby="comparison-title">
-          <p className="section-eyebrow">The choice</p>
-          <h2 id="comparison-title">Already have an Agent?</h2>
-          <p className="section-copy">Choose the layer that matches how you work.</p>
-          <dl className="choice-list">
-            <div><dt>Use Codex or Claude Code</dt><dd>You only need the product's own terminal, editor, or hosted flow.</dd></div>
-              <div><dt>Look at OpenClaw</dt><dd>You want a self-hosted service that connects agents to chat apps.</dd></div>
-            <div><dt>Choose Vibeface</dt><dd>You want one thread that can send work to your own computers and show the result back.</dd></div>
+        <section className="landing-section landing-system" aria-labelledby="system-title">
+          <h2 id="system-title" className="statement">Continue the conversation elsewhere. <em>Choose where the work runs.</em></h2>
+          <dl className="fact-rows">
+            <div><dt>Conversation and execution</dt><dd>Use a bot to coordinate work while Codex, Claude Code, pi, opencode, or Cursor runs it on the computer you choose.<br /><a className="text-link" href="/docs/bot-and-execution">See how work is split <ArrowRight size={16} aria-hidden="true" /></a></dd></div>
+            <div><dt>Shared history</dt><dd>Approved devices share conversations, settings, task updates, and saved results. Project files, logins, and Agent sessions stay on each computer.<br /><a className="text-link" href="/docs/history-sync">See what syncs <ArrowRight size={16} aria-hidden="true" /></a></dd></div>
+            <div><dt>Continue elsewhere</dt><dd>Open a synchronized thread on another computer and hand off the next turn. Replaying history never starts old work.</dd></div>
           </dl>
-          <a className="text-link" href="/docs/comparison">Compare the options <ArrowRight size={16} aria-hidden="true" /></a>
         </section>
 
-        <section className="landing-section landing-trust" aria-labelledby="trust-title">
-          <p className="section-eyebrow">The boundary</p>
-          <h2 id="trust-title">Know where your work goes.</h2>
-          <div className="trust-content">
-            <dl className="trust-facts">
-              <div><dt>Every device has its own identity</dt><dd>Each device has its own key. You approve new devices before they join.</dd></div>
-              <div><dt>Connections are encrypted</dt><dd>A public entry point can relay ciphertext without joining your private network.</dd></div>
-              <div><dt>Credentials stay local</dt><dd>AI service settings do not sync. A secret you send in chat becomes part of the shared conversation.</dd></div>
-            </dl>
-            <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
-              <p>Approved computers and the model service you choose handle your task content. Use devices and websites you trust.</p>
-              <p>Encrypted connections do not encrypt files on disk. Agents can run commands and edit files on the host. Project folder settings are not an operating system sandbox.</p>
-              <a className="text-link" href="/docs/privacy-security">Read privacy and permissions <ArrowRight size={16} aria-hidden="true" /></a>
-            </aside>
+        <section className="landing-section landing-choice" aria-labelledby="choice-title">
+          <h2 id="choice-title">Already have an Agent?</h2>
+          <p className="section-copy">Choose the tool that matches how you work.</p>
+          <div className="choice-grid">
+            <article className="choice-card choice-card-lead"><h3>Choose Vibeface</h3><p>You want one thread that can send work to your own computers and show the result back.</p><a className="text-link" href="/docs/comparison">Compare the options <ArrowRight size={16} aria-hidden="true" /></a></article>
+            <article className="choice-card"><h3>Use Codex or Claude Code</h3><p>You only need the product's own terminal, editor, or hosted flow.</p></article>
+            <article className="choice-card"><h3>Look at OpenClaw</h3><p>You want a self-hosted service that connects agents to chat apps.</p></article>
+          </div>
+        </section>
+
+        <section className="landing-band landing-trust" aria-labelledby="trust-title">
+          <div className="band-inner">
+            <h2 id="trust-title">Know where your work goes.</h2>
+            <div className="trust-grid">
+              <dl className="trust-facts">
+                <div><dt>Every device has its own identity</dt><dd>Each device holds a separate key. You approve new devices before they join.</dd></div>
+                <div><dt>Connections are encrypted</dt><dd>A public entry point can relay encrypted traffic without joining your private network.</dd></div>
+                <div><dt>Credentials stay local</dt><dd>AI service settings do not sync. A secret you send in chat does become part of the shared conversation.</dd></div>
+              </dl>
+              <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
+                <p>Approved computers and the model service you choose handle your task content. Use devices and websites you trust.</p>
+                <p>Encrypted connections do not encrypt files on disk. Agents can run commands and edit files on the host. Project folder settings are not an operating system sandbox.</p>
+                <a className="text-link" href="/docs/privacy-security">Read privacy and permissions <ArrowRight size={16} aria-hidden="true" /></a>
+              </aside>
+            </div>
           </div>
         </section>
 
         <section className="landing-section landing-start" aria-labelledby="start-title">
-          <p className="section-eyebrow">Start here</p>
-          <h2 id="start-title">Begin with one computer.</h2>
-          <p className="section-copy">Use a supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
-          <ol className="start-steps" role="list">
-            <li><a href="/docs/quick-start">Follow the quick start <span>Finish your first conversation</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/onboarding">Set up a device <span>Sign in and add computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/user-guide">Read the user guide <span>Use tasks and switch computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-          </ol>
-          <p className="nightly-note">Vibeface is in Nightly. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
+          <h2 id="start-title">Start with one computer.</h2>
+          <p className="section-copy">You need a supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
+          <div className="hero-actions start-actions">
+            <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Open the quick start <ArrowRight size={16} aria-hidden="true" /></Link>
+          </div>
+          <ul className="start-links" role="list">
+            <li><a className="text-link" href="/docs/onboarding">Set up a device <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a className="text-link" href="/docs/user-guide">Read the user guide <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+          </ul>
+          <p className="nightly-note">Vibeface ships as Nightly builds. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases</a></p>
         </section>
       </div>
     </SiteLayout>
