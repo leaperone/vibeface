@@ -456,22 +456,30 @@ impl Runtime {
         };
         for (scope, trigger, attempt) in abandoned {
             self.fence_manager_attempt(&attempt).await?;
-            self.store.lock().await.finish_job(
-                &self.identity,
-                &network,
+            let requeued = self.store.lock().await.requeue_abandoned_scheduler_claim(
                 &scope,
                 &trigger,
                 &attempt,
-                JobOutcome::Interrupted {
-                    failure: ExecFailure::new(
-                        FailureKind::Lost,
-                        "the reply process ended unexpectedly; its result is unverified",
-                    ),
-                    process_unconfirmed: true,
-                },
-                "",
-                now_ms(),
+                crate::scheduler::boot_id(),
             )?;
+            if !requeued {
+                self.store.lock().await.finish_job(
+                    &self.identity,
+                    &network,
+                    &scope,
+                    &trigger,
+                    &attempt,
+                    JobOutcome::Interrupted {
+                        failure: ExecFailure::new(
+                            FailureKind::Lost,
+                            "the reply process ended unexpectedly; its result is unverified",
+                        ),
+                        process_unconfirmed: true,
+                    },
+                    "",
+                    now_ms(),
+                )?;
+            }
             self.finish_manager_attempt(&attempt).await;
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
@@ -1310,6 +1318,175 @@ fn attachment_mime(name: &str, bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {
+        use crate::{
+            model::ResolvedModel,
+            runtime::triage::tests::{bot, node},
+            work::WorkSpec,
+        };
+        for case in ["needs_setup", "registration"] {
+            let (node, admin, directory) = node().await?;
+            let result = async {
+                {
+                    let mut settings = node.settings.lock().unwrap();
+                    settings.roots = vec![directory.clone()];
+                    settings.manager = Some(crate::config::ManagerSettings {
+                        provider: Provider::Pi, workspace: directory.clone(), model: "fixture".into(),
+                        reasoning_effort: None, backup: Default::default(),
+                    });
+                    let mut providers = node.providers.lock().unwrap();
+                    providers.switches.execution = [Provider::Pi].into();
+                    let binary = if case == "needs_setup" { directory.join("missing-pi") } else {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+                            .join(if cfg!(windows) { "fake-pi.cmd" } else { "fake-pi" })
+                    };
+                    providers.bins.insert(Provider::Pi, binary);
+                }
+                node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
+                bot(&node, &admin, "c", "Budget", &[]).await?;
+                let network = node.network_id().await?;
+                let local = node.identity.device_id()?;
+                let work_id = WorkSpec::id("c", "message:origin", case);
+                {
+                    let mut store = node.store.lock().await;
+                    let posted = admin.attest(&network, "c", serde_json::from_value(json!({
+                        "type":"message_posted","message_id":"origin","role":"user","text":"fixture"
+                    }))?)?;
+                    store.append_event(&node.identity, &network, "c", posted, vec![], now_ms())?;
+                    store.accept_work_fixture(&node.identity, &network, WorkSpec {
+                        work_id: work_id.clone(), conversation: "c".into(), trigger: "message:origin".into(),
+                        target: local.clone(), dispatcher: local, call_ref: case.into(), kind: WorkKind::Task,
+                        model: None, resolved: ResolvedModel { provider: Provider::Pi, model: Some("fixture".into()) },
+                        cwd: directory.to_string_lossy().into_owned(), title: "Budget".into(), prompt: "fixture".into(),
+                        continues: None, parent: None, thread: None,
+                    }, now_ms())?;
+                }
+                let claimed = Arc::new(tokio::sync::Notify::new());
+                let resume = Arc::new(tokio::sync::Notify::new());
+                if case == "registration" {
+                    *node.claim_to_start_barrier.lock().unwrap() = Some((claimed.clone(), resume.clone()));
+                }
+                let (running_node, running_network, running_id) = (node.clone(), network.clone(), work_id.clone());
+                let running = tokio::spawn(async move {
+                    crate::scheduler::run(running_node, Access { network_id: running_network, human: false,
+                        conversation_id: Some("c".into()), manager: None }, "c".into(),
+                        crate::scheduling::SessionScope::Task { work_id: running_id }).await
+                });
+                if case == "registration" {
+                    tokio::time::timeout(Duration::from_secs(5), claimed.notified()).await?;
+                    node.local_permission_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    resume.notify_one();
+                }
+                assert_eq!(tokio::time::timeout(Duration::from_secs(5), running).await???
+                    .context("refused invocation")?["state"], "failed");
+                let store = node.store.lock().await;
+                let used: u64 = store.connection.query_row(
+                    "SELECT COALESCE(sum(used),0) FROM budget_days WHERE network_id=?", [&network], |row| row.get(0))?;
+                assert_eq!(used, 0, "{case}");
+                assert!(store.pending_checks()?.is_empty());
+                let native: u64 = store.connection.query_row(
+                    "SELECT (SELECT count(*) FROM manager_turns)+(SELECT count(*) FROM manager_processes)", [], |row| row.get(0))?;
+                assert_eq!(native, 0);
+                store.scheduler_maintenance_idle()?;
+                drop(store);
+                assert!(node.agent_tokens.lock().await.is_empty());
+                assert!(node.manager_controls.lock().await.is_empty());
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            node.shutdown().await;
+            drop(node);
+            std::fs::remove_dir_all(directory)?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preparation_write_failures_leave_no_native_call_or_fabricated_pending_check()
+    -> Result<()> {
+        use crate::runtime::triage::tests::{bot, claim_reply, node};
+
+        for case in ["runtime", "runtime_and_finish", "failure_record"] {
+            let (node, admin, directory) = node().await?;
+            let result = async {
+                node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
+                    provider: Provider::Codex, workspace: directory.clone(), model: "fixture".into(),
+                    reasoning_effort: None, backup: Default::default(),
+                });
+                node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
+                bot(&node, &admin, "c", "Preparation", &[]).await?;
+                let network = node.network_id().await?;
+                let (trigger, old_attempt) = claim_reply(&node, &admin, "c", "prepare", crate::scheduler::boot_id()).await?;
+                {
+                    let mut store = node.store.lock().await;
+                    assert!(store.requeue_abandoned_scheduler_claim("c", &trigger, &old_attempt, crate::scheduler::boot_id())?);
+                    if case == "failure_record" {
+                        store.connection.execute_batch(
+                            "CREATE TRIGGER fail_context BEFORE UPDATE OF shown ON scheduler_sessions
+                             WHEN json_extract(NEW.shown,'$.context.stage')='compiled'
+                             BEGIN SELECT RAISE(FAIL,'controlled compiled-context failure'); END;
+                             CREATE TRIGGER fail_runtime BEFORE UPDATE OF runtime ON scheduler_jobs
+                             WHEN OLD.runtime IS NOT NULL AND NEW.runtime IS NOT NULL
+                             BEGIN SELECT RAISE(FAIL,'controlled failure-record write failure'); END;"
+                        )?;
+                    } else {
+                        store.connection.execute_batch(
+                            "CREATE TRIGGER fail_runtime BEFORE UPDATE OF runtime ON scheduler_jobs
+                             WHEN NEW.runtime IS NOT NULL
+                             BEGIN SELECT RAISE(FAIL,'controlled initial runtime failure'); END;"
+                        )?;
+                    }
+                    if case == "runtime_and_finish" {
+                        store.connection.execute_batch(
+                            "CREATE TRIGGER fail_finish BEFORE UPDATE OF state ON scheduler_jobs
+                             WHEN NEW.state='failed'
+                             BEGIN SELECT RAISE(FAIL,'controlled terminal write failure'); END;"
+                        )?;
+                    }
+                }
+                let invocation = tokio::time::timeout(Duration::from_secs(5), crate::scheduler::run(
+                    node.clone(), Access { network_id: network.clone(), human: false,
+                        conversation_id: Some("c".into()), manager: None },
+                    "c".into(), crate::scheduling::SessionScope::Main,
+                )).await?;
+                if case == "runtime" {
+                    assert_eq!(invocation?.context("failed preparation")?["state"], "failed");
+                } else {
+                    assert!(invocation.is_err(), "{case}");
+                }
+                let abandoned = node.store.lock().await.scheduler_job("c", &trigger)?.context("job")?;
+                assert!(node.agent_tokens.lock().await.is_empty());
+                assert!(node.manager_controls.lock().await.is_empty());
+                {
+                    let store = node.store.lock().await;
+                    assert!(store.pending_checks()?.is_empty());
+                    let native: u64 = store.connection.query_row(
+                        "SELECT (SELECT count(*) FROM manager_turns)+(SELECT count(*) FROM manager_processes)",
+                        [], |row| row.get(0))?;
+                    assert_eq!(native, 0, "{case}");
+                    store.connection.execute_batch("DROP TRIGGER fail_runtime; DROP TRIGGER IF EXISTS fail_context; DROP TRIGGER IF EXISTS fail_finish;")?;
+                }
+                node.settings.lock().unwrap().manager = None;
+                node.schedule_tick().await?;
+                if case != "runtime" {
+                    let mut store = node.store.lock().await;
+                    assert_eq!(store.scheduler_job("c", &trigger)?.context("recovered job")?.state, JobState::Queued);
+                    assert!(!store.manager_attempt_allowed(&network, &node.identity.device_id()?, "c", &trigger,
+                        &abandoned.state.attempt().context("old attempt")?.id)?);
+                    store.request_manager_cancel(&node.identity, &network, "c", &trigger)?;
+                }
+                node.store.lock().await.scheduler_maintenance_idle()?;
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            node.shutdown().await;
+            drop(node);
+            std::fs::remove_dir_all(directory)?;
+            result?;
+        }
+        Ok(())
+    }
 
     fn into() -> SteerTarget {
         SteerTarget {

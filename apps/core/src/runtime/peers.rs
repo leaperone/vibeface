@@ -521,6 +521,7 @@ impl Runtime {
         let _work = (!matches!(
             kind,
             "capabilities"
+                | "work_evidence"
                 | "progress_read"
                 | "addresses"
                 | "scheduler_jobs"
@@ -532,6 +533,15 @@ impl Runtime {
         .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
+            "work_evidence" => {
+                let conversation = field(input, "conversation_id")?;
+                let work_id = field(input, "work_id")?;
+                let vouches = self
+                    .local_work_vouches(network, conversation, work_id)
+                    .await?;
+                Ok(json!({"network_id":network,"conversation_id":conversation,
+                    "work_id":work_id,"vouches":vouches}))
+            }
             "addresses" => {
                 let records: Vec<SignedAddress> =
                     serde_json::from_value(input["records"].clone()).unwrap_or_default();
@@ -2414,6 +2424,103 @@ mod tests {
         )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test]
+    async fn an_online_target_without_the_original_work_journal_allows_one_signed_settlement()
+    -> Result<()> {
+        use crate::model::{ResolvedModel, WorkKind, WorkOutcome};
+        use crate::work::{Signal, WorkSpec};
+
+        let (entry, target) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (entry_id, target_id) = (entry.device_id()?, target.device_id()?);
+        let network = entry.fixture_network_id()?;
+        let state = entry.sign_network_fixture(1, vec![entry_id.clone(), target_id.clone()])?;
+        let (a, dir_a) = node(&entry).await?;
+        let (b, dir_b) = node(&target).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            b.net()?.learn(&a.net()?.addr()).await;
+            {
+                let mut store = a.store.lock().await;
+                store.create_conversation(&entry, &network, "c", "Settlement",
+                    entry.owner_fixture(&network, "c", &entry_id)?, now_ms())?;
+                store.append_event(&entry, &network, "c", posted(&entry, &network, "c", "m1")?, vec![], now_ms())?;
+            }
+            b.sync_peer(&network, &entry_id).await?;
+            let spec = WorkSpec {
+                work_id: WorkSpec::id("c", "message:m1", "original"),
+                conversation: "c".into(), trigger: "message:m1".into(),
+                target: target_id.clone(), dispatcher: entry_id.clone(), call_ref: "original".into(),
+                kind: WorkKind::Agent(Provider::Pi), model: None,
+                resolved: ResolvedModel { provider: Provider::Pi, model: None },
+                cwd: dir_b.to_string_lossy().into_owned(), title: "original".into(), prompt: "fixture only".into(),
+                continues: None, parent: None, thread: None,
+            };
+            b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms())?;
+            a.sync_peer(&network, &target_id).await?;
+            ready_member_rpc(&a, &network, &target_id).await?;
+            let access = Access { network_id: network.clone(), human: true,
+                conversation_id: Some("c".into()), manager: None };
+            let choice = |work_id: &str| -> Result<Value> {
+                let signed = entry.fixture_admin().attest(&network, "c", EventBody::WorkFinished {
+                    work_id: work_id.into(), outcome: WorkOutcome::Completed, result_text: "checked".into(),
+                    failure_reason: None, attestation: None, failure: None,
+                })?;
+                Ok(json!({"conversation_id":"c","check_id":format!("work:{work_id}"),
+                    "outcome":"completed","note":"checked","attestation":signed.attestation()}))
+            };
+            let answer = choice(&spec.work_id)?;
+            assert!(a.resolve_check(&access, &answer).await.is_err(), "the original journal can still report");
+            let evidence = || json!({"type":"work_evidence","conversation_id":"c","work_id":spec.work_id});
+            assert_eq!(a.peer_request(&network, &target_id, evidence()).await?["vouches"], true);
+            assert!(a.peer_request(&network, &target_id, json!({"type":"work_evidence",
+                "conversation_id":"other","work_id":spec.work_id})).await.is_err());
+            {
+                let store = b.store.lock().await;
+                assert!(store.work_record_in_scope("another-network", "c", &spec.work_id, &target_id).is_err());
+                store.connection.execute("DELETE FROM work_runs WHERE work_id=?", [&spec.work_id])?;
+            }
+            assert!(a.peer_request(&network, &target_id, json!({"type":"capabilities"})).await?.is_object(),
+                "the target is still reachable");
+            assert_eq!(a.peer_request(&network, &target_id, evidence()).await?["vouches"], false);
+            assert_eq!(a.resolve_check(&access, &answer).await?["resolved"], true);
+            assert!(a.resolve_check(&access, &answer).await.is_err(), "the signed result is admitted once");
+            b.sync_peer(&network, &entry_id).await?;
+            b.sync_peer(&network, &entry_id).await?;
+            assert!(b.store.lock().await.work_record(&spec.work_id)?.is_none(), "sync does not rebuild an execution");
+            assert!(b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms()).is_err(),
+                "missing admission evidence cannot start the old dispatch again");
+            let finished = a.store.lock().await.events_from(&network, &entry_id, 1, 100)?.into_iter()
+                .filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, outcome: WorkOutcome::Completed, .. } if work_id == &spec.work_id)).count();
+            assert_eq!(finished, 1);
+
+            let mut unknown = spec.clone();
+            unknown.call_ref = "unknown".into();
+            unknown.work_id = WorkSpec::id("c", "message:m1", &unknown.call_ref);
+            b.store.lock().await.accept_work_fixture(&target, &network, unknown.clone(), now_ms())?;
+            b.store.lock().await.apply_work_signal(&target, &network, &unknown.work_id,
+                Signal::SubmissionUnverified("fixture cannot prove its outcome".into()), now_ms())?;
+            a.sync_peer(&network, &target_id).await?;
+            assert_eq!(a.store.lock().await.work(&network, &unknown.work_id)?.context("unknown work")?.outcome,
+                Some(WorkOutcome::Unverified));
+            assert_eq!(a.resolve_check(&access, &choice(&unknown.work_id)?).await?["resolved"], true);
+            for node in [&a, &b] {
+                assert!(node.agent_tokens.lock().await.is_empty());
+                assert!(node.manager_controls.lock().await.is_empty());
+                let store = node.store.lock().await;
+                let native: u64 = store.connection.query_row(
+                    "SELECT (SELECT count(*) FROM manager_turns)+(SELECT count(*) FROM manager_processes)",
+                    [], |row| row.get(0))?;
+                assert_eq!(native, 0, "settlement never starts or sends a native turn");
+            }
+            Ok(())
+        }.await;
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b)]).await
     }
 
     #[tokio::test]

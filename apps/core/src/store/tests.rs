@@ -11223,6 +11223,276 @@ fn held_tasks_leave_room_for_humans_and_machine_slots_are_real() -> Result<()> {
 }
 
 #[test]
+fn abandoned_claims_requeue_only_without_execution_evidence_and_fence_the_old_attempt() -> Result<()>
+{
+    use crate::scheduling::{SessionScope, TurnExecution, TurnRuntime};
+    use vibeface_bridge::failure::ProviderStage;
+
+    for evidence in [
+        "missing_runtime",
+        "not_started",
+        "unknown",
+        "started",
+        "tool",
+        "process",
+        "native",
+        "pending",
+        "running",
+        "cancelling",
+    ] {
+        for restarted in [false, true] {
+            let net = net()?;
+            let (mut store, _) = bot_with_message(&net)?;
+            say(&mut store, &net, "abandoned", true)?;
+            let claimed = isolated_claim(
+                &mut store,
+                &net,
+                SessionScope::Main,
+                Provider::Codex,
+                crate::config::SchedulingLimits::default(),
+            )?
+            .context("claim")?;
+            let job = claimed.job;
+            let attempt = job.state.attempt().context("attempt")?.clone();
+            if evidence != "missing_runtime" {
+                store.record_turn_runtime(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    &TurnRuntime {
+                        provider: Provider::Codex,
+                        model: None,
+                        reasoning_effort: None,
+                        generation: "fixture".into(),
+                        session_generation: claimed.session_generation,
+                        delivery_id: attempt.id.clone(),
+                        stage: ProviderStage::Validate,
+                        execution: TurnExecution::NotStarted,
+                        attempted_at_ms: 0,
+                        switched_from: None,
+                        switch_reason: None,
+                    },
+                )?;
+            }
+            match evidence {
+                "unknown" | "started" => {
+                    store.update_turn_runtime(
+                        "c",
+                        &job.trigger,
+                        &attempt.id,
+                        ProviderStage::TurnStart,
+                        if evidence == "unknown" {
+                            TurnExecution::Unknown
+                        } else {
+                            TurnExecution::Started
+                        },
+                    )?;
+                }
+                "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
+                "process" => store.record_manager_process(&attempt.id, 123)?,
+                "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
+                "pending" => {
+                    store.connection.execute(
+                    "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
+                    params![attempt.id, job.trigger])?;
+                }
+                "running" => {
+                    store.mark_started("c", &job.trigger, &attempt.id)?;
+                }
+                "cancelling" => {
+                    store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
+                }
+                _ => {}
+            }
+            let unstarted = matches!(evidence, "missing_runtime" | "not_started");
+            if restarted {
+                store.recover_scheduler_jobs(&net.a, &net.network, "next-boot")?;
+            } else {
+                assert_eq!(
+                    store.requeue_abandoned_scheduler_claim(
+                        "c",
+                        &job.trigger,
+                        &attempt.id,
+                        "boot"
+                    )?,
+                    unstarted,
+                    "{evidence}"
+                );
+            }
+            let current = store
+                .scheduler_job("c", &job.trigger)?
+                .context("retained job")?;
+            if unstarted {
+                assert_eq!(current.state, JobState::Queued, "{evidence}");
+                assert!(current.runtime.is_none());
+                assert!(store.pending_checks()?.is_empty());
+                assert!(!store.manager_attempt_allowed(
+                    &net.network,
+                    &net.a.device_id()?,
+                    "c",
+                    &job.trigger,
+                    &attempt.id
+                )?);
+                assert!(!store.requeue_abandoned_scheduler_claim(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    "boot"
+                )?);
+                store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
+                store.scheduler_maintenance_idle()?;
+            } else if restarted {
+                assert!(
+                    matches!(current.state, JobState::Reconciling { .. }),
+                    "{evidence}"
+                );
+                assert_eq!(store.pending_checks()?.len(), 1, "{evidence}");
+            } else {
+                assert_ne!(current.state, JobState::Queued, "{evidence}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_refunds_only_live_unstarted_reservations_on_their_original_utc_day() -> Result<()> {
+    use crate::scheduling::TurnExecution;
+    use vibeface_bridge::failure::ProviderStage;
+
+    for evidence in [
+        "not_started",
+        "unknown",
+        "started",
+        "tool",
+        "process",
+        "native",
+        "pending",
+        "restarted",
+    ] {
+        let net = net()?;
+        let (mut store, _) = bot_with_message(&net)?;
+        say(&mut store, &net, "budget", true)?;
+        let job = store
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "budget")?
+            .context("claim")?
+            .job;
+        let attempt = job.state.attempt().context("attempt")?;
+        let reservation = store.reserve_scheduler_budget(&net.network, &job, 3, 5, 86_399_999)?;
+        assert!(
+            store
+                .reserve_scheduler_budget(&net.network, &job, 3, 5, 86_399_999)
+                .is_err()
+        );
+        store.connection.execute(
+            "INSERT INTO budget_days(network_id,day,used) VALUES(?,'1970-01-02',4)",
+            [&net.network],
+        )?;
+        match evidence {
+            "unknown" | "started" => {
+                store.update_turn_runtime(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    ProviderStage::TurnStart,
+                    if evidence == "unknown" {
+                        TurnExecution::Unknown
+                    } else {
+                        TurnExecution::Started
+                    },
+                )?;
+            }
+            "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
+            "process" => store.record_manager_process(&attempt.id, 123)?,
+            "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
+            "pending" => {
+                store.connection.execute(
+                "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
+                params![attempt.id, job.trigger])?;
+            }
+            _ => {}
+        }
+        let refunded = evidence == "not_started";
+        assert_eq!(
+            store.refund_scheduler_budget(
+                reservation,
+                if evidence == "restarted" {
+                    "next-boot"
+                } else {
+                    "boot"
+                }
+            )?,
+            refunded,
+            "{evidence}"
+        );
+        let used = |day: &str| -> Result<u64> {
+            Ok(store.connection.query_row(
+                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
+                params![net.network, day],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(
+            used("1970-01-01")?,
+            if refunded { 0 } else { 3 },
+            "{evidence}"
+        );
+        assert_eq!(
+            used("1970-01-02")?,
+            4,
+            "refund cannot debit the next UTC day"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_budget_reservations_share_an_atomic_daily_limit() -> Result<()> {
+    let net = net()?;
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("scheduler-budget-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&directory)?;
+    let path = directory.join("node.sqlite3");
+    let mut original = Store::open(&path)?;
+    original.install_trust_bundle(&net.network, &net.state)?;
+    conversation(&mut original, &net)?;
+    original.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    say(&mut original, &net, "concurrent-budget", true)?;
+    let job = original
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "budget")?
+        .context("claim")?
+        .job;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let mut connection = Store::open(&path)?;
+        let (network, job, barrier) = (net.network.clone(), job.clone(), barrier.clone());
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            connection
+                .reserve_scheduler_budget(&network, &job, 1, 3, 0)
+                .is_ok()
+        }));
+    }
+    let accepted = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("budget thread"))
+        .filter(|accepted| *accepted)
+        .count();
+    assert_eq!(accepted, 3);
+    let used: u64 = original.connection.query_row(
+        "SELECT used FROM budget_days WHERE network_id=? AND day='1970-01-01'",
+        [&net.network],
+        |row| row.get(0),
+    )?;
+    assert_eq!(used, 3);
+    drop(original);
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+#[test]
 fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<()> {
     use crate::scheduling::{QueueHoldReason, SessionScope};
     let net = net()?;

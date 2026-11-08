@@ -632,40 +632,63 @@ impl Runtime {
         Ok(json!({"check_id":check_id,"resolved":true}))
     }
 
-    /// Whether the work's device can still report it: this Node with the run on record, or a
-    /// reachable one; a work on the App Server also needs that device's App Server connected.
-    async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
-        let codex = if work.target_node == self.identity.device_id()? {
+    /// Capability alone cannot vouch for a lost work journal, even while the target is online.
+    pub(super) async fn local_work_vouches(
+        &self,
+        network: &str,
+        conversation: &str,
+        work_id: &str,
+    ) -> Result<bool> {
+        let kind = {
             let store = self.store.lock().await;
-            if store
-                .pending_checks()?
-                .iter()
-                .any(|check| check.trigger == crate::scheduling::task_trigger(&work.work_id))
-            {
+            if store.pending_checks()?.iter().any(|check| {
+                check.conversation_id == conversation
+                    && check.trigger == crate::scheduling::task_trigger(work_id)
+            }) {
                 return Ok(false);
             }
-            let run = store.work_record(&work.work_id)?;
-            drop(store);
-            if run.is_none_or(|run| matches!(run.state, WorkState::Unverified { .. })) {
+            let Some(run) = store.work_record_in_scope(
+                network,
+                conversation,
+                work_id,
+                &self.identity.device_id()?,
+            )?
+            else {
+                return Ok(false);
+            };
+            if matches!(run.state, WorkState::Unverified { .. }) {
                 return Ok(false);
             }
-            self.codex.capability().await
+            run.kind
+        };
+        Ok(match kind {
+            WorkKind::Agent(provider) if provider.on_app_server() => {
+                self.codex.capability().await["connected"] == true
+            }
+            _ => true,
+        })
+    }
+
+    async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
+        if work.target_node == self.identity.device_id()? {
+            self.local_work_vouches(network, &work.conversation_id, &work.work_id)
+                .await
         } else {
-            let request = json!({"type":"capabilities"});
+            let request = json!({"type":"work_evidence",
+                "conversation_id":work.conversation_id,"work_id":work.work_id});
             match tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 self.peer_request(network, &work.target_node, request),
             )
             .await
             {
-                Ok(Ok(capabilities)) => capabilities["codex"].clone(),
-                _ => return Ok(false),
+                Ok(Ok(evidence)) => Ok(evidence["network_id"] == network
+                    && evidence["conversation_id"] == work.conversation_id
+                    && evidence["work_id"] == work.work_id
+                    && evidence["vouches"] == true),
+                _ => Ok(false),
             }
-        };
-        Ok(match work.kind {
-            WorkKind::Agent(provider) if provider.on_app_server() => codex["connected"] == true,
-            _ => true,
-        })
+        }
     }
 
     async fn settle_work_check(
@@ -695,7 +718,7 @@ impl Runtime {
             Some(_) => bail!("这个结果已经不需要你确认了"),
             None => ensure!(
                 !self.target_vouches(network, &work).await?,
-                "它的设备还在线。等它报回结果就行。"
+                "它的设备仍持有原工作记录，可以继续报回结果。"
             ),
         }
         let unvouched = work.outcome.is_none();

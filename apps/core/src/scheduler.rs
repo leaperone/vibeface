@@ -680,24 +680,6 @@ async fn turn(
         tracing::Span::current().record("work_id", work_id);
     }
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
-    job = node.store.lock().await.record_turn_runtime(
-        &conversation,
-        &trigger,
-        &attempt.id,
-        &TurnRuntime {
-            provider,
-            model: (!config.model.is_empty()).then(|| config.model.clone()),
-            reasoning_effort: config.reasoning_effort.clone(),
-            generation: node.provider_generation(provider, &provider_local)?,
-            session_generation: claimed.session_generation,
-            delivery_id: attempt.id.clone(),
-            stage: ProviderStage::Validate,
-            execution: TurnExecution::NotStarted,
-            attempted_at_ms: crate::runtime::now_ms(),
-            switched_from: None,
-            switch_reason: None,
-        },
-    )?;
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
     let mut token = if provider.instance_per_bot() {
@@ -714,7 +696,26 @@ async fn turn(
     let mut tools_fenced = false;
     let mut registered = false;
     let mut sdk_live = false;
+    let mut budget = None;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
+        job = node.store.lock().await.record_turn_runtime(
+            &conversation,
+            &trigger,
+            &attempt.id,
+            &TurnRuntime {
+                provider,
+                model: (!config.model.is_empty()).then(|| config.model.clone()),
+                reasoning_effort: config.reasoning_effort.clone(),
+                generation: node.provider_generation(provider, &provider_local)?,
+                session_generation: claimed.session_generation,
+                delivery_id: attempt.id.clone(),
+                stage: ProviderStage::Validate,
+                execution: TurnExecution::NotStarted,
+                attempted_at_ms: crate::runtime::now_ms(),
+                switched_from: None,
+                switch_reason: None,
+            },
+        )?;
         #[cfg(test)]
         if job.kind == TriggerKind::AgentTask {
             let barrier = node.claim_to_start_barrier.lock().expect("claim barrier").take();
@@ -865,21 +866,6 @@ async fn turn(
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]);
-            if !started && matches!(
-                job.kind,
-                TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::WorkspaceTask | TriggerKind::Schedule | TriggerKind::BotMessage
-            ) {
-                node.store.lock().await.reserve_budget(
-                    &network,
-                    1,
-                    node.config.daily_decision_limit,
-                )?;
-            }
-            let cancel = node
-                .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider,permission_epoch)
-                .await?;
-            registered = true;
-            tools_fenced = false;
             let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
                 (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
             let resumed_thread = claimed.previous_native_id.clone();
@@ -887,21 +873,34 @@ async fn turn(
                 (node.clone(), network.clone(), job.clone(), attempt.id.clone(), node.identity.device_id()?);
             let progress_text = partial.clone();
             let progress_sequence = progress_sequence.clone();
-            if !started && job.kind != TriggerKind::AgentTask {
-                node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
-            }
-            node.publish_changed(&network, &conversation, Changed::Job(&trigger));
-            started = true;
-            sdk_live = true;
             let readiness = node.provider_readiness(provider, &config.model).await;
             let first = match ensure_readiness(&readiness) {
               Err(error) => Err(error),
               Ok(()) => {
+                let cancel = node
+                    .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider,permission_epoch)
+                    .await?;
+                registered = true;
+                tools_fenced = false;
+                if budget.is_none() && matches!(
+                    job.kind,
+                    TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::WorkspaceTask | TriggerKind::Schedule | TriggerKind::BotMessage
+                ) {
+                    budget = Some(node.store.lock().await.reserve_scheduler_budget(
+                        &network, &job, 1, node.config.daily_decision_limit, crate::runtime::now_ms(),
+                    )?);
+                }
+                if !started && job.kind != TriggerKind::AgentTask {
+                    node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
+                }
+                node.publish_changed(&network, &conversation, Changed::Job(&trigger));
+                started = true;
                 ensure!(node.local_permission_epoch.load(std::sync::atomic::Ordering::Acquire) == permission_epoch,"management permissions changed before native submission");
                 let _native_lease = node.manager_input_lease(&attempt.id,provider).await?;
                 node.store.lock().await.update_turn_runtime(
                     &conversation, &trigger, &attempt.id, ProviderStage::TurnStart, TurnExecution::Unknown,
                 )?;
+                sdk_live = true;
                 manager::run_manager(
                 &config,
                 &prompt,
@@ -1040,7 +1039,7 @@ async fn turn(
     .catch_unwind()
     .await
     .unwrap_or_else(|_| Err(anyhow::anyhow!("management attempt panicked; reconcile its outcome")));
-    let final_result: Result<Value> = async {
+    let mut final_result: Result<Value> = async {
         let Err(error) = outcome else {
             return outcome;
         };
@@ -1092,10 +1091,11 @@ async fn turn(
         };
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
-        let no_execution = current
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.execution == TurnExecution::NotStarted);
+        let no_execution = node
+            .store
+            .lock()
+            .await
+            .scheduler_attempt_not_started(&current)?;
         let terminal = if (cancellation || (stopped && no_execution)) && tools_fenced {
             JobOutcome::Cancelled(
                 if moved {
@@ -1113,6 +1113,15 @@ async fn turn(
         } else {
             JobOutcome::Failed(model_noted(failure, bot_model.as_deref()))
         };
+        if tools_fenced
+            && no_execution
+            && let Some(reservation) = budget.take()
+        {
+            node.store
+                .lock()
+                .await
+                .refund_scheduler_budget(reservation, boot_id())?;
+        }
         let text = partial.lock().expect("partial text").text();
         job = node.store.lock().await.finish_job(
             &node.identity,
@@ -1128,6 +1137,19 @@ async fn turn(
     }
     .await;
     node.finish_manager_attempt(&attempt.id).await;
+    if final_result.is_err()
+        && !sdk_live
+        && let Some(reservation) = budget.take()
+        && let Err(error) = node
+            .store
+            .lock()
+            .await
+            .refund_scheduler_budget(reservation, boot_id())
+    {
+        final_result = final_result.map_err(|failure| {
+            failure.context(format!("scheduler budget refund failed: {error:#}"))
+        });
+    }
     if let Err(error) = node.store.lock().await.settle_workspace_assignment(
         &node.identity,
         &network,
@@ -1194,6 +1216,12 @@ async fn record_failure(
             }))
     {
         execution = TurnExecution::Unknown;
+    }
+    if current.runtime.is_none()
+        && execution == TurnExecution::NotStarted
+        && store.scheduler_attempt_not_started(&current)?
+    {
+        return Ok(current);
     }
     store.update_turn_runtime(
         &job.conversation_id,
