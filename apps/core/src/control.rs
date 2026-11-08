@@ -176,6 +176,13 @@ fn wallet(data_dir: &Path, operation: Value) -> Result<Value> {
     }
 }
 
+fn authoritative_core_version(health: Option<&maintenance::Health>) -> &str {
+    match health {
+        Some(health) => health.version.as_str(),
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 pub async fn inspect(data_dir: &Path) -> Result<Value> {
     validate_data_dir(data_dir)?;
     let data_dir = fs::canonicalize(data_dir)
@@ -223,7 +230,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
             "status": health.as_ref().ok().and_then(|health| health.bootstrap.as_ref()),
         },
         "peers": health.as_ref().ok().map(|health| &health.peers),
-        "core_version": env!("CARGO_PKG_VERSION"),
+        "core_version": authoritative_core_version(health.as_ref().ok()),
         "error": error,
     }))
 }
@@ -730,6 +737,48 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("vibeface-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn authoritative_core_version_prefers_running_health_over_inspector_binary() {
+        use maintenance::Health;
+        let running = "0.0.1-nightly.20261107.1";
+        let health = Health {
+            device_id: "device-fixture".into(),
+            version: running.into(),
+            web_enabled: true,
+            write_state: None,
+            bootstrap: None,
+            peers: vec![],
+        };
+        assert_eq!(
+            super::authoritative_core_version(Some(&health)),
+            running,
+            "a health-confirmed daemon must report its own version"
+        );
+        assert_eq!(
+            super::authoritative_core_version(None),
+            env!("CARGO_PKG_VERSION"),
+            "offline inspection reports the inspecting Core binary"
+        );
+        assert_ne!(running, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_stopped_nodes_with_inspector_core_version() -> Result<()> {
+        let dir = temp_dir("inspect-stopped-version");
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        let identity = crypto::LocalIdentity::generate();
+        Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false).save(&dir)?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
+        let inspected = inspect(&dir).await?;
+        assert_eq!(inspected["status"], "stopped");
+        assert!(inspected["version"].is_null());
+        assert_eq!(inspected["core_version"], env!("CARGO_PKG_VERSION"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     fn free_addr() -> SocketAddr {

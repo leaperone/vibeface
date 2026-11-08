@@ -1,18 +1,10 @@
 import { join } from 'node:path'
 import { BrowserWindow, shell, type Event, type Session } from 'electron'
-import { LAUNCHER_URL, PRODUCT_NAME } from '../shared/contract.js'
+import { PRODUCT_NAME } from '../shared/contract.js'
 import { CLIENT_HOST, CLIENT_ORIGIN, CLIENT_SCHEME } from '../shared/client-contract.js'
 
 /** Permissions the Core-served page may ask for; everything else is refused. */
 const BUSINESS_PERMISSIONS = new Set(['notifications', 'clipboard-sanitized-write', 'fullscreen', 'media'])
-
-export function launcherPreload(mainDir: string): string {
-  return join(mainDir, '..', 'preload', 'launcher.cjs')
-}
-
-export function launcherAssets(mainDir: string): string {
-  return join(mainDir, '..', 'launcher')
-}
 
 /** Open an http(s) link in the user's own browser; anything else is dropped. */
 export function openExternally(rawUrl: string): void {
@@ -32,35 +24,6 @@ function guardNavigation(window: BrowserWindow, allowed: (url: string) => boolea
   }
   window.webContents.on('will-navigate', navigate)
   window.webContents.on('will-redirect', navigate)
-}
-
-export function createLauncherWindow(mainDir: string): BrowserWindow {
-  const window = new BrowserWindow({
-    width: 560,
-    height: 600,
-    minWidth: 460,
-    minHeight: 420,
-    show: false,
-    title: `${PRODUCT_NAME} 启动器`,
-    webPreferences: {
-      preload: launcherPreload(mainDir),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      webviewTag: false,
-      spellcheck: false,
-    },
-  })
-  window.setMenuBarVisibility(false)
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    openExternally(url)
-    return { action: 'deny' }
-  })
-  guardNavigation(window, (url) => url === LAUNCHER_URL)
-  window.webContents.on('will-attach-webview', (event) => event.preventDefault())
-  void window.loadURL(LAUNCHER_URL)
-  return window
 }
 
 /** The client preload is given only to this fixed first-party asset origin. */
@@ -87,10 +50,7 @@ export function sameOrigin(rawUrl: string, origin: string): boolean {
   }
 }
 
-/**
- * Permissions are answered per requesting origin: the Core page gets the browser
- * capabilities the web app already uses, and the launcher gets none at all.
- */
+/** Permissions are answered per requesting origin for the sole client window. */
 export function guardPermissions(session: Session, businessOrigin: () => string | null): void {
   session.setPermissionRequestHandler((contents, permission, callback, details) => {
     const origin = businessOrigin()

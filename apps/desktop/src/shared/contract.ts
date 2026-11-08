@@ -1,9 +1,4 @@
-/** Types shared by the main process, the trusted launcher preload and the launcher renderer. */
-
-export const LAUNCHER_SCHEME = 'vibeface-launcher'
-export const LAUNCHER_HOST = 'app'
-export const LAUNCHER_ORIGIN = `${LAUNCHER_SCHEME}://${LAUNCHER_HOST}`
-export const LAUNCHER_URL = `${LAUNCHER_ORIGIN}/index.html`
+/** Types shared by the main process and the trusted first-party client preload. */
 
 export const APP_ID = 'one.leaper.vibeface.desktop'
 export const PRODUCT_NAME = 'Vibeface'
@@ -11,27 +6,46 @@ export const PRODUCT_NAME = 'Vibeface'
 /** Hidden Core flag: the owned child shuts down gracefully when the desktop closes its stdin. */
 export const PARENT_STDIN_FLAG = '--desktop-parent-stdin'
 
+export const DESKTOP_NODE_SETTINGS_PATH = '/settings/desktop-node'
+
 export const IPC = {
-  status: 'launcher:status',
-  getStatus: 'launcher:get-status',
-  chooseDataDir: 'launcher:choose-data-dir',
-  useDataDir: 'launcher:use-data-dir',
-  forgetDataDir: 'launcher:forget-data-dir',
-  startOwned: 'launcher:start-owned',
-  attachExisting: 'launcher:attach-existing',
-  stopOwned: 'launcher:stop-owned',
-  openBusiness: 'launcher:open-business',
-  setPreference: 'launcher:set-preference',
-  openExternal: 'launcher:open-external',
-  discoverNodes: 'launcher:discover-nodes',
-  connectDiscoveredNode: 'launcher:connect-discovered-node',
-  startDiscoveredNode: 'launcher:start-discovered-node',
-  installBackgroundNode: 'launcher:install-background-node',
-  startBackgroundNode: 'launcher:start-background-node',
-  stopBackgroundNode: 'launcher:stop-background-node',
-  removeBackgroundNode: 'launcher:remove-background-node',
-  chooseNodeMode: 'launcher:choose-node-mode',
+  status: 'desktop:status',
+  getStatus: 'desktop:get-status',
+  chooseDataDir: 'desktop:choose-data-dir',
+  useDataDir: 'desktop:use-data-dir',
+  forgetDataDir: 'desktop:forget-data-dir',
+  startOwned: 'desktop:start-owned',
+  attachExisting: 'desktop:attach-existing',
+  stopOwned: 'desktop:stop-owned',
+  focusClient: 'desktop:focus-client',
+  reconnectClient: 'desktop:reconnect-client',
+  setPreference: 'desktop:set-preference',
+  openExternal: 'desktop:open-external',
+  discoverNodes: 'desktop:discover-nodes',
+  connectDiscoveredNode: 'desktop:connect-discovered-node',
+  startDiscoveredNode: 'desktop:start-discovered-node',
+  installBackgroundNode: 'desktop:install-background-node',
+  startBackgroundNode: 'desktop:start-background-node',
+  stopBackgroundNode: 'desktop:stop-background-node',
+  removeBackgroundNode: 'desktop:remove-background-node',
+  updateBackgroundNode: 'desktop:update-background-node',
+  chooseNodeMode: 'desktop:choose-node-mode',
 } as const
+
+export type BackgroundRuntimeUpdateAvailability =
+  | 'not_installed'
+  | 'current'
+  | 'newer_available'
+  | 'immutable_conflict'
+  | 'downgrade_refused'
+
+export type BackgroundRuntimeUpdate = {
+  bundledVersion: string
+  installedVersion: string | null
+  runningVersion: string | null
+  availability: BackgroundRuntimeUpdateAvailability
+  recoveryRequired: boolean
+}
 
 /** Read-only current-user Node observations; kept separate from App-host lifecycle state. */
 export type NodeSource = 'remembered' | 'app_profile' | 'default_home' | 'user_service' | 'running_process'
@@ -56,11 +70,11 @@ export type NodeDiscovery =
   | { kind: 'failed'; message: string }
 
 export type BackgroundNode =
-  | { kind: 'absent' | 'checking' }
-  | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler' }
-  | { kind: 'partial'; nodeId: string; dataDir: string; message: string }
-  | { kind: 'conflict'; message: string }
-  | { kind: 'failure'; message: string }
+  | { kind: 'absent' | 'checking'; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler'; runtimeUpdate: BackgroundRuntimeUpdate }
+  | { kind: 'partial'; nodeId: string; dataDir: string; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'conflict'; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'failure'; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
 
 /** Core availability as the desktop can actually prove it, not a guess. */
 export type RuntimeState =
@@ -92,11 +106,13 @@ export type Preferences = {
 export const PREFERENCE_KEYS = ['openBusinessOnConnect'] as const
 export type PreferenceKey = (typeof PREFERENCE_KEYS)[number]
 
-export type LauncherStatus = {
+export type DesktopStatus = {
   runtime: RuntimeState
   core: CoreState
-  /** True while the business window exists and shows the Core-served UI. */
-  businessOpen: boolean
+  /** Host startup has finished navigation and may accept native mutations. */
+  hostPhase: 'starting' | 'ready'
+  /** True while the sole client window is visible. */
+  clientVisible: boolean
   preferences: Preferences
   /** Absolute profile directory holding desktop preferences and the Chromium profile. */
   profileDir: string
@@ -113,24 +129,26 @@ export type LauncherStatus = {
   backgroundNode: BackgroundNode
 }
 
-export type LauncherApi = {
-  getStatus(): Promise<LauncherStatus>
-  chooseDataDir(): Promise<LauncherStatus>
-  useDataDir(dataDir: string): Promise<LauncherStatus>
-  forgetDataDir(): Promise<LauncherStatus>
-  startOwned(): Promise<LauncherStatus>
-  attachExisting(): Promise<LauncherStatus>
-  stopOwned(): Promise<LauncherStatus>
-  openBusiness(): Promise<LauncherStatus>
-  setPreference(key: PreferenceKey, value: boolean): Promise<LauncherStatus>
+export type DesktopNodeApi = {
+  getStatus(): Promise<DesktopStatus>
+  chooseDataDir(): Promise<DesktopStatus>
+  useDataDir(dataDir: string): Promise<DesktopStatus>
+  forgetDataDir(): Promise<DesktopStatus>
+  startOwned(): Promise<DesktopStatus>
+  attachExisting(): Promise<DesktopStatus>
+  stopOwned(): Promise<DesktopStatus>
+  focusClient(): Promise<DesktopStatus>
+  reconnectClient(showChat: boolean): void
+  setPreference(key: PreferenceKey, value: boolean): Promise<DesktopStatus>
   openExternal(url: string): Promise<void>
-  onStatus(handler: (status: LauncherStatus) => void): () => void
-  discoverNodes(): Promise<LauncherStatus>
-  connectDiscoveredNode(candidateId: string): Promise<LauncherStatus>
-  startDiscoveredNode(candidateId: string): Promise<LauncherStatus>
-  chooseNodeMode(mode: 'controller' | 'local'): Promise<LauncherStatus>
-  installBackgroundNode(): Promise<LauncherStatus>
-  startBackgroundNode(): Promise<LauncherStatus>
-  stopBackgroundNode(): Promise<LauncherStatus>
-  removeBackgroundNode(): Promise<LauncherStatus>
+  onStatus(handler: (status: DesktopStatus) => void): () => void
+  discoverNodes(): Promise<DesktopStatus>
+  connectDiscoveredNode(candidateId: string): Promise<DesktopStatus>
+  startDiscoveredNode(candidateId: string): Promise<DesktopStatus>
+  chooseNodeMode(mode: 'controller' | 'local'): Promise<DesktopStatus>
+  installBackgroundNode(): Promise<DesktopStatus>
+  startBackgroundNode(): Promise<DesktopStatus>
+  stopBackgroundNode(): Promise<DesktopStatus>
+  removeBackgroundNode(): Promise<DesktopStatus>
+  updateBackgroundNode(): Promise<DesktopStatus>
 }

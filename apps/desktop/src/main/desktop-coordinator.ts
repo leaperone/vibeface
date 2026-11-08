@@ -6,7 +6,7 @@ import { discoverLocalNodes, type LocalNodes } from './local-nodes.js'
 import type { ManagedNodeController, ManagedNodeStatus } from './managed-node.js'
 import { loadClientPreferences, saveClientPreferences, type ClientPreferences } from './client-preferences.js'
 import type { CoreProgram } from './control-client.js'
-import type { BackgroundNode, LauncherStatus, LocalNode, NodeDiscovery } from '../shared/contract.js'
+import type { BackgroundNode, BackgroundRuntimeUpdate, DesktopStatus, LocalNode, NodeDiscovery } from '../shared/contract.js'
 
 export type SelectedLocalNode = { inspect: Inspect; access: Access }
 export type DesktopCoordinatorOptions = {
@@ -40,17 +40,28 @@ function manager(platform: NodeJS.Platform): 'launchd' | 'systemd' | 'task-sched
   return 'systemd'
 }
 
+function runtimeFromStatus(status: ManagedNodeStatus): BackgroundRuntimeUpdate {
+  const update = status.runtime_update
+  return {
+    bundledVersion: update.bundledVersion,
+    installedVersion: update.installedVersion,
+    runningVersion: update.runningVersion,
+    availability: update.availability,
+    recoveryRequired: update.recoveryRequired,
+  }
+}
+
 export function backgroundNodeFromStatus(status: ManagedNodeStatus, platform: NodeJS.Platform): BackgroundNode {
   if (!status.ok) return { kind: 'failure', message: '无法读取后台节点状态。' }
-  if (status.state === 'not_installed') return { kind: 'absent' }
-  if (status.state === 'conflict') return { kind: 'conflict', message: '后台节点服务注册与 Vibeface 记录不一致。' }
-  if (status.state === 'unavailable') return { kind: 'failure', message: '无法检查后台节点服务健康状态。' }
+  if (status.state === 'not_installed') return { kind: 'absent', runtimeUpdate: runtimeFromStatus(status) }
+  if (status.state === 'conflict') return { kind: 'conflict', message: '后台节点服务注册与 Vibeface 记录不一致。', runtimeUpdate: runtimeFromStatus(status) }
+  if (status.state === 'unavailable') return { kind: 'failure', message: '无法检查后台节点服务健康状态。', runtimeUpdate: runtimeFromStatus(status) }
   if (status.state === 'partial') return { kind: 'partial', nodeId: status.device_id, dataDir: status.data_dir,
-    message: '后台服务注册不完整，可以核对后移除后台运行。节点数据会保留。' }
+    message: '后台服务注册不完整，可以核对后移除后台运行。节点数据会保留。', runtimeUpdate: runtimeFromStatus(status) }
   const health = status.service_running === true && status.core_status === 'running'
     ? 'running'
     : status.service_running === false && status.core_status === 'stopped' ? 'stopped' : 'unhealthy'
-  return { kind: 'installed', nodeId: status.device_id, dataDir: status.data_dir, health, manager: manager(platform) }
+  return { kind: 'installed', nodeId: status.device_id, dataDir: status.data_dir, health, manager: manager(platform), runtimeUpdate: runtimeFromStatus(status) }
 }
 
 /** Prepare only the App profile Node, and only when the user explicitly asks for background install. */
@@ -108,7 +119,7 @@ export class DesktopCoordinator {
     await Promise.all([this.refreshBackground(), this.discover()])
   }
 
-  status(): Pick<LauncherStatus, 'nodeMode' | 'selectedNode' | 'discovery' | 'backgroundNode'> {
+  status(): Pick<DesktopStatus, 'nodeMode' | 'selectedNode' | 'discovery' | 'backgroundNode'> {
     return {
       nodeMode: this.preferences.nodeMode,
       selectedNode: this.preferences.selectedNode,
@@ -295,10 +306,59 @@ export class DesktopCoordinator {
   async stopBackground(): Promise<void> { await this.backgroundAction('stop') }
   async removeBackground(): Promise<void> { await this.backgroundAction('uninstall') }
 
+  async updateBackground(): Promise<void> {
+    await this.serial(async () => {
+      const current = this.backgroundNode
+      if (current.kind !== 'installed' && current.kind !== 'partial') {
+        throw new Error('没有可更新的已验证后台节点。')
+      }
+      if (current.kind === 'installed' && !current.runtimeUpdate.recoveryRequired && current.runtimeUpdate.availability !== 'newer_available') {
+        throw new Error('App 内置运行时没有可更新的版本。')
+      }
+      const fresh = await this.options.managedNode.status()
+      if (!['installed', 'installed_stopped', 'partial'].includes(fresh.state)
+          || fresh.device_id !== current.nodeId || fresh.data_dir !== current.dataDir) {
+        throw new Error('后台节点身份已变化，请重新核对后再更新。')
+      }
+      if (!fresh.runtime_update.recoveryRequired && fresh.runtime_update.availability !== 'newer_available') {
+        throw new Error('App 内置运行时没有可更新的版本。')
+      }
+      if (fresh.runtime_update.recoveryRequired && (fresh.service_running !== false || fresh.core_status !== 'stopped')) {
+        throw new Error('上次更新尚未完成，请先停止后台节点，再点击“继续更新”。')
+      }
+      let result: ManagedNodeStatus
+      try { result = await this.options.managedNode.updateBackground(current.nodeId) }
+      catch (error) { await this.refreshBackground(); throw error }
+      this.backgroundNode = backgroundNodeFromStatus(result, this.platform)
+      const updated = this.backgroundNode
+      if (fresh.runtime_update.recoveryRequired && updated.kind === 'partial'
+          && updated.nodeId === current.nodeId && updated.dataDir === current.dataDir && !updated.runtimeUpdate?.recoveryRequired) {
+        this.changed()
+        return
+      }
+      if (updated.kind !== 'installed' || updated.nodeId !== current.nodeId || updated.dataDir !== current.dataDir) {
+        throw new Error('后台节点更新后未能确认相同的节点身份。')
+      }
+      const expectedHealth = fresh.service_running && fresh.core_status === 'running' ? 'running' : 'stopped'
+      const runtime = updated.runtimeUpdate
+      if (updated.health !== expectedHealth || runtime.recoveryRequired || runtime.availability !== 'current'
+          || runtime.installedVersion !== runtime.bundledVersion
+          || runtime.runningVersion !== (expectedHealth === 'running' ? runtime.bundledVersion : null)) {
+        throw new Error('后台节点更新后的运行状态或版本未能确认，请重新核对状态。')
+      }
+      await this.refreshBackground()
+      await this.discoverInner()
+      this.changed()
+    })
+  }
+
   private async backgroundAction(action: 'start' | 'stop' | 'uninstall'): Promise<void> {
     await this.serial(async () => {
       const current = this.backgroundNode
       if (current.kind !== 'installed' && !(action === 'uninstall' && current.kind === 'partial')) throw new Error('没有可管理的已验证后台节点。')
+      if (action !== 'stop' && current.runtimeUpdate?.recoveryRequired) {
+        throw new Error('上次更新尚未完成，请先点击“继续更新”完成核对。')
+      }
       let result: ManagedNodeStatus
       try {
         if (action === 'uninstall') {

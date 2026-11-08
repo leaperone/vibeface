@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { describe as toView } from '../src/launcher/view.js'
-import type { BackgroundNode, CoreState, LauncherStatus, LocalNode } from '../src/shared/contract.js'
+import { describeNodeSettings as toView } from '../src/shared/node-view.js'
+import type { BackgroundNode, CoreState, DesktopStatus, LocalNode } from '../src/shared/contract.js'
 
-const status = (overrides: Partial<LauncherStatus> = {}): LauncherStatus => ({
+const status = (overrides: Partial<DesktopStatus> = {}): DesktopStatus => ({
   runtime: { kind: 'ready', corePath: '/app/resources/runtime/vibeface-core' },
   core: { kind: 'none' },
-  businessOpen: false,
+  hostPhase: 'ready',
+  clientVisible: true,
   preferences: { openBusinessOnConnect: true },
   profileDir: '/tmp/profile',
   version: '0.0.1-nightly.20261107.1',
@@ -27,9 +28,29 @@ const node = (kind: LocalNode['kind'], id = 'candidate-1'): LocalNode => {
   }
 }
 
-describe('launcher view', () => {
+describe('desktop node settings view', () => {
+  it('requires a stop before continuing recovery and never offers a pending start or removal', () => {
+    const stopped = node('stopped')
+    const runtimeUpdate = { bundledVersion: '0.0.1', installedVersion: '0.0.1', runningVersion: null,
+      availability: 'current' as const, recoveryRequired: true }
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: stopped.deviceId, dataDir: stopped.dataDir,
+      health: 'stopped', manager: 'launchd', runtimeUpdate }
+    const offline = toView(status({ nodeMode: 'local', backgroundNode, discovery: { kind: 'ready', nodes: [stopped], warnings: [] } }))
+    expect(offline.backgroundActions.map(a => a.id)).toEqual(['update-background'])
+    expect(offline.backgroundActions[0]).toMatchObject({ label: '继续更新', disabled: false })
+    expect(offline.rows[0]?.actions).toEqual([])
+    const running = toView(status({ nodeMode: 'local', backgroundNode: { ...backgroundNode, health: 'running' } }))
+    expect(running.backgroundActions.map(a => a.id)).toEqual(['update-background', 'stop-background'])
+    expect(running.backgroundActions[0]?.disabled).toBe(true)
+    expect(running.backgroundMessage).toContain('先停止后台节点')
+  })
+
   it('offers controller-only and local-node choices on first open', () => {
     expect(toView(status()).actions.map((item) => item.id)).toEqual(['controller', 'local'])
+  })
+
+  it('still describes undecided mode while the desktop host is starting', () => {
+    expect(toView(status({ hostPhase: 'starting' })).headline).toBe('Vibeface')
   })
 
   it('keeps the controller available without a Core runtime and discovers healthy choices', () => {
@@ -74,18 +95,30 @@ describe('launcher view', () => {
   })
 
   it('shows installed background ownership even in controller mode and never offers its removal there', () => {
-    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'running', manager: 'launchd' }
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'running', manager: 'launchd',
+      runtimeUpdate: { bundledVersion: '0.0.1', installedVersion: '0.0.1', runningVersion: '0.0.1', recoveryRequired: false, availability: 'current' } }
     const view = toView(status({ nodeMode: 'controller', backgroundNode }))
     expect(view.backgroundMessage).toContain('正在运行')
     expect(view.backgroundActions).toEqual([])
   })
 
   it('offers truthful background service controls only when local hosting is selected', () => {
-    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'stopped', manager: 'launchd' }
+    const runtime = { bundledVersion: '0.0.1-nightly.20261108.1', installedVersion: '0.0.1-nightly.20261107.1', runningVersion: null, recoveryRequired: false, availability: 'current' as const }
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'stopped', manager: 'launchd', runtimeUpdate: runtime }
     expect(toView(status({ nodeMode: 'local', backgroundNode })).backgroundActions.map((item) => item.id)).toEqual(['start-background', 'remove-background'])
     expect(toView(status({ nodeMode: 'local', backgroundNode: { kind: 'conflict', message: '服务注册已更改' } })).backgroundActions).toEqual([])
-    const partial: BackgroundNode = { kind: 'partial', nodeId: 'node-1', dataDir: '/var/data/node', message: '后台服务注册不完整' }
+    const partial: BackgroundNode = { kind: 'partial', nodeId: 'node-1', dataDir: '/var/data/node', message: '后台服务注册不完整',
+      runtimeUpdate: { bundledVersion: '0.0.1', installedVersion: '0.0.1', runningVersion: null, recoveryRequired: false, availability: 'current' } }
     expect(toView(status({ nodeMode: 'local', backgroundNode: partial })).backgroundActions.map(item => item.id)).toEqual(['discover', 'remove-background'])
+  })
+
+  it('offers a primary update action only when the bundled runtime is newer', () => {
+    const runtimeUpdate = { bundledVersion: '0.0.1-nightly.20261108.1', installedVersion: '0.0.1-nightly.20261107.1', runningVersion: '0.0.1-nightly.20261107.1', recoveryRequired: false, availability: 'newer_available' as const }
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'running', manager: 'launchd', runtimeUpdate }
+    const view = toView(status({ nodeMode: 'local', backgroundNode }))
+    expect(view.backgroundActions.map((item) => item.id)).toEqual(['update-background', 'stop-background', 'remove-background'])
+    expect(view.backgroundActions[0]?.primary).toBe(true)
+    expect(view.backgroundMessage).toContain('0.0.1-nightly.20261108.1')
   })
 
   it('keeps client action present while local Core is missing and reports discovery failure separately', () => {
