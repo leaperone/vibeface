@@ -42,7 +42,7 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 | --- | --- | --- |
 | discovery | Core host network，discovery-only，`--no-web` | 上例全部 Core 字段 |
 | entry | Core host network，forward/grants，保留 API，无静态 App | 上例全部 Core 字段 |
-| relay | Core host network，forward/operator-token，`--no-web` | 全部 Core 字段，另加 `nginx_config`、`server_name` |
+| relay | Core host network，forward/operator-token，保留浏览器接入 API，无静态 App | 全部 Core 字段，另加 `nginx_config`、`server_name` |
 | app | 静态 App，bridge network | 通用字段，另加 `nginx_config`、`server_name` |
 | www | 静态 WWW，bridge network | 通用字段，另加 `nginx_config`、`server_name`，tag 使用 `www-v` 前缀 |
 

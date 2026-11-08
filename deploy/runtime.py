@@ -149,7 +149,7 @@ def health(info):
         result = inspect()
         require(result['status'] == 'running' and result['version'] == info['version']
                 and result['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE']
-                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] == 'entry'),
+                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] != 'discovery'),
                 'Core health, version, identity or browser mode differs')
         return {key: result[key] for key in ('status', 'version', 'device_id')}
     request = urllib.request.Request('http://127.0.0.1:8080/')
@@ -225,7 +225,7 @@ def main():
             with (DATA / 'node.lock').open('rb') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
-            if os.environ['VIBEFACE_ROLE'] != 'entry':
+            if os.environ['VIBEFACE_ROLE'] == 'discovery':
                 args.append('--no-web')
             os.execv(args[0], args)
     else:
