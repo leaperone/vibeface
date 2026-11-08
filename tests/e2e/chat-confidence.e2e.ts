@@ -53,9 +53,9 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     addWork('chat-confidence-unknown', 'message:report', '结果未知的任务', 'unverified');
     addWork('chat-confidence-scrolling', 'message:scroll-request', '即将完成的任务');
     addWork('chat-confidence-compact', 'message:compact-request', '完成行不重复的标题', 'completed');
-    const question = { type: 'question_asked', question_id: 'report-scope', target, attention: { kind: 'question', device_id: null }, severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
+    const question = { type: 'question_asked', question_id: 'q-report-scope', target, attention: { kind: 'question', device_id: null }, severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, question.question_id, conversation, '3', node.peer, Date.now(), node.peer, 'report', JSON.stringify(question));
-    const approval = { ...question, question_id: 'report-approval', attention: { kind: 'approval', device_id: node.peer }, text: '允许写入运营汇总吗？', choices: [{ label: '允许' }, { label: '拒绝' }], about: { ...question.about, agent: 'codex', session_id: 'approval-session', request_id: 'fixture-request' } };
+    const approval = { ...question, question_id: 'q-report-approval', attention: { kind: 'approval', device_id: node.peer }, text: '允许写入运营汇总吗？', choices: [{ label: '允许' }, { label: '拒绝' }], about: { ...question.about, agent: 'codex', session_id: 'approval-session', request_id: 'fixture-request' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?)').run(network, approval.question_id, conversation, '4', node.peer, Date.now() + 1, node.peer, 'approval-session', 'fixture-request', JSON.stringify(approval));
     const historyQuestion = { ...question, question_id: 'history-origin', severity: 'info', text: '历史交代已确认', choices: [], about: { ...question.about, session_id: 'history-origin' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, historyQuestion.question_id, conversation, '0', node.peer, Date.now() - 120000, node.peer, historyQuestion.about.session_id, JSON.stringify(historyQuestion));
@@ -233,15 +233,19 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     assert.deepEqual(description, { text: blockedReason, label: '补充给 整理本月运营情况', count: 1 });
     await app.screenshot('chat-confidence-unknown-phone');
 
+    const format = { ...question, question_id: 'q-report-format', text: '报表用什么格式？', choices: [{ label: '表格' }, { label: '文字' }] };
+    db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, format.question_id, conversation, '5', node.peer, Date.now(), node.peer, 'report', JSON.stringify(format));
     await browser.goto(`${node.url}/tasks`);
+    await screen.getByRole('heading', '退款需要单独统计吗？').scrollIntoView();
     await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toBeVisible();
     await app.screenshot('chat-confidence-tasks-decisions-phone');
     await screen.getByRole('button', '单独统计', { exact: true }).click();
     await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toHaveCount(0);
-    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('report-scope')?.text, '单独统计', 'one tap answers with the choice');
-    await screen.getByRole('button', '忽略', { exact: true }).click();
-    await expect(screen.getByRole('heading', '允许写入运营汇总吗？')).toHaveCount(0);
-    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('report-approval')?.text, '忽略', 'ignoring answers with the fixed text');
+    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('q-report-scope')?.text, '单独统计', 'one tap answers with the choice');
+    const formatCard = browser.locator('div').filter({ has: screen.getByRole('heading', '报表用什么格式？') }).filter({ has: screen.getByRole('button', '忽略', { exact: true }) }).last();
+    await formatCard.getByRole('button', '忽略', { exact: true }).click();
+    await expect(screen.getByRole('heading', '报表用什么格式？')).toHaveCount(0);
+    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('q-report-format')?.text, '忽略', 'ignoring answers with the fixed text');
     await app.screenshot('chat-confidence-tasks-cleared-phone');
   } finally { db.close(); }
 });
