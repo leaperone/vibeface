@@ -689,6 +689,8 @@ async fn recover_with_service(
         journal.previous.clone()
     };
     if !journal.resume_service {
+        let _node_lock =
+            lock_data_dir(data).context("stop the Node before recovering a stopped update")?;
         if installed(&root)? != wanted {
             switch(&root, &wanted)?;
         }
@@ -824,12 +826,11 @@ fn prepare_backup_dir(backups: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn switch_stopped(policy: &Policy, data: &Path, journal: &Journal) -> Result<()> {
+async fn switch_stopped(policy: &Policy, data: &Path, journal: &Journal) -> Result<File> {
     let lock = lock_data_dir(data).context("stop the Node before updating")?;
     backup(data, &journal.backup)?;
     switch(&policy.install_root, &journal.candidate)?;
-    drop(lock);
-    Ok(())
+    Ok(lock)
 }
 
 fn restore_stopped(policy: &Policy, journal: &Journal) -> Result<()> {
@@ -960,14 +961,12 @@ where
             )),
         };
         if let Err(error) = handed {
-            drop(lease);
             if error.to_string().contains("deadline expired") {
                 return Err(error);
             }
             return reconcile_running(&policy, data, &service, error).await;
         }
         if let Err(error) = prove(journal.candidate.clone()).await {
-            drop(lease);
             return reconcile_running(&policy, data, &service, error).await;
         }
         acknowledge(data, &service, &mut journal).await?;
@@ -976,10 +975,13 @@ where
     }
     prepare_backup_dir(&backups)?;
     persist_after_admission(data, &journal, Admission::Idle)?;
-    if let Err(error) = switch_stopped(&policy, data, &journal).await {
-        discard_unswitched_prepare(data, &root, &journal.previous)?;
-        return Err(error);
-    }
+    let _node_lock = match switch_stopped(&policy, data, &journal).await {
+        Ok(lock) => lock,
+        Err(error) => {
+            discard_unswitched_prepare(data, &root, &journal.previous)?;
+            return Err(error);
+        }
+    };
     if let Err(error) = prove(journal.candidate.clone()).await {
         if let Err(rollback) = restore_stopped(&policy, &journal) {
             return Err(error.context(rollback));
@@ -2198,9 +2200,14 @@ mod tests {
             tracks_current: true,
         };
         let during_proof = pending.clone();
+        let locked_data = data.clone();
         super::apply_desktop_managed_release(&data, release, move |_| {
             let during_proof = during_proof.clone();
             async move {
+                assert!(
+                    lock_data_dir(&locked_data).is_err(),
+                    "a concurrent Core cannot start during final proof"
+                );
                 assert!(during_proof.exists());
                 let stored: Journal =
                     serde_json::from_slice(&fs::read(&during_proof).unwrap()).unwrap();
@@ -2382,6 +2389,19 @@ mod tests {
             starts: std::sync::atomic::AtomicUsize::new(0),
             stops: std::sync::atomic::AtomicUsize::new(0),
         };
+        let held = lock_data_dir(&data).unwrap();
+        let pending_before = fs::read(data.join("update-pending.json")).unwrap();
+        assert!(
+            recover_with_service(&policy, &data, &service)
+                .await
+                .is_err()
+        );
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
+        assert_eq!(
+            fs::read(data.join("update-pending.json")).unwrap(),
+            pending_before
+        );
+        drop(held);
         recover_with_service(&policy, &data, &service)
             .await
             .unwrap();
