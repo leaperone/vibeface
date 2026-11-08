@@ -398,18 +398,29 @@ mod tests {
         ];
         let genesis = Genesis::create(&root, members[0].clone(), members[1].clone()).unwrap();
         let mut state = NetworkState::new(genesis).unwrap();
-        let checkpoint = RootCheckpoint::recovery(
-            &state, &root, &next.device_id(), members, vec![], 1_000,
-        ).unwrap();
+        let checkpoint =
+            RootCheckpoint::recovery(&state, &root, &next.device_id(), members, vec![], 1_000)
+                .unwrap();
         let due = checkpoint.effective_at_ms();
         state.recover_at(checkpoint, 1_000).unwrap();
         let json = serde_json::to_string(&state).unwrap();
         for now in [due - 1, due, due + 1] {
-            let native = verify_membership(json.clone(), root.device_id(), Some(now as f64)).unwrap();
-            let core = secure::membership::verify_membership(&json, &root.device_id(), Some(now as f64)).unwrap();
+            let native =
+                verify_membership(json.clone(), root.device_id(), Some(now as f64)).unwrap();
+            let core =
+                secure::membership::verify_membership(&json, &root.device_id(), Some(now as f64))
+                    .unwrap();
             assert_eq!(native.view_json().unwrap(), core.view_json().unwrap());
-            let view: serde_json::Value = serde_json::from_str(&native.view_json().unwrap()).unwrap();
-            assert_eq!(view["recovery_key"], if now < due { root.device_id() } else { next.device_id() });
+            let view: serde_json::Value =
+                serde_json::from_str(&native.view_json().unwrap()).unwrap();
+            assert_eq!(
+                view["recovery_key"],
+                if now < due {
+                    root.device_id()
+                } else {
+                    next.device_id()
+                }
+            );
         }
         assert!(verify_membership(json, root.device_id(), None).is_ok());
     }

@@ -1380,8 +1380,8 @@ impl Local {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Context;
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn readiness_keeps_unknowns_attemptable_and_blocks_only_proven_failures() {

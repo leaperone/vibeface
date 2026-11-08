@@ -3137,10 +3137,10 @@ mod tests {
             let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
             assert!(futures_util::poll!(queued.as_mut()).is_pending());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-                drop(queued);
+            drop(queued);
             drop(active);
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-                assert_eq!(
+            assert_eq!(
                 serde_json::to_value(node.settings_snapshot())?,
                 before_settings
             );
@@ -3176,8 +3176,7 @@ mod tests {
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
         let private_env = std::fs::read(dir.join("config.json"))?;
-        let private_env_modified =
-            std::fs::metadata(dir.join("config.json"))?.modified()?;
+        let private_env_modified = std::fs::metadata(dir.join("config.json"))?.modified()?;
         let repeated = dispatch(
             &node,
             &mut owner,
