@@ -1,6 +1,6 @@
 [package]
 name = "vibeface"
-version = "0.0.1-nightly.20261108.1"
+version = "0.0.1-nightly.20261108.2"
 edition.workspace = true
 rust-version.workspace = true
 
