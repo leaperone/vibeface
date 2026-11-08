@@ -6,7 +6,7 @@
   "description": "Vibeface Electron desktop app (sealed client + optional local Core)",
   "main": "dist/main/index.cjs",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.launcher.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run && node scripts/check-config.cjs",
     "build": "node scripts/bundle.mjs",
     "package": "node ../../scripts/build-desktop.mjs"

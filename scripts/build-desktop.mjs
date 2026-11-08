@@ -22,7 +22,7 @@ const PLATFORMS = {
 };
 const BUILD_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
-const HOST_OUTPUTS = ['dist/main/index.cjs', 'dist/preload/launcher.cjs', 'dist/launcher/index.html'];
+const HOST_OUTPUTS = ['dist/main/index.cjs', 'dist/preload/client.cjs'];
 
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });

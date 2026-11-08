@@ -1,4 +1,4 @@
-import type { LauncherStatus, LocalNode } from '../shared/contract.js'
+import type { DesktopStatus, LocalNode } from './contract.js'
 
 export type Tone = 'idle' | 'live' | 'busy' | 'bad'
 export type ActionId =
@@ -30,7 +30,7 @@ const unavailable = (node: Extract<LocalNode, { kind: 'unavailable' }>): string 
   inspection_unavailable: '暂时无法读取节点状态，请重新检查。',
 })[node.reason]
 
-function rows(status: LauncherStatus): NodeRow[] {
+function rows(status: DesktopStatus): NodeRow[] {
   if (status.discovery.kind !== 'ready') return []
   return status.discovery.nodes.map((node) => {
     if (node.kind === 'running') {
@@ -42,7 +42,7 @@ function rows(status: LauncherStatus): NodeRow[] {
   })
 }
 
-export function describe(status: LauncherStatus): View {
+export function describeNodeSettings(status: DesktopStatus): View {
   const discoveryMessage = status.discovery.kind === 'scanning'
     ? '正在检查已知的本机节点…'
     : status.discovery.kind === 'failed'
@@ -81,7 +81,7 @@ export function describe(status: LauncherStatus): View {
   const selected = status.selectedNode
   const failed = status.discovery.kind === 'failed'
   const actions: Action[] = [
-    ...(status.clientAvailable ? [action('open', '打开 Vibeface', true)] : []),
+    ...(status.clientAvailable ? [action('open', '开始使用 Vibeface', true)] : []),
     action('discover', '重新检查本机节点'),
     ...(!isLocal ? [action('local', '管理本机节点')] : []),
     ...(!hasCore ? [action('choose', '选择已有节点目录…')] : []),
@@ -93,7 +93,7 @@ export function describe(status: LauncherStatus): View {
   const tone: Tone = failure ? 'bad' : selected ? 'live' : status.discovery.kind === 'scanning' ? 'busy' : 'idle'
   const headline = selected ? '已选择本机节点' : status.nodeMode === 'controller' ? '连接你的 Vibeface 节点' : '在这台电脑启用节点'
   const explain = selected
-    ? '打开 Vibeface 即可访问这个节点。首次使用需要确认身份并保存恢复文件。'
+    ? '返回 Vibeface 即可访问这个节点。首次使用需要确认身份并保存恢复文件。'
     : status.nodeMode === 'controller'
       ? '选择一个正在运行的节点即可开始。已停止的节点只会在你明确选择后启动。'
       : '可以连接已有节点，或在此电脑创建新节点。退出 App 会停止由 App 临时运行的节点。'

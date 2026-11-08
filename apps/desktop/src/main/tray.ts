@@ -6,8 +6,8 @@ import template from '../../assets/trayTemplate.png'
 import template2x from '../../assets/trayTemplate@2x.png'
 
 export type TrayActions = {
-  showLauncher(): void
-  openBusiness(): void
+  openNodeSettings(): void
+  focusClient(): void
   quit(): void
 }
 
@@ -29,12 +29,12 @@ export function createTray(actions: TrayActions): Tray {
   tray.setToolTip(`${PRODUCT_NAME} ${app.getVersion()}`)
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: '启动器…', click: actions.showLauncher },
-      { label: `打开 ${PRODUCT_NAME} 窗口`, click: actions.openBusiness },
+      { label: '本机节点…', click: actions.openNodeSettings },
+      { label: `显示 ${PRODUCT_NAME}`, click: actions.focusClient },
       { type: 'separator' },
       { label: `退出 ${PRODUCT_NAME}`, click: actions.quit },
     ])
   )
-  tray.on('click', actions.showLauncher)
+  tray.on('click', actions.focusClient)
   return tray
 }

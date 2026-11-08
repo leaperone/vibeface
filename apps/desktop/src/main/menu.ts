@@ -6,8 +6,8 @@ const RELEASES = 'https://github.com/leaperone/vibeface/releases'
 const DOCS = 'https://github.com/leaperone/vibeface/tree/main/packages/docs'
 
 export type MenuActions = {
-  showLauncher(): void
-  openBusiness(): void
+  openNodeSettings(): void
+  focusClient(): void
   quit(): void
 }
 
@@ -17,8 +17,8 @@ export function applyApplicationMenu(actions: MenuActions): void {
     submenu: [
       { role: 'about', label: `关于 ${PRODUCT_NAME}` },
       { type: 'separator' },
-      { label: '启动器…', accelerator: 'CmdOrCtrl+,', click: actions.showLauncher },
-      { label: `打开 ${PRODUCT_NAME} 窗口`, accelerator: 'CmdOrCtrl+Shift+O', click: actions.openBusiness },
+      { label: '本机节点…', accelerator: 'CmdOrCtrl+,', click: actions.openNodeSettings },
+      { label: `显示 ${PRODUCT_NAME}`, accelerator: 'CmdOrCtrl+Shift+O', click: actions.focusClient },
       { type: 'separator' },
       ...(process.platform === 'darwin'
         ? ([{ role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }] satisfies MenuItemConstructorOptions[])

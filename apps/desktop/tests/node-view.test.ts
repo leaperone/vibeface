@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { describe as toView } from '../src/launcher/view.js'
-import type { BackgroundNode, CoreState, LauncherStatus, LocalNode } from '../src/shared/contract.js'
+import { describeNodeSettings as toView } from '../src/shared/node-view.js'
+import type { BackgroundNode, CoreState, DesktopStatus, LocalNode } from '../src/shared/contract.js'
 
-const status = (overrides: Partial<LauncherStatus> = {}): LauncherStatus => ({
+const status = (overrides: Partial<DesktopStatus> = {}): DesktopStatus => ({
   runtime: { kind: 'ready', corePath: '/app/resources/runtime/vibeface-core' },
   core: { kind: 'none' },
-  businessOpen: false,
+  clientVisible: true,
   preferences: { openBusinessOnConnect: true },
   profileDir: '/tmp/profile',
   version: '0.0.1-nightly.20261107.1',
@@ -27,7 +27,7 @@ const node = (kind: LocalNode['kind'], id = 'candidate-1'): LocalNode => {
   }
 }
 
-describe('launcher view', () => {
+describe('desktop node settings view', () => {
   it('offers controller-only and local-node choices on first open', () => {
     expect(toView(status()).actions.map((item) => item.id)).toEqual(['controller', 'local'])
   })

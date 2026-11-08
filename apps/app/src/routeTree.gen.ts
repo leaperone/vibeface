@@ -21,6 +21,7 @@ import { Route as AppChannelsIndexRouteImport } from './routes/_app/channels.ind
 import { Route as AppChannelsChannelIdRouteImport } from './routes/_app/channels.$channelId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
+import { Route as AppSettingsDesktopNodeRouteImport } from './routes/_app/settings_.desktop-node'
 import { Route as AppSettingsLabRouteImport } from './routes/_app/settings_.lab'
 import { Route as AppSettingsLogsRouteImport } from './routes/_app/settings_.logs'
 import { Route as AppTasksTaskIdRouteImport } from './routes/_app/tasks_.$taskId'
@@ -86,6 +87,11 @@ const AppDevicesDeviceIdRoute = AppDevicesDeviceIdRouteImport.update({
   path: '/devices/$deviceId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSettingsDesktopNodeRoute = AppSettingsDesktopNodeRouteImport.update({
+  id: '/settings_/desktop-node',
+  path: '/settings/desktop-node',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppSettingsLabRoute = AppSettingsLabRouteImport.update({
   id: '/settings_/lab',
   path: '/settings/lab',
@@ -122,6 +128,7 @@ export interface FileRoutesByFullPath {
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/settings/desktop-node': typeof AppSettingsDesktopNodeRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/tasks/$taskId': typeof AppTasksTaskIdRoute
@@ -140,6 +147,7 @@ export interface FileRoutesByTo {
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/settings/desktop-node': typeof AppSettingsDesktopNodeRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/tasks/$taskId': typeof AppTasksTaskIdRoute
@@ -160,6 +168,7 @@ export interface FileRoutesById {
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/_app/settings_/desktop-node': typeof AppSettingsDesktopNodeRoute
   '/_app/settings_/lab': typeof AppSettingsLabRoute
   '/_app/settings_/logs': typeof AppSettingsLogsRoute
   '/_app/tasks_/$taskId': typeof AppTasksTaskIdRoute
@@ -180,6 +189,7 @@ export interface FileRouteTypes {
     | '/b/$botId'
     | '/channels/$channelId'
     | '/devices/$deviceId'
+    | '/settings/desktop-node'
     | '/settings/lab'
     | '/settings/logs'
     | '/tasks/$taskId'
@@ -198,6 +208,7 @@ export interface FileRouteTypes {
     | '/b/$botId'
     | '/channels/$channelId'
     | '/devices/$deviceId'
+    | '/settings/desktop-node'
     | '/settings/lab'
     | '/settings/logs'
     | '/tasks/$taskId'
@@ -217,6 +228,7 @@ export interface FileRouteTypes {
     | '/_app/b/$botId'
     | '/_app/channels/$channelId'
     | '/_app/devices/$deviceId'
+    | '/_app/settings_/desktop-node'
     | '/_app/settings_/lab'
     | '/_app/settings_/logs'
     | '/_app/tasks_/$taskId'
@@ -318,6 +330,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDevicesDeviceIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings_/desktop-node': {
+      id: '/_app/settings_/desktop-node'
+      path: '/settings/desktop-node'
+      fullPath: '/settings/desktop-node'
+      preLoaderRoute: typeof AppSettingsDesktopNodeRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/settings_/lab': {
       id: '/_app/settings_/lab'
       path: '/settings/lab'
@@ -376,6 +395,7 @@ interface AppRouteChildren {
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppChannelsChannelIdRoute: typeof AppChannelsChannelIdRoute
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
+  AppSettingsDesktopNodeRoute: typeof AppSettingsDesktopNodeRoute
   AppSettingsLabRoute: typeof AppSettingsLabRoute
   AppSettingsLogsRoute: typeof AppSettingsLogsRoute
   AppTasksTaskIdRoute: typeof AppTasksTaskIdRoute
@@ -392,6 +412,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppChannelsChannelIdRoute: AppChannelsChannelIdRoute,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
+  AppSettingsDesktopNodeRoute: AppSettingsDesktopNodeRoute,
   AppSettingsLabRoute: AppSettingsLabRoute,
   AppSettingsLogsRoute: AppSettingsLogsRoute,
   AppTasksTaskIdRoute: AppTasksTaskIdRoute,
@@ -410,12 +431,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { createStart } from '@tanstack/react-start'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-  }
-}

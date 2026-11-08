@@ -39,7 +39,7 @@ module.exports = {
   electronVersion: ELECTRON_VERSION,
   directories: { output, buildResources: path.join(desktop, 'build') },
   // Only the compiled host ships inside the asar; business UI comes from the bundled Core.
-  files: ['package.json', 'dist/main/**', 'dist/preload/**', 'dist/launcher/**'],
+  files: ['package.json', 'dist/main/**', 'dist/preload/**'],
   // The runtime is already sealed by FILES.sha256, so it is copied verbatim and never rewritten.
   extraResources: [{ from: runtime, to: 'runtime' }],
   asar: true,
