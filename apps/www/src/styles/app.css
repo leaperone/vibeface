@@ -270,8 +270,8 @@ a { color: inherit; text-decoration: none; }
   .visual-node span { font-size: 12.5px; }
   .visual-node small { font-size: 10.5px; }
   .visual-node-top { right: 0; top: 4%; }
-  .visual-node-left { left: 0; top: 64%; }
-  .visual-node-right { bottom: 0; right: 0; }
+  .visual-node-left { left: 0; top: 62%; }
+  .visual-node-right { bottom: 4%; right: 0; }
   .landing-section { padding: 72px 20px; }
   .landing h2 { font-size: clamp(30px, 8.4vw, 40px); }
   .section-copy { font-size: 17px; }
@@ -311,7 +311,7 @@ a { color: inherit; text-decoration: none; }
   .orbit-two { animation-delay: .12s; }
   .orbit-three { animation-delay: .24s; }
   .visual-path { animation: landing-fade 1s var(--ease-out) .4s both; }
-  .visual-node { animation: landing-arrive .7s var(--ease-out) both; }
+  .visual-node { animation: landing-fade .7s var(--ease-out) both; }
   .visual-node-top { animation-delay: .2s; }
   .visual-node-left { animation-delay: .3s; }
   .visual-node-right { animation-delay: .4s; }
