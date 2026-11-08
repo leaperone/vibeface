@@ -60,7 +60,7 @@ function verifyCatalogSignature(deviceId: string, domain: string, payload: Uint8
   const digest = createHash('sha256').update(payload).digest('hex')
   assert.ok(verify(null, Buffer.from(`vibeface:message:v1:${domain}:${digest}`), key, Buffer.from(signature, 'hex')), 'invalid catalogue signature')
 }
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now } = {}) {
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now, ticketRelay = null as string | null } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -115,7 +115,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
-    parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
+    parseJoinLink: async () => ({ origin: entry.address, relay: ticketRelay, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
@@ -575,6 +575,16 @@ test('unmounting aborts pending local discovery without publishing setup state',
   hold.resolve({ kind: 'uninitialized', invitation: localInvitation }); await settle()
   assert.deepEqual(app.calls, ['local_setup'])
   assert.equal(app.render().localSetup, null)
+})
+
+test('a join goes through the relay the ticket names before the page or link origin', async () => {
+  const app = deviceHarness({ ticketRelay: 'https://relay.example' })
+  try {
+    app.render(); await settle()
+    await app.render().join('https://app.example/join#vibeface1ticket', 'browser')
+    assert.deepEqual(plain(app.sockets[0]?.entry), { kind: 'gateway', address: 'https://relay.example', device_id: target })
+    assert.ok(app.requests.some(request => request.method === 'join'))
+  } finally { app.close() }
 })
 
 test('joining commits first, reveals only after the manager nonce, then shows the short code and authenticates', async () => {
