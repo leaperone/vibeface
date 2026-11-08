@@ -82,6 +82,17 @@ pub(crate) struct HistoryFilter<'a> {
     pub keyword: Option<&'a str>,
 }
 
+pub(crate) fn network_from(connection: &Connection) -> Result<Option<NetworkId>> {
+    let mut statement = connection.prepare("SELECT network_id FROM networks LIMIT 2")?;
+    let mut rows = statement.query([])?;
+    let network = rows.next()?.map(|row| row.get(0)).transpose()?;
+    ensure!(
+        rows.next()?.is_none(),
+        "Node has more than one personal network"
+    );
+    Ok(network)
+}
+
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 ///
 /// A recovery takes effect with time alone, and a late veto can put the earlier directory back, so
@@ -96,6 +107,10 @@ pub(crate) fn install_trust_bundle_in(
     ensure!(
         state.genesis.network_id == network_id,
         "membership belongs to another personal network"
+    );
+    ensure!(
+        network_from(connection)?.is_none_or(|installed| installed == network_id),
+        "Node already belongs to another personal network"
     );
     state.project()?;
     let previous: Option<String> = connection
@@ -296,6 +311,7 @@ impl Store {
             version == SCHEMA_VERSION,
             "unsupported database schema version {version}"
         );
+        network_from(&connection)?;
         Ok(Self {
             connection,
             blob_dir: blob_dir_for(path),
@@ -326,7 +342,7 @@ impl Store {
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
     }
-    /// Stores each event or reports why not; one bad event never aborts the batch.
+    /// Stores each event or rejects invalid input; database and internal errors roll back the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards.
     pub fn ingest_events(
         &mut self,
@@ -999,10 +1015,7 @@ impl Store {
     }
     /// A Node belongs to at most one network.
     pub fn network(&self) -> Result<Option<NetworkId>> {
-        Ok(self
-            .connection
-            .query_row("SELECT network_id FROM networks", [], |r| r.get(0))
-            .optional()?)
+        network_from(&self.connection)
     }
     pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
         let mut statement = self.connection.prepare(

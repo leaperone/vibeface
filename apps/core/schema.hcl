@@ -155,6 +155,10 @@ table "pending_events" {
     null = false
     type = text
   }
+  column "author" {
+    null = false
+    type = text
+  }
   column "missing" {
     null = false
     type = text
@@ -164,6 +168,9 @@ table "pending_events" {
   }
   index "pending_events_missing" {
     columns = [column.network_id, column.missing]
+  }
+  index "pending_events_author" {
+    columns = [column.network_id, column.author]
   }
 }
 table "conversations" {
