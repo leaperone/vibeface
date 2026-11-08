@@ -21,4 +21,4 @@ python3 scripts/deploy.py release --service '<service>' --tag '<tag>'
 
 该命令请求 CI/CD，不直接修改服务器。跟踪本仓库 `deploy-services.yml` 对应 Tag、源码 SHA 和目标的运行到终态。使用 `gh-run-watch` 持续监控。派发成功不代表部署成功。
 
-验收必须包括镜像 digest、实际运行版本和原身份，以及该角色的真实网络行为。`relay-cn` 是国内纯 Relay，不提供网页或浏览器 gateway；`relay` 保留官方客户端接入 API，但镜像不含网页资源。网页由 App 提供。失败或响应未知时先对账，不能直接重发、重建产品或切回不明版本。
+验收必须包括镜像 digest、实际运行版本和原身份，以及该角色的真实网络行为。`relay-cn` 与 `relay` 都提供中继和浏览器接入 API，镜像不含网页资源，区别只在准入方式。网页由 App 提供。失败或响应未知时先对账，不能直接重发、重建产品或切回不明版本。

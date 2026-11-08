@@ -309,8 +309,9 @@ def transform_nginx(text, config):
         is_catchall = words == ['location', '/']
         catchall += int(is_catchall)
         if config['role'] == 'relay':
-            require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$'],
-                    'pure Relay refuses extra frontend or API routes')
+            require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$']
+                    or len(words) == 3 and words[1] == '=' and words[2] in ('/api/info', '/api/client'),
+                    'Relay refuses frontend and non-browser API routes')
             if not is_catchall:
                 continue
             body = 'return 404;'
@@ -680,10 +681,12 @@ server {
     assert transform_nginx(updated, app) == updated
     relay_source = '''server { listen 443 ssl; server_name app.example.invalid; root /old;
     location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }
+    location = /api/client { proxy_pass http://127.0.0.1:4900; }
     location / { proxy_pass http://127.0.0.1:4900; }
 }'''
     relay = transform_nginx(relay_source, dict(app, role='relay'))
     assert 'location / {\n        return 404;' in relay and 'location ~ ^/(relay|ping|generate_204)$' in relay
+    assert 'location = /api/client { proxy_pass http://127.0.0.1:4900; }' in relay
     for selector in ('location = /index.html { try_files $uri =404; }',
                      'location ^~ /assets/ { alias /old/; }'):
         try:
