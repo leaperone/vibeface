@@ -445,7 +445,7 @@ test('provider settings and deferred input cancellation work in the installed na
   const driverFailurePath = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
   await unlink(driverFailurePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   await unlink(resolve(root, '.artifacts/native/private/ios-actor-census.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
-  for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
+  for (const name of ['provider.json', 'provider-navigation.json', 'provider-clipboard.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -581,7 +581,35 @@ test('provider settings and deferred input cancellation work in the installed na
     const details = screen.getByRole('button', '详细信息', { exact: true });
     await details.click();
     await screen.getByRole('button', '复制设备编号', { exact: true }).click();
-    await expect.poll(() => device.clipboard()).toBe(network.receiver);
+    const clipboard = { started: 0, fulfilled: 0, rejected: 0, equal: 0, empty: 0, other: 0, capped: false };
+    let clipboardInflight = false;
+    const bumpClipboard = (key: Exclude<keyof typeof clipboard, 'capped'>) => {
+      if (clipboard[key] < 4096) clipboard[key]++;
+      else clipboard.capped = true;
+    };
+    try {
+      await expect.poll(async () => {
+        bumpClipboard('started');
+        clipboardInflight = true;
+        try {
+          const value = await device.clipboard();
+          bumpClipboard('fulfilled');
+          bumpClipboard(value === network.receiver ? 'equal' : value === '' ? 'empty' : 'other');
+          return value;
+        } catch (cause) {
+          bumpClipboard('rejected');
+          throw cause;
+        } finally {
+          clipboardInflight = false;
+        }
+      }).toBe(network.receiver);
+    } catch (cause) {
+      const frozen = { ...clipboard, inflight_at_poll_failure: clipboardInflight };
+      try {
+        await writeFile(join(publicPath, 'provider-clipboard.json'), `${JSON.stringify(frozen)}\n`, { mode: 0o600 });
+      } catch {}
+      throw cause;
+    }
     await details.click();
     const link = screen.getByRole('link', 'Bot 与任务', { exact: true });
     await screen.scrollUntilVisible(link, { direction: 'down', timeout: 30000 });

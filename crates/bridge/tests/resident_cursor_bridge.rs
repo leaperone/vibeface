@@ -19,6 +19,61 @@ fn starts(log: &Path) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(windows)]
+fn fixture_process_handle(log: &Path) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    let recorded = std::fs::read_to_string(log)?;
+    let pid = recorded
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    // SAFETY: only termination-observation rights are requested, without inheritance.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned a valid owned handle, transferred exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum FixtureExit {
+    Exited,
+    StillRunning,
+    Unobserved,
+    QueryFailed,
+}
+
+#[cfg(windows)]
+fn fixture_exit(
+    process: &std::io::Result<std::os::windows::io::OwnedHandle>,
+) -> (FixtureExit, Option<i32>) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
+
+    let process = match process {
+        Ok(process) => process,
+        Err(error) => return (FixtureExit::Unobserved, error.raw_os_error()),
+    };
+    // SAFETY: the handle stays owned through this nonblocking status query.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => (FixtureExit::Exited, None),
+        WAIT_TIMEOUT => (FixtureExit::StillRunning, None),
+        _ => (
+            FixtureExit::QueryFailed,
+            std::io::Error::last_os_error().raw_os_error(),
+        ),
+    }
+}
+
 fn fixture_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
         "tests/fixtures/fake-cursor-sdk-bridge.cmd"
@@ -867,9 +922,15 @@ async fn provider_observation_bounds_oversize_catalog_response() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
+    #[cfg(windows)]
+    let fixture_log = root.join("starts.log");
     let (bridge, observation) = provider_observation_fixture(
         &root,
-        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "oversize".into())]),
+        BTreeMap::from([
+            ("FAKE_BRIDGE_MODELS".into(), "oversize".into()),
+            #[cfg(windows)]
+            ("FAKE_BRIDGE_LOG".into(), fixture_log.display().to_string()),
+        ]),
     )
     .await
     .unwrap();
@@ -884,7 +945,11 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         .next()
         .unwrap()
         .to_owned();
+    #[cfg(windows)]
+    let fixture_process = fixture_process_handle(&fixture_log);
     bridge.stop().await;
+    #[cfg(windows)]
+    let (fixture_exit_after_stop, fixture_probe_os_code) = fixture_exit(&fixture_process);
     assert!(
         matches!(
             vibeface_bridge::platform::tree::Leftover::find(&token),
@@ -892,7 +957,20 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         ),
         "Bridge::stop returns only after the SDK wrapper and child tree have exited"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    let cleanup = std::fs::remove_dir_all(root);
+    #[cfg(windows)]
+    if let Err(error) = &cleanup {
+        eprintln!(
+            "stage=remove_dir_all path_class=cleanup_root_failed_entry_unknown os_code={:?} fixture_exit_after_stop={fixture_exit_after_stop:?} fixture_probe_os_code={fixture_probe_os_code:?}",
+            error.raw_os_error()
+        );
+    }
+    cleanup.unwrap();
+    #[cfg(windows)]
+    assert!(
+        matches!(fixture_exit_after_stop, FixtureExit::Exited),
+        "fixture_exit_after_stop={fixture_exit_after_stop:?}"
+    );
 }
 
 #[tokio::test]

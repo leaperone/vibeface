@@ -421,6 +421,21 @@ jobs:
               except (OSError, ValueError, TypeError, AssertionError):
                   diagnostics["navigation"] = {"stage": "invalid"}
 
+          clipboard_path = public / "provider-clipboard.json"
+          if clipboard_path.exists() or clipboard_path.is_symlink():
+              try:
+                  info = clipboard_path.lstat()
+                  assert stat.S_ISREG(info.st_mode) and info.st_size <= 1024
+                  clipboard = json.loads(clipboard_path.read_text(encoding="utf-8"))
+                  counts = {"started", "fulfilled", "rejected", "equal", "empty", "other"}
+                  flags = {"capped", "inflight_at_poll_failure"}
+                  assert isinstance(clipboard, dict) and set(clipboard) == counts | flags
+                  assert all(type(clipboard[key]) is int and 0 <= clipboard[key] <= 4096 for key in counts)
+                  assert all(type(clipboard[key]) is bool for key in flags)
+                  diagnostics["clipboard"] = {key: clipboard[key] for key in counts | flags}
+              except (OSError, ValueError, TypeError, AssertionError):
+                  diagnostics["clipboard"] = {"status": "invalid"}
+
           def safe_error(error, source=None, api=None):
               if not isinstance(error, dict):
                   return None
@@ -478,7 +493,7 @@ jobs:
                   line = source.get("line")
                   if type(line) is int and 1 <= line <= 100000:
                       result.update(file=source["file"], line=line)
-              if api in {"app.open", "app.screenshot", "device.installApp", "device.clearKeychain", "device.openLink", "device.dismissKeyboard",
+              if api in {"app.open", "app.screenshot", "device.installApp", "device.clearKeychain", "device.openLink", "device.dismissKeyboard", "device.clipboard",
                          "screen.scrollUntilVisible", "locator.click", "locator.tap", "locator.fill", "expect.toBeVisible", "expect.toBeHidden",
                          "expect.toHaveAccessibleName", "expect.toEqual", "expect.toBe", "expect.poll"}:
                   result["api"] = api
