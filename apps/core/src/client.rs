@@ -938,7 +938,7 @@ async fn dispatch(
                     .await
             }
         }
-        // A manager revokes any device; any client may revoke itself, which the history checks.
+        // A manager revokes any device; any client may revoke itself.
         "revoke" => {
             let view = node.membership_state().await?.project()?;
             view.client(&session.device_id)?;
@@ -949,6 +949,7 @@ async fn dispatch(
                     && matches!(event.action, GovernanceAction::Revoke(_)),
                 "invalid revoke signer or action"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(
@@ -975,6 +976,7 @@ async fn dispatch(
                     .is_ok_and(|current| current.kind == member.kind),
                 "device is not a member of this personal network"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(

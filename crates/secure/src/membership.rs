@@ -532,42 +532,7 @@ impl GovernanceEvent {
         issuer: &str,
         action: GovernanceAction,
     ) -> Result<Self> {
-        ensure!(
-            view.member(issuer)?.is_manager()
-                || leaves(issuer, &action, view.client(issuer).is_ok()),
-            "management permission required"
-        );
-        match &action {
-            GovernanceAction::Grant { member } => {
-                member.validate()?;
-                ensure!(
-                    member.manage || view.keeps_manager_without(&member.device_id),
-                    LAST_MANAGER
-                );
-            }
-            GovernanceAction::Revoke(revocation) => {
-                revocation.validate()?;
-                ensure!(
-                    view.keeps_manager_without(&revocation.device_id),
-                    LAST_MANAGER
-                );
-            }
-            GovernanceAction::Veto { checkpoint, .. } => ensure!(
-                view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
-                NO_RECOVERY_WAITING
-            ),
-            GovernanceAction::Approve { checkpoint, at_ms } => {
-                let pending = view
-                    .pending
-                    .as_ref()
-                    .filter(|pending| pending.checkpoint == *checkpoint)
-                    .context(NO_RECOVERY_WAITING)?;
-                ensure!(
-                    *at_ms < pending.effective_at_ms,
-                    "this recovery is already due"
-                );
-            }
-        }
+        view.authorize(issuer, &action)?;
         Ok(Self {
             version: IDENTITY_VERSION,
             network_id: view.network_id.clone(),
@@ -676,6 +641,51 @@ pub struct PendingRecovery {
 }
 
 impl AuthorizationView {
+    /// Whether `issuer` may take `action` on this directory. A client checks this before
+    /// signing, and a Node checks it again on the directory in effect before accepting: the
+    /// history keeps a signed event whose issuer lacks authority and gives it no effect, and a
+    /// revocation cuts the revoked device's concurrent actions, so the projection after one can
+    /// still show a manager this directory had already seen demoted.
+    pub fn authorize(&self, issuer: &str, action: &GovernanceAction) -> Result<()> {
+        ensure!(
+            self.member(issuer)?.is_manager()
+                || leaves(issuer, action, self.client(issuer).is_ok()),
+            "management permission required"
+        );
+        match action {
+            GovernanceAction::Grant { member } => {
+                member.validate()?;
+                ensure!(
+                    member.manage || self.keeps_manager_without(&member.device_id),
+                    LAST_MANAGER
+                );
+            }
+            GovernanceAction::Revoke(revocation) => {
+                revocation.validate()?;
+                ensure!(
+                    self.keeps_manager_without(&revocation.device_id),
+                    LAST_MANAGER
+                );
+            }
+            GovernanceAction::Veto { checkpoint, .. } => ensure!(
+                self.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
+                NO_RECOVERY_WAITING
+            ),
+            GovernanceAction::Approve { checkpoint, at_ms } => {
+                let pending = self
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                ensure!(
+                    *at_ms < pending.effective_at_ms,
+                    "this recovery is already due"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a manager other than `device` remains.
     pub fn keeps_manager_without(&self, device: &str) -> bool {
         self.members
