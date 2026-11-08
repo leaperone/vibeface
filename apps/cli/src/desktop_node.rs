@@ -519,7 +519,10 @@ fn runtime_update_for_packages(
 }
 
 fn recovery_required(data: &Path) -> bool {
-    data.join("update-pending.json").exists()
+    match fs::symlink_metadata(data.join("update-pending.json")) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn refuse_pending_journal(data: &Path) -> Result<()> {
@@ -1066,6 +1069,16 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         Ok(native) => native,
                         Err(_) => anyhow::bail!(OperationFailure::UpdateRefused),
                     };
+                    if !native.installed {
+                        return emit(
+                            "partial",
+                            Some(receipt),
+                            Some(native.running),
+                            Some(fresh.status.clone()),
+                            running_version.as_deref(),
+                            bundled,
+                        );
+                    }
                     match update_meta.availability {
                         "current" => {
                             if native.installed
@@ -1797,20 +1810,29 @@ mod tests {
             br#"{"phase":"prepared"}"#,
         )
         .unwrap();
-        let error = dispatch(
-            DesktopNode {
-                profile_dir: profile.clone(),
-                expected_device_id: Some("device-fixture".into()),
-                action: Action::Start,
-            },
-            &bundled,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            format!("{:?}", public_failure(error)),
-            "desktop_node_recovery_required"
-        );
+        for phase in ["prepared", "confirmed"] {
+            privatefs::write_atomic(
+                &data.join("update-pending.json"),
+                &serde_json::to_vec(&serde_json::json!({ "phase": phase })).unwrap(),
+            )
+            .unwrap();
+            for action in [Action::Start, Action::Install, Action::Uninstall] {
+                let error = dispatch(
+                    DesktopNode {
+                        profile_dir: profile.clone(),
+                        expected_device_id: Some("device-fixture".into()),
+                        action,
+                    },
+                    &bundled,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    format!("{:?}", public_failure(error)),
+                    "desktop_node_recovery_required"
+                );
+            }
+        }
         assert!(!calls.exists());
         fs::remove_dir_all(root).unwrap();
     }

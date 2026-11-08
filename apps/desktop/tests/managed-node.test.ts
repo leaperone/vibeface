@@ -16,11 +16,13 @@ describe('ManagedNodeController CLI JSON boundary', () => {
         bundled_version: '0.0.1-nightly.20261108.1',
         installed_version: '0.0.1-nightly.20261108.1',
         running_version: '0.0.1-nightly.20261108.1',
+        recovery_required: false,
         availability: 'current',
       },
     }
     const status = parseManagedNodeStatus(raw)
     expect(status.runtime_update).toEqual({
+      recoveryRequired: false,
       bundledVersion: '0.0.1-nightly.20261108.1',
       installedVersion: '0.0.1-nightly.20261108.1',
       runningVersion: '0.0.1-nightly.20261108.1',
@@ -44,6 +46,7 @@ describe('ManagedNodeController CLI JSON boundary', () => {
         bundled_version: '0.0.1',
         installed_version: '0.0.1',
         running_version: null,
+        recovery_required: false,
         availability: 'current',
       },
     }
@@ -53,11 +56,15 @@ describe('ManagedNodeController CLI JSON boundary', () => {
         bundledVersion: '0.0.1',
         installed_version: '0.0.1',
         running_version: null,
+        recovery_required: false,
         availability: 'current',
       },
     })).toThrow(/invalid runtime update metadata/)
     expect(() => parseManagedNodeStatus({ ...valid, runtime_update: { ...valid.runtime_update, bundled_version: '' } })).toThrow(/bundled runtime version/)
     expect(() => parseManagedNodeStatus({ ...valid, runtime_update: { ...valid.runtime_update, availability: 'busy' } })).toThrow(/unsupported runtime update availability/)
+    const { recovery_required: _recovery, ...missingRecovery } = valid.runtime_update
+    expect(() => parseManagedNodeStatus({ ...valid, runtime_update: missingRecovery })).toThrow(/recovery state/)
+    expect(parseManagedNodeStatus({ ...valid, runtime_update: { ...valid.runtime_update, recovery_required: true } }).runtime_update.recoveryRequired).toBe(true)
     expect(() => parseManagedNodeStatus({ ...valid, extra: true })).toThrow(/unsupported result/)
     expect(() => parseManagedNodeStatus({ ...valid, core_status: 'busy' })).toThrow(/unsupported result/)
     expect(() => parseManagedNodeStatus({ ...valid, service_running: null })).toThrow(/unsupported result/)
@@ -86,6 +93,7 @@ describe('ManagedNodeController deadlines', () => {
       bundled_version: '0.0.1',
       installed_version: null,
       running_version: null,
+      recovery_required: false,
       availability: 'not_installed',
     },
   }

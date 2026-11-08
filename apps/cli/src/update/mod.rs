@@ -2410,6 +2410,7 @@ mod tests {
             fs::read(data.join("update-pending.json")).unwrap(),
             pending_before
         );
+        held.unlock().unwrap();
         drop(held);
         recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
             .await

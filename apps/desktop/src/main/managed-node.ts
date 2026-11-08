@@ -18,6 +18,7 @@ const CLI_FAILURES: Record<string, string> = {
   desktop_node_lock_unconfirmed: '无法确认节点是否已退出，请重新核对状态。',
   desktop_node_registration_unconfirmed: '无法确认系统中的节点服务，请重新核对状态。',
   desktop_node_update_refused: '当前无法更新本机后台节点，请先核对运行状态。',
+  desktop_node_recovery_required: '上次更新尚未完成，请在后台节点停止后点击“继续更新”核对。',
 }
 class CliOperationFailure extends Error {}
 
@@ -36,6 +37,7 @@ export type ManagedNodeRuntimeUpdate = {
   installedVersion: string | null
   runningVersion: string | null
   availability: RuntimeUpdateAvailability
+  recoveryRequired: boolean
 }
 
 type ManagedNodeIdentity = { device_id: string; data_dir: string; service_id: string; managed_root: string }
@@ -89,11 +91,15 @@ function runtimeUpdate(value: unknown): ManagedNodeRuntimeUpdate {
   if (!(runningVersion === null || (typeof runningVersion === 'string' && runningVersion))) {
     throw new Error('desktop Node returned invalid running runtime version')
   }
+  if (typeof source.recovery_required !== 'boolean') {
+    throw new Error('desktop Node returned invalid recovery state')
+  }
   return {
     bundledVersion: source.bundled_version,
     installedVersion,
     runningVersion,
     availability: runtimeUpdateAvailability(source.availability),
+    recoveryRequired: source.recovery_required,
   }
 }
 
@@ -109,7 +115,7 @@ export function parseManagedNodeStatus(value: unknown): ManagedNodeStatus {
   const state = raw.state
   if (state === 'not_installed') {
     if (raw.device_id !== null || raw.data_dir !== null || raw.service_id !== null || raw.managed_root !== null ||
-        raw.service_running !== null || raw.core_status !== null || runtime.availability !== 'not_installed') {
+        raw.service_running !== null || raw.core_status !== null || runtime.availability !== 'not_installed' || runtime.recoveryRequired) {
       throw new Error('desktop Node returned an unsupported result')
     }
     return {

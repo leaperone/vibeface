@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { lstat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { runControl, type CoreProgram } from './control-client.js'
 import { parseAccess, parseInspect, type Inspect } from './control-types.js'
@@ -188,6 +189,12 @@ export class CoreSession {
 
   private async startChild(dataDir: string, initializeEmpty: boolean, expectedDeviceId: string | null): Promise<void> {
     if (this.lifecycle.state().kind === 'owned') throw new Error('这台电脑上已经有 Vibeface 启动的 Core。')
+    let pending = false
+    try { await lstat(join(dataDir, 'update-pending.json')); pending = true }
+    catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw new Error('无法核对节点的更新状态。')
+    }
+    if (pending) throw new Error('这个节点的更新尚未完成，请先在后台节点设置中继续更新。')
     if (!initialized(dataDir)) {
       if (!initializeEmpty) throw new Error('这个停止的节点没有完整的 Core 配置，无法启动。')
       await runControl(this.programs.control(), { command: 'init', options: { data_dir: dataDir } })

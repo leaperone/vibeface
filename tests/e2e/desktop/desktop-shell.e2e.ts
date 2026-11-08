@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { access, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep, toNamespacedPath } from 'node:path';
 import { expect } from 'e2e';
 import { evaluate, screenshot, test, type Inspection, type Page } from '../desktop';
 
@@ -319,6 +319,34 @@ test('the optional background Node survives app quit and removal preserves its N
     const managedHash = createHash('sha256').update(await readFile(join(managedPackage, binary))).digest('hex');
     assert.equal(managedHash, sourceHash, `the durable service runtime preserves the verified ${binary} bytes`);
   }
+
+  await desktop.invoke('stopBackgroundNode');
+  const beforeRecovery = await desktop.snapshotNode(installedData);
+  const canonicalPackage = process.platform === 'win32' ? toNamespacedPath(managedPackage) : managedPackage;
+  const pending = join(installedData, 'update-pending.json');
+  await writeFile(pending, JSON.stringify({
+    phase: 'prepared', previous: canonicalPackage, candidate: canonicalPackage, device_id: nodeId,
+    backup: join(service.managed_root, 'backups', 'e2e-interrupted'), resume_service: true,
+  }), { mode: 0o600 });
+  const pendingBytes = await readFile(pending, 'utf8');
+  const recoveryObserved = await desktop.invoke('discoverNodes');
+  assert.equal(recoveryObserved.backgroundNode.kind, 'installed');
+  assert.equal(recoveryObserved.backgroundNode.runtimeUpdate.recoveryRequired, true);
+  await assert.rejects(desktop.invoke('startBackgroundNode'), /继续更新/);
+  await assert.rejects(desktop.invoke('removeBackgroundNode'), /继续更新/);
+  assert.equal((await desktop.serviceStatus(nodeId)).service_running, false, 'pending controls never start the unconfirmed package');
+  assert.equal(await readFile(pending, 'utf8'), pendingBytes, 'observation and refusals retain the interrupted operation');
+  const repaired = await desktop.invoke('updateBackgroundNode');
+  assert.equal(repaired.backgroundNode.kind, 'installed');
+  assert.equal(repaired.backgroundNode.health, 'stopped', 'recovery respects the explicit stopped state');
+  assert.equal(repaired.backgroundNode.runtimeUpdate.recoveryRequired, false);
+  await noPath(pending, 'the confirmed stopped recovery clears only its update journal');
+  const afterRecovery = await desktop.snapshotNode(installedData);
+  assert.equal(afterRecovery.status, 'stopped');
+  assert.equal(afterRecovery.deviceId, nodeId);
+  assert.deepEqual(afterRecovery.values, beforeRecovery.values, 'recovery preserves identity, configuration and update policy');
+  await desktop.invoke('startBackgroundNode');
+  assert.equal((await desktop.serviceStatus(nodeId)).core_status, 'running');
 
   const firstRemoval = await desktop.invoke('removeBackgroundNode');
   assert.equal(firstRemoval.backgroundNode.kind, 'absent');

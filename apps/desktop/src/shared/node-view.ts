@@ -37,7 +37,14 @@ function rows(status: DesktopStatus): NodeRow[] {
       const selected = status.selectedNode?.deviceId === node.deviceId && status.selectedNode.dataDir === node.dataDir
       return { node, status: selected ? '已选择' : '正在运行', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('connect', selected ? '已选择' : '连接', true, selected, node.id)] }
     }
-    if (node.kind === 'stopped') return { node, status: '已停止', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('start-discovered', '启动并连接', true, false, node.id)] }
+    if (node.kind === 'stopped') {
+      const background = status.backgroundNode
+      if ((background.kind === 'installed' || background.kind === 'partial') && background.nodeId === node.deviceId
+          && background.dataDir === node.dataDir && background.runtimeUpdate?.recoveryRequired) {
+        return { node, status: '等待恢复', detail: '在后台节点设置中继续更新后再启动。', actions: [] }
+      }
+      return { node, status: '已停止', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('start-discovered', '启动并连接', true, false, node.id)] }
+    }
     return { node, status: '暂不可用', detail: unavailable(node), actions: [action('discover', '重新检查')] }
   })
 }
@@ -62,6 +69,12 @@ export function describeNodeSettings(status: DesktopStatus): View {
     if (runtime.runningVersion) parts.push(`正在运行 ${runtime.runningVersion}`)
     return parts.join(' · ')
   })()
+  const recoveryRequired = background.runtimeUpdate?.recoveryRequired === true
+  const recoveryMessage = recoveryRequired
+    ? background.kind === 'installed' && background.health !== 'stopped'
+      ? '上次更新尚未完成。先停止后台节点，再继续更新。'
+      : '上次更新尚未完成。继续更新会核对运行包，并保持节点停止。'
+    : ''
   const backgroundMessage = background.kind === 'installed'
     ? `${runtimeSummary ? `${runtimeSummary} · ` : ''}后台节点${background.health === 'running' ? '正在运行' : background.health === 'stopped' ? '已停止' : '状态异常'} · ${background.nodeId.slice(0, 12)} · ${background.dataDir}`
     : background.kind === 'checking' ? '正在核对后台节点状态…'
@@ -72,13 +85,15 @@ export function describeNodeSettings(status: DesktopStatus): View {
     ? [action('install-background', '安装后台节点')]
     : background.kind === 'installed'
       ? [
-          ...(background.runtimeUpdate.availability === 'newer_available'
-            ? [action('update-background', '更新本机节点', true)]
+          ...(recoveryRequired || background.runtimeUpdate.availability === 'newer_available'
+            ? [action('update-background', recoveryRequired ? '继续更新' : '更新本机节点', true, recoveryRequired && background.health !== 'stopped')]
             : []),
-          ...(background.health === 'running' ? [action('stop-background', '停止后台节点')] : [action('start-background', '启动后台节点')]),
-          action('remove-background', '移除后台运行'),
+          ...(background.health === 'running' || recoveryRequired && background.health !== 'stopped'
+            ? [action('stop-background', '停止后台节点')]
+            : recoveryRequired ? [] : [action('start-background', '启动后台节点')]),
+          ...(!recoveryRequired ? [action('remove-background', '移除后台运行')] : []),
         ]
-      : background.kind === 'partial' ? [action('discover', '重新核对状态'), action('remove-background', '移除后台运行')] : []
+      : background.kind === 'partial' ? [action('discover', '重新核对状态'), recoveryRequired ? action('update-background', '继续更新') : action('remove-background', '移除后台运行')] : []
 
   if (status.nodeMode === 'undecided') return {
     tone: 'idle', indicator: '可开始使用', headline: 'Vibeface',
@@ -118,7 +133,7 @@ export function describeNodeSettings(status: DesktopStatus): View {
     tone, indicator: selected ? '节点可用' : failed ? '检查未完成' : '等待连接', headline, explain,
     facts,
     failure, actions, rows: rows(status), discoveryMessage,
-    backgroundMessage: isLocal || background.kind !== 'absent' ? backgroundMessage : '',
+    backgroundMessage: isLocal || background.kind !== 'absent' ? [recoveryMessage, backgroundMessage].filter(Boolean).join(' ') : '',
     backgroundActions: isLocal ? backgroundActions : [],
     scope: isLocal ? '这台电脑可以运行节点，也可以连接其他节点。' : '连接已有节点，或使用邀请链接加入个人网络。',
   }

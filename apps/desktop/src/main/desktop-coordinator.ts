@@ -47,6 +47,7 @@ function runtimeFromStatus(status: ManagedNodeStatus): BackgroundRuntimeUpdate {
     installedVersion: update.installedVersion,
     runningVersion: update.runningVersion,
     availability: update.availability,
+    recoveryRequired: update.recoveryRequired,
   }
 }
 
@@ -311,7 +312,7 @@ export class DesktopCoordinator {
       if (current.kind !== 'installed' && current.kind !== 'partial') {
         throw new Error('没有可更新的已验证后台节点。')
       }
-      if (current.kind === 'installed' && current.runtimeUpdate.availability !== 'newer_available') {
+      if (current.kind === 'installed' && !current.runtimeUpdate.recoveryRequired && current.runtimeUpdate.availability !== 'newer_available') {
         throw new Error('App 内置运行时没有可更新的版本。')
       }
       const fresh = await this.options.managedNode.status()
@@ -319,20 +320,28 @@ export class DesktopCoordinator {
           || fresh.device_id !== current.nodeId || fresh.data_dir !== current.dataDir) {
         throw new Error('后台节点身份已变化，请重新核对后再更新。')
       }
-      if (fresh.runtime_update.availability !== 'newer_available') {
+      if (!fresh.runtime_update.recoveryRequired && fresh.runtime_update.availability !== 'newer_available') {
         throw new Error('App 内置运行时没有可更新的版本。')
+      }
+      if (fresh.runtime_update.recoveryRequired && (fresh.service_running !== false || fresh.core_status !== 'stopped')) {
+        throw new Error('上次更新尚未完成，请先停止后台节点，再点击“继续更新”。')
       }
       let result: ManagedNodeStatus
       try { result = await this.options.managedNode.updateBackground(current.nodeId) }
       catch (error) { await this.refreshBackground(); throw error }
       this.backgroundNode = backgroundNodeFromStatus(result, this.platform)
       const updated = this.backgroundNode
+      if (fresh.runtime_update.recoveryRequired && updated.kind === 'partial'
+          && updated.nodeId === current.nodeId && updated.dataDir === current.dataDir && !updated.runtimeUpdate?.recoveryRequired) {
+        this.changed()
+        return
+      }
       if (updated.kind !== 'installed' || updated.nodeId !== current.nodeId || updated.dataDir !== current.dataDir) {
         throw new Error('后台节点更新后未能确认相同的节点身份。')
       }
       const expectedHealth = fresh.service_running && fresh.core_status === 'running' ? 'running' : 'stopped'
       const runtime = updated.runtimeUpdate
-      if (updated.health !== expectedHealth || runtime.availability !== 'current'
+      if (updated.health !== expectedHealth || runtime.recoveryRequired || runtime.availability !== 'current'
           || runtime.installedVersion !== runtime.bundledVersion
           || runtime.runningVersion !== (expectedHealth === 'running' ? runtime.bundledVersion : null)) {
         throw new Error('后台节点更新后的运行状态或版本未能确认，请重新核对状态。')
@@ -347,6 +356,9 @@ export class DesktopCoordinator {
     await this.serial(async () => {
       const current = this.backgroundNode
       if (current.kind !== 'installed' && !(action === 'uninstall' && current.kind === 'partial')) throw new Error('没有可管理的已验证后台节点。')
+      if (action !== 'stop' && current.runtimeUpdate?.recoveryRequired) {
+        throw new Error('上次更新尚未完成，请先点击“继续更新”完成核对。')
+      }
       let result: ManagedNodeStatus
       try {
         if (action === 'uninstall') {

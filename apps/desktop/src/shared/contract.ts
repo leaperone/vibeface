@@ -44,6 +44,7 @@ export type BackgroundRuntimeUpdate = {
   installedVersion: string | null
   runningVersion: string | null
   availability: BackgroundRuntimeUpdateAvailability
+  recoveryRequired: boolean
 }
 
 /** Read-only current-user Node observations; kept separate from App-host lifecycle state. */

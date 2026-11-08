@@ -20,6 +20,7 @@ const runtime = (availability: ManagedNodeRuntimeUpdate['availability'], overrid
   installedVersion: availability === 'not_installed' ? null : '0.0.1-nightly.20261107.1',
   runningVersion: availability === 'not_installed' ? null : '0.0.1-nightly.20261107.1',
   availability,
+  recoveryRequired: false,
   ...overrides,
 })
 const noNode: ManagedNodeStatus = { ok: true, state: 'not_installed', device_id: null, data_dir: null,
@@ -346,6 +347,41 @@ describe('Desktop coordinator', () => {
     expect(managed.installBackground).not.toHaveBeenCalled()
     expect(managed.start).not.toHaveBeenCalled()
     expect(managed.stop).not.toHaveBeenCalled()
+  })
+
+  it('requires an explicit stop before recovering the same bundled version and keeps it stopped', async () => {
+    const profile = await temp(), dataDir = await temp()
+    let observed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: dataDir,
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running',
+      runtime_update: runtime('current', { recoveryRequired: true, installedVersion: '0.0.1-nightly.20261108.1', runningVersion: '0.0.1-nightly.20261108.1' }) }
+    const managed = {
+      status: vi.fn(async () => observed),
+      stop: vi.fn(async () => { observed = { ...observed, state: 'installed_stopped', service_running: false, core_status: 'stopped',
+        runtime_update: { ...observed.runtime_update, runningVersion: null } }; return observed }),
+      updateBackground: vi.fn(async () => { observed = { ...observed, runtime_update: { ...observed.runtime_update, recoveryRequired: false } }; return observed }),
+      start: vi.fn(), installBackground: vi.fn(), uninstall: vi.fn(),
+    }
+    const subject = new DesktopCoordinator({
+      profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] },
+      managedNode: managed as unknown as ManagedNodeController,
+      discover: async () => ({ nodes: [], warnings: [] }),
+      inspect: async () => { throw new Error('unused') }, access: async () => { throw new Error('unused') },
+      prepareBackgroundNode: async () => { throw new Error('unused') }, startDiscovered: vi.fn(), startOwnedAppNode: vi.fn(),
+    })
+    await subject.initialize()
+    await expect(subject.updateBackground()).rejects.toThrow(/先停止/)
+    await expect(subject.startBackground()).rejects.toThrow(/继续更新/)
+    await expect(subject.removeBackground()).rejects.toThrow(/继续更新/)
+    expect(managed.updateBackground).not.toHaveBeenCalled()
+    await subject.stopBackground()
+    expect(subject.status().backgroundNode).toMatchObject({ health: 'stopped', runtimeUpdate: { recoveryRequired: true } })
+    await subject.updateBackground()
+    expect(subject.status().backgroundNode).toMatchObject({ health: 'stopped', nodeId: deviceId, runtimeUpdate: { availability: 'current', recoveryRequired: false } })
+    expect(managed.stop).toHaveBeenCalledTimes(1)
+    expect(managed.updateBackground).toHaveBeenCalledTimes(1)
+    expect(managed.start).not.toHaveBeenCalled()
+    expect(managed.installBackground).not.toHaveBeenCalled()
+    expect(managed.uninstall).not.toHaveBeenCalled()
   })
 
 })
