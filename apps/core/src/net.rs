@@ -3,6 +3,7 @@
 //! Every request is one QUIC bidirectional stream carrying length-prefixed JSON frames. The
 //! remote `EndpointId` is the peer's `DeviceId`, proven by the QUIC TLS handshake.
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::memory::MemoryLookup,
@@ -759,6 +760,7 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        self.bootstrap.shutdown().await;
         self.endpoint.close().await;
     }
 }
@@ -820,21 +822,32 @@ where
     F: Fn(Value) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Value>> + Send,
 {
-    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            let response = match read_frame(&mut recv).await {
-                Ok(Some(request)) => handle(request)
-                    .await
-                    .unwrap_or_else(|error| serde_json::json!({"error":format!("{error:#}")})),
-                Ok(None) => return,
-                Err(error) => serde_json::json!({"error":format!("{error:#}")}),
-            };
-            if write_frame(&mut send, &response).await.is_ok() {
-                send.finish().ok();
-                let _ = send.stopped().await;
+    let mut replies = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            stream = connection.accept_bi() => {
+                let Ok((mut send, mut recv)) = stream else { break };
+                let handle = handle.clone();
+                replies.push(std::panic::AssertUnwindSafe(async move {
+                    let response = match read_frame(&mut recv).await {
+                        Ok(Some(request)) => handle(request)
+                            .await
+                            .unwrap_or_else(|error| serde_json::json!({"error":format!("{error:#}")})),
+                        Ok(None) => return,
+                        Err(error) => serde_json::json!({"error":format!("{error:#}")}),
+                    };
+                    if write_frame(&mut send, &response).await.is_ok() {
+                        send.finish().ok();
+                        let _ = send.stopped().await;
+                    }
+                }).catch_unwind());
             }
-        });
+            Some(result) = replies.next(), if !replies.is_empty() => {
+                if result.is_err() {
+                    tracing::warn!(event = "net.request_panicked", "peer request handler panicked");
+                }
+            }
+        }
     }
 }
 

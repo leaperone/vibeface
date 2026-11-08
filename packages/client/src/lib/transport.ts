@@ -26,6 +26,10 @@ export type LanStream = {
 }
 /** Opens a stream to Node `deviceId` at any of `addrs` (`ip:port`) within `timeoutMs`. */
 export type LanDial = (deviceId: string, addrs: string[], timeoutMs: number) => Promise<LanStream>
+/** Explicit native-only transport for the inspected local Node; browser local-origin checks stay in place. */
+export type NativeLocalCarrier = (entry: Extract<ConnectionEntry, { kind: 'local' }>, timeoutMs: number) => Promise<LanStream>
+/** Selected local Node's ordinary Gateway/bootstrap channel; remote Gateway entries remain browser WebSockets. */
+export type NativeLocalGatewayCarrier = (entry: Extract<ConnectionEntry, { kind: 'gateway' }>, target: string, timeoutMs: number) => Promise<LanStream | null>
 type ConnectOptions = {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
@@ -153,10 +157,10 @@ async function socketCarrier(url: string, connect: string | null, signal: AbortS
 }
 
 /** A QUIC stream straight to the Node: no Gateway in between, so no connect frame. */
-async function lanCarrier(dial: LanDial, deviceId: string, addrs: string[], signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+async function streamCarrier(openStream: () => Promise<LanStream>, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
   let stream: LanStream | undefined
   const frames = inbox(signal, timeoutMs, onClose, () => stream?.close())
-  const dialing = dial(deviceId, addrs, timeoutMs).then(opened => {
+  const dialing = openStream().then(opened => {
     stream = opened
     if (frames.closed()) opened.close()
     return opened
@@ -178,8 +182,12 @@ async function lanCarrier(dial: LanDial, deviceId: string, addrs: string[], sign
   return { send, receive: frames.receive, ready: frames.ready, close: frames.close }
 }
 
+async function lanCarrier(dial: LanDial, deviceId: string, addrs: string[], signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+  return streamCarrier(() => dial(deviceId, addrs, timeoutMs), signal, onClose, timeoutMs)
+}
+
 /** `dialLan`: the app's direct path to Nodes on its LAN; a browser has none. */
-export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: LanDial) {
+export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: LanDial, nativeLocalCarrier?: NativeLocalCarrier, nativeLocalGateway?: NativeLocalGatewayCarrier) {
   let device: { deviceId: string } | undefined
   let initializing: Promise<{ deviceId: string }> | null = null
 
@@ -229,13 +237,20 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     return { origin, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret, direct: lanAddrs(ticket.direct_addrs) }
   }
 
-  function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+  async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
     if (entry.kind === 'lan') {
       if (!dialLan) throw new Error('这里不能在局域网里直连设备。')
       return lanCarrier(dialLan, target, entry.addrs, signal, onClose, timeoutMs)
     }
     const endpoint = validEndpoint(entry.address)
+    if (entry.kind === 'local' && nativeLocalCarrier) {
+      return streamCarrier(() => nativeLocalCarrier(entry, timeoutMs), signal, onClose, timeoutMs)
+    }
     if (entry.kind === 'local' && endpoint !== page()?.origin) throw new Error('本机会话只能连接这个节点。')
+    if (entry.kind === 'gateway' && nativeLocalGateway) {
+      const stream = await nativeLocalGateway(entry, target, timeoutMs)
+      if (stream) return streamCarrier(() => Promise.resolve(stream), signal, onClose, timeoutMs)
+    }
     const url = new URL(entry.kind === 'local' ? '/api/local/ws' : '/api/client', endpoint)
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     return socketCarrier(url.href, entry.kind === 'local' ? null : JSON.stringify({ type: 'connect', target }), signal, onClose, timeoutMs)

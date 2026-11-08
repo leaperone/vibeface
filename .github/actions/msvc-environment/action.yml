@@ -1,0 +1,15 @@
+name: Existing MSVC environment
+description: Select the hosted runner's existing Visual Studio tools and its real MSVC linker.
+runs:
+  using: composite
+  steps:
+    - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+      with: {arch: x64}
+    - name: Pin the MSVC linker instead of Git's link.exe
+      shell: pwsh
+      run: |
+        $linker = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+        if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+          throw 'The hosted runner does not provide the existing x64 MSVC linker'
+        }
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV

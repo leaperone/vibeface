@@ -4,10 +4,11 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+use vibeface_bridge::platform::privatefs;
 use vibeface_delivery::hash;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,15 +65,10 @@ fn private_directory(path: &Path) -> Result<()> {
     crate::config::private_dir(path)
 }
 fn open_file(path: &Path, write: bool, create: bool) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(write)
-        .create(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
+    let file = match (write, create) {
+        (true, true) => privatefs::open_or_create(path)?,
+        (true, false) | (false, _) => privatefs::open_no_follow(path)?,
+    };
     ensure!(
         file.metadata()?.is_file(),
         "service object is not a regular file"
@@ -467,7 +463,7 @@ impl ServiceStore {
             }
             drop(file);
             std::fs::rename(&partial, self.object_path(order, index, kind, false)?)?;
-            File::open(partial.parent().context("object directory missing")?)?.sync_all()?;
+            privatefs::sync_dir(partial.parent().context("object directory missing")?)?;
         }
         self.db.execute(
             "UPDATE objects SET committed=?4,complete=?5 WHERE order_id=?1 AND idx=?2 AND kind=?3",
@@ -790,6 +786,7 @@ mod tests {
         drop(store);
         let mut store = ServiceStore::open(&dir, 200_000, 4).unwrap();
         assert_eq!(store.reserve_transaction(&intent, 20).unwrap().nonce, 7);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -893,6 +890,7 @@ mod tests {
         );
         assert!(store.find_transaction("order/hold").unwrap().is_none());
         assert_eq!(store.recent_transactions().unwrap().len(), 1);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -945,6 +943,7 @@ mod tests {
                 .reserve_object(&order, 1, "capsule", &digest, 81)
                 .is_err()
         );
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

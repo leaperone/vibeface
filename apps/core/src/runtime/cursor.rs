@@ -1178,13 +1178,17 @@ mod tests {
             1
         );
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
     fn fake_bridge() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+            "../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge.cmd"
+        } else {
+            "../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge"
+        })
     }
 
     async fn cursor_node() -> Result<(Arc<Runtime>, PathBuf, String, PathBuf)> {
@@ -1433,7 +1437,21 @@ mod tests {
             assert!(seen(&node).await?.1.dynamic.is_none());
             let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
             let started = Arc::new(tokio::sync::Notify::new());
+            let bridge_ready = Arc::new(tokio::sync::Notify::new());
+            let bridge_ready_hook = bridge_ready.clone();
             let mut running_config = config.clone();
+            let original_process_started = running_config.process_started.take();
+            running_config.process_started = Some(Arc::new(move |group| {
+                let bridge_ready_hook = bridge_ready_hook.clone();
+                let original_process_started = original_process_started.clone();
+                Box::pin(async move {
+                    if let Some(record) = original_process_started {
+                        record(group).await?;
+                    }
+                    bridge_ready_hook.notify_one();
+                    Ok(())
+                })
+            }));
             let mut observer =
                 crate::scheduler::turn_recorder(&node, &network, &job, "", shown, None);
             let original_started = observer.started.take().context("started callback")?;
@@ -1457,7 +1475,7 @@ mod tests {
             let persist_trigger = job.trigger.clone();
             let persist_attempt = attempt.clone();
             let (cancel, receiver) = tokio::sync::watch::channel(false);
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 crate::manager::run_manager(
                     &running_config,
                     "hang",
@@ -1480,8 +1498,53 @@ mod tests {
                 )
                 .await
             });
-            let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+            // Admission includes the bridge's separate 60-second startup budget in bridge::agent.
+            // The five-second native-run observation starts only after that transport is ready.
+            let ready = tokio::select! {
+                ready = tokio::time::timeout(Duration::from_secs(60), bridge_ready.notified()) => ready,
+                result = &mut task => {
+                    return match result {
+                        Ok(Ok(_)) => Err(anyhow::anyhow!("Cursor work completed before bridge admission")),
+                        Ok(Err(error)) => Err(error).context("Cursor work failed before bridge admission"),
+                        Err(error) => Err(error).context("Cursor work task failed before bridge admission"),
+                    };
+                }
+            };
+            if ready.is_err() {
+                cancel.send(true)?;
+                let _ = task.await;
+                bail!("controlled Cursor SDK bridge admission did not complete");
+            }
+            let observed = tokio::select! {
+                observed = tokio::time::timeout(Duration::from_secs(5), started.notified()) => observed,
+                result = &mut task => {
+                    match result {
+                        Ok(Ok(_)) => bail!("Cursor work completed before its native start callback"),
+                        Ok(Err(error)) => return Err(error).context("Cursor work ended before its native start callback"),
+                        Err(error) => return Err(error).context("Cursor work task ended before its native start callback"),
+                    }
+                }
+            };
             let pending = !task.is_finished();
+            if observed.is_err() {
+                let fake_send_seen = std::fs::read_to_string(dir.join("sends.log"))
+                    .is_ok_and(|log| log.lines().any(|line| line.contains("\"text\": \"hang\"")));
+                let session_saved = persisted.lock().unwrap().is_some();
+                let durable_run_recorded = node
+                    .store
+                    .lock()
+                    .await
+                    .manager_turn_record(&attempt)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.turn.is_some());
+                cancel.send(true)?;
+                let ended = task.await;
+                bail!(
+                    "native Cursor start callback deadline elapsed (fake Send seen: {fake_send_seen}; SDK session saved: {session_saved}; durable run recorded: {durable_run_recorded}; worker ended: {})",
+                    ended.is_ok()
+                );
+            }
             let captured = async {
                 let store = node.store.lock().await;
                 let early = store
@@ -1661,6 +1724,7 @@ mod tests {
             }
         }
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1721,6 +1785,7 @@ mod tests {
             1
         );
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1769,6 +1834,7 @@ mod tests {
         );
         assert!(running.state.handle().is_some());
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

@@ -2,8 +2,10 @@ use crate::update;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use update::release::{PROGRAMS, SERVICE_SCRIPT};
 use vibeface_control::{self, ControlRequest};
 
 #[derive(Args)]
@@ -130,7 +132,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
             .context("npm native package is missing")?
             .to_path_buf()
     } else {
-        let binary = root.join("current/vibeface");
+        let binary = root.join("current").join(PROGRAMS[0]);
         ensure!(
             std::fs::canonicalize(&binary)? == std::fs::canonicalize(executable)?,
             "service management requires the current managed binary; run {}",
@@ -138,13 +140,81 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         );
         root.join("current")
     };
-    let binary = package.join("vibeface");
-    let mut command = Command::new(package.join("scripts/install-node-service.sh"));
-    command.arg(action.argument()).arg("--data-dir").arg(data);
+    let binary = package.join(PROGRAMS[0]);
+    let mut command = service_script(&package.join(SERVICE_SCRIPT))?;
+    command
+        .arg(action.argument())
+        .arg("--data-dir")
+        .arg(script_os_argument(data));
     if matches!(action, Action::Install | Action::InstallUpdater) {
-        command.arg("--binary").arg(binary);
+        command.arg("--binary").arg(script_os_argument(&binary));
     }
     Ok(command)
+}
+
+/// Windows canonical paths can carry a verbatim `\\?\` prefix that PowerShell 5 `-File` and Task
+/// Scheduler reject; spell them as ordinary DOS or UNC paths at the script boundary.
+fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\").filter(|value| {
+        let bytes = value.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    }) {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+fn script_os_argument(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        match path.to_str() {
+            Some(path) => PathBuf::from(strip_verbatim_windows_path(path).as_ref()),
+            None => path.to_path_buf(),
+        }
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// A command that runs the service script a package carries.
+///
+/// Unix runs the script directly. Windows has no script a process can start on its own, so the
+/// shell that interprets it is named by its full path under the system directory, which keeps
+/// anything earlier on the search path out of it.
+pub(crate) fn service_script(script: &Path) -> Result<Command> {
+    ensure!(
+        script.is_file(),
+        "this installation carries no service script: {}",
+        script.display()
+    );
+    #[cfg(unix)]
+    {
+        Ok(Command::new(script))
+    }
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .context("SystemRoot is required to run the service script")?;
+        let shell = PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        ensure!(
+            shell.is_file(),
+            "the service script needs Windows PowerShell: {}",
+            shell.display()
+        );
+        let mut command = Command::new(shell);
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script_os_argument(script));
+        Ok(command)
+    }
 }
 
 pub async fn run(options: Service) -> Result<()> {
@@ -192,35 +262,139 @@ pub async fn run(options: Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::ffi::OsStr;
+    use vibeface_bridge::platform::privatefs;
+
+    #[test]
+    fn strip_verbatim_windows_path_returns_dos_and_unc_spelling() {
+        assert_eq!(
+            strip_verbatim_windows_path(
+                r"\\?\D:\Vibeface\current\scripts\install-node-service.ps1"
+            ),
+            r"D:\Vibeface\current\scripts\install-node-service.ps1"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"\\?\UNC\server\share\data"),
+            r"\\server\share\data"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"D:\ordinary\path"),
+            r"D:\ordinary\path"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"\\?\Volume{fixture}\path"),
+            r"\\?\Volume{fixture}\path"
+        );
+    }
+
+    /// Marks `path` as a program this account can run, where that is something a file carries.
+    fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(privatefs::is_executable(path));
+    }
+
+    /// What `command` is expected to start to run the service script at `script`.
+    fn expected_script_call(script: &Path) -> Vec<std::ffi::OsString> {
+        #[cfg(unix)]
+        {
+            vec![script.as_os_str().to_owned()]
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var_os("SystemRoot").unwrap();
+            vec![
+                PathBuf::from(root)
+                    .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+                    .into_os_string(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                script_os_argument(script).into_os_string(),
+            ]
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn command_spells_verbatim_windows_paths_for_script_arguments() {
+        let root = std::env::temp_dir().join(format!("vibeface-verbatim-{}", uuid::Uuid::new_v4()));
+        let package = root.join("releases/fixture");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(package.join("scripts")).unwrap();
+        std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
+        mark_runnable(&package.join(PROGRAMS[0]));
+        std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
+        privatefs::link_dir(&package, &root.join("current")).unwrap();
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        let executable = package.join(PROGRAMS[0]);
+        let install = command(
+            &root.canonicalize().unwrap(),
+            &data.canonicalize().unwrap(),
+            &executable.canonicalize().unwrap(),
+            Action::Install,
+        )
+        .unwrap();
+        let args: Vec<_> = install
+            .as_std()
+            .get_args()
+            .map(|value| value.to_owned())
+            .collect();
+        let verbatim = OsStr::new("--data-dir");
+        let position = args.iter().position(|value| value == verbatim).unwrap();
+        assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
+        let binary_flag = OsStr::new("--binary");
+        let position = args.iter().position(|value| value == binary_flag).unwrap();
+        assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Everything `command` built, the program first and then its arguments.
+    fn whole_call(command: &Command) -> Vec<std::ffi::OsString> {
+        let command = command.as_std();
+        std::iter::once(command.get_program().to_owned())
+            .chain(command.get_args().map(|argument| argument.to_owned()))
+            .collect()
+    }
 
     #[test]
     fn service_uses_current_and_preserves_argument_boundaries() {
         let root = std::env::temp_dir().join(format!("vibeface-service-{}", uuid::Uuid::new_v4()));
         let package = root.join("releases/fixture");
         std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("vibeface"), b"binary").unwrap();
-        std::os::unix::fs::symlink(&package, root.join("current")).unwrap();
+        std::fs::create_dir_all(package.join("scripts")).unwrap();
+        std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
+        mark_runnable(&package.join(PROGRAMS[0]));
+        std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
+        privatefs::link_dir(&package, &root.join("current")).unwrap();
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
-        let executable = package.join("vibeface");
+        let executable = package.join(PROGRAMS[0]);
         let install = command(&root, &data, &executable, Action::Install).unwrap();
-        let install = install.as_std();
-        assert_eq!(
-            install.get_program(),
-            root.join("current/scripts/install-node-service.sh")
-        );
-        assert_eq!(
-            install.get_args().collect::<Vec<_>>(),
-            [
-                std::ffi::OsStr::new("install"),
-                std::ffi::OsStr::new("--data-dir"),
-                data.as_os_str(),
-                std::ffi::OsStr::new("--binary"),
-                root.join("current/vibeface").as_os_str(),
-            ]
-        );
+        let mut expected = expected_script_call(&root.join("current").join(SERVICE_SCRIPT));
+        expected.extend([
+            "install".into(),
+            "--data-dir".into(),
+            data.clone().into_os_string(),
+            "--binary".into(),
+            root.join("current").join(PROGRAMS[0]).into_os_string(),
+        ]);
+        assert_eq!(whole_call(&install), expected);
         let stop = command(&root, &data, &executable, Action::Stop).unwrap();
-        assert_eq!(stop.as_std().get_args().count(), 3);
+        assert_eq!(
+            whole_call(&stop).len(),
+            expected_script_call(Path::new("script")).len() + 3
+        );
         let unrelated = root.join("local-build");
         std::fs::write(&unrelated, b"another binary").unwrap();
         assert!(command(&root, &data, &unrelated, Action::Install).is_err());
@@ -243,7 +417,12 @@ mod tests {
     fn npm_service_uses_the_native_package_and_rejects_a_second_updater() {
         let root =
             std::env::temp_dir().join(format!("vibeface-npm-service-{}", uuid::Uuid::new_v4()));
-        let package = root.join("vendor/aarch64-apple-darwin");
+        let target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        let package = root.join("vendor").join(target);
         std::fs::create_dir_all(package.join("scripts")).unwrap();
         std::fs::create_dir(root.join("bin")).unwrap();
         std::fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
@@ -252,25 +431,17 @@ mod tests {
             r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
         )
         .unwrap();
-        std::fs::write(package.join("vibeface"), b"binary").unwrap();
-        std::fs::write(package.join("vibeface-core"), b"core").unwrap();
-        std::fs::set_permissions(
-            package.join("vibeface"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            package.join("vibeface-core"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
+        std::fs::write(package.join(PROGRAMS[1]), b"core").unwrap();
+        mark_runnable(&package.join(PROGRAMS[0]));
+        mark_runnable(&package.join(PROGRAMS[1]));
         std::fs::create_dir(package.join("web")).unwrap();
         std::fs::write(package.join("web/index.html"), b"web").unwrap();
-        std::fs::write(package.join("scripts/install-node-service.sh"), b"script").unwrap();
+        std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
         std::fs::write(
             package.join("BUILD-INFO.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "1.2.3-nightly.20261019.1", "target": "aarch64-apple-darwin",
+                "version": "1.2.3-nightly.20261019.1", "target": target,
                 "source_commit": "a".repeat(40), "core_version": "1.2.3-nightly.20261019.1",
                 "core_source_commit": "a".repeat(40), "app_version": "1.2.3-nightly.20261019.1",
                 "app_source_commit": "a".repeat(40),
@@ -281,25 +452,20 @@ mod tests {
         )
         .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        let package = root.join("vendor/aarch64-apple-darwin");
-        let binary = package.join("vibeface");
+        let package = root.join("vendor").join(target);
+        let binary = package.join(PROGRAMS[0]);
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
         let install = command(&root, &data, &binary, Action::Install).unwrap();
-        assert_eq!(
-            install.as_std().get_program(),
-            package.join("scripts/install-node-service.sh")
-        );
-        assert_eq!(
-            install.as_std().get_args().collect::<Vec<_>>(),
-            [
-                std::ffi::OsStr::new("install"),
-                std::ffi::OsStr::new("--data-dir"),
-                data.as_os_str(),
-                std::ffi::OsStr::new("--binary"),
-                binary.as_os_str(),
-            ]
-        );
+        let mut expected = expected_script_call(&package.join(SERVICE_SCRIPT));
+        expected.extend([
+            "install".into(),
+            "--data-dir".into(),
+            script_os_argument(&data).into_os_string(),
+            "--binary".into(),
+            script_os_argument(&binary).into_os_string(),
+        ]);
+        assert_eq!(whole_call(&install), expected);
         assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
         assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
         assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());

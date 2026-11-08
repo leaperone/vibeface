@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,18 +19,60 @@ fn starts(log: &Path) -> Vec<u32> {
         .collect()
 }
 
-fn signal(group: u32, signal: &str) -> bool {
-    Command::new("/bin/kill")
-        .args([signal, "--", &format!("-{group}")])
-        .stderr(Stdio::null())
-        .status()
+fn fixture_executable() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+        "tests/fixtures/fake-cursor-sdk-bridge.cmd"
+    } else {
+        "tests/fixtures/fake-cursor-sdk-bridge"
+    })
+}
+
+fn signal(group: u32, signal: &str, pidfile: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::process::{Command, Stdio};
+        let _ = pidfile;
+        Command::new("/bin/kill")
+            .args([signal, "--", &format!("-{group}")])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+    #[cfg(windows)]
+    {
+        use vibeface_bridge::platform::tree;
+        if signal == "-0" {
+            return tree::root_is_running(group);
+        }
+        assert_eq!(signal, "-KILL");
+        let recorded = std::fs::read_to_string(pidfile).unwrap();
+        let tokens: Vec<_> = recorded
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().0)
+            .collect();
+        let root = group.to_string();
+        let matching = tokens
+            .iter()
+            .copied()
+            .find(|token| token.split('|').next() == Some(root.as_str()));
+        // A .cmd launcher owns the Python worker. A single-owner fixture can use that
+        // worker's observation PID; a multi-owner fixture must name the exact root.
+        let token = matching
+            .or_else(|| (tokens.len() == 1).then(|| tokens[0]))
+            .expect("the fixture's owned tree");
+        tree::stop_recorded(token, |image| {
+            tree::names_program(image, Path::new("cmd.exe"))
+                || tree::names_program(image, Path::new("python.exe"))
+        })
         .unwrap()
-        .success()
+        .is_some()
+    }
 }
 
 async fn gone(group: u32) -> bool {
     for _ in 0..50 {
-        if !signal(group, "-0") {
+        if !signal(group, "-0", Path::new("")) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -83,8 +124,7 @@ async fn provider_observation_fixture(
     root: &Path,
     env: BTreeMap<String, String>,
 ) -> anyhow::Result<(SdkBridge, SdkProviderObservation)> {
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let executable = fixture_executable();
     let bridge = SdkBridge::new(
         BTreeMap::new(),
         ToolCallbackConfig {
@@ -119,8 +159,7 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1500);
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let executable = fixture_executable();
     let bridge = SdkBridge::new(
         BTreeMap::from([("FAKE_BRIDGE_STARTUP_MS".into(), startup_ms.to_string())]),
         ToolCallbackConfig {
@@ -169,10 +208,23 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         vec![bridge_group],
         "both turns used one bridge"
     );
+    #[cfg(unix)]
     assert_eq!(*recorded.lock().unwrap(), vec![bridge_group, bridge_group]);
+    #[cfg(windows)]
+    {
+        let observed = recorded.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0], observed[1],
+            "both calls belong to the same launcher"
+        );
+        assert!(vibeface_bridge::platform::tree::root_is_running(
+            observed[0]
+        ));
+    }
     assert!(second_took < Duration::from_millis(startup_ms / 2));
 
-    assert!(signal(bridge_group, "-KILL"));
+    assert!(signal(bridge_group, "-KILL", &pidfile));
     assert!(gone(bridge_group).await);
     let (third, third_took) = reply(&bridge, &turn, "third").await;
     eprintln!("turn 3 (bridge killed before it): {third_took:?}");
@@ -194,10 +246,18 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
     let (fourth, _) = reply(&bridge, &turn, "fourth").await;
     assert_eq!(fourth.unwrap(), "done: fourth");
     let last = starts(&log)[2];
+    #[cfg(unix)]
     assert_eq!(
         std::fs::read_to_string(&pidfile).unwrap(),
         format!("{last} {}\n", executable.display())
     );
+    #[cfg(windows)]
+    {
+        let record = std::fs::read_to_string(&pidfile).unwrap();
+        let (token, program) = record.trim_end().split_once(' ').unwrap();
+        assert_eq!(program, executable.display().to_string());
+        assert!(vibeface_bridge::platform::tree::token_is_running(token));
+    }
 
     turn.env
         .insert("FIXTURE_ENGINE_VAR".into(), "changed".into());
@@ -256,8 +316,7 @@ async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifte
     let gates = root.join("gates");
     std::fs::create_dir(&gates).unwrap();
     let pidfile = root.join("cursor-sdk-bridge.pid");
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let executable = fixture_executable();
     let bridge = Arc::new(
         SdkBridge::new(
             BTreeMap::from([("FAKE_BRIDGE_DELAY_MS".into(), "100".into())]),
@@ -371,7 +430,7 @@ async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifte
     }
     wait_sends(&sends_log, "second-", 15).await;
     wait_sends(&sends_log, "hang", 1).await;
-    assert!(signal(crash_group, "-KILL"));
+    assert!(signal(crash_group, "-KILL", &pidfile));
     std::fs::write(gates.join("second"), b"").unwrap();
     let second: Vec<_> = futures_util::future::join_all(second)
         .await
@@ -471,8 +530,7 @@ async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_af
     let token_b = "fixture-second-attempt-token-".repeat(2);
     let turn = SdkTurn {
         owner: "bot:network:resume".into(),
-        executable: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake-cursor-sdk-bridge"),
+        executable: fixture_executable(),
         workspace: root.join("workspace"),
         local_store_root: root.join("private-instance"),
         api_key: "fixture-api-key".into(),
@@ -555,7 +613,7 @@ async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_af
         .collect();
     assert_eq!(callbacks, vec![token_a, token_b]);
     let first_group = starts(&starts_log)[0];
-    assert!(signal(first_group, "-KILL"));
+    assert!(signal(first_group, "-KILL", &root.join("bridge.pid")));
     assert!(gone(first_group).await);
     std::fs::write(gates.join("recall"), b"").unwrap();
     let result = bridge
@@ -594,8 +652,7 @@ async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_st
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let executable = fixture_executable();
     let bridge = SdkBridge::new(
         BTreeMap::new(),
         ToolCallbackConfig {
@@ -821,7 +878,20 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         SdkProviderAuthentication::Authenticated
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    let token = std::fs::read_to_string(root.join("bridge.pid"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     bridge.stop().await;
+    assert!(
+        matches!(
+            vibeface_bridge::platform::tree::Leftover::find(&token),
+            Ok(None)
+        ),
+        "Bridge::stop returns only after the SDK wrapper and child tree have exited"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -872,8 +942,7 @@ async fn provider_observation_does_not_wait_for_an_active_agent_owner() {
         .await
         .unwrap();
     let bridge = Arc::new(bridge);
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let executable = fixture_executable();
     let turn = SdkTurn {
         owner: "coordination".into(),
         executable: executable.clone(),

@@ -159,15 +159,31 @@ impl Infra {
         net::relay_url(&self.relay_url)
     }
 
-    async fn stop(self) {
-        for task in self.tasks {
+    async fn stop(self) -> Result<()> {
+        let Self {
+            discovery,
+            entry,
+            dirs,
+            tasks,
+            ..
+        } = self;
+        for task in tasks {
             task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                return Err(error).context("bootstrap test API task failed to stop");
+            }
         }
-        self.entry.stop_network().await;
-        self.discovery.stop_network().await;
-        for dir in self.dirs {
-            let _ = std::fs::remove_dir_all(dir);
+        entry.shutdown().await;
+        discovery.shutdown().await;
+        drop(entry);
+        drop(discovery);
+        for dir in dirs {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("remove bootstrap fixture {}", dir.display()))?;
         }
+        Ok(())
     }
 }
 
@@ -273,12 +289,12 @@ async fn wait_relay_connection(node: &Runtime, relay: &iroh::RelayUrl) -> Result
     wait_connected(&mut status, relay, true).await
 }
 
-async fn stop_node(node: Arc<Runtime>, dir: PathBuf) {
-    node.stop_network().await;
-    if let Ok(net) = node.net() {
-        net.close().await;
-    }
-    let _ = std::fs::remove_dir_all(dir);
+async fn stop_node(node: Arc<Runtime>, dir: PathBuf) -> Result<()> {
+    node.shutdown().await;
+    drop(node);
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("remove bootstrap fixture {}", dir.display()))?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -333,8 +349,8 @@ async fn admission_waits_for_the_public_relay_listener_before_reporting_ready() 
         Some(infra.gateway_url.as_str()),
         "after admission the catalogue gateway is advertised"
     );
-    stop_node(node, dir).await;
-    infra.stop().await;
+    stop_node(node, dir).await?;
+    infra.stop().await?;
     Ok(())
 }
 
@@ -375,8 +391,8 @@ async fn a_fresh_node_is_admitted_over_udp_and_relays_through_the_public_entry()
         Some(admitted.grant_until_ms),
         "the entry learnt the grant"
     );
-    stop_node(node, dir).await;
-    infra.stop().await;
+    stop_node(node, dir).await?;
+    infra.stop().await?;
     Ok(())
 }
 
@@ -393,8 +409,8 @@ async fn a_node_whose_udp_is_blocked_is_admitted_over_http() -> Result<()> {
     assert_eq!(admitted.via, Transport::Https);
     assert_eq!(admitted.relay_url, infra.relay_url);
     wait_relay_connection(&node, &infra.relay()?).await?;
-    stop_node(node, dir).await;
-    infra.stop().await;
+    stop_node(node, dir).await?;
+    infra.stop().await?;
     Ok(())
 }
 
@@ -455,8 +471,8 @@ async fn grants_are_renewed_registered_and_survive_a_relay_restart() -> Result<(
             .is_some_and(|until| until > now_ms()),
         "the Node re-registered a fresh grant"
     );
-    stop_node(node, dir).await;
-    infra.stop().await;
+    stop_node(node, dir).await?;
+    infra.stop().await?;
     Ok(())
 }
 
@@ -481,15 +497,26 @@ async fn a_node_without_public_infrastructure_starts_locally_and_keeps_seeking()
         Some(node.config.public_url.clone()),
         "without an admitted entry this Node advertises itself"
     );
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    match node.bootstrap_state().context("bootstrap is on")? {
-        BootstrapState::Seeking { reason, .. } => {
-            assert!(reason.is_some(), "the failure is reported, not hidden");
+    // Startup can finish while discovery is still awaiting its bounded HTTP fallback.
+    let mut states = node.net()?.bootstrap().subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = states.borrow_and_update().clone();
+            match state {
+                BootstrapState::Seeking {
+                    reason: Some(_), ..
+                } => return Ok::<(), anyhow::Error>(()),
+                BootstrapState::Seeking { reason: None, .. } => {
+                    states.changed().await.context("bootstrap stopped")?;
+                }
+                other => anyhow::bail!("unexpected bootstrap state: {other:?}"),
+            }
         }
-        other => panic!("unexpected bootstrap state: {other:?}"),
-    }
+    })
+    .await
+    .context("the failure must be reported after discovery and HTTP have failed")??;
     assert!(node.net()?.bootstrap().admitted().is_none());
-    stop_node(node, dir).await;
+    stop_node(node, dir).await?;
     Ok(())
 }
 
@@ -518,8 +545,8 @@ async fn a_catalogue_from_another_issuer_never_admits() -> Result<()> {
         }
         other => panic!("unexpected bootstrap state: {other:?}"),
     }
-    stop_node(node, dir).await;
-    infra.stop().await;
+    stop_node(node, dir).await?;
+    infra.stop().await?;
     Ok(())
 }
 
@@ -623,6 +650,6 @@ async fn bootstrap_http_serves_signed_resources_within_the_contract_limits() -> 
         infra.entry.bootstrap_state().is_none() && infra.discovery.bootstrap_state().is_none(),
         "public entries report no bootstrap of their own"
     );
-    infra.stop().await;
+    infra.stop().await?;
     Ok(())
 }

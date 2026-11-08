@@ -4,18 +4,20 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
+use vibeface_bridge::platform::privatefs;
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
 };
 
+mod desktop_node;
 mod service;
 mod terminal;
 mod triage;
@@ -73,6 +75,15 @@ enum Action {
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
     Update(crate::update::Update),
+    /// Internal Desktop managed Node provisioning interface.
+    #[command(hide = true)]
+    DesktopNode(crate::desktop_node::DesktopNode),
+    /// Prepare only the Electron profile's current-user filesystem permissions.
+    #[command(hide = true)]
+    DesktopProfile {
+        #[arg(long)]
+        profile_dir: PathBuf,
+    },
     /// Call a local tool with JSON arguments.
     Tool {
         /// Tool name.
@@ -305,15 +316,17 @@ enum WalletAction {
     Status,
     /// Create a wallet using a protected passphrase descriptor.
     Create {
-        /// Protected file descriptor containing the wallet passphrase.
+        /// Protected channel holding the wallet passphrase: a file descriptor on Unix, a
+        /// handle value on Windows.
         #[arg(long)]
-        passphrase_fd: Option<i32>,
+        passphrase_fd: Option<i64>,
     },
     /// Unlock the local wallet.
     Unlock {
-        /// Protected file descriptor containing the wallet passphrase.
+        /// Protected channel holding the wallet passphrase: a file descriptor on Unix, a
+        /// handle value on Windows.
         #[arg(long)]
-        passphrase_fd: Option<i32>,
+        passphrase_fd: Option<i64>,
     },
     /// Lock the local wallet.
     Lock,
@@ -696,13 +709,38 @@ async fn main() -> Result<()> {
         Some(Action::Logs(options)) => logs(options).await,
         Some(Action::Service(options)) => crate::service::run(options).await,
         Some(Action::Update(options)) => crate::update::run(options).await,
+        Some(Action::DesktopNode(options)) => crate::desktop_node::run(options).await,
+        Some(Action::DesktopProfile { profile_dir }) => {
+            crate::desktop_node::prepare_profile(&profile_dir)?;
+            println!("{}", json!({"ok": true}));
+            Ok(())
+        }
     }
 }
 
 fn exec_core(args: &[&str]) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let error = Command::new(core_binary()?).args(args).exec();
-    Err(error).context("exec vibeface-core")
+    let binary = core_binary()?;
+    #[cfg(unix)]
+    {
+        Err(vibeface_bridge::platform::program::become_program(
+            &binary, args,
+        ))
+        .context("run vibeface-core")
+    }
+    #[cfg(windows)]
+    {
+        let mut child = std::process::Command::new(binary)
+            .args(args)
+            .arg("--desktop-parent-stdin")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("run vibeface-core")?;
+        // Child::wait closes child.stdin. Hold the writer separately so only CLI exit sends EOF.
+        let lifetime = child.stdin.take().context("Core lifetime pipe")?;
+        let status = child.wait().context("wait for vibeface-core");
+        drop(lifetime);
+        std::process::exit(status?.code().unwrap_or(1));
+    }
 }
 
 fn core_binary() -> Result<PathBuf> {
@@ -1130,29 +1168,48 @@ fn read_text_bounded(path: &Path, limit: u64) -> Result<Option<String>> {
     }
 }
 
-fn read_wallet_passphrase(fd: Option<i32>) -> Result<SecretString> {
-    use std::os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{FileTypeExt, MetadataExt},
-    };
+/// The value a caller would pass to `--passphrase-fd` to hand `file` over.
+#[cfg(test)]
+fn handed_over_reference(file: &fs::File) -> i64 {
+    #[cfg(unix)]
+    {
+        std::os::fd::AsRawFd::as_raw_fd(file) as i64
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::io::AsRawHandle::as_raw_handle(file) as i64
+    }
+}
+
+/// A file holding the same bytes as `path` that accounts other than this one can read.
+#[cfg(test)]
+fn widely_readable_file(path: &Path) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+        Ok(path.to_owned())
+    }
+    #[cfg(windows)]
+    {
+        // Windows carries access in a list that only its own calls can widen, so a file every
+        // account on the machine may read is borrowed from the system instead.
+        let _ = path;
+        let root = std::env::var_os("SystemRoot").context("SystemRoot is required")?;
+        let shared = PathBuf::from(root).join("System32\\drivers\\etc\\hosts");
+        ensure!(shared.is_file(), "a widely readable file is required");
+        Ok(shared)
+    }
+}
+
+fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
+    use vibeface_bridge::platform::secret;
     use zeroize::Zeroizing;
     let mut bytes = Zeroizing::new(Vec::new());
-    if let Some(fd) = fd {
-        ensure!(fd >= 0, "wallet passphrase descriptor is invalid");
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        ensure!(
-            duplicate >= 0,
-            "wallet passphrase descriptor cannot be read"
-        );
-        let file = unsafe { fs::File::from_raw_fd(duplicate) };
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o077 == 0
-                && (metadata.is_file() || metadata.file_type().is_fifo()),
-            "wallet passphrase descriptor must be an owner-only regular file or pipe"
-        );
-        file.take(1026).read_to_end(&mut bytes)?;
+    if let Some(reference) = handed_over {
+        let channel = secret::handed_over(reference)
+            .context("read the wallet passphrase the caller handed over")?;
+        channel.take(1026).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
         }
@@ -1160,54 +1217,20 @@ fn read_wallet_passphrase(fd: Option<i32>) -> Result<SecretString> {
             bytes.pop();
         }
     } else {
-        let mut terminal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
+        let mut console = secret::Console::open()
             .context("wallet passphrase requires a terminal or --passphrase-fd")?;
-        let mut previous = std::mem::MaybeUninit::<libc::termios>::uninit();
-        ensure!(
-            unsafe { libc::tcgetattr(terminal.as_raw_fd(), previous.as_mut_ptr()) } == 0,
-            "wallet terminal settings are unavailable"
-        );
-        let previous = unsafe { previous.assume_init() };
-        let mut hidden = previous;
-        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
-        ensure!(
-            unsafe { libc::tcsetattr(terminal.as_raw_fd(), libc::TCSAFLUSH, &hidden) } == 0,
-            "wallet terminal cannot disable echo"
-        );
-        struct RestoreEcho {
-            fd: i32,
-            previous: libc::termios,
-        }
-        impl Drop for RestoreEcho {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.previous);
-                }
-            }
-        }
-        let restore = RestoreEcho {
-            fd: terminal.as_raw_fd(),
-            previous,
-        };
-        terminal.write_all(b"Delivery wallet passphrase: ")?;
-        terminal.flush()?;
+        console.prompt("Delivery wallet passphrase: ")?;
         loop {
-            let mut byte = [0];
-            ensure!(
-                terminal.read(&mut byte)? == 1,
-                "wallet terminal closed before a passphrase was entered"
-            );
-            if matches!(byte[0], b'\n' | b'\r') {
+            let byte = console
+                .read_byte()?
+                .context("the terminal closed before a passphrase was entered")?;
+            if matches!(byte, b'\n' | b'\r') {
                 break;
             }
             ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
-            bytes.push(byte[0]);
+            bytes.push(byte);
         }
-        drop(restore);
-        terminal.write_all(b"\n")?;
+        console.prompt("\n")?;
     }
     ensure!(
         (12..=1024).contains(&bytes.len())
@@ -2138,41 +2161,25 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    let created = if let Ok(metadata) = fs::symlink_metadata(path) {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "private path is not a private directory"
         );
-        false
-    } else {
-        fs::create_dir_all(path)?;
-        true
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if created {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        }
+        return Ok(());
     }
-    Ok(())
+    fs::create_dir_all(path)?;
+    privatefs::restrict_dir(path)
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
+            privatefs::is_plain_file(&metadata),
             "private file path is not a regular file"
         );
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    let mut file = privatefs::create_or_truncate(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -2231,15 +2238,51 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    const TEST_PRIVATE_NODE: &str = if cfg!(windows) {
+        r"C:\vibeface\private\node"
+    } else {
+        "/private/node"
+    };
+    const TEST_DATA_NODE: &str = if cfg!(windows) {
+        r"C:\vibeface\data\node"
+    } else {
+        "/data/node"
+    };
+    const TEST_PRIVATE_NODE_WITH_SPACE: &str = if cfg!(windows) {
+        r"C:\vibeface\private\node data"
+    } else {
+        "/private/node data"
+    };
+    const TEST_APP_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\app"
+    } else {
+        "/app"
+    };
+    const TEST_ONE_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\one"
+    } else {
+        "/one"
+    };
+    const TEST_TWO_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\two"
+    } else {
+        "/two"
+    };
+    const TEST_BIN_PATH: &str = if cfg!(windows) {
+        r"C:\vibeface\bin\claude"
+    } else {
+        "/opt/bin/claude"
+    };
+
     #[test]
     fn tui_is_explicit_read_only_and_help_describes_every_command() {
         use clap::CommandFactory;
         let options =
-            Cli::try_parse_from(["vibeface", "tui", "--data-dir", "/private/node"]).unwrap();
+            Cli::try_parse_from(["vibeface", "tui", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         let Some(Action::Tui(options)) = options.command else {
             panic!("expected tui")
         };
-        assert_eq!(options.data_dir, Path::new("/private/node"));
+        assert_eq!(options.data_dir, Path::new(TEST_PRIVATE_NODE));
         assert!(Cli::try_parse_from(["vibeface", "tui", "--json"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "tui", "--data-dir", "relative"]).is_err());
         let command = Cli::command();
@@ -2331,29 +2374,21 @@ mod tests {
     }
 
     #[test]
-    fn wallet_passphrase_requires_a_protected_descriptor_and_cli_never_accepts_it_as_text()
+    fn wallet_passphrase_requires_a_protected_channel_and_cli_never_accepts_it_as_text()
     -> Result<()> {
-        use std::os::{
-            fd::AsRawFd,
-            unix::fs::{OpenOptionsExt, PermissionsExt},
-        };
         let dir =
             std::env::temp_dir().join(format!("vibeface-wallet-cli-{}", uuid::Uuid::new_v4()));
         private_dir(&dir)?;
         let path = dir.join("synthetic-passphrase");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(b"synthetic test passphrase\n")?;
-        drop(file);
-        let file = fs::File::open(&path)?;
-        read_wallet_passphrase(Some(file.as_raw_fd()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
-        let file = fs::File::open(&path)?;
-        assert!(read_wallet_passphrase(Some(file.as_raw_fd())).is_err());
+        private_write(&path, b"synthetic test passphrase\n")?;
+        read_wallet_passphrase(Some(handed_over_reference(&fs::File::open(&path)?)))?;
+        let readable_by_anyone = widely_readable_file(&path)?;
+        assert!(
+            read_wallet_passphrase(Some(handed_over_reference(&fs::File::open(
+                readable_by_anyone
+            )?)))
+            .is_err()
+        );
         let data_dir = dir.to_string_lossy();
         assert!(
             Cli::try_parse_from([
@@ -2413,10 +2448,8 @@ mod tests {
 
     #[test]
     fn data_directory_defaults_to_home_unless_named() {
-        assert_eq!(
-            data_dir_or_home(Some(PathBuf::from("/arg"))).unwrap(),
-            Path::new("/arg")
-        );
+        let named = std::env::temp_dir().join("named-node");
+        assert_eq!(data_dir_or_home(Some(named.clone())).unwrap(), named);
         assert!(data_dir_or_home(Some(PathBuf::from("relative"))).is_err());
         assert!(data_dir_or_home(Some(PathBuf::new())).is_err());
     }
@@ -2425,17 +2458,17 @@ mod tests {
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
-        let direct = Cli::try_parse_from(["vibeface", "--data-dir", "/private/node"]).unwrap();
+        let direct = Cli::try_parse_from(["vibeface", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         assert!(direct.command.is_none());
-        assert_eq!(direct.data_dir.unwrap(), Path::new("/private/node"));
+        assert_eq!(direct.data_dir.unwrap(), Path::new(TEST_PRIVATE_NODE));
         let explicit =
-            Cli::try_parse_from(["vibeface", "serve", "--data-dir", "/private/node"]).unwrap();
+            Cli::try_parse_from(["vibeface", "serve", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         let Some(Action::Serve(options)) = explicit.command else {
             panic!("expected serve")
         };
-        assert_eq!(options.data_dir, Path::new("/private/node"));
+        assert_eq!(options.data_dir, Path::new(TEST_PRIVATE_NODE));
         assert!(
-            Cli::try_parse_from(["vibeface", "--data-dir", "/data/node", "--no-web"])
+            Cli::try_parse_from(["vibeface", "--data-dir", TEST_DATA_NODE, "--no-web"])
                 .unwrap()
                 .no_web
         );
@@ -2443,24 +2476,24 @@ mod tests {
             "vibeface",
             "serve",
             "--data-dir",
-            "/data/node",
+            TEST_DATA_NODE,
             "--no-web",
             "--app-dir",
-            "/app",
+            TEST_APP_DIR,
         ])
         .unwrap();
         let Some(Action::Serve(options)) = explicit.command else {
             panic!("expected serve")
         };
-        assert!(options.no_web && options.app_dir.as_deref() == Some(Path::new("/app")));
+        assert!(options.no_web && options.app_dir.as_deref() == Some(Path::new(TEST_APP_DIR)));
         assert!(
             Cli::try_parse_from([
                 "vibeface",
                 "--data-dir",
-                "/one",
+                TEST_ONE_DIR,
                 "serve",
                 "--data-dir",
-                "/two"
+                TEST_TWO_DIR
             ])
             .is_err()
         );
@@ -2479,7 +2512,7 @@ mod tests {
                 "--name",
                 "Build Node",
                 "--data-dir",
-                "/data/node"
+                TEST_DATA_NODE
             ])
             .is_ok()
         );
@@ -2489,17 +2522,23 @@ mod tests {
                 "join",
                 "https://node.example/join#vibeface1abc",
                 "--data-dir",
-                "/data/node"
+                TEST_DATA_NODE
             ])
             .is_err()
         );
         assert!(
-            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
+            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", TEST_DATA_NODE])
                 .is_ok()
         );
         assert!(
-            Cli::try_parse_from(["vibeface", "access", "--enable", "--data-dir", "/data/node"])
-                .is_ok()
+            Cli::try_parse_from([
+                "vibeface",
+                "access",
+                "--enable",
+                "--data-dir",
+                TEST_DATA_NODE
+            ])
+            .is_ok()
         );
         assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
@@ -2519,7 +2558,7 @@ mod tests {
                     "service",
                     action,
                     "--data-dir",
-                    "/private/node data"
+                    TEST_PRIVATE_NODE_WITH_SPACE
                 ])
                 .is_ok()
             );
@@ -2529,7 +2568,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--relay",
                 "https://relay.test",
                 "--relay-listen",
@@ -2544,7 +2583,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--manager",
                 "cursor",
                 "--workspace",
@@ -2559,7 +2598,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--manager",
                 "cursor_sdk",
                 "--workspace",
@@ -2572,9 +2611,9 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--bin",
-                "/opt/bin/claude"
+                TEST_BIN_PATH
             ])
             .is_err()
         );

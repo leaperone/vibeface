@@ -1,6 +1,6 @@
 [package]
 name = "vibeface-core"
-version = "0.0.1-nightly.20261107.1"
+version = "0.0.1-nightly.20261108.1"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -25,6 +25,7 @@ iroh.workspace = true
 iroh-dns = "=1.3.0"
 iroh-relay.workspace = true
 mdns-sd = { version = "=0.21.6", default-features = false, features = ["async"] }
+plist = "1.10"
 rand.workspace = true
 reqwest.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
@@ -43,5 +44,6 @@ vibeface-protocol.workspace = true
 vibeface-bridge.workspace = true
 vibeface-control.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
+vibeface-secure-ffi = { path = "../../crates/secure-ffi" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }

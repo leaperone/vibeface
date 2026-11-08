@@ -48,7 +48,9 @@ PATH_RULES = (
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
-    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
+    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py",
+              "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py",
+              "scripts/verify-windows-node.py")),
     ("control", ("crates/control/*",)),
     ("cli", ("apps/cli/*",)),
 )
@@ -61,9 +63,12 @@ PLATFORMS = (
     {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "key": "linux"},
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "key": "linux-arm"},
     {"runner": "macos-15", "target": "aarch64-apple-darwin", "key": "macos"},
+    {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc", "key": "windows"},
 )
-PLATFORM_JOBS = tuple(f"{kind}-{platform['key']}" for kind in ("native", "package") for platform in PLATFORMS)
+PLATFORM_JOBS = tuple(f"{kind}-{platform['key']}" for kind in ("native", "package") for platform in PLATFORMS if kind == "package" or platform["key"] != "windows")
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", *PLATFORM_JOBS, "npm-package", "npm-smoke", "www")
+# Only an explicit dispatch runs the hosted Windows and desktop application checks.
+DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
@@ -145,7 +150,8 @@ def scope_plan(scopes, event, ref_type, channel):
     required = {"quick-check"}
     if web:
         required.update(("crypto-web", "web"))
-        required.update(f"{kind}-{platform['key']}" for platform in platforms for kind in ("native", "package"))
+        required.update(f"{kind}-{platform['key']}" for platform in platforms for kind in ("native", "package")
+                        if kind == "package" or platform["key"] != "windows")
     if packages:
         required.update(("rust-check", "rust-fast"))
     if slow:
@@ -345,7 +351,7 @@ def frozen_plan(plan):
     return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"])
 
 
-def gate(needs, plan=None, delivery_live=False):
+def gate(needs, plan=None, delivery_live=False, desktop=False):
     if needs.get("plan", {}).get("result") != "success":
         raise ValueError("CI plan did not succeed")
     if plan is None:
@@ -361,16 +367,23 @@ def gate(needs, plan=None, delivery_live=False):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     if delivery_live and plan["event"] != "workflow_dispatch":
         raise ValueError("Live delivery proofs require explicit workflow_dispatch")
-    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else [])
+    if desktop and plan["event"] != "workflow_dispatch":
+        raise ValueError("Windows native and desktop application checks require explicit workflow_dispatch")
+    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else []) + (DESKTOP_JOBS if desktop else [])
     failed = [job for job in required if needs.get(job, {}).get("result") != "success"]
-    failed.extend(job for job in (*JOBS, "delivery-live") if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
+    failed.extend(job for job in (*JOBS, "delivery-live", *DESKTOP_JOBS)
+                  if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
     if failed:
         raise ValueError(f"Required CI checks did not succeed: {', '.join(failed)}")
     print(f"CI gate passed: {', '.join(required)}")
 
 
-def mobile_gate(needs, android_only):
-    required = ["android"] if android_only else ["android", "ios-build", "ios-accept"]
+def mobile_gate(needs, android_only, platforms="all"):
+    if platforms not in {"all", "android", "ios"}:
+        raise ValueError("Invalid mobile platform selection")
+    required = ["android"] if android_only or platforms != "ios" else []
+    if not android_only and platforms != "android":
+        required.extend(("ios-build", "ios-accept"))
     if (any(needs.get(job, {}).get("result") != "success" for job in required)
             or any(job.get("result") in {"failure", "cancelled"} for job in needs.values())):
         raise ValueError("Selected mobile jobs did not all succeed")
@@ -409,7 +422,7 @@ def run_test(packages, tier):
         command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
-        command = ["cargo", "test", "--locked", *selected, "--", *skips]
+        command = ["cargo", "test", "--locked", "--no-fail-fast", *selected, "--", *skips]
     subprocess.run(command, check=True)
 
 
@@ -496,6 +509,19 @@ def self_test():
     mobile = {job: {"result": "success"} for job in ("android", "ios-build", "ios-accept")}
     mobile_gate(mobile, False)
     mobile_gate({"android": {"result": "success"}, "ios-build": {"result": "skipped"}, "ios-accept": {"result": "skipped"}}, True)
+    for platforms, required in (("android", {"android"}), ("ios", {"ios-build", "ios-accept"})):
+        selected = {job: {"result": "success" if job in required else "skipped"} for job in mobile}
+        mobile_gate(selected, False, platforms)
+        for job in mobile:
+            for result in ("failure", "cancelled", "skipped", "missing"):
+                changed = dict(selected, **{job: {"result": result}})
+                if job in required or result in {"failure", "cancelled"}:
+                    expect_failure(lambda: mobile_gate(changed, False, platforms))
+                else:
+                    mobile_gate(changed, False, platforms)
+        for job in required:
+            expect_failure(lambda: mobile_gate({key: value for key, value in selected.items() if key != job}, False, platforms))
+    expect_failure(lambda: mobile_gate(mobile, False, "invalid"))
     for job in mobile:
         for result in ("failure", "cancelled", "skipped", "missing"):
             expect_failure(lambda: mobile_gate(dict(mobile, **{job: {"result": result}}), False))
@@ -520,7 +546,8 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py"):
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py",
+                 "apps/desktop/electron-builder.cjs", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
@@ -641,6 +668,24 @@ def self_test():
         broken["delivery-live"] = {"result": result}
         expect_failure(lambda: gate(broken, delivery_live=True))
     expect_failure(lambda: gate(needs, delivery_live=True))
+    expect_failure(lambda: gate(complete, desktop=True))
+    for job in DESKTOP_JOBS:
+        complete[job] = {"result": "success"}
+    gate(complete, desktop=True)
+    gate(complete)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        for job in DESKTOP_JOBS:
+            broken = json.loads(json.dumps(complete))
+            broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, desktop=True))
+            # Without the dispatch input a skipped desktop job is expected, but a failed one still fails the gate.
+            if result in {"failure", "cancelled"}:
+                expect_failure(lambda: gate(broken))
+            else:
+                gate(broken)
+    expect_failure(lambda: gate(needs, desktop=True))
+    for job in DESKTOP_JOBS:
+        del complete[job]
     delivery_plan = make_plan(["crates/delivery/proof/fixtures/manifest.json"])
     delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
     delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
@@ -726,8 +771,9 @@ def self_test():
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
     assert "github.run_attempt == 1 && (github.event_name == 'push' && github.ref == 'refs/heads/main'" in concurrency
-    for condition in ("inputs.feedback", "!inputs.delivery_live", "!inputs.delivery_small", "inputs.delivery_small_resume_run == ''"):
-        assert concurrency.count(condition) == 2
+    for condition in ("inputs.feedback", "!inputs.delivery_live", "!inputs.delivery_small", "inputs.delivery_small_resume_run == ''",
+                      "!inputs.desktop_only", "!inputs.windows_only", "inputs.mobile_apps == 'none'", "!inputs.desktop", "inputs.windows_package_run == ''"):
+        assert len(re.findall(re.escape(condition) + r"(?![A-Za-z0-9_])", concurrency)) == 2
     assert "feedback:\n" in workflow and "default: false" in workflow.split("feedback:\n", 1)[1].split("delivery_live:", 1)[0]
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
     for job in ("rust-check", "rust-fast", "rust-slow"):
@@ -737,6 +783,14 @@ def self_test():
         assert "actions/download-artifact@" not in block
     for platform in PLATFORMS:
         key, target, runner = (platform[field] for field in ("key", "target", "runner"))
+        if key == "windows":
+            block = re.search(r"(?ms)^  package-windows:\n(.*?)(?=^  [a-z]|\Z)", workflow)[1]
+            assert f"name: package ({target})" in block and f"runs-on: {runner}" in block
+            assert "needs: [plan, crypto-web, web]" in block and "scripts/package-node-windows.py" in block
+            assert f"name: node-package-{target}-${{{{ github.sha }}}}" in block
+            assert "artifact_id: ${{ steps.upload.outputs.artifact-id }}" in block
+            assert "package-windows" in ready["required_jobs"] and "native-windows" not in ready["required_jobs"]
+            continue
         for kind in ("native", "package"):
             block = re.search(rf"(?ms)^  {kind}-{key}:\n(.*?)(?=^  [a-z]|\Z)", workflow)[1]
             dependency = "plan" if kind == "native" else f"[plan, native-{key}, crypto-web, web]"
@@ -757,10 +811,25 @@ def self_test():
     accept = mobile_workflow.split("  ios-accept:\n", 1)[1].split("  mobile-gate:\n", 1)[0]
     assert "seal ios" in build and "restore ios" in accept
     assert "workspaces: |\n            . -> target\n            . -> .artifacts/native/target" in build
-    assert "xcodebuild" not in accept and "cargo build" not in accept and "build-web.sh" not in accept
+    assert not re.search(r"^\s+xcodebuild(?:\s|$)", accept, re.M) and "cargo build" not in accept and "build-web.sh" not in accept
     assert "nativeInvitation" not in build and "simctl\", \"create" not in build
     assert "artifact-ids: ${{ needs.ios-build.outputs.artifact_id }}" in accept and "needs.ios-build.outputs.producer_attempt" in accept
-    for text in (workflow, package, mobile_workflow):
+    assert "simslim" not in mobile_workflow and "actions/setup-go@" not in mobile_workflow
+    assert "inputs.platforms != 'android'" in build and "inputs.platforms != 'ios'" in mobile_workflow
+    assert "--platforms" in mobile_workflow
+    assert "Prepare the task simulator's XCTest runner" in accept and "safe_actor_census" in accept
+    for name in ("desktop-macos", "desktop-windows", "windows-native"):
+        block = re.search(rf"(?ms)^  {name}:\n(.*?)(?=^  [a-z]|\Z)", workflow)[1]
+        key = "macos" if name == "desktop-macos" else "windows"
+        assert f"needs: [plan, package-{key}]" in block
+        assert f"package_artifact_id: ${{{{ needs.package-{key}.outputs.artifact_id }}}}" in block
+    desktop = (root / ".github/workflows/ci-desktop.yml").read_text()
+    windows = (root / ".github/workflows/ci-windows-native.yml").read_text()
+    assert "name: crypto-web-" not in desktop and "name: web-" not in desktop
+    assert "artifact-ids: ${{ inputs.package_artifact_id }}" in desktop
+    assert "artifact-ids: ${{ inputs.package_artifact_id }}" in windows
+    assert "artifact-ids: ${{ steps.select.outputs.package_artifact_id }}" in windows
+    for text in (workflow, package, mobile_workflow, desktop, windows):
         lines = text.splitlines()
         for index, line in enumerate(lines):
             if "artifact-ids:" in line:
@@ -919,7 +988,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/package.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -1066,12 +1135,14 @@ def main():
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)
     final_gate.add_argument("--delivery-live", action="store_true", help="also require the explicitly dispatched live proof job")
+    final_gate.add_argument("--desktop", action="store_true", help="also require the explicitly dispatched Windows native and desktop jobs")
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
     mobile = commands.add_parser("mobile-gate")
     mobile.add_argument("--needs-env", required=True)
     mobile.add_argument("--android-only", action="store_true")
+    mobile.add_argument("--platforms", choices=("all", "android", "ios"), default="all")
     for name in ("test", "check"):
         command = commands.add_parser(name)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -1095,9 +1166,10 @@ def main():
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
-        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live)
+        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live,
+             desktop=args.desktop)
     elif args.command == "mobile-gate":
-        mobile_gate(json.loads(os.environ[args.needs_env]), args.android_only)
+        mobile_gate(json.loads(os.environ[args.needs_env]), args.android_only, args.platforms)
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":

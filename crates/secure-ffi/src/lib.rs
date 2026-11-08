@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use vibeface_secure as secure;
 
-mod lan;
+pub mod lan;
 
 uniffi::setup_scaffolding!();
 
@@ -23,7 +23,7 @@ impl From<secure::Error> for SecureError {
     }
 }
 
-type Result<T> = std::result::Result<T, SecureError>;
+pub type Result<T> = std::result::Result<T, SecureError>;
 
 fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state.lock().expect("secure state poisoned")

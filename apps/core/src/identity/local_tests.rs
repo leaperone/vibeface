@@ -3,7 +3,7 @@ use crate::{
     crypto::LocalIdentity,
     identity::{Genesis, Member},
 };
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs, path::PathBuf};
 use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
 
 struct Fixture {
@@ -22,7 +22,7 @@ impl Drop for Fixture {
 fn fixture() -> Result<Fixture> {
     let dir = std::env::temp_dir().join(format!("vibeface-identity-tests-{}", random_hex(8)));
     fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    vibeface_bridge::platform::privatefs::restrict_dir(&dir)?;
     let store = Store::open(dir.join("node.sqlite3"))?;
     let root = LocalIdentity::generate();
     let admin = LocalIdentity::generate();
@@ -290,7 +290,7 @@ fn only_the_joining_device_withdraws_and_a_withdrawn_request_cannot_be_approved(
 fn bootstrap_capability_is_one_time_and_requires_a_manager_session() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("vibeface-bootstrap-{}", random_hex(8)));
     fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    vibeface_bridge::platform::privatefs::restrict_dir(&dir)?;
     let store = Store::open(dir.join("node.sqlite3"))?;
     let capability = store.bootstrap_capability()?;
     assert!(store.bootstrap_capability().is_err());
@@ -322,6 +322,7 @@ fn bootstrap_capability_is_one_time_and_requires_a_manager_session() -> Result<(
             .bootstrap_network(state, &capability.capability, &admin.device_id()?)
             .is_err()
     );
+    drop(store);
     fs::remove_dir_all(dir)?;
     Ok(())
 }

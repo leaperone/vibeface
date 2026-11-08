@@ -35,6 +35,11 @@ pub enum ControlRequest {
     Inspect {
         data_dir: PathBuf,
     },
+    DiscoverLocalNodes {
+        app_profile_dir: PathBuf,
+        #[serde(default)]
+        remembered_data_dirs: Vec<PathBuf>,
+    },
     Access {
         data_dir: PathBuf,
         json: bool,
@@ -232,34 +237,102 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 pub mod agent;
 pub mod maintenance;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn discover_local_nodes_control_request_has_a_strict_wire_shape() -> Result<()> {
+        let request = ControlRequest::DiscoverLocalNodes {
+            app_profile_dir: PathBuf::from("/controlled/profile"),
+            remembered_data_dirs: vec![PathBuf::from("/controlled/node")],
+        };
+        assert_eq!(
+            serde_json::to_value(request)?,
+            serde_json::json!({
+                "command":"discover_local_nodes",
+                "app_profile_dir":"/controlled/profile",
+                "remembered_data_dirs":["/controlled/node"]
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn oversized_file() -> Result<PathBuf> {
+        let path =
+            std::env::temp_dir().join(format!("vibeface-control-bulk-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, vec![b'.'; MAX_CONTROL_PACKET + 1])?;
+        Ok(path)
+    }
+
+    #[cfg(windows)]
+    fn fixture(name: &str, body: &str) -> Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "vibeface-control-{name}-{}.cmd",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, format!("@echo off\r\n{body}"))?;
+        Ok(path)
+    }
+
+    /// A child that stays alive after closing its streams, used to reach the wait deadline.
+    fn lingering_child() -> Result<tokio::process::Child> {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(unix)]
+        command.args(["-c", "exec sleep 1"]);
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        // `waitfor` returns once its deadline passes, with no signal ever sent.
+        #[cfg(windows)]
+        command.args(["/c", "waitfor /t 1 vibeface-control-test"]);
+        Ok(command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+
     #[tokio::test]
     async fn control_client_bounds_child_output_before_waiting_for_exit() -> Result<()> {
+        #[cfg(unix)]
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/control-oversized-output.sh");
+        #[cfg(windows)]
+        let bulk = oversized_file()?;
+        #[cfg(windows)]
+        let path = fixture("output", &format!("type \"{}\"\r\n", bulk.display()))?;
         let error = request(
             &path,
             &ControlRequest::Inspect {
-                data_dir: "/tmp/vibeface-control-test".into(),
+                data_dir: std::env::temp_dir().join("vibeface-control-test"),
             },
         )
         .await
         .expect_err("oversized child output must be rejected");
         assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(path)?;
+            std::fs::remove_file(bulk)?;
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn control_client_rejects_ok_response_from_nonzero_child() -> Result<()> {
+        #[cfg(unix)]
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/control-nonzero-response.sh");
+        #[cfg(windows)]
+        let path = fixture(
+            "status",
+            "more > nul\r\necho {\"ok\":true,\"result\":{}}\r\nexit /b 7\r\n",
+        )?;
         let error = request(
             &path,
             &ControlRequest::Inspect {
-                data_dir: "/tmp/vibeface-control-test".into(),
+                data_dir: std::env::temp_dir().join("vibeface-control-test"),
             },
         )
         .await
@@ -268,16 +341,14 @@ mod tests {
             error.to_string().contains("core control process failed"),
             "{error:#}"
         );
+        #[cfg(windows)]
+        std::fs::remove_file(path)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn control_client_bounds_a_child_that_closes_streams_but_keeps_running() -> Result<()> {
-        let mut child = Command::new("sh")
-            .args(["-c", "exec sleep 1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = lingering_child()?;
         let error = wait_for_exit(&mut child, Some(Duration::from_millis(20)))
             .await
             .expect_err("a hanging child must hit the wait deadline");

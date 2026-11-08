@@ -248,19 +248,22 @@ impl Runtime {
             // re-signs the address record at once instead of at its next tick.
             let mut states = net.bootstrap().subscribe();
             let node = Arc::downgrade(self);
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 while states.changed().await.is_ok() {
                     let Some(node) = node.upgrade() else { break };
                     node.wake_sync_all();
                 }
-            });
+            })?;
         }
         let node = self.clone();
-        tokio::spawn(async move { node.sync_loop().await });
+        self.background_tasks
+            .spawn(async move { node.sync_loop().await })?;
         let node = self.clone();
-        tokio::spawn(async move { node.have_loop().await });
+        self.background_tasks
+            .spawn(async move { node.have_loop().await })?;
         let node = self.clone();
-        tokio::spawn(async move { node.outbox_loop().await });
+        self.background_tasks
+            .spawn(async move { node.outbox_loop().await })?;
         Ok(())
     }
 
@@ -467,7 +470,7 @@ impl Runtime {
     fn close_when_removed(self: &Arc<Self>, connection: Connection, remote: String) {
         let node = Arc::downgrade(self);
         let mut membership = self.membership.subscribe();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = connection.closed() => return,
@@ -480,7 +483,9 @@ impl Runtime {
                     }
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "membership watcher skipped while the Node is shutting down");
+        }
     }
 
     /// A request to another member Node over `vibeface/rpc/1`.
@@ -802,7 +807,8 @@ impl Runtime {
                 }
                 let node = self.clone();
                 let network = network.clone();
-                tokio::spawn(async move {
+                let tracked_peer = peer.clone();
+                if let Err(error) = self.background_tasks.spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
                     let (rerun, presence_changed) = {
                         let mut states = node.sync_peers.lock().expect("sync peers");
@@ -841,7 +847,9 @@ impl Runtime {
                     if rerun {
                         node.sync_wakeup.notify_one();
                     }
-                });
+                }) {
+                    tracing::debug!(%tracked_peer, %error, "peer sync was not started while the Node is shutting down");
+                }
             }
         }
     }
@@ -1375,14 +1383,17 @@ impl Runtime {
                     && view.cutoff(&member.device_id).is_none()
             }) {
                 let (net, peer, have) = (net.clone(), member.device_id.clone(), have.clone());
-                tokio::spawn(async move {
+                let tracked_peer = peer.clone();
+                if let Err(error) = self.background_tasks.spawn(async move {
                     if let Err(error) = net
                         .request(&peer, net::SYNC, &have, Duration::from_secs(10))
                         .await
                     {
                         tracing::debug!(%peer, %error, "have notice not delivered; Hello covers it");
                     }
-                });
+                }) {
+                    tracing::debug!(%tracked_peer, %error, "have notice skipped while the Node is shutting down");
+                }
             }
         }
     }
@@ -1430,7 +1441,7 @@ impl Runtime {
     pub(crate) fn join_changed(self: &Arc<Self>, network: &str) {
         self.publish_reread(network);
         let (node, network) = (self.clone(), network.to_owned());
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             let Ok((_, peers)) = node.member_peers().await else {
                 return;
             };
@@ -1455,7 +1466,9 @@ impl Runtime {
                 tokio::time::sleep(JOIN_NOTICE_WAIT).await;
                 notify(missed, PEER_TIMEOUT).await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "join notice skipped while the Node is shutting down");
+        }
     }
 
     /// An approval step for a join held elsewhere goes to the Node that holds it.
@@ -1744,7 +1757,7 @@ impl Runtime {
             }
             if let Some(guard) = self.peer_delivery_locks.try_lock("reconcile_works") {
                 let (node, network) = (self.clone(), network.to_owned());
-                tokio::spawn(async move {
+                if let Err(error) = self.background_tasks.spawn(async move {
                     let _guard = guard;
                     if let Err(error) = node.reconcile_works(&network).await {
                         tracing::debug!(%error, "work reconciliation pending");
@@ -1752,7 +1765,9 @@ impl Runtime {
                     if let Err(error) = node.reconcile_checks(&network).await {
                         tracing::debug!(%error, "pending check reconciliation pending");
                     }
-                });
+                }) {
+                    tracing::debug!(%error, "work reconciliation stopped");
+                }
             }
         }
     }
@@ -1796,7 +1811,7 @@ impl Runtime {
             };
             entries.sort_by_key(|(sequence, _)| *sequence);
             let (node, network) = (self.clone(), network.clone());
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let _guard = guard;
                 let mut progressed = false;
                 for (_, entry) in entries {
@@ -1812,7 +1827,7 @@ impl Runtime {
                 if progressed {
                     node.outbox_wakeup.notify_one();
                 }
-            });
+            })?;
         }
         Ok(())
     }
@@ -2008,7 +2023,7 @@ impl Runtime {
                 continue;
             };
             let (node, network) = (self.clone(), network.to_owned());
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let _guard = guard;
                 let mut drained = false;
                 let mut progressed = false;
@@ -2039,7 +2054,7 @@ impl Runtime {
                 if drained && progressed {
                     node.outbox_wakeup.notify_one();
                 }
-            });
+            })?;
         }
         Ok(())
     }
@@ -2117,7 +2132,8 @@ impl Runtime {
     async fn serve_blobs(self: Arc<Self>, connection: Connection, network: String, remote: String) {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let (node, network, remote) = (self.clone(), network.clone(), remote.clone());
-            tokio::spawn(async move {
+            let tracked_remote = remote.clone();
+            if let Err(error) = self.background_tasks.spawn(async move {
                 if let Err(error) = node
                     .send_blob(&network, &remote, &mut send, &mut recv)
                     .await
@@ -2127,7 +2143,9 @@ impl Runtime {
                 }
                 send.finish().ok();
                 let _ = send.stopped().await;
-            });
+            }) {
+                tracing::debug!(%tracked_remote, %error, "blob transfer skipped while the Node is shutting down");
+            }
         }
     }
 
@@ -2398,6 +2416,169 @@ mod tests {
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
+    #[tokio::test]
+    async fn shutdown_releases_runtime_with_an_active_peer_sync_job() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let peer = ib.device_id()?;
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, peer.clone()])?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            first_sync(&a, &peer).await?;
+            ensure!(
+                a.sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .get(&peer)
+                    .is_some_and(|sync| sync.synced_ms.is_some()),
+                "the peer sync completed before shutdown"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        let weak = Arc::downgrade(&a);
+        a.stop_network().await;
+        a.shutdown().await;
+        a.shutdown().await;
+        b.shutdown().await;
+        drop(a);
+        drop(b);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown releases active peer loop owners"
+        );
+        std::fs::remove_dir_all(&dir_a).with_context(|| {
+            format!(
+                "remove first active-peer fixture directory {}",
+                dir_a.display()
+            )
+        })?;
+        std::fs::remove_dir_all(&dir_b).with_context(|| {
+            format!(
+                "remove second active-peer fixture directory {}",
+                dir_b.display()
+            )
+        })?;
+        result
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_runtime_after_controlled_writer_start() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let (node, dir) = node(&identity).await?;
+        assert!(
+            node.manager().is_none(),
+            "fixture has no configured Provider"
+        );
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.start_writers(receiver);
+        let weak = Arc::downgrade(&node);
+
+        node.shutdown().await;
+        node.shutdown().await;
+        drop(node);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown releases all Runtime writer workers"
+        );
+        drop(events);
+        let reopened = Runtime::open(&dir)
+            .await
+            .context("reopen a fixture after all Runtime writer workers stopped")?;
+        reopened.shutdown().await;
+        drop(reopened);
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove writer-start fixture directory {}", dir.display()))?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_joins_a_queued_peer_command_worker_and_reopens_the_data_dir() -> Result<()> {
+        let (sender, owner) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, owner_id) = (sender.device_id()?, owner.device_id()?);
+        let network = sender.fixture_network_id()?;
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), owner_id.clone()])?;
+        let (node, dir) = node(&owner).await?;
+        let weak = Arc::downgrade(&node);
+        let result = async {
+            node.install_membership(state).await?;
+            {
+                let mut store = node.store.lock().await;
+                let grant = sender.owner_fixture(&network, "c", &owner_id)?;
+                store.create_conversation(
+                    &sender,
+                    &network,
+                    "c",
+                    "peer shutdown",
+                    grant,
+                    now_ms(),
+                )?;
+                store.append_event(
+                    &sender,
+                    &network,
+                    "c",
+                    posted(&sender, &network, "c", "peer-shutdown-input")?,
+                    vec![],
+                    now_ms(),
+                )?;
+                store.accept_message(
+                    &sender,
+                    &network,
+                    "c",
+                    "peer-shutdown-input",
+                    "peer-shutdown-input",
+                    vec![],
+                    true,
+                    user(&sender, &network, "peer-shutdown-input")?,
+                    now_ms(),
+                )?;
+                let command =
+                    store.peer_delivery_command(&network, "c", "message:peer-shutdown-input")?;
+                store.save_peer_command(&network, &sender_id, &command.envelope, now_ms())?;
+            }
+            let owners_before = Arc::strong_count(&node);
+            node.drive_peer_commands(&network).await?;
+            let store_guard = node
+                .store
+                .clone()
+                .try_lock_owned()
+                .context("hold Store before the queued peer lane polls")?;
+            tokio::task::yield_now().await;
+            assert!(
+                Arc::strong_count(&node) > owners_before,
+                "queued peer command worker retains the Runtime until shutdown joins it"
+            );
+            node.shutdown().await;
+            drop(store_guard);
+            anyhow::Ok(())
+        }
+        .await;
+        drop(node);
+        ensure!(
+            weak.upgrade().is_none(),
+            "shutdown must join the queued peer command worker"
+        );
+        let reopened = Runtime::open(&dir)
+            .await
+            .context("reopen fixture after peer command worker shutdown")?;
+        reopened.shutdown().await;
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).with_context(|| {
+            format!(
+                "remove peer command shutdown fixture directory {}",
+                dir.display()
+            )
+        })?;
+        result
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn peer_delivery_locks_serialize_same_target_and_allow_other_scopes() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2610,7 +2791,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await;
+        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
         result
     }
 
@@ -2659,6 +2840,7 @@ mod tests {
             for node in [&a, &r] { node.start_network().await?; }
             a.net()?.learn(&r.net()?.addr()).await;
             r.net()?.learn(&a.net()?.addr()).await;
+            ready_member_rpc(&a, &network, &request_node_id).await?;
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let answer = a.peer_request(&network, &request_node_id, json!({"type":"deliver","command":command.envelope})).await?;
@@ -2672,8 +2854,7 @@ mod tests {
             assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             anyhow::Ok(())
         }.await;
-        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await;
-        result
+        finish_nodes(result, vec![(a, dir_a), (r, dir_r)]).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3050,7 +3231,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await;
+        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
         result
     }
 
@@ -3439,14 +3620,89 @@ mod tests {
         now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - 1_000
     }
 
-    async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) {
+    async fn ready_member_rpc(node: &Runtime, network: &str, peer: &str) -> Result<()> {
+        // SYNC/BLOB traffic does not establish the separately cached RPC connection.
+        // An empty address exchange only reads member metadata and does not sync inputs.
+        let reply = node
+            .peer_request(network, peer, json!({"type":"addresses","records":[]}))
+            .await
+            .context("member RPC is ready before timing delivery")?;
+        ensure!(
+            reply["records"].is_array(),
+            "member RPC returns address records"
+        );
+        Ok(())
+    }
+
+    async fn finish_nodes(result: Result<()>, nodes: Vec<(Arc<Runtime>, PathBuf)>) -> Result<()> {
+        match (result, stop_nodes(nodes).await) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("peer fixture cleanup also failed: {cleanup:#}")))
+            }
+            (Ok(()), result) | (result, Ok(())) => result,
+        }
+    }
+
+    async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) -> Result<()> {
         for (node, _) in &nodes {
-            node.stop_network().await;
+            node.shutdown().await;
         }
+        let mut cleanup_errors = Vec::new();
         for (node, dir) in nodes {
+            let weak = Arc::downgrade(&node);
             drop(node);
-            let _ = std::fs::remove_dir_all(dir);
+            if weak.upgrade().is_some() {
+                cleanup_errors.push(anyhow::anyhow!(
+                    "shutdown left a strong Runtime owner for {}",
+                    dir.display()
+                ));
+            } else if let Err(error) = std::fs::remove_dir_all(&dir) {
+                cleanup_errors.push(anyhow::anyhow!(
+                    "remove peer Node fixture directory {}: {error:#}",
+                    dir.display()
+                ));
+            }
         }
+        if !cleanup_errors.is_empty() {
+            let details = cleanup_errors
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("peer fixture cleanup failed: {details}");
+        }
+        Ok(())
+    }
+
+    fn remove_directory(path: &Path) -> Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        vibeface_bridge::platform::privatefs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "node.lock" {
+                continue;
+            }
+            let from = entry.path();
+            let to = destination.join(name);
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                copy_snapshot(&from, &to)?;
+            } else if kind.is_file() {
+                std::fs::copy(&from, &to)?;
+                vibeface_bridge::platform::privatefs::restrict_file(&to)?;
+            } else {
+                anyhow::bail!("unexpected entry in Node data snapshot: {}", from.display());
+            }
+        }
+        Ok(())
     }
 
     /// A Node that slept through the wait puts the recovery in effect by the wall clock; the
@@ -3497,7 +3753,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3563,7 +3819,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(nodes).await;
+        stop_nodes(nodes).await?;
         result
     }
 
@@ -3606,7 +3862,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3656,7 +3912,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -4255,7 +4511,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -4358,7 +4614,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -4401,34 +4657,33 @@ mod tests {
             listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)
         }
         .await;
+        let identity = std::fs::read(dir_a.join("identity.json"))?;
         a.shutdown().await;
-        b.stop_network().await;
-        // Background tasks still hold the stopped Runtime and its directory lock; a copy of the
-        // directory is what the next process would open.
+        b.shutdown().await;
+        drop(a);
+        drop(b);
+        // Copy the closed data directory as a fresh process would receive it. The OS lock file
+        // belongs to the old process and is intentionally not part of the snapshot.
         let copy = dir_a.with_extension("restarted");
         let result = async {
             let online = online?;
             assert_eq!(online["capabilities"]["manager"], "cursor");
-            std::process::Command::new("cp")
-                .arg("-R")
-                .args([&dir_a, &copy])
-                .status()?
-                .success()
-                .then_some(())
-                .context("copy the data directory")?;
-            std::fs::remove_file(copy.join("node.lock"))?;
+            copy_snapshot(&dir_a, &copy).context("copy the data directory")?;
+            assert_eq!(std::fs::read(copy.join("identity.json"))?, identity);
             let again = Arc::new(Runtime::open(&copy).await?);
             again.start_network().await?;
             let nodes = again.rpc(access.clone(), json!({"method":"nodes"})).await;
-            again.stop_network().await;
+            again.shutdown().await;
+            drop(again);
             let offline = listed(nodes?)?;
             assert_eq!(offline["online"], false);
             assert_eq!(offline["capabilities"], online["capabilities"]);
             anyhow::Ok(())
         }
         .await;
-        let _ = std::fs::remove_dir_all(copy);
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        remove_directory(&copy)?;
+        std::fs::remove_dir_all(dir_a)?;
+        std::fs::remove_dir_all(dir_b)?;
         result
     }
 
@@ -4514,6 +4769,7 @@ mod tests {
             );
             a.sync_peer(&network, &ib.device_id()?).await?;
 
+            ready_member_rpc(&b, &network, &peer_a).await?;
             b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
                 user(&ia, &network, "m4")?, now_ms())?;
             assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
@@ -4523,7 +4779,18 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 anyhow::Ok(())
-            }).await.context("owner returns the stored delivery receipt")??;
+            }).await.with_context(|| {
+                let sender = b.store.try_lock().ok().and_then(|store|
+                    store.mailbox_for_test(&network, "c", "message:m4").ok().flatten());
+                let owner = a.store.try_lock().ok().map(|store| (
+                    store.message(&network, "c", "m4").ok().map(|message| message.is_some()),
+                    store.scheduler_job("c", "message:m4").ok().map(|job| job.is_some()),
+                ));
+                format!("owner returns the stored delivery receipt: sender_state={:?}, attempts={:?}, next_attempt_in_ms={:?}, owner_has_message_and_job={owner:?}",
+                    sender.as_ref().map(|record| record.state),
+                    sender.as_ref().map(|record| record.attempts),
+                    sender.as_ref().map(|record| record.next_attempt_ms.saturating_sub(now_ms()).max(0)))
+            })??;
             let trigger = crate::scheduling::message_trigger("m4");
             assert_eq!(
                 b.store
@@ -4568,14 +4835,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        for node in [&a, &b, &outsider] {
-            node.stop_network().await;
-        }
-        drop((a, b, outsider));
-        for dir in [dir_a, dir_b, dir_c] {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        result
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b), (outsider, dir_c)]).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4960,7 +5220,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b), (x, dir_x)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b), (x, dir_x)]).await?;
         result
     }
 
@@ -5026,7 +5286,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -5045,11 +5305,11 @@ mod tests {
         let (l, dir_l) = node(&il).await?;
         let (c, dir_c) = node(&ic).await?;
         let scratch_dir = dir_l.with_extension("other-branch");
+        let mut other = crate::store::Store::open(scratch_dir.join("db.sqlite"))?;
         let result = async {
             for node in [&l, &c] {
                 node.install_membership(state.clone()).await?;
             }
-            let mut other = crate::store::Store::open(scratch_dir.join("db.sqlite"))?;
             other.install_trust_bundle(&network, &state)?;
             let long = MAX_FORK_PAGES * crate::store::MAX_PULL_EVENTS + 100;
             {
@@ -5102,9 +5362,48 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        let _ = std::fs::remove_dir_all(&scratch_dir);
-        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
-        result
+        drop(other);
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = remove_directory(&scratch_dir)
+            .with_context(|| format!("remove fork branch fixture {}", scratch_dir.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        let retired_l = Arc::downgrade(&l);
+        let retired_c = Arc::downgrade(&c);
+        l.shutdown().await;
+        c.shutdown().await;
+        drop(l);
+        drop(c);
+        if retired_l.upgrade().is_some() {
+            cleanup_errors
+                .push("first fork fixture Runtime still has a strong owner after shutdown".into());
+        } else if let Err(error) = std::fs::remove_dir_all(&dir_l)
+            .with_context(|| format!("remove first fork fixture directory {}", dir_l.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        if retired_c.upgrade().is_some() {
+            cleanup_errors
+                .push("second fork fixture Runtime still has a strong owner after shutdown".into());
+        } else if let Err(error) = std::fs::remove_dir_all(&dir_c)
+            .with_context(|| format!("remove second fork fixture directory {}", dir_c.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(cleanup_errors.join("; ")))
+        };
+        match (result, cleanup) {
+            (Err(body), Err(cleanup)) => {
+                Err(body.context(format!("cleanup also failed: {cleanup:#}")))
+            }
+            (Err(body), Ok(())) => Err(body),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     /// A round that leaves events waiting on other authors past the pending limit is followed
@@ -5225,7 +5524,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
+        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await?;
         result
     }
     #[tokio::test]

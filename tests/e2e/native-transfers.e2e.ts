@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, readlink, unlink, writeFile } from 'node:fs/promises';
+import { constants, createWriteStream } from 'node:fs';
+import { copyFile, lstat, mkdir, open, readFile, readdir, readlink, realpath, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
-import { join, relative, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
@@ -18,6 +18,56 @@ function record(value: unknown): Record<string, unknown> {
   assert(valid(value), 'Expected bounded fixture JSON');
   return value;
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function driverFailurePointer(error: unknown): Record<string, unknown> {
+  const pointer: Record<string, unknown> = {};
+  const visited = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && isRecord(current) && !visited.has(current); depth += 1) {
+    visited.add(current);
+    const details = isRecord(current.details) ? current.details : undefined;
+    for (const source of [current, details]) {
+      if (!source) continue;
+      if (typeof source.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(source.code)) pointer.code = source.code;
+      if (['daemon_transport_timeout', 'daemon_request_timeout'].includes(String(source.reason))) pointer.reason = source.reason;
+      if (typeof source.timeoutMs === 'number' && Number.isSafeInteger(source.timeoutMs) && source.timeoutMs >= 0 && source.timeoutMs <= 600000) pointer.timeout_ms = source.timeoutMs;
+      if (typeof source.diagnosticId === 'string' && /^[A-Za-z0-9._-]{1,80}$/.test(source.diagnosticId)) pointer.diagnostic_id = source.diagnosticId;
+      if (typeof source.logPath === 'string' && source.logPath.length <= 4096 && !/[\u0000-\u001f]/.test(source.logPath)) {
+        const stateDir = resolve(root, '.artifacts/native/agent-device');
+        const logPath = resolve(source.logPath);
+        const relativePath = relative(stateDir, logPath);
+        if (relativePath && !relativePath.startsWith('..') && !relativePath.startsWith('/')) pointer.log_path = logPath;
+      }
+      if (typeof source.message === 'string' && /daemon request timed out/i.test(source.message)) pointer.message_kind = 'daemon_request_timeout';
+    }
+    current = current.cause;
+  }
+  return pointer;
+}
+async function recordDriverFailure(error: unknown): Promise<void> {
+  const path = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
+  try {
+    await mkdir(resolve(root, '.artifacts/native/private'), { recursive: true, mode: 0o700 });
+    await writeFile(path, `${JSON.stringify(driverFailurePointer(error))}\n`, { mode: 0o600 });
+  } catch {
+    // Keep the original driver error as the test result if private evidence cannot be written.
+  }
+}
+async function recordInitialActorCensus(simulator: string): Promise<void> {
+  try {
+    await execute('python3', [resolve(root, 'scripts/ios-actor-census.py'), simulator], {
+      cwd: root,
+      timeout: 20000,
+      maxBuffer: 8192,
+      env: { ...process.env, AGENT_DEVICE_HOME: resolve(root, '.artifacts/native/agent-device'),
+        AGENT_DEVICE_STATE_DIR: resolve(root, '.artifacts/native/agent-device') },
+    });
+  } catch {
+    // Preserve the accessibility failure even if bounded actor diagnostics are unavailable.
+  }
+}
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
 const jobStates = ['queued', 'steering', 'steered', 'claimed', 'running', 'cancelling', 'reconciling', 'completed', 'failed', 'cancelled', 'interrupted', 'pending_delivery', 'unknown'];
 function enumText(value: unknown, allowed: string[]) { const found = text(value); assert(allowed.includes(found)); return found; }
@@ -25,10 +75,10 @@ function nullableIdentifier(value: unknown, pattern: RegExp) {
   assert(value === null || typeof value === 'string' && pattern.test(value));
   return value;
 }
+const nativeDriverCodes = new Set(['ENGINE_FAILURE', 'COMMAND_FAILED', 'IOS_SNAPSHOT_ENGINE_FAILED', 'RUNNER_WEDGED', 'SESSION_NOT_FOUND', 'INVALID_ARGS', 'CANCELLED', 'UNSUPPORTED_CAPABILITY']);
 function welcomeDriverErrors(cause: unknown) {
   const context = { phase: 'body', operation: 'welcome-snapshot' };
   try {
-    const codes = new Set(['ENGINE_FAILURE', 'COMMAND_FAILED', 'IOS_SNAPSHOT_ENGINE_FAILED', 'RUNNER_WEDGED', 'SESSION_NOT_FOUND', 'INVALID_ARGS', 'CANCELLED', 'UNSUPPORTED_CAPABILITY']);
     const reasons = new Set(['malformed-graph', 'invalid-viewport', 'missing-viewport', 'invalid-presented-payload', 'invalid-quality-payload',
       'runner_busy', 'runner_main_thread_timeout', 'regular-degenerate-actionable-node', 'regular-node-outside-cumulative-clip', 'projection-mismatch']);
     const runnerKinds = new Map([['RUNNER_BUSY', 'runner_busy'], ['MAIN_THREAD_TIMEOUT', 'runner_main_thread_timeout'], ['APP_NOT_RUNNING', 'app_not_running'],
@@ -36,7 +86,7 @@ function welcomeDriverErrors(cause: unknown) {
     const failures: Record<string, string | number>[] = [], seen = new Set<Error>();
     for (let error = cause; error instanceof Error && failures.length < 8 && !seen.has(error); error = error.cause) {
       seen.add(error);
-      const code = 'code' in error && typeof error.code === 'string' && codes.has(error.code) ? error.code : 'unknown';
+      const code = 'code' in error && typeof error.code === 'string' && nativeDriverCodes.has(error.code) ? error.code : 'unknown';
       const details = 'details' in error && error.details !== null && typeof error.details === 'object' && !Array.isArray(error.details) ? record(error.details) : {};
       const kind = typeof details.reason === 'string' && reasons.has(details.reason) ? details.reason
         : typeof details.runnerErrorCode === 'string' ? runnerKinds.get(details.runnerErrorCode) ?? 'unknown'
@@ -51,9 +101,118 @@ function welcomeDriverErrors(cause: unknown) {
     return failures.length ? failures : [{ ...context, code: 'unknown', kind: 'unknown' }];
   } catch { return [{ ...context, code: 'unknown', kind: 'unavailable' }]; }
 }
-async function recordProviderFailure(path: string, source: string, driverErrors: unknown) {
+type WelcomeRequestDiagnostic = {
+  status: 'read' | 'request-id-missing' | 'request-id-invalid' | 'request-id-ambiguous' | 'ownership-unproven' | 'missing' | 'unreadable' | 'size-limit' | 'unavailable';
+  bytes_read: number; lines_read: number; invalid_lines: number; incomplete_lines: number; ignored_events: number; capped: boolean;
+  events: Record<string, string | number | boolean>[];
+};
+async function welcomeRequestDiagnostic(cause: unknown): Promise<WelcomeRequestDiagnostic> {
+  const summary: WelcomeRequestDiagnostic = { status: 'unavailable', bytes_read: 0, lines_read: 0, invalid_lines: 0,
+    incomplete_lines: 0, ignored_events: 0, capped: false, events: [] };
   try {
-    await writeFile(join(path, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: driverErrors })}\n`, { mode: 0o600 });
+    const requestIds = new Set<string>(), seen = new Set<Error>();
+    let error = cause, missingId = false, invalidId = false;
+    for (let depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
+      if (seen.has(error)) return summary;
+      seen.add(error);
+      if (!('code' in error) || error.code !== 'COMMAND_FAILED' || !('details' in error)
+        || error.details === null || typeof error.details !== 'object' || Array.isArray(error.details)) continue;
+      const details = record(error.details);
+      if (details.reason !== 'daemon_transport_timeout') continue;
+      if (details.requestId === undefined) missingId = true;
+      else if (typeof details.requestId !== 'string' || !/^[0-9a-f]{16}$/.test(details.requestId)) invalidId = true;
+      else requestIds.add(details.requestId);
+    }
+    if (error instanceof Error) return summary;
+    if (invalidId) { summary.status = 'request-id-invalid'; return summary; }
+    if (missingId || requestIds.size === 0) { summary.status = 'request-id-missing'; return summary; }
+    if (requestIds.size !== 1) { summary.status = 'request-id-ambiguous'; return summary; }
+    const requestId = requestIds.values().next().value;
+    assert(requestId !== undefined);
+    const native = resolve(root, '.artifacts/native'), rawState = process.env.AGENT_DEVICE_STATE_DIR;
+    summary.status = 'ownership-unproven';
+    if (!rawState || root.toLowerCase().includes('trash') || rawState.toLowerCase().includes('trash') || !process.getuid) return summary;
+    const state = resolve(rawState), inside = relative(native, state), uid = process.getuid();
+    if (!inside || inside.startsWith('..') || inside.startsWith(sep)) return summary;
+    const directory = join(state, 'sessions/vdp-native-acceptance-0/requests');
+    const directories = [];
+    let location = root;
+    for (const part of ['', ...relative(root, directory).split(sep)]) {
+      location = join(location, part);
+      const stat = await lstat(location);
+      if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== uid || await realpath(location) !== location) return summary;
+      directories.push({ location, stat });
+    }
+    const path = join(directory, `${requestId}.ndjson`), stat = await lstat(path);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || await realpath(path) !== path) return summary;
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > 1048576) {
+      summary.status = 'size-limit'; summary.capped = true; return summary;
+    }
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const opened = await file.stat();
+      if (!opened.isFile() || opened.uid !== uid || opened.nlink !== 1 || opened.dev !== stat.dev || opened.ino !== stat.ino) return summary;
+      for (const saved of directories) {
+        const current = await lstat(saved.location);
+        if (current.isSymbolicLink() || !current.isDirectory() || current.uid !== uid || current.dev !== saved.stat.dev
+          || current.ino !== saved.stat.ino || await realpath(saved.location) !== saved.location) return summary;
+      }
+      const current = await lstat(path);
+      if (current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino || await realpath(path) !== path) return summary;
+      const bytes = Buffer.alloc(stat.size);
+      summary.bytes_read = (await file.read(bytes, 0, stat.size, 0)).bytesRead;
+      if (summary.bytes_read !== stat.size) { summary.status = 'unreadable'; return summary; }
+      const phases = new Set(['request_start', 'request_success', 'request_failed', 'ios.snapshot-source.prepare', 'ios.snapshot-source.acquire',
+        'ios.snapshot-source.present', 'ios_runner_session_startup', 'ios_runner_session_reuse', 'ios_runner_session_startup_timings']);
+      const levels = new Set(['info', 'debug', 'warn', 'error']);
+      for (let offset = 0; offset < stat.size;) {
+        if (summary.lines_read === 10000 || summary.events.length === 128) { summary.capped = true; break; }
+        const end = bytes.indexOf(10, offset);
+        if (end === -1) { summary.incomplete_lines = 1; break; }
+        summary.lines_read++;
+        const line = bytes.subarray(offset, end); offset = end + 1;
+        if (line.length > 131072) { summary.invalid_lines++; summary.capped = true; continue; }
+        let event: Record<string, unknown>;
+        try { event = record(JSON.parse(line.toString('utf8'))); } catch { summary.invalid_lines++; continue; }
+        if (event.requestId !== requestId || event.session !== 'vdp-native-acceptance-0' || event.command !== 'snapshot') {
+          summary.events = []; return summary;
+        }
+        if (typeof event.phase !== 'string' || !phases.has(event.phase) || typeof event.level !== 'string' || !levels.has(event.level)) {
+          summary.ignored_events++; continue;
+        }
+        const data = event.data !== null && typeof event.data === 'object' && !Array.isArray(event.data) ? record(event.data) : {};
+        const safe: Record<string, string | number | boolean> = { phase: event.phase, level: event.level, command: 'snapshot' };
+        if (typeof event.durationMs === 'number' && Number.isFinite(event.durationMs) && event.durationMs >= 0 && event.durationMs <= 3600000) safe.duration_ms = event.durationMs;
+        if (event.phase === 'request_failed') safe.code = typeof data.code === 'string' && nativeDriverCodes.has(data.code) ? data.code : 'unknown';
+        if (event.phase.startsWith('ios.snapshot-source.')) {
+          if (data.producer !== 'simulator-ax-bridge') { summary.ignored_events++; continue; }
+          safe.producer = 'simulator-ax-bridge';
+        }
+        if (event.phase === 'ios_runner_session_reuse' || event.phase === 'ios_runner_session_startup_timings') {
+          if (typeof data.ready === 'boolean') safe.ready = data.ready;
+          if (data.cache === 'exact' || data.cache === 'miss' || data.cache === 'external') safe.cache = data.cache;
+        }
+        summary.events.push(safe);
+      }
+      summary.status = 'read';
+      return summary;
+    } finally { await file.close().catch(() => {}); }
+  } catch (error) {
+    summary.events = [];
+    summary.status = 'unavailable';
+    try {
+      if (error instanceof Error && 'code' in error) {
+        if (error.code === 'ENOENT') summary.status = 'missing';
+        else if (error.code === 'EACCES' || error.code === 'EPERM') summary.status = 'unreadable';
+      }
+    } catch {}
+    return summary;
+  }
+}
+async function recordProviderFailure(path: string, source: string, driverErrors: unknown, welcomeRequest?: WelcomeRequestDiagnostic) {
+  try {
+    await writeFile(join(path, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: driverErrors,
+      ...(welcomeRequest === undefined ? {} : { welcome_request: welcomeRequest }) })}\n`, { mode: 0o600 });
   } catch {
     try { process.stderr.write('Native failure diagnostic unavailable\n'); } catch {}
   }
@@ -96,6 +255,13 @@ const test = base.extend<{ network: NativeNetwork }>({
       try {
         assert(line.length <= 65536, 'Native fixture response is bounded');
         const value = record(JSON.parse(line));
+        if (value.ok === false) {
+          const kind = typeof value.error === 'string' && /^[A-Za-z_]{1,50}$/.test(value.error) ? value.error : 'Error';
+          const frames = Array.isArray(value.frames) ? value.frames.filter((frame: unknown): frame is string =>
+            typeof frame === 'string' && /^verify-node\.py:[1-9][0-9]{0,4}:[A-Za-z_][A-Za-z0-9_]{0,70}$/.test(frame)).slice(0, 4) : [];
+          current.reject(new Error(`Native fixture failure ${kind} [${frames.join(';')}]`));
+          return;
+        }
         assert('ready' in value || value.ok === true, 'Native fixture operation succeeds');
         current.resolve(record(value.ready ?? value.result));
       } catch { current.reject(new Error('Native fixture returned an invalid response')); }
@@ -215,7 +381,7 @@ function providerRunningStop(value: unknown) {
 }
 
 function providerInspection(value: Record<string, unknown>) {
-  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_stop', 'running_invocations', 'deferred_invocations'].sort());
+  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_stop', 'total_invocations', 'running_invocations', 'deferred_invocations'].sort());
   let manager: { provider: string; model: string; reasoning_effort: string | null } | null = null;
   if (value.manager !== null) {
     const saved = record(value.manager);
@@ -225,6 +391,7 @@ function providerInspection(value: Record<string, unknown>) {
   }
   assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
   assert(Array.isArray(value.jobs));
+  assert(typeof value.total_invocations === 'number' && Number.isSafeInteger(value.total_invocations) && value.total_invocations >= 0);
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.deferred_invocations === 'number' && Number.isSafeInteger(value.deferred_invocations) && value.deferred_invocations >= 0);
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
@@ -239,7 +406,7 @@ function providerInspection(value: Record<string, unknown>) {
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     deferred_input: providerDeferredInput(value.deferred_input),
-    running_stop: providerRunningStop(value.running_stop),
+    running_stop: providerRunningStop(value.running_stop), total_invocations: value.total_invocations,
     running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
 }
 
@@ -275,6 +442,9 @@ test('provider settings and deferred input cancellation work in the installed na
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
+  const driverFailurePath = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
+  await unlink(driverFailurePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  await unlink(resolve(root, '.artifacts/native/private/ios-actor-census.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
   for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
@@ -339,14 +509,15 @@ test('provider settings and deferred input cancellation work in the installed na
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
+  // Capture the fresh install before the driver requests an accessibility tree.
+  await execute('xcrun', ['simctl', 'io', simulator, 'screenshot', join(publicPath, 'provider-initial.png')]);
   try {
     await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   } catch (cause) {
-    await recordProviderFailure(publicPath, source, welcomeDriverErrors(cause));
+    await recordProviderFailure(publicPath, source, welcomeDriverErrors(cause), await welcomeRequestDiagnostic(cause));
+    await recordDriverFailure(cause);
+    await recordInitialActorCensus(simulator);
     throw cause;
-  }
-  if (run !== undefined || attempt !== undefined) {
-    await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
   await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
@@ -471,8 +642,10 @@ test('provider settings and deferred input cancellation work in the installed na
   expect((await inspect()).manager).toBeNull();
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   await initialProvider.click();
+  await expect(screen.getByLabel('Codex 执行任务', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 执行任务', { exact: true }).click();
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['agent', 'execution']);
+  await expect(screen.getByLabel('Codex 运行 Bot', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['execution']);
   expect((await inspect()).manager).toBeNull();
@@ -528,6 +701,7 @@ test('provider settings and deferred input cancellation work in the installed na
   await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
   await executionDetails.click();
   await screen.scrollUntilVisible(screen.getByLabel('Codex 运行 Bot', { exact: true }), { direction: 'up' });
+  await expect(screen.getByLabel('Codex 运行 Bot', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).manager?.provider, { timeout: 15000 }).toBe('codex');
   await openSettings('ai');
@@ -616,12 +790,13 @@ test('provider settings and deferred input cancellation work in the installed na
   const botId = text(queue.bot_id), conversationId = text(queue.conversation_id);
   const runningTrigger = text(queue.running_trigger), deferredMessageId = text(queue.deferred_message_id);
   assert(botId === 'native-provider' && conversationId === 'native-provider'
-    && runningTrigger === 'message:native-running' && deferredMessageId === 'native-deferred');
+    && runningTrigger === 'message:native-running' && deferredMessageId === 'native-deferred-input');
   const target = { kind: 'bot_main', bot_id: botId };
   assert.deepEqual(queue.target, target);
   const prepared = await inspect(), deferred = prepared.deferred_input;
   assert(deferred, 'The fixture reads the real deferred input and its owner receipt');
   expect(prepared.jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
+  expect(prepared.total_invocations).toBe(1);
   expect(prepared.running_invocations).toBe(1);
   expect(prepared.deferred_invocations).toBe(0);
   expect(deferred).toEqual({ message_id: deferredMessageId, conversation_id: conversationId, target, intent: 'defer',
@@ -661,6 +836,7 @@ test('provider settings and deferred input cancellation work in the installed na
     receipt: { ...deferred.receipt, control_event: cancelledInput.control_event, stage: 'refused', reason: 'cancelled_before_delivery', retry_safe: false } });
   expect(cancelledInput.control_event).not.toBe(deferred.control_event);
   expect(cancelled.jobs).toEqual(prepared.jobs);
+  expect(cancelled.total_invocations).toBe(1);
   expect(cancelled.running_invocations).toBe(1);
   expect(cancelled.deferred_invocations).toBe(0);
   await expect(queued).toHaveCount(0);
@@ -702,7 +878,9 @@ test('provider settings and deferred input cancellation work in the installed na
   }
   await expect(screen.getByRole('button', '停止', { exact: true })).toBeHidden();
   const after = await inspect();
+  expect(after.jobs).toEqual([{ trigger: runningTrigger, state: 'cancelled' }]);
   expect(after.deferred_input).toEqual(cancelledInput);
+  expect(after.total_invocations).toBe(1);
   expect(after.running_invocations).toBe(1);
   expect(after.deferred_invocations).toBe(0);
   await openLink('vibeface://settings', screen.getByText('我的设备', { exact: true, visible: true }));
@@ -711,6 +889,7 @@ test('provider settings and deferred input cancellation work in the installed na
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
   expect(reopened.deferred_input).toEqual(cancelledInput);
+  expect(reopened.total_invocations).toBe(1);
   expect(reopened.running_invocations).toBe(1);
   expect(reopened.deferred_invocations).toBe(0);
   expect(reopened.execution_model).toBe('');
@@ -737,7 +916,7 @@ test('provider settings and deferred input cancellation work in the installed na
     synthetic_login_count: reopened.login_count, native_authenticated_recheck: true, trimmed_controlled_cleared_effort: true,
     real_provider_model_calls: 0, not_checked: ['real Provider authentication', 'Claude-specific native login'],
     running_trigger: runningTrigger, deferred_message_id: deferredMessageId, deferred_input: reopened.deferred_input, jobs: reopened.jobs,
-    running_invocations: reopened.running_invocations, deferred_invocations: reopened.deferred_invocations,
+    total_invocations: reopened.total_invocations, running_invocations: reopened.running_invocations, deferred_invocations: reopened.deferred_invocations,
     native_cancelled_deferred_input: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
 });
 

@@ -1,3 +1,4 @@
+use crate::platform::ipc::Stream as LocalStream;
 use crate::{
     failure::{self, ExecFailure, FailureKind},
     methods::{self, Category},
@@ -14,7 +15,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::UnixStream,
     sync::{RwLock, mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
@@ -870,7 +870,7 @@ async fn connection_loop(
 }
 
 async fn run_session(
-    stream: WebSocketStream<UnixStream>,
+    stream: WebSocketStream<LocalStream>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     observed: &watch::Receiver<BTreeSet<String>>,
     cache: &Arc<RwLock<Cache>>,
@@ -1037,11 +1037,13 @@ async fn run_session(
     reason
 }
 
-async fn connect(socket: &Path) -> Result<WebSocketStream<UnixStream>, String> {
+async fn connect(socket: &Path) -> Result<WebSocketStream<LocalStream>, String> {
     let connect = async {
-        let stream = UnixStream::connect(socket)
+        let endpoint =
+            crate::platform::ipc::Alias::resolve(socket).map_err(|error| format!("{error:#}"))?;
+        let stream = LocalStream::connect(&endpoint)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{error:#}"))?;
         client_async("ws://localhost/", stream)
             .await
             .map(|(stream, _)| stream)
@@ -1059,7 +1061,7 @@ fn initialize_params(title: &str) -> Value {
 /// A short-lived connection for one caller, such as the Agent's CLI. It leaves server requests to
 /// the Node, which holds a lasting connection to every thread it watches.
 pub struct DirectSession {
-    stream: WebSocketStream<UnixStream>,
+    stream: WebSocketStream<LocalStream>,
     next_id: u64,
     /// Threads started on this connection. They have no rollout before their first turn, so they
     /// are not resumed.
@@ -1428,10 +1430,19 @@ impl DirectSession {
 mod tests {
     use super::*;
 
+    /// A local endpoint of this account that no other test shares.
+    fn local_endpoint(name: &str) -> crate::platform::ipc::Endpoint {
+        crate::platform::ipc::Endpoint::in_private_dir(
+            &std::env::temp_dir(),
+            &format!("vibeface-{name}-{}-{}.sock", std::process::id(), now_ms()),
+        )
+        .expect("a private endpoint in the temporary directory")
+    }
+
     #[tokio::test]
     async fn notifications_and_foreign_requests_flow_while_an_rpc_waits() {
         timeout(Duration::from_secs(3), async {
-            let (left, right) = UnixStream::pair().unwrap();
+            let (left, right) = crate::platform::ipc::pair().await.unwrap();
             let (client, server) = tokio::join!(
                 client_async("ws://localhost/", left),
                 tokio_tungstenite::accept_async(right)
@@ -1488,14 +1499,16 @@ mod tests {
     #[tokio::test]
     async fn a_thread_another_process_writes_is_read_and_a_new_endpoint_is_followed() {
         timeout(Duration::from_secs(8), async {
-            let path = |name: &str| std::env::temp_dir().join(format!("vibeface-{name}-{}-{}.sock", std::process::id(), now_ms()));
-            let (first, second) = (path("endpoint-a"), path("endpoint-b"));
-            let (listener_a, listener_b) = (tokio::net::UnixListener::bind(&first).unwrap(), tokio::net::UnixListener::bind(&second).unwrap());
-            let (endpoint, receiver) = watch::channel(Some(first.clone()));
+            let (first, second) = (local_endpoint("endpoint-a"), local_endpoint("endpoint-b"));
+            let (mut listener_a, mut listener_b) = (
+                crate::platform::ipc::Listener::bind(&first).await.unwrap(),
+                crate::platform::ipc::Listener::bind(&second).await.unwrap(),
+            );
+            let (endpoint, receiver) = watch::channel(Some(first.path().to_owned()));
             let (events, _events) = mpsc::unbounded_channel();
             let client = CodexClient::start(receiver, events);
             client.set_observed_threads(vec!["busy".into()]).unwrap();
-            let mut server = tokio_tungstenite::accept_async(listener_a.accept().await.unwrap().0).await.unwrap();
+            let mut server = tokio_tungstenite::accept_async(listener_a.accept().await.unwrap()).await.unwrap();
             let initialize = next(&mut server).await;
             server.send(Message::Text(json!({"id":initialize["id"],"result":{"userAgent":"a"}}).to_string().into())).await.unwrap();
             assert_eq!(next(&mut server).await["method"], "initialized");
@@ -1508,26 +1521,25 @@ mod tests {
             server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"busy","status":{"type":"idle"}}}}).to_string().into())).await.unwrap();
             assert_eq!(next(&mut server).await["method"], "thread/turns/list", "a thread another process writes is read, not resumed again");
 
-            endpoint.send_replace(Some(second.clone()));
-            let mut moved = tokio_tungstenite::accept_async(listener_b.accept().await.unwrap().0).await.unwrap();
+            endpoint.send_replace(Some(second.path().to_owned()));
+            let mut moved = tokio_tungstenite::accept_async(listener_b.accept().await.unwrap()).await.unwrap();
             assert_eq!(next(&mut moved).await["method"], "initialize", "the client follows the new endpoint");
             assert!(!matches!(timeout(Duration::from_secs(2), server.next()).await.unwrap(), Some(Ok(Message::Text(_)))), "the old connection ends");
-            std::fs::remove_file(first).unwrap();
-            std::fs::remove_file(second).unwrap();
+            drop((listener_a, listener_b));
         }).await.expect("endpoint test must finish");
     }
 
     #[tokio::test]
     async fn known_threads_resubscribe_after_disconnect_without_replaying_a_turn() {
         timeout(Duration::from_secs(8), async {
-            let socket = std::env::temp_dir().join(format!("vibeface-subscribe-{}-{}.sock", std::process::id(), now_ms()));
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let socket = local_endpoint("subscribe");
+            let mut listener = crate::platform::ipc::Listener::bind(&socket).await.unwrap();
             let (events, mut received_events) = mpsc::unbounded_channel();
-            let client = CodexClient::start(watch::channel(Some(socket.clone())).1, events);
+            let client = CodexClient::start(watch::channel(Some(socket.path().to_owned())).1, events);
             client.set_observed_threads(vec!["known".into()]).unwrap();
             let mut sent_turns = 0;
             for connection in 0..3 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let stream = listener.accept().await.unwrap();
                 let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(initialize["method"], "initialize");
@@ -1595,7 +1607,7 @@ mod tests {
             }
             assert_eq!(sent_turns, 1);
             drop(client);
-            std::fs::remove_file(socket).unwrap();
+            drop(socket);
         }).await.expect("Codex reconnect must restore observation without replaying a mutation");
     }
 
@@ -1824,17 +1836,17 @@ mod tests {
         );
     }
 
-    async fn next(server: &mut WebSocketStream<UnixStream>) -> Value {
+    async fn next(server: &mut WebSocketStream<LocalStream>) -> Value {
         serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap()
     }
 
     #[tokio::test]
     async fn direct_session_leaves_requests_and_returns_its_result() {
         timeout(Duration::from_secs(5), async {
-            let socket = std::env::temp_dir().join(format!("vibeface-direct-{}-{}.sock", std::process::id(), now_ms()));
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let socket = local_endpoint("direct");
+            let mut listener = crate::platform::ipc::Listener::bind(&socket).await.unwrap();
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
+                let stream = listener.accept().await.unwrap();
                 let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let initialize = next(&mut server).await;
                 assert_eq!(initialize["params"]["clientInfo"]["title"], "Vibeface Agent CLI");
@@ -1845,25 +1857,25 @@ mod tests {
                 server.send(Message::Text(json!({"id":5,"method":"item/fileChange/requestApproval","params":{"threadId":"t"}}).to_string().into())).await.unwrap();
                 server.send(Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"r"}}}).to_string().into())).await.unwrap();
             });
-            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let mut session = DirectSession::connect(socket.path()).await.unwrap();
             let reply = session.request("turn/start", json!({"threadId":"t","clientUserMessageId":"work-1","input":[]})).await.unwrap();
             assert_eq!(reply["turn"]["id"], "r");
             server.await.unwrap();
             let error = session.request("turn/start", json!({})).await.unwrap_err();
             assert!(error.uncertain, "a lost write reply is an unknown result");
-            std::fs::remove_file(socket).unwrap();
+            drop(socket);
         }).await.expect("direct session must finish");
     }
 
     #[tokio::test]
     async fn send_steers_an_active_turn_and_never_sends_twice() {
         timeout(Duration::from_secs(5), async {
-            let socket = std::env::temp_dir().join(format!("vibeface-send-{}-{}.sock", std::process::id(), now_ms()));
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let socket = local_endpoint("send");
+            let mut listener = crate::platform::ipc::Listener::bind(&socket).await.unwrap();
             let server = tokio::spawn(async move {
                 let mut sent = 0;
                 for connection in 0..2 {
-                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = listener.accept().await.unwrap();
                     let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                     let initialize = next(&mut server).await;
                     server.send(Message::Text(json!({"id":initialize["id"],"result":{}}).to_string().into())).await.unwrap();
@@ -1889,12 +1901,12 @@ mod tests {
             });
             let outgoing = Outgoing { thread_id: "t".into(), text: "use plan B".into(), client_id: "d1".into(), expected_turn_id:Some("r1".into()), ..Default::default() };
             for _ in 0..2 {
-                let mut session = DirectSession::connect(&socket).await.unwrap();
+                let mut session = DirectSession::connect(socket.path()).await.unwrap();
                 assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "r1".into() });
                 session.close().await;
             }
             assert_eq!(server.await.unwrap(), 1, "a repeated send only reads back");
-            std::fs::remove_file(socket).unwrap();
+            drop(socket);
         }).await.expect("send must finish");
     }
 
@@ -1902,10 +1914,10 @@ mod tests {
     async fn a_shared_turn_permit_never_starts_a_replacement_turn() {
         timeout(Duration::from_secs(5), async {
             for scenario in ["stale", "rejected", "lost", "wrong-turn"] {
-                let socket = std::env::temp_dir().join(format!("vibeface-permit-{scenario}-{}-{}.sock", std::process::id(), now_ms()));
-                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let socket = local_endpoint(&format!("permit-{scenario}"));
+                let mut listener = crate::platform::ipc::Listener::bind(&socket).await.unwrap();
                 let server = tokio::spawn(async move {
-                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = listener.accept().await.unwrap();
                     let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                     let mut methods = Vec::new();
                     while let Some(Ok(Message::Text(text))) = server.next().await {
@@ -1931,14 +1943,14 @@ mod tests {
                     }
                     methods
                 });
-                let mut session = DirectSession::connect(&socket).await.unwrap();
+                let mut session = DirectSession::connect(socket.path()).await.unwrap();
                 let report = session.send(&Outgoing { thread_id:"t".into(), text:"supplement".into(), client_id:"d1".into(), expected_turn_id:Some("r1".into()), ..Default::default() }).await;
                 assert!(if matches!(scenario,"lost"|"wrong-turn") { matches!(report,StartReport::Unknown { .. }) } else { matches!(report,StartReport::Rejected(_)) }, "{scenario}: {report:?}");
                 session.close().await;
                 let methods = server.await.unwrap();
                 assert_eq!(methods.iter().filter(|method| method.as_str()=="turn/steer").count(), usize::from(matches!(scenario,"rejected"|"lost")));
                 assert!(!methods.iter().any(|method| method=="turn/start"));
-                std::fs::remove_file(socket).unwrap();
+                drop(socket);
             }
         }).await.expect("shared permit checks must finish");
     }
@@ -1946,12 +1958,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_to_a_new_thread_delivers_the_first_turn() {
         timeout(Duration::from_secs(5), async {
-            let socket = std::env::temp_dir().join(format!("vibeface-fresh-{}-{}.sock", std::process::id(), now_ms()));
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let socket = local_endpoint("fresh");
+            let mut listener = crate::platform::ipc::Listener::bind(&socket).await.unwrap();
             let server = tokio::spawn(async move {
                 let mut turns: HashMap<String, Vec<Value>> = HashMap::new();
                 loop {
-                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = listener.accept().await.unwrap();
                     let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
                     while let Some(Ok(Message::Text(text))) = server.next().await {
                         let request: Value = serde_json::from_str(&text).unwrap();
@@ -1982,7 +1994,7 @@ mod tests {
                     }
                 }
             });
-            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let mut session = DirectSession::connect(socket.path()).await.unwrap();
             let started = session.request("thread/start", json!({"cwd":"/project","approvalPolicy":"never","sandbox":"danger-full-access"})).await.unwrap();
             let thread = started["thread"]["id"].as_str().unwrap().to_owned();
             let outgoing = Outgoing { thread_id: thread, text: "do the work".into(), client_id: "w1".into(), start_only: true, full_access: true, ..Default::default() };
@@ -1990,16 +2002,16 @@ mod tests {
                 "the thread this session started gets its first turn");
             session.close().await;
 
-            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let mut session = DirectSession::connect(socket.path()).await.unwrap();
             session.request("thread/start", json!({"cwd":"/project"})).await.unwrap();
             session.close().await;
-            let mut session = DirectSession::connect(&socket).await.unwrap();
+            let mut session = DirectSession::connect(socket.path()).await.unwrap();
             let outgoing = Outgoing { thread_id: "fresh-1".into(), text: "hello".into(), client_id: "m1".into(), ..Default::default() };
             assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "turn-fresh-1".into() },
                 "a thread started elsewhere without a rollout yet still gets its first turn");
             session.close().await;
             server.abort();
-            std::fs::remove_file(socket).unwrap();
+            drop(socket);
         }).await.expect("send must finish");
     }
 }

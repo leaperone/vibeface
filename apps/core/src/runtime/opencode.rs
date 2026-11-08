@@ -10,12 +10,12 @@ use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
 use futures_util::future::BoxFuture;
 use reqwest::Method;
-use std::os::unix::process::CommandExt as _;
 use tokio::io::AsyncBufReadExt as _;
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
+    platform::tree,
     turn::TurnStatus,
 };
 
@@ -28,6 +28,8 @@ pub(crate) fn reply_message(attempt_id: &str) -> String {
 /// The user's opencode hook plugin.
 pub(crate) const PLUGIN: &str = include_str!("../../extensions/opencode.ts");
 const PIDFILE: &str = "serve.pid";
+/// Names the serve's process tree in this account's job object namespace.
+const SERVE_TREE_KEY: &str = "opencode-serve";
 const READY_WAIT: Duration = Duration::from_secs(30);
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
 /// How often a turn reads whether its run ended; the event stream may miss the end.
@@ -128,54 +130,46 @@ struct Serve {
     launch: Launch,
     conn: Conn,
     child: tokio::process::Child,
-    group: i32,
+    tree: tree::Tree,
     pidfile: PathBuf,
 }
 
 impl Serve {
-    /// SIGTERM, then the drop's SIGKILL after a grace period.
+    /// Asks the tree to stop, then the drop ends what is left after a grace period.
     async fn stop(mut self) {
-        signal_group(self.group, libc::SIGTERM);
+        self.tree.ask_to_stop();
         let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
     }
 }
 
 impl Drop for Serve {
-    /// The tools the serve started share its group and end with it.
+    /// The tools the serve started belong to its tree and end with it.
     fn drop(&mut self) {
-        signal_group(self.group, libc::SIGKILL);
+        self.tree.kill();
         let _ = std::fs::remove_file(&self.pidfile);
     }
 }
 
-fn signal_group(group: i32, signal: i32) {
-    // SAFETY: kill(2) with a negative pid signals one process group and touches no memory.
-    unsafe { libc::kill(-group, signal) };
-}
-
 /// A serve an earlier run of the Node left is killed, not adopted: its runs died with that Node
-/// and probes read them back from the store. Only a group whose command is such a serve is
-/// touched.
+/// and probes read them back from the store. Only a tree whose own command line is such a serve
+/// is touched, so a recorded identifier that now belongs to something else is left alone.
 fn kill_orphan(pidfile: &Path) {
-    let Some(group) = std::fs::read_to_string(pidfile)
-        .ok()
-        .and_then(|text| text.trim().parse::<i32>().ok())
-        .filter(|group| *group > 1)
-    else {
+    let Ok(token) = std::fs::read_to_string(pidfile) else {
         return;
     };
-    let command = std::process::Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &group.to_string()])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
-    if command.contains(" serve --hostname 127.0.0.1 --port ") {
-        tracing::info!(
+    match tree::stop_recorded(token.trim(), |member| {
+        member.contains(" serve --hostname 127.0.0.1 --port ")
+    }) {
+        Ok(Some(_)) => tracing::info!(
             event = "opencode.leftover_stopped",
-            group,
             "stopping the opencode serve left by an earlier run"
-        );
-        signal_group(group, libc::SIGKILL);
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            event = "opencode.leftover_left_alone",
+            %error,
+            "the opencode serve left by an earlier run was not ended"
+        ),
     }
     let _ = std::fs::remove_file(pidfile);
 }
@@ -447,12 +441,8 @@ impl Opencode {
             .current_dir(&dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0);
-        let mut child = tokio::process::Command::from(command)
-            .kill_on_drop(true)
-            .spawn()?;
-        let group = child.id().context("the opencode serve exited at once")? as i32;
+            .stderr(std::process::Stdio::piped());
+        let (tree, mut child) = tree::Tree::spawn(command, SERVE_TREE_KEY, true)?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let mut serve = Serve {
             launch,
@@ -462,10 +452,10 @@ impl Opencode {
                 started_ms: now_ms(),
             },
             child,
-            group,
             pidfile: dir.join(PIDFILE),
+            tree,
         };
-        config::private_write(&serve.pidfile, group.to_string().as_bytes())?;
+        config::private_write(&serve.pidfile, serve.tree.token().as_bytes())?;
         if let Some(stderr) = stderr {
             tokio::spawn(crate::logging::forward_lines(
                 stderr,
@@ -511,7 +501,7 @@ impl Opencode {
         });
         tracing::info!(
             event = "opencode.serve.started",
-            group,
+            tree = serve.tree.token(),
             "opencode serve started"
         );
         Ok(serve)
@@ -1000,7 +990,7 @@ impl Opencode {
 
     /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
         let ended = async {
             let Some(conn) = self.running().await else {
@@ -2108,7 +2098,7 @@ impl Executor for Opencode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::crypto::LocalIdentity;

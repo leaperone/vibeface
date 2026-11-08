@@ -1,12 +1,12 @@
 # 产品组合发布
 
-Core、CLI、Web App 和 Mobile 使用同一个产品版本和 `v<version>` Tag，在一个 GitHub Release 交付。`www-v<version>` 继续独立发布官网与文档。
+Core、CLI、Web App、Desktop 和 Mobile 使用同一个产品版本和 `v<version>` Tag，在一个 GitHub Release 交付。`www-v<version>` 继续独立发布官网与文档。
 
-产品版本以 CLI 的 Cargo 版本为准，Core、Web App 和 Mobile 的发行版本必须与之相等。首个正式版前保持 `0.0.1` 基准及数据 epoch 1。各应用仍是独立构建目标，不再分别公开发布组件依赖。
+产品版本以 CLI 的 Cargo 版本为准，Core、Web App、Desktop 和 Mobile 的发行版本必须与之相等。首个正式版前保持 `0.0.1` 基准及数据 epoch 1。各应用仍是独立构建目标，不再分别公开发布组件依赖。
 
 ## 构建顺序
 
-身份检查后，Web App、macOS 原生程序、Linux x64 原生程序、Linux ARM64 原生程序与 Android APK 并行构建。原生任务一次构建本平台的 CLI 和 Core；macOS 保留签名与公证。
+身份检查后，Web App、macOS、Windows、Linux x64、Linux ARM64 原生程序、Android 和 iOS 并行构建。原生任务一次构建本平台的 CLI 和 Core；macOS 保留签名与公证。桌面 App 只等待本平台完整运行包，再与手机 App 一起进入完整产品汇总。
 
 每个平台的完整安装包只等待该平台原生程序和 Web 制品，不等待其他平台。组包校验本次运行内的不可变制品 ID、源码、版本、目标平台和字节摘要，不从其他公开 Release 拉组件。
 

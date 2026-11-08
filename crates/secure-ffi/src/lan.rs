@@ -23,7 +23,7 @@ use crate::{Result, SecureError};
 
 const ALPN: &[u8] = b"vibeface/client/1";
 /// What a Node accepts in one frame.
-const MAX_FRAME: usize = 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const BINARY: u8 = 0;
 const TEXT: u8 = 1;
 const PING: u8 = 2;
@@ -83,7 +83,7 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<u8>)>> {
         Err(error) => return Err(failed(error)),
     }
     let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if length > MAX_FRAME {
+    if length > MAX_FRAME_BYTES {
         return Err(failed("frame too large"));
     }
     let mut data = vec![0; length];
@@ -102,13 +102,13 @@ pub struct LanFrame {
 #[derive(uniffi::Object)]
 pub struct LanStream {
     connection: Connection,
-    outgoing: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    outgoing: mpsc::Sender<(u8, Vec<u8>)>,
     incoming: Mutex<RecvStream>,
 }
 
 impl LanStream {
     fn new(connection: Connection, mut send: SendStream, recv: RecvStream) -> Arc<Self> {
-        let (outgoing, mut queue) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+        let (outgoing, mut queue) = mpsc::channel::<(u8, Vec<u8>)>(16);
         let writer = connection.clone();
         // Ends with the connection too: the app's handle, which holds the queue, lives until GC.
         tokio::spawn(async move {
@@ -137,12 +137,15 @@ impl LanStream {
 impl LanStream {
     /// Queues one binary frame. A failed write closes the stream, which `recv` then reports.
     pub fn send(&self, data: Vec<u8>) -> Result<()> {
-        if data.len() > MAX_FRAME {
+        if data.len() > MAX_FRAME_BYTES {
             return Err(failed("frame too large"));
         }
         self.outgoing
-            .send((BINARY, data))
-            .map_err(|_| failed("stream closed"))
+            .try_send((BINARY, data))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => failed("stream backpressure limit reached"),
+                mpsc::error::TrySendError::Closed(_) => failed("stream closed"),
+            })
     }
 
     /// The next binary or text frame, `None` once the Node ended the stream.
@@ -161,7 +164,7 @@ impl LanStream {
                         }));
                     }
                     PING => {
-                        let _ = self.outgoing.send((PONG, data));
+                        let _ = self.outgoing.try_send((PONG, data));
                     }
                     PONG => {}
                     _ => return Err(failed("unknown frame")),

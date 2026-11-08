@@ -1,11 +1,21 @@
 ---
 title: 安装与管理节点
-description: 在自己的 Mac 或 Linux 设备上安装 Vibeface Nightly，并初始化本机 Node。
+description: 安装桌面 App，连接已有节点，或在自己的电脑上启用与管理 Node。
 ---
 
 # 安装与管理节点
 
 第一次使用可以先按[快速上手](quick-start.md)完成安装、建网和第一次对话。本文提供安装方式、后台服务和更新命令的详细说明。
+
+## 使用桌面 App
+
+从同一产品 Release 下载本平台的 Vibeface Desktop：macOS 使用 DMG，Windows 使用当前用户安装器，Linux 使用 AppImage。桌面包内已有对应平台的 Core、CLI 和客户端，无需先运行 CLI。
+
+打开 App 后会检查当前用户已有的本机节点。只有一个可用节点时会自动选择；多个节点会列出位置与状态，选择后打开客户端。记住的节点每次启动都重新核对身份。节点停止时，点击“启动并连接”后才会启动它。首次注册设备仍需要确认身份、下载恢复文件并确认已保存。
+
+没有已有节点时，可以选择“仅作控制端”，用邀请链接访问个人网络；也可以选择在这台电脑启用节点。点击“安装后台节点”后，App 会安装自己的当前用户服务，退出 App 后仍继续运行。“移除后台运行”会卸载服务并保留节点数据。
+
+关闭窗口会保留托盘。明确退出只停止 App 自己启动的临时节点，已存在的外部节点和已安装的后台服务继续运行。iOS 和 Android 作为控制与访问入口，不在手机上运行 Node。各平台的关系见[App 架构](design/desktop-platforms.md)。
 
 ## 先核对安装包版本
 
@@ -24,7 +34,7 @@ export VIBEFACE_BIN_DIR="$HOME/.local/bin"
 
 已有安装使用原来的路径，不要另建目录绕过更新。安装后将 `VIBEFACE_BIN_DIR` 加入 PATH，或用完整路径运行 CLI。
 
-Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` 和 `web/` 静态 App。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的两个程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
+Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` 和 `web/` 静态 App。支持 macOS Apple Silicon、Windows x64、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的两个程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
 ## npm Nightly
 
@@ -36,7 +46,7 @@ vibeface --version
 vibeface
 ```
 
-一个 npm 包包含三个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含四个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
 
@@ -160,7 +170,7 @@ vibeface service start
 vibeface service restart
 ```
 
-macOS 使用 launchd 用户服务，Linux 使用 `systemd --user`。CLI 管理当前用户的一套节点服务。GitHub 受管安装通过固定的 `current` 路径启动；npm 安装通过 npm 包中固定的原生程序路径启动。卸载服务保留数据：
+macOS 使用 launchd 用户服务，Linux 使用 `systemd --user`，Windows 使用当前用户的计划任务。CLI 管理当前用户的一套节点服务。GitHub 受管安装通过固定的 `current` 路径启动；npm 安装通过 npm 包中固定的原生程序路径启动。卸载服务保留数据：
 
 ```sh
 vibeface service uninstall
@@ -194,3 +204,20 @@ vibeface update configure --channel stable --automatic true --install-root "$VIB
 ```
 
 Stable 不存在时不会切换 Nightly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。
+
+
+## 安装桌面应用
+
+从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。两端也提供 `.zip`，以及校验摘要和来源收据。
+
+桌面应用内含同版本、同源码的 CLI、Core 和 Web 资源。关闭窗口后继续在托盘运行。选择退出时，应用停止自己启动的 Core；连接既有服务时，退出保留该服务。首次点击“在这台电脑开始使用”后，应用在自己的配置目录下保存数据。选择已有数据时，所选目录决定这台电脑的数据位置。
+
+Windows 安装器只安装到当前账户，不需要管理员、WSL、Git Bash 或开发者模式。未配置签名证书的 Nightly 明确标记为未签名开发预览。正式版必须通过签名验证。已有独立 CLI 服务可以继续运行；桌面应用只连接它，不接管启停。
+
+## 安装 Windows CLI 和 Core
+
+Windows 完整包使用 `x86_64-pc-windows-msvc` 目标，包含 `vibeface.exe`、`vibeface-core.exe`、`web/` 和 `scripts/install-node-service.ps1`。保持整个目录完整。Windows 数据目录使用当前账户的 SID 权限，本机维护接口使用仅当前账户可访问的命名管道。
+
+源码中的 `scripts/install.ps1 -Channel nightly` 安装最新包含 Windows 制品的产品 Nightly，使用目录 junction 和 `.cmd` 启动入口。该脚本不创建节点、安装后台服务或开启自动更新。初始化后，按 `vibeface service --help` 配置当前账户的后台任务。
+
+CLI 更新器只管理独立安装。更新桌面应用时安装新的桌面包，不能使用 CLI 更新器改写签名应用内的程序。

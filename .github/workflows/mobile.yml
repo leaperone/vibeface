@@ -8,6 +8,11 @@ on:
         description: 'Replace older ordinary mobile feedback on this branch'
         type: boolean
         default: false
+      platforms:
+        description: Native mobile platforms to build and verify
+        type: choice
+        options: [all, android, ios]
+        default: all
   workflow_call:
     outputs:
       android_artifact_id:
@@ -18,8 +23,8 @@ on:
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.feedback && github.run_attempt == 1 }}
+  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -31,7 +36,7 @@ jobs:
   android:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    if: inputs.android_only || github.event_name == 'workflow_dispatch'
+    if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -82,7 +87,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.inputs.outputs.artifact-id }}
       producer_attempt: ${{ github.run_attempt }}
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
@@ -217,67 +222,113 @@ jobs:
           subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.26.7'
-          cache: false
-      - name: Apply the local simslim profile to this simulator
+      - name: Prepare the task simulator's XCTest runner
         env:
-          GOTOOLCHAIN: auto
+          AGENT_DEVICE_HOME: ${{ github.workspace }}/.artifacts/native/agent-device
+          AGENT_DEVICE_STATE_DIR: ${{ github.workspace }}/.artifacts/native/agent-device
+          AGENT_DEVICE_SESSION: vdp-native-acceptance
         run: |
           umask 077
-          printf '%s\n' simulator-profile > .artifacts/native/private/stage.txt
-          export GOPATH="$PWD/.artifacts/native/simslim/go"
-          export GOMODCACHE="$PWD/.artifacts/native/simslim/mod"
-          export GOCACHE="$PWD/.artifacts/native/simslim/cache"
-          export GOBIN="$PWD/.artifacts/native/simslim/bin"
-          printf '%s\n' install > .artifacts/native/private/simslim-phase.txt
-          go install github.com/mobai-app/simslim/cmd/simslim@v0.13.0 > .artifacts/native/private/simslim-install.log 2>&1
-          printf '%s\n' ownership > .artifacts/native/private/simslim-phase.txt
-          python3 - <<'PY' > .artifacts/native/private/simslim.log 2>&1
-          import json, os, pathlib, re, subprocess
-          phase_path = pathlib.Path(".artifacts/native/private/simslim-phase.txt")
-          simulator = pathlib.Path(".artifacts/native/simulator.txt").read_text().strip()
-          assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator) and simulator == os.environ["VIBEFACE_E2E_SIMULATOR"]
-          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"]))["devices"]
-          matches = [row for rows in devices.values() for row in rows if row["udid"] == simulator]
-          expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-          assert len(matches) == 1 and matches[0]["name"] == expected and matches[0]["state"] == "Booted"
-          tool = str(pathlib.Path(os.environ["GOBIN"]) / "simslim")
-          phase_path.write_text("build-identity\n")
-          build = subprocess.check_output(["go", "version", "-m", tool], text=True)
-          pathlib.Path(".artifacts/native/private/simslim-build.txt").write_text(build)
-          version = re.search(r": go1\.(\d+)(?:\.\d+)?\n", build)
-          assert version and int(version[1]) >= 26
-          profile = {"name": "provider-ci", "except": ["siri", "icloud", "store", "pim", "web", "family", "health",
-                     "photos", "apps", "messaging", "connectivity", "telemetry", "other"], "keep": []}
-          phase_path.write_text("profiles\n")
-          profiles = json.loads(subprocess.run([tool, "profiles", "--json"], check=True, capture_output=True, text=True).stdout)
-          categories = [row["id"] for row in profiles]
-          assert len(categories) == len(set(categories)) and set(profile["except"]) <= set(categories)
-          assert set(categories) - set(profile["except"]) == {"widgets", "search"}
-          profile_path = pathlib.Path(".artifacts/native/private/simslim-profile.json")
-          profile_path.write_text(json.dumps(profile) + "\n")
-          phase_path.write_text("apply\n")
-          subprocess.run([tool, "on", simulator, "--profile", str(profile_path)], check=True)
-          phase_path.write_text("verify\n")
-          verified = json.loads(subprocess.run([tool, "verify", simulator, "--profile", str(profile_path), "--json"], check=True, capture_output=True, text=True).stdout)
-          assert verified["udid"] == simulator and verified["ok"] is True
-          assert verified.get("missing", []) == [] and verified.get("extra", []) == []
-          required = ("universal-links", "push", "photos", "contacts", "calendar", "siri")
-          phase_path.write_text("doctor\n")
-          doctor = json.loads(subprocess.run([tool, "doctor", simulator, "--requires", ",".join(required), "--json"], check=True, capture_output=True, text=True).stdout)
-          assert doctor["udid"] == simulator and doctor["ok"] is True
-          features = doctor["features"]
-          assert len(features) == len(required) and {row["id"] for row in features} == set(required)
-          assert all(row["ok"] is True and row.get("disabled", []) == [] for row in features)
-          phase_path.write_text("complete\n")
+          printf '%s\n' runner-prepare > .artifacts/native/private/stage.txt
+          [[ "$VIBEFACE_E2E_SIMULATOR" =~ ^[a-fA-F0-9-]{36}$ ]]
+          test "$(cat .artifacts/native/simulator.txt)" = "$VIBEFACE_E2E_SIMULATOR"
+          agent_device_bin="$(node -e 'const fs = require("node:fs"); const path = require("node:path"); const entry = require.resolve("@e2e-dev/mobile"); const container = path.resolve(path.dirname(path.dirname(entry)), "..", ".."); const pkg = fs.realpathSync(path.join(container, "agent-device")); const bin = path.join(pkg, "bin", "agent-device.mjs"); if (!fs.existsSync(bin)) process.exit(2); process.stdout.write(bin)')"
+          if AGENT_DEVICE_HOME="$GITHUB_WORKSPACE/.artifacts/native/agent-device" \
+             AGENT_DEVICE_STATE_DIR="$GITHUB_WORKSPACE/.artifacts/native/agent-device" \
+             node "$agent_device_bin" prepare ios-runner --platform ios --udid "$VIBEFACE_E2E_SIMULATOR" --json \
+               > .artifacts/native/private/ios-runner-prepare.raw.json \
+               2> .artifacts/native/private/ios-runner-prepare.stderr.log; then
+            prepare_exit_code=0
+          else
+            prepare_exit_code=$?
+          fi
+          PREPARE_EXIT_CODE="$prepare_exit_code" python3 - <<'PY'
+          import json, math, os, pathlib, sys
+          raw_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.raw.json")
+          error_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.stderr.log")
+          summary_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.json")
+          def write_failure(reason, exit_code):
+              summary_path.write_text(json.dumps({"status": "failed", "reason": reason,
+                                                  "exit_code": exit_code}) + "\n")
+              print("iOS XCTest runner preparation failed: " + reason, file=sys.stderr)
+              raise SystemExit(1)
+
+          def tail(path):
+              if path.is_symlink() or not path.is_file():
+                  return ""
+              size = path.stat().st_size
+              with path.open("rb") as stream:
+                  stream.seek(max(0, size - 32768))
+                  return stream.read(32768).decode("utf-8", errors="replace")
+
+          exit_code = int(os.environ["PREPARE_EXIT_CODE"])
+          if exit_code != 0:
+              text = "\n".join(tail(path) for path in (raw_path, error_path)).lower()
+              reason = next((category for needle, category in (
+                  ("runner_start_budget_exhausted", "runner_start_budget_exhausted"),
+                  ("xcodebuild build-for-testing failed", "xctest_build_failed"),
+                  ("runner did not accept connection", "runner_connect_failed"),
+                  ("daemon request timed out", "daemon_request_timeout"),
+              ) if needle in text), "prepare_command_failed")
+              write_failure(reason, exit_code)
+          try:
+              text = raw_path.read_text(encoding="utf-8")
+              try:
+                  result = json.loads(text)
+              except ValueError:
+                  result = None
+                  for line in reversed(text.splitlines()):
+                      try:
+                          candidate = json.loads(line)
+                      except ValueError:
+                          continue
+                      payload = candidate.get("data") if isinstance(candidate, dict) else None
+                      if not isinstance(payload, dict) and isinstance(candidate, dict):
+                          payload = candidate.get("result")
+                      if isinstance(candidate, dict) and (candidate.get("action") == "ios-runner"
+                                                          or isinstance(payload, dict) and payload.get("action") == "ios-runner"):
+                          result = candidate
+                          break
+              for _ in range(3):
+                  if isinstance(result, dict) and isinstance(result.get("data"), dict):
+                      result = result["data"]
+                  elif isinstance(result, dict) and isinstance(result.get("result"), dict):
+                      result = result["result"]
+                  else:
+                      break
+              assert isinstance(result, dict)
+              if result.get("failureReason") is not None:
+                  write_failure("prepare_reported_failure", exit_code)
+              assert result.get("action") == "ios-runner" and result.get("platform") == "ios" and result.get("kind") == "simulator"
+              assert isinstance(result.get("runner"), dict)
+              assert type(result.get("healthCheckMs")) in {int, float} and math.isfinite(result["healthCheckMs"]) and result["healthCheckMs"] >= 0
+              if result.get("recoveryReason") is not None:
+                  write_failure("runner_prepare_required_recovery", exit_code)
+              cache = result.get("cache")
+              artifact = result.get("artifact")
+              cache = cache if cache in {"exact", "miss", "external"} else "unknown"
+              artifact = artifact if artifact in {"valid", "rebuilt"} else "unknown"
+              build_ms = result.get("buildMs")
+              assert build_ms is None or type(build_ms) in {int, float} and math.isfinite(build_ms) and 0 <= build_ms <= 600000
+              summary = {"status": "healthy", "cache": cache, "artifact": artifact,
+                         "build_ms": build_ms, "connect_ms": result["connectMs"],
+                         "health_check_ms": result["healthCheckMs"]}
+              for key in ("connect_ms", "health_check_ms"):
+                  assert type(summary[key]) in {int, float} and math.isfinite(summary[key]) and 0 <= summary[key] <= 600000
+          except (OSError, ValueError, TypeError, AssertionError, KeyError):
+              write_failure("prepare_result_invalid", exit_code)
+          summary_path.write_text(json.dumps(summary) + "\n")
+          print("iOS XCTest runner healthy: " + json.dumps(summary, sort_keys=True))
           PY
-          printf '%s\n' '{"stage":"simulator-profile","profile_verified":true,"required_services_passed":true,"siri_kept":true}'
+      - name: Check bounded iOS actor diagnostics
+        run: python3 scripts/ios-actor-census.py --self-test
       - name: Verify Provider settings and cancellation in the installed iOS app
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
           E2E_TELEMETRY_DISABLED: '1'
+          AGENT_DEVICE_HOME: ${{ github.workspace }}/.artifacts/native/agent-device
+          AGENT_DEVICE_STATE_DIR: ${{ github.workspace }}/.artifacts/native/agent-device
+          AGENT_DEVICE_SESSION: vdp-native-acceptance
         run: |
           umask 077
           printf '%s\n' typecheck > .artifacts/native/private/stage.txt
@@ -298,14 +349,57 @@ jobs:
           echo "Native Provider e2e exit code: $result"
           exit "$result"
       - name: Clean up this task and require final UI acceptance
+        id: native_cleanup
         if: always()
         env:
           SOURCE_COMMIT: ${{ github.sha }}
         run: |
           umask 077
+          echo "safe_public_artifacts=false" >> "$GITHUB_OUTPUT"
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, shutil, stat, subprocess
-          root = pathlib.Path(".artifacts/native")
+          import hashlib, importlib.util, json, os, pathlib, re, shutil, stat, subprocess, sys
+          repo = pathlib.Path.cwd().resolve()
+          root = repo / ".artifacts/native"
+          spec = importlib.util.spec_from_file_location("ios_actor_census", repo / "scripts/ios-actor-census.py")
+          census_module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(census_module)
+          if not census_module.artifact_layout_safe(repo):
+              # Marker paths cannot be trusted here. The unique task name still identifies
+              # this run's simulator without following a rejected filesystem path.
+              simulator_cleanup = "unavailable"
+              try:
+                  run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+                  assert run_id.isdigit() and attempt.isdigit()
+                  expected = "vibeface-provider-" + run_id + "-" + attempt
+                  devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"], timeout=5))["devices"]
+                  matches = [row for rows in devices.values() for row in rows if row["name"] == expected]
+                  assert len(matches) <= 1
+                  simulator_cleanup = "not_present"
+                  if matches:
+                      simulator = matches[0]["udid"]
+                      assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+                      if matches[0]["state"] != "Shutdown":
+                          subprocess.run(["xcrun", "simctl", "shutdown", simulator], check=True,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                      subprocess.run(["xcrun", "simctl", "delete", simulator], check=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                      simulator_cleanup = "removed"
+              except Exception:
+                  simulator_cleanup = "unavailable"
+              finally:
+                  # Remove only independently validated task directories. Untrusted roots
+                  # remain untouched and are never read by the artifact upload step.
+                  for relative in (".artifacts/native/network", ".artifacts/native/agent-device", ".artifacts/native/cache",
+                                   ".artifacts/native/e2e", ".artifacts/native/private", "tests/e2e/.artifacts/native"):
+                      try:
+                          path = census_module.checked_task_path(repo, repo / relative)
+                          if path.is_dir():
+                              shutil.rmtree(path)
+                      except (OSError, ValueError):
+                          pass
+              print(json.dumps({"artifact_layout": "refused", "simulator_cleanup": simulator_cleanup}))
+              raise SystemExit("refusing task artifact paths with symlink components")
+          public_census_projection = census_module.public_census_projection
           public = root / "public"
           public.mkdir(parents=True, exist_ok=True, mode=0o700)
           receipt_path = public / "provider.json"
@@ -314,18 +408,8 @@ jobs:
           removed, fixture_stopped, selected_passed, private_removed = not simulator_file.exists(), False, False, False
           stage_path = root / "private/stage.txt"
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
-          stages = {"host-source", "host-build", "simulator-create", "simulator-profile", "typecheck", "selection", "ui-run"}
+          stages = {"host-source", "host-build", "simulator-create", "runner-prepare", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
-          simslim_phases = {b"install\n", b"ownership\n", b"build-identity\n", b"profiles\n", b"apply\n", b"verify\n", b"doctor\n", b"complete\n"}
-          try:
-              with (root / "private/simslim-phase.txt").open("rb") as phase_file:
-                  phase = phase_file.read(32)
-              diagnostics["simslim_phase"] = phase[:-1].decode("ascii") if phase in simslim_phases else "unknown"
-          except OSError:
-              diagnostics["simslim_phase"] = "unavailable"
-          ui_log = root / "private/ui.log"
-          if ui_log.exists():
-              diagnostics["runner_prepare_fallback_reported"] = "automation runner not prepared" in ui_log.read_text(errors="replace")
           navigation_path = public / "provider-navigation.json"
           if navigation_path.exists():
               try:
@@ -343,6 +427,15 @@ jobs:
               code = error.get("code")
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
               message = error.get("message")
+              if isinstance(message, str):
+                  fixture = re.search(r"Native fixture failure ([A-Za-z_]{1,50}) \[([^\]]{0,500})\]", message)
+                  if fixture:
+                      frames = []
+                      for raw in fixture[2].split(";"):
+                          frame = re.fullmatch(r"verify-node\.py:([1-9][0-9]{0,4}):([A-Za-z_][A-Za-z0-9_]{0,70})", raw)
+                          if frame and len(frames) < 4:
+                              frames.append({"file": "verify-node.py", "line": int(frame[1]), "function": frame[2]})
+                      result["fixture"] = {"error_type": fixture[1], "frames": frames}
               if code in {"ENGINE_FAILURE", "ENVIRONMENT_UNAVAILABLE"} and isinstance(message, str):
                   lowered = message.lower()
                   result["engine_timeout_kind"] = next((kind for needle, kind in (
@@ -392,6 +485,143 @@ jobs:
               if error.get("phase") in {"config", "collection", "filter", "launch", "beforeAll", "beforeEach", "body", "afterEach", "afterAll", "cleanup", "report"}:
                   result["phase"] = error["phase"]
               return result
+
+          def safe_driver_diagnostic():
+              private_dir = root / "private"
+              pointer_path = root / "private/ios-driver-failure.json"
+              if private_dir.is_symlink() or not pointer_path.is_file() or pointer_path.is_symlink():
+                  return {"status": "pointer_missing"}
+              try:
+                  pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                  assert isinstance(pointer, dict)
+                  output = {"status": "captured"}
+                  if pointer.get("code") in {"ENGINE_FAILURE", "COMMAND_FAILED"}:
+                      output["code"] = pointer["code"]
+                  if pointer.get("reason") in {"daemon_transport_timeout", "daemon_request_timeout"}:
+                      output["reason"] = pointer["reason"]
+                  if pointer.get("message_kind") == "daemon_request_timeout":
+                      output["message_kind"] = pointer["message_kind"]
+                  timeout_ms = pointer.get("timeout_ms")
+                  if type(timeout_ms) is int and 0 <= timeout_ms <= 600000:
+                      output["timeout_ms"] = timeout_ms
+                  log_path = pointer.get("log_path")
+                  if not isinstance(log_path, str) or len(log_path) > 4096:
+                      output["log"] = "pointer_unavailable"
+                      return output
+                  candidate = pathlib.Path(log_path)
+                  state_dir = root / "agent-device"
+                  if state_dir.is_symlink():
+                      output["log"] = "pointer_refused"
+                      return output
+                  allowed = state_dir.resolve()
+                  if (not candidate.is_absolute() or ".." in candidate.parts
+                          or "trash" in str(candidate).lower()
+                          or candidate.is_symlink()):
+                      output["log"] = "pointer_refused"
+                      return output
+                  resolved = candidate.resolve(strict=True)
+                  if (not resolved.is_relative_to(allowed)
+                          or "trash" in str(resolved).lower()
+                          or not resolved.is_file() or resolved.stat().st_size > 1048576):
+                      output["log"] = "pointer_refused"
+                      return output
+                  events = []
+                  for line in resolved.read_text(encoding="utf-8").splitlines():
+                      try:
+                          event = json.loads(line)
+                      except ValueError:
+                          continue
+                      if isinstance(event, dict) and event.get("phase") == "daemon_request_timeout":
+                          events.append(event)
+                  if not events:
+                      output["log"] = "event_missing"
+                      return output
+                  event = events[-1]
+                  data = event.get("data")
+                  summary = {}
+                  duration = event.get("durationMs")
+                  if type(duration) in {int, float} and 0 <= duration <= 600000:
+                      summary["duration_ms"] = int(duration)
+                  if isinstance(data, dict):
+                      timeout = data.get("timeoutMs")
+                      if type(timeout) is int and 0 <= timeout <= 600000:
+                          summary["timeout_ms"] = timeout
+                      for source, destination in (("daemonLivenessProbeAnswered", "liveness_probe_answered"),
+                                                  ("daemonPreservedAfterTimeout", "daemon_preserved")):
+                          if type(data.get(source)) is bool:
+                              summary[destination] = data[source]
+                      retirement = data.get("daemonRetirement")
+                      if isinstance(retirement, dict) and retirement.get("status") in {"retired", "retained", "absent"}:
+                          summary["retirement"] = retirement["status"]
+                          termination = retirement.get("termination")
+                          if isinstance(termination, dict) and termination.get("status") in {"exited", "already-exited", "retained"}:
+                              summary["termination"] = termination["status"]
+                  output["log"] = "event_found"
+                  output["event"] = summary
+                  return output
+              except (OSError, ValueError, TypeError, AssertionError):
+                  return {"status": "unreadable"}
+
+          def safe_runner_prepare():
+              path = root / "private/ios-runner-prepare.json"
+              if path.is_symlink() or not path.is_file():
+                  return {"status": "missing"}
+              try:
+                  result = json.loads(path.read_text(encoding="utf-8"))
+                  assert isinstance(result, dict)
+                  if result.get("status") == "failed":
+                      reason = result.get("reason")
+                      exit_code = result.get("exit_code")
+                      if (reason not in {"runner_start_budget_exhausted", "xctest_build_failed", "runner_connect_failed",
+                                         "daemon_request_timeout", "prepare_command_failed", "prepare_result_invalid",
+                                         "prepare_reported_failure", "runner_prepare_required_recovery"}
+                              or type(exit_code) is not int or not 0 <= exit_code <= 255):
+                          return {"status": "invalid"}
+                      return {"status": "failed", "reason": reason, "exit_code": exit_code}
+                  assert result.get("status") == "healthy"
+                  assert result.get("cache") in {"exact", "miss", "external", "unknown"}
+                  assert result.get("artifact") in {"valid", "rebuilt", "unknown"}
+                  summary = {"status": "healthy", "cache": result["cache"], "artifact": result["artifact"]}
+                  for key in ("build_ms", "connect_ms", "health_check_ms"):
+                      value = result.get(key)
+                      if key == "build_ms" and value is None:
+                          summary[key] = None
+                          continue
+                      if type(value) not in {int, float} or not 0 <= value <= 600000:
+                          return {"status": "invalid"}
+                      summary[key] = int(value)
+                  return summary
+              except (OSError, ValueError, TypeError, AssertionError, KeyError):
+                  return {"status": "invalid"}
+
+          def safe_actor_census():
+              path = root / "private/ios-actor-census.json"
+              try:
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or info.st_size > 8192:
+                      return {"status": "missing"}
+                  value = json.loads(path.read_text(encoding="utf-8"))
+                  assert isinstance(value, dict)
+                  assert value.get("stage") == "initial-accessibility-failure"
+                  assert value.get("source_commit") == os.environ["GITHUB_SHA"]
+                  assert value.get("run_id") == os.environ["GITHUB_RUN_ID"]
+                  assert value.get("run_attempt") == os.environ["GITHUB_RUN_ATTEMPT"]
+                  marker = root / "simulator.txt"
+                  marker_info = marker.lstat()
+                  assert stat.S_ISREG(marker_info.st_mode) and marker_info.st_size <= 128
+                  simulator = marker.read_text(encoding="utf-8").strip()
+                  assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+                  expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+                  devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"], timeout=5))["devices"]
+                  matches = [row for rows in devices.values() for row in rows if row["udid"].casefold() == simulator.casefold()]
+                  assert len(matches) == 1 and matches[0]["name"] == expected and matches[0]["state"] == "Booted"
+                  return public_census_projection(value)
+              except (OSError, subprocess.SubprocessError, ValueError, TypeError, AssertionError, KeyError):
+                  return {"status": "invalid"}
+
+          diagnostics["driver"] = safe_driver_diagnostic()
+          diagnostics["runner_prepare"] = safe_runner_prepare()
+          diagnostics["ios_actor_census"] = safe_actor_census()
 
           runner_root = pathlib.Path("tests/e2e/.artifacts/native")
           report_path = runner_root / "e2e/report.json"
@@ -529,10 +759,13 @@ jobs:
                                  diagnostics=diagnostics, run_id=os.environ["GITHUB_RUN_ID"], run_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
                   receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
           print(json.dumps(diagnostics, sort_keys=True))
+          if census_module.artifact_layout_safe(repo) and all(not path.is_symlink() for path in public.iterdir()):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write("safe_public_artifacts=true\n")
           raise SystemExit(0 if passed else 1)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.native_cleanup.outputs.safe_public_artifacts == 'true' }}
         with:
           name: native-provider-ios-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -557,4 +790,4 @@ jobs:
       - name: Require all selected mobile jobs
         env:
           MOBILE_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py mobile-gate --needs-env MOBILE_NEEDS ${{ inputs.android_only && '--android-only' || '' }}
+        run: python3 scripts/ci.py mobile-gate --needs-env MOBILE_NEEDS --platforms "${{ inputs.platforms || 'all' }}" ${{ inputs.android_only && '--android-only' || '' }}

@@ -1598,7 +1598,7 @@ impl Runtime {
                     ..Default::default()
                 };
                 let node = self.clone();
-                tokio::spawn(async move {
+                if let Err(error) = self.background_tasks.spawn(async move {
                     // Another CLI connection may have created the thread before this observer joined.
                     if event.cwd.is_empty()
                         && node.manager().is_some()
@@ -1629,7 +1629,9 @@ impl Runtime {
                     if let Err(error) = node.ingest_agent_event(event).await {
                         tracing::debug!(%error, "App Server turn was not triaged");
                     }
-                });
+                }) {
+                    tracing::debug!(%error, "App Server triage skipped while the Node is shutting down");
+                }
             }
             _ => {}
         }
@@ -1637,7 +1639,7 @@ impl Runtime {
 
     pub(super) fn start_triage(self: &Arc<Self>) {
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(WAKE_EVERY) => {}
@@ -1647,9 +1649,11 @@ impl Runtime {
                     tracing::warn!(event = "triage.wake_failed", %error, "could not hand triage events to the Agent");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "triage event worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 if let Err(error) = node.expire_requests().await {
@@ -1659,9 +1663,11 @@ impl Runtime {
                     tracing::warn!(event = "webhook.answers_failed", %error, "could not tell the webhook about answers");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "request-expiry worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 if let Err(error) = node.deliver_webhooks().await {
                     tracing::warn!(event = "webhook.failed", %error, "webhook delivery failed");
@@ -1669,9 +1675,11 @@ impl Runtime {
                 let _ = tokio::time::timeout(Duration::from_secs(5), node.triage.outbox.notified())
                     .await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "webhook worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 if let Err(error) = node.scan_sources().await {
@@ -1679,7 +1687,9 @@ impl Runtime {
                 }
                 tokio::time::sleep(SCAN_EVERY).await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "session scan worker skipped while the Node is shutting down");
+        }
     }
 
     async fn pending_events(&self) -> Result<Vec<AgentEvent>> {
@@ -2963,12 +2973,18 @@ pub(super) mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         // A unix socket path must stay short; nothing listens unless a test binds it.
-        let socket = format!(
+        #[cfg(unix)]
+        let socket = PathBuf::from(format!(
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
+        ));
+        #[cfg(windows)]
+        let socket =
+            vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&dir, "fixture.sock")?
+                .path()
+                .to_owned();
         configuration.providers.codex_app_server.mode = crate::providers::AppServerMode::System;
-        configuration.providers.codex_app_server.socket = Some(socket.into());
+        configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
         configuration.save(&dir)?;
@@ -2995,7 +3011,7 @@ pub(super) mod tests {
     fn with_agent(node: &Runtime) {
         node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
             provider: crate::providers::Provider::Codex,
-            workspace: "/tmp".into(),
+            workspace: std::env::temp_dir(),
             model: "fixture".into(),
             reasoning_effort: None,
             backup: Default::default(),
@@ -3257,7 +3273,7 @@ pub(super) mod tests {
         Ok(json!({"status":result.0,"message":result.1,"receipt":result.2}))
     }
 
-    type Server = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+    type Server = tokio_tungstenite::WebSocketStream<vibeface_bridge::platform::ipc::Stream>;
 
     fn named_socket(node: &Runtime) -> PathBuf {
         node.providers()
@@ -3284,8 +3300,11 @@ pub(super) mod tests {
 
     async fn app_server(node: &Runtime) -> Result<(Server, ServerRequest)> {
         use futures_util::SinkExt as _;
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
+        let stream = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
         let mut server = tokio_tungstenite::accept_async(stream).await?;
         let initialize = read(&mut server).await;
         let ready = json!({"id":initialize["id"],"result":{"userAgent":"codex/fixture"}});
@@ -3313,26 +3332,37 @@ pub(super) mod tests {
     }
 
     async fn cleanup(node: Arc<Runtime>, dir: PathBuf) -> Result<()> {
-        let _ = std::fs::remove_file(named_socket(&node));
+        node.shutdown().await;
+        #[cfg(unix)]
+        match std::fs::remove_file(named_socket(&node)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
-    fn answering_app_server(node: &Runtime) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
-        scripted_app_server(node, |_| json!({"result":{}}))
+    async fn answering_app_server(
+        node: &Runtime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        scripted_app_server(node, |_| json!({"result":{}})).await
     }
 
     /// An App Server fixture: `answer` gives each request's reply, `{"result":…}` or `{"error":…}`.
-    pub(in crate::runtime) fn scripted_app_server(
+    pub(in crate::runtime) async fn scripted_app_server(
         node: &Runtime,
         mut answer: impl FnMut(&Value) -> Value + Send + 'static,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
+            let Ok(stream) = listener.accept().await else {
                 return;
             };
             let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
@@ -3360,6 +3390,8 @@ pub(super) mod tests {
     async fn a_node_without_a_network_skips_the_session_scan() -> Result<()> {
         let (node, dir) = bare_node().await?;
         let result = node.scan_sources().await;
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         result
     }
@@ -3370,7 +3402,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            let mut requests = answering_app_server(&node)?;
+            let mut requests = answering_app_server(&node).await?;
             while node.codex.status().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -3547,7 +3579,8 @@ pub(super) mod tests {
                     }
                     Some("thread/read") => json!({"result":{"thread":{"turns":[]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             let local = node.identity.device_id()?;
@@ -3669,7 +3702,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                         {"id":"u-1","status":"completed","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             running_work(&node, &admin, "w-missed").await?;
@@ -3717,7 +3751,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                         {"id":"u-1","status":"inProgress","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             running_work(&node, &admin, "w-held").await?;
@@ -3813,7 +3848,7 @@ pub(super) mod tests {
             }
             let network = b.network_id().await?;
             bot(&b, &admin, "c", "前端", &[]).await?;
-            let mut requests = answering_app_server(&b)?;
+            let mut requests = answering_app_server(&b).await?;
             connected(&b).await;
             running_work(&b, &admin, "w-far").await?;
 
@@ -5011,7 +5046,7 @@ pub(super) mod tests {
                         std::fs::create_dir(&replacement)?;
                         if change == "retarget" {
                             std::fs::rename(&directory, root.join("previous-work"))?;
-                            std::os::unix::fs::symlink(&replacement, &directory)?;
+                            vibeface_bridge::platform::privatefs::link_dir(&replacement, &directory)?;
                             assert_eq!(
                                 node.allowed_path(directory.to_str().context("work directory")?)?,
                                 replacement.canonicalize()?,
@@ -5389,17 +5424,25 @@ pub(super) mod tests {
 
     #[test]
     fn shared_events_keep_relative_context_without_local_identity() {
+        let private_root =
+            std::env::temp_dir().join(format!("vibeface-private-event-{}", uuid::Uuid::new_v4()));
+        let private_project = private_root.join("project");
+        let private_project_text = private_project.to_string_lossy();
         let event = AgentEvent {
             host: "private-host".into(),
-            repo: Some("/private-event-fixture/project".into()),
-            last_message: "failed in /private-event-fixture/project/src".into(),
-            ..turn("session", "turn", "/private-event-fixture/project")
+            repo: Some(private_project_text.to_string()),
+            last_message: format!("failed in {private_project_text}/src"),
+            ..turn("session", "turn", &private_project_text)
         };
-        let shared = shared_event(&event, &[PathBuf::from("/private-event-fixture")]);
+        let shared = shared_event(&event, std::slice::from_ref(&private_root));
         assert_eq!(shared.cwd, "workspace-1/project");
         assert!(shared.host.is_empty() && shared.repo.is_none());
-        assert!(!shared.last_message.contains("/private-event-fixture"));
-        assert_eq!(event.cwd, "/private-event-fixture/project");
+        assert!(
+            !shared
+                .last_message
+                .contains(private_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(event.cwd, private_project_text);
         assert_eq!(shared.event_id, event.event_id);
         assert_eq!(shared_event(&event, &[]).cwd, "workspace");
     }
@@ -5853,7 +5896,7 @@ pub(super) mod tests {
                         _ => {}
                     }
                     json!({"result":{"thread":thread}})
-                })?;
+                }).await?;
                 tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
                 if case == "known" {
                     node.triage_app_server(&json!({"method":"thread/started","params":{"thread":
@@ -5999,7 +6042,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                     {"id":"turn","status":"completed","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             let network = node.network_id().await?;
             assert_eq!(node.codex.server(), "system");
@@ -6226,7 +6270,7 @@ pub(super) mod tests {
             let mut native_queries = scripted_app_server(&node, move |request| match request["method"].as_str() {
                 Some("thread/read") => json!({"result":{"thread":{"id":request["params"]["threadId"],"cwd":native_cwd}}}),
                 _ => json!({"result":{}}),
-            })?;
+            }).await?;
             tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
@@ -6465,7 +6509,7 @@ pub(super) mod tests {
             let mut native_queries = scripted_app_server(&node, move |request| match request["method"].as_str() {
                 Some("thread/read") => json!({"result":{"thread":{"id":request["params"]["threadId"],"cwd":native_cwd}}}),
                 _ => json!({"result":{}}),
-            })?;
+            }).await?;
             tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
@@ -6634,16 +6678,27 @@ pub(super) mod tests {
         response: CoordinationReply,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            loop {
+                let stream = tokio::select! {
+                    _ = sent.closed() => break,
+                    accepted = listener.accept() => match accepted { Ok(stream) => stream, Err(_) => break },
+                };
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
-                    while let Some(Ok(message)) = server.next().await {
+                    loop {
+                        let message = tokio::select! {
+                            _ = sent.closed() => break,
+                            message = server.next() => match message { Some(Ok(message)) => message, _ => break },
+                        };
                         let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
                         else {
                             continue;
@@ -7276,8 +7331,15 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>((action, dismissed, answered_request))
         }
         .await;
-        let _ = std::fs::remove_file(named_socket(&node));
+        let endpoint = vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(&node))?;
+        node.shutdown().await;
         drop(node);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while endpoint.is_held() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
             let (old_action, dismissed, answered_request) = before?;
@@ -7323,6 +7385,7 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>(held["request_id"].as_str().context("request")?.to_owned())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
@@ -7441,7 +7504,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            coordination_app_server(&node).await?;
+            let _requests = coordination_app_server(&node).await?;
             node.coordination_turn(None, |_| Ok("triage".into()))
                 .await?;
             *node.triage.config.lock().unwrap() = TriageConfig {
@@ -7501,22 +7564,25 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &["s1", "s2"]).await?;
             external_work_thread_fact(&node, &admin, "s1").await?;
             let secret = "fixture-webhook-secret-0123456789";
+            let project = dir.join("hooked");
+            let project_text = project.to_string_lossy();
+            let elsewhere = dir.join("elsewhere");
             let settings = node
-                .configure_triage(json!({"default_outlet":"record","projects":[{"prefix":"/hooked","outlet":"both"}],
+                .configure_triage(json!({"default_outlet":"record","projects":[{"prefix":project_text,"outlet":"both"}],
                     "webhook_url":url,"scan_codex_sessions":false,"webhook_secret":secret}))
                 .await?;
             assert_eq!(settings["webhook_secret_set"], true);
             assert!(!settings.to_string().contains(secret));
             assert!(!std::fs::read_to_string(dir.join("config.json"))?.contains(secret));
 
-            let first = node.ingest_agent_event(turn("s1", "t1", "/hooked/app")).await?;
+            let first = node.ingest_agent_event(turn("s1", "t1", &format!("{project_text}/app"))).await?;
             assert_eq!(first["status"], "accepted");
-            let scanned = AgentEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", "/hooked/app") };
+            let scanned = AgentEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", &format!("{project_text}/app")) };
             assert_eq!(node.ingest_agent_event(scanned).await?["status"], "duplicate");
             let test = node.ingest_agent_event(AgentEvent { test: true, ..turn("s9", "t9", "/x") }).await?;
             assert_eq!(test["test"], true);
-            node.ingest_agent_event(turn("s1", "t2", "/hooked/app")).await?;
-            node.ingest_agent_event(turn("s2", "t1", "/elsewhere")).await?;
+            node.ingest_agent_event(turn("s1", "t2", &format!("{project_text}/app"))).await?;
+            node.ingest_agent_event(turn("s2", "t1", elsewhere.to_string_lossy().as_ref())).await?;
             let pending = node.triage_command(json!({"action":"events"})).await?;
             assert_eq!(pending["events"].as_array().unwrap().len(), 3);
 
@@ -7783,12 +7849,18 @@ pub(super) mod tests {
     }
 
     fn controlled_pi(node: &Runtime, dir: &Path, mode: &str) -> Result<()> {
+        let name = if cfg!(windows) {
+            "fake-pi.cmd"
+        } else {
+            "fake-pi"
+        };
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        vibeface_bridge::platform::program::ensure_runnable(&bin, "controlled pi fixture")?;
         let mut providers = node.providers.lock().unwrap();
         providers.switches.execution = [Provider::Pi].into();
-        providers.bins.insert(
-            Provider::Pi,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi"),
-        );
+        providers.bins.insert(Provider::Pi, bin);
         providers.env.apply(
             Provider::Pi,
             BTreeMap::from([
@@ -7918,11 +7990,14 @@ pub(super) mod tests {
         let served_dirs = native_dirs.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let turns = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
-        let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(&node))?,
+        )
+        .await?;
         let seen = requests.clone();
         let server = tokio::spawn(async move {
             let mut sessions = tokio::task::JoinSet::new();
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let seen = seen.clone();
                 let turns = turns.clone();
                 let native_dirs = served_dirs.clone();
