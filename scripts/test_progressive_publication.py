@@ -314,6 +314,7 @@ def main():
                 rejects('partial manifest on public release', rel.begin_product, 'immutable complete release')
 
     state.immutable = True
+    state.assets.pop('release.json')
     with patch.object(rel, 'run', side_effect=output), patch(f'{rel.__name__}.subprocess.run', side_effect=handler):
         with patch.object(rel, 'require_product_publishing', side_effect=publishing_patch):
             with patch.object(rel, 'identity', side_effect=identity_patch):

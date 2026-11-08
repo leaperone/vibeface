@@ -269,7 +269,7 @@ def main():
                             'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-app.yml', 'deploy-www.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
-          'exact artifacts and complete-only publication')
+          'exact artifacts, progressive uploads and complete-only automatic consumption')
 
 
 if __name__ == '__main__':
