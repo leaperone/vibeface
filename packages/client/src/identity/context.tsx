@@ -1104,7 +1104,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       throw failure
     }
     if (status.status === 'joined') {
-      if (pin && pin.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。重新生成加入链接。')
+      if (pin?.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。重新生成加入链接。')
       const state = record(await request('join_status', { join_id: joinId })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
