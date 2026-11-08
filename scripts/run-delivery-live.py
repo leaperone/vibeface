@@ -2292,49 +2292,121 @@ def protected_container(original, package, expected, run, common, git_directory,
         "--protected-run-dir", str(Path("/work") / run.relative_to(ROOT))]
 
 
+def protected_public_failure(run, expected, returncode):
+    output = Path(tempfile.mkdtemp(prefix="public-export-", dir=run)); output.chmod(0o755)
+    replace_public(output / "summary.json", {"schemaVersion":1,"status":"FAIL","sourceCommit":expected,
+        "scope":"fresh-two-order-protected-native-only","genuineReceipts":0,"nativeStatus":"UNVERIFIED",
+        "containerExitCode":returncode,"failureCodes":["public_export_unavailable"]})
+    return output, False
+
+
 def protected_public(run, expected, returncode):
-    source, output = run / "native/public", run / "public"
-    files = {"progress.json", "before-source-offline.json", "confirmed-chain.json", "settlement.json", "settlement-observation.json"}
+    source = run / "native/public"
+    output = Path(tempfile.mkdtemp(prefix="public-export-", dir=run)); output.chmod(0o755)
+    failures = set()
+    recognized = {"progress.json"}
+    qualified, public_files = [], {}
     progress = None
-    if (source / "progress.json").exists():
-        progress = json.loads(regular(source / "progress.json", 131072))
-        if progress.get("source_commit") != expected or progress.get("scope") != "fresh-two-order-protected-native-only":
-            raise ValueError("Protected evidence differs from the expected source or scope")
-        for fact in progress["genuine_receipts"]:
-            public, receipt = fact["public"], fact["receipt"]
-            basename = "key-binding" if fact["relation"] == 1 else f"order-{fact['orderId'][2:]}-relation-{fact['relation']}-window-{fact['windowIndex']}"
-            if not re.fullmatch(r"key-binding|order-[0-9a-f]{64}-relation-[23]-window-0", basename) or public != basename + ".json" or receipt != basename + ".receipt":
-                raise ValueError("Protected proof export has an unexpected public filename")
+    try:
+        value = json.loads(regular(source / "progress.json", 131072))
+        if not isinstance(value, dict) or value.get("source_commit") != expected or value.get("scope") != "fresh-two-order-protected-native-only":
+            raise ValueError("invalid source or scope")
+        progress = value
+    except Exception:
+        failures.add("progress_unavailable")
+    native_status = progress.get("status") if progress else None
+    if native_status not in ("PASS","FAIL","RUNNING","INTERRUPTED"):
+        native_status = "UNVERIFIED"; failures.add("invalid_native_status")
+    facts = progress.get("genuine_receipts", []) if progress else []
+    if not isinstance(facts, list):
+        facts = []; failures.add("invalid_proof_manifest")
+    if len(facts) > 5: failures.add("excess_proof_manifest")
+    seen = set()
+    for fact in facts[:16]:
+        pair = []
+        try:
+            relation = fact["relation"]
+            if type(relation) is not int or relation not in (1,2,3): raise ValueError("invalid relation")
+            if relation == 1:
+                basename = "key-binding"
+            else:
+                order = fact["orderId"]
+                if not isinstance(order,str) or not re.fullmatch(r"0x[0-9a-f]{64}",order) or type(fact["windowIndex"]) is not int or fact["windowIndex"] != 0:
+                    raise ValueError("invalid slot")
+                basename = f"order-{order[2:]}-relation-{relation}-window-0"
+            public_name, receipt_name = basename + ".json", basename + ".receipt"
+            if fact["public"] != public_name or fact["receipt"] != receipt_name or basename in seen:
+                raise ValueError("invalid or duplicate filename")
+            recognized.update((public_name, receipt_name))
             if fact.get("official_host_verified") is not True or fact.get("wrong_journal_receipt_comparison_rejected") is not True:
-                raise ValueError("Only independently verified binary receipts may be exported")
-            if digest(source / receipt) != fact["receiptSha256"] or json.loads(regular(source / public, 16384))["journalHash"] != fact["journalHash"]:
-                raise ValueError("Protected receipt or metadata changed after verification")
-            files.update((public, receipt))
-        if any(path.name not in files or path.is_symlink() or not path.is_file() for path in source.iterdir()):
-            raise ValueError("Protected public directory contains an unapproved file")
-        if progress["status"] == "PASS":
-            facts = progress["genuine_receipts"]
-            sources = {fact["orderId"] for fact in facts if fact["relation"] == 2}
-            holds = {fact["orderId"] for fact in facts if fact["relation"] == 3}
-            if len(facts) != 5 or sum(fact["relation"] == 1 for fact in facts) != 1 or len(sources) != 2 or sources != holds:
-                raise ValueError("Protected native success requires five verified receipts for two distinct orders")
-    provenance = json.loads(regular(run / "artifact-provenance.json")) if (run / "artifact-provenance.json").exists() else None
-    resource = json.loads(regular(run / "resources.json")) if (run / "resources.json").exists() else None
-    if provenance is not None and provenance.get("sourceCommit") != expected:
-        raise ValueError("Protected artifact provenance differs from the final source")
-    passed = returncode == 0 and progress is not None and progress["status"] == "PASS" and provenance is not None and provenance["status"] == "PASS" and resource is not None and resource["status"] == "PASS"
-    if output.is_symlink(): raise ValueError("Protected export cannot follow a symlink")
-    output.mkdir(mode=0o755, exist_ok=True)
-    output.chmod(0o755)
+                raise ValueError("unverified proof")
+            if any(not isinstance(fact.get(key),str) or not re.fullmatch(r"[0-9a-f]{64}",fact[key]) for key in ("receiptSha256","publicSha256","journalHash")):
+                raise ValueError("invalid proof digest")
+            receipt_bytes = regular(source / receipt_name,16384)
+            metadata_bytes = regular(source / public_name,16384)
+            metadata = json.loads(metadata_bytes)
+            if hashlib.sha256(receipt_bytes).hexdigest() != fact["receiptSha256"] or hashlib.sha256(metadata_bytes).hexdigest() != fact["publicSha256"] or metadata["journalHash"] != fact["journalHash"]:
+                raise ValueError("changed proof pair")
+            certified = {key:fact[key] for key in ("relation","public","receipt","receiptSha256","publicSha256","journalHash")}
+            certified.update(official_host_verified=True,wrong_journal_receipt_comparison_rejected=True)
+            if relation != 1: certified.update(orderId=fact["orderId"],windowIndex=0)
+            pair = [output / public_name, output / receipt_name]
+            for target,data in zip(pair,(metadata_bytes,receipt_bytes)):
+                target.write_bytes(data); target.chmod(0o644)
+            seen.add(basename)
+            qualified.append(certified)
+        except Exception:
+            failures.add("invalid_certified_proof")
+            for target in pair: target.unlink(missing_ok=True)
+    allowed_files = {"before-source-offline.json","confirmed-chain.json","settlement.json","settlement-observation.json","native-result.json"}
+    certified_files = progress.get("public_files",{}) if progress else {}
+    if not isinstance(certified_files,dict):
+        certified_files = {}; failures.add("invalid_public_file_manifest")
+    for name,checksum in certified_files.items():
+        if name not in allowed_files:
+            failures.add("unapproved_public_material"); continue
+        recognized.add(name)
+        try:
+            data = regular(source / name,131072)
+            if not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum) or hashlib.sha256(data).hexdigest() != checksum:
+                raise ValueError("changed public report")
+            json.loads(data)
+            (output / name).write_bytes(data); (output / name).chmod(0o644)
+            public_files[name] = checksum
+        except Exception:
+            failures.add("invalid_certified_public_file")
+            (output / name).unlink(missing_ok=True)
+    try:
+        if any(path.name not in recognized or path.is_symlink() or not path.is_file() for path in source.iterdir()):
+            failures.add("unapproved_public_material")
+    except Exception:
+        failures.add("public_source_unavailable")
+    states = {}
+    for name in ("artifact-provenance.json","resources.json"):
+        try:
+            data = regular(run / name,131072); value = json.loads(data)
+            if not isinstance(value,dict) or value.get("status") not in ("PASS","FAIL","UNVERIFIED") or name == "artifact-provenance.json" and value.get("sourceCommit") != expected:
+                raise ValueError("invalid wrapper report")
+            (output / name).write_bytes(data); (output / name).chmod(0o644)
+            states[name] = value["status"]
+        except Exception:
+            failures.add("wrapper_report_unavailable")
+    sources = {fact["orderId"] for fact in qualified if fact["relation"] == 2}
+    holds = {fact["orderId"] for fact in qualified if fact["relation"] == 3}
+    complete = len(qualified) == 5 and sum(fact["relation"] == 1 for fact in qualified) == 1 and len(sources) == 2 and sources == holds
+    if not complete: failures.add("incomplete_verified_receipts")
+    if "native-result.json" not in public_files: failures.add("native_result_unavailable")
+    if native_status != "PASS": failures.add("native_run_not_passed")
+    if returncode != 0: failures.add("container_exit_nonzero")
+    if any(states.get(name) != "PASS" for name in ("artifact-provenance.json","resources.json")): failures.add("wrapper_checks_not_passed")
+    passed = not failures
     if progress is not None:
-        for name in files:
-            if (source / name).exists(): publish_file(source / name, output / name, 131072)
-    for name in ("artifact-provenance.json", "resources.json"):
-        if (run / name).exists(): publish_file(run / name, output / name, 131072)
-    replace_public(output / "summary.json", {"schemaVersion": 1, "status": "PASS" if passed else "FAIL", "sourceCommit": expected,
-        "scope": "fresh-two-order-protected-native-only", "genuineReceipts": len(progress["genuine_receipts"]) if progress else 0,
-        "nativeStatus": progress["status"] if progress else "UNVERIFIED", "containerExitCode": returncode,
-        "notChecked": ["rendered Web or Android UI", "old fee5 identical bytes or maximum capacity", "forced reorg/nonce-revert/near-cutoff/token faults", "public chain or real assets"]})
+        replace_public(output / "progress.json", {"schema_version":1,"source_commit":expected,"scope":"fresh-two-order-protected-native-only",
+            "status":"PASS" if passed else "FAIL","genuine_receipts":qualified,"public_files":public_files,"native_status":native_status})
+    replace_public(output / "summary.json", {"schemaVersion":1,"status":"PASS" if passed else "FAIL","sourceCommit":expected,
+        "scope":"fresh-two-order-protected-native-only","genuineReceipts":len(qualified),"nativeStatus":native_status,"containerExitCode":returncode,
+        "failureCodes":sorted(failures),
+        "notChecked":["rendered Web or Android UI","old fee5 identical bytes or maximum capacity","forced reorg/nonce-revert/near-cutoff/token faults","public chain or real assets"]})
     return output, passed
 
 
@@ -2376,11 +2448,17 @@ def protected_package_dispatch(package_input, expected, run_directory):
             removed = subprocess.run(["docker", "rm", "--force", name], capture_output=True, timeout=20)
             if removed.returncode and not any(text in removed.stderr for text in (b"No such container", b"No such object")):
                 returncode = returncode or 1
-        except (OSError, subprocess.SubprocessError):
+        except Exception:
             returncode = returncode or 1
         finally:
-            terminate_owned(process)
-        public, passed = protected_public(run, expected, returncode)
+            try:
+                terminate_owned(process)
+            except Exception:
+                returncode = returncode or 1
+        try:
+            public, passed = protected_public(run, expected, returncode)
+        except Exception:
+            public, passed = protected_public_failure(run, expected, returncode or 1)
         if os.environ.get("GITHUB_OUTPUT"):
             with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output: output.write("public-directory=" + str(public) + "\n")
         print(json.dumps({"event":"protected_native_result","status":"PASS" if passed else "FAIL","public_directory":str(public),"source_commit":expected}), flush=True)
@@ -2471,6 +2549,7 @@ def protected_dispatch(configuration, run_directory):
 
 
 def self_test_protected(original):
+    from copy import deepcopy
     from unittest.mock import Mock, patch
     expected = "1" * 40
     package, run = ROOT / ".artifacts/package", ROOT / ".artifacts/protected-run"
@@ -2521,31 +2600,95 @@ def self_test_protected(original):
         for relation, order in [(1,None),(2,"ab"*32),(3,"ab"*32),(2,"cd"*32),(3,"cd"*32)]:
             name = "key-binding" if relation == 1 else f"order-{order}-relation-{relation}-window-0"
             receipt = public / (name+".receipt"); receipt.write_bytes(b"synthetic exporter selfcheck only: "+name.encode())
-            (public / (name+".json")).write_text(json.dumps({"journalHash":"a"*64}))
-            fact = {"relation":relation,"public":name+".json","receipt":name+".receipt","receiptSha256":digest(receipt),"journalHash":"a"*64,
+            metadata = public / (name+".json"); metadata.write_text(json.dumps({"journalHash":"a"*64}))
+            fact = {"relation":relation,"public":name+".json","receipt":name+".receipt","receiptSha256":digest(receipt),"publicSha256":digest(metadata),"journalHash":"a"*64,
                 "official_host_verified":True,"wrong_journal_receipt_comparison_rejected":True}
             if order: fact.update(orderId="0x"+order,windowIndex=0)
             facts.append(fact)
-        progress = {"source_commit":expected,"scope":"fresh-two-order-protected-native-only","status":"PASS","genuine_receipts":facts}
-        (public / "progress.json").write_text(json.dumps(progress))
+        terminal = public / "native-result.json"; terminal.write_text(json.dumps({"marker":"synthetic exporter selfcheck only"}))
+        base = {"source_commit":expected,"scope":"fresh-two-order-protected-native-only","status":"PASS","genuine_receipts":facts,
+            "public_files":{"native-result.json":digest(terminal)}}
         (run / "artifact-provenance.json").write_text(json.dumps({"sourceCommit":expected,"status":"PASS"}))
         (run / "resources.json").write_text(json.dumps({"status":"PASS"}))
-        unexpected = public / "private-runtime.json"; unexpected.write_text("synthetic forbidden file")
-        try: protected_public(run, expected, 0)
-        except ValueError: pass
-        else: raise AssertionError("Private files entered the public export")
-        unexpected.unlink()
-        facts[0]["official_host_verified"] = False; (public / "progress.json").write_text(json.dumps(progress))
-        try: protected_public(run, expected, 0)
-        except ValueError: pass
-        else: raise AssertionError("Unverified receipts entered the public export")
-        facts[0]["official_host_verified"] = True; (public / "progress.json").write_text(json.dumps(progress))
-        output, passed = protected_public(run, expected, 0)
-        assert passed and (output / "key-binding.receipt").read_bytes().startswith(b"synthetic exporter selfcheck")
-        assert not (output / "configuration.json").exists() and not (output / "private-runtime.json").exists()
+        def export(manifest, returncode=0):
+            (public / "progress.json").write_text(json.dumps(manifest))
+            output, passed = protected_public(run, expected, returncode)
+            summary = json.loads((output / "summary.json").read_text())
+            assert summary["status"] == ("PASS" if passed else "FAIL")
+            assert summary["nativeStatus"] in ("PASS","FAIL","RUNNING","INTERRUPTED","UNVERIFIED")
+            assert all(re.fullmatch(r"[a-z_]+",code) for code in summary["failureCodes"])
+            assert len(list(output.glob("*.receipt"))) == summary["genuineReceipts"]
+            return output, passed, summary
+        output, passed, summary = export(base)
+        assert passed and summary["genuineReceipts"] == 5
         assert (output / "key-binding.receipt").stat().st_mode & 0o777 == 0o644
-        _, passed = protected_public(run, expected, 1)
-        assert not passed and json.loads((output / "summary.json").read_text())["status"] == "FAIL"
+        output, passed, summary = export(base,1)
+        assert not passed and summary["genuineReceipts"] == 5
+        (public / facts[-1]["public"]).unlink()
+        partial = {**deepcopy(base),"status":"FAIL","genuine_receipts":deepcopy(facts[:4])}
+        output, passed, summary = export(partial,1)
+        assert not passed and summary["genuineReceipts"] == 4 and not (output / facts[-1]["receipt"]).exists()
+        sentinel = "UNAPPROVED_PRIVATE_SENTINEL"
+        for name in (".progress.json.unregistered-temp", "private-runtime.json"):
+            (public / name).write_text(sentinel)
+        partial["raw_exception"] = sentinel
+        output, passed, summary = export(partial,1)
+        assert not passed and summary["genuineReceipts"] == 4
+        assert all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
+        assert not (output / "private-runtime.json").exists() and not any(path.name.startswith('.') for path in output.iterdir())
+        invalid = deepcopy(partial); invalid["genuine_receipts"][1]["official_host_verified"] = False
+        output, passed, summary = export(invalid)
+        assert not passed and summary["genuineReceipts"] == 3 and not (output / facts[1]["receipt"]).exists()
+        invalid = deepcopy(partial); rejected = deepcopy(facts[0]); rejected["official_host_verified"] = False
+        invalid["genuine_receipts"].insert(0,rejected)
+        output, passed, summary = export(invalid)
+        assert not passed and summary["genuineReceipts"] == 4 and (output / facts[0]["receipt"]).exists()
+        receipt = public / facts[0]["receipt"]; original_receipt = receipt.read_bytes(); receipt.write_bytes(b"changed synthetic receipt")
+        output, passed, summary = export(partial)
+        assert not passed and summary["genuineReceipts"] == 3 and not (output / facts[0]["receipt"]).exists()
+        receipt.write_bytes(original_receipt)
+        metadata = public / facts[0]["public"]; original_metadata = metadata.read_bytes(); metadata.write_text(json.dumps({"journalHash":"a"*64,"private":sentinel}))
+        output, passed, summary = export(partial)
+        assert not passed and summary["genuineReceipts"] == 3 and all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
+        metadata.write_bytes(original_metadata)
+        invalid = deepcopy(partial); invalid["genuine_receipts"][0]["public"] = sentinel
+        output, passed, summary = export(invalid)
+        assert not passed and summary["genuineReceipts"] == 3 and all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
+        invalid = deepcopy(partial); invalid["status"] = sentinel
+        output, passed, summary = export(invalid)
+        assert not passed and summary["nativeStatus"] == "UNVERIFIED" and summary["genuineReceipts"] == 4
+        assert all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
+        terminal.write_text(sentinel)
+        output, passed, summary = export(partial)
+        assert not passed and summary["genuineReceipts"] == 4 and not (output / "native-result.json").exists()
+        (public / "progress.json").write_text(sentinel)
+        output, passed = protected_public(run,expected,1)
+        assert not passed and json.loads((output / "summary.json").read_text())["genuineReceipts"] == 0
+        assert not (output / "progress.json").exists()
+        terminal.write_text(json.dumps({"marker":"synthetic exporter selfcheck only"}))
+        (public / "progress.json").write_text(json.dumps(partial))
+        package = run / "package"; package.mkdir(); (package / "BUILD-INFO.json").write_text("{}")
+        exporter = protected_public
+        for mode in ("partial","exception"):
+            github_output = run / ("github-output-"+mode)
+            process = Mock(wait=Mock(return_value=1),poll=Mock(return_value=1))
+            def publish(*_args):
+                if mode == "exception": raise RuntimeError(sentinel)
+                return exporter(run,expected,1)
+            with patch(f"{__name__}.source_commit"), patch(f"{__name__}.checked_package"), patch(f"{__name__}.command"), \
+                 patch(f"{__name__}.protected_public",side_effect=publish), \
+                 patch("runpy.run_path",return_value={"sandbox_commands":lambda _context:(["synthetic","build"],original)}), \
+                 patch("subprocess.check_output",side_effect=[str(common)+"\n",str(common/"worktrees/task")+"\n"]), \
+                 patch("subprocess.Popen",return_value=process), \
+                 patch("subprocess.run",return_value=subprocess.CompletedProcess([],1,b"",b"No such container")), \
+                 patch.dict(os.environ,{"GITHUB_OUTPUT":str(github_output)}), patch("builtins.print"):
+                try: protected_package_dispatch(package,expected,run/("host-"+mode))
+                except RuntimeError as error: assert sentinel not in str(error)
+                else: raise AssertionError("failed native/export runs cannot pass")
+            output = Path(github_output.read_text().strip().split("=",1)[1])
+            summary = json.loads((output/"summary.json").read_text())
+            assert summary["status"] == "FAIL" and summary["genuineReceipts"] == (4 if mode == "partial" else 0)
+            assert all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
 
 
 if __name__ == "__main__":

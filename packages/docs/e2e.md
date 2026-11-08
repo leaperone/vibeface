@@ -93,11 +93,15 @@ python3 scripts/run-delivery-live.py \
 
 本机入口按原生驱动既有阶段和业务期限等待，不再套用旧 Strict/UI 的 20700 秒整轮截止。KeyBinding 观察上限仍为 7400 秒，Source、Hold 各为 16000 秒；每次证明的 7200 秒硬界、原 UUID、报价/持有/密钥截止、费用与 W/I/F/S 均不变。每份完成的证明仍立即独立验真并保存。同一个运行容器可以跨宿主工具轮次继续等待；停止容器后不支持恢复原链/订单，不能把已保存分项称为已支持跨容器续跑。
 
+`prepare`、`confirm_batch`、`accept_batch` 只有在结构化响应明确返回提交前的固定错误 `another delivery operation is in progress` 时，才沿既有 120 秒阶段上限等待重试，原 UUID 和参数不变。超时、网络异常、未知结果及其他拒绝直接失败，不自动重发。
+
 GitHub Actions job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表单项失败或完整实验通过。需要继续同一合法原生运行时，应保留本机的原容器、原链和原业务期限；不得靠新 UUID、延长期限或重部署链绕过原边界。
 
 容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置并调用现有 `verify-node.py --delivery-protected`。Web 资源进程检查不代表渲染验收。
 
-输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只有 `public/` 的白名单内容可上传，包括已独立 host 验真的 receipts/metadata、原链公开观察、进度、制品来源、资源状态和最终摘要。失败保留已验真分项；任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能整目录上传。
+输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指安全目录，实际路径为本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+
+未登记、临时、私密或损坏材料不导出，也不妨碍其他已验真分项导出；整体仍为 FAIL，并写出安全摘要和 `public-directory`。任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能上传整个 run 或 `native/public/`。
 
 已准备好受限 sandbox 和全部精确制品时，也可以使用不构建、不下载或启动 Docker 的低层 `--protected-config`。配置 schema 为 `scripts/verify-delivery-protected.py` 的 `validate_config`；在本任务 `.artifacts/` 写入 `0600` 配置，所有摘要必须填实际值，不能沿用其他源码或旧 receipt：
 

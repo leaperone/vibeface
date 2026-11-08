@@ -235,7 +235,12 @@ class Experiment:
                         "driver_source_sha256": file_digest(Path(__file__)), "artifact_sha256": config["sha256"], "node_proof_timeout_seconds": 7200,
                         "fees_each": {"delivery": "5", "reservation": "0", "bonus": "0"},
                         "deposit": "10", "publication_policy": POLICY, "not_checked": NOT_CHECKED,
-                        "genuine_receipts": [], "orders": [], "checkpoints": {}}
+                        "genuine_receipts": [], "public_files": {}, "orders": [], "checkpoints": {}}
+
+    def public_json(self, name, value):
+        path = self.public / name
+        save_json(path, value)
+        self.summary["public_files"][name] = file_digest(path)
 
     def progress(self, stage=None, **facts):
         if stage:
@@ -330,7 +335,17 @@ class Experiment:
         return json.loads(result.stdout) if success and result.stdout.lstrip().startswith(b"{") else None
 
     def call(self, node, op, **params):
-        return node.client.call("delivery", {"op": op, **params})
+        packet = {"op": op, **params}
+        if op not in ("prepare", "confirm_batch", "accept_batch"):
+            return node.client.call("delivery", packet)
+        def attempt():
+            response = node.client.command("request", method="delivery", params=packet, connection="main")
+            error = response.get("error")
+            if error == "another delivery operation is in progress":
+                return None
+            need(not error, "delivery_" + op + "_rejected")
+            return {"result": response.get("result")}
+        return self.wait("delivery-" + op + "-after-explicit-pre-mutation-busy", attempt)["result"]
 
     def rows(self, node, query, parameters=()):
         path = node.directory / "delivery/service.sqlite3"
@@ -384,6 +399,7 @@ class Experiment:
                 if relation != 1:
                     entry.update({"orderId": "0x" + order_id, "windowIndex": 0})
                 fact = {**entry, "node": node.name, "journalHash": statement_digest, "receiptSha256": digest(receipt),
+                        "publicSha256": file_digest(self.public / (basename + ".json")),
                         "official_host_verified": True, "wrong_journal_receipt_comparison_rejected": True,
                         "first_reservation_observed_to_export_seconds": round(time.monotonic() - self.receipt_seen[key], 3)}
                 self.proofs[key] = {"entry": entry, "journal": journal, "fact": fact}
@@ -626,7 +642,7 @@ class Experiment:
         self.summary["source_offline"] = {"wallet_nonce": source_nonce, "after_two_slot_reserve": True,
             "after_both_c_e_objects_complete": True, "after_both_receiver_offers": True, "before_receiver_accept": True,
             "wall_clock_unix_seconds": int(time.time()), "chain_anchor": snapshot["anchor"]}
-        save_json(self.public / "before-source-offline.json", snapshot)
+        self.public_json("before-source-offline.json", snapshot)
         self.checkpoint("source-offline-before-receiver-accept")
 
     def compare_public_values(self, snapshot, *, relations=(2, 3)):
@@ -707,13 +723,13 @@ class Experiment:
                   "orders": [{"orderId": "0x" + value, "windowCount": 1, "amount": "5"} for value in self.orders],
                   "proofs": [item["entry"] for item in self.proofs.values()],
                   "capsules": [{name: item[name] for name in ("orderId", "windowIndex", "capsule")} for item in snapshot["windows"]], "transactions": transactions}
-        save_json(self.public / "settlement.json", bundle)
-        save_json(self.public / "confirmed-chain.json", snapshot)
+        self.public_json("settlement.json", bundle)
+        self.public_json("confirmed-chain.json", snapshot)
         observed = self.command(["node", self.repository / "contracts/delivery/observe-settlement.mjs", "--settlement", self.public / "settlement.json",
                                  "--rpc-url", self.deployment["rpc_url"], "--case", "protected"], timeout=180)
         value = json.loads(observed.stdout)
         need(value.get("status") == "PASS", "official_protected_settlement_observer_required")
-        durable(self.public / "settlement-observation.json", observed.stdout)
+        self.public_json("settlement-observation.json", value)
         self.summary["official_settlement_observer"] = "PASS"
 
     def restart_and_disabled_boundaries(self):
@@ -801,6 +817,8 @@ class Experiment:
                     self.summary["status"] = "FAIL"
                     self.summary["failure_code"] = "final_resource_read_failed"
             self.progress()
+            self.public_json("native-result.json", self.summary)
+            self.progress()
         return 0 if self.summary["status"] == "PASS" else 1
 
 
@@ -829,7 +847,8 @@ def run_from_options(options, helpers):
 
 
 def self_test():
-    from unittest.mock import patch
+    from unittest.mock import Mock, patch
+    from types import SimpleNamespace
     import socket
     def forbidden(*_args, **_kwargs):
         raise AssertionError("no-process self-test attempted an external process or network")
@@ -860,6 +879,41 @@ def self_test():
             except (CheckFailure, ValueError): pass
             else: raise AssertionError("non-loopback origin accepted")
         need(oom_delta({"memory.events": "oom 0\noom_kill 0\n"}, {"memory.events": "oom 1\noom_kill 0\n"})["oom"] == 1, "actual_oom_delta")
+        experiment = object.__new__(Experiment)
+        experiment.progress = Mock(); experiment.scan_receipts = Mock(); experiment.checkpoint = Mock()
+        experiment.processes = SimpleNamespace(capture=Mock())
+        busy = {"error": "another delivery operation is in progress"}
+        requests = {
+            "prepare": {"intent_id": "00000000-0000-4000-8000-000000000001", "budget_id": "b" * 64},
+            "confirm_batch": {"intent_ids": ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"]},
+            "accept_batch": {"order_ids": ["a" * 64, "b" * 64]},
+        }
+        for op, params in requests.items():
+            client = Mock(command=Mock(side_effect=[busy, {"result": {"accepted": True}}]))
+            with patch("time.monotonic", return_value=0), patch("time.sleep"):
+                need(experiment.call(SimpleNamespace(client=client), op, **params) == {"accepted": True}, "explicit_busy_then_success")
+            need(client.command.call_count == 2 and client.command.call_args_list[0] == client.command.call_args_list[1], "busy_retry_keeps_exact_request")
+            need(client.command.call_args.kwargs["params"] == {"op": op, **params}, "busy_retry_keeps_original_ids")
+            client.call.assert_not_called()
+            for error in (TimeoutError("network outcome unknown"), RuntimeError("another delivery operation is in progress"),
+                          {"error": "outcome unknown"}, {"error": "another delivery operation is in progress; uncertain"}, {"error": "other refusal"}):
+                client = Mock(command=Mock(side_effect=[error] if isinstance(error, Exception) else None, return_value=error))
+                with patch("time.monotonic", return_value=0), patch("time.sleep") as pause:
+                    try: experiment.call(SimpleNamespace(client=client), op, **params)
+                    except (CheckFailure, TimeoutError, RuntimeError): pass
+                    else: raise AssertionError("a non-busy failure was retried or accepted")
+                need(client.command.call_count == 1, "non_busy_failure_is_not_retried"); pause.assert_not_called()
+            client = Mock(command=Mock(return_value=busy))
+            with patch("time.monotonic", side_effect=[0, 0, 0, 0, 121]), patch("time.sleep"):
+                try: experiment.call(SimpleNamespace(client=client), op, **params)
+                except CheckFailure as error: need("stage_observer_timeout_" in str(error), "busy_keeps_existing_stage_bound")
+                else: raise AssertionError("busy exceeded the original stage bound")
+            need(client.command.call_count == 1, "expired_busy_stage_sends_no_new_request")
+        client = Mock(call=Mock(side_effect=AssertionError("another delivery operation is in progress")))
+        try: experiment.call(SimpleNamespace(client=client), "get", order_id="a" * 64)
+        except AssertionError: pass
+        else: raise AssertionError("read operations must retain their original Client.call behavior")
+        client.command.assert_not_called()
     print(json.dumps({"status": "SELF_TEST_PASS", "external_processes": 0, "network_sockets": 0, "genuine_receipts_generated": 0}))
 
 
