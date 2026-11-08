@@ -80,7 +80,7 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 
 产品发布不更新 App、Discovery 或 Relay。用户要求部署这些服务时，使用相邻的 [deploy skill](../deploy/SKILL.md)，显式选择已经完整发布的产品 Tag。不得由 `release product` 自动派发部署。
 
-官网发布同样不自动部署。只有另行执行 `deploy-www.yml` 时才跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
+官网发布同样不自动部署。部署官方站点时，在本仓库执行 `deploy www <精确官网 Tag>`，与产品服务使用相同的独立部署流水线。核对实际运行版本、镜像和线上页面，不能把 workflow 启动当作上线。
 
 npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在 产品 `publish` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
 

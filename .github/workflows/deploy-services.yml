@@ -1,5 +1,5 @@
 name: deploy-services
-run-name: Deploy ${{ inputs.service }} from ${{ inputs.tag }}
+run-name: Deploy ${{ inputs.service }} from ${{ inputs.tag }} (apply=${{ inputs.apply }})
 
 on:
   workflow_dispatch:
@@ -7,36 +7,74 @@ on:
       service:
         description: Official service to deploy
         type: choice
-        options: [all, discovery, relay, app]
+        options: [all, discovery, relay, relay-cn, app, www]
         required: true
       tag:
-        description: Exact published product tag
+        description: Exact published product tag, or website tag for www
         type: string
         required: true
+      apply:
+        description: Activate containers on the selected deployment environments
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: official-service-deployment-requests
+  group: vibeface-official-deployments
   cancel-in-progress: false
 
 jobs:
-  request:
-    if: github.ref == 'refs/heads/main'
+  plan:
+    if: github.ref == 'refs/heads/main' || !inputs.apply
     runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
     steps:
-      - name: Checkout deployment command
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify published release and request deployment
+      - name: Verify the published release
+        id: plan
         env:
-          GH_TOKEN: ${{ secrets.VIBEFACE_RELEASE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           SERVICE: ${{ inputs.service }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN"
-          python3 -B scripts/deploy.py dispatch --service "$SERVICE" --tag "$RELEASE_TAG"
+          python3 -B scripts/deploy.py plan --service "$SERVICE" --tag "$RELEASE_TAG" > .deployment-plan.json
+          python3 - <<'PY'
+          import json, os
+          plan = json.load(open('.deployment-plan.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('targets=' + json.dumps(plan['targets']) + '\n')
+          PY
+  containers:
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.plan.outputs.targets) }}
+    environment: ${{ inputs.apply && format('vibeface-{0}', matrix.service) || 'vibeface-validation' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify and package published bytes in containers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SERVICE: ${{ matrix.service }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 -B scripts/deploy-run.py build --service "$SERVICE" --tag "$RELEASE_TAG" --output .artifacts/deploy
+      - name: Activate the pinned container on the configured host
+        if: inputs.apply
+        env:
+          SERVICE: ${{ matrix.service }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+        run: python3 -B scripts/deploy-run.py activate --service "$SERVICE" --output .artifacts/deploy

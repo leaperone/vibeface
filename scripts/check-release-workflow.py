@@ -143,7 +143,7 @@ def main():
     source = (directory / 'release.yml').read_text()
     helpers = {name: (directory / name).read_text()
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml',
-                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml', 'deploy-www.yml')}
+                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
           'exact artifacts and complete-only publication')

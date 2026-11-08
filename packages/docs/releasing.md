@@ -40,7 +40,7 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 产品和官网发布只交付制品，不推送线上服务。Discovery、Relay 与 App 使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
 
-官网使用独立命令 `gh workflow run deploy-www.yml --repo leaperone/vibeface --ref www-v<version>`，当前官网部署仅接受 Stable。请求成功不代表上线，必须跟踪部署仓库运行到终态并验证线上版本。
+官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>`。所有部署都在本仓库的 `deploy-services.yml` 中执行，不派发其他仓库。命令成功不代表上线，必须跟踪运行到终态并验证线上版本。
 
 ## 可下载的包
 
@@ -113,7 +113,7 @@ pnpm --filter vibeface-www run build
 pnpm --filter vibeface-www run check:static
 ```
 
-产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；官网制品发布后，由独立的 `deploy-www.yml` 命令向部署仓库发送部署请求。请求成功不代表站点已经上线，仍需检查目标仓库的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
+产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；官网制品发布后，独立 deploy 命令在本仓库部署所选版本。命令成功不代表站点已经上线，仍需检查该运行的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
 
 ## 显式发布版本
 
