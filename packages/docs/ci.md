@@ -61,13 +61,13 @@ Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证�
 
 `scripts/check-delivery.py` 读取 `crates/delivery/proof/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
 
-当前仓库已包含四种关系的九个核心公开 fixture；完整 live 流程的十三份唯一证明仍由显式手动实验生成和验收。默认检查会重建 guest 并验证这些 fixture，目录不存在时打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，其余检查照常运行；目录存在但内容不全仍然失败。新的证明只在固定的 x86_64 sandbox 中按 11 GiB、零 swap 和 64 PIDs 的资源边界生成，文件较小不保证 Groth16 压缩所需内存较小。
+当前仓库已包含四种关系的九个核心公开 fixture。旧 Strict/十三证明 live 流程已退役；当前受保护两单最小样本须另行产生一份 KeyBinding、各单 Source/Hold，共五份真实证明。默认检查会重建 guest 并验证这些 fixture，目录不存在时打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，其余检查照常运行；目录存在但内容不全仍然失败。新的证明只在固定的 x86_64 sandbox 中按 11 GiB、零 swap 和 64 PIDs 的资源边界生成，文件较小不保证 Groth16 压缩所需内存较小。
 
 所有 receipt 还必须绑定产品的 `crates/delivery/proof/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
 
 合约检查使用锁定的 solc、Ganache 和 ethers。官方 verifier 源码逐项校验摘要，`compile.mjs --check-trust` 对比重新编译的 runtime 与已提交的 `trust.json`，不改 tracked 文件。检查还包括账务正反例、官方 published fixture、两连续窗口的 Rust 与 Solidity 编码比较，以及当前 delivery image 的真实 seal 在生产 adapter 上的验真和篡改拒绝。
 
-独立累计通道的 `verify-channel.mjs` 也由同一检查入口执行，覆盖合成累计券、重复与跨域重放、预算、挑战期退出和异常代币。它不生成证明。真实 Node 通道验收是另行显式选择的 `verify-node.py --delivery-channel`；默认公益验收仍不启动链或钱包。
+默认 `run.mjs` 已迁移为受保护预算账务正反例，覆盖真实两订单批次、不可变预分配、奖金、固定收款、earned 幂等、退款与异常代币；使用显式 test digest verifier，不生成或冒充 genuine proof。`exercise-settlement.mjs --self-test` 同时检查 schema2 公开证据边界。旧 voluntary 通道与签券入口已撤下；`--delivery-charity` 仍不启动链或钱包。
 
 这些结果分别保留在 `.artifacts/vdp/` 和 `.artifacts/vdp/contracts/`。CI 只上传公开 journal、结果和合成公开向量，不上传私密见证、密钥、Node 数据或工具链。官方 published fixture 和账务测试有各自的标签，它们不能替代当前 delivery image 的证明。
 
@@ -90,7 +90,7 @@ python3 scripts/check-delivery.py --sandbox
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
-普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。显式手动选中的 `delivery_live` 按下文生成新的真实证明。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 `delivery_live` Strict/十三证明流程明确拒绝启动，不能用其成功状态为新预算背书；受保护真实 Node/证明验收须独立执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
 
 当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复及私人协议拒绝使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
 
@@ -116,41 +116,19 @@ python3 scripts/check-delivery.py --sandbox --prove-small prepare
 
 公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
 
-同一 Held 快照分别验证正常 publish/open/withdraw 的 17 atoms、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。公开固定的测试种子不为生产保密背书。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
+同一 Held 快照分别验证正常 revealBatch、可选 Open 与 withdrawBudget 的 17 atoms、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。公开固定的测试种子不为生产保密背书。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
 
 结果在 `.artifacts/vdp/canonical/small/<work-id>/public/`，每个阶段单独上传精确白名单。`context.json`、`summary.json` 和 `resources.json` 之外，合格关系项只有 `partials/relation-N/part.json` 及实际 `.json`、`.receipt` 两个证明文件。`VERIFIED_PARTIAL` 要求当前 host 的二进制正验、Node 单一构造的 intended wrong-journal 拒绝、全部控制、Node 清理和最终 cgroup 无 OOM 观察通过。Node 后续失败或资源 UNKNOWN/OOM 时，只能保留当前 host 已按实际 profile/context 独立验真的证明对，标为 `UNQUALIFIED`，不写可复用证书，也不满足缺项。未验真的字节永不上传。prepare 的 `PREPARED` 和本机 `local-control` 均不代表证明成功。
 
 完整验收候选通过独立二进制检查后，`proofs/` 恰好保留原四关系的九个文件，manifest 和核心 loader 不放宽。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的完整 bundle，摘要将 `VERIFIED_BUNDLE` 与整体 `FAIL` 分开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`。原文、恢复文件、E、witness、接收秘密、私钥、vectors、Succinct checkpoint、calldata 与原始日志均不上传。CPU 是整个 sandbox 区间增量，`memory.peak` 是容器生命周期累计峰值，复用验证耗用不替代原证明耗用。任何证明、结算、恢复、清理或资源检查失败都不能报告完整实验通过。
 
-现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
+旧 `delivery_live` 与 `verify-node.py --delivery` 依赖 Strict/十三证明和逐单 fund/publish，已明确拒绝其原启动协议。相关历史 artifact/控制器纯自检可继续用于识别旧证据，但不运行当前受保护付费，也不计入当前产品完成项。该手动选项不得被当成新预算验收；普通核心 CI 不自动生成新证明。
 
-该入口还通过 `mobile.yml` 的 `workflow_call` 构建同一提交的 Android release APK，不构建 iOS。Android 构建记录实际 APK 摘要、release variant、application id，以及 arm64-v8a 和 x86_64 两份安全库的 ELF ABI 与摘要。`delivery-live` 只接收同一 run、同一 SHA 的 Android、Linux x64 Node 包、Web 和 WASM，并重新核对源码、归档和原生库字节及生成资源的隐私收据。
+当前预算真实进程入口为 `run-delivery-live.py --protected-config <0600-final-config>`，内部调用当前 `verify-node.py --delivery-protected`。它要求 clean HEAD、精确 Linux CLI/Core/crypto/host/r0vm/profile/ELF 摘要与原资源硬界，新建五份 genuine receipt、两笔订单和三种真正2slot批次，并核对自动提款与真实重启。详细配置见 [受保护交付验收](e2e.md#验证受保护付费交付)。`run-delivery-live.py --protected-selfcheck` 不启动链、Node、套接字或证明，不等于执行该验收；该模式没有自动接入旧 `delivery_live` job，也不替代独立渲染证据。
 
-Android 的 UBRN 配置保留项目自行维护的 `android/proguard-rules.pro`，与现有 CMake、Gradle 和 manifest 一样列入 `noOverwrite`。生成器不得以通用 JNA 规则覆盖实际 React Native 模块的 R8 keep 规则。打包后仍要求整个源码 checkout 与本次提交一致，不通过恢复文件或忽略 dirty 状态补造来源。
+当前受保护验收通过正式产品入口完成：两个 paid/recoverable 单窗口订单、同一预付预算、`confirm_batch`、P 的 `ready_windows` 与显式 `budget flush`。实际 reserveBatch、holdBatch、revealBatch 均须至少一笔含两个不同 slot；S 上传完必要对象并离线后，P 独立 earned/withdraw，R 实际恢复原文件。新的最小五份真实证明驱动、真实重启、同 HEAD 制品及界面渲染需分别验收，不能用合约探针、旧17 fixture 或 parser 自检替代。正式公开 bundle 使用 schema2，`observe-settlement.mjs` 只读原链，核对 pinned runtime、逐窗 genuine Source/Hold、同 canonical anchor 的预算与订单、实际方法/事件/金额/余额和 gas。binary receipt 还必须由官方 host 独立验真。
 
-固定 sandbox 先运行打包 Node 的真实网页进程。只有明确的 GLIBC symbol 或 loader 不兼容才从同一提交和已经验证的 Web/WASM 实际构建 Node，并单独记录这一来源。业务或验收失败直接阻塞任务。任务安装固定 guest 编译器，重编实际 guest 和 host，核对产品 profile，构建真实 QUIC probe，再写入权限为 `0600` 的全新本机部署配置。
-
-以下完整付费验收由外层脚本调用 `verify-node.py --delivery --delivery-ui-control <私有描述文件>` 并启动真实 Web 和 Android worker。单独运行 `--delivery` 不会启动这两个 UI，也不覆盖普通 UI 订单、完整分支与十三份证明的联合验收。`--delivery-ui-selfcheck` 只检查 controller 自身，不生成业务证据。
-
-完整入口生成十三份唯一真实证明。严格最大文件订单产生七份，原文件必须覆盖实际 130816 字节边界，独立只读 observer 验证实际 29 TestToken 提现。rotate、revoke、register 产生三份新的密钥证明，记录实际 serial、intent、交易及 journal 和 receipt 摘要。普通订单复用最后有效的 register 证明，由真实网页选文件、确认报价和付款，真实 Android 接收、断线、恢复并保存 4096 字节原文件，再产生三份 source、hold、open 证明。普通订单使用自己的四份公开证明 bundle 和只读 observer，独立核对 17 TestToken 提现。复用的 binding 不计为新证明。
-
-同一严格订单还执行 16 项客户端权限检查、7 项有效 Agent token 检查、8 项服务授权检查，以及三台 Node 各自的 RPC、SYNC、BLOB 私人协议拒绝。真实普通成员和本机会话保留同网络读权限，写入和付款需要管理成员。Agent 工具正例在拒绝前后都成功，过期服务授权使用实际 Provider 正确签名。检查时钱包实际解锁，财务、对象、设置、DAG 和工作记录保持不变，正常 Agent 完成只增加原回合的一条回复。公开 summary 只包含固定计数和前后状态摘要，不导出 token、服务授权签名字节或本机启动材料。
-
-外层脚本在宿主启动 Chromium 和专属 root AOSP x86_64 AVD。受认证的 loopback controller 发布私有 `0600` 描述文件后，两个 e2e worker 同时驱动 Web 和指定 Android APK。Node 验收与 e2e 必须同时成功，订单、intent、文件 SHA-256、离线观察及真实保存记录均须一致。仅退出码为零、跳过测试或已有公开 fixture 均不能通过。任一进程失败会终止本任务另一进程，恢复本任务接收端的 ADB reverse，并关闭专属 AVD 和私有 ADB server。
-
-controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数据进入全部分支。`stage` 明确区分 `bootstrap`、`inspections`、`ordinary`、`complete`。两个 UI 提前配对并观察原订单的部分退款、真实 HTTP502 未知交易，以及接收密钥 key1 到 Rotate2。检查时钱包锁定，广播数为零，proof 和金融 intent 行保持不变，故障清除后才确认检查。只有 `stage=ordinary` 才允许普通订单的 prepare、confirm、accept。单次 inspection 有独立上限；整个 UI 测试与宿主 join 使用既有 LIVE 剩余总截止，普通订单自身仍保留原一小时上限。
-
-`ui-inspections.json` 只包含四次真实 Node 和 PNG 交叉验证的检查结果，生成证明数为零。外层按严格订单的 public journal 绑定 source/receiver Peer 和 key ID、serial，再核对实际分支的 12/12/17、未知状态下撤回的窗口证明，以及四张 PNG 的字节摘要。普通订单另保留 `web-settled.png`，与原 17/17/0 及真实 Web 验收共验。真实 provider 已提交前缀、held 和 key-published 的 SIGKILL 恢复结果另按固定 case 投影，明确复用了原订单的缓存材料。
-
-整个 Node、EVM、prover 和其包装进程保持 root、固定 HOME、既定四挂载及同一 cgroup，内存上限为 11 GiB，零交换，上限为 64 个进程。Node 使用两个 Tokio worker threads。容器只增加 host network，共享本机 loopback。宿主 UI 和 AVD 不计入该 proof cgroup 的资源记录。任何 OOM 计数增长、资源观察失败或缺少证明均失败。只有 proof、两个真实 UI 和清理全部成功后，宿主才把 `PROOFS_PASS` 更新为最终 `PASS`。
-
-若 paid process 后续失败，外层只尝试保留本次唯一 summary 对应的 strict 七份公开证明。全部 receipt 必须由当前 host 再次验真，绑定当前 image、profile、journal 与 receipt 摘要，且原独立 observer 确认 strict 29 的实际收付款，才整组发布。缺少任何数据均不发布该组。`partialEvidence.scope=strict-only` 始终伴随整体 FAIL，不代表分支恢复、普通 UI 或当前 canonical 状态通过。UI 先失败时，固定 controller abort 后仅在原总截止内给收尾留证一个有界窗口，随后执行原定清理并保留原异常。
-
-完整验收还要求本次 session 的固定 branch index、全部 24 个有限分支、三个 key 观察及 core-restored。逐项核对 index 的文件 SHA-256、真实 ledger、Node 观察范围、同一生命周期 journal 和恢复后的 strict 29 TestToken 结果。缺少任一分支、恢复仍为 pending、旧文件摘要不同或只剩证明总数，均不能通过。incoming 分支只证明原 Node 签名交易在受控原链的实际资金行为，保留 `NOT_TESTED_ORIGINAL_BROADCAST_RAW_ONLY` 标记。
-
-宿主用 `xvfb-run` 分配专用 DISPLAY、`1440x1000x24` 屏幕及任务内的 `0600` XAUTHORITY，Web 使用 headed 模式。e2e 全程视频仍关闭。测试只在配对后录制三个指定短片，Web 为报价确认和同 intent 重载，Android 为接收后离线与恢复后保存。每段最多 180 秒。宿主独立核对 MP4 容器、视频流、时长、文件 SHA-256 和真实退出方式，合并两端独立收据为 `video-metadata.json`。ffmpeg 必须以 q 正常退出，Android screenrecord 保留实际 SIGINT 对应的退出码或信号。
-
-上传清单仅含公开 receipt 与对应 JSON、两个 settlement bundle 及各自 observer、安全 summary/resource、固定白名单中的分支与恢复记录、原有五个 UI JSON 和 PNG、检查清单及指定新增五张 PNG，以及 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4` 和对应合并元数据。分支记录是受控分支的历史证据，不能当作恢复后的当前 canonical 状态。join 邀请、全程 attempt 视频、trace、controller token、原始文件、Node 数据、钱包、私密见证及原始日志不上传。测试链限 loopback 31337，不使用真实资产、公共部署或 AI Provider，也不据此宣称绝对链终局性或 iOS 付费验收。
+首次 E 外发门、签名私密状态、DisclosedOutstanding 近截止恢复、nonce-consuming revert 后原 cap 新 attempt、锁钱包/关实验室的只读对账都属于原生安全验收。固定本地 policy、两次确认或 cached genuine17 不构成公网活性、真实稳定币或绝对公平证明。见 [受保护预算说明](paid-delivery.md)。
 
 ## 定期、手动和发布检查
 

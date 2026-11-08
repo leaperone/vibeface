@@ -5,8 +5,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 
 export const root = path.dirname(fileURLToPath(import.meta.url));
-export const artifacts = path.resolve(root, '../../.artifacts/vdp/contracts');
-export const requireDependency = createRequire(path.join(artifacts, 'package.json'));
+const dependencyRoot = path.resolve(root, '../../.artifacts/vdp/contracts');
+export const artifacts = process.env.DELIVERY_CONTRACT_ARTIFACTS || dependencyRoot;
+export const requireDependency = createRequire(path.join(dependencyRoot, 'package.json'));
 export const abiFile = process.env.DELIVERY_ABI_FILE || path.resolve(root, '../../crates/delivery/abi/Statement.sol');
 export const schema = fs.readFileSync(abiFile, 'utf8');
 const solc = requireDependency('solc');
@@ -14,7 +15,7 @@ const solc = requireDependency('solc');
 export function compile({ writeTrust = false, checkTrust = false } = {}) {
   if (writeTrust && checkTrust) throw Error('--write-trust and --check-trust are mutually exclusive');
   const sources = { 'crates/delivery/abi/Statement.sol': { content: schema } };
-  for (const name of ['DeliveryEscrow.sol', 'CumulativeChannel.sol', 'TestAdapters.sol', 'RiscZeroAdapter.sol']) {
+  for (const name of ['DeliveryEscrow.sol', 'TestAdapters.sol', 'RiscZeroAdapter.sol']) {
     sources[`contracts/delivery/${name}`] = { content: fs.readFileSync(path.join(root, name), 'utf8') };
   }
   const pins = JSON.parse(fs.readFileSync(path.join(root, 'verifier-sources.json')));
@@ -41,7 +42,7 @@ export function compile({ writeTrust = false, checkTrust = false } = {}) {
     fs.writeFileSync(path.join(artifacts, 'build', `${name}.json`), JSON.stringify({
       abi: contract.abi, bytecode: `0x${contract.evm.bytecode.object}`, deployedBytes: bytes,
     }, null, 2));
-    if (['DeliveryEscrow', 'CumulativeChannel', 'RiscZeroAdapter', 'RiscZeroGroth16Verifier', 'TestToken'].includes(name)) {
+    if (['DeliveryEscrow', 'RiscZeroAdapter', 'RiscZeroGroth16Verifier', 'TestToken'].includes(name)) {
       trust.contracts[name] = { runtime: `0x${contract.evm.deployedBytecode.object}`,
         immutable_ranges: Object.values(contract.evm.deployedBytecode.immutableReferences || {}).flat().sort((a, b) => a.start - b.start),
         immutable_groups: Object.values(contract.evm.deployedBytecode.immutableReferences || {}).map(group => group.toSorted((a, b) => a.start - b.start)) };

@@ -5,7 +5,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
@@ -32,7 +32,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
   const { directory } = useDevice()
   // Paid delivery and its test chain stay out of sight unless 实验功能 is on in settings.
   const [experiments] = useExperiments(mobilePlatform.storage)
-  const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
+  const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null })
   const [file, setFile] = useState<TransferFile | null>(null)
   // Feedback shows next to the control that caused it, not at the top of a long page.
   const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
@@ -47,10 +47,13 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
   // Paid already on at this Node stays visible, so it can be seen and turned off.
   const paid = experiments || !!status?.paid_enabled
   const sending = draftFor(draft, paid)
+  const availableBudgets = delivery.budgets.filter(budget => budget.state === 'open' && budget.payer.toLowerCase() === status?.wallet.address?.toLowerCase())
+  const preparedBatch = delivery.orders.filter(order => order.role === 'sender' && order.mode === 'paid' && order.phase === 'prepared' && order.payment.budget_id === draft.budget_id)
+  const canConfirmBatch = preparedBatch.length === 2 && preparedBatch.every(order => order.windows.length === 1)
   const mine = receiverChoices(directory?.members ?? [], status?.node_peer ?? '')
   const picked = mine.some(item => item.device_id === draft.receiver_peer)
   const receiverId = <InputField label={transferCopy.receiver} value={picked ? '' : draft.receiver_peer} disabled={working} onChange={receiver_peer => setDraft({ ...draft, receiver_peer })} peer />
-  const unusable = working || !file || !draft.receiver_peer || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
+  const unusable = working || !file || !draft.receiver_peer || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && (!status?.paid_enabled || !sending.budget_id)
   const prepare = (restart?: string) => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, restart) } }
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {feedback('page')}
@@ -89,10 +92,16 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <InputField label={transferCopy.provider} hint={transferCopy.providerHint} value={draft.provider_peer} disabled={working} onChange={provider_peer => setDraft({ ...draft, provider_peer })} peer />
         {paid ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
         {sending.mode === 'paid' ? <>
-          <Text className="text-meta text-muted-foreground">什么时候付款</Text>
-          <Segmented options={acceptanceOptions} value={draft.acceptance} disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
+          <Text className="text-meta text-muted-foreground">{transferCopy.protected}</Text>
+          <Text className="text-meta font-medium">预付预算</Text>
+          {availableBudgets.map(budget => <Pressable key={budget.budget_id} accessibilityRole="radio" accessibilityState={{ checked: draft.budget_id === budget.budget_id, disabled: working }} disabled={working}
+            className="min-h-11 flex-row items-center gap-3 rounded-lg border border-border px-3" onPress={() => setDraft({ ...draft, budget_id: budget.budget_id, provider_peer: budget.provider_peer, max_gas_amount: budget.gas_cap })}>
+            <Text className="min-w-0 flex-1">{budget.budget_id.slice(0, 12)} · 可分配 {budget.free}</Text>
+            {draft.budget_id === budget.budget_id ? <Icon as={Check} className="size-4 text-primary" /> : null}
+          </Pressable>)}
+          {!availableBudgets.length ? <Text className="text-meta text-muted-foreground">先在发送设备本机建立预付预算，再刷新。</Text> : null}
           <InputField label={transferCopy.serviceCap} value={draft.max_service_amount} disabled={working} onChange={max_service_amount => setDraft({ ...draft, max_service_amount })} numeric />
-          <InputField label={transferCopy.gasCap} value={draft.max_gas_amount} disabled={working} onChange={max_gas_amount => setDraft({ ...draft, max_gas_amount })} numeric />
+          <Info label={transferCopy.gasCap} value={draft.max_gas_amount} />
         </> : <IconLine icon={ShieldCheck} tone="text-success" text={transferCopy.free} />}
         <View className="flex-row flex-wrap items-center gap-x-3 gap-y-2">
           <Button variant="outline" disabled={working} onPress={() => void picker.run('pick', async () => { const picked = await mobilePlatform.files?.pick(); if (picked) setFile(picked) })}><Icon as={picker.busy === 'pick' ? LoaderCircle : File} /><Text>选择文件</Text></Button>
@@ -111,11 +120,29 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         </Details>
       </View> : null}
     </>}
+    {paid && delivery.budgets.length ? <View className="gap-3 rounded-xl border border-border bg-card p-4">
+      <Text role="heading" className="text-heading font-semibold">预付预算</Text>
+      {delivery.budgets.map(budget => <View key={budget.budget_id} className="gap-2">
+        <Info label="预算" value={budget.budget_id} />
+        <Info label="可分配 / 已占用" value={`${budget.free} / ${budget.locked}`} />
+        <Info label="已收到待批次核验的窗口" value={budget.ready_windows.length.toString()} />
+        <Info label="累计赚取 / 提款 / 退款" value={`${budget.earned} / ${budget.withdrawn} / ${budget.refunded}`} />
+        {budget.payee.toLowerCase() === status?.wallet.address?.toLowerCase() ? <Button variant="outline" disabled={working || budget.ready_windows.length === 0 || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onPress={() => { setOrigin('page'); void delivery.flushBudget(budget.budget_id) }}><Text>结算已就绪批次（最多两窗）</Text></Button> : null}
+      </View>)}
+      {canConfirmBatch ? <View className="gap-2">
+        {preparedBatch.map(order => <Text key={order.order_id} className="text-meta">{order.name} · 服务费 {order.payment.total}</Text>)}
+        <Button disabled={working || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onPress={() => { setOrigin('page'); void delivery.confirmBatch(preparedBatch) }}><Text>确认这两笔并同批分配预算</Text></Button>
+      </View> : null}
+    </View> : null}
     <View className="gap-3">
       <View className="flex-row items-center justify-between gap-3">
         <Text role="heading" className="text-heading font-semibold">传输记录</Text>
         <Button variant="ghost" disabled={working} onPress={() => { setOrigin('page'); void delivery.refresh() }}><Icon as={delivery.busy === 'refresh' ? LoaderCircle : RefreshCw} /><Text>刷新</Text></Button>
       </View>
+      {receivingBatches(delivery.orders).map(([budgetId, batch]) => <View key={budgetId} className="gap-2 rounded-xl border border-border bg-card p-4">
+        {batch.map(order => <Text key={order.order_id} className="text-meta">{orderTitle(order)}</Text>)}
+        <Button disabled={working || !delivery.canManage || !status?.enabled || !status.paid_enabled} onPress={() => { setOrigin('page'); void delivery.acceptBatch(batch) }}><Text>同时接收这两份文件</Text></Button>
+      </View>)}
       {delivery.orders.length ? <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{delivery.orders.map((order, index) => <Pressable key={order.order_id} accessibilityRole="button" accessibilityState={{ selected: selected?.order_id === order.order_id }}
         className={cn('min-h-16 flex-row items-center gap-3 px-4 py-3 active:bg-muted/60', index > 0 && 'border-t border-border', selected?.order_id === order.order_id && 'bg-muted/60')} onPress={() => delivery.select(order.order_id)}>
         <Icon as={roleIcons[order.role]} className="size-4 text-muted-foreground" />
@@ -140,9 +167,9 @@ function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, 
     {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
     {paid ? <>
       <Info label="传输方式" value={transferCopy.paid} />
+      <Info label="预付预算" value={order.payment.budget_id ?? ''} />
       <Info label={transferCopy.serviceTotal} value={order.payment.total} />
       <Info label={transferCopy.gasCap} value={order.payment.gas_cap} />
-      {order.acceptance === 'strict' ? <Text className="text-meta text-warning">{transferCopy.strict}</Text> : null}
     </> : <IconLine icon={ShieldCheck} tone="text-success" text={transferCopy.charity} />}
     <ErrorText error={order.error ?? ''} />
     {feedback}
@@ -158,11 +185,20 @@ function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, 
       <Text className="text-meta text-muted-foreground">{evidenceLabels[order.evidence]}。交付确认不表示真人已阅读。</Text>
       <Info label="订单" value={order.order_id} /><Info label="付款意图" value={order.intent_id} />
       <Info label="发送设备" value={order.source_peer} /><Info label="接收设备" value={order.receiver_peer} /><Info label="中转设备" value={order.provider_peer} />
-      <Info label="验收条件" value={paid ? order.acceptance === 'strict' ? '接收设备证明实际解密后结算' : '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
+      <Info label="验收条件" value={paid ? '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
       {paid ? <>
         <Info label="测试链 ID" value={order.payment.chain_id ?? ''} /><Info label="测试资产合约" value={order.payment.asset ?? ''} /><Info label="付款钱包" value={order.payment.payer ?? ''} /><Info label="固定收款钱包" value={order.payment.provider_wallet ?? ''} />
         <Info label="传输费" value={order.payment.delivery_fee} /><Info label="暂存预留费" value={order.payment.reservation_fee} /><Info label="时效优先费" value={order.payment.priority_fee} />
-        <Info label={settlementAmountsLabel(order)} value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
+        <Info label={settlementAmountsLabel(order, 'order')} value={`${order.payment.earned} / ${order.payment.refunded}`} />
+        {order.payment.settlement ? <>
+          <Info label={settlementAmountsLabel(order, 'budget')} value={`${order.payment.settlement.earned} / ${order.payment.settlement.withdrawn} / ${order.payment.settlement.refunded}`} />
+          <Info label="批次状态" value={publicationLabel(order)} />
+          {order.payment.settlement.publication ? <>
+            <Info label="本批目标赚取金额" value={order.payment.settlement.publication.total_amount} />
+            <Info label="本批完整金额截止" value={new Date(order.payment.settlement.publication.economic_cutoff * 1000).toLocaleString()} />
+            {order.payment.settlement.publication.availability_risk ? <Text role="status" className="text-meta text-warning">{order.payment.settlement.publication.availability_risk}</Text> : null}
+          </> : null}
+        </> : null}
         {deadlineRows(order).map(([label, value]) => <Info key={label} label={label} value={value} />)}
         <Text className="text-meta text-muted-foreground">时效优先费只有在其截止前完成整单才赚取。过了时效截止，仍可在结算硬截止前完成交付。暂存费支付容量预留，不代表持续存储证明。</Text>
         {order.payment.tx_hash ? <Info label="原交易" value={order.payment.tx_hash} /> : null}

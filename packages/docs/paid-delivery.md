@@ -1,203 +1,101 @@
-# 文件交付实验参考
+# 受保护预付预算实验
 
-VDP-1 为本人文件增加独立的免费传输和付费传输。传输默认关闭。节点发现不收费，不需要钱包，也不授予个人网络成员权限。普通会话同步和附件仍使用原来的私人网络协议。
+此功能只用于手动启用的本机实验室、loopback EVM 31337 和六位精度的本地 TestToken。`enabled`、`paid_enabled` 默认都是 `false`。免费发现、公益传输及公益收据继续免费，不创建付款义务；已经收到的公益文件不能事后升级为受保护付费订单。
 
-网页从“设置 → 实验室”进入，独立的免费与付费传输页面位于 `/settings/lab/transfers`，页面代码集中在 `apps/app/src/features/lab/`。实验室的“文件传输实验”开关对应当前连接 Node 的 `enabled`，需要管理成员权限。开启只恢复原免费/付费方式配置，不自动开启付费、创建钱包或发起链上密钥注册。关闭暂停传输和中转，订单、旧密钥与已保存文件保留；历史记录和具备读取条件的文件仍可查看。未完成订单需重新开启相应服务后继续，原链交易与截止时间不会撤销。移动端仍沿用原实验显示开关和传输页面。
+发送方 S 在服务前把精确条款不可撤销地分配到预付预算。Provider P 只在 genuine Source、Receiver R 的 genuine Hold 和正确 80 字节恢复包 E 满足原条件时赚取费用，后续不依赖 S 在线或再次签名。当前产品只接受 Recoverable：R 持有正确密文并具有恢复明文的条件，不代表真人已读。Strict 产品入口已撤下，不会自动改写成 Recoverable。
 
-当前付费实现只接受字面回环 HTTP 地址上的 `chain_id=31337` 测试链。仓库提供 `TestToken`，不接入真实 USDT、主网、法币或平台币。此实验不提供长期存储证明。
+## 预算和发送
 
-## 累计小额结算实验
+预算固定 payer、payee、Provider PeerID、asset 和一次存款金额。多 Provider 使用不同预算。Node 固定当前构建的 DeliveryEscrow、官方 adapter/verifier、产品 profile 和 TestToken runtime，不接受自定义 verifier、公开 RPC、主网或真实资产。
 
-累计支付通道是独立的本地链实验。付款人预存固定预算，为已有 Source 文件订单显式授权费用，完整接收收据落盘后再签发累计券。服务 Node 导入公开签名券后自行兑付。普通聊天、发现、公益传输和私人网络同步均不会自动计费；原逐窗口 ZK 托管继续独立运行。
-
-S 和 P 的本机所有者须分别手动设置 `enabled=true`、`paid_enabled=true`，配置同一回环 HTTP `chain_id=31337` 部署，并解锁各自的钱包。`chain.escrow` 仍指向 `DeliveryEscrow`，新增的可选 `chain.channel_escrow` 指向独立 `CumulativeChannel`。合约和资产 runtime 均由本次构建的 `trust.json` 固定，挑战窗口为 3600 秒，资产仅为六位精度的本地 `TestToken`。通道不需要启动 prover。
-
-每个通道固定付款钱包、服务钱包、服务 PeerID、资产和一次性押金，不追加押金。ID 在合约内由链、合约、实际付款人和唯一 salt 派生，关闭后不能复用。EIP-712 累计券绑定链、合约、通道、递增序号、累计金额及最后一笔完整收据承诺。任何人可提交券，合约只将尚未兑付的差额付给固定服务钱包；过期或重复券不能重复扣款。
-
-费用只接受最小代币单位的十进制整数。六位精度下 `1` 表示 `0.000001 TestToken`。比一个最小单位更细的业务费用须先累计用量，再显式授权整数单位；CLI 不做小数换算，也不会逐消息向上取整。示例费率不表示商业价格或主网成本。
-
-以下命令均经同用户维护 socket 执行。先按下文配置、创建并解锁 S/P 各自钱包，测试链账户还需为两个钱包提供测试 gas，并为 S 提供测试代币。各 UUID 使用本轮唯一、重试保持不变的值。
+在 S、P 的本机维护命令中创建并解锁独立钱包，备份保管方式沿用钱包命令。密码只通过受保护 FD 传递。R 先用现有 `register-key` 操作完成真实接收密钥注册，再准备订单；历史接收密钥仍保留给已分配订单。
 
 ```sh
-# 持续运行的本地链，公开输出包含原 escrow、channel_escrow、asset 和 profile。
-node contracts/delivery/deploy-local.mjs --channel --listen 127.0.0.1:0 \
-  --output "$PWD/.artifacts/channel-deployment.json"
-
-# 在另一终端把输出部署字段写入 S/P 的 delivery 配置后，分别应用。
-vibeface wallet --data-dir /absolute/source configure /absolute/source-delivery.json
-vibeface wallet --data-dir /absolute/provider configure /absolute/provider-delivery.json
-vibeface wallet --data-dir /absolute/source channel open --intent-id "$OPEN_UUID" \
-  --payee "$PROVIDER_WALLET" --provider-peer "$PROVIDER_PEER" --budget 100 \
-  --gas-cap 100000000000000000
-
-# 保存返回的 CHANNEL_ID，显式授权已有 Source 订单的一笔费用。
-vibeface wallet --data-dir /absolute/source channel authorize --channel-id "$CHANNEL_ID" \
-  --order-id "$SOURCE_ORDER_ID" --amount 7 --intent-id "$CHARGE_UUID"
-# 仅在 Source 保存接收方的完整文件签名收据后签发。
-vibeface wallet --data-dir /absolute/source channel issue \
-  --order-id "$SOURCE_ORDER_ID" --intent-id "$CHARGE_UUID"
-vibeface wallet --data-dir /absolute/source channel export \
-  --channel-id "$CHANNEL_ID" /absolute/public-voucher.json
-vibeface wallet --data-dir /absolute/provider channel import /absolute/public-voucher.json
-vibeface wallet --data-dir /absolute/provider channel redeem --channel-id "$CHANNEL_ID" \
-  --intent-id "$REDEEM_UUID" --gas-cap 100000000000000000
-vibeface wallet --data-dir /absolute/source channel close --channel-id "$CHANNEL_ID" \
-  --intent-id "$CLOSE_UUID" --gas-cap 100000000000000000
-# 到达 closes_at 后退回剩余押金，接收地址固定为付款钱包。
-vibeface wallet --data-dir /absolute/provider channel refund --channel-id "$CHANNEL_ID" \
-  --intent-id "$REFUND_UUID" --gas-cap 100000000000000000
-vibeface wallet --data-dir /absolute/source channel status --channel-id "$CHANNEL_ID"
+node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output "$VDP_RUN/deployment.json"
+vibeface wallet --data-dir "$VDP_SOURCE" budget open \
+  --intent-id "$VDP_OPEN_UUID" --payee "$VDP_PAYEE" --provider-peer "$VDP_PROVIDER_PEER" \
+  --deposit 10 --gas-cap "$VDP_PAYER_CAP_WEI"
+vibeface wallet --data-dir "$VDP_SOURCE" budget status --budget-id "$VDP_BUDGET_ID"
 ```
 
-链上动作可能先返回 `included` 或 `unknown`。保留 UUID、通道、金额和 gas cap，重试原命令对账；不得换 UUID 当作原交易失败。一次 open 的精确 approval 和 deposit 共用同一 gas cap。费用授权原子占用通道预算，不可通过改金额、UUID 或换通道覆盖；同一 Source 订单只能收费一次。issue 重试返回原券，后续订单增加累计序号与金额。Node 在返回券前原子保存订单去重、累计状态和签名券。
+开户命令先精确 approve，再 openBudget。同一 UUID 和条款重试原 intent，不重开预算。存款、服务金额都是测试代币最小单位；gas cap 是原生币 wei。payer 和 provider 各自的 cap 按预算累计，包括开户/分配、Hold、揭钥、提款以及失败 attempt 的保守最大 gas 承诺；换交易不能重置它。`provider_gas_cap` 在 P 第一次接受该预算时固定，不再按每个订单重新授权。
 
-export 仅包含公开条款和签名，不含钱包或接收密钥，锁定或关闭实验后仍可导出。新 import 需要两个实验开关，但不要求解锁钱包。钱包锁定、付费开关关闭或部署改变会阻止新签名和广播。
+现有实验室文件传输页选择预付预算，固定中转设备及累计链费上限，再准备文件。Prepare 必须包含 `budget_id`，只接受 `acceptance: "recoverable"`。确认单单使用原 `confirm`；两笔不同的单窗口订单先分别 prepare，再明确确认同批：
 
-付款人发起关闭后，P 必须在链上 `closes_at` 之前提交最高券；到达截止时间后仅退未兑付余额。服务先完成、付款人后签券，付款人仍可拒签，P 承担这次服务的信用风险。收据是接收 Node 对完整清单的签名确认，不是链上 ZK 交付证明，不能保证公平交换、独有带宽贡献或永久离线兑付。
+```json
+{"op":"confirm_batch","intent_ids":["<A UUID>","<B UUID>"]}
+```
 
-`verify-channel.mjs` 验证合成本地结算。真实 Node 验收使用 `verify-node.py --delivery-channel`：先执行默认免费的公益验收，再显式开启通道，用真实 Source 订单和实际恢复文件的收据签发三笔费用。构建命令见 `contracts/delivery/README.md`。普通 `--delivery-charity` 不启动链、不创建钱包、不收费。
+同一 Source 和 Receiver 各最多处理两个活跃窗口，原操作锁及证明锁继续生效。批次确认一次事务保存两份明确授权；后台按原证明执行器逐份生成 Source，全部就绪后才单笔 reserveBatch。预算不足会整批拒绝；未完成分配之前不提供付费传输。页面展示两笔订单的名称和费用后，由管理成员确认该批，不替用户自动确认别的草稿。
 
-## 角色与信任
+`wallet budget reserve --budget-id ID --order-ids A B --intent-id UUID` 可显式提交已经确认且 Source 证明齐全的本机订单。正常 confirm/confirm_batch 已完成分配时不必再执行它。
 
-| 角色 | 职责 |
-| --- | --- |
-| 发送 Node，S | 接收本人选择的文件，切分并加密，固定条款，生成 source 证明并付款。 |
-| 服务 Node，P | 提供报价，暂存密文 C 和接收方加密密钥包 E，按合约条件发布 E 并提取已赚费用。 |
-| 接收 Node，R | 经本人授权接收，完整持有 C，生成 hold 证明，取得 E 后解密并生成 open 证明。 |
+## Hold、批次揭钥和提款
 
-S 和 R 可以属于不同个人网络。P 可以是没有个人网络成员关系的 `public_entry`。服务通道认证 PeerID，个人网络通道另外验证成员资格。付款、报价或发现记录均不能访问私人事件、附件、Agent 或模型密钥。
+R 明确接受订单，完整密文落盘后产生 Hold。P 的请求处理器只耐久保存 Hold 授权，不立即公开 E。R 等待批次是正常可恢复状态；实际恢复后不会再自动启动 Open 证明。显式 Open 仅能为已经 Earned 的窗口增加解密证据，不能阻止付款。
 
-浏览器先把明文文件交给当前连接的可信 S。传输加密保护 S、R 与 P 之间的对象，不能隔离恶意的发送端、接收端或提供客户端代码的网页 origin。P 看不到文件名和正文，但能看到 PeerID、对象大小、哈希、时间和访问关系。付费合约还公开钱包、条款、证明和 E。E 是给 R 的加密密钥包，链上没有明文文件密钥。
-
-## 实验边界
-
-当前候选配置固定在 [`crates/delivery/proof/profile.json`](../../crates/delivery/proof/profile.json)。Node 拒绝其他 image、schema 或资源配置。
-
-| 项目 | 上限或规则 |
-| --- | --- |
-| 每个窗口明文 | 65536 字节。 |
-| 窗口数 | 2。 |
-| 窗口明文总量 | 131072 字节，包含私有文件封装。 |
-| 客户端原文件 | 130816 字节，文件名另限 128 字节。 |
-| 每个 C | 对应窗口明文长度加 68 字节。 |
-| 每个 E | 80 字节。 |
-| guest cycles | 64000000。 |
-| profile 内存上限 | 17179869184 字节，实际运行还必须受 Linux cgroup 硬限制。 |
-
-逐窗口付费传输的 S 和 R 需要匹配 profile 的本机 prover、可信 `r0vm` 和 Linux cgroup v2。cgroup 必须禁用 swap，并限制进程数不超过 64。P 只验证和转交证明，不需要本机 prover。构建、guest 执行、真实 Groth16 证明、资源限制和链上结算是分别验收的结果。
-
-公益采用独立签名条款和加密上下文，当前 Node 使用相同的文件容量边界。它不伪造链地址、钱包、registry 或付费证明，只有公益签名收据。
-
-## 交付与结算
-
-付费订单按窗口推进。S 的 source 证明校验签名、完整有序 manifest，以及明文、C、E 和条款的对应关系。R 的 hold 证明包含完整 C、接收私钥和接收同意签名。open 证明实际执行 E 解封及 C 解密，不接受外部声称的明文或文件密钥。
-
-| 结算条件 | 窗口费用何时变为 P 的收入 |
-| --- | --- |
-| 普通验收 `recoverable` | 合约已接受 hold，P 在期限内原子发布完整且哈希匹配的 E。R 已证明持有 C 和相应私钥，因此具备恢复条件。 |
-| 严格验收 `strict` | 合约已接受 hold 和 E，并在期限内接受 R 的 open 证明。 |
-
-`recoverable` 不表示 R 已经执行解密。`decryption_proven` 证明指定 R 的计算完成了解密，不证明真人阅读、文件内容有商业价值，或副本永远可用。严格验收依赖 R 提交 open。R 离线、拒绝提交或丢失密钥时，P 可能无法收款。
-
-这些证明校验内容对应关系及 R 持有的材料，不能计量真实物理路径、P 独有的带宽贡献或防止参与方串通。此版本按完成窗口结算，不把证明当作网络流量计量。
-
-普通订单的 open 可以补充更强证据，不重复计费。E 发布后不提供删除入口。已发布 E 仍需与 R 保有的完整 C 和旧接收密钥配合使用。
-
-## 费用和期限
-
-服务费为所有窗口的 `delivery_fee`、`reservation_fee`，再加整单 `priority_fee`。金额均为测试代币最小单位的十进制整数。链费预算单独以测试链原生币最小单位表示，不属于服务费托管。
-
-传输费和暂存预留费只在该窗口达到约定验收条件时一起赚取。预留费购买暂存容量承诺，不是按持续存储证明支付的租金。时效优先费只在所有窗口均赚取、且最后完成不晚于独立的 `priority_deadline` 时赚取一次。默认测试费率不是商业定价或美元报价。
-
-期限单位为 Unix 秒，由订单固定，重试不能更改。
-
-| 字段 | 含义 |
-| --- | --- |
-| `quote_expires_at` | 最晚付款入约时间。 |
-| `hold_deadline` | 最晚接受 hold 的时间。 |
-| `key_deadline` | 最晚发布 E 的时间，也是普通验收的结算硬截止。 |
-| `open_deadline` | 最晚接受严格 open 的时间。 |
-| `retain_until` | 订单约定的材料保留期限。 |
-| `priority_deadline` | 整单时效优先费的独立截止。 |
-
-条款要求 `quote_expires_at <= hold_deadline < key_deadline <= open_deadline <= retain_until`。时效截止必须晚于报价截止，且不晚于所选验收的硬截止。超过时效截止仍可在硬截止内交付，P 只失去时效优先费。
-
-未 hold 的窗口在 hold 超时，或接收 registry 已轮换、撤销时可退款。已 Held 的窗口须等 E 发布超时。严格模式已发布 E 的窗口须等 open 超时。退款只退该窗口未赚取的两项服务费，不撤销其他窗口收入。已有退款终态的窗口不能再次赚取。
-
-时效优先费在已不可能赚取时单独退回。付款人只能在没有 Held、KeyPublished 或 Earned 窗口时取消整单。任何 keeper 都能提交合约允许的证明、退款或提款，但退款地址固定为付款人，提款地址固定为 P。链上 revert、代币冻结或转账异常不会消除尚未支付的债权。已消耗 gas 不在服务退款范围内。
-
-## 本机设置和钱包
-
-交付设置保存在数据目录的 `delivery-settings.json`，由 `vibeface wallet --data-dir <目录> configure <JSON文件>` 应用。它与个人网络的 `config.json` 分开，配置不改变设备身份。默认值如下。
-
-| 字段 | 默认值或要求 |
-| --- | --- |
-| `enabled` | `false`。服务总开关。 |
-| `charity_enabled` | `true`，仅在总开关打开后生效。 |
-| `paid_enabled` | `false`。 |
-| `storage_limit_bytes` | `67108864`。对象、私密材料和证明收据共享配额，允许范围为 131208 至 1073741824。 |
-| `max_orders` | `128`，允许范围为 1 至 128，历史终态订单也占用槽位。 |
-| `chain` | 默认 `null`。付费时指定 `rpc_url`、`chain_id`、`escrow`、`asset`、完整 `profile` 和 `confirmations`。独立通道另需 `channel_escrow`，不替换原 escrow。 |
-| `prover` | 默认 `null`。证明端指定绝对路径 `program`、`r0vm`、`cgroup` 和完整 `profile`。 |
-| `delivery_fee_per_window` | `"10"`，测试代币最小单位。 |
-| `reservation_fee_per_window` | `"2"`，测试代币最小单位。 |
-| `priority_fee` | `"5"`，测试代币最小单位。 |
-| `provider_gas_cap` | `"0"`，付费 P 必须另行授权非零链费预算。 |
-
-网页只能更改三个服务开关，链部署、prover 路径和钱包由本机所有者配置。创建、解锁和锁定通过同用户维护 socket 完成。钱包口令由关闭回显的 TTY，或所有者私有文件、管道的 `--passphrase-fd` 输入，不放进参数、环境变量、网页或聊天。口令须为单行 UTF-8，长度 12 至 1024 字节。
-
-实验版没有订单归档接口。达到订单上限后拒绝新单，已有订单继续可查询和取回。订单账本和旧接收密钥必须随完整数据目录保留。
-
-EVM 钱包独立于 Ed25519 设备身份和 X25519 接收密钥。钱包创建后保持锁定，每次 Node 重启也保持锁定。`absent` 表示未创建，`unavailable` 表示现有钱包无法读取，不能当作未创建并覆盖。锁定的钱包可以观察原交易，不能签新交易或重播原 raw transaction。
-
-## 接收密钥和恢复材料
-
-接收密钥注册、轮换和撤销只通过本机所有者命令完成，不向网页或 Agent 开放。操作不更换设备 PeerID 或 EVM 钱包。
+P 可以在现有实验室预算区或本机 CLI 先查看就绪窗口，再明确结算当前最多两个窗口：
 
 ```sh
-vibeface wallet --data-dir <目录> register-key --intent-id <UUID> --gas-cap <原生币最小单位>
-vibeface wallet --data-dir <目录> rotate-key --intent-id <UUID> --gas-cap <原生币最小单位>
-vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原生币最小单位>
+vibeface wallet --data-dir "$VDP_PROVIDER" budget status --budget-id "$VDP_BUDGET_ID"
+vibeface wallet --data-dir "$VDP_PROVIDER" budget flush --budget-id "$VDP_BUDGET_ID"
 ```
 
-轮换生成新的 X25519 接收密钥。撤销递增 registry serial，并停止新订单使用旧 key。两者均保留旧 KeyId 材料，已 Held 订单继续使用原密钥。尚未 Held 的旧 serial 窗口在 registry 确认后不能继续 hold，可以按合约退款。撤销后只有本机所有者以新 UUID 显式 `register-key` 才重新开启接收，读取状态不会自动恢复它。
+状态中的 `ready_windows` 只公开 budget/order/index，表示 P 已耐久收到 Hold 请求、恢复包完整、链上分配仍处于 Funded/Held 且未入其他 claim。它不包含 seal、E、calldata 或 raw。链上 Hold 尚未确认时，不把本机队列标成已经确认的持有证据。
 
-注册、轮换和撤销都要求显式 UUID，同一操作重试使用原 UUID 和原 gas 预算。UUID 固定 action、profile 和部署，未知结果复用原 binding、serial、证明、nonce 和签名交易。另有未决 key 操作时先对账，不另起 serial。只有响应 `registry_confirmed=true` 才代表 registry 已按确认策略生效，`submitted`、`included`、`confirming` 和 `unknown` 均未完成。
+flush 固定选中的窗口，持久授权后以一笔 holdBatch 核验逐窗 Hold，再进入唯一的持久 publication claim 路径。后台只推进已有 flush 授权、恢复 claim 和累计提款，不抢先把第二份 Hold 尚未完成的第一窗自动发出。revealBatch 不转代币；逐窗 Earned 和预算累计债权独立保存。withdrawBudget 把 `earned - withdrawn` 一次转给固定 payee，任何 keeper 都不能改收款人。
 
-`wallet backup` 只导出加密 EVM 钱包，不覆盖已存在的目标。它不包含接收私钥、订单、密文或续传和交易账本。个人根身份恢复文件也不含这些材料。停掉 Node 后备份完整数据目录，包括 `identity.json`、`delivery-settings.json`、`delivery-wallet.json` 和整个 `delivery/`。该目录含私钥及私密证明材料，须按凭证保管。
+```sh
+vibeface wallet --data-dir "$VDP_PROVIDER" budget withdraw \
+  --budget-id "$VDP_BUDGET_ID" --intent-id "$VDP_WITHDRAW_UUID"
+```
 
-恢复时保留原意图和交易账本，先对账。不要运行同一数据目录的两份副本，也不要只用旧钱包备份另起一个付款实例。缺少旧接收密钥时明确显示 `key_unavailable`，不能以新 key 冒充原订单解密成功。
+Order 的 `withdrawn` 保持 0，因为提款归属预算。页面分别展示本单 earned/refunded 和预算累计 earned/withdrawn/refunded，不能把整个预算提款算作每一单分别到账。token 冻结或转账失败保留 Earned 债权，实际到账仍依赖 token 恢复及成功提款。
 
-## 重试、状态和文件取回
+## 首次披露门与恢复
 
-订单意图 `intent_id` 为 UUID，订单内容和条款固定。确认、刷新、断线恢复和“检查进度”使用原意图。签名前在 SQLite 事务中保留 nonce、精确 calldata 和链费预算，签名交易落盘后广播。结果未知时查询原交易和链上状态，只在仍有授权时重播原字节，不换 nonce 再付款。
+P 必须显式配置本机 `publication_policy`，未配置时不提供受保护付费报价或自动揭钥。示例值只用于受控本地链，不是公网 SLA：
 
-客户端按网络、客户端、源 Node、文件和条款保存意图。同一文件的普通准备复用原意图。只有原订单终态已由 Node 核对，用户显式选择“作为新订单再次发送”才创建另一笔订单。刷新和轮询不接受订单、不确认费用，也不重新付款。
+```json
+{
+  "watchdog_seconds": 32,
+  "inclusion_seconds": 5,
+  "finality_seconds": 5,
+  "clock_skew_seconds": 2,
+  "max_fee_per_gas": "3000000000",
+  "priority_fee_per_gas": "1000000000"
+}
+```
 
-正常取消和停机会结束证明进程组。强杀 Node 后，已授权的本机证明可能继续运行；继承的文件锁阻止重启后并发证明。旧任务退出后，Node 先验真原收据再恢复。接收密钥操作继续使用原 UUID，钱包重启后仍须本机解锁。
+W 是本机最多两个活动 claim 和一个历史复查槽的调度界；每槽有 10 秒执行截止，轮询间隔 1 秒。I/F/S 分别是配置明确承担的 canonical 执行、后续最终性和时钟误差边界。网络或主机不满足这些边界时必须报告可用性风险，配置数字本身不证明边界已经成立。
 
-| 证据 | 能确认的事实 |
-| --- | --- |
-| `none` | 尚无交付证据。 |
-| `charity_receipt` | 公益签名收据，无链上强证明和付款。 |
-| `ciphertext_held` | 合约已接受指定 R 持有完整 C 和相应接收私钥的证明。 |
-| `recoverable` | 完整 C 与正确 E 已具备恢复条件。 |
-| `decryption_proven` | 合约已接受指定 R 实际解封、解密的证明。 |
+publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变签名 attempt。四种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、ExpiredUnrevealed。签好 raw 仍是私密状态。
 
-订单阶段、交付证据和资金状态分别展示。`included` 只表示入块，`confirmed` 按配置的确认深度观察，`earned` 为合约债权，`withdrawn` 才表示实际提款。浅确认不是绝对终局。检测到 reorg 或无法继续核实原交易时，Node 撤回暂定完成状态并进入 `reconciling` 或 `unknown`。
+任何含 E 的 estimateGas、eth_call、simulation 都被禁止。有限两窗 reveal 使用离线固定 800000 gas：没有 verifier 调用，每项固定 80 字节及有界 storage/事件；相关真实有限形状和合成账务用例检查该上界。runtime 改变时须重新核对，不能用真实 E 去估算。首次外发前检查原 cap、原生币余额、固定 fee 足额和无低 nonce 阻塞；raw、nonce、claim 关联原子落盘。紧邻首次可能含 E 的 RPC 再检查 `now + W + I + F + S < economic_cutoff`，耐久记录可能披露，之后才广播。RPC 超时或错误仍是 Outstanding，不能按失败另付。
 
-接收端取回先在 Node 重组并核对文件，客户端再核对完整长度、文件名和 SHA-256。Web 的保存动作只确认已交给浏览器，不能声称用户磁盘已写入。Mobile 写入独立文档文件后再次核对，再提供分享副本。
+已可能披露的同一 claim 恢复只受原经济截止和原累计授权限制，不重新套完整首次余量；否则合法披露后的临界回滚会被本机错误阻断。canonical revert 消耗 nonce 后，先对账所有原 attempt 和窗口，再按同一 claim、固定收款人及原总 cap 生成新 nonce attempt。未知、pending nonce 前进都不证明失败。当前固定费率模式没有同 nonce 自动加价/替换承诺；原 raw 可在回滚后原 nonce 合法时原样重播。
 
-## 构建与验收入口
+完整 17 由 10 传输费、2 预留费和有条件奖金 5 组成；承诺完整17的经济截止是 keyDeadline 与 priorityDeadline 的较早值。奖金为0的订单只受 keyDeadline；首次在奖金截止后组建的合法 base-only claim 只计原条款仍能赚取的费用，页面显示原报价与该批目标金额，不声称仍能赚17。已经生成的完整金额 claim 不悄悄改价、延长截止或重置 cap。
 
-规范 ABI 为 [`crates/delivery/abi/Statement.sol`](../../crates/delivery/abi/Statement.sol)，Rust 关系和字节约定见 [领域 API](../../crates/delivery/API.md)。规范构建与真实证明入口见 [proof 构建说明](../../crates/delivery/proof/README.md)。合约、只读结算观察器和本地部署工具见 [合约说明](../../contracts/delivery/README.md)。
+关闭实验室、关闭 paid、锁钱包或更改授权会停止新签名/广播，保留 claim/raw 并允许只读链上对账。用户暂停唯一执行者、无 gas、长于界限的停链/重组/审查、分配本身回滚或 fee 超出固定策略，可能导致 E 已知但收入未 canonical 成立。此模型不承诺绝对公平或任意公网活性。
 
-`deploy-local.mjs` 只在字面回环地址启动独立测试链，部署正常 escrow、固定 verifier 和 TestToken，输出公开配置，不输出私钥。完整 Node 验收使用 [e2e 的付费模式](e2e.md#验证付费交付和实际结算)，在同一受限 Linux 环境生成真实证明、完成双窗口结算并只读复核原链。当前核心 CI 在整个 fixture 目录缺失时会跳过 receipt 验证并成功退出，这属于未完成的 proof 验收，不能用绿色 CI、always-true verifier 或其他 image 的证明替代。实际跳过范围见 [CI 说明](ci.md#可验证交付的核心检查)。
+## 关闭和退款
 
-## 小文件证明与结算实验
+```sh
+vibeface wallet --data-dir "$VDP_SOURCE" budget close \
+  --budget-id "$VDP_BUDGET_ID" --intent-id "$VDP_CLOSE_UUID"
+vibeface wallet --data-dir "$VDP_SOURCE" budget refund \
+  --budget-id "$VDP_BUDGET_ID" --intent-id "$VDP_REFUND_UUID" --windows "$VDP_ORDER_ID:0"
+```
 
-实验从 4 KiB 单窗口合成文件开始，使用固定合成 S、R、P 测试身份、本机 `31337` 测试链和 TestToken。测试身份与接收密钥由公开 fixture 种子产生，不验证生产密钥保密。先生成并独立验证当前 image 的 KeyBinding、Source、Hold、Open 真实 receipt，再检验正常交付与资金状态。用于付款的证明必须绑定本次实际部署地址、条款和 manifest，生成后不能改写订单。
+只有 payer 能 close；它立即禁止新增分配，不能取消活跃权利。事后 key 轮换、撤销、其他窗口失败都不能提前撤回已经分配的款项。有限退款批次最多两个窗口，须晚于预算全部分配的最大 keyDeadline。已 Earned 费用永不退给 payer；未 Earned 部分及未赚取奖金按原条款退款。普通 keepers 可以退款到固定 payer；未花尽预算仍需退款操作，已精确花尽的关闭预算不要求零金额转账。
 
-对抗用例在发布交易仍待确认时，从公开 calldata 提取完整 E；随后让交易超时回滚或撤销发布块，检查退款、服务收入与 R 离线恢复原文件的实际结果。文件长度、SHA-256、交易回执和原链余额分别记录，不能用其中一项推断其他项。
+R 拒绝 Hold 时没有 delivery earned，预算到期可退，P 的资源支出不一定获得补偿。Source/Hold+E 不证明中继实际物理路径、独有带宽或持续存储时长；传输/预留费只是报价组成，没有新增存储或带宽证明。
 
-公开证据只包含 receipt、journal、seal、公开 manifest 和脱敏结果。私密 witness、接收私钥和临时钱包留在隔离任务目录。资源不足、未运行和验证失败须各自说明，开发模式、存根 verifier 或其他 image 的证明不算实验通过。
+## 验证范围
+
+默认相关检查仍执行合约编译/trust、`run.mjs` 受保护资金正反例、schema2 证据边界自检、官方 verifier 和真实 fixture seal 验真。账务测试使用明确标记的 digest test verifier，不能替代 genuine proof 或真实 Node。
+
+原 fee5 公益拒签、genuine17 提前披露/退款失败保留在固定旧源码及任务证据中，不因新名称变成通过。新 fee5 必须创建发送前选择的新 paid 订单并产生对应 genuine Source/Hold；旧17不能改成5，也不能变成不同订单的第二窗。最小两单样本需要一份 KeyBinding、A/B 各一份 Source/Hold，共五份真实证明。必须实际观察 reserve/hold/reveal 各自含两个不同 slot、payer 离线、R 恢复原文件及预算累计真实提款。
+
+旧 `--delivery-channel` 和 Strict/13-proof live 协议已撤下；旧 `verify-node.py --delivery`/`run-delivery-live.py` 明确拒绝原启动方式。正式 native 入口是 `run-delivery-live.py --protected-config <owner-only-final-config>`，也可使用 `verify-node.py --delivery-protected`；配置、资源和命令见 [e2e](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 只自检配置与公开证据边界，不启动进程或证明。genuine5/双单运行、实际重启、渲染及制品证据必须分别完成；只读 schema2 observer、genuine17 重验或本地单元通过不能替代这些覆盖。

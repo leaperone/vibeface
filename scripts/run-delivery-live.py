@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Join genuine paid proofs with real Web and Android delivery in one bounded run."""
+"""Run protected native acceptance or inspect historical Web and Android artifacts."""
 
 import argparse
 import hashlib
@@ -1499,10 +1499,7 @@ def self_test_ui(directory):
         observe = progress_observer("1" * 40)
         assert not list(progress_ui.iterdir()) and observe() == {}
         enter("guest-build")
-        options = argparse.Namespace(delivery_ui_control=progress_ui / "control.json")
-        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "1" * 40}), patch("runpy.run_path", return_value={"progress_writer": progress_writer}) as loader:
-            driver["delivery_progress"](options)("first-proof-starting")
-            loader.assert_called_once_with(str(ROOT / "scripts/run-delivery-live.py"))
+        progress_writer("paid", "1" * 40)("first-proof-starting")
         expected = {"inside": "guest-build", "paid": "first-proof-starting"}
         assert observe() == expected and len(output.call_args_list) == 2
         assert observe() == expected and len(output.call_args_list) == 2
@@ -1547,37 +1544,12 @@ def self_test_ui(directory):
         rejected(lambda: enter("private-wallet-marker"))
         with patch(f"{__name__}.replace_public", side_effect=OSError("private-observation-error")):
             enter("guest-build")
-        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "1" * 40}), patch("runpy.run_path") as loader:
-            driver["delivery_progress"](argparse.Namespace(delivery_ui_control=None))("first-proof-starting")
-            loader.assert_not_called()
-        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "private-wallet-marker"}), patch("runpy.run_path") as loader:
-            driver["delivery_progress"](options)("first-proof-starting")
-            loader.assert_not_called()
-    profile = json.loads((ROOT / "crates/delivery/proof/profile.json").read_bytes())
-    chain = {"rpc_url": "http://127.0.0.1:12345", "chain_id": 31337, "confirmations": 2, "profile": profile,
-             "escrow": "0x" + "1" * 40, "asset": "0x" + "2" * 40}
-    configuration = {"prover": {"program": "/prover", "r0vm": "/r0vm", "cgroup": "/sys/fs/cgroup", "profile": profile},
-                     **{key: "1" for key in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei")}}
-    options = argparse.Namespace(delivery_ui_control=None, delivery_profile=ROOT / "crates/delivery/proof/profile.json")
-    stop_before_nodes = RuntimeError("self-test stops at the existing free-network gate")
-    checkpoint = Mock(side_effect=stop_before_nodes)
-    with patch.dict(driver["delivery_paid_run"].__globals__, {"delivery_charity_acceptance": checkpoint}):
-        for url in ("http://127.0.0.1:12345", "http://[::1]:12345"):
-            try:
-                driver["delivery_paid_run"](options, configuration, {**chain, "rpc_url": url})
-            except RuntimeError as error:
-                assert error is stop_before_nodes
-            else:
-                raise AssertionError("Valid loopback RPC must reach the existing free-network gate")
-        for url in ("https://127.0.0.1:12345", "http://203.0.113.1:12345", "http://user:pass@127.0.0.1:12345", "http://127.0.0.1:12345/other"):
-            checkpoint.reset_mock()
-            try:
-                driver["delivery_paid_run"](options, configuration, {**chain, "rpc_url": url})
-            except AssertionError as error:
-                assert str(error) == "paid acceptance RPC is a literal loopback HTTP origin"
-            else:
-                raise AssertionError("A non-loopback origin must not reach the free-network gate")
-            checkpoint.assert_not_called()
+    try:
+        driver["delivery_paid_acceptance"](argparse.Namespace())
+    except ValueError as error:
+        assert "retired" in str(error)
+    else:
+        raise AssertionError("The retired paid runner must reject before starting any work")
     def checked_android_homes(*args, env, **kwargs):
         for variable, name in (("ANDROID_USER_HOME", "android-user"), ("ANDROID_EMULATOR_HOME", "android-emulator"), ("ANDROID_AVD_HOME", "avd")):
             home = Path(env[variable])
@@ -2300,6 +2272,18 @@ def self_test():
     print("Live dispatch, APK/ABI, UI/video evidence, process join/cleanup, capacity, OOM and GLIBC self-tests passed; no Android, UI, recording, container or proof ran")
 
 
+def protected_dispatch(configuration, run_directory):
+    protected = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+    if "trash" in str(configuration).lower():
+        raise ValueError("Forbidden configuration path")
+    config = protected["validate_config"](json.loads(protected["read_regular"](configuration.resolve(strict=True), 16384, private=True)))
+    paths = {name: Path(value) for name, value in config["paths"].items()}
+    options = argparse.Namespace(delivery_config=configuration, delivery_run_dir=run_directory,
+        artifacts=ROOT / ".artifacts", binary=paths["binary"], core_binary=paths["core_binary"], crypto_module=paths["crypto_module"])
+    driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
+    driver["delivery_protected_acceptance"](options)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path)
@@ -2309,8 +2293,19 @@ if __name__ == "__main__":
     parser.add_argument("--source-commit")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--protected-config", type=Path, help="owner-only final config for fresh protected native acceptance inside the bounded Linux proof sandbox")
+    parser.add_argument("--protected-run-dir", type=Path, help="fresh evidence directory inside this worktree's .artifacts")
+    parser.add_argument("--protected-selfcheck", action="store_true", help="check the current protected driver without starting processes or proofs")
     args = parser.parse_args()
-    if args.verify_source_commit is not None:
+    historical_action = any((args.package, args.android, args.record_android_apk, args.source_commit, args.inside, args.self_test, args.verify_source_commit))
+    if args.protected_config or args.protected_selfcheck or args.protected_run_dir:
+        if historical_action or bool(args.protected_config) == args.protected_selfcheck or (args.protected_run_dir and not args.protected_config):
+            parser.error("Provide --protected-config with optional --protected-run-dir, or --protected-selfcheck")
+        if args.protected_selfcheck:
+            runpy.run_path(str(ROOT / "scripts/verify-node.py"))["delivery_protected_selfcheck"]()
+        else:
+            protected_dispatch(args.protected_config, args.protected_run_dir)
+    elif args.verify_source_commit is not None:
         if any((args.package, args.android, args.record_android_apk, args.source_commit, args.inside, args.self_test)):
             parser.error("--verify-source-commit cannot be combined with another action")
         source_commit(args.verify_source_commit)
@@ -2320,6 +2315,6 @@ if __name__ == "__main__":
     elif args.record_android_apk and args.source_commit and not (args.package or args.android or args.inside):
         record_android(args.record_android_apk.resolve(strict=True), args.source_commit)
     elif args.package and args.source_commit and (args.inside or args.android) and not args.record_android_apk:
-        inside(args.package.resolve(strict=True), args.source_commit) if args.inside else dispatch(args.package.resolve(strict=True), args.android.resolve(strict=True), args.source_commit)
+        parser.error("the old Strict/13-proof live protocol is retired; protected acceptance uses normal budget confirm_batch/flush, five genuine Source/Hold receipts and schema-2 observation; this historical artifact inspector does not start a replacement paid test")
     else:
-        parser.error("Provide --package, --android and --source-commit, --record-android-apk and --source-commit, or --verify-source-commit")
+        parser.error("Provide --protected-config, --protected-selfcheck, --record-android-apk and --source-commit, or --verify-source-commit")

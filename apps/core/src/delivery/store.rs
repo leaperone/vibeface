@@ -224,6 +224,34 @@ impl ServiceStore {
         body.map(|body| serde_json::from_str(&body).map_err(Into::into))
             .transpose()
     }
+    pub(super) fn save_authorized_batch(&mut self, orders: &[StoredOrder]) -> Result<()> {
+        ensure!(
+            (1..=2).contains(&orders.len()),
+            "invalid confirmed delivery batch"
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for order in orders {
+            ensure!(
+                (order.confirmed && order.view.role == super::types::Role::Sender)
+                    || (order.accepted && order.view.role == super::types::Role::Receiver),
+                "batch contains no explicit sender/receiver authorization"
+            );
+            let changed = tx.execute(
+                "UPDATE orders SET body=?1 WHERE id=?2 AND network IS ?3 AND role=?4",
+                params![
+                    serde_json::to_string(order)?,
+                    order.view.order_id,
+                    order.network_id,
+                    serde_json::to_string(&order.view.role)?
+                ],
+            )?;
+            ensure!(changed == 1, "confirmed batch order owner changed");
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn orders(&self, network: Option<&str>) -> Result<Vec<StoredOrder>> {
         let mut statement = self
             .db
@@ -342,6 +370,14 @@ impl ServiceStore {
                 r.get(0)
             })
             .optional()?)
+    }
+    pub fn values_with_prefix(&self, prefix: &str) -> Result<Vec<Vec<u8>>> {
+        let mut query = self.db.prepare(
+            "SELECT body FROM private_values WHERE substr(id,1,length(?1))=?1 ORDER BY id",
+        )?;
+        Ok(query
+            .query_map([prefix], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     fn object_path(&self, order: &str, index: u16, kind: &str, partial: bool) -> Result<PathBuf> {
         parse_word(order)?;
@@ -629,6 +665,15 @@ impl ServiceStore {
         })
     }
     pub fn sign_transaction(&self, id: &str, raw: &str, hash: &str) -> Result<()> {
+        self.sign_transaction_with_claim(id, raw, hash, None)
+    }
+    pub(super) fn sign_transaction_with_claim(
+        &self,
+        id: &str,
+        raw: &str,
+        hash: &str,
+        claim: Option<(&str, &[u8])>,
+    ) -> Result<()> {
         let prior = self.transaction(id)?;
         ensure!(
             prior.raw_tx.as_deref().is_none_or(|v| v == raw)
@@ -639,7 +684,24 @@ impl ServiceStore {
             raw.starts_with("0x") && raw.len() <= 512 * 1024 && hash.len() == 66,
             "invalid signed transaction encoding"
         );
-        self.db.execute("UPDATE transactions SET raw=?2,hash=?3,phase=CASE WHEN raw IS NULL THEN 'signed' ELSE phase END WHERE id=?1",params![id,raw,hash])?;
+        let tx = self.db.unchecked_transaction()?;
+        if let Some((key, body)) = claim {
+            ensure!(
+                key.starts_with("protected-claim:")
+                    && key.len() <= 160
+                    && body.len() <= 1024 * 1024,
+                "invalid publication claim"
+            );
+            let used: u64 = tx.query_row("SELECT (SELECT coalesce(sum(length(body)),0) FROM private_values)+(SELECT coalesce(sum(size),0) FROM objects)+(SELECT coalesce(sum(size),0) FROM proof_jobs)-coalesce((SELECT length(body) FROM private_values WHERE id=?1),0)", [key], |row| row.get(0))?;
+            ensure!(
+                used.checked_add(body.len() as u64)
+                    .is_some_and(|total| total <= self.capacity),
+                "publication claim storage quota exceeded"
+            );
+            tx.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![key, body])?;
+        }
+        tx.execute("UPDATE transactions SET raw=?2,hash=?3,phase=CASE WHEN raw IS NULL THEN 'signed' ELSE phase END WHERE id=?1",params![id,raw,hash])?;
+        tx.commit()?;
         Ok(())
     }
     pub fn observe_transaction(
@@ -699,7 +761,7 @@ impl ServiceStore {
         }
     }
     pub fn next_transaction_for_reconcile(&self) -> Result<Option<SignedTransaction>> {
-        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE raw IS NOT NULL AND phase NOT IN ('failed','reverted','conflicted') ORDER BY checked_at,nonce LIMIT 1",[],|r|r.get(0)).optional()?;
+        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE raw IS NOT NULL AND phase NOT IN ('failed','reverted','conflicted') AND id NOT LIKE 'budget-%/reveal-%' ORDER BY checked_at,nonce LIMIT 1",[],|r|r.get(0)).optional()?;
         id.map(|id| self.transaction(&id)).transpose()
     }
     pub fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
@@ -717,6 +779,19 @@ impl ServiceStore {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ids.iter().map(|id| self.transaction(id)).collect()
+    }
+    pub(super) fn next_nonce_is_contiguous(
+        &self,
+        chain: u64,
+        wallet: &str,
+        nonce: u64,
+    ) -> Result<bool> {
+        let last: Option<u64> = self.db.query_row(
+            "SELECT max(nonce) FROM transactions WHERE chain=?1 AND wallet=?2",
+            params![chain, wallet],
+            |row| row.get(0),
+        )?;
+        Ok(last.is_none_or(|last| last < nonce))
     }
 }
 const MAX_CHARITY_ORDER_BYTES: usize = 16 * 1024;
@@ -890,6 +965,93 @@ mod tests {
         );
         assert!(store.find_transaction("order/hold").unwrap().is_none());
         assert_eq!(store.recent_transactions().unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claim_raw_association_is_atomic_and_reverted_attempts_keep_the_original_total_cap() {
+        let (mut store, dir) = store();
+        let budget = format!("budget-{}", "ab".repeat(32));
+        let mut intent = SpendIntent {
+            id: format!("{budget}/reveal-claim-0"),
+            chain_id: 31337,
+            wallet: "wallet".into(),
+            to: "escrow".into(),
+            calldata: "0x1234".into(),
+            value: "0".into(),
+            gas_limit: 100_000,
+            gas_cap: "600000".into(),
+            max_fee_per_gas: "3".into(),
+            max_priority_fee_per_gas: "1".into(),
+        };
+        store
+            .reserve_budget_transaction(&intent, 0, &budget, "600000")
+            .unwrap();
+        let key = format!("protected-claim:{}", "cd".repeat(32));
+        assert!(
+            store
+                .sign_transaction_with_claim(
+                    &intent.id,
+                    "0x0201",
+                    &format!("0x{}", "aa".repeat(32)),
+                    Some((&key, &vec![0; 200_001]))
+                )
+                .is_err()
+        );
+        assert!(store.transaction(&intent.id).unwrap().raw_tx.is_none());
+        assert!(store.value(&key).unwrap().is_none());
+        let body = serde_json::to_vec(
+            &serde_json::json!({"attempt_ids":[intent.id],"state":"private_ready"}),
+        )
+        .unwrap();
+        store
+            .sign_transaction_with_claim(
+                &intent.id,
+                "0x0201",
+                &format!("0x{}", "aa".repeat(32)),
+                Some((&key, &body)),
+            )
+            .unwrap();
+        store
+            .observe_transaction(
+                &intent.id,
+                "reverted",
+                Some(1),
+                Some("canonical-block"),
+                None,
+            )
+            .unwrap();
+        intent.id = format!("{budget}/reveal-claim-1");
+        assert_eq!(
+            store
+                .reserve_budget_transaction(&intent, 1, &budget, "600000")
+                .unwrap()
+                .nonce,
+            1
+        );
+        intent.id = format!("{budget}/reveal-claim-2");
+        assert!(
+            store
+                .reserve_budget_transaction(&intent, 2, &budget, "600000")
+                .is_err(),
+            "new attempt must not reset the cumulative native cap"
+        );
+        drop(store);
+        let store = ServiceStore::open(&dir, 200_000, 4).unwrap();
+        assert_eq!(store.value(&key).unwrap().unwrap(), body);
+        assert_eq!(
+            store
+                .transaction(&format!("{budget}/reveal-claim-0"))
+                .unwrap()
+                .raw_tx
+                .as_deref(),
+            Some("0x0201")
+        );
+        assert!(
+            store.next_transaction_for_reconcile().unwrap().is_none(),
+            "generic reconciliation must never broadcast an E-bearing claim attempt"
+        );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -325,7 +325,7 @@ def check():
             raise ValueError("A receipt accepted a journal with another guest image")
         verified.append({"relation": relation, "journalHash": proof["journalHash"], "verified": True, "wrongJournalRejected": True})
         print(f"PASS current guest relation {relation} public receipt and wrong-journal rejection", flush=True)
-    scripts = [("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("exercise-settlement.mjs", ["--self-test"]), ("run.mjs", []), ("verify-channel.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)])]
+    scripts = [("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("exercise-settlement.mjs", ["--self-test"]), ("run.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)])]
     if fixtures:
         scripts.append(("verify-delivery.mjs", [str(FIXTURES)]))
     for script, arguments in scripts:

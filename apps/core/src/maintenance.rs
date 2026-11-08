@@ -217,7 +217,7 @@ enum Command {
     },
     DeliveryWallet(crate::delivery::wallet::WalletCommand),
     DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
-    DeliveryChannel(Box<crate::delivery::channel::ChannelCommand>),
+    DeliveryBudget(Box<crate::delivery::budget::BudgetCommand>),
     DeliveryKeyOperation {
         action: crate::delivery::KeyAction,
         intent_id: String,
@@ -533,9 +533,9 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             }
             write_packet(&mut stream, &response).await?;
         }
-        Command::DeliveryChannel(command) => {
+        Command::DeliveryBudget(command) => {
             let result = match runtime.maintenance.enter() {
-                Ok(_guard) => runtime.delivery.local_channel(*command).await,
+                Ok(_guard) => runtime.delivery.local_budget(*command).await,
                 Err(error) => Err(error),
             };
             match result {

@@ -1,5 +1,5 @@
+pub mod budget;
 pub mod chain;
-pub mod channel;
 mod charity;
 mod keys;
 mod orders;
@@ -44,6 +44,7 @@ pub struct DeliveryConfig {
     pub reservation_fee_per_window: String,
     pub priority_fee: String,
     pub provider_gas_cap: String,
+    pub publication_policy: Option<budget::PublicationPolicy>,
 }
 impl Default for DeliveryConfig {
     fn default() -> Self {
@@ -59,6 +60,7 @@ impl Default for DeliveryConfig {
             reservation_fee_per_window: "2".into(),
             priority_fee: "5".into(),
             provider_gas_cap: "0".into(),
+            publication_policy: None,
         }
     }
 }
@@ -82,6 +84,9 @@ impl DeliveryConfig {
         }
         if let Some(prover) = &self.prover {
             prover.validate()?;
+        }
+        if let Some(policy) = &self.publication_policy {
+            policy.validate()?;
         }
         if self.paid_enabled {
             let chain = self
@@ -119,10 +124,12 @@ pub struct Delivery {
     peer_slots: Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
     operations: tokio::sync::Mutex<()>,
     provider_operations: tokio::sync::Mutex<()>,
+    publication_operations: tokio::sync::Mutex<()>,
     runtime: std::sync::OnceLock<Weak<Runtime>>,
     wakeup: Arc<tokio::sync::Notify>,
     changes: tokio::sync::watch::Sender<u64>,
     executor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    publication_executor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Delivery {
     pub fn open(dir: &Path, identity: LocalIdentity) -> Result<Self> {
@@ -144,10 +151,12 @@ impl Delivery {
             peer_slots: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             provider_operations: tokio::sync::Mutex::new(()),
+            publication_operations: tokio::sync::Mutex::new(()),
             runtime: std::sync::OnceLock::new(),
             wakeup: Arc::new(tokio::sync::Notify::new()),
             changes: tokio::sync::watch::Sender::new(0),
             executor: Mutex::new(None),
+            publication_executor: Mutex::new(None),
         })
     }
     pub fn config(&self) -> DeliveryConfig {
@@ -164,6 +173,25 @@ impl Delivery {
             .context("delivery runtime is not attached")?
             .clone();
         let wakeup = self.wakeup.clone();
+        let publication_runtime = runtime.clone();
+        let publisher = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(node) = publication_runtime.upgrade() else {
+                    break;
+                };
+                let Ok(_maintenance) = node.maintenance.enter() else {
+                    continue;
+                };
+                if let Err(error) = node.delivery.run_publications(true).await {
+                    tracing::debug!(error=%error, "protected publication reconciliation waits for availability");
+                }
+            }
+        });
+        *self
+            .publication_executor
+            .lock()
+            .expect("publication executor") = Some(publisher);
         let executor = tokio::spawn(async move {
             loop {
                 tokio::select! {_=wakeup.notified()=>{},_=tokio::time::sleep(std::time::Duration::from_secs(5))=>{}}
@@ -252,6 +280,15 @@ impl Delivery {
         Ok(())
     }
     pub(crate) async fn shutdown(&self) {
+        let publisher = self
+            .publication_executor
+            .lock()
+            .expect("publication executor")
+            .take();
+        if let Some(publisher) = publisher {
+            publisher.abort();
+            let _ = publisher.await;
+        }
         let executor = self.executor.lock().expect("delivery executor").take();
         if let Some(executor) = executor {
             executor.abort();
@@ -264,8 +301,8 @@ impl Delivery {
             .split('/')
             .next()
             .context("spend intent has no order")?;
-        if group.starts_with("channel-") {
-            return self.authorize_channel_spend(intent);
+        if group.starts_with("budget-") {
+            return self.authorize_budget_spend(intent).await;
         }
         if let Some(serial) = group.strip_prefix("key-") {
             ensure!(
@@ -449,6 +486,14 @@ impl Delivery {
             .context("delivery operation is required")?;
         match op {
             "status" => self.status(),
+            "budgets" => self.client_budgets(network).await,
+            "flush_budget" => {
+                self.authorize_effect(network, device).await?;
+                self.local_budget(budget::BudgetCommand::Flush {
+                    budget_id: text(&params, "budget_id")?.into(),
+                })
+                .await
+            }
             "find_intent" => {
                 let intent = text(&params, "intent_id")?;
                 uuid::Uuid::parse_str(intent)?;
@@ -525,6 +570,95 @@ impl Delivery {
                 }
                 Ok(serde_json::to_value(order.view)?)
             }
+            "confirm_batch" => {
+                self.ensure_mode(Mode::Paid)?;
+                self.authorize_effect(network, device).await?;
+                let _operation = self
+                    .operations
+                    .try_lock()
+                    .context("another delivery operation is in progress")?;
+                let intents: Vec<String> = serde_json::from_value(params["intent_ids"].clone())?;
+                ensure!(
+                    intents.len() == 2 && intents[0] != intents[1],
+                    "confirm_batch requires two distinct prepared intents"
+                );
+                let mut orders = Vec::new();
+                for intent in &intents {
+                    let order = self
+                        .with_store(|store| store.by_intent(network, intent))?
+                        .context("prepared batch order is missing")?;
+                    ensure!(
+                        order.view.role == Role::Sender && order.view.mode == Mode::Paid,
+                        "batch confirmation only authorizes prepared paid sender orders"
+                    );
+                    orders.push(order);
+                }
+                let budget_id = orders[0]
+                    .view
+                    .payment
+                    .budget_id
+                    .clone()
+                    .context("protected budget missing")?;
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
+                        && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
+                            <= budget::MAX_BATCH_WINDOWS,
+                    "a confirmed batch uses one budget and at most two windows"
+                );
+                let ids: Vec<_> = orders.iter().map(|o| o.view.order_id.clone()).collect();
+                if orders
+                    .iter()
+                    .all(|o| o.confirmed && o.allocation_batch == ids)
+                {
+                    return Ok(
+                        json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}),
+                    );
+                }
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| !o.confirmed && o.view.phase == Phase::Prepared),
+                    "batch confirmation requires the original prepared orders"
+                );
+                let active: usize = self
+                    .with_store(|store| store.orders(Some(network)))?
+                    .iter()
+                    .filter(|other| {
+                        other.view.role == Role::Sender
+                            && other.confirmed
+                            && !ids.contains(&other.view.order_id)
+                            && !matches!(
+                                other.view.phase,
+                                Phase::Paid | Phase::Refunded | Phase::Failed
+                            )
+                    })
+                    .map(|other| other.view.windows.len())
+                    .sum();
+                ensure!(
+                    active == 0,
+                    "finish the active protected sending batch before confirming another"
+                );
+                ensure!(
+                    matches!(
+                        self.wallet.lock().expect("delivery wallet").status(),
+                        wallet::WalletStatus::Unlocked { .. }
+                    ),
+                    "unlock the local wallet before confirming the batch"
+                );
+                for order in &mut orders {
+                    order.confirmed = true;
+                    order.resume_requested = true;
+                    order.authorized_by = Some(device.into());
+                    order.allocation_batch = ids.clone();
+                    order.view.phase = Phase::FundingPending;
+                    order.view.updated_at_ms = crate::runtime::now_ms();
+                }
+                self.with_store(|store| store.save_authorized_batch(&orders))?;
+                self.wakeup.notify_one();
+                Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
+            }
             "confirm" => {
                 let intent = text(&params, "intent_id")?;
                 let operation = self.operations.try_lock();
@@ -549,18 +683,23 @@ impl Delivery {
                     )?);
                 };
                 if !order.confirmed {
-                    ensure!(
-                        !self
-                            .with_store(|store| store.orders(Some(network)))?
-                            .iter()
-                            .any(|other| other.view.order_id != order.view.order_id
+                    let active: usize = self
+                        .with_store(|store| store.orders(Some(network)))?
+                        .iter()
+                        .filter(|other| {
+                            other.view.order_id != order.view.order_id
                                 && other.view.role == Role::Sender
                                 && other.confirmed
                                 && !matches!(
                                     other.view.phase,
                                     Phase::Paid | Phase::Refunded | Phase::Failed
-                                )),
-                        "finish or refund the current paid order before confirming another"
+                                )
+                        })
+                        .map(|other| other.view.windows.len())
+                        .sum();
+                    ensure!(
+                        active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                        "protected sending permits at most two active windows"
                     );
                 }
                 order.authorized_by = Some(device.into());
@@ -572,6 +711,9 @@ impl Delivery {
                     "unlock the independent delivery wallet locally before confirming payment"
                 );
                 order.confirmed = true;
+                if order.allocation_batch.is_empty() {
+                    order.allocation_batch = vec![order.view.order_id.clone()];
+                }
                 order.resume_requested = true;
                 if order.view.phase == Phase::Prepared {
                     order.view.phase = Phase::FundingPending;
@@ -579,6 +721,69 @@ impl Delivery {
                 self.save(&mut order)?;
                 self.wakeup.notify_one();
                 Ok(serde_json::to_value(order.view)?)
+            }
+            "accept_batch" => {
+                self.ensure_mode(Mode::Paid)?;
+                self.authorize_effect(network, device).await?;
+                let _operation = self
+                    .operations
+                    .try_lock()
+                    .context("another delivery operation is in progress")?;
+                let ids: Vec<String> = serde_json::from_value(params["order_ids"].clone())?;
+                ensure!(
+                    ids.len() == 2 && ids[0] != ids[1],
+                    "accept_batch needs two distinct orders"
+                );
+                let mut orders = Vec::new();
+                for id in &ids {
+                    let order = self.scoped_order(network, id)?;
+                    ensure!(
+                        order.view.role == Role::Receiver
+                            && order.view.mode == Mode::Paid
+                            && !matches!(order.view.phase, Phase::Refunded | Phase::Failed),
+                        "batch acceptance requires live receiving orders"
+                    );
+                    orders.push(order);
+                }
+                let budget_id = orders[0]
+                    .view
+                    .payment
+                    .budget_id
+                    .clone()
+                    .context("protected budget missing")?;
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
+                        && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
+                            <= budget::MAX_BATCH_WINDOWS,
+                    "receiving batch uses one budget and at most two windows"
+                );
+                let active: usize = self
+                    .with_store(|store| store.orders(Some(network)))?
+                    .iter()
+                    .filter(|o| {
+                        o.view.role == Role::Receiver
+                            && o.accepted
+                            && !ids.contains(&o.view.order_id)
+                            && !matches!(
+                                o.view.phase,
+                                Phase::Paid | Phase::Refunded | Phase::Failed
+                            )
+                    })
+                    .map(|o| o.view.windows.len())
+                    .sum();
+                ensure!(active == 0, "finish the active receiving batch first");
+                for order in &mut orders {
+                    order.accepted = true;
+                    order.authorized_by = Some(device.into());
+                    order.resume_requested = true;
+                    order.view.error = None;
+                    order.view.updated_at_ms = crate::runtime::now_ms();
+                }
+                self.with_store(|store| store.save_authorized_batch(&orders))?;
+                self.wakeup.notify_one();
+                Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
             }
             "accept" | "reconcile" => {
                 let _operation = self
@@ -599,18 +804,23 @@ impl Delivery {
                         "only the receiving Node can accept delivery"
                     );
                     if !order.accepted {
-                        ensure!(
-                            !self
-                                .with_store(|store| store.orders(Some(network)))?
-                                .iter()
-                                .any(|other| other.view.order_id != order.view.order_id
+                        let active: usize = self
+                            .with_store(|store| store.orders(Some(network)))?
+                            .iter()
+                            .filter(|other| {
+                                other.view.order_id != order.view.order_id
                                     && other.view.role == Role::Receiver
                                     && other.accepted
                                     && !matches!(
                                         other.view.phase,
                                         Phase::Paid | Phase::Refunded | Phase::Failed
-                                    )),
-                            "finish the accepted paid order before accepting another"
+                                    )
+                            })
+                            .map(|other| other.view.windows.len())
+                            .sum();
+                        ensure!(
+                            active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                            "protected receiving permits at most two active windows"
                         );
                     }
                     order.accepted = true;

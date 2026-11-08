@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, FlaskConical, RefreshCw, type LucideIcon } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
@@ -23,13 +23,16 @@ export function Transfers() {
 function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
   const delivery = useDelivery(connection, webPlatform)
   const { directory } = useDevice()
-  const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
+  const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null })
   const [file, setFile] = useState<TransferFile | null>(null)
   // Feedback shows next to the control that caused it, not at the top of a long page.
   const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
   const picker = useAction()
   const status = delivery.status
   const selected = delivery.selected
+  const availableBudgets = delivery.budgets.filter(budget => budget.state === 'open' && budget.payer.toLowerCase() === status?.wallet.address?.toLowerCase())
+  const preparedBatch = delivery.orders.filter(order => order.role === 'sender' && order.mode === 'paid' && order.phase === 'prepared' && order.payment.budget_id === draft.budget_id)
+  const canConfirmBatch = preparedBatch.length === 2 && preparedBatch.every(order => order.windows.length === 1)
   const working = delivery.busy !== null || picker.busy !== null
   const change = (patch: Partial<DeliverySettings>) => {
     setOrigin('page')
@@ -79,9 +82,19 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
         <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
         {draft.mode === 'paid' ? <>
-          <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
+          <p className="text-meta text-muted-foreground">{transferCopy.protected}</p>
+          <Field><FieldLabel htmlFor="transfer-budget">预付预算</FieldLabel>
+            <NativeSelect id="transfer-budget" className="w-full" value={draft.budget_id ?? ''} required disabled={working} onChange={event => {
+              const budget = availableBudgets.find(item => item.budget_id === event.target.value)
+              if (budget) setDraft({ ...draft, budget_id: budget.budget_id, provider_peer: budget.provider_peer, max_gas_amount: budget.gas_cap })
+            }}>
+              <NativeSelectOption value="" disabled>选择发送前已建立的预算</NativeSelectOption>
+              {availableBudgets.map(budget => <NativeSelectOption key={budget.budget_id} value={budget.budget_id}>{budget.budget_id.slice(0, 12)} · 可分配 {budget.free}</NativeSelectOption>)}
+            </NativeSelect>
+            <FieldDescription>预算固定收款钱包和中转设备。先在发送设备本机建立预付预算，再刷新此页。</FieldDescription>
+          </Field>
           <Field><FieldLabel htmlFor="transfer-service-cap">{transferCopy.serviceCap}</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
-          <Field><FieldLabel htmlFor="transfer-gas-cap">{transferCopy.gasCap}</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
+          <Field><FieldLabel htmlFor="transfer-gas-cap">{transferCopy.gasCap}</FieldLabel><Input id="transfer-gas-cap" value={draft.max_gas_amount} readOnly /></Field>
         </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />{transferCopy.free}</p>}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const picked = await webPlatform.files?.pick(); if (picked) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
@@ -97,11 +110,29 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         <Details><p>{transferCopy.prepareDetails}</p>{draft.mode === 'paid' ? <p>{transferCopy.units}</p> : null}</Details>
       </form> : null}
     </>}
+    {delivery.budgets.length ? <section aria-label="预付预算" className="grid gap-3 rounded-xl border bg-card p-4">
+      <h2 className="text-heading font-semibold">预付预算</h2>
+      {delivery.budgets.map(budget => <div key={budget.budget_id} className="grid gap-2">
+        <Info label="预算" value={budget.budget_id} />
+        <Info label="可分配 / 已占用" value={`${budget.free} / ${budget.locked}`} />
+        <Info label="已收到待批次核验的窗口" value={budget.ready_windows.length.toString()} />
+        <Info label="累计赚取 / 提款 / 退款" value={`${budget.earned} / ${budget.withdrawn} / ${budget.refunded}`} />
+        {budget.payee.toLowerCase() === status?.wallet.address?.toLowerCase() ? <Button type="button" variant="outline" disabled={working || budget.ready_windows.length === 0 || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onClick={() => { setOrigin('page'); void delivery.flushBudget(budget.budget_id) }}>结算当前已就绪批次（最多两窗）</Button> : null}
+      </div>)}
+      {canConfirmBatch ? <div className="grid gap-2">
+        {preparedBatch.map(order => <p key={order.order_id} className="text-meta">{order.name} · 服务费 {order.payment.total}</p>)}
+        <Button type="button" disabled={working || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onClick={() => { setOrigin('page'); void delivery.confirmBatch(preparedBatch) }}>确认这两笔并同批分配预算</Button>
+      </div> : null}
+    </section> : null}
     <section aria-labelledby="transfer-orders" className="grid gap-3">
       <div className="flex items-center justify-between gap-3">
         <h2 id="transfer-orders" className="text-heading font-semibold">传输记录</h2>
         <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => { setOrigin('page'); void delivery.refresh() }}><BusyIcon busy={delivery.busy === 'refresh'} icon={RefreshCw} />刷新</Button>
       </div>
+      {receivingBatches(delivery.orders).map(([budgetId, batch]) => <div key={budgetId} className="grid gap-2 rounded-xl border bg-card p-4">
+        {batch.map(order => <p key={order.order_id} className="text-meta">{orderTitle(order)}</p>)}
+        <Button type="button" disabled={working || !delivery.canManage || !status?.enabled || !status.paid_enabled} onClick={() => { setOrigin('page'); void delivery.acceptBatch(batch) }}>同时接收这两份文件</Button>
+      </div>)}
       {delivery.orders.length ? <ul className="divide-y overflow-hidden rounded-xl border bg-card">{delivery.orders.map(order => {
         const Icon = roleIcons[order.role]
         return <li key={order.order_id}><button type="button" className="interactive-row flex w-full items-center gap-3 px-4 py-3 text-left" aria-pressed={delivery.selected?.order_id === order.order_id} onClick={() => delivery.select(order.order_id)}>
@@ -130,9 +161,9 @@ function OrderDetails({ order, busy, canManage, enabled, walletReady, feedback, 
     {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
     <Info label="传输方式" value={paid ? transferCopy.paid : <span className="inline-flex items-center gap-1.5"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />{transferCopy.charity}</span>} />
     {paid ? <>
+      <Info label="预付预算" value={order.payment.budget_id} />
       <Info label={transferCopy.serviceTotal} value={order.payment.total} />
       <Info label={transferCopy.gasCap} value={order.payment.gas_cap} />
-      {order.acceptance === 'strict' ? <p className="text-meta text-warning">{transferCopy.strict}</p> : null}
     </> : null}
     {order.error ? <p role="alert" className="text-meta text-danger">{order.error}</p> : null}
     {feedback}
@@ -149,11 +180,20 @@ function OrderDetails({ order, busy, canManage, enabled, walletReady, feedback, 
       <p>{evidenceLabels[order.evidence]}。交付确认不表示真人已阅读。</p>
       <Info label="订单" value={order.order_id} /><Info label="付款意图" value={order.intent_id} />
       <Info label="发送设备" value={order.source_peer} /><Info label="接收设备" value={order.receiver_peer} /><Info label="中转设备" value={order.provider_peer} />
-      <Info label="验收条件" value={paid ? order.acceptance === 'strict' ? '接收设备证明实际解密后结算' : '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
+      <Info label="验收条件" value={paid ? '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
       {paid ? <>
         <Info label="测试链 ID" value={order.payment.chain_id ?? ''} /><Info label="测试资产合约" value={order.payment.asset ?? ''} /><Info label="付款钱包" value={order.payment.payer ?? ''} /><Info label="固定收款钱包" value={order.payment.provider_wallet ?? ''} />
         <Info label="传输费" value={order.payment.delivery_fee} /><Info label="暂存预留费" value={order.payment.reservation_fee} /><Info label="时效优先费" value={order.payment.priority_fee} />
-        <Info label={settlementAmountsLabel(order)} value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
+        <Info label={settlementAmountsLabel(order, 'order')} value={`${order.payment.earned} / ${order.payment.refunded}`} />
+        {order.payment.settlement ? <>
+          <Info label={settlementAmountsLabel(order, 'budget')} value={`${order.payment.settlement.earned} / ${order.payment.settlement.withdrawn} / ${order.payment.settlement.refunded}`} />
+          <Info label="批次状态" value={publicationLabel(order)} />
+          {order.payment.settlement.publication ? <>
+            <Info label="本批目标赚取金额" value={order.payment.settlement.publication.total_amount} />
+            <Info label="本批完整金额截止" value={new Date(order.payment.settlement.publication.economic_cutoff * 1000).toLocaleString()} />
+            {order.payment.settlement.publication.availability_risk ? <p role="status" className="text-meta text-warning">{order.payment.settlement.publication.availability_risk}</p> : null}
+          </> : null}
+        </> : null}
         {deadlineRows(order).map(([label, value]) => <Info key={label} label={label} value={value} />)}
         <p>时效优先费只有在其截止前完成整单才赚取。过了时效截止，仍可在结算硬截止前完成交付。暂存费支付容量预留，不代表持续存储证明。</p>
         {order.payment.tx_hash ? <Info label="原交易" value={order.payment.tx_hash} /> : null}

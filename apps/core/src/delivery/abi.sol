@@ -38,39 +38,36 @@
         function getWindow(bytes32 id, uint16 index) external view returns (ChainWindow);
         function publicValues(bytes32 id, uint16 index, uint8 relation) external view returns (DeliveryStatement);
         function registerKey(DeliveryStatement input, bytes seal) external;
-        function fund(DeliveryStatement input, WindowSpec[] specs, bytes[] seals, bytes walletSignature) external returns (bytes32);
-        function hold(bytes32 id, uint16 index, bytes seal) external;
-        function publish(bytes32 id, uint16 index, bytes capsule) external;
         function open(bytes32 id, uint16 index, bytes seal) external;
-        function refund(bytes32 id, uint16 index) external;
-        function refundBonus(bytes32 id) external;
-        function cancel(bytes32 id) external;
-        function withdraw(bytes32 id) external;
         function balanceOf(address owner) external view returns (uint256);
         function allowance(address owner, address spender) external view returns (uint256);
         function approve(address spender, uint256 amount) external returns (bool);
         function decimals() external view returns (uint8);
 
-struct CumulativeVoucher {
-    bytes32 channelId;
-    uint64 sequence;
-    uint256 totalAmount;
-    bytes32 receiptCommitment;
-}
-struct ChainChannel {
+struct ChainBudget {
     address payer;
     address payee;
     bytes32 providerPeer;
-    uint256 budget;
-    uint256 redeemed;
-    uint64 sequence;
-    uint64 closesAt;
+    address asset;
+    uint256 deposit;
+    uint256 locked;
+    uint256 earned;
+    uint256 withdrawn;
+    uint256 refunded;
+    uint64 maxClaimUntil;
+    uint8 assetDecimals;
     uint8 state;
 }
-function asset() external view returns (address);
-function CHALLENGE_WINDOW() external view returns (uint64);
-function getChannel(bytes32 id) external view returns (ChainChannel);
-function openChannel(bytes32 salt, address payee, bytes32 providerPeer, uint256 budget) external returns (bytes32);
-function redeemChannel(bytes32 id, uint64 sequence, uint256 totalAmount, bytes32 receiptCommitment, bytes signature) external;
-function closeChannel(bytes32 id) external;
-function refundChannel(bytes32 id) external;
+struct Reservation { DeliveryStatement input; WindowSpec[] specs; bytes[] seals; bytes walletSignature; }
+struct WindowRef { bytes32 orderId; uint16 index; }
+struct HoldItem { bytes32 orderId; uint16 index; bytes seal; }
+struct RevealItem { bytes32 orderId; uint16 index; bytes capsule; }
+function getBudget(bytes32 id) external view returns (ChainBudget);
+function orderBudget(bytes32 id) external view returns (bytes32);
+function openBudget(bytes32 salt, address payee, bytes32 providerPeer, address asset, uint256 deposit) external returns (bytes32);
+function reserveBatch(bytes32 budgetId, Reservation[] reservations) external;
+function holdBatch(bytes32 budgetId, HoldItem[] items) external;
+function revealBatch(bytes32 budgetId, RevealItem[] items) external;
+function withdrawBudget(bytes32 id) external;
+function closeBudget(bytes32 id) external;
+function refundBudget(bytes32 id, WindowRef[] items) external;
