@@ -1,8 +1,8 @@
 "use client"
 
-import { useId, useRef, useState, type ReactNode } from "react"
+import { useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Info, Laptop, ListChecks, MessageCircleQuestionMark, RotateCw, SendHorizontal, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Info, Laptop, ListChecks, MessageCircleQuestionMark, RotateCw, SendHorizontal, TriangleAlert, X, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { BotFace } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -22,10 +22,8 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> 
   info: { icon: Info, tone: "info" },
 }
 
-type Selection = { kind: "none" } | { kind: "choice"; label: string } | { kind: "custom" }
-
 /**
- * A question waiting on the person: select or write an answer, then send it.
+ * A question waiting on the person: a choice sends on tap, the last line takes a written answer, and 忽略 sets it aside.
  * `answer`: what the chat already holds for it. `inbox`: also names the bot and links to its chat. `inTask`: inside the task's own panel, which already names the task and device.
  */
 export function QuestionCard({ question, answer, inbox = false, inTask = false, from }: { question: Question; answer?: string; inbox?: boolean; inTask?: boolean; from?: "inbox" | "tasks" }) {
@@ -33,12 +31,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const { directory, ready } = useDevice()
   const action = useAction()
   const navigate = useNavigate()
-  const fieldId = useId()
   const [text, setText] = useState("")
-  const [selection, setSelection] = useState<Selection>(question.choices.length ? { kind: "none" } : { kind: "custom" })
-  const [validation, setValidation] = useState("")
-  const choicesRef = useRef<HTMLFieldSetElement>(null)
-  const textRef = useRef<HTMLTextAreaElement>(null)
   // Answered here, the result line takes focus after the controls disappear.
   const answering = useRef(false)
   const id = question.question_id
@@ -55,7 +48,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const about = heldTask ? <span className="flex min-w-0 items-center gap-1"><ListChecks aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">任务 </span><span className="min-w-0 truncate">{heldTask}</span>
     <span aria-hidden="true">·</span><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">设备 </span><span className="min-w-0 truncate">{node}</span></span> : null
   if (settled) return <Settled ask={ask} detail={detail} about={about} focus={answering.current} role={standing === undefined || settled.beaten ? "status" : undefined}
-    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(displayAnswer(settled.text)) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : settled.text.trim() === ignoredAnswer ? <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" /> : declined(displayAnswer(settled.text)) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
     <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : answerLabel(displayAnswer(settled.text))}</span>
   </Settled>
 
@@ -73,28 +66,13 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
       answering.current = true
       const result = await workspace.answer(question, value)
       if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
-      else if (inbox) settledToast()
+      else if (inbox) settledToast(value)
     })
   }
-  const submit = () => {
-    if (disabled) return
-    if (selection.kind === "none") {
-      setValidation("选一个回答，或自己写回答。")
-      choicesRef.current?.querySelector("input")?.focus()
-      return
-    }
-    if (selection.kind === "custom" && !text.trim()) {
-      setValidation("写下你的回答。")
-      textRef.current?.focus()
-      return
-    }
-    setValidation("")
-    void send("answer", selection.kind === "choice" ? selection.label : text)
-  }
   // Answered in 待处理, the card leaves; the toast leads to the chat the answer went to.
-  const settledToast = () => {
+  const settledToast = (value: string) => {
     const bot = question.bot
-    toast("已回答", { tone: "success", action: inputTarget && (taskScope || bot) ? { label: "查看", onClick: () => {
+    toast(value === ignoredAnswer ? "已忽略" : "已回答", { tone: "success", action: inputTarget && (taskScope || bot) ? { label: "查看", onClick: () => {
       if (taskScope) void navigate({ to: '/tasks/$taskId', params: { taskId: taskScope } })
       else if (inputTarget?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: inputTarget.channel_id } })
       else if (bot && inputTarget?.kind === 'work') void navigate({ to: '/b/$botId/work/$workId', params: { botId: bot.bot_id, workId: inputTarget.work_id } })
@@ -128,25 +106,20 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
       <span className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-foreground">{displayAnswer(pending.text)}</span>
       <span aria-hidden="true">·</span>{action.busy !== null ? "正在发送" : "没确认送达"}<span aria-hidden="true">·</span>
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
-    </p> : approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <div className="grid gap-2">
-      {question.choices.length ? <fieldset ref={choicesRef} disabled={disabled} aria-describedby={`${fieldId}-hint${validation ? ` ${fieldId}-error` : ""}`} aria-invalid={Boolean(validation) || undefined} className="grid min-w-0 gap-2">
-        <legend className="sr-only">选一个回答</legend>
-        {question.choices.map((choice, index) => <label key={index} className={row}>
-          <input type="radio" name={fieldId} value={choice.label} checked={selection.kind === "choice" && selection.label === choice.label} onChange={() => { setSelection({ kind: "choice", label: choice.label }); setValidation("") }} className="size-4 shrink-0 accent-primary" />
-          <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{choice.label}</span>
-        </label>)}
-        <label className={row}>
-          <input type="radio" name={fieldId} value="custom" checked={selection.kind === "custom"} onChange={() => { setSelection({ kind: "custom" }); setValidation("") }} className="size-4 shrink-0 accent-primary" />
-          <span>自己写回答</span>
-        </label>
-      </fieldset> : null}
-      {selection.kind === "custom" ? <div className="grid gap-1.5">
-        <label htmlFor={`${fieldId}-text`} className="text-meta font-medium">你的回答</label>
-        <textarea ref={textRef} id={`${fieldId}-text`} rows={3} placeholder="写下你的选择、条件或需要澄清的问题" className="min-h-24 min-w-0 resize-y rounded-lg border bg-card p-3 text-body outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50" value={text} maxLength={4000} disabled={disabled} aria-describedby={`${fieldId}-hint${validation ? ` ${fieldId}-error` : ""}`} aria-invalid={Boolean(validation) || undefined} onChange={(event) => { setText(event.target.value); setValidation("") }} />
-      </div> : null}
-      {validation ? <p id={`${fieldId}-error`} role="alert" className="text-meta text-danger">{validation}</p> : null}
-      <p id={`${fieldId}-hint`} className="text-meta text-muted-foreground">发送会回答本题，让 Bot 按回答继续处理。</p>
-      <Button type="button" variant={selection.kind === "none" ? "outline" : "default"} className="min-h-11 justify-self-start" disabled={disabled} aria-busy={action.busy === "answer" || undefined} onClick={submit}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} />发送回答</Button>
+    </p> : <div className="grid gap-2">
+      {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
+        {question.choices.length ? <div role="group" aria-label="选一个回答" className="grid min-w-0 gap-2">
+          {question.choices.map((choice, index) => <button key={index} type="button" className={row} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
+            <span aria-hidden="true" className="w-4 shrink-0 text-center tabular-nums text-muted-foreground">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
+            <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{choice.label}</span>
+          </button>)}
+        </div> : null}
+        <div className="flex min-w-0 items-end gap-2">
+          <textarea aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-h-11 min-w-0 flex-1 resize-none rounded-lg border bg-card px-3 py-2.5 text-body outline-none [field-sizing:content] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+          <Button type="button" size="icon" className="size-11 shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
+        </div>
+      </>}
+      <Button type="button" variant="ghost" className="min-h-11 justify-self-start text-muted-foreground" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button>
     </div>}
     <InlineError error={action.error} />
   </ActionCard>
@@ -174,7 +147,7 @@ function Settled({ ask, detail, about, mark, focus = false, role, children }: { 
   </details>
 }
 
-const row = "flex min-h-12 w-full min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-card px-3 py-3 text-start font-medium transition-colors hover:bg-muted focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-checked:border-ring has-disabled:cursor-not-allowed has-disabled:opacity-50"
+const row = "flex min-h-12 w-full min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-card px-3 py-3 text-start font-medium transition-colors hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
 
 /** `compact`: on a phone it gives way to the task link, so the line keeps to one row. */
 function Meta({ icon: Icon, label, title, compact = false, children }: { icon: LucideIcon; label: string; title?: string; compact?: boolean; children: ReactNode }) {

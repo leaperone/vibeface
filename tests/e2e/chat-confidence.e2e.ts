@@ -65,7 +65,7 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await browser.reload();
     await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toBeVisible();
     await expect(screen.getByText('选择后会按这个口径整理。', { exact: true })).toBeVisible();
-    await expect(screen.getByRole('radio', '单独统计', { exact: true })).toBeVisible();
+    await expect(screen.getByRole('button', '单独统计', { exact: true })).toBeVisible();
     await expect(screen.getByRole('heading', '允许写入运营汇总吗？')).toBeVisible();
     await expect(screen.getByRole('heading', '待确认 · 结果未知的任务')).toBeVisible();
     await app.screenshot('chat-confidence-decision-desktop');
@@ -232,5 +232,16 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     }, hintId);
     assert.deepEqual(description, { text: blockedReason, label: '补充给 整理本月运营情况', count: 1 });
     await app.screenshot('chat-confidence-unknown-phone');
+
+    await browser.goto(`${node.url}/tasks`);
+    await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toBeVisible();
+    await app.screenshot('chat-confidence-tasks-decisions-phone');
+    await screen.getByRole('button', '单独统计', { exact: true }).click();
+    await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toHaveCount(0);
+    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('report-scope')?.text, '单独统计', 'one tap answers with the choice');
+    await screen.getByRole('button', '忽略', { exact: true }).click();
+    await expect(screen.getByRole('heading', '允许写入运营汇总吗？')).toHaveCount(0);
+    assert.equal(db.prepare('SELECT text FROM messages WHERE answers=?').get('report-approval')?.text, '忽略', 'ignoring answers with the fixed text');
+    await app.screenshot('chat-confidence-tasks-cleared-phone');
   } finally { db.close(); }
 });
