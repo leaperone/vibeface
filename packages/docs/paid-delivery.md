@@ -133,7 +133,7 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 | `recoverable` | 完整 C 与正确 E 已具备恢复条件。 |
 | `decryption_proven` | 合约已接受指定 R 实际解封、解密的证明。 |
 
-订单阶段、交付证据和资金状态分别展示。`included` 只表示入块，`confirmed` 按配置的确认深度观察，`earned` 为合约债权，`withdrawn` 才表示实际提款。浅确认不是绝对终局。检测到 reorg 或无法继续核实原交易时，Node 撤回暂定完成状态并进入 `reconciling` 或 `unknown`。
+订单阶段、交付证据和资金状态分别展示。资金交易达到配置的确认深度后订单才显示 `confirmed`；交易已入块但深度不够时，交易账本记为 `confirming`，订单保持 `reconciling`、付款 `unknown`；`submitted` 和 `included` 保留在类型里，当前观察不产出。`earned` 为合约债权，`withdrawn` 才表示实际提款。浅确认不是绝对终局。检测到 reorg 或无法继续核实原交易时，Node 撤回暂定完成状态并进入 `reconciling` 或 `unknown`。
 
 接收端取回先在 Node 重组并核对文件，客户端再核对完整长度、文件名和 SHA-256。Web 的保存动作只确认已交给浏览器，不能声称用户磁盘已写入。Mobile 写入独立文档文件后再次核对，再提供分享副本。
 

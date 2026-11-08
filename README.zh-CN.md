@@ -123,7 +123,6 @@ vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@disc
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface -p vibeface-core --locked
 bash scripts/package-node.sh
 ```
 

@@ -1446,7 +1446,8 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
-    /// What this Node offers its peers right now; work it does not execute is not offered.
+    /// The workspace roots this Node publishes and the state of each capability. A root listed
+    /// here is not an execution grant: the submitting side checks execution and roots again.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
         let manager = self.manager().map(|m| m.provider);

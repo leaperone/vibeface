@@ -64,14 +64,14 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 - 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
 - Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
-- 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin` 和 `/usr/local/bin`。Codex 还查找 NVM 的 Node 安装目录和 `/Applications/Codex.app/Contents/Resources`。NVM 根目录取 `NVM_DIR`，未设置时取 `~/.nvm`。
+- 只写了名字的程序（`codex`、`claude`、`opencode`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`，然后是该产品安装器自己的目录（Claude Code 为 `~/.claude/local`，opencode 为 `~/.opencode/bin`），再到 `/opt/homebrew/bin` 和 `/usr/local/bin`。Codex 还查找 NVM 的 Node 安装目录和 `/Applications/Codex.app/Contents/Resources`。以上是 Unix 路径，不构成 Windows 上的查找承诺。NVM 根目录取 `NVM_DIR`，未设置时取 `~/.nvm`。
 - NVM 安装的程序使用同一 `bin` 目录下的 Node。程序发现无需加载 shell 配置，也不依赖终端中执行过 `nvm use`。
 
 已写下的程序路径、模型和用途不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。
 
 启用 Node 独立 App Server 或自动接入 Codex，且私有 `config.toml` 尚不存在时，Node 从用户的 Codex 配置中初始化当前选中的模型、Provider 地址和认证环境变量名称。已有私有配置保持不变。配置投影不复制登录文件、密钥、固定认证请求头、会话、hooks、MCP 或项目信任设置。
 
-启动已启用服务、开启用途及自动接入时，Node 只补该服务实际需要的认证变量。已有私有值优先，其次是 Node 继承环境，最后按需读取操作系统登记的 `zsh`、`bash` 或 `sh` 交互登录环境。只查询缺少的名称，使用 Node 的 `HOME`；不继承 `ZDOTDIR`，不保存整个 shell 环境。补入的值只写当前 Node 的私有 `provider-env.json`，不会跟随来源自动更新。本次明确填写或删除的变量不被补回；删除仍表示移除私有覆盖，后续接入或重启可以再次补缺。
+启动已启用服务、开启用途及自动接入时，Node 只补该服务实际需要的认证变量。已有私有值优先，其次是 Node 继承环境，最后按需读取操作系统登记的 `zsh`、`bash` 或 `sh` 交互登录环境。只查询缺少的名称，使用 Node 的 `HOME`；不继承 `ZDOTDIR`，不保存整个 shell 环境。补入的值只写进当前 Node 私有 `config.json` 的 `provider_env`，与其余配置同一次原子保存，不会跟随来源自动更新。本次明确填写或删除的变量不被补回；删除仍表示移除私有覆盖，后续接入或重启可以再次补缺。
 
 登录 shell 有执行用户启动脚本的副作用，只在存在变量缺口时运行，并限制输出和时限、回收子进程。无可复用变量时显示缺失；读取异常时按钮报告失败，启动只记录固定告警并继续上线。新配置或变量等待活跃任务结束后切换并重新检查，不中断任务或重放历史。
 
