@@ -323,7 +323,7 @@ impl Runtime {
         self.membership_state()
             .await
             .and_then(|state| state.project())
-            .is_ok_and(|view| view.revocation(device).is_some())
+            .is_ok_and(|view| view.removed_node(device))
     }
 
     /// A member Node refusing this one hands back the signed history that removed it. Installing
@@ -1535,7 +1535,7 @@ impl Runtime {
         let Ok(view) = state.project() else {
             return;
         };
-        let removed = signed_removals(&state, &view);
+        let removed = view.signed_removals().to_vec();
         if removed.is_empty() {
             return;
         }
@@ -2358,32 +2358,6 @@ impl Runtime {
         self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(())
     }
-}
-
-/// Devices out of `view` by a manager's signed revocation in an epoch in effect, not only
-/// because a recovery left them out.
-fn signed_removals(state: &NetworkState, view: &AuthorizationView) -> Vec<String> {
-    let stopped: BTreeSet<u64> = state
-        .checkpoints
-        .iter()
-        .filter(|checkpoint| {
-            checkpoint
-                .hash()
-                .is_ok_and(|hash| view.stopped.contains(&hash))
-        })
-        .map(|checkpoint| checkpoint.epoch)
-        .collect();
-    view.revoked
-        .iter()
-        .filter(|revoked| {
-            state.events.iter().any(|event| {
-                event.epoch <= view.epoch
-                    && !stopped.contains(&event.epoch)
-                    && matches!(&event.action, GovernanceAction::Revoke(revocation) if revocation.device_id == revoked.device_id)
-            })
-        })
-        .map(|revoked| revoked.device_id.clone())
-        .collect()
 }
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.

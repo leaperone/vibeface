@@ -82,6 +82,7 @@ pub const MAX_CHECKPOINTS: usize = 64;
 /// Every checkpoint, stopped ones included; each stopped one cost a veto or a rotation.
 const MAX_CHECKPOINT_RECORDS: usize = 1024;
 const MAX_PARENTS: usize = 64;
+const MAX_SCOPE_PARENTS: usize = MAX_PARENTS * (MAX_CHECKPOINT_RECORDS + 1);
 const MAX_MANAGEMENT_DEPTH: usize = 128;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -348,7 +349,7 @@ impl RootCheckpoint {
         );
         device_id(&self.recovery_key)?;
         ensure!(
-            self.heads.len() <= MAX_PARENTS
+            self.heads.len() <= MAX_SCOPE_PARENTS
                 && self.heads.windows(2).all(|pair| pair[0] < pair[1])
                 && (self.directory.is_some() || self.heads.is_empty()),
             "invalid recovery checkpoint heads"
@@ -642,7 +643,7 @@ pub enum WriteBound<'a> {
 }
 
 /// The directory as of one time: the last epoch in effect.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationView {
     pub network_id: String,
@@ -660,6 +661,10 @@ pub struct AuthorizationView {
     pub pending: Option<PendingRecovery>,
     /// Hashes of the checkpoints a veto or a rotation stopped, and of any signed on top of them.
     pub stopped: Vec<String>,
+    #[serde(skip)]
+    signed_removals: Vec<String>,
+    #[serde(skip)]
+    historical_nodes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -722,9 +727,28 @@ impl AuthorizationView {
     /// `None` when nothing `device` wrote can count here.
     pub fn write_bound(&self, device: &str) -> Option<WriteBound<'_>> {
         match self.revocation(device) {
-            Some(revocation) => Some(WriteBound::Cutoff(revocation)),
+            Some(revocation) if self.historical_node(device) => {
+                Some(WriteBound::Cutoff(revocation))
+            }
+            Some(_) => None,
             None => self.node(device).ok().map(|_| WriteBound::Unlimited),
         }
+    }
+
+    /// Only definite daily Revoke effects in live scopes contribute this source list.
+    pub fn signed_removals(&self) -> &[String] {
+        &self.signed_removals
+    }
+
+    fn historical_node(&self, device: &str) -> bool {
+        self.historical_nodes
+            .binary_search_by(|known| known.as_str().cmp(device))
+            .is_ok()
+    }
+
+    /// A removed Client or an unproven Node never enters the old-Node sync channel.
+    pub fn removed_node(&self, device: &str) -> bool {
+        self.revocation(device).is_some() && self.historical_node(device)
     }
 
     pub fn attester(&self, device: &str) -> bool {
@@ -760,69 +784,531 @@ impl AuthorizationView {
     }
 }
 
-struct ValidEvent {
-    event: GovernanceEvent,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    No,
+    Unknown,
+    Yes,
+}
+
+impl Effect {
+    fn from_bool(value: bool) -> Self {
+        if value { Self::Yes } else { Self::No }
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Self::No => Self::Yes,
+            Self::Unknown => Self::Unknown,
+            Self::Yes => Self::No,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::No, _) | (_, Self::No) => Self::No,
+            (Self::Yes, Self::Yes) => Self::Yes,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Yes, _) | (_, Self::Yes) => Self::Yes,
+            (Self::No, Self::No) => Self::No,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn any_effect(values: impl Iterator<Item = Effect>) -> Effect {
+    values.fold(Effect::No, Effect::or)
+}
+
+struct ValidEvent<'a> {
+    event: &'a GovernanceEvent,
     ancestors: BTreeSet<String>,
+    /// Only edges within this event's epoch count toward the existing depth limit.
     depth: usize,
 }
 
-/// One epoch's directory after its events.
+struct HistoryEpoch {
+    key: String,
+    parent: Option<usize>,
+    checkpoint: Option<String>,
+    /// The explicit root directory that starts this authorization scope.
+    scope: usize,
+    lineage: BTreeSet<u64>,
+    base: Vec<Member>,
+    retired: Vec<Revocation>,
+}
+
+struct CheckedHistory<'a> {
+    epochs: Vec<HistoryEpoch>,
+    events: BTreeMap<String, ValidEvent<'a>>,
+}
+
+struct GrantGate {
+    effect: usize,
+    superseded_by: Vec<usize>,
+    manager: bool,
+}
+
+struct PermissionGate {
+    base_present: bool,
+    base_manager: bool,
+    retired: bool,
+    grants: Vec<GrantGate>,
+    revokes: Vec<usize>,
+}
+
+impl PermissionGate {
+    fn evaluate(&self, effects: &[Effect]) -> (Effect, Effect) {
+        let base_selected = any_effect(self.grants.iter().map(|grant| effects[grant.effect])).not();
+        let mut present = Effect::from_bool(self.base_present).and(base_selected);
+        let mut manager = Effect::from_bool(self.base_manager).and(base_selected);
+        let mut demoted = Effect::No;
+        for grant in &self.grants {
+            let selected = effects[grant.effect]
+                .and(any_effect(grant.superseded_by.iter().map(|index| effects[*index])).not());
+            present = present.or(selected);
+            if grant.manager {
+                manager = manager.or(selected);
+            } else {
+                demoted = demoted.or(selected);
+            }
+        }
+        let not_revoked = any_effect(self.revokes.iter().map(|index| effects[*index]))
+            .or(Effect::from_bool(self.retired))
+            .not();
+        (
+            present.and(not_revoked),
+            manager.and(demoted.not()).and(not_revoked),
+        )
+    }
+}
+
+struct Sources<'a> {
+    base: Option<&'a Member>,
+    retired: bool,
+    grants: Vec<usize>,
+    revokes: Vec<usize>,
+}
+
+struct Barrier {
+    effect: usize,
+    /// A signed causal re-promotion can end a demotion, never an explicit Revoke.
+    promotions: Vec<usize>,
+}
+
+struct EffectGate {
+    permission: PermissionGate,
+    self_leave: bool,
+    barriers: Vec<Barrier>,
+}
+
+/// One scope's effects, from its explicit root constants and one immutable cut.
 struct EpochView {
     heads: Vec<String>,
     members: BTreeMap<String, Member>,
     revoked: BTreeMap<String, Revocation>,
-    /// Its base's clients and every client granted in it.
-    clients: Vec<String>,
-    /// Every event here, valid in its own causal past.
-    known: BTreeSet<String>,
-    vetoes: Vec<CastVeto>,
-    approvals: Vec<CastApproval>,
+    clients: BTreeSet<String>,
+    nodes: BTreeSet<String>,
+    signed_removals: BTreeSet<String>,
 }
 
-/// A veto with its causal past, which alone decides whether it counts.
-struct CastVeto {
-    checkpoint: String,
-    at_ms: u64,
-    ancestors: BTreeSet<String>,
-}
+impl CheckedHistory<'_> {
+    fn basis(&self, epoch: usize) -> BTreeSet<String> {
+        self.events
+            .iter()
+            .filter(|(_, entry)| self.epochs[epoch].lineage.contains(&entry.event.epoch))
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
 
-/// An approval with its causal past, which alone decides whether it counts.
-struct CastApproval {
-    checkpoint: String,
-    at_ms: u64,
-    ancestors: BTreeSet<String>,
+    /// Unknown hashes keep recovery incomplete; known hashes must belong to this root branch.
+    fn references(&self, epoch: usize, hashes: &[String]) -> Result<bool> {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        let mut complete = true;
+        for hash in hashes {
+            let Some(entry) = self.events.get(hash) else {
+                complete = false;
+                continue;
+            };
+            ensure!(
+                self.epochs[epoch].lineage.contains(&entry.event.epoch),
+                "management dependency belongs to another root scope or branch"
+            );
+            let count = counts.entry(entry.event.epoch).or_default();
+            *count += 1;
+            ensure!(
+                *count <= MAX_PARENTS,
+                "too many management references in one epoch"
+            );
+        }
+        Ok(complete)
+    }
+
+    fn permission(
+        &self,
+        source: &Sources<'_>,
+        variables: &[(&String, &ValidEvent<'_>)],
+        basis: &BTreeSet<String>,
+    ) -> PermissionGate {
+        let grants: Vec<usize> = source
+            .grants
+            .iter()
+            .copied()
+            .filter(|index| basis.contains(variables[*index].0))
+            .collect();
+        PermissionGate {
+            base_present: source.base.is_some(),
+            base_manager: source.base.is_some_and(Member::is_manager),
+            retired: source.retired,
+            revokes: source
+                .revokes
+                .iter()
+                .copied()
+                .filter(|index| basis.contains(variables[*index].0))
+                .collect(),
+            grants: grants
+                .iter()
+                .map(|index| {
+                    let GovernanceAction::Grant { member } = &variables[*index].1.event.action
+                    else {
+                        unreachable!("grant source is a Grant")
+                    };
+                    GrantGate {
+                        effect: *index,
+                        superseded_by: grants
+                            .iter()
+                            .copied()
+                            .filter(|later| {
+                                variables[*later].1.ancestors.contains(variables[*index].0)
+                            })
+                            .collect(),
+                        manager: member.is_manager(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn project(&self, epoch: usize, basis: &BTreeSet<String>) -> Result<EpochView> {
+        let root = &self.epochs[self.epochs[epoch].scope];
+        let variables: Vec<_> = basis
+            .iter()
+            .filter_map(|hash| {
+                let entry = &self.events[hash];
+                matches!(
+                    entry.event.action,
+                    GovernanceAction::Grant { .. } | GovernanceAction::Revoke(_)
+                )
+                .then_some((hash, entry))
+            })
+            .collect();
+        let mut sources = BTreeMap::<String, Sources<'_>>::new();
+        for member in &root.base {
+            sources.insert(
+                member.device_id.clone(),
+                Sources {
+                    base: Some(member),
+                    retired: false,
+                    grants: vec![],
+                    revokes: vec![],
+                },
+            );
+        }
+        for retired in &root.retired {
+            sources
+                .entry(retired.device_id.clone())
+                .or_insert(Sources {
+                    base: None,
+                    retired: false,
+                    grants: vec![],
+                    revokes: vec![],
+                })
+                .retired = true;
+        }
+        for (index, (_, entry)) in variables.iter().enumerate() {
+            let (device, grant) = match &entry.event.action {
+                GovernanceAction::Grant { member } => (&member.device_id, true),
+                GovernanceAction::Revoke(revocation) => (&revocation.device_id, false),
+                _ => unreachable!("only Grant and Revoke have recursive effects"),
+            };
+            let source = sources.entry(device.clone()).or_insert(Sources {
+                base: None,
+                retired: false,
+                grants: vec![],
+                revokes: vec![],
+            });
+            if grant {
+                source.grants.push(index);
+            } else {
+                source.revokes.push(index);
+            }
+        }
+        let mut gates = Vec::with_capacity(variables.len());
+        for (hash, entry) in &variables {
+            let source = &sources[&entry.event.issuer];
+            let self_leave = matches!(&entry.event.action,
+                GovernanceAction::Revoke(revocation) if revocation.device_id == entry.event.issuer);
+            let mut barriers = Vec::new();
+            for index in &source.revokes {
+                let (barrier_hash, barrier) = variables[*index];
+                if barrier_hash != *hash && !barrier.ancestors.contains(*hash) {
+                    barriers.push(Barrier {
+                        effect: *index,
+                        promotions: vec![],
+                    });
+                }
+            }
+            if !self_leave {
+                for index in &source.grants {
+                    let (barrier_hash, barrier) = variables[*index];
+                    let GovernanceAction::Grant { member } = &barrier.event.action else {
+                        unreachable!("grant source is a Grant")
+                    };
+                    if member.kind != IdentityKind::Client
+                        || member.manage
+                        || barrier_hash == *hash
+                        || barrier.ancestors.contains(*hash)
+                    {
+                        continue;
+                    }
+                    let promotions = source
+                        .grants
+                        .iter()
+                        .copied()
+                        .filter(|promotion| {
+                            let (promotion_hash, promotion) = variables[*promotion];
+                            entry.ancestors.contains(promotion_hash)
+                                && promotion.ancestors.contains(barrier_hash)
+                                && matches!(&promotion.event.action,
+                                GovernanceAction::Grant { member } if member.is_manager())
+                        })
+                        .collect();
+                    barriers.push(Barrier {
+                        effect: *index,
+                        promotions,
+                    });
+                }
+            }
+            gates.push(EffectGate {
+                permission: self.permission(source, &variables, &entry.ancestors),
+                self_leave,
+                barriers,
+            });
+        }
+        let mut effects = vec![Effect::Unknown; variables.len()];
+        let mut stable = false;
+        // Strong Kleene gates are information-monotone; each variable refines at most once.
+        for _ in 0..=gates.len() {
+            let next: Vec<_> = gates
+                .iter()
+                .map(|gate| {
+                    let (client, manager) = gate.permission.evaluate(&effects);
+                    let authority = if gate.self_leave { client } else { manager };
+                    let barrier = any_effect(gate.barriers.iter().map(|barrier| {
+                        effects[barrier.effect].and(
+                            any_effect(barrier.promotions.iter().map(|index| effects[*index]))
+                                .not(),
+                        )
+                    }));
+                    authority.and(barrier.not())
+                })
+                .collect();
+            debug_assert!(
+                effects
+                    .iter()
+                    .zip(&next)
+                    .all(|(old, new)| *old == Effect::Unknown || old == new)
+            );
+            if effects == next {
+                stable = true;
+                break;
+            }
+            effects = next;
+        }
+        ensure!(stable, "governance effect projection did not converge");
+        let mut members = BTreeMap::new();
+        let mut revoked: BTreeMap<_, _> = root
+            .retired
+            .iter()
+            .map(|revocation| (revocation.device_id.clone(), revocation.clone()))
+            .collect();
+        let mut clients: BTreeSet<_> = root
+            .base
+            .iter()
+            .filter(|member| member.kind == IdentityKind::Client)
+            .map(|member| member.device_id.clone())
+            .collect();
+        let mut nodes: BTreeSet<_> = root
+            .base
+            .iter()
+            .filter(|member| member.kind == IdentityKind::Node)
+            .map(|member| member.device_id.clone())
+            .collect();
+        let mut signed_removals = BTreeSet::new();
+        for (index, (_, entry)) in variables.iter().enumerate() {
+            if effects[index] != Effect::Yes {
+                continue;
+            }
+            match &entry.event.action {
+                GovernanceAction::Grant { member } => {
+                    if member.kind == IdentityKind::Client {
+                        clients.insert(member.device_id.clone());
+                    } else {
+                        nodes.insert(member.device_id.clone());
+                    }
+                }
+                GovernanceAction::Revoke(revocation) => {
+                    widen(&mut revoked, revocation);
+                    signed_removals.insert(revocation.device_id.clone());
+                }
+                _ => unreachable!("only Grant and Revoke have recursive effects"),
+            }
+        }
+        for (device, source) in &sources {
+            let (present, manager) = self
+                .permission(source, &variables, basis)
+                .evaluate(&effects);
+            if present != Effect::Yes {
+                continue;
+            }
+            let grants: Vec<_> = source
+                .grants
+                .iter()
+                .copied()
+                .filter(|index| effects[*index] == Effect::Yes)
+                .collect();
+            let mut chosen = None::<Member>;
+            for index in grants.iter().filter(|index| {
+                !grants.iter().any(|later| {
+                    self.events[variables[*later].0]
+                        .ancestors
+                        .contains(variables[**index].0)
+                })
+            }) {
+                let GovernanceAction::Grant { member } = &variables[*index].1.event.action else {
+                    unreachable!("grant source is a Grant")
+                };
+                if let Some(current) = &mut chosen {
+                    if member.name < current.name {
+                        current.name.clone_from(&member.name);
+                    }
+                } else {
+                    chosen = Some(member.clone());
+                }
+            }
+            if let Some(mut member) = chosen.or_else(|| source.base.cloned()) {
+                member.manage = member.kind == IdentityKind::Client && manager == Effect::Yes;
+                members.insert(device.clone(), member);
+            }
+        }
+        let mut heads = basis.clone();
+        for hash in basis {
+            for parent in &self.events[hash].event.parents {
+                heads.remove(parent);
+            }
+        }
+        let heads: Vec<_> = heads.into_iter().collect();
+        self.references(epoch, &heads)?;
+        ensure!(members.len() <= MAX_MEMBERS, "too many current members");
+        Ok(EpochView {
+            heads,
+            members,
+            revoked,
+            clients,
+            nodes,
+            signed_removals,
+        })
+    }
+
+    fn electorate(
+        &self,
+        parent: usize,
+        checkpoint: &RootCheckpoint,
+    ) -> Result<Option<BTreeSet<String>>> {
+        if !self.references(parent, &checkpoint.heads)? {
+            return Ok(None);
+        }
+        let mut basis = BTreeSet::new();
+        for head in &checkpoint.heads {
+            basis.insert(head.clone());
+            basis.extend(self.events[head].ancestors.iter().cloned());
+        }
+        Ok(Some(
+            self.project(parent, &basis)?
+                .members
+                .into_values()
+                .filter(Member::is_manager)
+                .map(|member| member.device_id)
+                .collect(),
+        ))
+    }
+
+    fn votes(
+        &self,
+        parent: usize,
+        checkpoint: &RootCheckpoint,
+        hash: &str,
+    ) -> Result<(bool, Option<u64>, bool)> {
+        let Some(electorate) = self.electorate(parent, checkpoint)? else {
+            return Ok((false, None, true));
+        };
+        let mut vetoed = false;
+        let mut approved = None::<u64>;
+        for entry in self.events.values().filter(|entry| {
+            entry.event.epoch == parent as u64 + 1
+                && electorate.contains(&entry.event.issuer)
+                && checkpoint
+                    .heads
+                    .iter()
+                    .all(|head| entry.ancestors.contains(head))
+        }) {
+            match &entry.event.action {
+                GovernanceAction::Veto {
+                    checkpoint: target,
+                    at_ms,
+                } if target == hash && *at_ms < checkpoint.effective_at_ms() => vetoed = true,
+                GovernanceAction::Approve {
+                    checkpoint: target,
+                    at_ms,
+                } if target == hash && *at_ms < checkpoint.effective_at_ms() => {
+                    approved = Some(approved.map_or(*at_ms, |known| known.min(*at_ms)));
+                }
+                _ => {}
+            }
+        }
+        Ok((vetoed, approved, false))
+    }
 }
 
 /// Where an epoch stands at one time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Standing {
     Live,
-    /// A new directory waiting for its time.
     Pending,
-    /// Signed on top of an epoch not in effect yet.
     Waiting,
-    /// Vetoed in time, or retired by a sibling rotation signed before its time.
     Vetoed,
-    /// Signed on top of a stopped epoch.
     Void,
 }
 
 struct Epoch {
     key: String,
-    /// The epoch whose key signed this one's checkpoint.
     parent: Option<usize>,
     checkpoint: Option<String>,
+    scope: usize,
     rotation: bool,
     effective_at_ms: u64,
-    /// Vetoed, or retired by a sibling rotation; independent of time.
+    approved_at_ms: Option<u64>,
     stopped: bool,
-    /// Names heads its parent epoch does not hold here, so it waits for them.
     incomplete: bool,
     standing: Standing,
     view: EpochView,
 }
 
-/// The last epoch in effect; the genesis epoch always is.
 fn live(epochs: &[Epoch]) -> usize {
     epochs
         .iter()
@@ -830,40 +1316,6 @@ fn live(epochs: &[Epoch]) -> usize {
         .expect("the genesis epoch is in effect")
 }
 
-/// Whether a veto in `parent` stops `checkpoint`'s new directory: one signed before its time on
-/// top of every head the root saw. Its issuer was a manager in that causal past, or the history
-/// is invalid; later events, a revocation included, change nothing.
-fn vetoed(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> bool {
-    checkpoint.directory.is_some()
-        && parent.vetoes.iter().any(|veto| {
-            veto.checkpoint == hash
-                && veto.at_ms < checkpoint.effective_at_ms()
-                && checkpoint
-                    .heads
-                    .iter()
-                    .all(|head| veto.ancestors.contains(head))
-        })
-}
-
-/// The first valid confirmation time, including one ahead of this replica's clock.
-fn approval_at(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> Option<u64> {
-    parent
-        .approvals
-        .iter()
-        .filter(|approval| {
-            checkpoint.directory.is_some()
-                && approval.checkpoint == hash
-                && approval.at_ms < checkpoint.effective_at_ms()
-                && checkpoint
-                    .heads
-                    .iter()
-                    .all(|head| approval.ancestors.contains(head))
-        })
-        .map(|approval| approval.at_ms)
-        .min()
-}
-
-/// Whether a sibling checkpoint signed at `issued_at_ms` retires the recovery `earlier`.
 fn retires(rotation: bool, issued_at_ms: u64, earlier: &Epoch) -> bool {
     rotation && !earlier.rotation && issued_at_ms < earlier.effective_at_ms
 }
@@ -975,7 +1427,7 @@ impl NetworkState {
         Ok(true)
     }
 
-    /// The union of both histories: commutative, associative and idempotent.
+    /// The union of compatible checkpoint chains; conflicting checkpoints fail closed.
     pub fn merge(&self, incoming: &Self) -> Result<Self> {
         ensure!(
             self.genesis == incoming.genesis,
@@ -984,7 +1436,11 @@ impl NetworkState {
         let mut checkpoints: BTreeMap<u64, &RootCheckpoint> = BTreeMap::new();
         for checkpoint in self.checkpoints.iter().chain(&incoming.checkpoints) {
             if let Some(known) = checkpoints.insert(checkpoint.epoch, checkpoint) {
-                ensure!(known == checkpoint, "conflicting recovery checkpoint");
+                ensure!(
+                    known == checkpoint,
+                    "conflicting recovery checkpoint at epoch {}; reuse the same prepared checkpoint",
+                    checkpoint.epoch
+                );
             }
         }
         let mut events = BTreeMap::new();
@@ -1016,18 +1472,15 @@ impl NetworkState {
         self.project_at(now_ms())
     }
 
-    /// Checks every epoch against its own base and returns the directory in effect at `now_ms`.
+    /// Checks the complete signed history and returns the directory in effect at `now_ms`.
     pub fn project_at(&self, now_ms: u64) -> Result<AuthorizationView> {
         let mut epochs = self.epochs(now_ms)?;
         let live = live(&epochs);
         let pending = pending(&epochs, live).map(|index| PendingRecovery {
             checkpoint: epochs[index].checkpoint.clone().unwrap_or_default(),
-            effective_at_ms: approval_at(
-                &epochs[live].view,
-                &self.checkpoints[index - 1],
-                epochs[index].checkpoint.as_deref().unwrap_or_default(),
-            )
-            .unwrap_or(epochs[index].effective_at_ms),
+            effective_at_ms: epochs[index]
+                .approved_at_ms
+                .unwrap_or(epochs[index].effective_at_ms),
             members: epochs[index].view.members.values().cloned().collect(),
         });
         let stopped = epochs
@@ -1035,10 +1488,25 @@ impl NetworkState {
             .filter(|epoch| matches!(epoch.standing, Standing::Vetoed | Standing::Void))
             .filter_map(|epoch| epoch.checkpoint.clone())
             .collect();
-        let attesters: BTreeSet<String> = epochs
-            .iter()
-            .filter(|epoch| epoch.standing == Standing::Live)
-            .flat_map(|epoch| epoch.view.clients.iter().cloned())
+        // A later rotation's effects apply to the whole scope, including historical grant sources.
+        let mut scopes = BTreeMap::new();
+        for (index, epoch) in epochs.iter().enumerate() {
+            if epoch.standing == Standing::Live {
+                scopes.insert(epoch.scope, index);
+            }
+        }
+        let attesters: BTreeSet<_> = scopes
+            .values()
+            .flat_map(|index| epochs[*index].view.clients.iter().cloned())
+            .collect();
+        let historical_nodes: BTreeSet<_> = scopes
+            .values()
+            .flat_map(|index| epochs[*index].view.nodes.iter().cloned())
+            .collect();
+        let signed_removals: BTreeSet<_> = scopes
+            .values()
+            .flat_map(|index| epochs[*index].view.signed_removals.iter().cloned())
+            .filter(|device| epochs[live].view.revoked.contains_key(device))
             .collect();
         let current = epochs.swap_remove(live);
         Ok(AuthorizationView {
@@ -1051,44 +1519,32 @@ impl NetworkState {
             attesters: attesters.into_iter().collect(),
             pending,
             stopped,
+            signed_removals: signed_removals.into_iter().collect(),
+            historical_nodes: historical_nodes.into_iter().collect(),
         })
     }
 
-    /// Every epoch checked against its own base, and where each stands at `now_ms`. Only the
-    /// standing depends on the time; whether the history is valid, and which recoveries were
-    /// stopped, do not.
-    fn epochs(&self, now_ms: u64) -> Result<Vec<Epoch>> {
+    fn checked_history(&self) -> Result<CheckedHistory<'_>> {
         self.genesis.verify()?;
         ensure!(
-            self.checkpoints.len() <= MAX_CHECKPOINT_RECORDS
-                && self
-                    .checkpoints
-                    .windows(2)
-                    .all(|pair| pair[0].epoch < pair[1].epoch),
+            self.checkpoints.len() <= MAX_CHECKPOINT_RECORDS,
+            "recovery checkpoint record limit reached; existing history is unchanged"
+        );
+        ensure!(
+            self.checkpoints
+                .windows(2)
+                .all(|pair| pair[0].epoch < pair[1].epoch),
             "invalid recovery history"
         );
-        let mut keys = Vec::with_capacity(self.events.len());
-        for event in &self.events {
-            keys.push((event.epoch, event.hash()?));
-        }
-        ensure!(
-            keys.windows(2).all(|pair| pair[0] < pair[1]),
-            "duplicate or noncanonical management events"
-        );
         let root = &self.genesis.network_id;
-        let events = self.epoch_events(1);
-        let mut checked = events.len();
-        let view = self.project_epoch(1, &self.genesis.members(), &[], root, &events)?;
-        let mut epochs = vec![Epoch {
+        let mut epochs = vec![HistoryEpoch {
             key: root.clone(),
             parent: None,
             checkpoint: None,
-            rotation: false,
-            effective_at_ms: 0,
-            stopped: false,
-            incomplete: false,
-            standing: Standing::Live,
-            view,
+            scope: 0,
+            lineage: BTreeSet::from([1]),
+            base: self.genesis.members(),
+            retired: vec![],
         }];
         for (index, checkpoint) in self.checkpoints.iter().enumerate() {
             ensure!(
@@ -1109,45 +1565,253 @@ impl NetworkState {
                         .is_ok()
                 })
                 .context("recovery checkpoint is not signed by a recovery key of this network")?;
+            let (scope, mut lineage, base, retired) = match &checkpoint.directory {
+                Some(directory) => (
+                    index + 1,
+                    BTreeSet::new(),
+                    directory.members.clone(),
+                    directory.retired.clone(),
+                ),
+                None => (
+                    epochs[parent].scope,
+                    epochs[parent].lineage.clone(),
+                    vec![],
+                    vec![],
+                ),
+            };
+            lineage.insert(checkpoint.epoch);
+            epochs.push(HistoryEpoch {
+                key: checkpoint.recovery_key.clone(),
+                parent: Some(parent),
+                checkpoint: Some(checkpoint.hash()?),
+                scope,
+                lineage,
+                base,
+                retired,
+            });
+        }
+        let mut keys = Vec::with_capacity(self.events.len());
+        for event in &self.events {
+            keys.push((event.epoch, event.hash()?));
+        }
+        ensure!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "duplicate or noncanonical management events"
+        );
+        ensure!(
+            self.events
+                .iter()
+                .all(|event| (1..=epochs.len() as u64).contains(&event.epoch)),
+            "management event epoch has no recovery checkpoint"
+        );
+        let mut validated = BTreeMap::<String, ValidEvent<'_>>::new();
+        for (index, epoch) in epochs.iter().enumerate() {
+            let base = &epochs[epoch.scope].base;
+            let mut kinds: BTreeMap<String, IdentityKind> = base
+                .iter()
+                .map(|member| (member.device_id.clone(), member.kind))
+                .collect();
+            for entry in validated
+                .values()
+                .filter(|entry| epoch.lineage.contains(&entry.event.epoch))
+            {
+                if let GovernanceAction::Grant { member } = &entry.event.action {
+                    kinds.insert(member.device_id.clone(), member.kind);
+                }
+            }
+            let events = self.epoch_events(index as u64 + 1);
+            ensure!(
+                events.len() <= MAX_GOVERNANCE_EVENTS,
+                "too many management events"
+            );
+            let mut pending = BTreeMap::new();
+            for event in events {
+                ensure!(
+                    event.version == IDENTITY_VERSION
+                        && event.network_id == self.genesis.network_id,
+                    "management event network or epoch mismatch"
+                );
+                ensure!(
+                    event.parents.len() <= MAX_SCOPE_PARENTS
+                        && event.parents.windows(2).all(|pair| pair[0] < pair[1]),
+                    "invalid management parents"
+                );
+                for parent in &event.parents {
+                    validate_hash(parent)?;
+                }
+                device_id(&event.issuer)?;
+                match &event.action {
+                    GovernanceAction::Grant { member } => {
+                        member.validate()?;
+                        ensure_not_root(&epoch.key, std::iter::once(member))?;
+                        if let Some(kind) = kinds.insert(member.device_id.clone(), member.kind) {
+                            ensure!(
+                                kind == member.kind,
+                                "device cannot change between Node and client"
+                            );
+                        }
+                    }
+                    GovernanceAction::Revoke(revocation) => revocation.validate()?,
+                    GovernanceAction::Veto { checkpoint, .. }
+                    | GovernanceAction::Approve { checkpoint, .. } => {
+                        validate_hash(checkpoint)?;
+                    }
+                }
+                pending.insert(event.hash()?, event);
+            }
+            while !pending.is_empty() {
+                let ready: Vec<_> = pending
+                    .iter()
+                    .filter(|(_, event)| {
+                        event
+                            .parents
+                            .iter()
+                            .all(|parent| validated.contains_key(parent))
+                    })
+                    .map(|(hash, _)| hash.clone())
+                    .collect();
+                ensure!(
+                    !ready.is_empty(),
+                    "missing or cyclic management dependencies"
+                );
+                for hash in ready {
+                    let event = pending.remove(&hash).expect("ready event exists");
+                    let mut ancestors = BTreeSet::new();
+                    let mut depth = 1;
+                    let mut counts = BTreeMap::<u64, usize>::new();
+                    for parent in &event.parents {
+                        let previous = &validated[parent];
+                        ensure!(
+                            epoch.lineage.contains(&previous.event.epoch),
+                            "management dependency belongs to another root scope or branch"
+                        );
+                        let count = counts.entry(previous.event.epoch).or_default();
+                        *count += 1;
+                        ensure!(
+                            *count <= MAX_PARENTS,
+                            "too many management references in one epoch"
+                        );
+                        ancestors.extend(previous.ancestors.iter().cloned());
+                        ancestors.insert(parent.clone());
+                        if previous.event.epoch == event.epoch {
+                            depth = depth.max(previous.depth + 1);
+                        }
+                    }
+                    ensure!(
+                        depth <= MAX_MANAGEMENT_DEPTH,
+                        "management history is too deep"
+                    );
+                    let historical_client = base.iter().any(|member| {
+                        member.device_id == event.issuer && member.kind == IdentityKind::Client
+                    }) || ancestors.iter().any(|hash| {
+                        matches!(&validated[hash].event.action,
+                        GovernanceAction::Grant { member } if member.device_id == event.issuer
+                            && member.kind == IdentityKind::Client)
+                    });
+                    let historical_manager = base.iter().any(|member| {
+                        member.device_id == event.issuer && member.is_manager()
+                    }) || ancestors.iter().any(|hash| matches!(&validated[hash].event.action,
+                        GovernanceAction::Grant { member } if member.device_id == event.issuer && member.is_manager()));
+                    ensure!(
+                        historical_manager
+                            || leaves(&event.issuer, &event.action, historical_client),
+                        "management permission required"
+                    );
+                    verify_payload(
+                        &event.issuer,
+                        GOVERNANCE_DOMAIN,
+                        &event.signing_bytes()?,
+                        &event.signature,
+                    )?;
+                    validated.insert(
+                        hash,
+                        ValidEvent {
+                            event,
+                            ancestors,
+                            depth,
+                        },
+                    );
+                }
+            }
+            let mut heads: BTreeSet<_> = validated
+                .iter()
+                .filter(|(_, entry)| entry.event.epoch == index as u64 + 1)
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            for entry in validated
+                .values()
+                .filter(|entry| entry.event.epoch == index as u64 + 1)
+            {
+                for parent in &entry.event.parents {
+                    heads.remove(parent);
+                }
+            }
+            ensure!(
+                heads.len() <= MAX_PARENTS,
+                "too many concurrent management heads in one epoch"
+            );
+        }
+        Ok(CheckedHistory {
+            epochs,
+            events: validated,
+        })
+    }
+
+    /// Only standing depends on wall time; signed history and frozen vote cuts do not.
+    fn epochs(&self, now_ms: u64) -> Result<Vec<Epoch>> {
+        let history = self.checked_history()?;
+        let mut epochs = Vec::<Epoch>::with_capacity(history.epochs.len());
+        for (index, checked) in history.epochs.iter().enumerate() {
+            let view = history.project(index, &history.basis(index))?;
+            ensure_not_root(&checked.key, view.members.values())?;
+            let Some(parent) = checked.parent else {
+                epochs.push(Epoch {
+                    key: checked.key.clone(),
+                    parent: None,
+                    checkpoint: None,
+                    scope: checked.scope,
+                    rotation: false,
+                    effective_at_ms: 0,
+                    approved_at_ms: None,
+                    stopped: false,
+                    incomplete: false,
+                    standing: Standing::Live,
+                    view,
+                });
+                continue;
+            };
+            let checkpoint = &self.checkpoints[index - 1];
             let rotation = checkpoint.directory.is_none();
-            // A key signs again only after each earlier recovery it signed was vetoed in time,
-            // or with a rotation signed before that recovery's time, which retires it.
+            let (stopped, approved_at_ms, incomplete) = if rotation {
+                (false, None, false)
+            } else {
+                history.votes(
+                    parent,
+                    checkpoint,
+                    checked.checkpoint.as_deref().expect("checkpoint hash"),
+                )?
+            };
             let mut retired = Vec::new();
-            for (index, sibling) in epochs.iter().enumerate() {
+            for (sibling_index, sibling) in epochs.iter().enumerate() {
                 if sibling.parent == Some(parent) && !sibling.stopped {
                     ensure!(
                         retires(rotation, checkpoint.issued_at_ms, sibling),
                         "a recovery key signs again only after its earlier recoveries were vetoed"
                     );
-                    retired.push(index);
+                    retired.push(sibling_index);
                 }
             }
-            for index in retired {
-                epochs[index].stopped = true;
+            for sibling in retired {
+                epochs[sibling].stopped = true;
             }
-            let hash = checkpoint.hash()?;
-            let stopped = vetoed(&epochs[parent].view, checkpoint, &hash);
-            let incomplete = !checkpoint
-                .heads
-                .iter()
-                .all(|head| epochs[parent].view.known.contains(head));
-            let (base, retired) = match &checkpoint.directory {
-                Some(directory) => (directory.members.clone(), directory.retired.clone()),
-                None => (
-                    epochs[parent].view.members.values().cloned().collect(),
-                    epochs[parent].view.revoked.values().cloned().collect(),
-                ),
-            };
-            let events = self.epoch_events(checkpoint.epoch);
-            checked += events.len();
-            let key = &checkpoint.recovery_key;
-            let view = self.project_epoch(checkpoint.epoch, &base, &retired, key, &events)?;
             epochs.push(Epoch {
-                key: key.clone(),
+                key: checked.key.clone(),
                 parent: Some(parent),
-                checkpoint: Some(hash),
+                checkpoint: checked.checkpoint.clone(),
+                scope: checked.scope,
                 rotation,
                 effective_at_ms: checkpoint.effective_at_ms(),
+                approved_at_ms,
                 stopped,
                 incomplete,
                 standing: Standing::Live,
@@ -1155,21 +1819,12 @@ impl NetworkState {
             });
         }
         ensure!(
-            checked == self.events.len(),
-            "management event epoch has no recovery checkpoint"
-        );
-        ensure!(
             epochs.iter().filter(|epoch| !epoch.stopped).count() <= MAX_CHECKPOINTS + 1,
-            "invalid recovery history"
+            "active recovery checkpoint limit reached; existing history is unchanged"
         );
         for index in 1..epochs.len() {
             let epoch = &epochs[index];
             let parent = epochs[epoch.parent.expect("only genesis has no parent")].standing;
-            let checkpoint = &self.checkpoints[index - 1];
-            let checkpoint_hash = epoch
-                .checkpoint
-                .as_deref()
-                .expect("checkpoint epoch has a checkpoint hash");
             epochs[index].standing = match parent {
                 Standing::Vetoed | Standing::Void => Standing::Void,
                 _ if epoch.stopped => Standing::Vetoed,
@@ -1177,12 +1832,7 @@ impl NetworkState {
                 Standing::Pending | Standing::Waiting => Standing::Waiting,
                 Standing::Live
                     if epoch.rotation
-                        || approval_at(
-                            &epochs[epoch.parent.expect("only genesis has no parent")].view,
-                            checkpoint,
-                            checkpoint_hash,
-                        )
-                        .is_some_and(|at| at <= now_ms)
+                        || epoch.approved_at_ms.is_some_and(|at| at <= now_ms)
                         || now_ms >= epoch.effective_at_ms =>
                 {
                     Standing::Live
@@ -1200,220 +1850,25 @@ impl NetworkState {
             .collect()
     }
 
-    /// `root` is the recovery key of this epoch, which no member may be.
-    fn project_epoch(
-        &self,
-        epoch: u64,
-        base: &[Member],
-        retired: &[Revocation],
-        root: &str,
-        events: &[&GovernanceEvent],
-    ) -> Result<EpochView> {
-        ensure_not_root(root, base.iter())?;
-        ensure!(
-            events.len() <= MAX_GOVERNANCE_EVENTS,
-            "too many management events"
-        );
-        let mut pending = BTreeMap::new();
-        let mut kinds: BTreeMap<&str, IdentityKind> = base
+    fn ensure_checkpoint_voter(&self, checkpoint: &str, issuer: &str) -> Result<()> {
+        let history = self.checked_history()?;
+        let index = history
+            .epochs
             .iter()
-            .map(|member| (member.device_id.as_str(), member.kind))
-            .collect();
-        let mut clients: Vec<String> = base
-            .iter()
-            .filter(|member| member.kind == IdentityKind::Client)
-            .map(|member| member.device_id.clone())
-            .collect();
-        for event in events {
-            ensure!(
-                event.version == IDENTITY_VERSION
-                    && event.network_id == self.genesis.network_id
-                    && event.epoch == epoch,
-                "management event network or epoch mismatch"
-            );
-            ensure!(
-                event.parents.len() <= MAX_PARENTS
-                    && event.parents.windows(2).all(|pair| pair[0] < pair[1]),
-                "invalid management parents"
-            );
-            for parent in &event.parents {
-                validate_hash(parent)?;
-            }
-            device_id(&event.issuer)?;
-            match &event.action {
-                GovernanceAction::Grant { member } => {
-                    member.validate()?;
-                    ensure_not_root(root, std::iter::once(member))?;
-                    if let Some(kind) = kinds.insert(&member.device_id, member.kind) {
-                        ensure!(
-                            kind == member.kind,
-                            "device cannot change between Node and client"
-                        );
-                    }
-                    if member.kind == IdentityKind::Client {
-                        clients.push(member.device_id.clone());
-                    }
-                }
-                GovernanceAction::Revoke(revocation) => revocation.validate()?,
-                GovernanceAction::Veto { checkpoint, .. }
-                | GovernanceAction::Approve { checkpoint, .. } => validate_hash(checkpoint)?,
-            }
-            pending.insert(event.hash()?, (*event).clone());
-        }
-        let mut validated: BTreeMap<String, ValidEvent> = BTreeMap::new();
-        while !pending.is_empty() {
-            let ready = pending
-                .iter()
-                .filter(|(_, event)| event.parents.iter().all(|p| validated.contains_key(p)))
-                .map(|(hash, _)| hash.clone())
-                .collect::<Vec<_>>();
-            ensure!(
-                !ready.is_empty(),
-                "missing or cyclic management dependencies"
-            );
-            for hash in ready {
-                let event = pending.remove(&hash).expect("ready event exists");
-                let mut ancestors = BTreeSet::new();
-                let mut depth = 1;
-                for parent in &event.parents {
-                    let previous = &validated[parent];
-                    ancestors.extend(previous.ancestors.iter().cloned());
-                    ancestors.insert(parent.clone());
-                    depth = depth.max(previous.depth + 1);
-                }
-                ensure!(
-                    depth <= MAX_MANAGEMENT_DEPTH,
-                    "management history is too deep"
-                );
-                // ponytail: re-projects the ancestor set per event, O(n²) over at most 1024 events.
-                let (members, revoked) = project_members(base, retired, &validated, &ancestors);
-                ensure!(
-                    !revoked.contains_key(&event.issuer)
-                        && members.get(&event.issuer).is_some_and(|member| {
-                            member.is_manager()
-                                || leaves(
-                                    &event.issuer,
-                                    &event.action,
-                                    member.kind == IdentityKind::Client,
-                                )
-                        }),
-                    "management permission required"
-                );
-                verify_payload(
-                    &event.issuer,
-                    GOVERNANCE_DOMAIN,
-                    &event.signing_bytes()?,
-                    &event.signature,
-                )?;
-                validated.insert(
-                    hash,
-                    ValidEvent {
-                        event,
-                        ancestors,
-                        depth,
-                    },
-                );
-            }
-        }
-        let all = validated.keys().cloned().collect();
-        let (members, revoked) = project_members(base, retired, &validated, &all);
-        ensure!(members.len() <= MAX_MEMBERS, "too many current members");
-        let mut heads: BTreeSet<String> = validated.keys().cloned().collect();
-        for entry in validated.values() {
-            for parent in &entry.event.parents {
-                heads.remove(parent);
-            }
-        }
+            .position(|epoch| epoch.checkpoint.as_deref() == Some(checkpoint))
+            .context("unknown recovery checkpoint")?;
+        let parent = history.epochs[index]
+            .parent
+            .expect("checkpoint has a parent");
+        let voters = history
+            .electorate(parent, &self.checkpoints[index - 1])?
+            .context(RECOVERY_INCOMPLETE)?;
         ensure!(
-            heads.len() <= MAX_PARENTS,
-            "too many concurrent management heads"
+            voters.contains(issuer),
+            "device is not a manager in this recovery's signed cut"
         );
-        let mut vetoes = Vec::new();
-        let mut approvals = Vec::new();
-        for entry in validated.values() {
-            match &entry.event.action {
-                GovernanceAction::Veto { checkpoint, at_ms } => vetoes.push(CastVeto {
-                    checkpoint: checkpoint.clone(),
-                    at_ms: *at_ms,
-                    ancestors: entry.ancestors.clone(),
-                }),
-                GovernanceAction::Approve { checkpoint, at_ms } => {
-                    approvals.push(CastApproval {
-                        checkpoint: checkpoint.clone(),
-                        at_ms: *at_ms,
-                        ancestors: entry.ancestors.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
-        Ok(EpochView {
-            heads: heads.into_iter().collect(),
-            members,
-            revoked,
-            clients,
-            known: validated.into_keys().collect(),
-            vetoes,
-            approvals,
-        })
+        Ok(())
     }
-}
-
-/// Revocation wins over any grant; concurrent grants keep the narrower permission.
-fn project_members(
-    base: &[Member],
-    retired: &[Revocation],
-    events: &BTreeMap<String, ValidEvent>,
-    basis: &BTreeSet<String>,
-) -> (BTreeMap<String, Member>, BTreeMap<String, Revocation>) {
-    let mut members: BTreeMap<String, Member> = base
-        .iter()
-        .map(|member| (member.device_id.clone(), member.clone()))
-        .collect();
-    let mut revoked: BTreeMap<String, Revocation> = retired
-        .iter()
-        .map(|revocation| (revocation.device_id.clone(), revocation.clone()))
-        .collect();
-    let mut candidates: BTreeMap<String, Vec<&String>> = BTreeMap::new();
-    for hash in basis {
-        match &events[hash].event.action {
-            GovernanceAction::Veto { .. } | GovernanceAction::Approve { .. } => {}
-            GovernanceAction::Revoke(revocation) => widen(&mut revoked, revocation),
-            GovernanceAction::Grant { member } => {
-                candidates
-                    .entry(member.device_id.clone())
-                    .or_default()
-                    .push(hash);
-            }
-        }
-    }
-    for (device, grants) in candidates {
-        let mut chosen: Option<Member> = None;
-        for hash in grants.iter().filter(|hash| {
-            !grants
-                .iter()
-                .any(|later| events[*later].ancestors.contains(hash.as_str()))
-        }) {
-            let GovernanceAction::Grant { member } = &events[*hash].event.action else {
-                unreachable!("candidates are grants")
-            };
-            if let Some(current) = &mut chosen {
-                current.manage &= member.manage;
-                if member.name < current.name {
-                    current.name.clone_from(&member.name);
-                }
-            } else {
-                chosen = Some(member.clone());
-            }
-        }
-        if let Some(member) = chosen {
-            members.insert(device, member);
-        }
-    }
-    for device in revoked.keys() {
-        members.remove(device);
-    }
-    (members, revoked)
 }
 
 pub fn validate_hash(value: &str) -> Result<()> {
@@ -1537,8 +1992,13 @@ impl VerifiedMembership {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = governanceTemplate))]
     pub fn governance_template(&self, issuer: &str, action_json: &str) -> crate::Result<String> {
         js((|| {
-            let event =
-                GovernanceEvent::unsigned(&self.view, issuer, serde_json::from_str(action_json)?)?;
+            let action: GovernanceAction = serde_json::from_str(action_json)?;
+            if let GovernanceAction::Veto { checkpoint, .. }
+            | GovernanceAction::Approve { checkpoint, .. } = &action
+            {
+                self.state.ensure_checkpoint_voter(checkpoint, issuer)?;
+            }
+            let event = GovernanceEvent::unsigned(&self.view, issuer, action)?;
             Ok(serde_json::to_string(&event)?)
         })())
     }
@@ -1806,11 +2266,7 @@ mod tests {
             Member::client(&b, "b", true)?,
         )?)?;
         let before_removal = state.clone();
-        state.append(GovernanceEvent::revoke(
-            &b,
-            &state.project()?,
-            cut(&a, 0),
-        )?)?;
+        state.append(GovernanceEvent::revoke(&b, &state.project()?, cut(&a, 0))?)?;
         let attack = GovernanceEvent::grant(
             &a,
             &before_removal.project()?,
@@ -1821,8 +2277,723 @@ mod tests {
         let view = state.project()?;
         assert!(view.member(&id(&derived)).is_err());
         assert!(!view.attester(&id(&derived)));
-        assert!(state.events.iter().any(|event| event.hash().ok().as_ref() == Some(&attack_hash)));
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|event| event.hash().ok().as_ref() == Some(&attack_hash))
+        );
         Ok(())
+    }
+
+    fn signed_at(
+        state: &NetworkState,
+        issuer: &Identity,
+        epoch: u64,
+        parents: Vec<String>,
+        action: GovernanceAction,
+    ) -> Result<GovernanceEvent> {
+        GovernanceEvent {
+            version: IDENTITY_VERSION,
+            network_id: state.network_id().to_owned(),
+            epoch,
+            parents,
+            issuer: id(issuer),
+            action,
+            signature: String::new(),
+        }
+        .sign(issuer)
+    }
+
+    fn two_managers() -> Result<(Identity, Identity, Identity, Identity, NetworkState)> {
+        let (root, a, node, mut state) = setup()?;
+        let b = identity();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::client(&b, "b", true)?,
+        )?)?;
+        Ok((root, a, b, node, state))
+    }
+
+    #[test]
+    fn causal_grants_survive_the_grantee_revoking_the_grantor_across_rotations() -> Result<()> {
+        for rotations in [0, 1, 3] {
+            let (mut root, a, _, mut state) = setup()?;
+            let x = identity();
+            state.append(GovernanceEvent::grant(
+                &a,
+                &state.project_at(T)?,
+                Member::client(&x, "x", true)?,
+            )?)?;
+            let grant = state.events[0].hash()?;
+            for _ in 0..rotations {
+                let next = identity();
+                state.recover_at(RootCheckpoint::rotation(&state, &root, &id(&next), T)?, T)?;
+                root = next;
+            }
+            let revoke = GovernanceEvent::revoke(&x, &state.project_at(T)?, cut(&a, 0))?;
+            assert!(revoke.parents.contains(&grant));
+            let before = state.clone();
+            state.append(revoke)?;
+            let view = state.project_at(T)?;
+            assert!(view.manager(&id(&x)).is_ok() && view.attester(&id(&x)));
+            assert_eq!(view.cutoff(&id(&a)), Some(0));
+            assert_eq!(state, before.merge(&state)?);
+            assert_eq!(view, state.merge(&before)?.project_at(T)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_derived_grants_and_revokes_preserve_history_without_isolating_other_devices()
+    -> Result<()> {
+        let (_, a, b, node, base) = two_managers()?;
+        let (x, y) = (identity(), identity());
+        let g = GovernanceEvent::grant(&a, &base.project_at(T)?, Member::client(&x, "x", true)?)?;
+        let h = signed_at(
+            &base,
+            &x,
+            1,
+            vec![g.hash()?],
+            GovernanceAction::Grant {
+                member: Member::client(&y, "y", true)?,
+            },
+        )?;
+        let r = signed_at(
+            &base,
+            &y,
+            1,
+            vec![h.hash()?],
+            GovernanceAction::Revoke(cut(&node, 9)),
+        )?;
+        let mut removed = base.clone();
+        removed.append(GovernanceEvent::revoke(
+            &b,
+            &base.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        let mut attack = base;
+        for event in [&g, &h, &r] {
+            attack.append(event.clone())?;
+        }
+        let merged = removed.merge(&attack)?;
+        assert_eq!(merged, attack.merge(&removed)?);
+        assert_eq!(merged, merged.merge(&attack)?.merge(&removed)?);
+        let view = merged.project_at(T)?;
+        for device in [&x, &y] {
+            assert!(view.member(&id(device)).is_err() && !view.attester(&id(device)));
+        }
+        assert!(view.node(&id(&node)).is_ok());
+        assert_eq!(view.cutoff(&id(&node)), None);
+        assert_eq!(view.signed_removals(), [id(&a)]);
+        for event in [g, h, r] {
+            assert!(merged.events.contains(&event));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mutual_and_derived_cycles_keep_unknown_permissions_closed() -> Result<()> {
+        let (_, a, b, _, mut base) = two_managers()?;
+        let c = identity();
+        base.append(GovernanceEvent::grant(
+            &a,
+            &base.project_at(T)?,
+            Member::client(&c, "c", true)?,
+        )?)?;
+        for devices in [vec![&a, &b], vec![&a, &b, &c]] {
+            let view = base.project_at(T)?;
+            let mut branches = Vec::new();
+            for (index, issuer) in devices.iter().enumerate() {
+                let mut branch = base.clone();
+                branch.append(GovernanceEvent::revoke(
+                    issuer,
+                    &view,
+                    cut(devices[(index + 1) % devices.len()], 0),
+                )?)?;
+                branches.push(branch);
+            }
+            let forward = branches
+                .iter()
+                .try_fold(base.clone(), |state, branch| state.merge(branch))?;
+            let reverse = branches
+                .iter()
+                .rev()
+                .try_fold(base.clone(), |state, branch| state.merge(branch))?;
+            assert_eq!(forward, reverse);
+            let view = forward.project_at(T)?;
+            for device in &devices {
+                assert!(view.member(&id(device)).is_err());
+                assert_eq!(
+                    view.cutoff(&id(device)),
+                    None,
+                    "Unknown is not a signed cutoff"
+                );
+            }
+            assert!(view.signed_removals().is_empty());
+        }
+        let x = identity();
+        let g = GovernanceEvent::grant(&a, &base.project_at(T)?, Member::client(&x, "x", true)?)?;
+        let s = signed_at(
+            &base,
+            &x,
+            1,
+            vec![g.hash()?],
+            GovernanceAction::Revoke(cut(&b, 0)),
+        )?;
+        let mut left = base.clone();
+        left.append(g)?;
+        left.append(s)?;
+        let mut right = base;
+        right.append(GovernanceEvent::revoke(
+            &b,
+            &right.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        let merged = left.merge(&right)?;
+        assert_eq!(merged, right.merge(&left)?);
+        let view = merged.project_at(T)?;
+        for device in [&a, &b, &x] {
+            assert!(view.member(&id(device)).is_err());
+        }
+        assert!(!view.attester(&id(&x)) && view.signed_removals().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_causal_removal_preserves_its_safe_bound_when_its_issuer_is_removed() -> Result<()> {
+        let (_, a, b, node, mut state) = two_managers()?;
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &state.project_at(T)?,
+            cut(&node, 7),
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &b,
+            &state.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        let view = state.project_at(T)?;
+        assert_eq!(
+            view.write_bound(&id(&node)),
+            Some(WriteBound::Cutoff(&cut(&node, 7)))
+        );
+        assert_eq!(view.cutoff(&id(&a)), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn demotion_blocks_backdated_management_but_preserves_self_leave_and_causal_repromotion()
+    -> Result<()> {
+        let (_, a, b, _, base) = two_managers()?;
+        let (x, y) = (identity(), identity());
+        let stale =
+            GovernanceEvent::grant(&a, &base.project_at(T)?, Member::client(&x, "stale", true)?)?;
+        let mut demoted = base.clone();
+        demoted.append(GovernanceEvent::grant(
+            &b,
+            &base.project_at(T)?,
+            Member::client(&a, "a", false)?,
+        )?)?;
+        demoted.append(stale)?;
+        assert!(demoted.project_at(T)?.member(&id(&x)).is_err());
+        let mut leaving = demoted.clone();
+        leaving.append(GovernanceEvent::revoke(
+            &a,
+            &leaving.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        assert_eq!(leaving.project_at(T)?.cutoff(&id(&a)), Some(0));
+        assert!(leaving.project_at(T)?.manager(&id(&b)).is_ok());
+
+        demoted.append(GovernanceEvent::grant(
+            &b,
+            &demoted.project_at(T)?,
+            Member::client(&a, "a", true)?,
+        )?)?;
+        demoted.append(GovernanceEvent::grant(
+            &a,
+            &demoted.project_at(T)?,
+            Member::client(&y, "causal", true)?,
+        )?)?;
+        assert!(demoted.project_at(T)?.manager(&id(&y)).is_ok());
+        assert!(
+            demoted.project_at(T)?.member(&id(&x)).is_err(),
+            "later promotion does not bless stale parents"
+        );
+        let before_second = demoted.project_at(T)?;
+        demoted.append(GovernanceEvent::grant(
+            &b,
+            &before_second,
+            Member::client(&a, "a", false)?,
+        )?)?;
+        let z = identity();
+        demoted.append(GovernanceEvent::grant(
+            &a,
+            &before_second,
+            Member::client(&z, "stale again", true)?,
+        )?)?;
+        assert!(demoted.project_at(T)?.manager(&id(&y)).is_ok());
+        assert!(demoted.project_at(T)?.member(&id(&z)).is_err());
+
+        let mut concurrent = base.clone();
+        concurrent.append(GovernanceEvent::grant(
+            &b,
+            &base.project_at(T)?,
+            Member::client(&a, "a", false)?,
+        )?)?;
+        concurrent.append(GovernanceEvent::grant(
+            &b,
+            &base.project_at(T)?,
+            Member::client(&a, "a", true)?,
+        )?)?;
+        let g = GovernanceEvent::grant(
+            &a,
+            &base.project_at(T)?,
+            Member::client(&x, "concurrent", true)?,
+        )?;
+        concurrent.append(g)?;
+        let view = concurrent.project_at(T)?;
+        assert!(view.client(&id(&a)).is_ok() && view.manager(&id(&a)).is_err());
+        assert!(view.member(&id(&x)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_and_unknown_promotions_do_not_release_a_demotion_barrier() -> Result<()> {
+        let (_, a, b, _, mut base) = two_managers()?;
+        let (c, x, target) = (identity(), identity(), identity());
+        base.append(GovernanceEvent::grant(
+            &b,
+            &base.project_at(T)?,
+            Member::client(&c, "c", true)?,
+        )?)?;
+        let d = GovernanceEvent::grant(&b, &base.project_at(T)?, Member::client(&a, "a", false)?)?;
+        for unknown in [false, true] {
+            let gx =
+                GovernanceEvent::grant(&c, &base.project_at(T)?, Member::client(&x, "x", true)?)?;
+            let mut history = base.clone();
+            history.append(gx.clone())?;
+            let authority = history.project_at(T)?;
+            let mut left = history.clone();
+            left.append(d.clone())?;
+            let issuer = if unknown { &c } else { &x };
+            let p = signed_at(
+                &history,
+                issuer,
+                1,
+                left.project_at(T)?.heads,
+                GovernanceAction::Grant {
+                    member: Member::client(&a, "a", true)?,
+                },
+            )?;
+            let g = signed_at(
+                &history,
+                &a,
+                1,
+                vec![p.hash()?],
+                GovernanceAction::Grant {
+                    member: Member::client(&target, "target", true)?,
+                },
+            )?;
+            left.append(p)?;
+            left.append(g)?;
+            if unknown {
+                history.append(GovernanceEvent::revoke(&c, &authority, cut(&x, 0))?)?;
+                history.append(GovernanceEvent::revoke(&x, &authority, cut(&c, 0))?)?;
+            } else {
+                let mut removal = base.clone();
+                removal.append(GovernanceEvent::revoke(
+                    &b,
+                    &base.project_at(T)?,
+                    cut(&c, 0),
+                )?)?;
+                history = history.merge(&removal)?;
+            }
+            let view = history.merge(&left)?.project_at(T)?;
+            assert!(view.member(&id(&target)).is_err() && !view.attester(&id(&target)));
+            assert!(view.manager(&id(&a)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_grant_cannot_override_an_independent_valid_grant() -> Result<()> {
+        let (_, a, b, _, base) = two_managers()?;
+        let x = identity();
+        let mut state = base.clone();
+        state.append(GovernanceEvent::revoke(
+            &b,
+            &base.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &a,
+            &base.project_at(T)?,
+            Member::client(&x, "aaa invalid", false)?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &b,
+            &base.project_at(T)?,
+            Member::client(&x, "valid", true)?,
+        )?)?;
+        let member = state.project_at(T)?.manager(&id(&x))?;
+        assert_eq!(member.name, "valid");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rotation_checkpoint_freezes_its_old_epoch_electorate() -> Result<()> {
+        let (root, a, b, node, before_grant) = two_managers()?;
+        let x = identity();
+        let mut state = before_grant.clone();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project_at(T)?,
+            Member::client(&x, "x", true)?,
+        )?)?;
+        let next = identity();
+        state.recover_at(RootCheckpoint::rotation(&state, &root, &id(&next), T)?, T)?;
+        let (_, _, checkpoint) = recovering(&state, &next, &node, T + 1)?;
+        assert!(!checkpoint.heads.is_empty());
+        state.recover_at(checkpoint.clone(), T + 1)?;
+        state.append(veto(&x, &state.project_at(T + 1)?, &checkpoint, T + 2)?)?;
+        let mut removed = before_grant;
+        removed.append(GovernanceEvent::revoke(
+            &b,
+            &removed.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        let merged = state.merge(&removed)?;
+        assert_eq!(merged, removed.merge(&state)?);
+        let view = merged.project_at(T + RECOVERY_DELAY_MS + 2)?;
+        assert_eq!(view.epoch, 2);
+        assert!(view.stopped.contains(&checkpoint.hash()?));
+        assert!(view.member(&id(&x)).is_err() && !view.attester(&id(&x)));
+        let (_, _, later) = recovering(&merged, &next, &node, T + 3)?;
+        let mut later_state = merged;
+        later_state.recover_at(later.clone(), T + 3)?;
+        let event = signed_at(
+            &later_state,
+            &x,
+            2,
+            later_state.project_at(T + 3)?.heads,
+            GovernanceAction::Veto {
+                checkpoint: later.hash()?,
+                at_ms: T + 4,
+            },
+        )?;
+        later_state.append(event)?;
+        assert!(later_state.project_at(T + 4)?.pending.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_manager_outside_the_checkpoint_cut_cannot_vote_even_with_complete_parents() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let x = identity();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project_at(T)?,
+            Member::client(&x, "x", true)?,
+        )?)?;
+        for action in [
+            GovernanceAction::Veto {
+                checkpoint: checkpoint.hash()?,
+                at_ms: T + 1,
+            },
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: T + 1,
+            },
+        ] {
+            let encoded = serde_json::to_string(&state)?;
+            let verified = verify_membership(&encoded, state.network_id(), Some(T as f64))?;
+            assert!(
+                verified
+                    .governance_template(&id(&x), &serde_json::to_string(&action)?)
+                    .is_err()
+            );
+            let event = signed_at(&state, &x, 1, state.project_at(T)?.heads, action)?;
+            state.append(event)?;
+            assert_eq!(state.project_at(T + 2)?.epoch, 1);
+            assert!(state.project_at(T + 2)?.pending.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scope_frontiers_keep_eighty_heads_and_depth_is_bounded_per_epoch() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        for epoch in [1, 2] {
+            if epoch == 2 {
+                state.recover_at(
+                    RootCheckpoint::rotation(&state, &root, &id(&identity()), T)?,
+                    T,
+                )?;
+            }
+            let mut incoming = state.clone();
+            for index in 0..40 {
+                incoming.events.push(signed_at(
+                    &state,
+                    &a,
+                    epoch,
+                    vec![],
+                    GovernanceAction::Grant {
+                        member: Member::client(&identity(), &format!("{epoch}-{index}"), false)?,
+                    },
+                )?);
+            }
+            state = state.merge(&incoming)?;
+        }
+        assert_eq!(state.project_at(T)?.heads.len(), 80);
+        let next_root = state.checkpoints[0].recovery_key.clone();
+        let heads = state.heads_of(&next_root)?;
+        assert_eq!(heads.len(), 80);
+        let event =
+            GovernanceEvent::grant(&a, &state.project_at(T)?, Member::node(&node, "renamed")?)?;
+        assert_eq!(event.parents.len(), 80);
+        state.append(event)?;
+        assert_eq!(state.project_at(T)?.heads.len(), 1);
+
+        let (root, a, node, mut state) = setup()?;
+        let mut parent = vec![];
+        for epoch in [1, 2] {
+            if epoch == 2 {
+                state.checkpoints.push(RootCheckpoint::rotation(
+                    &state,
+                    &root,
+                    &id(&identity()),
+                    T,
+                )?);
+            }
+            for _ in 0..MAX_MANAGEMENT_DEPTH {
+                let event = signed_at(
+                    &state,
+                    &a,
+                    epoch,
+                    parent.clone(),
+                    GovernanceAction::Grant {
+                        member: Member::node(&node, "node")?,
+                    },
+                )?;
+                parent = vec![event.hash()?];
+                state.events.push(event);
+            }
+        }
+        let mut canonical = state.clone();
+        canonical.events.clear();
+        state = canonical.merge(&state)?;
+        assert_eq!(state.project_at(T)?.heads, parent);
+        let before = state.clone();
+        let too_deep = signed_at(
+            &state,
+            &a,
+            2,
+            parent,
+            GovernanceAction::Grant {
+                member: Member::node(&node, "too deep")?,
+            },
+        )?;
+        assert!(state.append(too_deep).is_err());
+        assert_eq!(state, before);
+        let parents = state
+            .events
+            .iter()
+            .filter(|event| event.epoch == 1)
+            .take(65)
+            .map(GovernanceEvent::hash)
+            .collect::<Result<Vec<_>>>()?;
+        let mut parents = parents;
+        parents.sort();
+        let too_wide = signed_at(
+            &state,
+            &a,
+            2,
+            parents,
+            GovernanceAction::Grant {
+                member: Member::node(&node, "too wide")?,
+            },
+        )?;
+        assert!(state.append(too_wide).is_err());
+        assert_eq!(state, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_explicit_directory_rejects_old_scope_and_future_parents() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project_at(T)?,
+            Member::node(&node, "renamed")?,
+        )?)?;
+        let old = state.events[0].hash()?;
+        let (manager, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint, T)?;
+        let event = signed_at(
+            &state,
+            &manager,
+            2,
+            vec![old],
+            GovernanceAction::Grant {
+                member: Member::client(&identity(), "foreign parent", false)?,
+            },
+        )?;
+        let before = state.clone();
+        assert!(state.append(event).is_err());
+        assert_eq!(state, before);
+        let valid = signed_at(
+            &state,
+            &manager,
+            2,
+            vec![],
+            GovernanceAction::Grant {
+                member: Member::client(&identity(), "new scope", false)?,
+            },
+        )?;
+        state.append(valid.clone())?;
+        let future = signed_at(
+            &state,
+            &a,
+            1,
+            vec![valid.hash()?],
+            GovernanceAction::Grant {
+                member: Member::client(&identity(), "future parent", false)?,
+            },
+        )?;
+        let before = state.clone();
+        assert!(state.append(future).is_err());
+        assert_eq!(state, before);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_invalid_removals_and_fake_nodes_do_not_gain_projection_sources() -> Result<()> {
+        let (root, a, b, node, base) = two_managers()?;
+        let fake = identity();
+        let mut state = base.clone();
+        state.append(GovernanceEvent::revoke(
+            &b,
+            &base.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &base.project_at(T)?,
+            cut(&node, 7),
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &a,
+            &base.project_at(T)?,
+            Member::node(&fake, "fake")?,
+        )?)?;
+        let before = state.project_at(T)?;
+        assert!(!before.signed_removals().contains(&id(&node)));
+        let kept = vec![Member::client(&b, "b", true)?];
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &id(&identity()),
+            kept,
+            vec![cut(&a, 0), cut(&node, 7), cut(&fake, 3)],
+            T,
+        )?;
+        state.recover_at(checkpoint, T)?;
+        let view = state.project_at(T + RECOVERY_DELAY_MS)?;
+        assert!(view.removed_node(&id(&node)));
+        assert!(!view.removed_node(&id(&a)) && !view.removed_node(&id(&fake)));
+        assert!(!view.signed_removals().contains(&id(&node)));
+        assert!(!view.signed_removals().contains(&id(&fake)));
+        assert_eq!(view.write_bound(&id(&fake)), None);
+        assert_eq!(view.write_bound(&id(&a)), None);
+        let mut daily = base.clone();
+        daily.append(GovernanceEvent::revoke(
+            &b,
+            &base.project_at(T)?,
+            cut(&node, 7),
+        )?)?;
+        assert!(daily.project_at(T)?.signed_removals().contains(&id(&node)));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_conflicts_fail_closed_in_both_merge_directions() -> Result<()> {
+        let (root, _, node, base) = setup()?;
+        let (_, _, recovery) = recovering(&base, &root, &node, T)?;
+        let (_, _, other_recovery) = recovering(&base, &root, &node, T)?;
+        let rotation = RootCheckpoint::rotation(&base, &root, &id(&identity()), T)?;
+        let other_rotation = RootCheckpoint::rotation(&base, &root, &id(&identity()), T)?;
+        for (left, right) in [
+            (recovery.clone(), other_recovery),
+            (rotation.clone(), other_rotation),
+            (recovery, rotation),
+        ] {
+            let (mut l, mut r) = (base.clone(), base.clone());
+            l.recover_at(left, T)?;
+            r.recover_at(right, T)?;
+            let before = (l.clone(), r.clone());
+            for error in [l.merge(&r).unwrap_err(), r.merge(&l).unwrap_err()] {
+                assert!(
+                    format!("{error:#}").contains("conflicting recovery checkpoint at epoch 2")
+                );
+            }
+            assert_eq!((l.clone(), r.clone()), before);
+            assert_eq!(l.merge(&l)?, l);
+            assert_eq!(r.merge(&r)?, r);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_capacity_diagnostics_preserve_the_existing_directory() -> Result<()> {
+        let (mut root, _, _, mut state) = setup()?;
+        for epoch in 2..=MAX_CHECKPOINTS as u64 + 1 {
+            let next = identity();
+            state.checkpoints.push(RootCheckpoint::create(
+                state.network_id(),
+                epoch,
+                &root,
+                &id(&next),
+                None,
+                vec![],
+                T,
+            )?);
+            root = next;
+        }
+        let before = state.clone();
+        let view = state.project_at(T)?;
+        let next = RootCheckpoint::rotation(&state, &root, &id(&identity()), T)?;
+        refused(
+            state.recover_at(next, T),
+            "active recovery checkpoint limit reached",
+        );
+        assert_eq!(state, before);
+        assert_eq!(state.project_at(T)?, view);
+        let mut oversized = state.clone();
+        oversized
+            .checkpoints
+            .resize(MAX_CHECKPOINT_RECORDS + 1, state.checkpoints[0].clone());
+        refused(
+            oversized.project_at(T),
+            "recovery checkpoint record limit reached",
+        );
+        assert_eq!(state, before);
+        Ok(())
+    }
+
+    #[test]
+    fn effect_gates_preserve_unknown_and_absorbing_constants() {
+        assert_eq!(Effect::Unknown.not(), Effect::Unknown);
+        assert_eq!(Effect::No.and(Effect::Unknown), Effect::No);
+        assert_eq!(Effect::Yes.or(Effect::Unknown), Effect::Yes);
+        for effect in [Effect::No, Effect::Unknown, Effect::Yes] {
+            assert_eq!(effect.and(Effect::Yes), effect);
+            assert_eq!(effect.or(Effect::No), effect);
+        }
     }
 
     #[test]
@@ -2779,10 +3950,9 @@ mod tests {
             state.clone().append(signed_by(&ordinary)?),
             "management permission required",
         );
-        refused(
-            state.clone().append(signed_by(&removed)?),
-            "management permission required",
-        );
+        let mut saved_removal = state.clone();
+        assert!(saved_removal.append(signed_by(&removed)?)?);
+        assert!(saved_removal.project_at(T)?.pending.is_some());
         // On top of parents from before its removal it signs a valid event, which stops nothing:
         // its causal past misses the heads the root saw, the removal among them.
         let mut rewound = veto(&a, &view, &checkpoint, T)?;

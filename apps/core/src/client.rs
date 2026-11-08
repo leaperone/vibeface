@@ -22,7 +22,13 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_secure::{
@@ -1117,9 +1123,8 @@ async fn dispatch(
     }
 }
 
-/// The history a recovery file carries, on top of `state`'s genesis. Anyone may send it, so of
-/// its events only the vetoes of its own checkpoints count: they let a recovery key sign again.
-/// Any other event, and with it any way to sign into an older epoch, is dropped.
+/// A recovery file carries its checkpoint vetoes and their complete signed dependencies.
+/// Dependencies establish history, and receive the same authorization projection as any sync.
 fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
     let checkpoints: Vec<RootCheckpoint> = optional(params, "checkpoints")?;
     let hashes = checkpoints
@@ -1127,15 +1132,35 @@ fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
         .map(RootCheckpoint::hash)
         .collect::<Result<Vec<_>>>()?;
     let events: Vec<GovernanceEvent> = optional(params, "events")?;
+    let mut available = BTreeMap::new();
+    for event in state.events.iter().chain(&events) {
+        available.insert(event.hash()?, event);
+    }
+    let mut pending = events.iter().filter(|event| {
+        matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
+    }).map(GovernanceEvent::hash).collect::<Result<Vec<_>>>()?;
+    let mut selected = BTreeSet::new();
+    while let Some(hash) = pending.pop() {
+        if !selected.insert(hash.clone()) {
+            continue;
+        }
+        let event = available
+            .get(&hash)
+            .context("missing carried governance dependency")?;
+        pending.extend(event.parents.iter().cloned());
+    }
+    let mut events: Vec<_> = selected
+        .into_iter()
+        .map(|hash| {
+            let event = available[&hash];
+            ((event.epoch, hash), event.clone())
+        })
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(NetworkState {
         genesis: state.genesis.clone(),
         checkpoints,
-        events: events
-            .into_iter()
-            .filter(|event| {
-                matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
-            })
-            .collect(),
+        events: events.into_iter().map(|(_, event)| event).collect(),
     })
 }
 
