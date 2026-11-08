@@ -1,9 +1,15 @@
 ---
 name: release
-description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对并行构建、完整制品、npm 与部署结果。
+description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建并签名本机 iOS 真机版本，核对制品、npm 与部署结果。
 ---
 
 # Vibeface release
+
+## 本机 iOS 构建与安装
+
+用户要求在本机编译 iOS 或安装到 iPhone 时，先读 [iOS 命令行构建](references/ios-local-build.md)。默认由独立 Aqua LaunchAgent 执行 Expo、CocoaPods 和 `xcodebuild`，复用本机已有开发签名身份，不依赖操作 Xcode 窗口。当前 Codex 后台 daemon 保持原样。
+
+本机开发签名构建、真机安装、公开产品发布和 TestFlight 分发分别核验、分别授权。只要求本机构建或安装时，不因此创建产品 Tag 或发布 npm。CI 的分发签名仍使用现有 `scripts/build-ios.sh` 流程。
 
 ## 确认发布范围
 
