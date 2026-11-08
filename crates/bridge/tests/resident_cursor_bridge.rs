@@ -27,6 +27,30 @@ fn fixture_executable() -> PathBuf {
     })
 }
 
+/// Deletes a fixture tree after the owned bridge job is gone. Windows can briefly retain cwd or
+/// file handles after job teardown; retry sharing violations only then, not to mask live children.
+fn remove_fixture_root(root: &Path) {
+    #[cfg(windows)]
+    {
+        const SHARING_VIOLATION: i32 = 32;
+        for attempt in 0..30 {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => return,
+                Err(error)
+                    if error.raw_os_error() == Some(SHARING_VIOLATION) && attempt + 1 < 30 =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("remove fixture root {}: {error}", root.display()),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn signal(group: u32, signal: &str, pidfile: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -892,7 +916,8 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         ),
         "Bridge::stop returns only after the SDK wrapper and child tree have exited"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    drop(bridge);
+    remove_fixture_root(&root);
 }
 
 #[tokio::test]
