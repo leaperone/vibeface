@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import { once } from 'node:events'
 import { createHash } from 'node:crypto'
+import { symlink } from 'node:fs/promises'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -89,6 +90,21 @@ function json(response: import('node:http').ServerResponse, status: number, valu
   response.end(JSON.stringify(value))
 }
 
+const fixtureCsp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: ws: wss; object-src 'none'"
+
+async function writeClientAssetFixture(base: string, indexBody = '<!doctype html><title>vibeface-app</title>'): Promise<void> {
+  await writeFile(join(base, '.vibeface-build.json'), JSON.stringify({ version: 1, component: 'web', content_security_policy: fixtureCsp }))
+  await writeFile(join(base, 'index.html'), indexBody)
+}
+
+async function protocolHandler(runtimeRoot: string): Promise<(request: Request) => Promise<Response>> {
+  const host = createClientHost({ runtimeRoot, resolveSelectedNode: async () => null, getClientContents: () => null, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
+  host.registerProtocol()
+  const handler = mocks.protocolHandler
+  if (!handler) throw new Error('protocol handler missing')
+  return handler
+}
+
 beforeEach(() => { mocks.handlers.clear(); mocks.protocolHandler = null })
 afterEach(async () => {
   for (const socket of upgradeSockets) socket.destroy()
@@ -103,14 +119,9 @@ describe('Desktop client host', () => {
   it('serves only confined GET/HEAD assets with CSP from the signed app receipt', async () => {
     rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
     await mkdir(join(rootDir, 'assets'))
-    await writeFile(join(rootDir, '.vibeface-build.json'), JSON.stringify({
-      version: 1, component: 'web', content_security_policy: "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: ws: wss; object-src 'none'",
-    }))
+    await writeClientAssetFixture(rootDir, '<!doctype html>fixture')
     await writeFile(join(rootDir, 'assets', 'crypto.wasm'), Buffer.from([0, 97, 115, 109]))
-    const host = createClientHost({ runtimeRoot: rootDir, resolveSelectedNode: async () => null, getClientContents: () => null, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
-    host.registerProtocol()
-    const handler = mocks.protocolHandler
-    if (!handler) throw new Error('protocol handler missing')
+    const handler = await protocolHandler(rootDir)
     const wasm = await handler(new Request(`${CLIENT_ORIGIN}/assets/crypto.wasm`))
     expect(wasm.status).toBe(200)
     expect(wasm.headers.get('content-type')).toBe('application/wasm')
@@ -297,5 +308,44 @@ describe('Desktop client host', () => {
     await invoke(CLIENT_IPC.carrierClose, call, streamId)
     await expect(invoke(CLIENT_IPC.carrierSend, call, streamId, sent)).rejects.toThrow('closed')
     host.dispose()
+  })
+
+  it('serves the signed SPA shell for client routes and preserves 404 for APIs and missing assets', async () => {
+    rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
+    await writeClientAssetFixture(rootDir)
+    const handler = await protocolHandler(rootDir)
+    const shell = await handler(new Request(`${CLIENT_ORIGIN}/`))
+    expect(shell.status).toBe(200)
+    expect(shell.headers.get('content-type')).toBe('text/html; charset=utf-8')
+    expect(shell.headers.get('cache-control')).toBe('no-store')
+    expect(await shell.text()).toContain('vibeface-app')
+    for (const path of ['/join', '/tasks', '/settings/desktop-node', '/devices', `/b/${'a'.repeat(32)}`, '/b/room/work/item']) {
+      const route = await handler(new Request(`${CLIENT_ORIGIN}${path}`))
+      expect(route.status).toBe(200)
+      expect(route.headers.get('content-type')).toBe('text/html; charset=utf-8')
+      expect(route.headers.get('content-security-policy')).toContain(CLIENT_ORIGIN)
+      expect(await route.text()).toContain('vibeface-app')
+    }
+    const head = await handler(new Request(`${CLIENT_ORIGIN}/settings/desktop-node`, { method: 'HEAD' }))
+    expect(head.status).toBe(200)
+    expect(head.headers.get('content-length')).toBe(String(Buffer.byteLength('<!doctype html><title>vibeface-app</title>')))
+    expect(await head.text()).toBe('')
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/api/local/setup`))).status).toBe(404)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/assets/missing.js`))).status).toBe(404)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/unknown/route`))).status).toBe(404)
+  })
+
+  it('rejects traversal, encoded traversal, and symlinks outside the signed asset root', async () => {
+    rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
+    await writeClientAssetFixture(rootDir)
+    const outside = await mkdtemp(join(tmpdir(), 'vibeface-client-outside-'))
+    await writeFile(join(outside, 'secret.txt'), 'leak')
+    await symlink(join(outside, 'secret.txt'), join(rootDir, 'escape-link'))
+    const handler = await protocolHandler(rootDir)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/../.vibeface-build.json`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/%2e%2e/.vibeface-build.json`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/escape-link`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/.vibeface-build.json`))).status).toBe(403)
+    await rm(outside, { recursive: true, force: true })
   })
 })
