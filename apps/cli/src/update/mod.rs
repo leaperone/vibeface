@@ -2319,7 +2319,7 @@ mod tests {
     #[tokio::test]
     async fn uncertain_stop_switch_start_and_health_keep_the_journal() {
         for failure in ["stop", "switch", "start", "health"] {
-            let (policy, data, mut journal) = activation_fixture();
+            let (policy, data, journal) = activation_fixture();
             fs::write(data.join("providers.json"), b"provider-material").unwrap();
             let update_policy = br#"{"channel":"stable","automatic":false}"#;
             fs::write(data.join("update.json"), update_policy).unwrap();
@@ -2333,7 +2333,7 @@ mod tests {
                 stops: std::sync::atomic::AtomicUsize::new(0),
             };
             assert!(
-                handoff(&policy, &data, &service, &mut journal)
+                handoff(&policy, &data, &service, &journal)
                     .await
                     .is_err(),
                 "{failure}"

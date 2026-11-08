@@ -92,7 +92,7 @@ struct ResultJson {
     runtime_update: RuntimeUpdateJson,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Receipt {
     schema: u32,
@@ -682,7 +682,7 @@ fn runtime_update_for_receipt(
     let installed = receipt
         .map(|value| managed_current(&value.managed_root))
         .transpose()?;
-    runtime_update_for_packages(&bundled, installed.as_deref(), running_version)
+    runtime_update_for_packages(bundled, installed.as_deref(), running_version)
 }
 
 fn emit(
@@ -761,24 +761,22 @@ fn update_refused(error: &anyhow::Error) -> bool {
 }
 
 async fn prove_switched_release(
+    receipt: &Receipt,
     data: &Path,
     bundled: &Path,
-    managed_root: &Path,
     candidate: &Path,
-    service_id: &str,
-    expected_device: &str,
     bundled_version: &str,
     resume_service: bool,
 ) -> Result<VerifiedRelease> {
-    let package = managed_current(managed_root)?;
+    let package = managed_current(&receipt.managed_root)?;
     if fs::canonicalize(&package)? != fs::canonicalize(candidate)?
         || managed_package_version(&package)? != bundled_version
     {
         return Err(OperationFailure::Package.into());
     }
-    let native = native_service(&package, data, service_id).await?;
+    let native = native_service(&package, data, &receipt.service_id).await?;
     let inspected = inspect(data, bundled).await?;
-    if inspected.device_id != expected_device {
+    if inspected.device_id != receipt.device_id {
         return Err(OperationFailure::UpdateRefused.into());
     }
     if resume_service {
@@ -1005,16 +1003,15 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         receipt.managed_root == profile.join("node-runtime"),
                         "managed runtime root is not owned by this profile"
                     );
-                    if data.join("update-pending.json").exists() {
-                        if let Err(error) =
+                    if data.join("update-pending.json").exists()
+                        && let Err(error) =
                             crate::update::recover_desktop_managed(&data, &receipt.managed_root)
                                 .await
-                        {
-                            if update_refused(&error) {
-                                anyhow::bail!(OperationFailure::UpdateRefused);
-                            }
-                            return Err(error);
+                    {
+                        if update_refused(&error) {
+                            anyhow::bail!(OperationFailure::UpdateRefused);
                         }
+                        return Err(error);
                     }
                     let source = bundled.to_path_buf();
                     let installed = managed_current(&receipt.managed_root)?;
@@ -1039,13 +1036,13 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     };
                     match update_meta.availability {
                         "current" => {
-                            if native.installed && native.running {
-                                if fresh.status != "running"
+                            if native.installed
+                                && native.running
+                                && (fresh.status != "running"
                                     || running_core_version(&fresh)?
-                                        != bundled_package_version(&source)?
-                                {
-                                    anyhow::bail!(OperationFailure::UpdateRefused);
-                                }
+                                        != bundled_package_version(&source)?)
+                            {
+                                anyhow::bail!(OperationFailure::UpdateRefused);
                             }
                             let core_status = if native.running && fresh.status == "running" {
                                 "running".to_string()
@@ -1087,9 +1084,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     let slot = std::sync::Arc::clone(&verified);
                     let proof_data = data.clone();
                     let proof_bundled = bundled.to_path_buf();
-                    let proof_root = receipt.managed_root.clone();
-                    let proof_service = receipt.service_id.clone();
-                    let proof_device = expected.to_owned();
+                    let proof_receipt = receipt.clone();
                     let proof_version = bundled_version.clone();
                     let release = crate::update::DesktopManagedRelease {
                         managed_root: &receipt.managed_root,
@@ -1106,18 +1101,14 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                             let slot = std::sync::Arc::clone(&slot);
                             let proof_data = proof_data.clone();
                             let proof_bundled = proof_bundled.clone();
-                            let proof_root = proof_root.clone();
-                            let proof_service = proof_service.clone();
-                            let proof_device = proof_device.clone();
+                            let proof_receipt = proof_receipt.clone();
                             let proof_version = proof_version.clone();
                             async move {
                                 let snapshot = prove_switched_release(
+                                    &proof_receipt,
                                     &proof_data,
                                     &proof_bundled,
-                                    &proof_root,
                                     &candidate,
-                                    &proof_service,
-                                    &proof_device,
                                     &proof_version,
                                     was_running,
                                 )
@@ -1719,12 +1710,10 @@ mod tests {
             .unwrap();
         }
         let proof = prove_switched_release(
+            &receipt,
             &data,
             &source,
-            &managed_root,
             &package,
-            &receipt.service_id,
-            &receipt.device_id,
             env!("CARGO_PKG_VERSION"),
             true,
         )
