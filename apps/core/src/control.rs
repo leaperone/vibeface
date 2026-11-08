@@ -216,6 +216,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         "public_url": configuration.public_url,
         "public_entry": configuration.public_entry,
         "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
+        "http_enabled": health.as_ref().is_ok_and(|health| health.http_enabled),
         "version": health.as_ref().ok().map(|health| &health.version),
         "write_state": health.as_ref().ok().and_then(|health| health.write_state),
         "bootstrap": {

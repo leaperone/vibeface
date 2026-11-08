@@ -2179,10 +2179,7 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
             "private file path is not a regular file"
         );
     }
-    let mut file = privatefs::create_or_truncate(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    privatefs::write_atomic(path, bytes)
 }
 
 fn provider_bin(value: &str) -> Result<(triage::Provider, PathBuf), String> {
@@ -2709,6 +2706,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&path)?, code);
         run(HooksAction::Uninstall).await?;
         assert!(!path.exists());
+        let settings = home.join(".claude/settings.json");
+        fs::write(&settings, b"{invalid JSON")?;
+        assert!(run(HooksAction::Install).await.is_err());
+        assert_eq!(fs::read(&settings)?, b"{invalid JSON");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_writes_replace_whole_files_and_preserve_failed_replacements() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-write-{}", uuid::Uuid::new_v4()));
+        private_dir(&dir)?;
+        let path = dir.join("hook.json");
+        private_write(&path, b"old complete content")?;
+        private_write(&path, b"new complete content")?;
+        assert_eq!(fs::read(&path)?, b"new complete content");
+        privatefs::ensure_private(&path, "the hook fixture")?;
+        let linked = dir.join("linked");
+        privatefs::link_dir(&fs::canonicalize(&dir)?, &linked)?;
+        assert!(private_write(&linked, b"must not replace a link").is_err());
+        assert!(privatefs::is_dir_link(&linked)?);
+        privatefs::remove_dir_link(&linked)?;
+        #[cfg(unix)]
+        {
+            let linked = dir.join("linked-file");
+            std::os::unix::fs::symlink(&path, &linked)?;
+            assert!(private_write(&linked, b"must not touch the target").is_err());
+            assert_eq!(fs::read(&path)?, b"new complete content");
+            // The existing name fits NAME_MAX; the atomic temporary name cannot fit it.
+            let long = dir.join("a".repeat(240));
+            privatefs::create_durable(&long, b"old complete content")?;
+            assert!(private_write(&long, b"replacement must fail").is_err());
+            assert_eq!(fs::read(&long)?, b"old complete content");
+        }
         fs::remove_dir_all(dir)?;
         Ok(())
     }
