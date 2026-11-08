@@ -76,7 +76,7 @@ describe('payload readers', () => {
     expect(readExternalUrl('https://example.com/a')).toBe('https://example.com/a')
     for (const blocked of [
       'file:///etc/passwd',
-      'vibeface://join?link=x',
+      'vibeface://join/x',
       'javascript:alert(1)',
       'ms-msdt:/id',
       'smb://host/share',

@@ -8,11 +8,8 @@ export type DeviceChannel = {
   idle(): boolean
   close(): void
 }
-/**
- * `relay`: the origin of the entry Node's relay from the ticket, whose Core also takes browsers at `/api/client`.
- * `direct`: the `ip:port` the entry Node listened on when it made the ticket, for the app to dial on the LAN.
- */
-export type JoinLink = { origin: string | null; relay: string | null; entryId: string; inviteId: string; inviteHash: string; secret: string; direct: string[] }
+/** The ticket names the entry Node only by its device ID. */
+export type JoinLink = { entryId: string; inviteId: string; inviteHash: string; secret: string }
 /** This device's Ed25519 key as its platform keeps it: made once, it only ever signs. */
 export type DeviceKeys = {
   /** The key, made on first use. Throws an error with `code: 'key_lost'` when a key this device made is gone, unless replacing it. */
@@ -80,20 +77,18 @@ export function validEndpoint(value: string): string {
 export const lanAddrs = (value: unknown): string[] =>
   Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === 'string' && ipPort.test(item)))].slice(0, 16) : []
 
-/** The ticket in a join QR code or link: `vibeface1…` alone or `https://<entry>/join#vibeface1…`, either also inside `vibeface://join?link=…`. */
-export function joinTicket(value: string): { ticket: string; origin: string | null } | null {
+const JOIN_LINK = 'vibeface://join/'
+const ticketPattern = /^vibeface1[0-9a-z]+$/
+
+/** The ticket in a join link or QR code: `vibeface://join/vibeface1…` or the ticket alone. */
+export function joinTicket(value: string): string | null {
   const input = value.trim()
-  if (input.startsWith('vibeface1')) return { ticket: input, origin: null }
-  try {
-    const url = new URL(input)
-    if (url.protocol === 'vibeface:') {
-      const inner = url.host === 'join' ? url.searchParams.get('link') : null
-      return inner && !inner.startsWith('vibeface:') ? joinTicket(inner) : null
-    }
-    if (url.pathname === '/join' && url.hash.startsWith('#vibeface1')) return { ticket: url.hash.slice(1), origin: url.origin }
-  } catch {}
-  return null
+  const ticket = input.startsWith(JOIN_LINK) ? input.slice(JOIN_LINK.length) : input
+  return ticketPattern.test(ticket) ? ticket : null
 }
+
+/** An invite as it is shared; the desktop and phone apps open it, a browser takes it pasted. */
+export const joinLink = (ticket: string) => `${JOIN_LINK}${ticket}`
 
 /** Frames not yet read, the connect timer and the one close of a carrier; `shut` drops what carries them. */
 function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (error: Error) => void, shut: () => void) {
@@ -228,17 +223,14 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     return sign(secure.signingMessage(domain, typeof payload === 'string' ? encoder.encode(payload) : payload))
   }
 
-  /** Trust comes from the ticket's device key; the addresses in a link or ticket are only hints. */
+  /** Trust comes from the ticket's device key. */
   async function parseJoinLink(value: string): Promise<JoinLink> {
     await initClient()
     if (value.trim().length > 8192) throw new Error('加入链接过长。重新复制管理设备上的链接。')
     const found = joinTicket(value)
     if (!found) throw new Error('这不是 Vibeface 加入链接。')
-    const ticket = JSON.parse(secure.ticketDecode(found.ticket))
-    let origin: string | null = null, relay: string | null = null
-    try { origin = found.origin && validEndpoint(found.origin) } catch {}
-    try { relay = typeof ticket.relay_url === 'string' ? validEndpoint(ticket.relay_url) : null } catch {}
-    return { origin, relay, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret, direct: lanAddrs(ticket.direct_addrs) }
+    const ticket = JSON.parse(secure.ticketDecode(found))
+    return { entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret }
   }
 
   async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {

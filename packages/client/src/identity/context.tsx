@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { joinTicket, unreachableText, validTarget } from '../lib/transport.ts'
+import { joinLink, joinTicket, unreachableText, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
@@ -15,7 +15,7 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { APP_ORIGIN, candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import { candidates, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
 import {
   catalogConnectionEntries,
@@ -53,17 +53,14 @@ type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string; admin?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
-/**
- * A fresh invitation; `qr` is what a phone scans: `link` itself when its camera can open it (`publicEntry`),
- * otherwise `vibeface://join?link=<ticket>` for the Vibeface app, which joins over the LAN.
- */
 /** `open`: 加入 may go ahead; `used` or `expired`: the link's computer would refuse it. */
 export type InviteState = 'open' | 'used' | 'expired'
 const inviteState = (value: unknown): InviteState | null => {
   const state = record(value).invite
   return state === 'open' || state === 'used' || state === 'expired' ? state : null
 }
-export type Invitation = { link: string; qr: string; publicEntry: boolean; expiresAt: number }
+/** A fresh invitation; `link` is `vibeface://join/<ticket>`, which the desktop and phone apps open. */
+export type Invitation = { link: string; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, an outbox change, or local inbox state. */
 type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string } | { type: 'ignored-inbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
@@ -682,10 +679,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function joinThisComputer(linkText: string, nameValue: string): Promise<'joined' | 'cancelled'> {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这个节点已经设置过。')
     const name = deviceName(nameValue)
-    const found = joinTicket(linkText)
-    const origin = found?.origin ?? page?.origin
-    if (!found || !origin) throw new Error('这不是有效的加入链接。')
-    const link = `${origin}/join#${found.ticket}`
+    const ticket = joinTicket(linkText)
+    if (!ticket) throw new Error('这不是有效的加入链接。')
+    const link = joinLink(ticket)
     const { capability, entry } = localSetup
     const active = await open(entry)
     setNodeJoining({ status: 'waiting' })
@@ -759,26 +755,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const result = record(await request('invite', { record: record_ }))
     const entryId = validTarget(result.entry_id)
     if (entryId !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
-    const route = connection.info.connection_entry ?? connection.entry
-    // Any member Gateway forwards the join to this Node, so a public entrance beats the address in use.
-    // The entry Node's own record names the public entry it is reached through, if it has one.
-    const known = openEntrances(loadEntrances(connection.principal.network_id))
-    const reachable = known.filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0] ?? known.find(item => item.device_id === entryId)
-    // The Node's own public entry, when it has one, is what a phone's camera can open.
-    const configured = typeof result.gateway_url === 'string' && isPublicUrl(result.gateway_url) ? result.gateway_url : undefined
-    const used = route.kind !== 'lan' && route.device_id === entryId ? route : connection.entry
-    const origin = configured ?? reachable?.gateway_url ?? (used.kind === 'lan' ? null : used.address)
-    const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
-    const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined
-    // Where the entry Node listens, so the app can join it on the LAN.
-    const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
-    const ticket = ticketEncode(entryId, hex(secret), relay, direct)
+    const ticket = ticketEncode(entryId, hex(secret))
     secret.fill(0)
-    const app = `vibeface://join?link=${encodeURIComponent(ticket)}`
-    // A public entrance is reachable from the App site; a LAN or loopback one only from its own page.
-    const publicEntry = origin !== null && isPublicUrl(origin)
-    const link = publicEntry ? `${APP_ORIGIN}/join#${ticket}` : origin ? `${origin}/join#${ticket}` : app
-    return { link, qr: publicEntry ? link : app, publicEntry, expiresAt }
+    return { link: joinLink(ticket), expiresAt }
   }
   async function startApproval(joinId: string) {
     managing()
@@ -994,15 +973,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The app tries the entry Node where the ticket says it listens on the LAN, then the entry Node's relay from the
-   * ticket, then this page's own entry: a scanned code's address is only a hint, the device key is the check.
+   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: this page's own
+   * entry, then the catalogue's. The device key is the check.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    const addresses = [...new Set([...link.relay ? [link.relay] : [], ...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
-    const base = [
-      ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
-      ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
-    ]
+    const base = page ? [{ kind: 'gateway' as const, address: page.origin, device_id: link.entryId }] : []
     return mergeJoinWays(base, link.entryId, new Set([link.entryId]))
   }
   /**
@@ -1019,9 +994,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     try {
       if (localSetup?.kind === 'uninitialized') {
-        const found = joinTicket(linkText), origin = found?.origin ?? page?.origin
-        if (!found || !origin) return null
-        return await ask(localSetup.entry, 'node_join_check', { capability: localSetup.capability, link: `${origin}/join#${found.ticket}` })
+        const ticket = joinTicket(linkText)
+        if (!ticket) return null
+        return await ask(localSetup.entry, 'node_join_check', { capability: localSetup.capability, link: joinLink(ticket) })
       }
       const link = await parseJoinLink(linkText)
       try {

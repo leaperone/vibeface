@@ -7,7 +7,6 @@ use crate::{Result, decode32, membership::canonical_json, validate_device_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -16,18 +15,12 @@ pub const TICKET_LIFETIME_MS: i64 = 10 * 60 * 1000;
 pub const INVITE_DOMAIN: &str = "identity-invite";
 pub const ATTESTATION_DOMAIN: &str = "attestation";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EntryAddr {
-    pub id: [u8; 32],
-    pub relay_url: Option<String>,
-    pub direct_addrs: Vec<SocketAddr>,
-}
-
-/// `vibeface1` ‖ lowercase base32 of the postcard encoding, like iroh's `EndpointTicket`.
+/// `vibeface1` ‖ lowercase base32 of the postcard encoding, like iroh's `EndpointTicket`. It
+/// names the entry Node only by device ID; the joiner finds where it is.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ticket {
     pub version: u8,
-    pub entry: EntryAddr,
+    pub entry_id: [u8; 32],
     pub secret: [u8; 32],
 }
 
@@ -36,11 +29,7 @@ impl Ticket {
         validate_device_id(entry_id)?;
         Ok(Self {
             version: 1,
-            entry: EntryAddr {
-                id: decode32(entry_id)?,
-                relay_url: None,
-                direct_addrs: vec![],
-            },
+            entry_id: decode32(entry_id)?,
             secret,
         })
     }
@@ -74,7 +63,7 @@ impl Ticket {
     }
 
     pub fn entry_id(&self) -> String {
-        hex::encode(self.entry.id)
+        hex::encode(self.entry_id)
     }
 
     pub fn invite_hash(&self) -> String {
@@ -174,24 +163,11 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body_json: &str) ->
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = ticketEncode))]
-pub fn ticket_encode(
-    entry_id: &str,
-    secret_hex: &str,
-    relay_url: Option<String>,
-    direct_addrs: Vec<String>,
-) -> Result<String> {
-    let mut ticket = Ticket::new(entry_id, decode32(secret_hex)?)?;
-    ticket.entry.relay_url = relay_url.filter(|url| url.len() <= 512);
-    ticket.entry.direct_addrs = direct_addrs
-        .iter()
-        .filter_map(|addr| addr.parse().ok())
-        .take(8)
-        .collect();
-    ticket.encode()
+pub fn ticket_encode(entry_id: &str, secret_hex: &str) -> Result<String> {
+    Ticket::new(entry_id, decode32(secret_hex)?)?.encode()
 }
 
-/// `{entry_id, invite_id, invite_hash, secret, relay_url, direct_addrs}`; `direct_addrs` are
-/// `ip:port` where the entry Node listened when it made the ticket.
+/// `{entry_id, invite_id, invite_hash, secret}`.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = ticketDecode))]
 pub fn ticket_decode(text: &str) -> Result<String> {
     let ticket = Ticket::decode(text)?;
@@ -201,8 +177,6 @@ pub fn ticket_decode(text: &str) -> Result<String> {
         "invite_id": invite_id(&hash)?,
         "invite_hash": hash,
         "secret": hex::encode(ticket.secret),
-        "relay_url": ticket.entry.relay_url,
-        "direct_addrs": ticket.entry.direct_addrs,
     })
     .to_string())
 }
@@ -233,14 +207,28 @@ mod tests {
     }
 
     #[test]
-    fn decoded_tickets_name_where_the_entry_listens() {
+    fn decoded_tickets_name_the_entry_only_by_device_id() {
         let entry = Identity::generate().unwrap().device_id();
-        let addrs = vec!["192.168.1.5:7000".into(), "[fd00::5]:7000".into()];
-        let text = ticket_encode(&entry, &hex::encode([7; 32]), None, addrs.clone()).unwrap();
+        let text = ticket_encode(&entry, &hex::encode([7; 32])).unwrap();
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(text["vibeface1".len()..].to_ascii_uppercase().as_bytes())
+            .unwrap();
+        assert_eq!(
+            bytes.len(),
+            1 + 32 + 32,
+            "version, entry ID and secret only"
+        );
         let decoded: Value = serde_json::from_str(&ticket_decode(&text).unwrap()).unwrap();
-        assert_eq!(decoded["direct_addrs"], serde_json::json!(addrs));
-        assert_eq!(decoded["relay_url"], Value::Null);
-        assert_eq!(decoded["entry_id"], entry);
+        let hash = invite_hash(&[7; 32]);
+        assert_eq!(
+            decoded,
+            serde_json::json!({
+                "entry_id": entry,
+                "invite_id": &hash[..32],
+                "invite_hash": hash,
+                "secret": hex::encode([7; 32]),
+            })
+        );
     }
 
     #[test]

@@ -4226,7 +4226,7 @@ test('unknown task detail reads its exact work without starting a Main request a
 
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
-  const invitation = { link: 'https://node.example/join#vibeface1test', qr: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
+  const invitation = { link: 'vibeface://join/vibeface1test', expiresAt: Date.now() + 600_000 }
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
@@ -4252,10 +4252,10 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   } finally { app.close() }
 })
 
-test("a link a phone's browser cannot open still gets a QR code, for the app", async () => {
-  const shown = async (link: string, qr: string, publicEntry: boolean) => {
+test("the invitation's QR code is its link, for the app", async () => {
+  const shown = async (link: string) => {
     const encoded: string[] = []
-    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, qr, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
       '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
       '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData(value: string) { encoded.push(value) }, make() {}, createDataURL: () => 'data:qr' }),
@@ -4265,14 +4265,10 @@ test("a link a phone's browser cannot open still gets a QR code, for the app", a
       return { tree: app.render('AddDevice'), encoded }
     } finally { app.close() }
   }
-  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', 'vibeface://join?link=vibeface1test', false)
-  assert.deepEqual(local.encoded, ['vibeface://join?link=vibeface1test'])
+  const local = await shown('vibeface://join/vibeface1test')
+  assert.deepEqual(local.encoded, ['vibeface://join/vibeface1test'])
   assert.equal(local.tree.find(({ type }) => type === 'img')?.props.alt, '用手机 App 扫码')
   assert.ok(local.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')))
-  const open = await shown('https://node.example/join#vibeface1test', 'https://node.example/join#vibeface1test', true)
-  assert.deepEqual(open.encoded, ['https://node.example/join#vibeface1test'])
-  assert.equal(open.tree.find(({ type }) => type === 'img')?.props.alt, '用手机相机扫码打开')
-  assert.equal(open.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')), false)
 })
 
 test("an entry is stored in the one form Nodes send it in, and a LAN entry as its device id and addresses", () => {

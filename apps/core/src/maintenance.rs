@@ -977,7 +977,10 @@ mod tests {
             &dir.join("data-epoch.json"),
             &crate::config::data_epoch_marker(),
         )?;
-        Config::local("127.0.0.1:4794".parse()?, vec![], false).save(&dir)?;
+        let mut configuration = Config::local("127.0.0.1:4794".parse()?, vec![], false);
+        // A relay nobody answers on keeps each join waiting.
+        configuration.network.relays = vec!["http://127.0.0.1:9".into()];
+        configuration.save(&dir)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
@@ -987,9 +990,7 @@ mod tests {
         let node = Arc::new(Runtime::open(&dir).await?);
         let server = tokio::spawn(serve(node.clone(), dir.clone()));
         let link = |secret: u8| -> Result<String> {
-            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
-            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
-            Ok(ticket.encode()?)
+            Ok(Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?.encode()?)
         };
         let nonce = || -> Result<(String, String)> {
             let pending: serde_json::Value =

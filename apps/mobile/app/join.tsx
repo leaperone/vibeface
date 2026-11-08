@@ -112,7 +112,7 @@ function JoinForm() {
   // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
   const [edited, setEdited] = useState(false)
   const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
-  // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
+  // Every new `vibeface://join/<ticket>` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
     const link = openedLink(url)
     if (link && link !== spent) edit(link)

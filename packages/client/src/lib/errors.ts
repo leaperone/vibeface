@@ -6,7 +6,7 @@ import { nodeJoinCopy } from '../identity/copy.ts'
  */
 const codes: Record<string, string> = {
   target_not_member: '那个节点不在我的设备里，访问地址不会转发给它。',
-  target_unreachable: '访问地址连不上那个节点。它可能已停止或断网，稍后会自动重试。',
+  target_unreachable: '访问地址找不到通往那台设备的线路，也无法直连。它可能已停止或断网，稍后会自动重试。',
   codex_missing: '没找到这个节点上的 Codex 目录或程序。装好 Codex，或在设备页填写程序路径。',
 }
 
