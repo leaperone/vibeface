@@ -1083,16 +1083,19 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function checkJoin() {
     const pending = joiningRef.current
     if (!pending) return
+    const joinId = pending.join_id
+    const stillJoining = () => joiningRef.current?.join_id === joinId
     const active = current(), request = scoped(active)
-    let status = parseJoinRequest(await request('join_status', { join_id: pending.join_id }))
-    if (joiningRef.current !== pending) return
-    let mine = pending
+    let status = parseJoinRequest(await request('join_status', { join_id: joinId }))
+    if (!stillJoining()) return
+    let mine = joiningRef.current ?? pending
     if (status.status === 'confirming' && !status.joiner_nonce && status.admin_id && status.admin_nonce) {
       // Fix the manager's nonce before revealing ours, so the entry cannot pick it after seeing our nonce.
       if (!mine.pinned) { mine = { ...mine, pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }; setJoin(mine) }
-      status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
+      status = parseJoinRequest(await request('join_status', { join_id: joinId, reveal: pending.nonce }))
     }
-    if (joiningRef.current !== mine) return
+    if (!stillJoining()) return
+    mine = joiningRef.current ?? mine
     if (status.device_id !== own().deviceId || status.invite_id !== pending.invite_id) throw new Error(`加入状态与${self}不一致。`)
     const pin = mine.pinned
     if (pin && status.admin_id && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
@@ -1101,8 +1104,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       throw failure
     }
     if (status.status === 'joined') {
-      if (pin?.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。重新生成加入链接。')
-      const state = record(await request('join_status', { join_id: pending.join_id })).state
+      if (pin && pin.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。重新生成加入链接。')
+      const state = record(await request('join_status', { join_id: joinId })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
       return
@@ -1115,7 +1118,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     const code = pin && status.joiner_nonce ? shortCode(pin.network_id, pending.invite_id, own().deviceId, pin.admin_id, pin.admin_nonce, pending.nonce) : undefined
     const next = { ...mine, status: status.status, code, admin: status.admin_name }
-    joiningRef.current = next; setJoining(next)
+    if (!stillJoining()) return
+    setJoin(next)
   }
   /**
    * Cancelling takes the request back at the entry so the manager's approval card goes away now, not at expiry.
