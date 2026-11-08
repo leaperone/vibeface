@@ -2481,6 +2481,7 @@ def protected_package_inside(package, expected, run):
             "rustupReadable":os.access(os.environ.get("RUSTUP_HOME","/usr/local/rustup"),os.R_OK),
             "rustupWritable":os.access(os.environ.get("RUSTUP_HOME","/usr/local/rustup"),os.W_OK)}}
     failure = None
+    os.environ["npm_config_cache"] = str(run / "npm-cache")
     environment = {**os.environ, "CARGO_BUILD_JOBS":"2", "TOKIO_WORKER_THREADS":"2", "VIBEFACE_APP_DIR":str(package / "web")}
     log = run / "sandbox-private.log"
     previous = signal.getsignal(signal.SIGTERM)
@@ -2587,6 +2588,23 @@ def self_test_protected(original):
             protected_package_dispatch(package, expected, run)
         process.wait.assert_called_once_with()
         assert "timeout" not in build.call_args.kwargs, "the native stages must not inherit the old UI total timeout"
+    with tempfile.TemporaryDirectory(prefix="protected-npm-cache-selftest-", dir=ARTIFACTS) as temporary:
+        run = Path(temporary); package = run / "package"; package.mkdir()
+        snapshot = {"memory.events":"oom 0\noom_kill 0\noom_group_kill 0\n"}
+        with patch(f"{__name__}.source_commit"), patch(f"{__name__}.resources", return_value=(Path('/synthetic-cgroup'),snapshot)), \
+             patch(f"{__name__}.command", side_effect=RuntimeError("synthetic stop before artifact preparation")) as prepare, \
+             patch("subprocess.Popen", forbidden), patch("subprocess.run", forbidden), patch("socket.socket", forbidden), \
+             patch.dict(os.environ,{"HOME":"/home/runner","TOKIO_WORKER_THREADS":"2","RISC0_HOME":"/risc0", \
+                 "RISC0_SERVER_PATH":"/opt/vdp/bin/r0vm","npm_config_cache":"/home/runner/.npm"},clear=True):
+            try: protected_package_inside(package,expected,run)
+            except RuntimeError as error: assert str(error) == "Protected sandbox failed; only independently verified partial evidence may be exported"
+            else: raise AssertionError("the preparation selfcheck must stop before real work")
+            prepare.assert_called_once()
+            environment = prepare.call_args.kwargs["env"]
+            assert environment["npm_config_cache"] == os.environ["npm_config_cache"] == str(run / "npm-cache")
+            assert environment["HOME"] == "/home/runner" and environment["RISC0_HOME"] == "/risc0"
+            assert environment["RISC0_SERVER_PATH"] == "/opt/vdp/bin/r0vm" and environment["TOKIO_WORKER_THREADS"] == "2"
+            assert not any(name.startswith(("RISC0_DEV","RISC0_SKIP")) for name in environment)
     driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
     assert "BootstrapSite" in driver and "BootstrapSite" in driver["e2e_fixture"].__code__.co_names
     def forbidden(*_args, **_kwargs): raise AssertionError("retired UI selfcheck started work")
