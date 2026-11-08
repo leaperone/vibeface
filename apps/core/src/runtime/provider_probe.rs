@@ -161,6 +161,11 @@ impl Runtime {
 
     pub(crate) async fn manager_readiness(&self) -> Option<ProviderProbeReadiness> {
         let manager = self.manager()?;
+        if !manager.workspace.is_dir() {
+            return Some(ProviderProbeReadiness::NeedsSetup {
+                issue: ProbeIssue::new(ProbeStage::Launch, ProbeCode::ConfigInvalid),
+            });
+        }
         Some(
             self.provider_readiness(manager.provider, &manager.model)
                 .await,

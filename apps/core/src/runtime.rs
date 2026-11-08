@@ -599,16 +599,16 @@ impl Runtime {
         let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
-            env: crate::providers::ProviderEnv::load(dir)?,
+            env: config.provider_env.clone(),
         };
         let codex_agent = config
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         provider_roots.apply(&mut local)?;
-        let mut codex_config = if local.launches(Provider::Codex)
-            && local.switches.app_server_used(codex_agent)
-        {
+        let mut codex_config = if config.codex_config.is_some() {
+            config.codex_config.clone()
+        } else if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
             match provider_roots.prepare_codex_config(&host) {
                 Ok(projected) => projected,
                 Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
@@ -623,7 +623,6 @@ impl Runtime {
         } else {
             None
         };
-        let mut completed_env = false;
         for provider in [Provider::Codex, Provider::Cursor] {
             let enabled = if provider == Provider::Codex {
                 local.switches.app_server_used(codex_agent)
@@ -648,10 +647,10 @@ impl Runtime {
             )
             .await
             {
-                Ok(changed) => completed_env |= changed,
+                Ok(_) => {}
                 Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
                     if provider == Provider::Codex {
-                        codex_config = None;
+                        codex_config = config.codex_config.clone();
                     }
                     tracing::warn!(
                         event = "providers.local_source_failed",
@@ -662,8 +661,10 @@ impl Runtime {
                 Err(error) => return Err(error),
             }
         }
-        if completed_env {
-            local.env.save(dir)?;
+        if local.env != config.provider_env || codex_config != config.codex_config {
+            config.provider_env = local.env.clone();
+            config.codex_config = codex_config.clone();
+            config.save(dir)?;
         }
         if let Some(projected) = codex_config {
             provider_roots.publish_codex_config(&projected)?;

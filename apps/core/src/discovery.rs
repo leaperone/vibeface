@@ -1,7 +1,7 @@
 //! Finds the paths this computer's providers need and writes them into the Node's own
 //! configuration once, where Settings shows them and the owner can change them. Nothing is
 //! guessed while running: a value is filled only for an enabled use or explicit local connection.
-//! The paths stay in `config.json` and `provider-env.json`; they never reach shared records.
+//! The paths stay in the private `config.json` snapshot; they never reach shared records.
 use crate::{
     config::{Config, ManagerSettings},
     providers::{AppServer, AppServerMode, Local, Provider, ProviderEnv},
@@ -495,8 +495,8 @@ pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Resu
 /// Before a Node starts: what its saved configuration misses is found and saved. When Codex
 /// cannot be found, nothing is written and loading the configuration says why.
 pub fn complete_saved(dir: &Path, host: &Host) -> Result<()> {
-    let mut config: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-    let mut env = ProviderEnv::load(dir)?;
+    let mut config = Config::load(dir)?;
+    let mut env = std::mem::take(&mut config.provider_env);
     let filled = match complete(&mut config, &mut env, host) {
         Ok(filled) => filled,
         Err(error) => {
@@ -507,10 +507,8 @@ pub fn complete_saved(dir: &Path, host: &Host) -> Result<()> {
     if filled.is_empty() {
         return Ok(());
     }
+    config.provider_env = env;
     config.save(dir)?;
-    if filled.codex_home.is_some() {
-        env.save(dir)?;
-    }
     tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
     Ok(())
 }
@@ -899,7 +897,8 @@ exec /bin/sh -c "$2"
         assert_eq!(saved.providers.codex_app_server.mode, AppServerMode::Spawn);
         assert_eq!(saved.triage.codex_sessions, None);
         assert!(
-            ProviderEnv::load(&dir)?
+            Config::load(&dir)?
+                .provider_env
                 .get(crate::providers::Provider::Codex)
                 .get(CODEX_HOME)
                 .is_none()

@@ -1,6 +1,6 @@
 //! The AI providers this Node runs locally, what a bot on each can do, and the variables each
-//! provider's processes get. The bot's provider and which providers execute work live in `config.json`;
-//! the variables are model keys, so they stay in one private file of the data directory and
+//! provider's processes get. Provider configuration and model keys live in one private `config.json`
+//! snapshot in the data directory and
 //! never reach events, logs or the web, which only learns which names are set.
 use crate::scheduling::TriggerKind;
 use anyhow::{Context, Result, ensure};
@@ -12,7 +12,6 @@ use std::{
 };
 use vibeface_bridge::agent::CustomToolConfig;
 
-pub const ENV_FILE: &str = "provider-env.json";
 const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
@@ -1025,25 +1024,14 @@ pub struct ProviderEnv(BTreeMap<Provider, BTreeMap<String, String>>);
 static NO_VARIABLES: BTreeMap<String, String> = BTreeMap::new();
 
 impl ProviderEnv {
-    pub fn load(dir: &Path) -> Result<Self> {
-        let env: Self = match std::fs::read(dir.join(ENV_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid provider environment")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(error) => return Err(error.into()),
-        };
-        for (provider, variables) in &env.0 {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (provider, variables) in &self.0 {
             for (name, value) in variables {
                 validate(*provider, name, value)?;
                 crate::logging::add_private_path(std::path::Path::new(value));
             }
         }
-        env.hide_values();
-        Ok(env)
-    }
-
-    pub fn save(&self, dir: &Path) -> Result<()> {
         self.hide_values();
-        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         Ok(())
     }
 
@@ -1502,7 +1490,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("vibeface-provider-env-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        let mut env = ProviderEnv::load(&dir)?;
+        let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
             BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-codex-value".into()))]),
@@ -1528,12 +1516,14 @@ mod tests {
                 "{name}"
             );
         }
-        env.save(&dir)?;
+        let mut configuration = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.provider_env = env;
+        configuration.save(&dir)?;
         vibeface_bridge::platform::privatefs::ensure_private(
-            &dir.join(ENV_FILE),
-            "the saved provider environment",
+            &dir.join("config.json"),
+            "the saved private configuration",
         )?;
-        let loaded = ProviderEnv::load(&dir)?;
+        let loaded = crate::config::Config::load(&dir)?.provider_env;
         assert!(!loaded.get(Provider::Cursor).contains_key("CPA_API_KEY"));
         assert!(!loaded.get(Provider::Codex).contains_key("CURSOR_API_KEY"));
         let (key, rest) = cursor_launch(loaded.get(Provider::Cursor));
@@ -1927,8 +1917,10 @@ requires_openai_auth = false
             BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-auth".into()))]),
         )?;
         roots.apply(&mut local)?;
-        local.env.save(&dir)?;
-        let loaded = ProviderEnv::load(&dir)?;
+        let mut configuration = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.provider_env = local.env;
+        configuration.save(&dir)?;
+        let loaded = crate::config::Config::load(&dir)?.provider_env;
         for provider in Provider::ALL {
             for (name, value) in roots.env(provider) {
                 assert_eq!(loaded.get(provider).get(&name), Some(&value));
