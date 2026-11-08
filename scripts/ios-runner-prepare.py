@@ -31,7 +31,6 @@ def number(value):
 
 
 STARTUP_PHASES = {"adopt_detached_runner", "ensure_booted", "verify_device_readiness", "verify_host_dev_tools_security", "cleanup_stale_bundles", "ensure_xctestrun", "build_xctestrun", "allocate_port", "prepare_xctestrun_env", "launch_xcodebuild"}
-LAUNCH_MARKERS = {"HEADLESS_STARTUP", "LISTENER_CONFIGURATION_MISSING", "LISTENER_READY", "PORT_NOT_SET", "LISTENER_FAILED", "WAITING"}
 
 
 def project_startup(value):
@@ -118,7 +117,7 @@ def project_error(error):
 
 
 
-def bounded_file(root, path, *, tail=False):
+def bounded_file(root, path):
     relative = path.absolute().relative_to(root.absolute())
     descriptors = [os.open(root.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
     try:
@@ -128,12 +127,10 @@ def bounded_file(root, path, *, tail=False):
             descriptors.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptors[-1]))
         descriptors.append(os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptors[-1]))
         info = os.fstat(descriptors[-1])
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not tail and info.st_size > LIMIT:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > LIMIT:
             raise ValueError("invalid task file")
-        if tail:
-            os.lseek(descriptors[-1], max(0, info.st_size - 65536), os.SEEK_SET)
-        data = os.read(descriptors[-1], 65536 if tail else LIMIT + 1)
-        if not tail and len(data) > LIMIT:
+        data = os.read(descriptors[-1], LIMIT + 1)
+        if len(data) > LIMIT:
             raise ValueError("task file too large")
         return data
     finally:
@@ -237,9 +234,6 @@ def self_test():
         error = dict(code="COMMAND_FAILED", message=marker, details=dict(reason="prepare_deadline_expired", phase="runner_rebuild", raw=marker), diagnosticsRecord=dict(session=SESSION, requestId=request_id))
         raw.write_text(json.dumps(dict(success=False, error=error)))
         record.write_bytes(encode([row, invalidated]))
-        large = root / "bounded-runner.log"
-        large.write_bytes(b"x" * LIMIT + b"AGENT_DEVICE_RUNNER_LISTENER_READY")
-        assert bounded_file(root, large, tail=True) == large.read_bytes()[-65536:]
         result = read_error(root, raw)
         assert result["initial_health"] == expected and result["details"]["reason"] == "prepare_deadline_expired"
         assert marker not in json.dumps(result) and request_id not in json.dumps(result)
@@ -253,158 +247,8 @@ def self_test():
     print("XCTest prepare error projection bounds passed")
 
 
-def probe():
-    import shutil
-    import subprocess
-
-    repo = Path(__file__).resolve().parents[1]
-    run_id, attempt, source = (os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"))
-    assert run_id.isdigit() and attempt.isdigit() and re.fullmatch(r"[a-f0-9]{40}", source)
-    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip() == source
-    layout = __import__("runpy").run_path(str(repo / "scripts/ios-actor-census.py"))
-    root = layout["inside_artifacts"](repo, repo / ".artifacts/native")
-    os.umask(0o077)
-    root.mkdir(parents=True, exist_ok=False)
-    private = root / "private"
-    private.mkdir(); (root / "public").mkdir()
-    state = root / "agent-device"
-    environment = {**os.environ, "AGENT_DEVICE_HOME": str(state), "AGENT_DEVICE_STATE_DIR": str(state), "AGENT_DEVICE_SESSION": SESSION}
-    runtime = simulator = binary = None
-    prepare_code = None
-    stage = "device-selection"
-    result = {"source_commit": source, "run_id": run_id, "run_attempt": attempt, "product_acceptance": False, "SDK_prepare_invocations": 0}
-    cleanup = {"daemon_stopped": False, "simulator_removed": False, "private_state_removed": False}
-
-    def command(arguments, label):
-        with (private / (label + ".stdout")).open("xb") as output, (private / (label + ".stderr")).open("xb") as error:
-            process = subprocess.run(arguments, cwd=repo, env=environment, stdout=output, stderr=error)
-        if process.returncode:
-            raise RuntimeError("probe command failed")
-        return (private / (label + ".stdout")).read_bytes()
-
-    try:
-        resolver = 'const fs=require("node:fs"),path=require("node:path"); const entry=require.resolve("@e2e-dev/mobile"); const container=path.resolve(path.dirname(path.dirname(entry)),"..",".."); const pkg=fs.realpathSync(path.join(container,"agent-device")); const bin=path.join(pkg,"bin","agent-device.mjs"); if(!fs.existsSync(bin))process.exit(2); process.stdout.write(bin)'
-        binary = command(["node", "-e", resolver], "resolve-sdk").decode().strip()
-        runtimes = json.loads(command(["xcrun", "simctl", "list", "runtimes", "--json"], "runtimes"))["runtimes"]
-        available = [row for row in runtimes if row.get("isAvailable") and ".SimRuntime.iOS-" in row["identifier"]]
-        selected = max(available, key=lambda row: tuple(map(int, row["version"].split("."))))
-        runtime = selected["identifier"]
-        name = "vibeface-provider-" + run_id + "-" + attempt
-        simulator = command(["xcrun", "simctl", "create", name, "com.apple.CoreSimulator.SimDeviceType.iPhone-17", runtime], "create").decode().strip()
-        assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
-        stage = "simulator-boot"
-        command(["xcrun", "simctl", "boot", simulator], "boot")
-        command(["xcrun", "simctl", "bootstatus", simulator, "-b"], "bootstatus")
-        stage = "runner-prepare"
-        result["SDK_prepare_invocations"] = 1
-        raw = private / "ios-runner-prepare.raw.json"
-        with raw.open("xb") as output, (private / "ios-runner-prepare.stderr.log").open("xb") as error:
-            process = subprocess.run(["node", binary, "prepare", "ios-runner", "--platform", "ios", "--udid", simulator, "--json"], cwd=repo, env=environment, stdout=output, stderr=error)
-        prepare_code = process.returncode
-        result["prepare_exit_code"] = prepare_code
-        result["error"] = read_error(repo, raw) if prepare_code else None
-        result["status"] = "prepare_failed" if prepare_code else "prepare_command_succeeded"
-        runner_tail = b""
-        try:
-            runner_tail = bounded_file(repo, state / "sessions" / SESSION / "runner.log", tail=True)
-            decoded = runner_tail.decode("utf-8", errors="replace")
-            result["launch_markers"] = {"status": "tail_captured", "bytes": len(runner_tail), "read_bound_reached": len(runner_tail) == 65536,
-                                        "reported": sorted(marker for marker in LAUNCH_MARKERS if "AGENT_DEVICE_RUNNER_" + marker in decoded)}
-        except (OSError, ValueError):
-            result["launch_markers"] = {"status": "unavailable"}
-        try:
-            payload = json.dumps({"prepare_result": bounded_file(repo, raw).decode("utf-8", errors="replace"),
-                                  "runner_tail": runner_tail.decode("utf-8", errors="replace"), "simulator": simulator}).encode()
-            assert len(payload) <= 393216
-            program = "import {readFileSync} from 'node:fs'; import {randomBytes,createCipheriv,publicEncrypt,constants} from 'node:crypto'; const key=randomBytes(32),nonce=randomBytes(12),aad=process.argv[2],cipher=createCipheriv('aes-256-gcm',key,nonce); cipher.setAAD(Buffer.from(aad)); const body=Buffer.concat([cipher.update(readFileSync(0)),cipher.final()]); const wrapped=publicEncrypt({key:Buffer.from(process.argv[1],'base64'),oaepHash:'sha256',padding:constants.RSA_PKCS1_OAEP_PADDING},key); process.stdout.write(JSON.stringify({schema:1,aad,nonce:nonce.toString('base64'),tag:cipher.getAuthTag().toString('base64'),key:wrapped.toString('base64'),body:body.toString('base64')}));"
-            aad = "vibeface:" + source + ":" + run_id + ":" + attempt + ":runner-launch-v1"
-            envelope = root / "public/runner-launch.sealed.json"
-            with envelope.open("xb") as output, (private / "seal.stderr").open("xb") as error:
-                sealed = subprocess.run(["node", "--input-type=module", "-e", program, 'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUF2SGxya0JoOEhObWFtMnFnL0lHRQpMSlM0WjNCYi9ZV3VTbjM5N1hZT1ZYeEY0RjNOQTBUUmZJbEdHZkhsa0RtUko3MHN0VnRQeS81blZ0Nk04Z0lzCkRjam0wRlJxa2NONks0cWE4L3V6VWxRK1ZlWTNZa1lBS0YxQ1M2SzY5MXRLQzNqTjdwc1JWVzgwYW10c21XTmUKQmZZc3d0Y01uQ0VRZjAxazkxdjF2Q1pPb2YveFVEbHpCaUU5REU1L1VIOGFXV1pTd3dkQUFqVzJzL2g1eER5UQpzamFiU3BGOG9PaGx5dHFPN1hwNXkrcThiV1pacEEyVjNQWDlINWdQTFlKSWVvM2t1dEorU3dlSzNjYStHVVZHClZheTRYc0NqSE50ZTczRXVoQTN4YkJNYzYwMTJNR1gzZVVDeTVvTGJKYzdMZUdvTnlxcjc1SGFTOFRxRWFpUW8KRWduTmRPak9rbnp5WWlCUjFnU2tjSzQyYnp3b3dZWW5iMjJJbG1MTFQvTVNFUEpZQlNHSjZMUzRuV0owbURjTwpiY3NDbFAwSk1QSDVrZzVCUVduR1NESWNldkU3TVBEb2owTjRaS212RCtKV2ZkOWFqSVowcHFVSHpOMzRKaWdRCi81cHhYRDFXMDlaeXBLY1ZaS2NRbzBEa1dEUDhIK25CR1o5SnhLQWtVUHZ0QWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==', aad], input=payload,
-                                        cwd=repo, env=environment, stdout=output, stderr=error, timeout=15)
-            if sealed.returncode != 0:
-                raise RuntimeError("encryption failed")
-            sealed_value = json.loads(envelope.read_bytes())
-            assert set(sealed_value) == {"schema", "aad", "nonce", "tag", "key", "body"} and sealed_value["schema"] == 1 and sealed_value["aad"] == aad
-            decode = lambda key: __import__("base64").b64decode(sealed_value[key], validate=True)
-            assert len(decode("nonce")) == 12 and len(decode("tag")) == 16 and len(decode("key")) == 384 and len(decode("body")) == len(payload)
-            result["sealed_launch_evidence"] = {"status": "sealed", "sha256": __import__("hashlib").sha256(envelope.read_bytes()).hexdigest()}
-        except (OSError, ValueError, TypeError, KeyError, AssertionError, RuntimeError, subprocess.TimeoutExpired):
-            envelope = root / "public/runner-launch.sealed.json"
-            if envelope.exists():
-                envelope.unlink()
-            result["sealed_launch_evidence"] = {"status": "unavailable"}
-        toolchain = {"runtime_version": selected["version"] if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", selected["version"]) else "unknown"}
-        for label, arguments in (("xcode-version", ["xcodebuild", "-version"]), ("simulator-sdk-version", ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"])):
-            try:
-                with (private / (label + ".stdout")).open("xb") as output, (private / (label + ".stderr")).open("xb") as error:
-                    version = subprocess.run(arguments, cwd=repo, env=environment, stdout=output, stderr=error, timeout=15)
-                content = bounded_file(repo, private / (label + ".stdout")).decode("ascii").strip()
-                if label == "xcode-version":
-                    match = re.fullmatch(r"Xcode ([0-9]+(?:\.[0-9]+){1,3})\nBuild version ([A-Za-z0-9]{1,20})", content)
-                    toolchain["xcode"] = {"version": match[1], "build": match[2]} if version.returncode == 0 and match else {"status": "unavailable"}
-                else:
-                    toolchain["simulator_sdk_version"] = content if version.returncode == 0 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", content) else "unknown"
-            except (OSError, ValueError, subprocess.TimeoutExpired):
-                if label == "xcode-version":
-                    toolchain["xcode"] = {"status": "unavailable"}
-                else:
-                    toolchain["simulator_sdk_version"] = "unknown"
-        result["toolchain"] = toolchain
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, RuntimeError):
-        result["status"] = "probe_failed"
-    finally:
-        result["stage"] = stage
-        if binary is not None and prepare_code is not None:
-            try:
-                command(["node", binary, "daemon", "stop", "--json"], "daemon-stop")
-                cleanup["daemon_stopped"] = True
-            except (OSError, RuntimeError):
-                pass
-        elif result["SDK_prepare_invocations"] == 0:
-            cleanup["daemon_not_started"] = True
-        if simulator is not None:
-            try:
-                devices = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"], "cleanup-inventory"))["devices"]
-                matches = [row for rows in devices.values() for row in rows if row["udid"] == simulator]
-                assert len(matches) == 1 and matches[0]["name"] == "vibeface-provider-" + run_id + "-" + attempt
-                shutdown = matches[0]["state"] == "Shutdown"
-                if not shutdown:
-                    try:
-                        command(["xcrun", "simctl", "shutdown", simulator], "shutdown")
-                        shutdown = True
-                    except (OSError, RuntimeError):
-                        pass
-                cleanup["simulator_shutdown"] = shutdown
-                command(["xcrun", "simctl", "delete", simulator], "delete")
-                remaining = json.loads(command(["xcrun", "simctl", "list", "devices", "--json"], "post-delete"))["devices"]
-                cleanup["simulator_removed"] = not any(row["udid"] == simulator for rows in remaining.values() for row in rows)
-            except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, RuntimeError):
-                pass
-        else:
-            cleanup["simulator_not_created"] = True
-        safe = (cleanup["daemon_stopped"] or cleanup.get("daemon_not_started") is True) and (
-            cleanup["simulator_removed"] and cleanup.get("simulator_shutdown") is True or cleanup.get("simulator_not_created") is True)
-        if safe:
-            try:
-                for path in (state, private):
-                    layout["inside_artifacts"](repo, path)
-                    if path.exists():
-                        shutil.rmtree(path)
-                cleanup["private_state_removed"] = True
-            except (OSError, ValueError):
-                pass
-        result["cleanup"] = cleanup
-        result["cleanup_safe"] = safe and cleanup["private_state_removed"]
-        (root / "public/runner-probe.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps(result))
-    return 0 if prepare_code == 0 and result["cleanup_safe"] else 1
-
-
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         self_test()
-    elif sys.argv[1:] == ["--probe"]:
-        raise SystemExit(probe())
     else:
-        raise SystemExit("usage: python3 scripts/ios-runner-prepare.py --self-test|--probe")
+        raise SystemExit("usage: python3 scripts/ios-runner-prepare.py --self-test")

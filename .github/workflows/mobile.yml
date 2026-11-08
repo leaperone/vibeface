@@ -4,10 +4,6 @@ name: mobile
 on:
   workflow_dispatch:
     inputs:
-      runner_probe:
-        description: Temporarily collect one SDK-only XCTest prepare diagnostic; product acceptance remains failed
-        type: boolean
-        default: false
       feedback:
         description: 'Replace older ordinary mobile feedback on this branch'
         type: boolean
@@ -27,8 +23,8 @@ on:
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 }}
+  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -40,7 +36,7 @@ jobs:
   android:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    if: ${{ !inputs.runner_probe && (inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')) }}
+    if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -91,7 +87,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.inputs.outputs.artifact-id }}
       producer_attempt: ${{ github.run_attempt }}
-    if: ${{ !inputs.runner_probe && !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
@@ -158,7 +154,7 @@ jobs:
 
   ios-accept:
     needs: ios-build
-    if: ${{ !inputs.runner_probe && !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -818,38 +814,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  runner-probe:
-    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter .
-      - run: python3 scripts/ios-runner-prepare.py --self-test
-      - run: python3 scripts/ios-runner-prepare.py --probe
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always() && !cancelled()
-        with:
-          name: runner-probe-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            .artifacts/native/public/runner-probe.json
-            .artifacts/native/public/runner-launch.sealed.json
-          if-no-files-found: error
-          retention-days: 7
-
   mobile-gate:
     if: always()
-    needs: [android, ios-build, ios-accept, runner-probe]
+    needs: [android, ios-build, ios-accept]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
