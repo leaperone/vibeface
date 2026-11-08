@@ -20,6 +20,7 @@ const desktop: DesktopNodeApi = {
   startBackgroundNode: () => ipcRenderer.invoke(IPC.startBackgroundNode),
   stopBackgroundNode: () => ipcRenderer.invoke(IPC.stopBackgroundNode),
   removeBackgroundNode: () => ipcRenderer.invoke(IPC.removeBackgroundNode),
+  updateBackgroundNode: () => ipcRenderer.invoke(IPC.updateBackgroundNode),
   setPreference: (key: PreferenceKey, value: boolean) =>
     ipcRenderer.invoke(IPC.setPreference, String(key), Boolean(value)),
   openExternal: (url: string) => ipcRenderer.invoke(IPC.openExternal, String(url)),

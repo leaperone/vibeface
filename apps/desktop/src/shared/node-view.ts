@@ -4,7 +4,7 @@ export type Tone = 'idle' | 'live' | 'busy' | 'bad'
 export type ActionId =
   | 'controller' | 'local' | 'discover' | 'connect' | 'start-discovered'
   | 'choose' | 'start-owned' | 'stop-owned' | 'open'
-  | 'install-background' | 'start-background' | 'stop-background' | 'remove-background'
+  | 'install-background' | 'update-background' | 'start-background' | 'stop-background' | 'remove-background'
 export type Action = { id: ActionId; label: string; primary?: boolean; disabled?: boolean; nodeId?: string }
 export type NodeRow = { node: LocalNode; status: string; detail: string; actions: Action[] }
 export type View = {
@@ -52,15 +52,29 @@ export function describeNodeSettings(status: DesktopStatus): View {
         : ''
 
   const background = status.backgroundNode
+  const runtimeSummary = (() => {
+    const runtime = background.kind === 'installed' || background.kind === 'partial' || background.kind === 'conflict' || background.kind === 'absent'
+      ? background.runtimeUpdate
+      : undefined
+    if (!runtime) return ''
+    const parts = [`App 内置 ${runtime.bundledVersion}`]
+    if (runtime.installedVersion) parts.push(`已安装 ${runtime.installedVersion}`)
+    if (runtime.runningVersion) parts.push(`正在运行 ${runtime.runningVersion}`)
+    return parts.join(' · ')
+  })()
   const backgroundMessage = background.kind === 'installed'
-    ? `后台节点${background.health === 'running' ? '正在运行' : background.health === 'stopped' ? '已停止' : '状态异常'} · ${background.nodeId.slice(0, 12)} · ${background.dataDir}`
+    ? `${runtimeSummary ? `${runtimeSummary} · ` : ''}后台节点${background.health === 'running' ? '正在运行' : background.health === 'stopped' ? '已停止' : '状态异常'} · ${background.nodeId.slice(0, 12)} · ${background.dataDir}`
     : background.kind === 'checking' ? '正在核对后台节点状态…'
       : background.kind === 'partial' || background.kind === 'conflict' || background.kind === 'failure' ? background.message
-        : '安装后台节点后，退出 Vibeface 仍会运行，并在此用户登录后启动。'
+        : runtimeSummary ? `${runtimeSummary}。安装后台节点后，退出 Vibeface 仍会运行，并在此用户登录后启动。`
+          : '安装后台节点后，退出 Vibeface 仍会运行，并在此用户登录后启动。'
   const backgroundActions: Action[] = background.kind === 'absent'
     ? [action('install-background', '安装后台节点')]
     : background.kind === 'installed'
       ? [
+          ...(background.runtimeUpdate.availability === 'newer_available'
+            ? [action('update-background', '更新本机节点', true)]
+            : []),
           ...(background.health === 'running' ? [action('stop-background', '停止后台节点')] : [action('start-background', '启动后台节点')]),
           action('remove-background', '移除后台运行'),
         ]

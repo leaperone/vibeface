@@ -11,16 +11,32 @@ const CLI_FAILURES: Record<string, string> = {
   desktop_node_health_unconfirmed: '后台节点尚未确认就绪，请重新核对状态。',
   desktop_node_lock_unconfirmed: '无法确认节点是否已退出，请重新核对状态。',
   desktop_node_registration_unconfirmed: '无法确认系统中的节点服务，请重新核对状态。',
+  desktop_node_update_refused: '当前无法更新本机后台节点，请先核对运行状态。',
 }
 class CliOperationFailure extends Error {}
 
 export type ManagedNodeProgram = { command: string; args?: readonly string[] }
 type CoreStatus = 'running' | 'stopped' | 'unavailable' | null
+
+export type RuntimeUpdateAvailability =
+  | 'not_installed'
+  | 'current'
+  | 'newer_available'
+  | 'immutable_conflict'
+  | 'downgrade_refused'
+
+export type ManagedNodeRuntimeUpdate = {
+  bundledVersion: string
+  installedVersion: string | null
+  runningVersion: string | null
+  availability: RuntimeUpdateAvailability
+}
+
 type ManagedNodeIdentity = { device_id: string; data_dir: string; service_id: string; managed_root: string }
 export type ManagedNodeStatus =
-  | { ok: true; state: 'not_installed'; device_id: null; data_dir: null; service_id: null; managed_root: null; service_running: null; core_status: null }
-  | ({ ok: true; state: 'installed' | 'installed_stopped' | 'partial'; service_running: boolean; core_status: CoreStatus } & ManagedNodeIdentity)
-  | ({ ok: true; state: 'conflict' | 'unavailable'; service_running: boolean | null; core_status: CoreStatus } & ManagedNodeIdentity)
+  | { ok: true; state: 'not_installed'; device_id: null; data_dir: null; service_id: null; managed_root: null; service_running: null; core_status: null; runtime_update: ManagedNodeRuntimeUpdate }
+  | ({ ok: true; state: 'installed' | 'installed_stopped' | 'partial'; service_running: boolean; core_status: CoreStatus; runtime_update: ManagedNodeRuntimeUpdate } & ManagedNodeIdentity)
+  | ({ ok: true; state: 'conflict' | 'unavailable'; service_running: boolean | null; core_status: CoreStatus; runtime_update: ManagedNodeRuntimeUpdate } & ManagedNodeIdentity)
 
 type Options = {
   profileDir: string
@@ -40,14 +56,52 @@ async function readBounded(stream: Readable, limit: number): Promise<string> {
   return Buffer.concat(chunks, size).toString('utf8')
 }
 
+function runtimeUpdateAvailability(value: unknown): RuntimeUpdateAvailability {
+  if (value === 'not_installed' || value === 'current' || value === 'newer_available' || value === 'immutable_conflict' || value === 'downgrade_refused') {
+    return value
+  }
+  throw new Error('desktop Node returned unsupported runtime update availability')
+}
+
+function runtimeUpdate(value: unknown): ManagedNodeRuntimeUpdate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('desktop Node returned invalid runtime update metadata')
+  }
+  const source = value as Record<string, unknown>
+  if (!('bundled_version' in source) || !('availability' in source)) {
+    throw new Error('desktop Node returned invalid runtime update metadata')
+  }
+  if (typeof source.bundled_version !== 'string' || !source.bundled_version) {
+    throw new Error('desktop Node returned invalid bundled runtime version')
+  }
+  const installedVersion = source.installed_version
+  if (!(installedVersion === null || (typeof installedVersion === 'string' && installedVersion))) {
+    throw new Error('desktop Node returned invalid installed runtime version')
+  }
+  const runningVersion = source.running_version
+  if (!(runningVersion === null || (typeof runningVersion === 'string' && runningVersion))) {
+    throw new Error('desktop Node returned invalid running runtime version')
+  }
+  return {
+    bundledVersion: source.bundled_version,
+    installedVersion,
+    runningVersion,
+    availability: runtimeUpdateAvailability(source.availability),
+  }
+}
+
 function isStatus(value: unknown): value is ManagedNodeStatus {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   if (!('ok' in value) || !('state' in value) || !('device_id' in value) || !('data_dir' in value) ||
-      !('service_id' in value) || !('managed_root' in value) || !('service_running' in value) || !('core_status' in value)) return false
-  if (Object.keys(value).length !== 8 || value.ok !== true) return false
+      !('service_id' in value) || !('managed_root' in value) || !('service_running' in value) || !('core_status' in value) ||
+      !('runtime_update' in value)) return false
+  if (Object.keys(value).length !== 9 || value.ok !== true) return false
+  let update: ManagedNodeRuntimeUpdate
+  try { update = runtimeUpdate((value as { runtime_update: unknown }).runtime_update) } catch { return false }
   if (value.state === 'not_installed') {
     return value.device_id === null && value.data_dir === null && value.service_id === null &&
-      value.managed_root === null && value.service_running === null && value.core_status === null
+      value.managed_root === null && value.service_running === null && value.core_status === null &&
+      update.availability === 'not_installed'
   }
   const identityValid = typeof value.device_id === 'string' && typeof value.data_dir === 'string' &&
     typeof value.service_id === 'string' && typeof value.managed_root === 'string'
@@ -130,6 +184,10 @@ export class ManagedNodeController {
 
   async installBackground(expectedNodeId: string): Promise<ManagedNodeStatus> {
     return this.#run('install', expectedNodeId)
+  }
+
+  async updateBackground(expectedNodeId: string): Promise<ManagedNodeStatus> {
+    return this.#run('update', expectedNodeId)
   }
 
   async start(expectedNodeId: string): Promise<ManagedNodeStatus> {

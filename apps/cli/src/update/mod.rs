@@ -572,6 +572,14 @@ pub(crate) fn validate_desktop_package(package: &Path) -> Result<()> {
     manifest(package).map(|_| ())
 }
 
+pub(crate) fn package_release_version(package: &Path) -> Result<String> {
+    Ok(manifest(package)?.version.to_string())
+}
+
+pub(crate) fn switch_managed_current(managed_root: &Path, release: &Path) -> Result<()> {
+    switch(managed_root, release)
+}
+
 fn switch(root: &Path, package: &Path) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let package = fs::canonicalize(package)?;

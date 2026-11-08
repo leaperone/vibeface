@@ -79,6 +79,7 @@ export function DesktopNodeSettings() {
       case 'start-background': return api.startBackgroundNode()
       case 'stop-background': return api.stopBackgroundNode()
       case 'remove-background': return api.removeBackgroundNode()
+      case 'update-background': return api.updateBackgroundNode()
     }
   }
 

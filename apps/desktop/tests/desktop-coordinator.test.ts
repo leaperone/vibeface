@@ -4,7 +4,7 @@ import { join, resolve, toNamespacedPath } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DesktopCoordinator, backgroundNodeFromStatus, prepareAppProfileNode } from '../src/main/desktop-coordinator.js'
 import { parseLocalNodes, type LocalNodes } from '../src/main/local-nodes.js'
-import type { ManagedNodeController, ManagedNodeStatus } from '../src/main/managed-node.js'
+import type { ManagedNodeController, ManagedNodeRuntimeUpdate, ManagedNodeStatus } from '../src/main/managed-node.js'
 import type { ControlRequest, Inspect } from '../src/main/control-types.js'
 
 const deviceId = 'a'.repeat(64)
@@ -15,8 +15,15 @@ const inspect = (dataDir: string, id = deviceId, status: Inspect['status'] = 'ru
 const local = (dataDir: string, id = deviceId, status = 'running') => ({ status, data_dir: dataDir, device_id: id,
   local_listen: '127.0.0.1:4791', listen: '0.0.0.0:4790', web_enabled: true,
   core_version: '0.0.1-nightly.20261107.1', sources: ['remembered'] })
+const runtime = (availability: ManagedNodeRuntimeUpdate['availability'], overrides: Partial<ManagedNodeRuntimeUpdate> = {}): ManagedNodeRuntimeUpdate => ({
+  bundledVersion: '0.0.1-nightly.20261108.1',
+  installedVersion: availability === 'not_installed' ? null : '0.0.1-nightly.20261107.1',
+  runningVersion: availability === 'not_installed' ? null : '0.0.1-nightly.20261107.1',
+  availability,
+  ...overrides,
+})
 const noNode: ManagedNodeStatus = { ok: true, state: 'not_installed', device_id: null, data_dir: null,
-  service_id: null, managed_root: null, service_running: null, core_status: null }
+  service_id: null, managed_root: null, service_running: null, core_status: null, runtime_update: runtime('not_installed') }
 
 let roots: string[] = []
 afterEach(async () => { await Promise.all(roots.map(path => rm(path, { recursive: true, force: true }))); roots = [] })
@@ -24,7 +31,7 @@ async function temp(): Promise<string> { const path = await mkdtemp(join(tmpdir(
 
 function coordinator(profileDir: string, rows: unknown[], identities: Map<string, Inspect>, startDiscovered = vi.fn()) {
   const catalog: LocalNodes = parseLocalNodes({ nodes: rows, warnings: [] })
-  const managed = { status: vi.fn().mockResolvedValue(noNode), installBackground: vi.fn(), start: vi.fn(), stop: vi.fn(), uninstall: vi.fn() } as unknown as ManagedNodeController
+  const managed = { status: vi.fn().mockResolvedValue(noNode), installBackground: vi.fn(), updateBackground: vi.fn(), start: vi.fn(), stop: vi.fn(), uninstall: vi.fn() } as unknown as ManagedNodeController
   const value = new DesktopCoordinator({
     profileDir, controlProgram: { command: '/fixed/core', args: ['--control'] },
     discover: async () => catalog,
@@ -72,7 +79,8 @@ describe('Desktop coordinator', () => {
     await instance.value.initialize()
     expect(await instance.value.resolveSelectedNode()).toBeNull()
     const installed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: dataDir,
-      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'stopped' }
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'stopped',
+      runtime_update: runtime('current') }
     expect(backgroundNodeFromStatus(installed, 'darwin')).toMatchObject({ kind: 'installed', health: 'unhealthy', manager: 'launchd' })
   })
 
@@ -104,10 +112,11 @@ describe('Desktop coordinator', () => {
     const profile = await temp(), dataDir = await realpath(await temp())
     let running = false
     const installed: ManagedNodeStatus = { ok: true, state: 'installed_stopped', device_id: deviceId, data_dir: dataDir,
-      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped' }
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped',
+      runtime_update: runtime('current') }
     const managed = { status: vi.fn(async () => installed),
       start: vi.fn(async () => { running = true; return { ...installed, state: 'installed', service_running: true, core_status: 'running' } }),
-      stop: vi.fn(), installBackground: vi.fn(), uninstall: vi.fn() } as unknown as ManagedNodeController
+      stop: vi.fn(), installBackground: vi.fn(), uninstall: vi.fn(), updateBackground: vi.fn() } as unknown as ManagedNodeController
     const startChild = vi.fn()
     const subject = new DesktopCoordinator({
       profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
@@ -134,7 +143,8 @@ describe('Desktop coordinator', () => {
   it('reconciles a partial removal and retries only the same verified Node', async () => {
     const profile = await temp(), dataDir = await temp()
     const partial: ManagedNodeStatus = { ok: true, state: 'partial', device_id: deviceId, data_dir: dataDir,
-      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped' }
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped',
+      runtime_update: runtime('current') }
     const status = vi.fn().mockResolvedValueOnce(partial).mockResolvedValueOnce(partial).mockResolvedValue(noNode)
     const uninstall = vi.fn().mockResolvedValue(noNode)
     const managed = { status, uninstall } as unknown as ManagedNodeController
@@ -204,11 +214,12 @@ describe('Desktop coordinator', () => {
     const canonicalDataDir = await realpath(dataDir)
     const selectedId = 'b'.repeat(64)
     const installed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: canonicalDataDir,
-      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running' }
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running',
+      runtime_update: runtime('current') }
     const managed = {
       status: vi.fn().mockResolvedValue(noNode),
       installBackground: vi.fn(async () => { events.push('install'); return installed }),
-      start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(),
+      start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(), updateBackground: vi.fn(),
     } as unknown as ManagedNodeController
     const runChild = vi.fn()
     const access = vi.fn(async (path: string) => ({ kind: 'local' as const, url: 'http://127.0.0.1:4791/#local=secret', deviceId: path === selectedDir ? selectedId : deviceId }))
@@ -245,11 +256,12 @@ describe('Desktop coordinator', () => {
     const canonicalDataDir = await realpath(dataDir)
     const running = inspect(canonicalDataDir, deviceId, 'running')
     const installed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: canonicalDataDir,
-      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running' }
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'running',
+      runtime_update: runtime('current') }
     const managed = {
       status: vi.fn().mockResolvedValue(noNode),
       installBackground: vi.fn(async () => { events.push('install'); return installed }),
-      start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(),
+      start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(), updateBackground: vi.fn(),
     } as unknown as ManagedNodeController
     const subject = new DesktopCoordinator({
       profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] },
@@ -274,5 +286,33 @@ describe('Desktop coordinator', () => {
     expect(events).toEqual(['owned-child-exit', 'verify-stopped', 'install'])
     expect(managed.installBackground).toHaveBeenCalledWith(deviceId)
     expect(subject.status().backgroundNode).toMatchObject({ kind: 'installed', nodeId: deviceId, dataDir: canonicalDataDir })
+  })
+
+  it('updates an installed managed background Node only when bundled runtime is newer', async () => {
+    const profile = await temp(), dataDir = await temp()
+    const stale: ManagedNodeStatus = { ok: true, state: 'installed_stopped', device_id: deviceId, data_dir: dataDir,
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped',
+      runtime_update: runtime('newer_available') }
+    const updated: ManagedNodeStatus = { ...stale, state: 'installed', service_running: true, core_status: 'running',
+      runtime_update: runtime('current', { installedVersion: '0.0.1-nightly.20261108.1', runningVersion: '0.0.1-nightly.20261108.1' }) }
+    const managed = {
+      status: vi.fn().mockResolvedValueOnce(stale).mockResolvedValueOnce(stale).mockResolvedValue(updated),
+      updateBackground: vi.fn(async () => updated),
+      installBackground: vi.fn(), start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(),
+    } as unknown as ManagedNodeController
+    const subject = new DesktopCoordinator({
+      profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
+      discover: async () => ({ nodes: [], warnings: [] }),
+      inspect: async () => { throw new Error('unused') }, access: async () => { throw new Error('unused') },
+      prepareBackgroundNode: async () => { throw new Error('unused') },
+      startDiscovered: vi.fn(), startOwnedAppNode: vi.fn(),
+    })
+    await subject.initialize()
+    await subject.updateBackground()
+    expect(managed.updateBackground).toHaveBeenCalledWith(deviceId)
+    expect(subject.status().backgroundNode).toMatchObject({
+      kind: 'installed', runtimeUpdate: { availability: 'current', installedVersion: '0.0.1-nightly.20261108.1' },
+    })
+    await expect(subject.updateBackground()).rejects.toThrow(/没有可更新的版本/)
   })
 })

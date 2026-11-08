@@ -2,6 +2,7 @@
 //! CLI surface; the Electron main process is its only caller.
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,6 +23,7 @@ enum OperationFailure {
     Health,
     Lock,
     Registration,
+    UpdateRefused,
 }
 
 impl std::fmt::Display for OperationFailure {
@@ -32,6 +34,7 @@ impl std::fmt::Display for OperationFailure {
             Self::Health => "desktop_node_health_unconfirmed",
             Self::Lock => "desktop_node_lock_unconfirmed",
             Self::Registration => "desktop_node_registration_unconfirmed",
+            Self::UpdateRefused => "desktop_node_update_refused",
         })
     }
 }
@@ -61,9 +64,19 @@ pub struct DesktopNode {
 enum Action {
     Status,
     Install,
+    Update,
     Start,
     Stop,
     Uninstall,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct RuntimeUpdateJson {
+    bundled_version: String,
+    installed_version: Option<String>,
+    running_version: Option<String>,
+    availability: &'static str,
 }
 
 #[derive(Serialize)]
@@ -76,6 +89,7 @@ struct ResultJson {
     managed_root: Option<PathBuf>,
     service_running: Option<bool>,
     core_status: Option<String>,
+    runtime_update: RuntimeUpdateJson,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,6 +109,8 @@ struct InspectResult {
     data_dir: PathBuf,
     device_id: String,
     status: String,
+    #[serde(default)]
+    core_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -314,13 +330,17 @@ fn read_receipt(root: &Path) -> Result<Option<Receipt>> {
     Ok(Some(receipt))
 }
 
-fn package_version(package: &Path) -> Result<String> {
+fn bundled_package_version(package: &Path) -> Result<String> {
     let build = crate::update::release::verify_sealed_package(
         package,
         env!("CARGO_PKG_VERSION"),
         &target()?,
     )?;
     Ok(build.version)
+}
+
+fn managed_package_version(package: &Path) -> Result<String> {
+    crate::update::package_release_version(package)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -376,9 +396,9 @@ fn ensure_root(profile: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
+fn stage_runtime_release(root: &Path, source: &Path) -> Result<PathBuf> {
     let root = fs::canonicalize(root)?;
-    let version = package_version(source)?;
+    let version = managed_package_version(source)?;
     let releases = root.join("releases");
     if !releases.exists() {
         fs::create_dir(&releases)?;
@@ -393,7 +413,7 @@ fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
         let staging = releases.join(format!(".stage-{}", uuid::Uuid::new_v4()));
         let result = (|| {
             copy_tree(source, &staging)?;
-            package_version(&staging)?;
+            managed_package_version(&staging)?;
             crate::update::validate_desktop_package(&staging)?;
             fs::rename(&staging, &destination)?;
             Ok::<_, anyhow::Error>(())
@@ -408,13 +428,19 @@ fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
                 && privatefs::is_private(&destination)?,
             "existing runtime release is unsafe"
         );
-        package_version(&destination)?;
+        managed_package_version(&destination)?;
         crate::update::validate_desktop_package(&destination)?;
         ensure!(
             crate::update::release::same_package_bytes(source, &destination)?,
             "existing runtime version has different contents"
         );
     }
+    Ok(destination)
+}
+
+fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)?;
+    let destination = stage_runtime_release(&root, source)?;
     let current = root.join("current");
     match fs::symlink_metadata(&current) {
         Ok(metadata) => ensure!(
@@ -431,8 +457,46 @@ fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
             "managed runtime current link escapes its root"
         );
     }
-    privatefs::point_dir_link(&destination, &current)?;
+    crate::update::switch_managed_current(&root, &destination)?;
     Ok(current)
+}
+
+fn parse_release_version(version: &str) -> Result<Version> {
+    Version::parse(version).context("managed runtime version is invalid")
+}
+
+fn runtime_update_for_packages(
+    bundled: &Path,
+    installed: Option<&Path>,
+    running_version: Option<&str>,
+) -> Result<RuntimeUpdateJson> {
+    let bundled_version = bundled_package_version(bundled)
+        .or_else(|_| managed_package_version(bundled))?;
+    let installed_version = installed.map(managed_package_version).transpose()?;
+    let availability = match installed {
+        None => "not_installed",
+        Some(current) => {
+            let bundled_parsed = parse_release_version(&bundled_version)?;
+            let current_parsed = parse_release_version(installed_version.as_deref().unwrap())?;
+            if bundled_parsed < current_parsed {
+                "downgrade_refused"
+            } else if bundled_parsed == current_parsed {
+                if crate::update::release::same_package_bytes(bundled, current)? {
+                    "current"
+                } else {
+                    "immutable_conflict"
+                }
+            } else {
+                "newer_available"
+            }
+        }
+    };
+    Ok(RuntimeUpdateJson {
+        bundled_version,
+        installed_version,
+        running_version: running_version.map(str::to_owned),
+        availability,
+    })
 }
 
 fn managed_current(root: &Path) -> Result<PathBuf> {
@@ -595,11 +659,54 @@ async fn wait_health(data: &Path, expected: &str) -> Result<()> {
     }
 }
 
+fn runtime_update_for_receipt(
+    receipt: Option<&Receipt>,
+    running_version: Option<&str>,
+) -> Result<RuntimeUpdateJson> {
+    let bundled = match source_package() {
+        Ok(value) => value,
+        Err(error) if cfg!(test) => {
+            return Ok(RuntimeUpdateJson {
+                bundled_version: env!("CARGO_PKG_VERSION").into(),
+                installed_version: None,
+                running_version: running_version.map(str::to_owned),
+                availability: if receipt.is_some() {
+                    "current"
+                } else {
+                    "not_installed"
+                },
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let installed = receipt
+        .map(|value| managed_current(&value.managed_root))
+        .transpose()?;
+    runtime_update_for_packages(&bundled, installed.as_deref(), running_version)
+}
+
+fn emit(
+    state: &'static str,
+    receipt: Option<&Receipt>,
+    service_running: Option<bool>,
+    core_status: Option<String>,
+    running_version: Option<&str>,
+) -> Result<()> {
+    output(
+        state,
+        receipt,
+        service_running,
+        core_status,
+        runtime_update_for_receipt(receipt, running_version)?,
+    )
+}
+
 fn output(
     state: &'static str,
     receipt: Option<&Receipt>,
     service_running: Option<bool>,
     core_status: Option<String>,
+    runtime_update: RuntimeUpdateJson,
 ) -> Result<()> {
     let receipt = receipt.filter(|_| state != "not_installed");
     let service_running = (state != "not_installed")
@@ -617,6 +724,7 @@ fn output(
             managed_root: receipt.map(|value| value.managed_root.clone()),
             service_running,
             core_status,
+            runtime_update,
         })?
     );
     Ok(())
@@ -636,7 +744,7 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
             Err(ref error) if error.kind() == io::ErrorKind::NotFound
         )
     {
-        return output("not_installed", None, None, None);
+        return emit("not_installed", None, None, None, None);
     }
     let profile = canonical_profile(&options.profile_dir)?;
     let root = profile.join("node-runtime");
@@ -644,7 +752,7 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
     match options.action {
         Action::Status => {
             let Some(receipt) = existing.as_ref() else {
-                return output("not_installed", None, None, None);
+                return emit("not_installed", None, None, None, None);
             };
             let data = data_dir(&profile)?;
             ensure!(
@@ -660,13 +768,13 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                 .as_deref()
                 .is_some_and(|id| id != receipt.device_id)
             {
-                return output("conflict", Some(receipt), None, None);
+                return emit("conflict", Some(receipt), None, None, None);
             }
             if !matches!(
                 crate::update::desktop_policy_matches(&data, &receipt.managed_root),
                 Ok(true)
             ) {
-                return output("conflict", Some(receipt), None, None);
+                return emit("conflict", Some(receipt), None, None, None);
             }
             let package = managed_current(&receipt.managed_root)?;
             let native = native_service(&package, &data, &receipt.service_id).await;
@@ -682,21 +790,28 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                     } else {
                         "partial"
                     };
-                    output(
+                    let running_version = if native.running {
+                        core.core_version.as_deref()
+                    } else {
+                        None
+                    };
+                    emit(
                         state,
                         Some(receipt),
                         Some(native.running),
                         Some(core.status),
+                        running_version,
                     )
                 }
-                (Ok(native), Ok(core)) => output(
+                (Ok(native), Ok(core)) => emit(
                     "conflict",
                     Some(receipt),
                     Some(native.running),
                     Some(core.status),
+                    core.core_version.as_deref(),
                 ),
-                (Err(_), _) => output("conflict", Some(receipt), None, None),
-                (_, Err(_)) => output("unavailable", Some(receipt), None, None),
+                (Err(_), _) => emit("conflict", Some(receipt), None, None, None),
+                (_, Err(_)) => emit("unavailable", Some(receipt), None, None, None),
             }
         }
         action => {
@@ -732,11 +847,12 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                                 inspected.status == "running",
                                 "registered service and Core health disagree"
                             );
-                            output(
+                            emit(
                                 "installed",
                                 Some(receipt),
                                 Some(true),
                                 Some("running".into()),
+                                inspected.core_version.as_deref(),
                             )?;
                             return Ok(());
                         }
@@ -772,11 +888,138 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                         native.installed && native.running,
                         "background service manager did not confirm the installed Node"
                     );
-                    output(
+                    let final_inspect = inspect(&data).await?;
+                    emit(
                         "installed",
                         Some(&receipt),
                         Some(true),
                         Some("running".into()),
+                        final_inspect.core_version.as_deref(),
+                    )
+                }
+                Action::Update => {
+                    let receipt = existing.as_ref().context("Desktop Node is not installed")?;
+                    ensure!(
+                        receipt.device_id == expected
+                            && receipt.data_dir == data
+                            && receipt.service_id == service_id(&profile),
+                        "managed Node identity or data directory changed"
+                    );
+                    ensure!(
+                        crate::update::desktop_policy_matches(&data, &receipt.managed_root)?,
+                        "Desktop Node updater policy changed"
+                    );
+                    let source = source_package()?;
+                    let installed = managed_current(&receipt.managed_root)?;
+                    let update_meta = runtime_update_for_packages(
+                        &source,
+                        Some(&installed),
+                        inspected.core_version.as_deref(),
+                    )?;
+                    match update_meta.availability {
+                        "current" => {
+                            let native =
+                                native_service(&installed, &data, &receipt.service_id).await?;
+                            if native.installed && native.running {
+                                ensure!(
+                                    inspected.status == "running",
+                                    "registered service and Core health disagree"
+                                );
+                                let bundled_version = bundled_package_version(&source)?;
+                                if let Some(running) = inspected.core_version.as_deref() {
+                                    ensure!(
+                                        running == bundled_version,
+                                        "running Core still reports an older program version"
+                                    );
+                                }
+                            }
+                            let core_status = if native.running && inspected.status == "running" {
+                                "running".to_string()
+                            } else if inspected.status == "stopped" {
+                                "stopped".to_string()
+                            } else {
+                                inspected.status.clone()
+                            };
+                            return emit(
+                                if native.running { "installed" } else { "installed_stopped" },
+                                Some(receipt),
+                                Some(native.running),
+                                Some(core_status),
+                                inspected.core_version.as_deref(),
+                            );
+                        }
+                        "newer_available" => {}
+                        "downgrade_refused" | "immutable_conflict" => {
+                            anyhow::bail!(OperationFailure::UpdateRefused)
+                        }
+                        _ => anyhow::bail!(OperationFailure::UpdateRefused),
+                    }
+                    let native = native_service(&installed, &data, &receipt.service_id).await?;
+                    if inspected.status == "running" && !(native.installed && native.running) {
+                        anyhow::bail!(OperationFailure::UpdateRefused);
+                    }
+                    let staged = stage_runtime_release(&receipt.managed_root, &source)
+                        .context(OperationFailure::Package)?;
+                    let was_running = native.installed && native.running;
+                    if was_running {
+                        if inspected.status != "running" {
+                            anyhow::bail!(OperationFailure::Health);
+                        }
+                        run_service(&installed, &data, &receipt.service_id, "stop")
+                            .await
+                            .context(OperationFailure::Service)?;
+                        wait_data_unlocked(&data)
+                            .await
+                            .context(OperationFailure::Lock)?;
+                    } else {
+                        require_data_unlocked(&data).context(OperationFailure::Lock)?;
+                    }
+                    crate::update::switch_managed_current(&receipt.managed_root, &staged)
+                        .context(OperationFailure::Package)?;
+                    let package = managed_current(&receipt.managed_root)?;
+                    if native.installed {
+                        run_service(&package, &data, &receipt.service_id, "install").await?;
+                    }
+                    if was_running {
+                        run_service(&package, &data, &receipt.service_id, "start").await?;
+                        wait_health(&data, expected).await?;
+                    }
+                    let native = native_service(&package, &data, &receipt.service_id).await?;
+                    let final_inspect = inspect(&data).await?;
+                    let bundled_version = bundled_package_version(&source)?;
+                    ensure!(
+                        managed_package_version(&package)? == bundled_version,
+                        "managed runtime did not switch to the bundled version"
+                    );
+                    if was_running {
+                        ensure!(
+                            native.installed && native.running,
+                            "background service manager did not confirm the updated Node"
+                        );
+                        ensure!(
+                            final_inspect.status == "running",
+                            "updated Core did not return to a running state"
+                        );
+                        if let Some(running) = final_inspect.core_version.as_deref() {
+                            ensure!(
+                                running == bundled_version,
+                                "running Core still reports an older program version"
+                            );
+                        }
+                    }
+                    let core_status = if final_inspect.status == "running" {
+                        "running".to_string()
+                    } else if final_inspect.status == "stopped" {
+                        "stopped".to_string()
+                    } else {
+                        final_inspect.status.clone()
+                    };
+                    emit(
+                        if native.running { "installed" } else { "installed_stopped" },
+                        Some(receipt),
+                        Some(native.running),
+                        Some(core_status),
+                        final_inspect.core_version.as_deref(),
                     )
                 }
                 Action::Start => {
@@ -798,11 +1041,13 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                         native.installed && native.running,
                         "background service manager did not confirm the started Node"
                     );
-                    output(
+                    let final_inspect = inspect(&data).await?;
+                    emit(
                         "installed",
                         Some(receipt),
                         Some(true),
                         Some("running".into()),
+                        final_inspect.core_version.as_deref(),
                     )
                 }
                 Action::Stop => {
@@ -825,11 +1070,12 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                         native.installed && !native.running,
                         "background service manager did not confirm the stopped Node"
                     );
-                    output(
+                    emit(
                         "installed_stopped",
                         Some(receipt),
                         Some(false),
                         Some("stopped".into()),
+                        None,
                     )
                 }
                 Action::Uninstall => {
@@ -853,7 +1099,7 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                         "background service registration remains after removal"
                     );
                     fs::remove_file(receipt_path(&receipt.managed_root))?;
-                    output("not_installed", None, Some(false), Some("stopped".into()))
+                    emit("not_installed", None, Some(false), Some("stopped".into()), None)
                 }
                 Action::Status => unreachable!(),
             }
@@ -1079,6 +1325,47 @@ mod tests {
         );
         fs::write(package.join("web/index.html"), b"modified").unwrap();
         assert!(crate::update::release::verify_sealed_package(&package, version, &target).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_update_availability_covers_current_newer_conflict_and_downgrade() {
+        let root = temp("runtime-compare");
+        let bundled = sealed_fixture_version(&root.join("bundled"), env!("CARGO_PKG_VERSION"));
+        let installed = sealed_fixture_version(&root.join("installed"), "0.0.1-nightly.20261107.1");
+        let newer =
+            runtime_update_for_packages(&bundled, Some(&installed), None).unwrap();
+        assert_eq!(newer.availability, "newer_available");
+        let matching = sealed_fixture_version(&root.join("matching"), env!("CARGO_PKG_VERSION"));
+        let current = runtime_update_for_packages(&matching, Some(&matching), None).unwrap();
+        assert_eq!(current.availability, "current");
+        let downgraded = sealed_fixture_version(&root.join("downgraded"), "0.0.1-nightly.20261106.1");
+        let downgrade =
+            runtime_update_for_packages(&downgraded, Some(&installed), None).unwrap();
+        assert_eq!(downgrade.availability, "downgrade_refused");
+        let same_version = sealed_fixture_version(&root.join("same"), "0.0.1-nightly.20261107.1");
+        fs::write(same_version.join("web/index.html"), b"changed-bytes").unwrap();
+        let conflict =
+            runtime_update_for_packages(&same_version, Some(&installed), None).unwrap();
+        assert_eq!(conflict.availability, "immutable_conflict");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_staging_does_not_switch_current_until_requested() {
+        let root = temp("stage-only");
+        let managed = root.join("managed");
+        fs::create_dir(&managed).unwrap();
+        privatefs::restrict_dir(&managed).unwrap();
+        let first = sealed_fixture_version(&root.join("first"), "0.0.1-nightly.20261107.1");
+        let first_release = stage_runtime_release(&managed, &first).unwrap();
+        crate::update::switch_managed_current(&managed, &first_release).unwrap();
+        let current_before = managed_package_version(&managed_current(&managed).unwrap()).unwrap();
+        let second = sealed_fixture_version(&root.join("second"), env!("CARGO_PKG_VERSION"));
+        stage_runtime_release(&managed, &second).unwrap();
+        let current_after = managed_package_version(&managed_current(&managed).unwrap()).unwrap();
+        assert_eq!(current_before, current_after);
+        assert_eq!(current_before, "0.0.1-nightly.20261107.1");
         fs::remove_dir_all(root).unwrap();
     }
 

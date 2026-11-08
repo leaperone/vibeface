@@ -327,6 +327,11 @@ function registerIpc(): void {
     await requireCoordinator().removeBackground()
     return status()
   })
+  handle(IPC.updateBackgroundNode, async (passed) => {
+    readNoArguments(passed, IPC.updateBackgroundNode)
+    await requireCoordinator().updateBackground()
+    return status()
+  })
 }
 
 function requireCoordinator(): DesktopCoordinator {

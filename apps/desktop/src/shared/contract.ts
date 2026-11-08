@@ -28,8 +28,23 @@ export const IPC = {
   startBackgroundNode: 'desktop:start-background-node',
   stopBackgroundNode: 'desktop:stop-background-node',
   removeBackgroundNode: 'desktop:remove-background-node',
+  updateBackgroundNode: 'desktop:update-background-node',
   chooseNodeMode: 'desktop:choose-node-mode',
 } as const
+
+export type BackgroundRuntimeUpdateAvailability =
+  | 'not_installed'
+  | 'current'
+  | 'newer_available'
+  | 'immutable_conflict'
+  | 'downgrade_refused'
+
+export type BackgroundRuntimeUpdate = {
+  bundledVersion: string
+  installedVersion: string | null
+  runningVersion: string | null
+  availability: BackgroundRuntimeUpdateAvailability
+}
 
 /** Read-only current-user Node observations; kept separate from App-host lifecycle state. */
 export type NodeSource = 'remembered' | 'app_profile' | 'default_home' | 'user_service' | 'running_process'
@@ -54,11 +69,11 @@ export type NodeDiscovery =
   | { kind: 'failed'; message: string }
 
 export type BackgroundNode =
-  | { kind: 'absent' | 'checking' }
-  | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler' }
-  | { kind: 'partial'; nodeId: string; dataDir: string; message: string }
-  | { kind: 'conflict'; message: string }
-  | { kind: 'failure'; message: string }
+  | { kind: 'absent' | 'checking'; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler'; runtimeUpdate: BackgroundRuntimeUpdate }
+  | { kind: 'partial'; nodeId: string; dataDir: string; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'conflict'; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
+  | { kind: 'failure'; message: string; runtimeUpdate?: BackgroundRuntimeUpdate }
 
 /** Core availability as the desktop can actually prove it, not a guess. */
 export type RuntimeState =
@@ -132,4 +147,5 @@ export type DesktopNodeApi = {
   startBackgroundNode(): Promise<DesktopStatus>
   stopBackgroundNode(): Promise<DesktopStatus>
   removeBackgroundNode(): Promise<DesktopStatus>
+  updateBackgroundNode(): Promise<DesktopStatus>
 }
