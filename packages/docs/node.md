@@ -231,7 +231,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 `vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台做三件事，本机网页、维护接口和局域网发现不等待它们：
 
-1. 向 `config/public-bootstrap.json` 里固定的发现服务（`discovery.vibeface.dev:4792`，UDP）索取**服务目录**；UDP 不通时改从 `https://app.vibeface.dev/bootstrap/catalog` 获取。目录由发现服务的设备密钥签名，列出成对的网页入口 `gateway_url` 和 relay `relay_url`，最多 4 对；签名、签发者、有效期或大小不符的目录一律丢弃。
+1. 向 `config/public-bootstrap.json` 里固定的发现服务（`discovery.vibeface.dev:4792`，UDP）索取**服务目录**；UDP 不通时改从 `https://discovery.vibeface.dev/bootstrap/catalog` 获取。目录由发现服务的设备密钥签名，列出成对的网页入口 `gateway_url` 和 relay `relay_url`，最多 4 对；签名、签发者、有效期或大小不符的目录一律丢弃。
 2. 按目录顺序向发现服务申请 **relay 许可**。许可绑定本设备的设备编号和那台 relay 的 origin，默认 30 分钟有效，最长 1 小时；UDP 路径由 QUIC TLS 证明设备，HTTPS 路径由设备私钥签名请求。许可在过半有效期时续签，续签结果同时登记到入口，所以 relay 重启后拿旧许可重连的设备仍被接纳，不会反复重连。
 3. 把许可交给 iroh 连接那台 relay，并把这台入口的 `gateway_url` 写进自己的签名地址记录，让其他设备和浏览器知道经哪个入口能找到它。
 
@@ -466,7 +466,7 @@ vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@disc
 
 新初始化的 Node 默认（`bootstrap` 为 `public`）就向它登记地址、索取目录和许可，不需要再传 `--discovery`。`--bootstrap off` 的 Node 不会连接它；之后要启用，停掉 Node，把 `config.json` 里 `network.bootstrap` 改为 `{"mode": "public"}` 再启动。只想用它查询地址、不接入官方公共入口的 Node，可以在 `--bootstrap off` 的同时显式传 `--discovery` 这个地址，或把它加入 `config.json` 的 `network.discovery` 数组后重启。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
 
-服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理；只有目录和许可的 HTTPS 第二路径经 `https://app.vibeface.dev/bootstrap/` 到达同一个实例。运营者能看到设备编号、UDP 地址、查询关系和许可申请；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，业务流量经许可的公共 relay 转发。自建同类服务见下一节。
+服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理；只有目录和许可的 HTTPS 第二路径经 `https://discovery.vibeface.dev/bootstrap/` 到达同一个实例。运营者能看到设备编号、UDP 地址、查询关系和许可申请；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，业务流量经许可的公共 relay 转发。自建同类服务见下一节。
 
 ## 运行不转发业务数据的公共发现服务
 
