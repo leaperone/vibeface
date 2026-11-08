@@ -1,6 +1,6 @@
 {
   "name": "vibeface-desktop",
-  "version": "0.0.1-nightly.20261107.1",
+  "version": "0.0.1-nightly.20261108.1",
   "private": true,
   "type": "module",
   "description": "Vibeface Electron desktop app (sealed client + optional local Core)",
