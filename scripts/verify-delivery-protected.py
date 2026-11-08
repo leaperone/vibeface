@@ -125,10 +125,10 @@ def loopback(url):
 
 def extract_journal(receipt, expected_digest):
     need(0 < len(receipt) <= 16384 and re.fullmatch(r"[0-9a-f]{64}", expected_digest), "bounded_receipt_and_statement_digest_required")
-    candidates = [receipt[index:index + 1504] for index in range(max(0, len(receipt) - 1504 + 1))
-                  if digest(receipt[index:index + 1504]) == expected_digest]
+    candidates = {receipt[index:index + 1504] for index in range(max(0, len(receipt) - 1504 + 1))
+                  if digest(receipt[index:index + 1504]) == expected_digest}
     need(len(candidates) == 1, "unique_47_word_journal_required")
-    return candidates[0]
+    return next(iter(candidates))
 
 
 def words(journal):
@@ -866,11 +866,12 @@ def self_test():
             except CheckFailure: pass
             else: raise AssertionError("invalid protected config accepted")
         journal = bytes(range(256)) * 5 + bytes(range(224))
-        need(extract_journal(b"prefix" + journal + b"suffix", digest(journal)) == journal, "unique_public_journal")
-        for invalid in (b"missing", journal + journal, b"x" * 16385):
+        for receipt in (b"prefix" + journal + b"suffix", b"prefix" + journal + b"middle" + journal + b"suffix"):
+            need(extract_journal(receipt, digest(journal)) == journal, "unique_public_journal_content")
+        for invalid in (b"missing", journal[:-1], b"x" + journal[1:], b"x" * 16385):
             try: extract_journal(invalid, digest(journal))
             except CheckFailure: pass
-            else: raise AssertionError("ambiguous public journal accepted")
+            else: raise AssertionError("missing, altered or oversized public journal accepted")
         for relation in (1, 2, 3):
             fields = [bytes([7]) * 32 for _ in range(47)]; fields[1] = relation.to_bytes(32, "big")
             need(len(wrong_journal(b"".join(fields))) == 1504, "wrong_journal_shape")
