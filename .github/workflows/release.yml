@@ -185,6 +185,99 @@ jobs:
       IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
       IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
       IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+  release-start:
+    needs: [identity]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - name: Create or reconcile the single public BUILDING release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/release.py begin-product
+  publish-app:
+    name: publish-app
+    needs: [identity, release-start, static]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-app, kind: app, artifact_id: '${{ needs.static.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-native-macos:
+    name: publish-native-macos
+    needs: [identity, release-start, compose-macos]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-native-aarch64-apple-darwin, kind: native, target: aarch64-apple-darwin, artifact_id: '${{ needs.compose-macos.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-native-linux-x64:
+    name: publish-native-linux-x64
+    needs: [identity, release-start, compose-linux-x64]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-native-x86_64-unknown-linux-gnu, kind: native, target: x86_64-unknown-linux-gnu, artifact_id: '${{ needs.compose-linux-x64.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-native-linux-arm64:
+    name: publish-native-linux-arm64
+    needs: [identity, release-start, compose-linux-arm64]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-native-aarch64-unknown-linux-gnu, kind: native, target: aarch64-unknown-linux-gnu, artifact_id: '${{ needs.compose-linux-arm64.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-native-windows:
+    name: publish-native-windows
+    needs: [identity, release-start, compose-windows]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-native-x86_64-pc-windows-msvc, kind: native, target: x86_64-pc-windows-msvc, artifact_id: '${{ needs.compose-windows.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-desktop-macos:
+    name: publish-desktop-macos
+    needs: [identity, release-start, desktop-macos]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-desktop-aarch64-apple-darwin, kind: desktop, target: aarch64-apple-darwin, artifact_id: '${{ needs.desktop-macos.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-desktop-linux-x64:
+    name: publish-desktop-linux-x64
+    needs: [identity, release-start, desktop-linux-x64]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-desktop-x86_64-unknown-linux-gnu, kind: desktop, target: x86_64-unknown-linux-gnu, artifact_id: '${{ needs.desktop-linux-x64.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-desktop-linux-arm64:
+    name: publish-desktop-linux-arm64
+    needs: [identity, release-start, desktop-linux-arm64]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-desktop-aarch64-unknown-linux-gnu, kind: desktop, target: aarch64-unknown-linux-gnu, artifact_id: '${{ needs.desktop-linux-arm64.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-desktop-windows:
+    name: publish-desktop-windows
+    needs: [identity, release-start, desktop-windows]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-desktop-x86_64-pc-windows-msvc, kind: desktop, target: x86_64-pc-windows-msvc, artifact_id: '${{ needs.desktop-windows.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-android:
+    name: publish-android
+    needs: [identity, release-start, android]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-android, kind: android, artifact_id: '${{ needs.android.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
+  publish-ios:
+    name: publish-ios
+    needs: [identity, release-start, ios]
+    if: needs.identity.outputs.app == 'product' && needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish-part.yml
+    with: {label: publish-ios, kind: ios, artifact_id: '${{ needs.ios.outputs.artifact_id }}'}
+    permissions: {contents: write, actions: read}
   compose-macos:
     needs: [identity, static, native-macos]
     if: needs.identity.outputs.app == 'product'
@@ -398,7 +491,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: [identity, collect]
-    if: needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
+    if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www' && needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -417,11 +510,37 @@ jobs:
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}
         run: |
           python3 -B scripts/release.py plan --app "$SCOPE" --tag "$RELEASE_TAG" --require-main --publish
-          if [[ "$SCOPE" == product ]]; then python3 -B scripts/check-android-manifest-tool.py; fi
           python3 -B scripts/release.py publish "$SCOPE" .artifacts/release
+  publish-product:
+    needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android, publish-ios]
+    if: >-
+      always() && !cancelled() && needs.identity.outputs.app == 'product' &&
+      needs.identity.outputs.publish == 'true' && needs.collect.result == 'success' &&
+      needs.publish-app.result == 'success' && needs.publish-native-macos.result == 'success' &&
+      needs.publish-native-linux-x64.result == 'success' && needs.publish-native-linux-arm64.result == 'success' &&
+      needs.publish-native-windows.result == 'success' && needs.publish-desktop-macos.result == 'success' &&
+      needs.publish-desktop-linux-x64.result == 'success' && needs.publish-desktop-linux-arm64.result == 'success' &&
+      needs.publish-desktop-windows.result == 'success' && needs.publish-android.result == 'success' &&
+      needs.publish-ios.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {artifact-ids: '${{ needs.collect.outputs.release_artifact_id }}', merge-multiple: true, path: .artifacts/release}
+      - name: Audit every original artifact and complete the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/check-android-manifest-tool.py
+          python3 -B scripts/release.py publish product .artifacts/release
   npm:
-    needs: [identity, collect, publish]
-    if: needs.publish.result == 'success' && needs.identity.outputs.app == 'product' && contains(needs.identity.outputs.version, '-nightly.')
+    needs: [identity, collect, publish-product]
+    if: needs.publish-product.result == 'success' && needs.identity.outputs.app == 'product' && contains(needs.identity.outputs.version, '-nightly.')
     uses: ./.github/workflows/npm-publish.yml
     with:
       tag: ${{ needs.identity.outputs.tag }}

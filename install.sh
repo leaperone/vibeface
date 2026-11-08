@@ -23,16 +23,20 @@ json_fields() {
     function field(value, k) {
       k=key; key=""
       if (mode=="build" && k !~ /^(version|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/) error()
-      if (!(k ~ /^(tag_name|draft|prerelease|sha|version|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/)) return
-      if (seen[record SUBSEP k]++) error()
+      if (mode=="completion" && depth==1 && k !~ /^(app|version|tag|source_commit|channel|schema|assets)$/) error()
+      if (mode=="completion" && depth==3 && k !~ /^(name|size|sha256)$/) error()
+      if (mode=="completion" && k=="assets") { seen[0 SUBSEP k]++; return }
+      if (!(k ~ /^(tag_name|draft|prerelease|sha|app|version|tag|channel|schema|name|size|sha256|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/)) return
+      record_key=(mode=="completion" && depth==1 ? 0 : record)
+      if (seen[record_key SUBSEP k]++) error()
       if (k ~ /^(draft|prerelease)$/ && value !~ /^(true|false)$/) error()
-      if (k ~ /^(update_protocol|data_epoch)$/ && value !~ /^(0|[1-9][0-9]*)$/) error()
-      if (k !~ /^(draft|prerelease|update_protocol|data_epoch)$/ && value !~ /^"/) error()
+      if (k ~ /^(update_protocol|data_epoch|schema|size)$/ && value !~ /^(0|[1-9][0-9]*)$/) error()
+      if (k !~ /^(draft|prerelease|update_protocol|data_epoch|schema|size)$/ && value !~ /^"/) error()
       if (value ~ /^"/) {
         value=substr(value,2,length(value)-2)
         if (value ~ /[^a-zA-Z0-9._-]/) error()
       }
-      print page "." record "\t" k "\t" value
+      print page "." record_key "\t" k "\t" value
     }
     BEGIN { depth=0; record=0; expected=(mode=="releases" ? "[" : "{") }
     {
@@ -62,16 +66,18 @@ json_fields() {
         if (closed) error()
         if (!started++) { if (token!=expected) error() }
         at=(mode=="releases" ? 2 : 1)
-        if (key!="" && depth==at && token!=":") field(token)
+        if (key!="" && token!=":" && (depth==at || (mode=="completion" && depth==3))) {
+          if (mode!="completion" || depth==1 || key ~ /^(name|size|sha256)$/) field(token)
+        }
         if (token=="{" || token=="[") {
           if (depth==0 && closed) error()
           depth++; stack[depth]=token
-          if (mode=="releases" && depth==2) { if (token!="{") error(); record++ }
+          if ((mode=="releases" && depth==2) || (mode=="completion" && depth==3)) { if (token!="{") error(); record++ }
           if (depth>64) error()
         } else if (token=="}" || token=="]") {
           if (depth<1 || (token=="}" ? stack[depth]!="{" : stack[depth]!="[")) error()
           depth--; if (!depth) closed=1
-        } else if (token==":" && depth==at) {
+        } else if (token==":" && (depth==at || (mode=="completion" && depth==3))) {
           if (previous !~ /^"/) error()
           key=substr(previous,2,length(previous)-2)
         }
@@ -79,7 +85,7 @@ json_fields() {
       }
     }
     END {
-      if (invalid || !started || depth || !closed) exit 1
+      if (invalid || !started || depth || !closed || (mode=="completion" && !seen[0 SUBSEP "assets"])) exit 1
       if (mode=="releases") print record "\tcount\t" record
     }
   ' "$1"
@@ -113,7 +119,49 @@ select_release() {
         print base[1],base[2],base[3],day,build,tag
       }
     }
-  ' "$1" | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | tail -n 1 | awk '{print $6}'
+  ' "$1" | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | awk '{print $6}' | {
+    if [[ ${3:-} == all ]]; then cat; else tail -n 1; fi
+  }
+}
+
+select_releases() {
+  select_release "$1" "$2" all | awk '{line[NR]=$0} END {for(i=NR;i>0;i--) print line[i]}'
+}
+
+fetch_optional_marker() {
+  local url="$1" destination="$2" code
+  code=$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 15 --max-time 180 --max-filesize 1048576 -o "$destination" -w '%{http_code}' \
+    --header 'Accept: application/vnd.github+json' --user-agent 'vibeface-installer' "$url") || fail "completion manifest transport failed: $url"
+  case "$code" in
+    200) [[ $(wc -c < "$destination") -le 1048576 ]] || fail 'completion manifest exceeds size limit'; return 0 ;;
+    404) return 1 ;;
+    *) fail "completion manifest request failed with HTTP $code" ;;
+  esac
+}
+
+verify_completion() {
+  local file="$1" tag="$2" version="$3" target="$4" archive="$5"
+  json_fields "$file" completion > "$file.fields" || fail 'invalid release completion manifest JSON'
+  awk -F '\t' -v tag="$tag" -v version="$version" -v target="$target" -v archive="$archive" '
+    $2=="app" {app=$3} $2=="version" {v=$3} $2=="tag" {t=$3} $2=="channel" {ch=$3}
+    $2=="source_commit" && $1 ~ /\.0$/ {source=$3}
+    $2=="schema" {schema=$3}
+    $2=="name" {an[$1]=$3} $2=="size" {as[$1]=$3} $2=="sha256" {ah[$1]=$3}
+    END {
+      wanted=(tag ~ /-nightly\./ ? "nightly" : "stable")
+      if (app!="product" || schema!="1" || v!=version || t!=tag || ch!=wanted || length(source)!=40 || source ~ /[^a-f0-9]/) exit 1
+      foundA=foundC=0
+      for (i in an) {
+        name=an[i]
+        if (name==archive) {foundA++; ahash=ah[i]; size=as[i]}
+        if (name==archive ".sha256") {foundC++; chash=ah[i]; csize=as[i]}
+      }
+      if (foundA!=1 || foundC!=1 || ahash !~ /^[a-f0-9]{64}$/ || chash !~ /^[a-f0-9]{64}$/ ||
+          size !~ /^(0|[1-9][0-9]*)$/ || csize !~ /^(0|[1-9][0-9]*)$/) exit 1
+      print source "\t" ahash "\t" chash "\t" size "\t" csize
+    }
+  ' "$file.fields" || fail 'release completion manifest identity or target binding is invalid'
 }
 
 fetch() {
@@ -238,7 +286,21 @@ install_release() (
     if ((count < 100)); then found=true; break; fi
   done
   "$found" || fail 'release list exceeds 20 pages; cannot select the latest version safely'
-  tag=$(select_release "$scratch/releases" "$channel")
+  local candidate manifest_fields selected=false
+  while IFS= read -r candidate; do
+    [[ -n $candidate ]] || continue
+    version=${candidate#v}
+    package="vibeface-$version-$target"
+    archive="$package.tar.gz"
+    if ! fetch_optional_marker "https://github.com/leaperone/vibeface/releases/download/$candidate/release.json" "$scratch/release.json"; then
+      continue
+    fi
+    manifest_fields=$(verify_completion "$scratch/release.json" "$candidate" "$version" "$target" "$archive") || fail 'release completion manifest validation failed'
+    tag=$candidate
+    selected=true
+    break
+  done < <(select_releases "$scratch/releases" "$channel")
+  "$selected" || tag=''
   if [[ -z $tag ]]; then
     if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel nightly explicitly to install a preview'; fi
     fail 'no published Nightly release'
@@ -251,15 +313,20 @@ install_release() (
   local commit
   commit=$(awk -F '\t' '$2=="sha" {print $3}' "$scratch/commit-fields")
   [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'release tag has no valid source commit'
+  [[ $(awk -F '\t' '{print $1}' <<< "$manifest_fields") == "$commit" ]] || fail 'completion manifest source does not match release tag'
   printf 'Downloading %s (%s)...\n' "$tag" "$target"
   fetch "https://github.com/leaperone/vibeface/releases/download/$tag/$archive" "$scratch/$archive" 134217728
   fetch "https://github.com/leaperone/vibeface/releases/download/$tag/$archive.sha256" "$scratch/checksum" 4096
+  [[ $(wc -c < "$scratch/$archive" | tr -d ' ') == $(awk -F '\t' '{print $4}' <<< "$manifest_fields") &&
+     $(wc -c < "$scratch/checksum" | tr -d ' ') == $(awk -F '\t' '{print $5}' <<< "$manifest_fields") ]] || fail 'release completion manifest target sizes mismatch'
   local expected actual
   expected=$(awk -v name="$archive" '
     NR==1 && NF==2 { file=$2; sub(/^\*/,"",file); if (file!=name || length($1)!=64 || $1 ~ /[^0-9a-fA-F]/) exit 1; hash=tolower($1); next }
     { exit 1 }
     END { if (NR!=1 || hash=="") exit 1; print hash }
   ' "$scratch/checksum") || fail 'checksum must name exactly the downloaded archive'
+  [[ $(sha256 "$scratch/checksum") == $(awk -F '\t' '{print $3}' <<< "$manifest_fields") &&
+     $expected == $(awk -F '\t' '{print $2}' <<< "$manifest_fields") ]] || fail 'completion manifest digest does not match target payload'
   actual=$(sha256 "$scratch/$archive")
   [[ $actual == "$expected" ]] || fail 'SHA256 mismatch; nothing was installed'
   check_archive "$scratch/$archive" "$package" "$scratch"
@@ -305,16 +372,37 @@ set -euo pipefail
 output=''
 [[ ! -f "$VIBEFACE_INSTALL_FIXTURE/http-failure" ]] || exit 22
 while (($#)); do
-  if [[ $1 == --output ]]; then output=$2; shift 2; else url=$1; shift; fi
+  case "$1" in
+    --output|-o) output=$2; shift 2 ;;
+    -w) writeout=$2; shift 2 ;;
+    --proto|--proto-redir|--connect-timeout|--max-time|--max-filesize|--header|--user-agent) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
  done
 case "$url" in
   *'/releases?per_page=100&page=1') cp "$VIBEFACE_INSTALL_FIXTURE/releases.json" "$output" ;;
   *'/releases?per_page=100&page=2') cp "$VIBEFACE_INSTALL_FIXTURE/page2.json" "$output" ;;
   *'/commits/'*) printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nested":{"sha":"ignored"}}' > "$output" ;;
+  */releases/download/*/release.json)
+    tag=${url#*://github.com/leaperone/vibeface/releases/download/}
+    tag=${tag%/release.json}
+    mcode=200
+    if [[ -f "$VIBEFACE_INSTALL_FIXTURE/marker-code/$tag" ]]; then mcode=$(tr -d '[:space:]' < "$VIBEFACE_INSTALL_FIXTURE/marker-code/$tag"); fi
+    if [[ $mcode == 404 ]]; then
+      : > "$output"
+    elif [[ -f "$VIBEFACE_INSTALL_FIXTURE/marker-body/$tag.json" ]]; then
+      cp "$VIBEFACE_INSTALL_FIXTURE/marker-body/$tag.json" "$output"
+    else
+      cp "$VIBEFACE_INSTALL_FIXTURE/release.json" "$output"
+    fi
+    [[ ${writeout:-} != '%{http_code}' ]] || printf '%s' "$mcode"
+    exit 0 ;;
   *.tar.gz.sha256) cp "$VIBEFACE_INSTALL_FIXTURE/checksum" "$output" ;;
   *.tar.gz) cp "$VIBEFACE_INSTALL_FIXTURE/package.tar.gz" "$output" ;;
   *) exit 22 ;;
 esac
+[[ ${writeout:-} != '%{http_code}' ]] || printf '200'
 MOCK
   cat > "$fixture/bin/uname" <<'MOCK'
 #!/usr/bin/env bash
@@ -369,6 +457,16 @@ JSON
     (cd "$fixture/source/$package" && find . -type f ! -name FILES.sha256 | LC_ALL=C sort | while IFS= read -r file; do printf '%s  %s\n' "$(sha256 "$file")" "${file#./}"; done) > "$fixture/source/$package/FILES.sha256"
     tar -czf "$fixture/package.tar.gz" -C "$fixture/source" "$package"
     printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
+    write_marker
+  }
+  write_marker() {
+    local checksum_hash archive_hash archive_size checksum_size
+    checksum_hash=$(sha256 "$fixture/checksum")
+    archive_hash=$(sha256 "$fixture/package.tar.gz")
+    archive_size=$(wc -c < "$fixture/package.tar.gz" | tr -d ' ')
+    checksum_size=$(wc -c < "$fixture/checksum" | tr -d ' ')
+    printf '{"app":"product","version":"%s","tag":"v%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"nightly","schema":1,"assets":[{"name":"%s.tar.gz","size":%s,"sha256":"%s"},{"name":"%s.tar.gz.sha256","size":%s,"sha256":"%s"}]}\n' \
+      "$version" "$version" "$package" "$archive_size" "$archive_hash" "$package" "$checksum_size" "$checksum_hash" > "$fixture/release.json"
   }
   expect_failure() {
     if bash "$script" --channel "$1" --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output" 2>&1; then
@@ -414,13 +512,13 @@ JSON
   case_dir="$test_dir/checksum"
   mkdir "$case_dir"
   printf '%064d  %s.tar.gz\n' 0 "$package" > "$fixture/checksum"
-  expect_failure nightly 'SHA256 mismatch'
+  expect_failure nightly 'completion manifest digest'
   [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: failed checksum activated a release'
   repack_fixture
   case_dir="$test_dir/checksum-name"
   mkdir "$case_dir"
   printf '%s  ../%s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
-  expect_failure nightly 'checksum must name exactly'
+  expect_failure nightly 'completion manifest target sizes mismatch'
   repack_fixture
   case_dir="$test_dir/symlink"
   mkdir "$case_dir"
@@ -432,6 +530,7 @@ JSON
   mkdir "$case_dir"
   tar -czPf "$fixture/package.tar.gz" "$fixture/source/$package" 2>/dev/null
   printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
+  write_marker
   expect_failure nightly 'archive contains unsafe or duplicate paths'
   repack_fixture
   case_dir="$test_dir/package-protocol"
@@ -502,7 +601,87 @@ JSON
   : > "$fixture/http-failure"
   expect_failure stable 'download failed (HTTP/network or GitHub API limit)'
   rm "$fixture/http-failure"
-  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, and existing-install protection.\n'
+  reset_progressive_markers() { rm -rf "$fixture/marker-code" "$fixture/marker-body"; }
+  marker_code() {
+    mkdir -p "$fixture/marker-code"
+    printf '%s' "$2" > "$fixture/marker-code/$1"
+  }
+  progressive_releases() {
+    cat > "$fixture/releases.json" <<'JSON'
+[
+ {"tag_name":"v0.0.1-nightly.20261017.99","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
+ {"tag_name":"v1.9.0","draft":false,"prerelease":false}
+]
+JSON
+  }
+  cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
+  production_manifest="$(dirname "$script")/scripts/fixtures/product-release-completion.json"
+  if [[ -f $production_manifest ]]; then
+    json_fields "$production_manifest" completion > "$test_dir/production.fields" ||
+      fail 'self-test: production release.json failed completion parse'
+    awk -F '\t' '
+      $2=="name" && $3 ~ /-unknown-linux-gnu\.tar\.gz$/ && $3 !~ /\.sha256$/ { found=1 }
+      END { exit !found }
+    ' "$test_dir/production.fields" || fail 'self-test: production manifest missing linux-gnu archive binding'
+  else
+    fail 'self-test: production release.json fixture is missing'
+  fi
+  progressive_releases
+  reset_progressive_markers
+  marker_code v0.0.1-nightly.20261017.99 404
+  case_dir="$test_dir/progressive-fallback"
+  mkdir -p "$case_dir/root" "$case_dir/bin"
+  bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+  [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: progressive fallback installed older complete release'
+  reset_progressive_markers
+  marker_code v0.0.1-nightly.20261017.99 200
+  mkdir -p "$fixture/marker-body"
+  printf '{not-json' > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  case_dir="$test_dir/corrupt-marker"
+  mkdir "$case_dir"
+  expect_failure nightly 'invalid release completion manifest JSON'
+  [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: corrupt marker left a partial installation'
+  reset_progressive_markers
+  progressive_releases
+  marker_code v0.0.1-nightly.20261017.99 200
+  write_marker
+  mkdir -p "$fixture/marker-body"
+  cp "$fixture/release.json" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  sed 's/"tag":"v'"$version"'"/"tag":"v0.0.1-nightly.20261017.99"/' \
+    "$fixture/marker-body/v0.0.1-nightly.20261017.99.json" > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp"
+  mv "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  case_dir="$test_dir/marker-identity"
+  mkdir "$case_dir"
+  expect_failure nightly 'release completion manifest identity or target binding is invalid'
+  reset_progressive_markers
+  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  marker_code "v$version" 503
+  case_dir="$test_dir/marker-transport"
+  mkdir "$case_dir"
+  expect_failure nightly 'completion manifest request failed with HTTP 503'
+  reset_progressive_markers
+  repack_fixture
+  marker_code "v$version" 200
+  mkdir -p "$fixture/marker-body"
+  write_marker
+  cp "$fixture/release.json" "$fixture/marker-body/v$version.json"
+  sed 's/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' \
+    "$fixture/marker-body/v$version.json" > "$fixture/marker-body/v$version.json.tmp"
+  mv "$fixture/marker-body/v$version.json.tmp" "$fixture/marker-body/v$version.json"
+  case_dir="$test_dir/manifest-source"
+  mkdir "$case_dir"
+  expect_failure nightly 'completion manifest source does not match release tag'
+  reset_progressive_markers
+  progressive_releases
+  marker_code v0.0.1-nightly.20261017.99 404
+  marker_code v0.0.1-nightly.20261017.10 404
+  case_dir="$test_dir/no-complete-channel"
+  mkdir "$case_dir"
+  expect_failure nightly 'no published Nightly release'
+  reset_progressive_markers
+  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
 )
 
 if [[ ${1:-} == --self-test ]]; then
