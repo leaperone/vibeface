@@ -5,10 +5,11 @@ import type { TestFixtures } from 'e2e';
 import { expect, secrets } from 'e2e';
 import type { Browser } from '@e2e-dev/web';
 import { deliveryTest as test } from './fixtures';
+import type { OwnerNode } from './fixtures';
 
 type Page = Pick<TestFixtures, 'screen'> & { browser: Browser };
-async function createNetwork({ screen, browser }: Page, url: string, name: string) {
-  await browser.goto(url);
+async function createNetwork({ screen, browser }: Page, { url, entry }: OwnerNode, name: string) {
+  await browser.goto(entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill(name);
   await screen.getByRole('button', '下一步').click();
@@ -43,8 +44,8 @@ async function createNetwork({ screen, browser }: Page, url: string, name: strin
 }
 
 test('forwards an encrypted charity file between separate networks and survives a receiver restart', { timeout: 180000 }, async ({ network, browser, screen, app }) => {
-  await createNetwork({ browser, screen }, network.receiver.url, 'E2E Receiver');
-  await createNetwork({ browser, screen }, network.source.url, 'E2E Sender');
+  await createNetwork({ browser, screen }, network.receiver, 'E2E Receiver');
+  await createNetwork({ browser, screen }, network.source, 'E2E Sender');
   await screen.getByLabel('接收方的连接 ID').fill(network.receiver.peer);
   await screen.getByLabel('中转设备的连接 ID').fill(network.provider.peer);
   await expect(screen.getByText('全程加密 · 免费', { exact: true })).toBeVisible();

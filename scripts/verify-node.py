@@ -609,7 +609,7 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
+    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None, local_port=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
@@ -617,7 +617,8 @@ class Node:
         require(0 < self.port < 65536, "Node listener uses a valid port")
         _assigned_ports.add(self.port)
         self.quic_port = available_port() if port is not None else self.port
-        self.local_port = available_port()
+        self.local_port = local_port if local_port is not None else available_port()
+        _assigned_ports.add(self.local_port)
         self.url = f"http://127.0.0.1:{self.port}"
         self.client = Client(self.url, helper, identity_file=self.directory / "client-identity.json")
         self.process = None
@@ -641,6 +642,8 @@ class Node:
         require(self.device_id, "the initialized data directory pins the Node identity")
         # The owner's access material exists only while the Node runs; `start` reads it once the listener publishes it.
         self.access = None
+        # The owner's access link for a browser, read on the first web start while the Node is still uninitialized.
+        self.entry = None
 
     def configure(self, *, app_server=None, **values):
         path = self.directory / "config.json"
@@ -714,6 +717,7 @@ class Node:
                             and bootstrap_entry(link.stdout.strip()) == {"url": launcher["origin"], "device_id": self.device_id,
                                                                          "capability": self.access["capability"]},
                             "the owner's access link carries the bootstrap entry a browser consumes")
+                    self.entry = link.stdout.strip()
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -8731,8 +8735,10 @@ def e2e_fixture(options):
     bootstrap_kind = options.fixture_kind in ("bootstrap", "bootstrap-http")
 
     def details():
+        # A browser lives on the origin of the owner's access link; a Node without one names its listener.
         return {"run": str(run), "site": bootstrap_site.url if bootstrap_site else None, "nodes": {
-            role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
+            role: {"url": node.access["url"] if node.entry else node.url, "entry": node.entry,
+                   "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
@@ -8782,8 +8788,9 @@ def e2e_fixture(options):
             bootstrap_site = BootstrapSite(options.fixture_port, entry, discovery)
         for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
             args = delivery_entry_args() if role == "provider" else []
+            # The e2e runner's port is the browser's origin: the source Node's local listener, where its owner link opens.
             node = Node(run, role, binary, workspace, helper, init_args=args,
-                        port=options.fixture_port if role == "source" else None)
+                        local_port=options.fixture_port if role == "source" else None)
             nodes[role] = node
             isolate_delivery_node(node)
             if relay:
