@@ -1144,16 +1144,11 @@ mod tests {
     }
 
     fn fake_bridge() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root")
-            .join("crates/bridge/tests/fixtures")
-            .join(if cfg!(windows) {
-                "fake-cursor-agent.cmd"
-            } else {
-                "fake-cursor-agent"
-            })
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+            "../../crates/bridge/tests/fixtures/fake-cursor-agent.cmd"
+        } else {
+            "../../crates/bridge/tests/fixtures/fake-cursor-agent"
+        })
     }
 
     async fn cursor_node() -> Result<(Arc<Runtime>, PathBuf, String, PathBuf)> {
