@@ -2408,7 +2408,7 @@ mod tests {
             for (index, issuer) in devices.iter().enumerate() {
                 let mut branch = base.clone();
                 branch.append(GovernanceEvent::revoke(
-                    issuer,
+                    *issuer,
                     &view,
                     cut(devices[(index + 1) % devices.len()], 0),
                 )?)?;
