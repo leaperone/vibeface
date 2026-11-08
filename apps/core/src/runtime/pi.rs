@@ -142,7 +142,7 @@ struct Launch {
 struct Process {
     child: Child,
     tree: tree::Tree,
-    _tracked: Tracked,
+    processes: Arc<Processes>,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: mpsc::UnboundedReceiver<Value>,
@@ -469,15 +469,6 @@ async fn read_output(stdout: ChildStdout, rpc: Arc<Rpc>, events: mpsc::Unbounded
     *lock(&rpc.waiting) = None;
 }
 
-/// A pi process tree recorded in the pidfile until its process is done.
-struct Tracked(Arc<Processes>, String);
-
-impl Drop for Tracked {
-    fn drop(&mut self) {
-        self.0.forget(&self.1);
-    }
-}
-
 impl Process {
     fn spawn(
         launch: &Launch,
@@ -520,7 +511,6 @@ impl Process {
         processes
             .track(tree.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
-        let tracked = Tracked(processes.clone(), tree.token().to_owned());
         let (Some(stdin), Some(stdout), Some(mut stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -545,23 +535,25 @@ impl Process {
         Ok(Self {
             child,
             tree,
-            _tracked: tracked,
+            processes: processes.clone(),
             rpc,
             events,
             stderr,
         })
     }
 
-    /// Ends the process: closing its input shuts pi down, and one that does not exit in time is
-    /// ended with its tree. Returns the end of its stderr.
+    /// Closes pi's input, then confirms its whole tree exited before forgetting its record.
+    /// Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
-        let exited = matches!(
-            tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await,
-            Ok(Ok(_))
-        );
-        if !exited {
-            agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        if agent::terminate_process_tree(&mut self.child, &mut self.tree).await {
+            self.processes.forget(self.tree.token());
+        } else {
+            tracing::warn!(
+                event = "pi.tree_exit_unconfirmed",
+                "pi process-tree exit is unconfirmed; keeping its journal"
+            );
         }
         match tokio::time::timeout(Duration::from_secs(1), self.stderr).await {
             Ok(Ok(tail)) => tail,
@@ -2019,6 +2011,135 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn teardown_normal_exit_clears_the_confirmed_tree_record() -> Result<()> {
+        let dir = scratch("teardown-normal");
+        let pi = Pi::new(&dir)?;
+        let (process, _) = pi
+            .open(
+                &launch(&dir, "reply", "s-1"),
+                "s-1",
+                &mut watch::channel(false).1,
+            )
+            .await?;
+        let token = process.tree.token().to_owned();
+        assert!(pi.processes.tracked(&token));
+        assert!(dir.join(PIDFILE).is_file());
+        process.end().await;
+        assert!(!tree::token_is_running(&token));
+        assert!(!pi.processes.tracked(&token));
+        assert!(!dir.join(PIDFILE).exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_drop_and_cancelled_future_keep_the_record_and_probe_pending() -> Result<()> {
+        use futures_util::FutureExt as _;
+
+        for cancel_end in [false, true] {
+            let dir = scratch(if cancel_end {
+                "teardown-cancel"
+            } else {
+                "teardown-drop"
+            });
+            let pi = Pi::new(&dir)?;
+            let (process, _) = pi
+                .open(
+                    &launch(&dir, "reply", "s-1"),
+                    "s-1",
+                    &mut watch::channel(false).1,
+                )
+                .await?;
+            let token = process.tree.token().to_owned();
+            let cleanup = tree::Leftover::find(&token)?.context("the owned fixture tree")?;
+            assert!(
+                cleanup
+                    .members()?
+                    .iter()
+                    .any(|member| tree::names_program(member, &fake()))
+            );
+            let recorded = std::fs::read(dir.join(PIDFILE))?;
+            if cancel_end {
+                let rpc = process.rpc.clone();
+                let stdin = rpc.stdin.lock().await;
+                let mut ending = Box::pin(process.end());
+                assert!(ending.as_mut().now_or_never().is_none());
+                drop(ending);
+                drop(stdin);
+            } else {
+                drop(process);
+            }
+            let retained = pi.processes.tracked(&token);
+            let journal = std::fs::read(dir.join(PIDFILE)).ok();
+            let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
+            crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
+            let pending = pi.probe(&work).await.is_err();
+            if tree::token_is_running(&token) {
+                cleanup.stop()?;
+            }
+            std::fs::remove_dir_all(dir)?;
+            assert!(retained, "drop is not proof that the whole tree exited");
+            assert_eq!(journal.as_deref(), Some(recorded.as_slice()));
+            assert!(pending, "an unconfirmed tree must not become NotStarted");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_reaps_children_even_when_the_root_already_exited() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch("teardown-children");
+        let pi = Pi::new(&dir)?;
+        let bin = dir.join("pi-tree-fixture");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n/bin/sleep 120 >/dev/null 2>&1 &\nprintf '{\"type\":\"fixture_child_ready\"}\\n'\nread ignored\nexit 0\n",
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let launch = Launch {
+            bin,
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            args: Vec::new(),
+        };
+        let mut process = Process::spawn(&launch, &pi.processes, &pi.sessions)
+            .map_err(|failure| anyhow::anyhow!("{failure}"))?;
+        let token = process.tree.token().to_owned();
+        let ready = tokio::time::timeout(ANSWER, process.events.recv())
+            .await?
+            .context("the controlled child is running")?;
+        assert_eq!(ready["type"], "fixture_child_ready");
+        let cleanup = tree::Leftover::find(&token)?.context("the owned fixture tree")?;
+        assert!(
+            cleanup
+                .members()?
+                .iter()
+                .any(|member| tree::names_program(member, &launch.bin))
+        );
+        process.rpc.stdin.lock().await.take();
+        let status = tokio::time::timeout(ANSWER, process.child.wait()).await??;
+        assert!(status.success());
+        assert!(process.tree.is_running(), "the child outlives the root");
+        assert!(pi.processes.tracked(&token));
+        process.end().await;
+        let running = tree::token_is_running(&token);
+        let tracked = pi.processes.tracked(&token);
+        let recorded = dir.join(PIDFILE).exists();
+        if running {
+            cleanup.stop()?;
+        }
+        std::fs::remove_dir_all(dir)?;
+        assert!(
+            !running,
+            "normal root exit does not prove its children exited"
+        );
+        assert!(!tracked);
+        assert!(!recorded);
+        Ok(())
     }
 
     #[tokio::test]

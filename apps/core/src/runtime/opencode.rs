@@ -453,7 +453,6 @@ impl Opencode {
         let dir = self.dir.canonicalize()?;
         let password = crate::crypto::random_hex(32);
         crate::logging::add_secret(&password);
-        // ponytail: the port may be taken before the serve binds it; the next use starts again.
         let port = std::net::TcpListener::bind("127.0.0.1:0")?
             .local_addr()?
             .port();
