@@ -50,12 +50,12 @@ export function DesktopNodeSettings() {
       .then((next) => {
         if (!next) return
         setStatus(next)
-        if (!action || action === 'open' || action === 'local') return
+        if (action === 'open' || action === 'local') return
         const changing = new Set<string>(['controller', 'choose', 'connect', 'start-discovered', 'start-owned', 'stop-owned', 'install-background', 'start-background', 'stop-background', 'remove-background', 'update-background'])
         const selectedChanged = status?.selectedNode?.deviceId !== next.selectedNode?.deviceId || status?.selectedNode?.dataDir !== next.selectedNode?.dataDir
-        if (!changing.has(action) && !selectedChanged) return
+        if (!selectedChanged && (!action || !changing.has(action))) return
         if (action === 'choose' && !selectedChanged) return
-        const stopping = action === 'stop-owned' || action === 'stop-background' || action === 'remove-background'
+        const stopping = next.selectedNode === null || action === 'stop-owned' || action === 'stop-background' || action === 'remove-background'
         api.reconnectClient(!stopping && next.preferences.openBusinessOnConnect)
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : '出现未知错误。'))

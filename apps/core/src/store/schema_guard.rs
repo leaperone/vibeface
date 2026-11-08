@@ -109,7 +109,7 @@ pub(crate) fn validate_application_schema(connection: &Connection) -> Result<()>
     mismatches.sort();
     bail!(
         "data_schema_mismatch: database user_version matches the current data epoch but table/column metadata does not match this Core build. \
-Back up the Node data directory and apply the offline additive schema upgrade; do not wipe identity or change the data epoch.\n{}",
+Keep a backup of the Node data directory and its identity. This database needs offline repair before this Core can start; do not wipe identity or change the data epoch.\n{}",
         mismatches.join("\n")
     );
 }

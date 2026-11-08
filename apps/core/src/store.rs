@@ -28,11 +28,11 @@ pub(crate) mod scope_projection;
 mod sync;
 pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
+mod schema_guard;
 #[cfg(test)]
 mod tests;
 pub(crate) mod work;
 pub(crate) mod workspace;
-mod schema_guard;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/1_initial.sql");
 pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;

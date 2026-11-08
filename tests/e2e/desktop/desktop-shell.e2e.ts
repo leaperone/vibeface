@@ -223,6 +223,23 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.equal(new URL(attachedPage.url).pathname, '/', 'connecting opens the sole client on the workspace shell');
   await screenshot(attachedPage, 'desktop-discovered-node-status');
 
+  await openNodePanel(attachedPage);
+  const selectedDocument = await evaluate(attachedPage, 'performance.timeOrigin');
+  expect(await evaluate(attachedPage, `(() => {
+    const clear = [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === '清除');
+    if (!clear || clear.disabled) return false;
+    clear.click();
+    return true;
+  })()`)).toBe(true);
+  await expect.poll(() => evaluate(attachedPage, 'performance.timeOrigin'), { timeout: 30000 }).not.toBe(selectedDocument);
+  await expect.poll(() => evaluate(attachedPage, 'location.pathname'), { timeout: 30000 }).toBe('/settings/desktop-node');
+  const cleared = await desktop.inspect();
+  assert.equal(cleared.status.selectedNode, null, 'clearing selection also replaces the old client session');
+  assert.equal(clientWindow(cleared).webSocketDebuggerUrl, attachedPage.webSocketDebuggerUrl,
+    'clearing selection reloads the same window');
+  assert.equal((await desktop.snapshotNode(first.dataDir)).status, 'running', 'clearing access leaves the Node running');
+  await desktop.invoke('connectDiscoveredNode', candidate.id);
+
   await desktop.stopFixture(first.dataDir);
   await desktop.invoke('discoverNodes');
   const stoppedChoice = await desktop.status();
