@@ -452,6 +452,7 @@ async fn grants_are_renewed_registered_and_survive_a_relay_restart() -> Result<(
     let wait = (first.grant_until_ms - now_ms()).max(0) as u64 + 200;
     tokio::time::sleep(Duration::from_millis(wait)).await;
     let mut status = node.net()?.endpoint.home_relay_status();
+    status.update();
     infra.entry.restart_relay().await?;
     wait_connected(&mut status, &relay, false).await?;
     assert!(
@@ -462,6 +463,7 @@ async fn grants_are_renewed_registered_and_survive_a_relay_restart() -> Result<(
     // denial or simply renews on schedule, registers, and is admitted on the next retry. Either
     // way it is back without hammering the relay, and its registration is current again.
     let mut status = node.net()?.endpoint.home_relay_status();
+    status.update();
     admission.forget_all();
     infra.entry.restart_relay().await?;
     wait_connected(&mut status, &relay, false).await?;
