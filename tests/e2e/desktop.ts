@@ -6,8 +6,8 @@ import { lstat, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test as base } from 'e2e';
-import type { LauncherStatus } from '../../apps/desktop/src/shared/contract';
-export type { LauncherStatus } from '../../apps/desktop/src/shared/contract';
+import type { DesktopStatus } from '../../apps/desktop/src/shared/contract';
+export type { DesktopStatus } from '../../apps/desktop/src/shared/contract';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/e2e/desktop');
@@ -19,14 +19,14 @@ export type Inspection = {
   profile: string;
   runtime: Record<string, unknown>;
   cores: number[];
-  status: LauncherStatus;
+  status: DesktopStatus;
   pages: Page[];
 };
 export type FixtureNode = { dataDir: string; peerPort: number; localPort: number; deviceId: string; running: boolean };
 export type Desktop = {
   inspect(): Promise<Inspection>;
-  status(): Promise<LauncherStatus>;
-  invoke(method: string, ...args: unknown[]): Promise<LauncherStatus>;
+  status(): Promise<DesktopStatus>;
+  invoke(method: string, ...args: unknown[]): Promise<DesktopStatus>;
   discoveryCensus(remembered?: string[]): Promise<Record<string, unknown>>;
   quit(): Promise<{ pid: number | null; owned: number[]; surviving: number[]; forced: boolean }>;
   closeWindows(): Promise<Array<{ url: string; visibility: string }>>;
@@ -71,7 +71,7 @@ function inspection(value: unknown): Inspection {
     profile: text(fields.profile),
     runtime: record(fields.runtime),
     cores: identifiers(fields.cores),
-    status: record(fields.status) as LauncherStatus,
+    status: record(fields.status) as DesktopStatus,
     pages: pages.map(page),
   };
 }
@@ -204,8 +204,8 @@ export const test = base.extend<{ desktop: Desktop }>({
       assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'The desktop profile stays in this task');
       await use({
         inspect: async () => inspection(await call({ op: 'inspect' })),
-        status: async () => record(await call({ op: 'status' })) as LauncherStatus,
-        invoke: async (method, ...args) => record(await call({ op: 'invoke', method, args })) as LauncherStatus,
+        status: async () => record(await call({ op: 'status' })) as DesktopStatus,
+        invoke: async (method, ...args) => record(await call({ op: 'invoke', method, args })) as DesktopStatus,
         quit: async () => {
           const result = record(await call({ op: 'quit' }));
           assert(typeof result.forced === 'boolean', 'The driver reports whether application quit was forced');

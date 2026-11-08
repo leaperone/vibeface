@@ -11,6 +11,7 @@ const desktop: DesktopNodeApi = {
   attachExisting: () => ipcRenderer.invoke(IPC.attachExisting),
   stopOwned: () => ipcRenderer.invoke(IPC.stopOwned),
   focusClient: () => ipcRenderer.invoke(IPC.focusClient),
+  reconnectClient: (showChat: boolean) => ipcRenderer.send(IPC.reconnectClient, Boolean(showChat)),
   discoverNodes: () => ipcRenderer.invoke(IPC.discoverNodes),
   connectDiscoveredNode: (candidateId: string) => ipcRenderer.invoke(IPC.connectDiscoveredNode, String(candidateId)),
   startDiscoveredNode: (candidateId: string) => ipcRenderer.invoke(IPC.startDiscoveredNode, String(candidateId)),

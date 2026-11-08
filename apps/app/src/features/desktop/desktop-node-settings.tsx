@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link } from '@tanstack/react-router'
 import { ChevronRight, Laptop, RefreshCw } from 'lucide-react'
 import { BusyIcon, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -10,7 +10,6 @@ import { describeNodeSettings, type Action, type ActionId } from '../../../../de
 const RELEASES = 'https://github.com/leaperone/vibeface/releases'
 
 export function DesktopNodeSettings() {
-  const navigate = useNavigate()
   const api = desktopNodeApi()
   const [status, setStatus] = useState<DesktopStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -43,12 +42,22 @@ export function DesktopNodeSettings() {
     </SettingsGroup>
   }
 
-  const run = (work: () => Promise<DesktopStatus | void>) => {
+  const run = (work: () => Promise<DesktopStatus | void>, action?: ActionId) => {
     if (busy) return
     setBusy(true)
     setError(null)
     void work()
-      .then((next) => { if (next) setStatus(next) })
+      .then((next) => {
+        if (!next) return
+        setStatus(next)
+        if (!action || action === 'open' || action === 'local') return
+        const changing = new Set<string>(['controller', 'choose', 'connect', 'start-discovered', 'start-owned', 'stop-owned', 'install-background', 'start-background', 'stop-background', 'remove-background', 'update-background'])
+        const selectedChanged = status?.selectedNode?.deviceId !== next.selectedNode?.deviceId || status?.selectedNode?.dataDir !== next.selectedNode?.dataDir
+        if (!changing.has(action) && !selectedChanged) return
+        if (action === 'choose' && !selectedChanged) return
+        const stopping = action === 'stop-owned' || action === 'stop-background' || action === 'remove-background'
+        api.reconnectClient(!stopping && next.preferences.openBusinessOnConnect)
+      })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : '出现未知错误。'))
       .finally(() => setBusy(false))
   }
@@ -61,8 +70,7 @@ export function DesktopNodeSettings() {
       case 'start-owned': return api.startOwned()
       case 'stop-owned': return api.stopOwned()
       case 'open':
-        await api.focusClient()
-        await navigate({ to: '/' })
+        api.reconnectClient(true)
         return
       case 'choose': return api.chooseDataDir()
       case 'connect': return api.connectDiscoveredNode(nodeId ?? '')
@@ -85,7 +93,7 @@ export function DesktopNodeSettings() {
         {view.failure ? <p className="px-4 text-body text-danger" role="alert">{view.failure}</p> : null}
         {error ? <p className="px-4 text-body text-danger" role="alert">{error}</p> : null}
         {view.discoveryMessage ? <p className="px-4 text-meta text-muted-foreground">{view.discoveryMessage}</p> : null}
-        <ActionList actions={view.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId))} />
+        <ActionList actions={view.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
       </> : error ? <>
         <p className="px-4 text-body text-danger" role="alert">{error}</p>
         <div className="px-4 pb-4">
@@ -102,12 +110,12 @@ export function DesktopNodeSettings() {
         <p className="text-body font-medium text-foreground">{row.status} · {row.node.deviceId.slice(0, 12)}</p>
         <p className="text-meta text-muted-foreground">{row.detail}</p>
         <p className="mt-1 break-all font-mono text-meta text-muted-foreground">{row.node.dataDir}</p>
-        <ActionList actions={row.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId))} className="mt-3" />
+        <ActionList actions={row.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} className="mt-3" />
       </div>)}
     </SettingsGroup> : null}
 
     {view && (view.backgroundMessage || view.backgroundActions.length > 0) ? <SettingsGroup title="后台节点" footer={view.backgroundMessage}>
-      <ActionList actions={view.backgroundActions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId))} />
+      <ActionList actions={view.backgroundActions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
     </SettingsGroup> : null}
 
     {status ? <SettingsGroup title="桌面偏好">

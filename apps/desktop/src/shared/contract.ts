@@ -18,6 +18,7 @@ export const IPC = {
   attachExisting: 'desktop:attach-existing',
   stopOwned: 'desktop:stop-owned',
   focusClient: 'desktop:focus-client',
+  reconnectClient: 'desktop:reconnect-client',
   setPreference: 'desktop:set-preference',
   openExternal: 'desktop:open-external',
   discoverNodes: 'desktop:discover-nodes',
@@ -110,9 +111,6 @@ export type DesktopStatus = {
   backgroundNode: BackgroundNode
 }
 
-/** @deprecated Internal modules still importing LauncherStatus; use DesktopStatus. */
-export type LauncherStatus = DesktopStatus
-
 export type DesktopNodeApi = {
   getStatus(): Promise<DesktopStatus>
   chooseDataDir(): Promise<DesktopStatus>
@@ -122,6 +120,7 @@ export type DesktopNodeApi = {
   attachExisting(): Promise<DesktopStatus>
   stopOwned(): Promise<DesktopStatus>
   focusClient(): Promise<DesktopStatus>
+  reconnectClient(showChat: boolean): void
   setPreference(key: PreferenceKey, value: boolean): Promise<DesktopStatus>
   openExternal(url: string): Promise<void>
   onStatus(handler: (status: DesktopStatus) => void): () => void

@@ -373,10 +373,30 @@ async function invoke(method, args = []) {
   assert(client, 'The trusted client window exists');
   const allowed = new Set(['chooseNodeMode', 'discoverNodes', 'connectDiscoveredNode', 'startDiscoveredNode',
     'startOwned', 'stopOwned', 'focusClient', 'installBackgroundNode', 'startBackgroundNode',
-    'stopBackgroundNode', 'removeBackgroundNode']);
+    'stopBackgroundNode', 'removeBackgroundNode', 'updateBackgroundNode']);
   assert(allowed.has(method), 'Only the fixed public client desktop API can be invoked');
   const encoded = JSON.stringify(args);
-  return inPage(client, `window.vibefaceClient.desktop[${JSON.stringify(method)}](...${encoded})`);
+  const result = await inPage(client, `window.vibefaceClient.desktop[${JSON.stringify(method)}](...${encoded})`);
+  const reconnecting = new Set(['connectDiscoveredNode', 'startDiscoveredNode', 'startOwned', 'stopOwned',
+    'installBackgroundNode', 'startBackgroundNode', 'stopBackgroundNode', 'removeBackgroundNode', 'updateBackgroundNode', 'focusClient']);
+  if (reconnecting.has(method)) {
+    const stopping = ['stopOwned', 'stopBackgroundNode', 'removeBackgroundNode'].includes(method);
+    const showChat = !stopping && result.preferences.openBusinessOnConnect;
+    // Like Settings, acknowledge the confirmed mutation before asking the existing page to reconnect.
+    const previousDocument = await inPage(client, 'performance.timeOrigin');
+    await inPage(client, `window.vibefaceClient.desktop.reconnectClient(${JSON.stringify(showChat)})`);
+    const deadline = Date.now() + 30000;
+    let reloaded = false;
+    while (Date.now() < deadline) {
+      try {
+        if (await inPage(client, 'performance.timeOrigin') !== previousDocument) { reloaded = true; break; }
+      } catch { /* navigation replaces the document, while retaining this target */ }
+      await sleep(50);
+    }
+    assert(reloaded, 'the acknowledged operation refreshes the document in the same window');
+    await waitClient();
+  }
+  return result;
 }
 
 async function inspect() {

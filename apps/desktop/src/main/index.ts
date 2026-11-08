@@ -115,30 +115,25 @@ async function openNodeSettings(): Promise<void> {
   broadcast()
 }
 
-async function focusClientApp(reconnect = false): Promise<void> {
+async function focusClientApp(reconnect = false, showChat = true): Promise<void> {
   if (!clientHost) throw new Error('客户端界面尚未就绪。')
-  await ensureClientWindow(reconnect)
-  const destination = new URL(clientHost.clientUrl)
-  destination.pathname = '/'
-  const selected = await requireCoordinator().resolveSelectedNode()
-  if (selected && selected.access.kind === 'local') destination.hash = new URL(selected.access.url).hash
+  await ensureClientWindow()
   const window = clientWindow!
-  const current = new URL(window.webContents.getURL())
-  const target = destination.toString()
-  if (reconnect || current.origin !== destination.origin || current.pathname !== '/' || current.hash !== destination.hash) {
-    await window.loadURL(target)
+  if (reconnect) {
+    const destination = new URL(clientHost.clientUrl)
+    destination.pathname = showChat ? '/' : DESKTOP_NODE_SETTINGS_PATH
+    const selected = await requireCoordinator().resolveSelectedNode()
+    if (selected && selected.access.kind === 'local') destination.hash = new URL(selected.access.url).hash
+    clientHost.disconnect()
+    await window.webContents.executeJavaScript(`history.replaceState(null, '', ${JSON.stringify(destination.toString())})`)
+    window.webContents.reload()
   }
   window.show()
   window.focus()
   broadcast()
 }
 
-async function ensureClientWindow(recreate = false): Promise<void> {
-  if (recreate && clientWindow && !clientWindow.isDestroyed()) {
-    clientWindow.destroy()
-    clientWindow = null
-    clientIpcInstalled = false
-  }
+async function ensureClientWindow(): Promise<void> {
   if (!clientWindow || clientWindow.isDestroyed()) {
     clientWindow = createClientWindow(mainDir)
     if (!clientIpcInstalled) {
@@ -174,7 +169,7 @@ async function handleJoin(link: DeepLink): Promise<void> {
     if (!clientHost) throw new Error('客户端界面尚未就绪。')
     const target = new URL('/join', clientHost.clientUrl)
     target.hash = new URLSearchParams({ invitation: link.origin === null ? link.ticket : `${link.origin}/join#${link.ticket}` }).toString()
-    await ensureClientWindow(true)
+    await ensureClientWindow()
     await clientWindow!.loadURL(target.toString())
     clientWindow!.show()
     clientWindow!.focus()
@@ -184,7 +179,7 @@ async function handleJoin(link: DeepLink): Promise<void> {
   }
 }
 
-function trusted(event: IpcMainInvokeEvent): void {
+function trusted(event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>): void {
   const frame = event.senderFrame
   let frameUrl: string | null = null
   let frameParent: object | null = null
@@ -205,7 +200,13 @@ function trusted(event: IpcMainInvokeEvent): void {
 function handle(channel: string, work: (args: readonly unknown[]) => Promise<unknown>): void {
   ipcMain.handle(channel, async (event, ...args: unknown[]) => {
     trusted(event)
-    return work(args)
+    const before = coordinator?.status().selectedNode
+    try {
+      return await work(args)
+    } finally {
+      const after = coordinator?.status().selectedNode
+      if (before?.deviceId !== after?.deviceId || before?.dataDir !== after?.dataDir) clientHost?.disconnect()
+    }
   })
 }
 
@@ -222,6 +223,15 @@ function stringArgument(args: readonly unknown[], what: string, maxLength: numbe
 }
 
 function registerIpc(): void {
+  ipcMain.on(IPC.reconnectClient, (event, ...args: unknown[]) => {
+    let showChat: boolean
+    try {
+      trusted(event)
+      if (args.length !== 1) return
+      showChat = readBoolean(args[0], '显示聊天')
+    } catch { return }
+    void focusClientApp(true, showChat).catch((error: unknown) => reportFailure('无法重新连接本机节点', error))
+  })
   handle(IPC.getStatus, async (passed) => {
     readNoArguments(passed, IPC.getStatus)
     return status()
@@ -235,40 +245,33 @@ function registerIpc(): void {
     const chosen = picked.canceled ? null : picked.filePaths[0]
     if (chosen) {
       await requireCoordinator().rememberDirectory(chosen)
-      if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     }
     return status()
   })
   handle(IPC.useDataDir, async (passed) => {
     await requireCoordinator().rememberDirectory(stringArgument(passed, '数据目录', MAX_PATH))
-    if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.forgetDataDir, async (passed) => {
     readNoArguments(passed, IPC.forgetDataDir)
     await requireCoordinator().clearSelection()
-    if (clientWindow && !clientWindow.isDestroyed()) await focusClientApp(true)
     return status()
   })
   handle(IPC.startOwned, async (passed) => {
     readNoArguments(passed, IPC.startOwned)
-    const current = requireSession()
     await requireCoordinator().startOwnedAppNode()
-    if (current.preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.attachExisting, async (passed) => {
     readNoArguments(passed, IPC.attachExisting)
     const current = requireSession()
     await current.attachExisting()
-    if (current.preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.stopOwned, async (passed) => {
     readNoArguments(passed, IPC.stopOwned)
     await requireSession().stopOwned()
     await requireCoordinator().discover()
-    if (clientWindow && !clientWindow.isDestroyed()) await focusClientApp(true)
     return status()
   })
   handle(IPC.focusClient, async (passed) => {
@@ -287,37 +290,31 @@ function registerIpc(): void {
     readNoArguments(passed, IPC.discoverNodes)
     await requireCoordinator().refreshBackground()
     await requireCoordinator().discover()
-    if (requireSession().preferences().openBusinessOnConnect && requireCoordinator().status().selectedNode) await focusClientApp(true)
     return status()
   })
   handle(IPC.chooseNodeMode, async (passed) => {
     const mode = stringArgument(passed, '节点模式', 16)
     if (mode !== 'controller' && mode !== 'local') throw new TypeError('未知的节点模式')
     await requireCoordinator().chooseMode(mode)
-    if (mode === 'controller') await focusClientApp()
     return status()
   })
   handle(IPC.connectDiscoveredNode, async (passed) => {
     await requireCoordinator().connect(stringArgument(passed, '节点标识', 64))
-    if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.startDiscoveredNode, async (passed) => {
     await requireCoordinator().start(stringArgument(passed, '节点标识', 64))
-    if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.installBackgroundNode, async (passed) => {
     readNoArguments(passed, IPC.installBackgroundNode)
     await requireCoordinator().installBackground()
     await requireCoordinator().discover()
-    if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.startBackgroundNode, async (passed) => {
     readNoArguments(passed, IPC.startBackgroundNode)
     await requireCoordinator().startBackground()
-    if (requireSession().preferences().openBusinessOnConnect) await focusClientApp(true)
     return status()
   })
   handle(IPC.stopBackgroundNode, async (passed) => {
@@ -475,7 +472,7 @@ async function start(): Promise<void> {
   if (coordinator.status().nodeMode === 'undecided') {
     await openNodeSettings()
   } else if (coreSession.preferences().openBusinessOnConnect) {
-    await focusClientApp().catch(() => {
+    await focusClientApp(true).catch(() => {
       /* node settings explain why the client could not open */
     })
   }

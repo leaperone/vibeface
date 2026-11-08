@@ -37,7 +37,7 @@ fn application_shape(connection: &Connection) -> Result<ApplicationShape> {
     let mut shape = ApplicationShape::new();
     for table in tables {
         let mut columns = TableShape::new();
-        let pragma = format!("PRAGMA table_info({table})");
+        let pragma = format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""));
         let mut stmt = connection.prepare(&pragma)?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -97,15 +97,7 @@ pub(crate) fn validate_application_schema(connection: &Connection) -> Result<()>
             };
             if actual_column != expected_column {
                 mismatches.push(format!(
-                    "{table}.{column}: expected type={} notnull={} default={:?} pk={}, got type={} notnull={} default={:?} pk={}",
-                    expected_column.type_name,
-                    expected_column.notnull,
-                    expected_column.default_value,
-                    expected_column.pk,
-                    actual_column.type_name,
-                    actual_column.notnull,
-                    actual_column.default_value,
-                    actual_column.pk,
+                    "{table}.{column}: metadata does not match this Core"
                 ));
             }
         }
@@ -125,7 +117,7 @@ Back up the Node data directory and apply the offline additive schema upgrade; d
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Store, SCHEMA_VERSION};
+    use crate::store::{SCHEMA_VERSION, Store};
 
     const OLD_EPOCH1_SCHEMA: &str = include_str!("fixtures/epoch1_1c3f1463.sql");
 
@@ -137,7 +129,8 @@ mod tests {
 
     #[test]
     fn stale_epoch1_layout_refused_without_mutating_database_bytes() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("vibeface-schema-guard-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-schema-guard-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
@@ -152,7 +145,9 @@ mod tests {
 
         let legacy = Connection::open(&path)?;
         let err = legacy
-            .query_row("SELECT target FROM messages LIMIT 1", [], |row| row.get::<_, String>(0))
+            .query_row("SELECT target FROM messages LIMIT 1", [], |row| {
+                row.get::<_, String>(0)
+            })
             .unwrap_err();
         assert!(
             err.to_string().contains("no such column"),
@@ -177,7 +172,10 @@ mod tests {
         let store = Store::open(":memory:")?;
         drop(store);
 
-        let dir = std::env::temp_dir().join(format!("vibeface-schema-guard-upgraded-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-schema-guard-upgraded-{}",
+            uuid::Uuid::new_v4()
+        ));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
@@ -190,7 +188,7 @@ mod tests {
                  CREATE INDEX messages_replies ON messages (network_id, conversation_id, in_reply_to) WHERE in_reply_to IS NOT NULL;
                  CREATE INDEX messages_steered ON messages (network_id, conversation_id, steered_into, rank) WHERE steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL;",
             )?;
-            db.execute("CREATE TABLE user_notes(note text NOT NULL)", [])?;
+            db.execute("CREATE TABLE \"用户备注-1\" (note text NOT NULL)", [])?;
         }
         let store = Store::open(&path)?;
         let _version: u32 = store
@@ -200,5 +198,4 @@ mod tests {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
-
 }

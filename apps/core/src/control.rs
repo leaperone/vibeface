@@ -176,10 +176,10 @@ fn wallet(data_dir: &Path, operation: Value) -> Result<Value> {
     }
 }
 
-fn authoritative_core_version(health: Option<&maintenance::Health>) -> std::borrow::Cow<'_, str> {
+fn authoritative_core_version(health: Option<&maintenance::Health>) -> &str {
     match health {
-        Some(health) => std::borrow::Cow::Borrowed(health.version.as_str()),
-        None => std::borrow::Cow::Borrowed(env!("CARGO_PKG_VERSION")),
+        Some(health) => health.version.as_str(),
+        None => env!("CARGO_PKG_VERSION"),
     }
 }
 
@@ -772,10 +772,7 @@ mod tests {
         config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
         let identity = crypto::LocalIdentity::generate();
         Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false).save(&dir)?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&identity)?,
-        )?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let inspected = inspect(&dir).await?;
         assert_eq!(inspected["status"], "stopped");
         assert!(inspected["version"].is_null());

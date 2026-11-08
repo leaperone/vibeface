@@ -83,6 +83,17 @@ function selectedTarget(value: SelectedLocalNode | null): LocalTarget | null {
   return { nodeId: inspect.deviceId, host: privateOrigin.host.replace(/^\[|\]$/g, ''), port: privateOrigin.port, origin: privateOrigin.origin }
 }
 
+function selectedGatewayAddress(address: string, target: LocalTarget, publicListen: string): boolean {
+  try {
+    const requested = new URL(address)
+    if (requested.protocol !== 'http:' || requested.username || requested.password || requested.search || requested.hash || requested.pathname !== '/') return false
+    const requestedPort = Number(requested.port || '80')
+    parsePrivateOrigin(`${requested.hostname}:${requestedPort}`)
+    const publicPort = Number(publicListen.slice(publicListen.lastIndexOf(':') + 1))
+    return requestedPort === target.port || (Number.isInteger(publicPort) && publicPort > 0 && publicPort <= 65535 && requestedPort === publicPort)
+  } catch { return false }
+}
+
 function readBoundedBody(response: IncomingMessage): Promise<Buffer> {
   return new Promise((resolveBody, reject) => {
     const chunks: Buffer[] = []
@@ -546,9 +557,11 @@ export function createClientHost(options: ClientHostOptions) {
 
   async function openGateway(contents: WebContents, deviceId: string, address: unknown, timeoutMs: unknown): Promise<string | null> {
     if (!DEVICE_ID.test(deviceId) || typeof address !== 'string' || typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error('Invalid local Gateway target')
-    const target = await currentTarget()
-    if (!target) return null
-    if (target.nodeId !== deviceId || target.origin !== address) return null
+    const selected = await options.resolveSelectedNode()
+    const target = selectedTarget(selected)
+    if (!selected || !target) return null
+    if (target.nodeId !== deviceId || !selectedGatewayAddress(address, target, selected.inspect.listen)) return null
+    // Invitations name the public listener; the native broker uses this same Node's private listener.
     const socket = await ClientWebSocket.open(target, '/api/client', null, timeoutMs, deviceId)
     const id = randomUUID()
     sockets.set(id, { nodeId: target.nodeId, contents, socket, receiving: false, sending: 0 })
@@ -641,13 +654,19 @@ export function createClientHost(options: ClientHostOptions) {
     protocol.handle(CLIENT_SCHEME, serve)
   }
 
-  function dispose(): void {
+  function disconnect(): void {
     for (const id of sockets.keys()) closeSocket(id)
+    const contents = options.getClientContents()
+    if (contents) cookies.delete(contents)
+  }
+
+  function dispose(): void {
+    disconnect()
     if (installed) {
       for (const channel of Object.values(CLIENT_IPC)) ipcMain.removeHandler(channel)
       installed = false
     }
   }
 
-  return { clientUrl: CLIENT_URL, registerProtocol, installIpc, dispose }
+  return { clientUrl: CLIENT_URL, registerProtocol, installIpc, disconnect, dispose }
 }

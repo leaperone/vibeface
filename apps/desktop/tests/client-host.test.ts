@@ -307,6 +307,54 @@ describe('Desktop client host', () => {
     expect(streamId).not.toContain(cookieValue)
     await invoke(CLIENT_IPC.carrierClose, call, streamId)
     await expect(invoke(CLIENT_IPC.carrierSend, call, streamId, sent)).rejects.toThrow('closed')
+    const second = await invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)
+    host.disconnect()
+    await expect(invoke(CLIENT_IPC.carrierReceive, call, second)).rejects.toThrow('closed')
+    await expect(invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)).rejects.toThrow('A local session is required')
+    await invoke(CLIENT_IPC.localEntry, call, clientId, { token: localToken, deviceId: nodeId, rejoin: false })
+    const refreshed = await invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)
+    expect(refreshed).not.toBe(second)
+    host.dispose()
+  })
+
+  it('maps this Node public invitation origins onto its pinned private Gateway listener', async () => {
+    const fixture = await localFixture((_request, response) => json(response, 404, {}))
+    const connects: unknown[] = []
+    fixture.server.on('upgrade', (request, socket) => {
+      upgradeSockets.add(socket)
+      socket.on('close', () => upgradeSockets.delete(socket))
+      expect(request.url).toBe('/api/client')
+      expect(request.headers.host).toBe(new URL(fixture.origin).host)
+      expect(request.headers.origin).toBe(fixture.origin)
+      expect(request.headers.cookie).toBeUndefined()
+      const key = request.headers['sec-websocket-key']
+      if (typeof key !== 'string') throw new Error('Gateway key missing')
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      socket.once('data', (raw: Buffer) => {
+        const length = (raw[1] ?? 0) & 0x7f
+        const mask = raw.subarray(2, 6), bytes = Buffer.from(raw.subarray(6, 6 + length))
+        for (let i = 0; i < bytes.length; i++) bytes[i] = (bytes[i] ?? 0) ^ (mask[i % 4] ?? 0)
+        connects.push(JSON.parse(bytes.toString('utf8')))
+      })
+    })
+    const selected = inspected(fixture.origin)
+    selected.inspect.listen = '127.0.0.1:30479'
+    const window = contents()
+    const host = createClientHost({ runtimeRoot: '/unused', getClientContents: () => window.value as never,
+      resolveSelectedNode: async () => selected, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
+    host.installIpc()
+    const call = trustedEvent(window.value, window.frame)
+    for (const address of ['http://localhost:30479', 'http://127.0.0.1:30479']) {
+      const stream = await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, address, 1000)
+      expect(typeof stream).toBe('string')
+      await invoke(CLIENT_IPC.carrierClose, call, stream)
+    }
+    await expect.poll(() => connects.length).toBe(2)
+    expect(connects).toEqual([{ type: 'connect', target: nodeId }, { type: 'connect', target: nodeId }])
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, 'http://127.0.0.1:30480', 1000)).toBeNull()
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, 'http://192.168.1.1:30479', 1000)).toBeNull()
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, 'e'.repeat(64), 'http://127.0.0.1:30479', 1000)).toBeNull()
     host.dispose()
   })
 

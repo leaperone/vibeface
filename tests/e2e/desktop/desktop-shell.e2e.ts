@@ -132,6 +132,8 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
 
   await desktop.invoke('startOwned');
   const started = await desktop.inspect();
+  assert.equal(clientWindow(started).webSocketDebuggerUrl, clientWindow(before).webSocketDebuggerUrl,
+    'enabling and reconnecting the Node retains the same BrowserWindow');
   assert.equal(started.cores.length, 1, 'the explicit enable action starts one app-owned Core');
   assert.equal(started.status.core.kind, 'owned');
   const nodeId = started.status.core.deviceId;

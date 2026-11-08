@@ -6,7 +6,7 @@ import { discoverLocalNodes, type LocalNodes } from './local-nodes.js'
 import type { ManagedNodeController, ManagedNodeStatus } from './managed-node.js'
 import { loadClientPreferences, saveClientPreferences, type ClientPreferences } from './client-preferences.js'
 import type { CoreProgram } from './control-client.js'
-import type { BackgroundNode, LauncherStatus, LocalNode, NodeDiscovery } from '../shared/contract.js'
+import type { BackgroundNode, DesktopStatus, LocalNode, NodeDiscovery } from '../shared/contract.js'
 
 export type SelectedLocalNode = { inspect: Inspect; access: Access }
 export type DesktopCoordinatorOptions = {
@@ -108,7 +108,7 @@ export class DesktopCoordinator {
     await Promise.all([this.refreshBackground(), this.discover()])
   }
 
-  status(): Pick<LauncherStatus, 'nodeMode' | 'selectedNode' | 'discovery' | 'backgroundNode'> {
+  status(): Pick<DesktopStatus, 'nodeMode' | 'selectedNode' | 'discovery' | 'backgroundNode'> {
     return {
       nodeMode: this.preferences.nodeMode,
       selectedNode: this.preferences.selectedNode,

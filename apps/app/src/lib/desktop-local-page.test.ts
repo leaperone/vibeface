@@ -18,6 +18,7 @@ test('desktop invitation fragments preserve the original join URL and origin, th
       chooseDataDir: async () => null as never, useDataDir: async () => null as never, forgetDataDir: async () => null as never,
       startOwned: async () => null as never, attachExisting: async () => null as never, stopOwned: async () => null as never,
       focusClient: async () => null as never, setPreference: async () => null as never, openExternal: async () => {},
+      reconnectClient: () => {},
       onStatus: () => () => {}, discoverNodes: async () => null as never, connectDiscoveredNode: async () => null as never,
       startDiscoveredNode: async () => null as never, chooseNodeMode: async () => null as never, installBackgroundNode: async () => null as never,
       startBackgroundNode: async () => null as never, stopBackgroundNode: async () => null as never, removeBackgroundNode: async () => null as never,
