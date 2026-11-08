@@ -13,6 +13,9 @@ export type OpenEntrance = Entrance & { gateway_url: string }
 type SignedAddress = { payload: string; signature: string }
 type Check = (deviceId: string, payload: string, signature: string) => boolean
 
+/** Every invite opens here; the ticket, not this origin, says how to reach the inviting Node. */
+export const APP_ORIGIN = 'https://app.vibeface.dev'
+
 const devicePattern = /^[a-f0-9]{64}$/
 const privateHost = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|\[::1\]|\[f[cd]|\[fe80:)|\.local$|\.lan$|\.internal$|\.home\.arpa$/i
 

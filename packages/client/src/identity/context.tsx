@@ -15,7 +15,7 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import { APP_ORIGIN, candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
 import {
   catalogConnectionEntries,
@@ -785,7 +785,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const ticket = ticketEncode(entryId, hex(secret), relay, direct)
     secret.fill(0)
     const app = `vibeface://join?link=${encodeURIComponent(ticket)}`
-    const link = origin ? `${origin}/join#${ticket}` : app, publicEntry = origin !== null && isPublicUrl(origin)
+    // A public entrance is reachable from the App site; a LAN or loopback one only from its own page.
+    const publicEntry = origin !== null && isPublicUrl(origin)
+    const link = publicEntry ? `${APP_ORIGIN}/join#${ticket}` : origin ? `${origin}/join#${ticket}` : app
     return { link, qr: publicEntry ? link : app, publicEntry, expiresAt }
   }
   async function startApproval(joinId: string) {
@@ -1004,11 +1006,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned
-   * code's address is only a hint, the device key is the check.
+   * The app tries the entry Node where the ticket says it listens on the LAN, then the entry Node's relay from the
+   * ticket, then this page's own entry: a scanned code's address is only a hint, the device key is the check.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
+    const addresses = [...new Set([...link.relay ? [link.relay] : [], ...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
     const base = [
       ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
       ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),

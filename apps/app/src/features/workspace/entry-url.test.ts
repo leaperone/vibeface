@@ -13,7 +13,7 @@ import type { InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessag
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
+import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination, openedJoinLink } from '@vibeface/client/identity/switch-network.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
@@ -3061,6 +3061,7 @@ test('bound permission choices show readable actions and return their original s
       assert.match(componentText(elements), /拒绝/)
       assert.doesNotMatch(componentText(elements), /decision|accept|decline/)
       assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'TextInput'), false)
+      assert.doesNotMatch(componentText(elements), /忽略/, 'a held approval takes only its own actions')
       shared.writable = false; press(); assert.equal(sent.length, 0)
       shared.writable = true; press(); assert.deepEqual(sent, [raw])
       shared.pendingAnswers = [{ question_id: question.question_id, text: raw }]
@@ -3075,7 +3076,7 @@ test('bound permission choices show readable actions and return their original s
   }
 })
 
-test("question cards select locally, send exact answers only on confirmation, and keep unknown retries and winning answers", async () => {
+test("question cards send a choice on tap, send written text from the last line, ignore on demand, and keep unknown retries and winning answers", async () => {
   const sent: unknown[][] = [], notices: string[] = []
   let actionBusy: string | null = null, answerStatus = 'answered'
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce: (notice: string) => { notices.push(notice) },
@@ -3084,18 +3085,13 @@ test("question cards select locally, send exact answers only on confirmation, an
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
-  const choose = (value: string) => {
-    const option = render().find(({ type, props }) => type === 'input' && props.value === value)
-    assert.ok(option?.props.onChange, `missing radio ${value}`)
-    option.props.onChange({})
-  }
-  const send = async (props: object = {}) => {
-    const button = render(props).find(({ type, props }) => type === 'Button' && componentText(props.children).includes('发送回答'))
-    assert.ok(button?.props.onClick)
+  const tap = async (label: string, props: object = {}) => {
+    const button = render(props).find(({ type, props }) => (type === 'button' || type === 'Button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
+    assert.ok(button?.props.onClick, `missing button ${label}`)
     button.props.onClick(); await settleComponent()
   }
   const write = (value: string) => {
@@ -3107,53 +3103,37 @@ test("question cards select locally, send exact answers only on confirmation, an
   try {
     let elements = render()
     assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
-    assert.equal(elements.filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 4, 'three real choices and one custom mode')
-    assert.equal(elements.filter(({ type }) => type === 'input').every(({ props }) => props.checked === false), true, 'no answer is recommended or selected by default')
-    assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'form'), false)
-    assert.equal(elements.some(({ props }) => props.onKeyDown || props['aria-keyshortcuts']), false, 'digits have no answer shortcut')
+    assert.deepEqual(elements.filter(({ type }) => type === 'button').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
+    const input = elements.find(({ type }) => type === 'textarea')
+    assert.equal(input?.props.rows, 1, 'the last line waits for a written answer')
+    assert.equal(input?.props['aria-label'], '你的回答')
+    assert.equal(input?.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
+    assert.equal(elements.find(({ type, props }) => type === 'Button' && props['aria-label'] === '发送回答')?.props.disabled, true, 'an empty answer cannot be sent')
     assert.ok(elements.some(({ props }) => props.text === '已完成本机检查。\n\n线上结果未知。'), 'the decision context keeps its paragraphs')
-    await send()
-    assert.equal(sent.length, 0)
-    assert.match(componentText(render()), /选一个回答，或自己写回答。/)
-    choose('允许')
-    assert.equal(sent.length, 0, 'selecting approval never sends it')
-    assert.equal(render().find(({ type, props }) => type === 'input' && props.value === '允许')?.props.checked, true)
-    await send()
-    assert.deepEqual(plain(sent.at(-1)), [question, '允许'], 'the approval label remains exact')
-    choose(longChoice)
-    assert.equal(sent.length, 1)
-    await send()
+    await tap('允许')
+    assert.deepEqual(plain(sent.at(-1)), [question, '允许'], 'a tap sends the exact choice')
+    await tap(longChoice)
     assert.deepEqual(plain(sent.at(-1)), [question, longChoice], 'the complete choice is submitted')
-    choose('custom')
     for (const value of ['1', '１', '先检查配置\n确认后再继续']) {
       write(value)
-      const input = render().find(({ type }) => type === 'textarea')
-      assert.ok(input?.props.id)
-      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && componentText(props.children) === '你的回答'), true)
-      assert.equal(input.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
-      await send()
+      await tap('发送回答')
       assert.deepEqual(plain(sent.at(-1)), [question, value], 'custom text is literal, including digits and newlines')
     }
     const count = sent.length
-    choose('停下'); choose('custom')
-    assert.equal(render().find(({ type }) => type === 'textarea')?.props.value, '先检查配置\n确认后再继续', 'switching modes keeps the handwritten draft')
-    write('   '); await send()
-    assert.equal(sent.length, count, 'whitespace cannot be submitted')
-    elements = render()
-    const invalid = elements.find(({ type }) => type === 'textarea')
-    assert.equal(invalid?.props['aria-invalid'], true)
-    assert.ok(elements.some(({ props }) => props.role === 'alert' && String(invalid?.props['aria-describedby']).includes(String(props.id))))
+    write('   ')
+    assert.equal(render().find(({ type, props }) => type === 'Button' && props['aria-label'] === '发送回答')?.props.disabled, true, 'whitespace cannot be submitted')
     write('新回答')
     workspace.writable = false
     elements = render()
-    assert.equal(elements.find(({ type }) => type === 'fieldset')?.props.disabled, true)
-    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.disabled, true)
-    await send()
-    assert.equal(sent.length, count, 'the submit handler also enforces read-only state')
+    assert.equal(elements.filter(({ type }) => type === 'button' || type === 'textarea').every(({ props }) => props.disabled === true), true)
+    await tap('停下'); await tap('忽略')
+    assert.equal(sent.length, count, 'the send handler also enforces read-only state')
     workspace.writable = true
+    await tap('忽略')
+    assert.deepEqual(plain(sent.at(-1)), [question, ignoredAnswer], 'ignoring sends the fixed answer')
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
-    assert.equal(elements.some(({ type }) => type === 'input' || type === 'textarea'), false, 'a pending answer cannot be replaced')
+    assert.equal(elements.some(({ type }) => type === 'button' || type === 'textarea'), false, 'a pending answer cannot be replaced')
     assert.match(componentText(elements), /没确认送达/)
     const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
@@ -3168,49 +3148,50 @@ test("question cards select locally, send exact answers only on confirmation, an
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
     assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
     workspace.pendingAnswers = []
     elements = render()
     assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
     assert.doesNotMatch(componentText(elements), /升级依赖/, 'an ordinary question names no held task')
     elements = render({ question: { ...question, about: { ...question.about, request_id: 'r' } } })
     assert.match(componentText(elements), /升级依赖[^]*工作电脑/)
+    workspace.answered = { q1: ignoredAnswer }
+    assert.match(componentText(render()), /已忽略/, 'an ignored question folds as ignored')
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
     assert.match(componentText(elements), /已失效/)
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
-    const four = { ...question, choices: [...question.choices, { label: '先核对发布目标' }] }
-    assert.equal(render({ question: four }).filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 5, 'four alternatives remain complete')
-    choose('允许')
-    await send({ inbox: true })
-    assert.deepEqual(toasts.map(({ text }) => text), ['已回答'])
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
+    await tap('允许', { inbox: true })
+    await tap('忽略', { inbox: true })
+    assert.deepEqual(toasts.map(({ text }) => text), ['已回答', '已忽略'])
     toasts[0].action?.onClick()
     assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'bot' } }])
     answerStatus = 'already_answered'
-    await send({ inbox: true })
+    await tap('允许', { inbox: true })
     assert.deepEqual(notices, ['这个问题已经回答过了'], 'the existing race announcement is retained')
-    assert.equal(toasts.length, 1, 'a losing answer has no success toast')
+    assert.equal(toasts.length, 2, 'a losing answer has no success toast')
   } finally { app.close() }
 })
 
-test("a question without choices opens a labelled multiline answer directly", () => {
+test("a question without choices offers only the answer line and 忽略", () => {
   const app = componentHarness('./question-card.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ writable: true, nodes: [], answered: {}, pendingAnswers: [], bots: [], openWorks: [] }) },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
-    '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+    '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
     '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
     '@tanstack/react-router': { useNavigate: () => () => {} },
   })
   try {
     const elements = app.render('QuestionCard', { question: { question_id: 'free', text: '需要什么配置？', choices: [], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null } })
-    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.rows, 3)
-    assert.equal(elements.some(({ type }) => type === 'fieldset'), false)
+    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.rows, 1)
+    assert.equal(elements.some(({ type }) => type === 'button'), false)
+    assert.ok(elements.some(({ type, props }) => type === 'Button' && componentText(props.children).includes('忽略')))
   } finally { app.close() }
 })
 
-test("mobile questions select before sending, preserve literal text and retry only the unknown answer", async () => {
-  for (const value of ['允许', '1', '１', '先核对配置\n确认后再继续']) {
+test("mobile questions send a choice on tap, preserve literal text, ignore on demand and retry only the unknown answer", async () => {
+  for (const value of ['允许', '1', '１', '先核对配置\n确认后再继续', ignoredAnswer]) {
     const sent: unknown[][] = []
     let hold = pendingResult()
     const shared = { writable: true, answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], openWorks: [], nodes: [] }
@@ -3219,7 +3200,7 @@ test("mobile questions select before sending, preserve literal text and retry on
       '@/data/context': { useWorkspace: () => ({ members: [], bots: [], actions: { answer: (...args: unknown[]) => { sent.push(args); return hold.promise } } }) },
       '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'mobile', source: 'membership', can_manage: false } } }) },
-      '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+      '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
       '@vibeface/client/lib/errors.ts': errors,
       'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
       '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
@@ -3232,26 +3213,24 @@ test("mobile questions select before sending, preserve literal text and retry on
     }
     const words = () => componentText(render())
     try {
-      assert.equal(render().filter(({ props }) => props.accessibilityRole === 'radio').length, 5)
-      press('发送回答')
-      assert.equal(sent.length, 0)
-      if (value === '允许') press('允许')
-      else {
-        press('自己写回答')
-        const input = render().find(({ type }) => type === 'TextInput')
-        assert.equal(input?.props.multiline, true)
-        assert.equal(input?.props.submitBehavior, 'newline')
-        assert.equal(input?.props.onSubmitEditing, undefined)
+      assert.deepEqual(render().filter(({ props }) => props.accessibilityRole === 'button' && props.onPress).map(({ props }) => props.accessibilityLabel), ['允许', '先核对配置', '停下', '保持现状'], 'one row per choice')
+      const input = render().find(({ type }) => type === 'TextInput')
+      assert.equal(input?.props.multiline, true)
+      assert.equal(input?.props.submitBehavior, 'newline')
+      assert.equal(input?.props.onSubmitEditing, undefined)
+      const control = value === '允许' ? '允许' : value === ignoredAnswer ? '忽略' : '发送回答'
+      if (control === '发送回答') {
+        assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送回答')?.props.disabled, true, 'an empty answer cannot be sent')
         const write = input?.props.onChangeText
         assert.ok(typeof write === 'function')
         write(value)
+        assert.equal(sent.length, 0, 'writing is local')
       }
-      assert.equal(sent.length, 0, 'selecting or writing is local')
       shared.writable = false
-      press('发送回答')
+      press(control)
       assert.equal(sent.length, 0, 'read-only state also guards the handler')
       shared.writable = true
-      press('发送回答'); press('发送回答')
+      press(control); press(control)
       assert.equal(sent.length, 1, 'the busy ref blocks a second tap before React rerenders')
       assert.equal(sent[0][1], value)
       shared.pendingAnswers = [{ question_id: 'mobile', text: value }]
@@ -3259,7 +3238,7 @@ test("mobile questions select before sending, preserve literal text and retry on
       assert.doesNotMatch(words(), /没确认送达/)
       hold.reject(new Error('connection lost')); await settleComponent()
       assert.match(words(), /没确认送达/)
-      assert.equal(render().some(({ type, props }) => type === 'TextInput' || props.accessibilityRole === 'radio'), false)
+      assert.equal(render().some(({ type, props }) => type === 'TextInput' || props.accessibilityLabel === '允许'), false)
       hold = pendingResult()
       const retry = render().find(({ type }) => type === 'Button')?.props.onPress
       assert.ok(typeof retry === 'function')
@@ -3285,7 +3264,7 @@ test("remounted question cards identify the answer author and reserve warning st
         '@/data/live': { useLive: () => shared },
         '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { principal: { device_id: 'self', source: 'membership', can_manage: false } } }) },
         '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
-        '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+        '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
         '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
         '@tanstack/react-router': { useNavigate: () => () => {} },
       })
