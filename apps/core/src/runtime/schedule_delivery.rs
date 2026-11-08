@@ -1352,7 +1352,7 @@ mod tests {
                 {
                     let mut store = node.store.lock().await;
                     let posted = admin.attest(&network, "c", serde_json::from_value(json!({
-                        "type":"message_posted","message_id":"origin","role":"user","text":"fixture"
+                        "type":"message_posted","message_id":"origin","role":"user","text":"fixture","report_results":true
                     }))?)?;
                     store.append_event(&node.identity, &network, "c", posted, vec![], now_ms())?;
                     store.accept_work_fixture(&node.identity, &network, WorkSpec {
@@ -1381,7 +1381,7 @@ mod tests {
                 }
                 assert_eq!(tokio::time::timeout(Duration::from_secs(5), running).await???
                     .context("refused invocation")?["state"], "failed");
-                let store = node.store.lock().await;
+                let mut store = node.store.lock().await;
                 let used: u64 = store.connection.query_row(
                     "SELECT COALESCE(sum(used),0) FROM budget_days WHERE network_id=?", [&network], |row| row.get(0))?;
                 assert_eq!(used, 0, "{case}");
@@ -1389,6 +1389,13 @@ mod tests {
                 let native: u64 = store.connection.query_row(
                     "SELECT (SELECT count(*) FROM manager_turns)+(SELECT count(*) FROM manager_processes)", [], |row| row.get(0))?;
                 assert_eq!(native, 0);
+                let task = store.scheduler_job("c", &crate::scheduling::task_trigger(&work_id))?.context("task job")?;
+                assert!(matches!(task.state, JobState::Failed { .. }), "{case}: {:?}", task.state);
+                let report = crate::scheduling::work_trigger(&work_id);
+                let queued: Vec<(String, crate::scheduling::TriggerKind)> = store.scheduler_jobs("c")?.into_iter()
+                    .filter(|job| job.state == JobState::Queued).map(|job| (job.trigger, job.kind)).collect();
+                assert_eq!(queued, vec![(report.clone(), crate::scheduling::TriggerKind::WorkResult)], "{case}");
+                store.request_manager_cancel(&node.identity, &network, "c", &report)?;
                 store.scheduler_maintenance_idle()?;
                 drop(store);
                 assert!(node.agent_tokens.lock().await.is_empty());
