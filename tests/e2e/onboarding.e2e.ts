@@ -174,15 +174,14 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     seed('q-decision-three', three);
     await browser.goto(`${node.url}/inbox`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
-    await expect(screen.getByRole('radio')).toHaveCount(4);
-    await expect(screen.getByLabel('你的回答')).toHaveCount(0);
-    await screen.getByRole('radio', three[0]).check();
-    await screen.getByRole('radio', three[1]).check();
+    await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);
+    await expect(screen.getByLabel('你的回答')).toBeVisible();
+    await expect(screen.getByRole('button', '发送回答', { exact: true })).toBeDisabled();
+    await expect(screen.getByRole('button', '忽略', { exact: true })).toBeVisible();
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-three'), undefined);
-    await expect(screen.getByRole('radio', three[1])).toBeChecked();
-    await app.screenshot('decision-three-selected-desktop');
-    await screen.getByRole('button', '发送回答', { exact: true }).click();
-    await expect(screen.getByRole('radio')).toHaveCount(0);
+    await app.screenshot('decision-three-desktop');
+    await screen.getByRole('button', three[1], { exact: true }).click();
+    await expect(screen.getByRole('group', '选一个回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-three')?.text, three[1]);
 
@@ -194,12 +193,11 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
     await expect(screen.getByText('问题待确认', { exact: true })).toHaveCount(0);
     await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
-    await expect(screen.getByLabel('你的回答')).toHaveCount(0);
+    await expect(screen.getByLabel('你的回答')).toHaveCount(1);
     await app.screenshot('task-overview-single-question-and-turn');
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });
-    await expect(screen.getByRole('radio')).toHaveCount(5);
-    await screen.getByRole('radio', '自己写回答').check();
+    await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(4);
     await screen.getByLabel('你的回答').fill('1');
     await screen.getByLabel('你的回答').press('Enter');
     await expect(screen.getByLabel('你的回答')).toHaveValue('1\n');
@@ -208,7 +206,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-four'), undefined);
     await app.screenshot('decision-four-custom-narrow');
     await screen.getByRole('button', '发送回答', { exact: true }).click();
-    await expect(screen.getByRole('radio')).toHaveCount(0);
+    await expect(screen.getByRole('group', '选一个回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-four')?.text, '1\n１');
 
