@@ -627,6 +627,7 @@ jobs:
           report_path = runner_root / "e2e/report.json"
           canonical_report = report_path.exists()
           exit_path = root / "private/ui-exit-code.txt"
+          ui_log = root / "private/ui.log"
           if exit_path.exists():
               value = exit_path.read_text().strip()
               if re.fullmatch(r"[0-9]{1,3}", value) and int(value) <= 255:

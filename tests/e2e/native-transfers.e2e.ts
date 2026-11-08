@@ -315,7 +315,7 @@ function providerDeferredInput(value: unknown) {
   if (value === null) return null;
   const input = record(value), receipt = record(input.receipt);
   assert.deepEqual(Object.keys(input).sort(), ['message_id', 'conversation_id', 'target', 'intent', 'deferred', 'cancelled', 'source_event', 'control_event', 'receipt'].sort());
-  assert(input.message_id === 'native-deferred' && input.conversation_id === 'native-provider' && input.intent === 'defer');
+  assert(input.message_id === 'native-deferred-input' && input.conversation_id === 'native-provider' && input.intent === 'defer');
   assert.deepEqual(input.target, { kind: 'bot_main', bot_id: 'native-provider' });
   assert(typeof input.deferred === 'boolean' && typeof input.cancelled === 'boolean');
   const sourceEvent = text(input.source_event), controlEvent = text(input.control_event);
