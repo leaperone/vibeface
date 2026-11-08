@@ -26,7 +26,18 @@ PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
 PRODUCER = 'collect'
-PUBLISHERS = ('publish', 'npm')
+PART_PUBLISHERS = (
+    'publish-app',
+    'publish-native-aarch64-apple-darwin',
+    'publish-native-x86_64-unknown-linux-gnu',
+    'publish-native-aarch64-unknown-linux-gnu',
+    'publish-native-x86_64-pc-windows-msvc',
+    'publish-desktop-aarch64-apple-darwin',
+    'publish-desktop-x86_64-unknown-linux-gnu',
+    'publish-desktop-aarch64-unknown-linux-gnu',
+    'publish-desktop-x86_64-pc-windows-msvc',
+    'publish-android', 'publish-ios')
+PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'publish', 'npm')
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 require = release.require
 
@@ -480,9 +491,16 @@ def job_leaf(job):
 
 def original_artifacts(app, run, source):
     """Immutable artifact IDs the publisher jobs must reuse instead of rebuilding."""
-    prefixes = [f'{app}-release-{source}-']
+    prefixes = ([f'www-release-{source}-'] if app == 'www' else [
+        f'static-release-{source}-',
+        *(f'native-release-{target}-{source}-' for target in release.TARGETS),
+        *(f'desktop-release-{target}-{source}-' for target in release.TARGETS),
+        f'android-release-{source}-', f'ios-device-archive-{source}-',
+        f'product-release-{source}-'])
     if app == 'product':
-        prefixes.append(f'npm-package-{source}-')
+        _, _, channel = release.parse_tag(release_dispatch_tag(app))
+        if channel == 'nightly':
+            prefixes.append(f'npm-package-{source}-')
     available = [artifact for artifact in pages(f'actions/runs/{run["id"]}/artifacts', 'artifacts')
                  if not artifact['expired'] and artifact['size_in_bytes'] > 0
                  and (artifact.get('workflow_run') or {}).get('id') == run['id']
@@ -493,7 +511,7 @@ def original_artifacts(app, run, source):
                    if re.fullmatch(re.escape(prefix) + r'[1-9][0-9]*', artifact['name'])
                    and int(artifact['name'][len(prefix):]) <= run['run_attempt']]
         require(len(matches) == 1 and type(matches[0]['id']) is int and matches[0]['id'] > 0,
-                'original complete release artifact is unavailable; refusing a rebuild')
+                'original producer artifact is unavailable; refusing a rebuild')
         identifiers[prefix] = matches[0]['id']
     return identifiers
 
@@ -503,10 +521,16 @@ def recover_publisher(app, run, source):
     jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
     producers = [job for job in jobs if job_leaf(job) == PRODUCER]
     require(len(producers) == 1 and producers[0]['conclusion'] == 'success',
-            'the complete release artifact producer did not succeed; refusing a publisher recovery')
+            'the complete original-artifact audit did not succeed; refusing a publisher recovery')
     failed = [job for job in jobs if job['conclusion'] not in ('success', 'skipped')]
-    require(failed and all(job['status'] == 'completed' and job_leaf(job) in PUBLISHERS for job in failed),
-            'failure includes a producer job; only an original-artifact publisher may be recovered')
+    allowed = set(PUBLISHERS if app == 'product' else ('publish',))
+    require(failed and all(job['status'] == 'completed' and job_leaf(job) in allowed for job in failed),
+            'failure includes a producer or unknown job; only a named original-artifact publisher may be recovered')
+    names = {job_leaf(job) for job in failed}
+    if app == 'product':
+        require('publish' not in names, 'product recovery cannot rerun the independent website publisher')
+    else:
+        require(names == {'publish'}, 'website recovery must contain only its publisher')
     original_artifacts(app, run, source)
     return rerun(run, True)
 
@@ -893,11 +917,17 @@ def self_test():
                 return attempts['value']
 
             produced = dict(workflow_run=dict(id=1, head_sha=merged), expired=False, size_in_bytes=100)
+            product_prefixes = [f'static-release-{merged}-',
+                                *(f'native-release-{target}-{merged}-' for target in release.TARGETS),
+                                *(f'desktop-release-{target}-{merged}-' for target in release.TARGETS),
+                                f'android-release-{merged}-', f'ios-device-archive-{merged}-',
+                                f'product-release-{merged}-', f'npm-package-{merged}-']
+            good_artifacts = [dict(produced, id=51 + index, name=prefix + '1')
+                              for index, prefix in enumerate(product_prefixes)]
             remote_state = {
-                'artifacts': [dict(produced, id=51, name=f'product-release-{merged}-1'),
-                              dict(produced, id=52, name=f'npm-package-{merged}-1')],
+                'artifacts': good_artifacts,
                 'jobs': [dict(name='collect', status='completed', conclusion='success'),
-                         dict(name='publish', status='completed', conclusion='success'),
+                         dict(name='publish-product', status='completed', conclusion='success'),
                          dict(name='npm / npm', status='completed', conclusion='failure')],
             }
 
@@ -907,36 +937,37 @@ def self_test():
             failing = dict(good, conclusion='failure')
             with patch(f'{__name__}.api', side_effect=recovery_api), patch(f'{__name__}.pages', side_effect=recovery_pages):
                 # A public product Release whose npm job failed is recovered from the original immutable artifacts.
-                assert original_artifacts('product', failing, merged) == {
-                    f'product-release-{merged}-': 51, f'npm-package-{merged}-': 52}
+                recovered_ids = original_artifacts('product', failing, merged)
+                assert set(recovered_ids) == set(product_prefixes)
+                assert recovered_ids[f'product-release-{merged}-'] == 51 + product_prefixes.index(f'product-release-{merged}-')
                 assert recover_publisher('product', failing, merged)['run_attempt'] == 2
                 assert writes == ['actions/runs/1/rerun-failed-jobs']
-                for artifacts in ([], [dict(produced, id=51, name=f'product-release-{merged}-1')],
-                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
-                                   dict(produced, id=52, name=f'npm-package-{merged}-2')],
-                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
-                                   dict(produced, id=52, name=f'npm-package-{merged}-1', expired=True)],
-                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
-                                   dict(produced, id=52, name=f'npm-package-{merged}-1', workflow_run=dict(id=9, head_sha=merged))],
-                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
-                                   dict(produced, id=52, name=f'npm-package-{merged}-1', workflow_run=dict(id=1, head_sha='b' * 40))]):
+                for artifacts in ([], good_artifacts[:-1],
+                                  [dict(item, name=(item['name'][:-1] + '2') if item['name'].startswith(f'npm-package-{merged}-') else item['name']) for item in good_artifacts],
+                                  [dict(item, expired=True) if item['name'].startswith(f'npm-package-{merged}-') else item for item in good_artifacts],
+                                  [dict(item, workflow_run=dict(id=9, head_sha=merged)) if item['name'].startswith(f'npm-package-{merged}-') else item for item in good_artifacts],
+                                  [dict(item, workflow_run=dict(id=1, head_sha='b' * 40)) if item['name'].startswith(f'npm-package-{merged}-') else item for item in good_artifacts]):
                     with patch.dict(remote_state, {'artifacts': artifacts}):
                         rejected(lambda: recover_publisher('product', failing, merged), 'refusing a rebuild')
                 for jobs in ([dict(name='collect', status='completed', conclusion='success'),
                               dict(name='compose-macos', status='completed', conclusion='failure')],
                              [dict(name='collect', status='completed', conclusion='success'),
-                              dict(name='npm / npm', status='in_progress', conclusion=None)],
-                             [dict(name='collect', status='completed', conclusion='success'),
-                              dict(name='publish', status='completed', conclusion='success')]):
+                              dict(name='npm / npm', status='in_progress', conclusion=None)]):
                     with patch.dict(remote_state, {'jobs': jobs}):
-                        rejected(lambda: recover_publisher('product', failing, merged), 'only an original-artifact publisher')
+                        rejected(lambda: recover_publisher('product', failing, merged), 'named original-artifact publisher')
+                product_publishers = ('release-start', *PART_PUBLISHERS, 'publish-product', 'npm')
+                for label in product_publishers:
+                    with patch.dict(remote_state, {'jobs': [dict(name='collect', status='completed', conclusion='success'),
+                                                           dict(name='publish-product', status='completed', conclusion='success'),
+                                                           dict(name=f'{label} / {label}', status='completed', conclusion='failure')]}):
+                        assert recover_publisher('product', failing, merged)['run_attempt'] == 2
                 for jobs in ([dict(name='collect', status='completed', conclusion='failure'),
-                              dict(name='publish', status='completed', conclusion='failure')],
-                             [dict(name='publish', status='completed', conclusion='failure')]):
+                              dict(name='publish-product', status='completed', conclusion='failure')],
+                             [dict(name='publish-product', status='completed', conclusion='failure')]):
                     with patch.dict(remote_state, {'jobs': jobs}):
-                        rejected(lambda: recover_publisher('product', failing, merged), 'producer did not succeed')
+                        rejected(lambda: recover_publisher('product', failing, merged), 'audit did not succeed')
                 rejected(lambda: recover_publisher('mobile', failing, merged), 'product and www')
-                assert len(writes) == 1
+                assert len(writes) == 1 + len(product_publishers)
 
             with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
                     patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
@@ -954,6 +985,12 @@ def self_test():
                         patch(f'{__name__}.time.sleep'):
                     assert finish_release('product', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
                 verified.assert_called_once()
+
+            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+                    patch('release.verify_public', side_effect=ValueError('canonical completion manifest is missing')), \
+                    patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']), \
+                    patch(f'{__name__}.matching_runs', return_value=[good]):
+                rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'completion manifest is missing')
 
             with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=None), \
                     patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
