@@ -449,7 +449,7 @@ mod tests {
         configuration.save_and_publish(&dir, || published.set(true))?;
         assert!(published.get());
         let saved = Config::load(&dir)?;
-        assert_eq!(saved.roots, [root.clone()]);
+        assert_eq!(saved.roots, std::slice::from_ref(&root));
         assert_eq!(
             saved.manager.as_ref().context("manager")?.workspace,
             workspace

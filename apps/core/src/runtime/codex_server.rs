@@ -1825,7 +1825,7 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
-            matches!(discover(&[stalled.clone()]).await, Discovery::HandshakeFailed { socket, reason }
+            matches!(discover(std::slice::from_ref(&stalled)).await, Discovery::HandshakeFailed { socket, reason }
             if socket == stalled && reason == "Codex App Server connection probe timed out")
         );
         silent.abort();

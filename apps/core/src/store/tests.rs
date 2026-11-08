@@ -509,7 +509,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     })?;
     assert_eq!(
         waiting
-            .ingest_events(&net.network, &[child.clone()])?
+            .ingest_events(&net.network, std::slice::from_ref(&child))?
             .statuses,
         [IngestStatus::Pending]
     );

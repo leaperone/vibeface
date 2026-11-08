@@ -1534,7 +1534,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await?;
                 received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut request = [0_u8; 4096];
-                stream.read(&mut request).await?;
+                let _request_bytes = stream.read(&mut request).await?;
                 let body = serde_json::json!({"device_id":http_device,"version":"9.0.0"});
                 let body = serde_json::to_vec(&body)?;
                 stream

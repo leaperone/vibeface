@@ -802,10 +802,9 @@ impl Delivery {
                 .rev()
                 .find(|window| window.state == WindowState::Earned)
                 .map(|window| window.index)
+            && let Err(error) = self.withdraw_earned(&mut order, index).await
         {
-            if let Err(error) = self.withdraw_earned(&mut order, index).await {
-                order.view.error = Some(error.to_string());
-            }
+            order.view.error = Some(error.to_string());
         }
         self.save(&mut order)
     }
