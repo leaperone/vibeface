@@ -1395,7 +1395,7 @@ pub(super) mod tests {
             .reserve_budget_transaction(&intent, 7, &unsigned.view.order_id, &intent.gas_cap)
             .unwrap();
         store
-            .reclaim_unaccepted_receivers(super::super::now() + 1_000)
+            .reclaim_unaccepted_receivers(super::super::now() + 1_000, Mode::Paid)
             .unwrap();
         assert!(store.find_order(&expired.view.order_id).unwrap().is_none());
         for order in [&authorized, &referenced, &unsigned] {
