@@ -156,7 +156,9 @@ async function ensureClientWindow(): Promise<void> {
     clientWindow.on('show', broadcast)
     clientWindow.on('hide', broadcast)
     clientWindow.webContents.on('did-finish-load', broadcast)
-    await clientWindow.loadURL(clientHost?.clientUrl ?? CLIENT_URL)
+    const initialUrl = new URL(clientHost?.clientUrl ?? CLIENT_URL)
+    if (hostPhase === 'starting') initialUrl.pathname = DESKTOP_NODE_SETTINGS_PATH
+    await clientWindow.loadURL(initialUrl.toString())
   }
 }
 
@@ -512,7 +514,6 @@ async function start(): Promise<void> {
   })
 
   await ensureClientWindow()
-  await navigateClient(DESKTOP_NODE_SETTINGS_PATH)
   clientWindow?.show()
   broadcast()
 
