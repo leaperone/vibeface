@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { requireAuthenticode } from './windows-signing.mjs';
+import { prefetchElectronArchive } from '../apps/desktop/scripts/prefetch-electron.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const desktop = path.join(repo, 'apps/desktop');
@@ -149,7 +150,7 @@ function verifySealedRuntime(directory, sealed) {
   }
 }
 
-function build({ target, runtimeDir, output, runtimeArchive, sign }) {
+async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const platform = PLATFORMS[target];
   assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
   assert.equal(process.platform, platform.platform, `${target} desktop applications are built on their own platform`);
@@ -176,8 +177,16 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   fs.rmSync(stage, { recursive: true, force: true });
   const runtimeStage = path.join(stage, 'runtime');
   const electronOut = path.join(stage, 'out');
+  const electronCache = path.join(stage, 'cache', 'electron');
+  fs.mkdirSync(electronCache, { recursive: true });
   copyRuntime(runtimeDir, runtimeStage);
   verifySealedRuntime(runtimeStage, sealed);
+
+  await prefetchElectronArchive({
+    target,
+    cacheRoot: electronCache,
+    tempDirectory: path.join(stage, 'cache', 'tmp'),
+  });
 
   const builderCli = createRequire(path.join(desktop, 'package.json')).resolve('electron-builder/cli.js');
   run(process.execPath, [builderCli, '--config', path.join(desktop, 'electron-builder.cjs'),
@@ -189,6 +198,7 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
       VIBEFACE_DESKTOP_TARGET: target,
       VIBEFACE_DESKTOP_RUNTIME_STAGE: runtimeStage,
       VIBEFACE_DESKTOP_OUT: electronOut,
+      VIBEFACE_DESKTOP_ELECTRON_CACHE: electronCache,
       VIBEFACE_DESKTOP_SIGN: signed ? '1' : '',
       CSC_IDENTITY_AUTO_DISCOVERY: signed ? 'true' : 'false',
       ...notaryEnvironment(target, signed),
@@ -319,30 +329,32 @@ function selfTest() {
   }
 }
 
-try {
-  const args = process.argv.slice(2);
-  if (args.length === 1 && args[0] === '--self-test') {
-    selfTest();
-  } else {
-    const options = new Map();
-    let sign = false;
-    while (args.length) {
-      const flag = args.shift();
-      if (flag === '--sign') { sign = true; continue; }
-      assert(['--target', '--runtime-dir', '--output', '--runtime-archive'].includes(flag) && args.length && !options.has(flag),
-        `invalid argument: ${flag}`);
-      options.set(flag, args.shift());
+(async () => {
+  try {
+    const args = process.argv.slice(2);
+    if (args.length === 1 && args[0] === '--self-test') {
+      selfTest();
+    } else {
+      const options = new Map();
+      let sign = false;
+      while (args.length) {
+        const flag = args.shift();
+        if (flag === '--sign') { sign = true; continue; }
+        assert(['--target', '--runtime-dir', '--output', '--runtime-archive'].includes(flag) && args.length && !options.has(flag),
+          `invalid argument: ${flag}`);
+        options.set(flag, args.shift());
+      }
+      for (const flag of ['--target', '--runtime-dir', '--output']) assert(options.has(flag), `${flag} is required`);
+      await build({
+        target: options.get('--target'),
+        runtimeDir: path.resolve(options.get('--runtime-dir')),
+        output: path.resolve(options.get('--output')),
+        runtimeArchive: options.has('--runtime-archive') ? path.resolve(options.get('--runtime-archive')) : undefined,
+        sign,
+      });
     }
-    for (const flag of ['--target', '--runtime-dir', '--output']) assert(options.has(flag), `${flag} is required`);
-    build({
-      target: options.get('--target'),
-      runtimeDir: path.resolve(options.get('--runtime-dir')),
-      output: path.resolve(options.get('--output')),
-      runtimeArchive: options.has('--runtime-archive') ? path.resolve(options.get('--runtime-archive')) : undefined,
-      sign,
-    });
+  } catch (error) {
+    console.error(`vibeface desktop build: ${error.message}`);
+    process.exitCode = 1;
   }
-} catch (error) {
-  console.error(`vibeface desktop build: ${error.message}`);
-  process.exitCode = 1;
-}
+})();

@@ -24,10 +24,12 @@ const PLATFORMS = {
 const target = process.env.VIBEFACE_DESKTOP_TARGET;
 const runtime = process.env.VIBEFACE_DESKTOP_RUNTIME_STAGE;
 const output = process.env.VIBEFACE_DESKTOP_OUT;
+const electronCache = process.env.VIBEFACE_DESKTOP_ELECTRON_CACHE;
 const signed = process.env.VIBEFACE_DESKTOP_SIGN === '1';
 assert(PLATFORMS[target], 'VIBEFACE_DESKTOP_TARGET must name a supported desktop platform');
 assert(runtime && path.isAbsolute(runtime) && fs.statSync(runtime).isDirectory(), 'VIBEFACE_DESKTOP_RUNTIME_STAGE must be the staged runtime directory');
 assert(output && path.isAbsolute(output), 'VIBEFACE_DESKTOP_OUT must be an absolute output directory');
+assert(electronCache && path.isAbsolute(electronCache), 'VIBEFACE_DESKTOP_ELECTRON_CACHE must be the absolute Electron download cache prepared by the desktop build script');
 const metadata = JSON.parse(fs.readFileSync(path.join(desktop, 'package.json'), 'utf8'));
 assert.equal(metadata.main, 'dist/main/index.cjs', 'the desktop package must point at the compiled main entry');
 assert.equal((metadata.devDependencies ?? {}).electron, ELECTRON_VERSION, `the desktop package must pin electron ${ELECTRON_VERSION}`);
@@ -43,7 +45,7 @@ module.exports = {
   protocols: [{ name: 'Vibeface', schemes: ['vibeface'] }],
   copyright: 'LEAPER ONE',
   electronVersion: ELECTRON_VERSION,
-  electronDownload: { isVerifyChecksum: true, checksums: electronChecksums.files },
+  electronDownload: { isVerifyChecksum: true, checksums: electronChecksums.files, cache: electronCache },
   directories: { output, buildResources: path.join(desktop, 'build') },
   // Only the compiled host ships inside the asar; business UI comes from the bundled Core.
   files: ['package.json', 'dist/main/**', 'dist/preload/**'],
