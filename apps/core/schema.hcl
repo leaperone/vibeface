@@ -832,6 +832,30 @@ table "triage_queue" {
   primary_key {
     columns = [column.ts_ms, column.event_id]
   }
+  index "triage_queue_pending" {
+    columns = [column.ts_ms, column.event_id]
+    where   = "json_type(event,'$._triage') IS NULL"
+  }
+  index "triage_queue_claim" {
+    on {
+      expr = "json_extract(event,'$._triage.boot')"
+    }
+    on {
+      expr = "json_extract(event,'$._triage.attempt')"
+    }
+    on {
+      expr = "json_extract(event,'$._triage.state')"
+    }
+    on {
+      column = column.ts_ms
+    }
+    on {
+      column = column.event_id
+    }
+  }
+  index "triage_queue_event" {
+    columns = [column.event_id]
+  }
 }
 table "triage_handled" {
   schema = schema.main
@@ -875,6 +899,9 @@ table "triage_outbox" {
   }
   primary_key {
     columns = [column.event_id]
+  }
+  index "triage_outbox_due" {
+    columns = [column.state, column.next_ms, column.event_id]
   }
 }
 table "triage_scans" {

@@ -2229,7 +2229,6 @@ impl Runtime {
             return Default::default();
         }
         let fetch = async {
-            let _download = self.blob_fetch.lock().await;
             for (author, blob) in &wanted {
                 if local.as_ref() == Some(author)
                     || self.store.lock().await.has_blob(blob).unwrap_or(false)
@@ -2253,7 +2252,6 @@ impl Runtime {
     /// Downloads from `peer` every attachment stored events reference that is not here yet. Each
     /// sync round runs it, so one a turn left pending arrives once a member holding it is reached.
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
-        let _download = self.blob_fetch.lock().await;
         let missing = self.store.lock().await.missing_blobs(network)?;
         let mut failed = 0;
         for blob in &missing {
@@ -2271,6 +2269,7 @@ impl Runtime {
     pub(crate) async fn fetch_blob(&self, network: &str, peer: &str, blob: &BlobRef) -> Result<()> {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(blob.size as usize <= MAX_BLOB_BYTES, "attachment too large");
+        let _download = self.blob_fetch.lock().await;
         let (part, target, committed) = {
             let store = self.store.lock().await;
             (
@@ -2279,10 +2278,18 @@ impl Runtime {
                 store.committed_offset(&blob.hash)?,
             )
         };
+        if tokio::fs::metadata(&target)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == blob.size)
+        {
+            return Ok(());
+        }
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
-        if !part.exists() {
-            staging_room(dir, blob.size)?;
+        if !tokio::fs::try_exists(&part).await? {
+            let dir = dir.to_owned();
+            let size = blob.size;
+            tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -2336,8 +2343,12 @@ impl Runtime {
             .commit_offset(&blob.hash, Some(offset))?;
         ensure!(offset == blob.size, "attachment stream ended early");
         drop(file);
-        let bytes = tokio::fs::read(&part).await?;
-        if crate::crypto::digest(&bytes) != blob.hash {
+        let hash_part = part.clone();
+        let hash = tokio::task::spawn_blocking(move || {
+            std::fs::read(hash_part).map(|bytes| crate::crypto::digest(&bytes))
+        })
+        .await??;
+        if hash != blob.hash {
             let _ = tokio::fs::remove_file(&part).await;
             self.store.lock().await.commit_offset(&blob.hash, None)?;
             bail!("downloaded attachment failed its hash check");

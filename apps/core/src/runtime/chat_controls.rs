@@ -95,7 +95,7 @@ impl Runtime {
     /// the reply's offset says where the client continues.
     pub(super) async fn upload_attachment(&self, access: &Access, input: &Value) -> Result<Value> {
         use base64::Engine as _;
-        use std::io::{Seek as _, Write as _};
+        use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(access.human, "only the user sends attachments");
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
@@ -107,15 +107,22 @@ impl Runtime {
             blob.size > 0 && blob.size as usize <= MAX_BLOB_BYTES,
             "attachment must be 1 byte to 64 MiB"
         );
-        let mut store = self.store.lock().await;
-        if store.has_blob(&blob)? {
+        let _upload = self.blob_fetch.lock().await;
+        self.require_scope(access, scope).await?;
+        let (part, target, committed) = {
+            let store = self.store.lock().await;
+            (
+                store.partial_blob_file(&blob.hash)?,
+                store.blob_file(&blob.hash)?,
+                store.committed_offset(&blob.hash)?,
+            )
+        };
+        if tokio::fs::metadata(&target)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == blob.size)
+        {
             return Ok(json!({"offset":blob.size,"complete":true}));
         }
-        let (part, target) = (
-            store.partial_blob_file(&blob.hash)?,
-            store.blob_file(&blob.hash)?,
-        );
-        let committed = store.committed_offset(&blob.hash)?;
         let offset = input["offset"].as_u64().context("offset is required")?;
         if offset != committed {
             return Ok(json!({"offset":committed,"complete":false}));
@@ -129,34 +136,47 @@ impl Runtime {
             "attachment chunk does not fit"
         );
         let dir = part.parent().context("partial directory")?;
-        std::fs::create_dir_all(dir)?;
-        if !part.exists() {
-            super::peers::staging_room(dir, blob.size)?;
+        tokio::fs::create_dir_all(dir).await?;
+        if !tokio::fs::try_exists(&part).await? {
+            let dir = dir.to_owned();
+            tokio::task::spawn_blocking(move || super::peers::staging_room(&dir, blob.size))
+                .await??;
         }
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&part)?;
-        file.set_len(committed)?;
-        file.seek(std::io::SeekFrom::Start(committed))?;
-        file.write_all(&data)?;
-        file.sync_data()?;
+            .open(&part)
+            .await?;
+        file.set_len(committed).await?;
+        file.seek(std::io::SeekFrom::Start(committed)).await?;
+        file.write_all(&data).await?;
+        file.sync_data().await?;
         let offset = committed + data.len() as u64;
-        store.commit_offset(&blob.hash, Some(offset))?;
+        self.store
+            .lock()
+            .await
+            .commit_offset(&blob.hash, Some(offset))?;
         if offset < blob.size {
             return Ok(json!({"offset":offset,"complete":false}));
         }
+        file.sync_all().await?;
         drop(file);
-        // ponytail: hashes the whole file under the store lock once per attachment (<= 64 MiB).
-        if crate::crypto::digest(&std::fs::read(&part)?) != blob.hash {
-            let _ = std::fs::remove_file(&part);
-            store.commit_offset(&blob.hash, None)?;
+        let hash_part = part.clone();
+        let hash = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            super::triage::tests::pause_attachment_hash(&hash_part);
+            std::fs::read(hash_part).map(|bytes| crate::crypto::digest(&bytes))
+        })
+        .await??;
+        if hash != blob.hash {
+            let _ = tokio::fs::remove_file(&part).await;
+            self.store.lock().await.commit_offset(&blob.hash, None)?;
             bail!("attachment failed its hash check; send it again");
         }
-        std::fs::create_dir_all(target.parent().context("blob directory")?)?;
-        std::fs::rename(&part, &target)?;
-        store.commit_offset(&blob.hash, None)?;
+        tokio::fs::create_dir_all(target.parent().context("blob directory")?).await?;
+        tokio::fs::rename(&part, &target).await?;
+        self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(json!({"offset":offset,"complete":true}))
     }
 

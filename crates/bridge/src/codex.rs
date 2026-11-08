@@ -679,6 +679,7 @@ struct Session {
     ready: bool,
     pending: HashMap<RpcId, Pending>,
     subscribed: HashSet<String>,
+    snapshotted: HashSet<String>,
     resuming: HashSet<String>,
     /// Threads another process writes: they cannot be resumed here, so their turns are read.
     polled: HashSet<String>,
@@ -741,7 +742,8 @@ impl Session {
         self.retry_observation_at
             .retain(|id, _| threads.contains(id));
         for id in threads {
-            if self.resuming.contains(id)
+            if (self.subscribed.contains(id) && self.snapshotted.contains(id))
+                || self.resuming.contains(id)
                 || self
                     .retry_observation_at
                     .get(id)
@@ -790,6 +792,7 @@ impl Session {
             self.fail(pending, reason, true);
         }
         self.subscribed.clear();
+        self.snapshotted.clear();
         self.ready = false;
     }
 }
@@ -809,8 +812,30 @@ async fn connection_loop(
     events: mpsc::UnboundedSender<ExecEvent>,
 ) {
     let mut backoff = 1;
+    let mut disconnected = false;
     loop {
         let socket = endpoint.borrow_and_update().clone();
+        if socket.is_none() {
+            if !disconnected {
+                cache
+                    .write()
+                    .await
+                    .disconnect("no Codex App Server is selected");
+                let _ = events.send(ExecEvent::Disconnected);
+                disconnected = true;
+            }
+            loop {
+                tokio::select! {
+                    () = endpoint_changed(&mut endpoint) => break,
+                    command = commands.recv() => match command {
+                        Some(command) => command.reject("Codex is disconnected"),
+                        None => return,
+                    }
+                }
+            }
+            backoff = 1;
+            continue;
+        }
         let connect = async {
             match &socket {
                 Some(socket) => connect(socket).await,
@@ -850,6 +875,10 @@ async fn connection_loop(
         };
         cache.write().await.disconnect(&reason);
         let _ = events.send(ExecEvent::Disconnected);
+        disconnected = true;
+        if endpoint.borrow().is_none() {
+            continue;
+        }
         let delay = tokio::time::sleep(Duration::from_secs(backoff));
         tokio::pin!(delay);
         loop {
@@ -958,8 +987,14 @@ async fn run_session(
                         let _ = events.send(ExecEvent::Request(ServerRequest { id, method: method.into(), thread_id: thread.map(str::to_owned), params: message["params"].clone() }));
                     }
                     drop(observed_cache);
-                    if (message["method"] == "thread/closed" || message["method"] == "thread/unsubscribed")
-                        && let Some(id) = message["params"]["threadId"].as_str() { state.subscribed.remove(id); }
+                    if (message["method"] == "thread/closed" || message["method"] == "thread/unsubscribed"
+                        || (message["method"] == "thread/status/changed" && message["params"]["status"]["type"] == "notLoaded"))
+                        && let Some(id) = message["params"]["threadId"].as_str() {
+                            state.subscribed.remove(id);
+                            state.snapshotted.remove(id);
+                            state.polled.remove(id);
+                            state.retry_observation_at.remove(id);
+                        }
                     let _ = events.send(ExecEvent::Message(message));
                     continue;
                 }
@@ -997,11 +1032,17 @@ async fn run_session(
                     PendingKind::ObserveTurns(thread_id) => {
                         let mut cache = cache.write().await;
                         let thread = cache.threads.entry(thread_id.clone()).or_default();
-                        if let Some(turns) = result["data"].as_array() {
+                        let snapshotted = if let Some(turns) = result["data"].as_array() {
                             for turn in turns.iter().rev() { observe_turn(thread, turn); }
-                        }
+                            true
+                        } else { false };
                         state.resuming.remove(&thread_id);
-                        state.retry_observation_at.insert(thread_id, Instant::now() + Duration::from_secs(5));
+                        if snapshotted { state.snapshotted.insert(thread_id.clone()); }
+                        if state.subscribed.contains(&thread_id) && snapshotted {
+                            state.retry_observation_at.remove(&thread_id);
+                        } else {
+                            state.retry_observation_at.insert(thread_id, Instant::now() + Duration::from_secs(5));
+                        }
                     }
                     PendingKind::Request(execute) => {
                         let mut observed_cache = cache.write().await;
@@ -1505,7 +1546,7 @@ mod tests {
                 crate::platform::ipc::Listener::bind(&second).await.unwrap(),
             );
             let (endpoint, receiver) = watch::channel(Some(first.path().to_owned()));
-            let (events, _events) = mpsc::unbounded_channel();
+            let (events, mut received_events) = mpsc::unbounded_channel();
             let client = CodexClient::start(receiver, events);
             client.set_observed_threads(vec!["busy".into()]).unwrap();
             let mut server = tokio_tungstenite::accept_async(listener_a.accept().await.unwrap()).await.unwrap();
@@ -1521,6 +1562,12 @@ mod tests {
             server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"busy","status":{"type":"idle"}}}}).to_string().into())).await.unwrap();
             assert_eq!(next(&mut server).await["method"], "thread/turns/list", "a thread another process writes is read, not resumed again");
 
+            endpoint.send_replace(None);
+            while received_events.recv().await.unwrap() != ExecEvent::Disconnected {}
+            let rejected = timeout(Duration::from_millis(250), client.request("thread/read", json!({"threadId":"busy","includeTurns":false}))).await.unwrap().unwrap_err();
+            assert!(!rejected.uncertain);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(!std::iter::from_fn(|| received_events.try_recv().ok()).any(|event| event == ExecEvent::Disconnected), "None reports one disconnection and then waits");
             endpoint.send_replace(Some(second.path().to_owned()));
             let mut moved = tokio_tungstenite::accept_async(listener_b.accept().await.unwrap()).await.unwrap();
             assert_eq!(next(&mut moved).await["method"], "initialize", "the client follows the new endpoint");
@@ -1596,6 +1643,16 @@ mod tests {
                     assert_eq!(snapshot["replies"][0]["decision"], "accept");
                     client.set_observed_threads(vec!["known".into(), "known".into()]).unwrap();
                     assert!(timeout(Duration::from_millis(300), server.next()).await.is_err());
+                    server.send(Message::Text(json!({"method":"thread/unsubscribed","params":{"threadId":"known"}}).to_string().into())).await.unwrap();
+                    let read = next(&mut server).await;
+                    assert_eq!(read["method"], "thread/read");
+                    server.send(Message::Text(json!({"id":read["id"],"result":{"thread":{"id":"known","status":{"type":"active"}}}}).to_string().into())).await.unwrap();
+                    let resume = next(&mut server).await;
+                    assert_eq!(resume["method"], "thread/resume");
+                    server.send(Message::Text(json!({"id":resume["id"],"result":{"thread":{"id":"known","status":{"type":"active"}}}}).to_string().into())).await.unwrap();
+                    let turns = next(&mut server).await;
+                    assert_eq!(turns["method"], "thread/turns/list");
+                    server.send(Message::Text(json!({"id":turns["id"],"result":{"data":[]}}).to_string().into())).await.unwrap();
                     server.close(None).await.unwrap();
                 } else {
                     assert!(timeout(Duration::from_millis(300), server.next()).await.is_err());
@@ -1609,6 +1666,43 @@ mod tests {
             drop(client);
             drop(socket);
         }).await.expect("Codex reconnect must restore observation without replaying a mutation");
+    }
+
+    #[test]
+    fn subscribed_snapshots_leave_periodic_polling_but_fallbacks_keep_reading() {
+        let (writer, mut requests) = mpsc::unbounded_channel();
+        let threads = BTreeSet::from(["known".to_owned()]);
+        let mut state = Session {
+            ready: true,
+            ..Default::default()
+        };
+        state.subscribed.insert("known".into());
+        state.snapshotted.insert("known".into());
+        for _ in 0..3 {
+            state
+                .retry_observation_at
+                .insert("known".into(), Instant::now() - Duration::from_secs(1));
+            state.observe_threads(&writer, &threads).unwrap();
+            assert!(
+                requests.try_recv().is_err(),
+                "a subscribed initial snapshot is followed by notifications"
+            );
+        }
+        state.snapshotted.clear();
+        state.observe_threads(&writer, &threads).unwrap();
+        assert!(
+            requests.try_recv().is_ok(),
+            "a subscription still needs its first snapshot"
+        );
+        state.resuming.clear();
+        state.snapshotted.insert("known".into());
+        state.subscribed.clear();
+        state.polled.insert("known".into());
+        state.observe_threads(&writer, &threads).unwrap();
+        assert!(
+            requests.try_recv().is_ok(),
+            "writer-busy and notLoaded snapshots keep their read-only fallback"
+        );
     }
 
     #[test]

@@ -38,8 +38,12 @@ CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL,
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 CREATE TABLE `triage_seen` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, PRIMARY KEY (`event_id`));
 CREATE TABLE `triage_queue` (`ts_ms` integer NOT NULL, `event_id` text NOT NULL, `request_id` text NULL, `event` text NOT NULL, PRIMARY KEY (`ts_ms`, `event_id`));
+CREATE INDEX `triage_queue_pending` ON `triage_queue` (`ts_ms`, `event_id`) WHERE json_type(event,'$._triage') IS NULL;
+CREATE INDEX `triage_queue_claim` ON `triage_queue` (json_extract(event,'$._triage.boot'), json_extract(event,'$._triage.attempt'), json_extract(event,'$._triage.state'), `ts_ms`, `event_id`);
+CREATE INDEX `triage_queue_event` ON `triage_queue` (`event_id`);
 CREATE TABLE `triage_handled` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, `result` text NOT NULL, PRIMARY KEY (`event_id`));
 CREATE TABLE `triage_outbox` (`event_id` text NOT NULL, `body` text NOT NULL, `state` text NOT NULL, `attempts` integer NOT NULL, `next_ms` integer NOT NULL, PRIMARY KEY (`event_id`));
+CREATE INDEX `triage_outbox_due` ON `triage_outbox` (`state`, `next_ms`, `event_id`);
 CREATE TABLE `triage_scans` (`rollout` text NOT NULL, `scanned_to` integer NOT NULL, PRIMARY KEY (`rollout`));
 CREATE TABLE `coordination_threads` (`thread_id` text NOT NULL, PRIMARY KEY (`thread_id`));
 CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`device_id`));
