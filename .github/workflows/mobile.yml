@@ -4,6 +4,10 @@ name: mobile
 on:
   workflow_dispatch:
     inputs:
+      runner_probe:
+        description: Temporarily collect one SDK-only XCTest prepare diagnostic; product acceptance remains failed
+        type: boolean
+        default: false
       feedback:
         description: 'Replace older ordinary mobile feedback on this branch'
         type: boolean
@@ -23,8 +27,8 @@ on:
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 }}
+  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ jobs:
   android:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
+    if: ${{ !inputs.runner_probe && (inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -87,7 +91,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.inputs.outputs.artifact-id }}
       producer_attempt: ${{ github.run_attempt }}
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
+    if: ${{ !inputs.runner_probe && !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
@@ -154,7 +158,7 @@ jobs:
 
   ios-accept:
     needs: ios-build
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.runner_probe && !inputs.android_only && github.event_name == 'workflow_dispatch' }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -247,60 +251,11 @@ jobs:
           raw_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.raw.json")
           error_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.stderr.log")
           summary_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.json")
-          def prepare_error_detail(error):
-              codes = {"INVALID_ARGS", "DEVICE_NOT_FOUND", "DEVICE_IN_USE", "TOOL_MISSING", "APP_NOT_INSTALLED",
-                       "UNSUPPORTED_PLATFORM", "UNSUPPORTED_OPERATION", "NOT_IMPLEMENTED", "COMMAND_FAILED",
-                       "SESSION_NOT_FOUND", "UNAUTHORIZED", "AMBIGUOUS_MATCH", "REPLAY_DIVERGENCE",
-                       "REPAIR_SESSION_EXPIRED", "REPAIR_COMMIT_FAILED", "UNKNOWN"}
-              if not isinstance(error, dict):
-                  return {"code": "unknown"}
-              code = error.get("code")
-              result = {"code": code if isinstance(code, str) and code in codes else "unknown"}
-              details = error.get("details")
-              if not isinstance(details, dict):
-                  return result
-              projected = {}
-              for key, allowed in (
-                  ("reason", {"runner_start_budget_exhausted", "runner_phase_budget_exhausted", "prepare_deadline_expired",
-                              "simulator_set_destination_not_found", "simulator_service_hub_unavailable", "build_failed_unclassified",
-                              "bundle_identifier_already_registered", "signing_no_development_team", "signing_provisioning_profile_missing",
-                              "signing_unspecified", "devtools_security_developer_mode_disabled", "device_developer_disk_image_unavailable",
-                              "IOS_RUNNER_CONNECT_TIMEOUT", "IOS_RUNNER_DEVICE_NOT_PROVISIONED", "IOS_BOOT_TIMEOUT", "IOS_TOOL_MISSING",
-                              "BOOT_COMMAND_FAILED", "CI_RESOURCE_STARVATION_SUSPECTED", "UNKNOWN", "request_canceled",
-                              "daemon_transport_timeout", "daemon_transport_failure", "startup-stalled", "startup-ceiling", "startup-exited"}),
-                  ("runnerConnectFailureReason", {"runner_connect_refused", "runner_endpoint_probe_exhausted", "xcodebuild_exited_early"}),
-                  ("phase", {"runner_session", "runner_rebuild", "runner_health", "runner_xctestrun_build"}),
-              ):
-                  value = details.get(key)
-                  if isinstance(value, str) and value in allowed:
-                      projected[key] = value
-              for key in ("timeoutMs", "startupTimeoutMs"):
-                  value = details.get(key)
-                  if type(value) in {int, float} and 0 <= value <= 600000:
-                      projected[key] = value
-              attempts = details.get("startupAttempts")
-              if type(attempts) is int and 1 <= attempts <= 2:
-                  projected["startupAttempts"] = attempts
-              xcodebuild_result = details.get("xcodebuild")
-              value = xcodebuild_result.get("exitCode") if isinstance(xcodebuild_result, dict) else None
-              if type(value) is int and 0 <= value <= 255:
-                  projected["xcodebuild"] = {"exitCode": value}
-              if projected:
-                  result["details"] = projected
-              return result
+          prepare_module = __import__("runpy").run_path("scripts/ios-runner-prepare.py")
+          prepare_error_detail = prepare_module["project_error"]
 
           def read_prepare_error():
-              try:
-                  if raw_path.is_symlink() or not raw_path.is_file():
-                      return {"code": "unknown"}
-                  with raw_path.open("rb") as stream:
-                      raw = stream.read(262145)
-                  assert len(raw) <= 262144
-                  result = json.loads(raw)
-                  assert isinstance(result, dict) and result.get("success") is False
-                  return prepare_error_detail(result.get("error"))
-              except (OSError, ValueError, TypeError, AssertionError, RecursionError):
-                  return {"code": "unknown"}
+              return prepare_module["read_error"](pathlib.Path.cwd(), raw_path)
 
           def write_failure(reason, exit_code, error=None):
               summary = {"status": "failed", "reason": reason, "exit_code": exit_code}
@@ -378,7 +333,9 @@ jobs:
           print("iOS XCTest runner healthy: " + json.dumps(summary, sort_keys=True))
           PY
       - name: Check bounded iOS actor diagnostics
-        run: python3 scripts/ios-actor-census.py --self-test
+        run: |
+          python3 scripts/ios-actor-census.py --self-test
+          python3 scripts/ios-runner-prepare.py --self-test
       - name: Verify Provider settings and cancellation in the installed iOS app
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -634,47 +591,8 @@ jobs:
               except (OSError, ValueError, TypeError, AssertionError):
                   return {"status": "unreadable"}
 
-          def prepare_error_detail(error):
-              codes = {"INVALID_ARGS", "DEVICE_NOT_FOUND", "DEVICE_IN_USE", "TOOL_MISSING", "APP_NOT_INSTALLED",
-                       "UNSUPPORTED_PLATFORM", "UNSUPPORTED_OPERATION", "NOT_IMPLEMENTED", "COMMAND_FAILED",
-                       "SESSION_NOT_FOUND", "UNAUTHORIZED", "AMBIGUOUS_MATCH", "REPLAY_DIVERGENCE",
-                       "REPAIR_SESSION_EXPIRED", "REPAIR_COMMIT_FAILED", "UNKNOWN"}
-              if not isinstance(error, dict):
-                  return {"code": "unknown"}
-              code = error.get("code")
-              result = {"code": code if isinstance(code, str) and code in codes else "unknown"}
-              details = error.get("details")
-              if not isinstance(details, dict):
-                  return result
-              projected = {}
-              for key, allowed in (
-                  ("reason", {"runner_start_budget_exhausted", "runner_phase_budget_exhausted", "prepare_deadline_expired",
-                              "simulator_set_destination_not_found", "simulator_service_hub_unavailable", "build_failed_unclassified",
-                              "bundle_identifier_already_registered", "signing_no_development_team", "signing_provisioning_profile_missing",
-                              "signing_unspecified", "devtools_security_developer_mode_disabled", "device_developer_disk_image_unavailable",
-                              "IOS_RUNNER_CONNECT_TIMEOUT", "IOS_RUNNER_DEVICE_NOT_PROVISIONED", "IOS_BOOT_TIMEOUT", "IOS_TOOL_MISSING",
-                              "BOOT_COMMAND_FAILED", "CI_RESOURCE_STARVATION_SUSPECTED", "UNKNOWN", "request_canceled",
-                              "daemon_transport_timeout", "daemon_transport_failure", "startup-stalled", "startup-ceiling", "startup-exited"}),
-                  ("runnerConnectFailureReason", {"runner_connect_refused", "runner_endpoint_probe_exhausted", "xcodebuild_exited_early"}),
-                  ("phase", {"runner_session", "runner_rebuild", "runner_health", "runner_xctestrun_build"}),
-              ):
-                  value = details.get(key)
-                  if isinstance(value, str) and value in allowed:
-                      projected[key] = value
-              for key in ("timeoutMs", "startupTimeoutMs"):
-                  value = details.get(key)
-                  if type(value) in {int, float} and 0 <= value <= 600000:
-                      projected[key] = value
-              attempts = details.get("startupAttempts")
-              if type(attempts) is int and 1 <= attempts <= 2:
-                  projected["startupAttempts"] = attempts
-              xcodebuild_result = details.get("xcodebuild")
-              value = xcodebuild_result.get("exitCode") if isinstance(xcodebuild_result, dict) else None
-              if type(value) is int and 0 <= value <= 255:
-                  projected["xcodebuild"] = {"exitCode": value}
-              if projected:
-                  result["details"] = projected
-              return result
+          prepare_module = __import__("runpy").run_path("scripts/ios-runner-prepare.py")
+          prepare_error_detail = prepare_module["project_error"]
 
           def safe_runner_prepare():
               path = root / "private/ios-runner-prepare.json"
@@ -900,9 +818,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  runner-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --filter .
+      - run: python3 scripts/ios-runner-prepare.py --self-test
+      - run: python3 scripts/ios-runner-prepare.py --probe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && !cancelled()
+        with:
+          name: runner-probe-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/native/public/runner-probe.json
+          if-no-files-found: error
+          retention-days: 7
+
   mobile-gate:
     if: always()
-    needs: [android, ios-build, ios-accept]
+    needs: [android, ios-build, ios-accept, runner-probe]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

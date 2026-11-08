@@ -506,6 +506,7 @@ def macos_process(package, artifacts):
 def self_test():
     from unittest.mock import patch
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "ios-runner-prepare.py"), "--self-test"], check=True)
     mobile = {job: {"result": "success"} for job in ("android", "ios-build", "ios-accept")}
     mobile_gate(mobile, False)
     mobile_gate({"android": {"result": "success"}, "ios-build": {"result": "skipped"}, "ios-accept": {"result": "skipped"}}, True)
