@@ -508,8 +508,7 @@ class Experiment:
             self.nodes.append(node)
             self.helpers["isolate_delivery_node"](node)
             node.configure_network(pkarr={"publish": True, "resolve": True, "urls": [self.relay.url], "publish_direct": True})
-            default = json.loads((node.directory / "config.json").read_bytes())["delivery"]
-            need(default["enabled"] is False and default["paid_enabled"] is False, "lab_paid_default_off_required")
+            need(not (node.directory / "delivery-settings.json").exists(), "fresh_delivery_settings_must_be_absent")
             node.start()
             if name != "P":
                 node.bootstrap()
@@ -850,6 +849,7 @@ def self_test():
     from unittest.mock import Mock, patch
     from types import SimpleNamespace
     import socket
+    import tempfile
     def forbidden(*_args, **_kwargs):
         raise AssertionError("no-process self-test attempted an external process or network")
     with patch.object(subprocess, "Popen", forbidden), patch.object(subprocess, "run", forbidden), patch.object(socket, "socket", forbidden):
@@ -879,6 +879,25 @@ def self_test():
             except (CheckFailure, ValueError): pass
             else: raise AssertionError("non-loopback origin accepted")
         need(oom_delta({"memory.events": "oom 0\noom_kill 0\n"}, {"memory.events": "oom 1\noom_kill 0\n"})["oom"] == 1, "actual_oom_delta")
+        for preconfigured in (False, True):
+            with tempfile.TemporaryDirectory(prefix="protected-fresh-settings-selftest-", dir=ARTIFACTS) as temporary:
+                run = Path(temporary); directory = run / "S"; directory.mkdir()
+                save_json(directory / "config.json", {"network": {}})
+                if preconfigured: save_json(directory / "delivery-settings.json", {"enabled": False, "paid_enabled": False})
+                node = SimpleNamespace(directory=directory, configure_network=Mock(),
+                    start=Mock(side_effect=CheckFailure("synthetic_stop_before_real_node_start")))
+                startup = object.__new__(Experiment)
+                startup.run = run; startup.paths = {name: Path(value) for name, value in sample["paths"].items()}
+                startup.nodes = []; startup.progress = Mock(); startup.deployment = {"funder":"0x" + "11" * 20}
+                startup.rpc = Mock(side_effect=[["0x" + value * 20 for value in ("11","22","33","44")],"0x7a69"])
+                startup.helpers = {"CLIENT_SOURCE":"MODULE_URL", "PkarrRelay":Mock(), "Node":Mock(return_value=node), "isolate_delivery_node":Mock()}
+                try: startup.setup_nodes()
+                except CheckFailure as error:
+                    need(str(error) == ("fresh_delivery_settings_must_be_absent" if preconfigured else "synthetic_stop_before_real_node_start"),
+                         "fresh_settings_use_independent_file_contract")
+                else: raise AssertionError("the settings selfcheck must stop before real Node startup")
+                need(node.start.call_count == (0 if preconfigured else 1), "only_absent_delivery_settings_reach_fresh_startup")
+                need(json.loads((directory / "config.json").read_bytes()) == {"network": {}}, "main_config_must_not_gain_delivery_fields")
         experiment = object.__new__(Experiment)
         experiment.progress = Mock(); experiment.scan_receipts = Mock(); experiment.checkpoint = Mock()
         experiment.processes = SimpleNamespace(capture=Mock())
