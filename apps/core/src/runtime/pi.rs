@@ -719,20 +719,20 @@ impl Pi {
     }
 
     /// Ends the pi processes an earlier Node run left, so their turns are read back as they are.
-    pub(crate) fn new(data_dir: &Path) -> Self {
-        Self {
+    pub(crate) fn new(data_dir: &Path) -> Result<Self> {
+        Ok(Self {
             dir: data_dir.join("pi"),
             sessions: ProviderRoots::new(data_dir).pi_sessions,
-            processes: Arc::new(Processes::open(data_dir.join(PIDFILE))),
+            processes: Arc::new(Processes::open(data_dir.join(PIDFILE))?),
             live: Default::default(),
             preparing: Default::default(),
             resuming: Default::default(),
-        }
+        })
     }
 
     /// Ends every running pi; the Node calls this before it exits.
-    pub(super) async fn stop(&self) {
-        self.processes.stop().await;
+    pub(super) async fn stop(&self) -> Result<()> {
+        self.processes.stop().await
     }
 
     fn pointer_path(&self, session: &str) -> Result<PathBuf> {
@@ -2028,7 +2028,7 @@ mod tests {
         std::fs::create_dir(&user)?;
         for name in ["node-a", "node-b"] {
             let data = dir.join(name);
-            let pi = Arc::new(Pi::new(&data));
+            let pi = Arc::new(Pi::new(&data)?);
             let mut launch = launch(&dir, "reply", name);
             launch.env.insert(
                 "PI_CODING_AGENT_SESSION_DIR".into(),
@@ -2068,7 +2068,7 @@ mod tests {
     #[tokio::test]
     async fn bot_readback_uses_its_frozen_input_and_requires_an_ending() -> Result<()> {
         let dir = scratch("bot-readback");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir)?;
         let file = dir.join("session.jsonl");
         std::fs::write(&file, "")?;
         pi.keep("s-1", &file, &dir, "")?;
@@ -2136,7 +2136,7 @@ mod tests {
     #[tokio::test]
     async fn a_bot_turn_streams_its_reply_and_the_next_turn_goes_on_in_its_session() -> Result<()> {
         let dir = scratch("bot");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let mut config = bot(&dir, &pi, "reply", None);
         config.reasoning_effort = Some("high".into());
         let shown = std::sync::Mutex::new(Vec::new());
@@ -2207,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_steered_into_the_running_reply_is_answered_in_it() -> Result<()> {
         let dir = scratch("steer");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let turns = Turns::default();
         let mut config = bot(&dir, &pi, "wait", Some(&turns));
         let native_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2306,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_a_bot_turn_aborts_it_in_pi() -> Result<()> {
         let dir = scratch("stop");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let turns = Turns::default();
         let config = bot(&dir, &pi, "wait", Some(&turns));
         let (stop, cancel) = watch::channel(false);
@@ -2343,7 +2343,7 @@ mod tests {
     #[tokio::test]
     async fn sixteen_pi_turns_overlap_and_keep_their_outputs() -> Result<()> {
         let dir = scratch("concurrent");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let tasks = concurrent_pi_turns(&dir, &pi, (0..16).map(|_| String::from("reply")));
         wait_for_gate(&dir).await?;
         release(&dir);
@@ -2361,7 +2361,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_one_of_sixteen_pi_turns_leaves_the_others_running() -> Result<()> {
         let dir = scratch("concurrent-cancel");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let mut tasks = Vec::with_capacity(16);
         let mut stops = Vec::with_capacity(16);
         for index in 0..16 {
@@ -2413,7 +2413,7 @@ mod tests {
     #[tokio::test]
     async fn one_failed_pi_turn_does_not_stop_the_other_fifteen() -> Result<()> {
         let dir = scratch("concurrent-failure");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir)?);
         let modes = (0..16).map(|index| {
             if index == 0 {
                 String::from("fail")
@@ -2546,7 +2546,7 @@ mod tests {
     async fn a_cancelled_prompt_never_wins_a_ready_or_queued_stdin_write() -> Result<()> {
         for queued in [false, true] {
             let dir = scratch("cancel-before-write");
-            let pi = Pi::new(&dir);
+            let pi = Pi::new(&dir)?;
             let (stop, mut cancel) = watch::channel(false);
             let (mut process, after) = pi
                 .open(&launch(&dir, "reply", "s-1"), "s-1", &mut cancel)
@@ -2593,7 +2593,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_after_the_prompt_write_keeps_an_unknown_outcome() -> Result<()> {
         let dir = scratch("cancel-after-write");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir)?;
         let (stop, mut cancel) = watch::channel(false);
         let (mut process, after) = pi
             .open(&launch(&dir, "prompt-pending", "s-1"), "s-1", &mut cancel)
@@ -2861,7 +2861,7 @@ mod tests {
         let mut recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();
         recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
         std::fs::write(&pidfile, recorded)?;
-        let restarted = Pi::new(&data);
+        let restarted = Pi::new(&data)?;
         assert!(ended(&left).await, "the restart ended the pi it left");
         assert!(!pidfile.exists());
         assert!(
@@ -2902,7 +2902,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_without_the_prompt_reads_as_not_started() -> Result<()> {
         let dir = scratch("unsent");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir)?;
         let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
         crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);
@@ -2944,7 +2944,7 @@ mod tests {
             ("pointer-error", NotStarted, FailureKind::Unknown, 0, 1),
         ] {
             let dir = scratch(mode);
-            let pi = Arc::new(Pi::new(&dir));
+            let pi = Arc::new(Pi::new(&dir)?);
             let mut config = bot(&dir, &pi, mode, None);
             let previous = match mode {
                 "instructions-error" => {

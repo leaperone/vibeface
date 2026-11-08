@@ -595,7 +595,7 @@ impl Runtime {
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
+        vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE))?;
         let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
@@ -678,7 +678,7 @@ impl Runtime {
             .clone();
         local.validate(codex_agent)?;
         let claude_env = local.env.get(Provider::Claude).clone();
-        let claude = claude::Claude::open(dir, &claude_env);
+        let claude = claude::Claude::open(dir, &claude_env)?;
         let codex_target = local.codex_target(codex_agent);
         let codex = Arc::new(codex_server::CodexServer::open(
             codex_target,
@@ -755,7 +755,7 @@ impl Runtime {
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             claude,
-            pi: Arc::new(pi::Pi::new(dir)),
+            pi: Arc::new(pi::Pi::new(dir)?),
             opencode,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
@@ -987,12 +987,22 @@ impl Runtime {
         if let Ok(net) = self.net() {
             net.close().await;
         }
-        self.codex.stop().await;
-        self.claude.stop().await;
-        self.pi.stop().await;
-        self.opencode.stop().await;
-        if let Some(bridge) = self.cursor.get() {
-            bridge.stop().await;
+        if let Err(error) = self.codex.stop().await {
+            tracing::warn!(%error, "Codex process-tree exit is unconfirmed during shutdown");
+        }
+        if let Err(error) = self.claude.stop().await {
+            tracing::warn!(%error, "Claude process-tree exit is unconfirmed during shutdown");
+        }
+        if let Err(error) = self.pi.stop().await {
+            tracing::warn!(%error, "pi process-tree exit is unconfirmed during shutdown");
+        }
+        if let Err(error) = self.opencode.stop().await {
+            tracing::warn!(%error, "opencode process-tree exit is unconfirmed during shutdown");
+        }
+        if let Some(bridge) = self.cursor.get()
+            && let Err(error) = bridge.stop().await
+        {
+            tracing::warn!(%error, "Cursor SDK process-tree exit is unconfirmed during shutdown");
         }
     }
     pub(crate) fn writable(&self) -> bool {

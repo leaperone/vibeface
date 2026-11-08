@@ -349,7 +349,7 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         sends_before
     );
 
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     assert!(gone(last).await);
     assert!(!pidfile.exists());
     std::fs::remove_dir_all(root).unwrap();
@@ -554,7 +554,7 @@ async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifte
         48,
         "no crash or cancellation replays a Send"
     );
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     assert!(!pidfile.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -690,7 +690,7 @@ async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_af
         "resume starts an independent replacement process"
     );
     assert!(!turn.workspace.join(".sdk").exists());
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     for group in starts(&starts_log) {
         assert!(gone(group).await);
     }
@@ -782,7 +782,7 @@ async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_st
         .cancel(&turn, result.session_id.as_deref().unwrap(), &run_id)
         .await
         .unwrap();
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -827,7 +827,7 @@ async fn provider_observation_reads_metadata_without_an_agent_turn() {
     }));
     let shown = format!("{observation:?}");
     assert!(!shown.contains("private@example.invalid"));
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -852,7 +852,7 @@ async fn provider_observation_keeps_authentication_when_catalog_fails() {
         SdkProviderAuthentication::Authenticated
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -880,7 +880,7 @@ async fn provider_observation_maps_only_http_auth_status_to_sign_in_required() {
         SdkProviderAuthentication::SignInRequired
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -908,7 +908,7 @@ async fn provider_observation_keeps_malformed_metadata_unknown() {
         SdkProviderAuthentication::Unknown
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -947,7 +947,7 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         .to_owned();
     #[cfg(windows)]
     let fixture_process = fixture_process_handle(&fixture_log);
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     #[cfg(windows)]
     let (fixture_exit_after_stop, fixture_probe_os_code) = fixture_exit(&fixture_process);
     assert!(
@@ -994,7 +994,7 @@ async fn provider_observation_times_out_catalog_without_downgrading_authenticati
         SdkProviderAuthentication::Authenticated
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1058,6 +1058,6 @@ async fn provider_observation_does_not_wait_for_an_active_agent_owner() {
     assert!(!running.is_finished());
     std::fs::write(root.join("gates/first"), b"").unwrap();
     assert_eq!(running.await.unwrap().0.unwrap(), "done: first-active");
-    bridge.stop().await;
+    bridge.stop().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -198,7 +198,10 @@ fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailur
 /// later attempt, or the next run of the Node, ends it rather than losing track of it.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
+    if let Err(error) = tree.stop() {
+        tracing::warn!(%error, "could not confirm managed process-tree exit");
+        return false;
+    }
     let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
         tree.kill();
@@ -210,8 +213,8 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
         }
     }
     for _ in 0..20 {
-        // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
-        // by token so this checks the whole tree, including children of a `.cmd` launcher.
+        // Windows stop already waited on member handles before releasing its Job. Also confirm
+        // the recorded tree is gone after the root is reaped.
         match platform::tree::Leftover::find(&token) {
             Ok(None) => return true,
             Ok(Some(_)) => {}
@@ -332,6 +335,7 @@ impl Live {
 
     async fn healthy(&self) -> bool {
         !self.exited()
+            && self.exited.has_changed().is_ok()
             && matches!(
                 tokio::time::timeout(
                     PING_TIMEOUT,
@@ -555,8 +559,8 @@ impl SdkBridge {
         }
     }
 
-    /// Kills every bridge process group this Node started and removes the pidfile.
-    pub async fn stop(&self) {
+    /// Stops every bridge tree this Node started, retaining the journal if any exit is unconfirmed.
+    pub async fn stop(&self) -> Result<()> {
         let running: Vec<_> = self
             .processes
             .running
@@ -565,42 +569,79 @@ impl SdkBridge {
             .values()
             .map(|tracked| (tracked.kill.clone(), tracked.exited.clone()))
             .collect();
-        for (kill, mut exited) in running {
+        for (kill, _) in &running {
             kill.notify_one();
-            let _ = exited.wait_for(|exited| *exited).await;
         }
+        let mut confirmed = true;
+        for (_, mut exited) in running {
+            if exited.wait_for(|exited| *exited).await.is_err() {
+                confirmed = false;
+            }
+        }
+        ensure!(
+            confirmed,
+            "Cursor SDK process-tree exit is unconfirmed; the journal was retained"
+        );
+        let running = self
+            .processes
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            running.is_empty(),
+            "Cursor SDK bridges were tracked during stop; the journal was retained"
+        );
         if let Some(pidfile) = &self.processes.pidfile {
-            let _ = std::fs::remove_file(pidfile);
+            match std::fs::remove_file(pidfile) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("remove the stopped Cursor SDK process journal");
+                }
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     /// Ends the bridge trees an earlier Node run recorded in `pidfile`, but only those still
     /// running the recorded program. A record whose identifier the operating system has since
     /// handed to something else is left alone.
-    pub fn kill_orphan(pidfile: &Path) {
-        let Ok(recorded) = std::fs::read_to_string(pidfile) else {
-            return;
+    pub fn kill_orphan(pidfile: &Path) -> Result<()> {
+        let recorded = match std::fs::read_to_string(pidfile) {
+            Ok(recorded) => recorded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("read the recorded agent process journal"),
         };
+        let mut failure = None;
         for line in recorded.lines() {
             // A journal record never contains a space, so the rest of the line is the whole
             // program path even when a directory in it has one.
-            let Some((token, executable)) = line.split_once(' ') else {
-                continue;
-            };
-            if executable.is_empty() {
+            if line.trim().is_empty() {
                 continue;
             }
-            let stopped =
-                platform::tree::stop_recorded(token, |member| member.contains(executable));
-            if let Err(error) = stopped {
-                tracing::debug!(
-                    event = "sdk.leftover_left_alone",
-                    %error,
-                    "a recorded Cursor SDK bridge was not ended"
+            let stopped = (|| {
+                let (token, executable) = line
+                    .split_once(' ')
+                    .context("the recorded agent process journal is malformed")?;
+                ensure!(
+                    !executable.is_empty(),
+                    "the recorded agent program is missing"
                 );
+                platform::tree::stop_recorded(token, |member| member.contains(executable))
+            })();
+            if let Err(error) = stopped {
+                failure.get_or_insert(error);
             }
         }
-        let _ = std::fs::remove_file(pidfile);
+        if let Some(error) = failure {
+            return Err(error)
+                .context("agent process-tree exit is unconfirmed; the journal was retained");
+        }
+        match std::fs::remove_file(pidfile) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).context("remove the stopped agent process journal")
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Runs the prompt with the turn's tools on the resident bridge.
@@ -983,13 +1024,23 @@ impl SdkBridge {
                     continue;
                 }
                 let live = match slot.slot.try_lock() {
-                    Ok(mut state) => state.live.take(),
+                    Ok(state) => state.live.clone(),
                     Err(_) => continue,
                 };
                 if let Some(live) = live {
                     live.retire();
                     let mut exited = live.exited.clone();
-                    let _ = exited.wait_for(|exited| *exited).await;
+                    if exited.wait_for(|exited| *exited).await.is_err() {
+                        break;
+                    }
+                    let mut state = slot.slot.lock().await;
+                    if state
+                        .live
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &live))
+                    {
+                        state.live = None;
+                    }
                 }
                 let mut slots = all_slots.lock().await;
                 if slots
@@ -1025,22 +1076,30 @@ impl SdkBridge {
                 return Ok(admission);
             }
             let mut slot = owner_slot.slot.lock().await;
+            if current
+                && slot
+                    .live
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &live))
+            {
+                slot.failed(live.started.elapsed());
+                live.kill.notify_one();
+            }
+            live.retire();
+            drop(admission);
+            if !live.exited() {
+                let mut exited = live.exited.clone();
+                exited
+                    .wait_for(|exited| *exited)
+                    .await
+                    .context("the previous Cursor SDK process-tree exit is unconfirmed")?;
+            }
             if slot
                 .live
                 .as_ref()
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &live))
             {
                 slot.live = None;
-                if current {
-                    slot.failed(live.started.elapsed());
-                    live.kill.notify_one();
-                }
-            }
-            live.retire();
-            drop(admission);
-            if !live.exited() {
-                let mut exited = live.exited.clone();
-                let _ = exited.wait_for(|exited| *exited).await;
             }
         }
         let mut slot = owner_slot.slot.lock().await;
@@ -1299,13 +1358,16 @@ async fn supervise(
         _ = kill.notified() => JoinedIo::Neither,
     };
     let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
-    if let Some(mut tree) = process.tree.take()
-        && !terminate_process_tree(&mut process.child, &mut tree).await
-    {
-        // Something of the tree is left; keeping the handle lets the drop of the process
-        // end it rather than leaving it unowned.
-        process.tree = Some(tree);
-    }
+    let stopped = if let Some(mut tree) = process.tree.take() {
+        let stopped = terminate_process_tree(&mut process.child, &mut tree).await;
+        if !stopped {
+            // Keep ownership until the process drop ends anything still left.
+            process.tree = Some(tree);
+        }
+        stopped
+    } else {
+        true
+    };
     // The process exit signal is also the bridge's teardown barrier. Reap the output tasks before
     // publishing it so their pipe handles, along with the child and job handles below, cannot
     // outlive SdkBridge::stop and race its owner removing the bridge state directory.
@@ -1318,10 +1380,12 @@ async fn supervise(
         let _ = (&mut process.stderr).await;
     }
     drop(process);
-    if let Some(token) = token {
-        processes.forget(&token);
+    if stopped {
+        if let Some(token) = token {
+            processes.forget(&token);
+        }
+        let _ = exited.send(true);
     }
-    let _ = exited.send(true);
 }
 
 async fn prepare_sdk_workspace(
@@ -2483,6 +2547,168 @@ pub(crate) async fn bounded_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_bridge(pidfile: Option<PathBuf>) -> SdkBridge {
+        SdkBridge::new(
+            BTreeMap::new(),
+            ToolCallbackConfig {
+                url: "http://127.0.0.1:9".into(),
+                auth_token: "fixture-callback-token-".repeat(2),
+            },
+            pidfile,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stop_requests_every_owned_bridge_and_rejects_an_unconfirmed_exit() {
+        use futures_util::FutureExt as _;
+
+        let bridge = fixture_bridge(None);
+        let first = Arc::new(Notify::new());
+        let second = Arc::new(Notify::new());
+        let mut senders = Vec::new();
+        for (key, kill) in [("first", &first), ("second", &second)] {
+            let (sender, exited) = watch::channel(false);
+            senders.push(sender);
+            bridge
+                .processes
+                .track(
+                    key.into(),
+                    Tracked {
+                        executable: "fixture".into(),
+                        kill: kill.clone(),
+                        exited,
+                    },
+                )
+                .unwrap();
+        }
+
+        let stopping = bridge.stop();
+        tokio::pin!(stopping);
+        assert!(stopping.as_mut().now_or_never().is_none());
+        assert!(first.notified().now_or_never().is_some());
+        assert!(second.notified().now_or_never().is_some());
+        drop(senders.remove(0));
+        assert!(stopping.as_mut().now_or_never().is_none());
+        senders[0].send(true).unwrap();
+        assert!(stopping.await.is_err());
+        assert_eq!(bridge.processes.running.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_a_journal_created_by_concurrent_tracking() {
+        use futures_util::FutureExt as _;
+
+        let root = std::env::temp_dir().join(format!("vibeface-sdk-stop-{}", uuid::Uuid::new_v4()));
+        platform::privatefs::create_dir(&root).unwrap();
+        let pidfile = root.join("bridge.pid");
+        let bridge = fixture_bridge(Some(pidfile.clone()));
+        let (sender, exited) = watch::channel(false);
+        bridge
+            .processes
+            .track(
+                "first".into(),
+                Tracked {
+                    executable: "fixture".into(),
+                    kill: Arc::new(Notify::new()),
+                    exited,
+                },
+            )
+            .unwrap();
+        let stopping = bridge.stop();
+        tokio::pin!(stopping);
+        assert!(stopping.as_mut().now_or_never().is_none());
+        let (_new_sender, exited) = watch::channel(false);
+        bridge
+            .processes
+            .track(
+                "new".into(),
+                Tracked {
+                    executable: "fixture".into(),
+                    kill: Arc::new(Notify::new()),
+                    exited,
+                },
+            )
+            .unwrap();
+        bridge.processes.forget("first");
+        sender.send(true).unwrap();
+        assert!(stopping.await.is_err());
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "new fixture\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_unconfirmed_owner_blocks_repeated_admission() {
+        let bridge = fixture_bridge(None);
+        let owner = OwnerSlot::new();
+        let (sender, exited) = watch::channel(false);
+        drop(sender);
+        let live = Arc::new(Live {
+            key: 0,
+            group: 0,
+            rpc: Rpc {
+                endpoint: "http://127.0.0.1:9".parse().unwrap(),
+                bearer: "fixture".into(),
+                client: reqwest::Client::new(),
+            },
+            agents: None,
+            started: Instant::now(),
+            turns: AtomicUsize::new(0),
+            retired: AtomicBool::new(true),
+            kill: Arc::new(Notify::new()),
+            exited,
+        });
+        owner.slot.lock().await.live = Some(live.clone());
+        let root =
+            std::env::temp_dir().join(format!("vibeface-sdk-admit-{}", uuid::Uuid::new_v4()));
+        for _ in 0..2 {
+            let error = bridge
+                .admit(
+                    &owner,
+                    &root.join("missing-fixture"),
+                    &root.join("workspace"),
+                    &root.join("store"),
+                    "fixture-api-key",
+                    &BTreeMap::new(),
+                )
+                .await
+                .err()
+                .expect("an unconfirmed owner refuses another admission");
+            assert!(error.to_string().contains("exit is unconfirmed"));
+            assert!(
+                owner
+                    .slot
+                    .lock()
+                    .await
+                    .live
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &live))
+            );
+        }
+        assert_eq!(live.turns.load(SeqCst), 0);
+        assert!(
+            !root.exists(),
+            "replacement startup never prepared a workspace"
+        );
+    }
+
+    #[test]
+    fn stop_orphan_failure_retains_the_original_journal() {
+        let root =
+            std::env::temp_dir().join(format!("vibeface-sdk-orphan-{}", uuid::Uuid::new_v4()));
+        platform::privatefs::create_dir(&root).unwrap();
+        let pidfile = root.join("bridge.pid");
+        platform::privatefs::write_atomic(&pidfile, b"malformed-record\n").unwrap();
+        for _ in 0..2 {
+            assert!(SdkBridge::kill_orphan(&pidfile).is_err());
+            assert_eq!(std::fs::read(&pidfile).unwrap(), b"malformed-record\n");
+        }
+        platform::privatefs::write_atomic(&pidfile, b"").unwrap();
+        SdkBridge::kill_orphan(&pidfile).unwrap();
+        assert!(!pidfile.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn metadata_authentication_requires_a_profile_identity_and_exact_auth_status() {

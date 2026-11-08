@@ -83,7 +83,9 @@ impl Tree {
                 )),
                 Err(error) => {
                     // The child is still suspended, so ending the job ends it before it runs.
-                    job.terminate();
+                    if let Err(error) = job.terminate() {
+                        tracing::warn!(%error, "could not terminate the managed program after startup failed");
+                    }
                     let _ = child.start_kill();
                     Err(error).context("start the program inside its own job")
                 }
@@ -112,7 +114,7 @@ impl Tree {
         {
             self.job
                 .as_ref()
-                .is_some_and(|job| job.member_count().unwrap_or(0) > 0)
+                .is_some_and(|job| job.member_count().map_or(true, |count| count > 0))
         }
     }
 
@@ -125,8 +127,10 @@ impl Tree {
         }
         #[cfg(windows)]
         {
-            if let Some(job) = self.job.take() {
-                job.terminate();
+            if let Some(job) = self.job.take()
+                && let Err(error) = job.terminate()
+            {
+                tracing::warn!(%error, "could not terminate the managed process tree");
             }
         }
     }
@@ -140,8 +144,10 @@ impl Tree {
         }
         #[cfg(windows)]
         {
-            if let Some(job) = self.job.as_ref() {
-                job.terminate();
+            if let Some(job) = self.job.as_ref()
+                && let Err(error) = job.terminate()
+            {
+                tracing::warn!(%error, "could not request the managed process tree to stop");
             }
         }
     }
@@ -149,34 +155,29 @@ impl Tree {
     /// Asks the tree to stop, then ends it if it outlives the grace period.
     ///
     /// Blocks for at most [`GRACE`]; it runs only while the Node is starting or shutting down.
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<()> {
         #[cfg(unix)]
         {
             if !signal_group(self.group, libc::SIGTERM) {
-                return;
+                return Ok(());
             }
             for _ in 0..30 {
                 if !signal_group(self.group, 0) {
-                    return;
+                    return Ok(());
                 }
                 std::thread::sleep(GRACE / 30);
             }
             signal_group(self.group, libc::SIGKILL);
+            Ok(())
         }
         #[cfg(windows)]
         {
-            let Some(job) = self.job.take() else {
-                return;
-            };
             // The job handle bounds termination to this tree; console events are not job-scoped.
-            job.terminate();
-            for _ in 0..30 {
-                if job.member_count().unwrap_or(0) == 0 {
-                    return;
-                }
-                std::thread::sleep(GRACE / 30);
+            if let Some(job) = self.job.as_ref() {
+                job.stop(GRACE)?;
             }
-            job.terminate();
+            self.job = None;
+            Ok(())
         }
     }
 }
@@ -197,14 +198,18 @@ impl Leftover {
     pub fn find(token: &str) -> Result<Option<Self>> {
         #[cfg(unix)]
         {
-            let Some(group) = token
+            let group = token
                 .trim()
                 .parse::<i32>()
-                .ok()
-                .filter(|group| *group > 1 && signal_group(*group, 0))
-            else {
-                return Ok(None);
-            };
+                .context("invalid process-tree record")?;
+            ensure!(group > 1, "invalid process-tree group");
+            if !signal_group(group, 0) {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(None);
+                }
+                return Err(error.into());
+            }
             Ok(Some(Self { group }))
         }
         #[cfg(windows)]
@@ -222,15 +227,17 @@ impl Leftover {
     /// On Unix this is the command line of the group leader, which is what the Node matched
     /// before this module existed. On Windows it is the image path of every member, read through
     /// a handle to the process the job itself named, so no process id is ever guessed.
-    pub fn members(&self) -> Vec<String> {
+    pub fn members(&self) -> Result<Vec<String>> {
         #[cfg(unix)]
         {
-            std::process::Command::new("/bin/ps")
+            let output = std::process::Command::new("/bin/ps")
                 .args(["-o", "command=", "-p", &self.group.to_string()])
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .map(|line| vec![line])
-                .unwrap_or_default()
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "could not query the recorded process tree"
+            );
+            Ok(vec![String::from_utf8_lossy(&output.stdout).into_owned()])
         }
         #[cfg(windows)]
         {
@@ -255,7 +262,7 @@ impl Leftover {
 
     /// Ends the tree. Only call this once [`Leftover::members`] has confirmed it is the Node's
     /// own program.
-    pub fn stop(self) {
+    pub fn stop(self) -> Result<()> {
         #[cfg(unix)]
         {
             let mut tree = Tree {
@@ -263,18 +270,11 @@ impl Leftover {
                 root: self.group as u32,
                 group: self.group,
             };
-            tree.stop();
+            tree.stop()
         }
         #[cfg(windows)]
         {
-            self.job.terminate();
-            for _ in 0..30 {
-                if self.job.member_count().unwrap_or(0) == 0 {
-                    return;
-                }
-                std::thread::sleep(GRACE / 30);
-            }
-            self.job.terminate();
+            self.job.stop(GRACE)
         }
     }
 }
@@ -320,8 +320,8 @@ pub fn token_is_running(token: &str) -> bool {
 /// the Node started. `accept` sees each member and answers whether it is the Node's own program.
 ///
 /// `Ok(None)` means nothing was ended, either because nothing is left or because what is left
-/// is not the recorded program. An error means the record could not be trusted, which is left
-/// for the caller to report rather than acted on.
+/// is not the recorded program. An error means the record could not be verified or the tree's
+/// exit could not be confirmed. Keep its journal even if termination was already requested.
 pub fn stop_recorded(token: &str, accept: impl Fn(&str) -> bool) -> Result<Option<Vec<String>>> {
     let Some(leftover) = Leftover::find(token)? else {
         return Ok(None);
@@ -330,11 +330,11 @@ pub fn stop_recorded(token: &str, accept: impl Fn(&str) -> bool) -> Result<Optio
         leftover.matches_record(),
         "the recorded program is gone and its identifier now belongs to something else"
     );
-    let members = leftover.members();
+    let members = leftover.members()?;
     if members.is_empty() || !members.iter().any(|member| accept(member)) {
         return Ok(None);
     }
-    leftover.stop();
+    leftover.stop()?;
     Ok(Some(members))
 }
 

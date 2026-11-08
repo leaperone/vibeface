@@ -644,29 +644,62 @@ impl Inner {
     /// epoch and its turns are settled by probes on the new App Server. Only a tree still
     /// running an App Server on the Node's own endpoint is touched, never the system App Server
     /// and never a program the recorded identifier was handed to since.
-    fn kill_orphan(&self) {
-        let Ok(token) = std::fs::read_to_string(&self.pidfile) else {
-            return;
+    fn kill_orphan(&self) -> Result<()> {
+        let token = match std::fs::read_to_string(&self.pidfile) {
+            Ok(token) => token,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("read the recorded App Server tree"),
         };
         let endpoint = self.spawn_endpoint.to_string();
-        match tree::stop_recorded(token.trim(), |member| {
+        if tree::stop_recorded(token.trim(), |member| {
             member.contains("app-server") && member.contains(&endpoint)
-        }) {
-            Ok(Some(_)) => tracing::info!(
+        })
+        .context("App Server tree exit is unconfirmed; the journal was retained")?
+        .is_some()
+        {
+            tracing::info!(
                 event = "app_server.leftover_stopped",
                 "stopping App Server left by an earlier run"
-            ),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                event = "app_server.leftover_left_alone",
-                %error,
-                "the App Server left by an earlier run was not ended"
-            ),
+            );
         }
-        let _ = std::fs::remove_file(&self.pidfile);
+        match std::fs::remove_file(&self.pidfile) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    async fn stop_tree(self: &Arc<Self>) -> Result<()> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut spawned = inner.tree.lock().expect("tree lock");
+            if let Some(tree) = spawned.as_mut() {
+                tree.stop()?;
+            } else {
+                ensure!(
+                    !inner.pidfile.try_exists()?,
+                    "App Server tree exit is unconfirmed; the journal was retained"
+                );
+            }
+            match std::fs::remove_file(&inner.pidfile) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                _ => {}
+            }
+            *spawned = None;
+            Ok(())
+        })
+        .await
+        .context("join the App Server process-tree shutdown")?
     }
 
     fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
+        let mut tree = self.tree.lock().expect("tree lock");
+        ensure!(!self.stopping(), "the App Server is stopping");
+        ensure!(
+            tree.is_none() && !self.pidfile.try_exists()?,
+            "the previous App Server tree exit is unconfirmed"
+        );
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
@@ -692,13 +725,13 @@ impl Inner {
             ));
         }
         config::private_write(&self.pidfile, spawned.token().as_bytes())?;
-        *self.tree.lock().expect("tree lock") = Some(spawned);
+        *tree = Some(spawned);
         Ok(child)
     }
 
     /// Runs the Node's own App Server once. `true` when a new target ended it; its turns are
     /// settled by probes on the next App Server, as after a crash.
-    async fn run_spawned(&self, launch: &CodexLaunch) -> bool {
+    async fn run_spawned(self: &Arc<Self>, launch: &CodexLaunch) -> Result<bool> {
         if self
             .target
             .lock()
@@ -716,7 +749,7 @@ impl Inner {
                 self.set_link(Link::LaunchFailed {
                     reason: "could not reconnect Codex after its configuration changed".into(),
                 });
-                return false;
+                return Ok(false);
             }
         }
         self.point(Some(self.spawn_endpoint.path().to_owned()));
@@ -727,7 +760,7 @@ impl Inner {
                 self.set_link(Link::LaunchFailed {
                     reason: format!("App Server could not start: {error}"),
                 });
-                return false;
+                return Ok(false);
             }
         };
         {
@@ -752,13 +785,9 @@ impl Inner {
                 }
             }
         };
-        let mut spawned = self.tree.lock().expect("tree lock").take();
+        self.stop_tree().await?;
         let replaced = match status {
             Some(status) => {
-                if let Some(spawned) = &mut spawned {
-                    // Tools the App Server started belong to its tree and end with it.
-                    spawned.kill();
-                }
                 tracing::warn!(event = "app_server.exited", ?status, "App Server exited");
                 if !self.stopping() {
                     self.set_link(Link::LaunchFailed {
@@ -771,22 +800,18 @@ impl Inner {
                 false
             }
             None => {
-                if let Some(spawned) = &mut spawned {
-                    spawned.ask_to_stop();
-                    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-                    spawned.kill();
-                }
                 let _ = child.wait().await;
-                tracing::info!(
-                    event = "app_server.restarted",
-                    "App Server restarts with new provider settings"
-                );
+                if !self.stopping() {
+                    tracing::info!(
+                        event = "app_server.restarted",
+                        "App Server restarts with new provider settings"
+                    );
+                }
                 true
             }
         };
-        let _ = std::fs::remove_file(&self.pidfile);
         self.target.lock().expect("target lock").applied = None;
-        replaced
+        Ok(replaced)
     }
 
     async fn use_system(&self, socket: &Path) -> bool {
@@ -839,7 +864,18 @@ impl Inner {
                     self.changed.notified().await;
                     true
                 }
-                CodexTarget::Spawn(launch) => self.run_spawned(launch).await,
+                CodexTarget::Spawn(launch) => match self.run_spawned(launch).await {
+                    Ok(replaced) => replaced,
+                    Err(error) => {
+                        self.stopping
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.point(None);
+                        self.set_link(Link::LaunchFailed {
+                            reason: format!("App Server tree exit is unconfirmed: {error}"),
+                        });
+                        return;
+                    }
+                },
                 CodexTarget::System(socket) => self.use_system(socket).await,
             };
             if replaced || started.elapsed() > Duration::from_secs(60) {
@@ -894,7 +930,7 @@ impl CodexServer {
             tree: std::sync::Mutex::new(None),
             stopping: std::sync::atomic::AtomicBool::new(false),
         };
-        inner.kill_orphan();
+        inner.kill_orphan()?;
         inner.point(named);
         Ok(Self {
             client,
@@ -1106,17 +1142,13 @@ impl CodexServer {
 
     /// Stops the App Server the Node started; called on SIGTERM before the Node exits. The
     /// system App Server is never stopped.
-    pub(crate) async fn stop(&self) {
+    pub(crate) async fn stop(&self) -> Result<()> {
         self.inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let spawned = self.inner.tree.lock().expect("tree lock").take();
-        if let Some(mut spawned) = spawned {
-            tokio::task::spawn_blocking(move || spawned.stop())
-                .await
-                .ok();
-        }
-        let _ = std::fs::remove_file(&self.inner.pidfile);
+        self.inner.changed.notify_one();
+        self.inner.point(None);
+        self.inner.stop_tree().await
     }
 }
 
@@ -1374,6 +1406,47 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[tokio::test]
+    async fn unconfirmed_stop_keeps_the_app_server_record_and_blocks_startup() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-codex-stop-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let identity = LocalIdentity::generate();
+        let (events, _) = mpsc::unbounded_channel();
+        let server = CodexServer::open(CodexTarget::Off, &identity, &dir, events)?;
+        let sockets = server
+            .socket()
+            .parent()
+            .context("App Server socket directory")?
+            .to_owned();
+        config::private_write(&server.inner.pidfile, b"invalid-record")?;
+        assert!(server.stop().await.is_err());
+        assert_eq!(std::fs::read(&server.inner.pidfile)?, b"invalid-record");
+        let launch = CodexLaunch {
+            bin: dir.join("missing-fixture"),
+            env: BTreeMap::new(),
+        };
+        assert!(
+            server
+                .inner
+                .spawn(&launch)
+                .err()
+                .context("stopped server refuses spawn")?
+                .to_string()
+                .contains("stopping")
+        );
+        drop(server);
+        let (events, _) = mpsc::unbounded_channel();
+        assert!(CodexServer::open(CodexTarget::Off, &identity, &dir, events).is_err());
+        assert_eq!(
+            std::fs::read(dir.join("codex-app-server.pid"))?,
+            b"invalid-record"
+        );
+        std::fs::remove_dir_all(sockets)?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     async fn lines(path: &Path, count: usize) -> Vec<String> {
         for _ in 0..100 {
@@ -1580,7 +1653,7 @@ mod tests {
                 server.configuration_pending(&next),
                 server.lease("manager:new-fixture".into(), &next).is_ok(),
             ));
-            server.stop().await;
+            server.stop().await?;
             std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         }
         assert!(!ran.exists());
@@ -1653,7 +1726,7 @@ mod tests {
             2,
             "an unchanged request does not reload again"
         );
-        server.stop().await;
+        server.stop().await?;
         std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -1748,7 +1821,7 @@ mod tests {
             2,
             "nothing starts while it is off"
         );
-        server.stop().await;
+        server.stop().await?;
         std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -1863,7 +1936,7 @@ mod tests {
 
         server.retarget(CodexTarget::Off);
         link_becomes(&server, |link| *link == Link::Off).await;
-        server.stop().await;
+        server.stop().await?;
         std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         assert!(
             vibeface_bridge::codex::DirectSession::connect(&control)
@@ -1908,7 +1981,7 @@ mod tests {
                 candidates: vec![candidate]
             }
         );
-        server.stop().await;
+        server.stop().await?;
         std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         std::fs::remove_dir_all(sockets)?;
         std::fs::remove_dir_all(dir)?;

@@ -254,7 +254,7 @@ async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
     );
     assert!(spawned.is_running());
 
-    spawned.stop();
+    spawned.stop()?;
     let _ = child.start_kill();
     child.wait().await?;
     eventually("the tree to be cleared", || !spawned.is_running());
@@ -439,10 +439,10 @@ async fn two_programs_with_the_same_label_have_independent_trees() -> Result<()>
     let (mut first, mut first_child) = tree::Tree::spawn(long_lived(), "same-provider", true)?;
     let (mut second, mut second_child) = tree::Tree::spawn(long_lived(), "same-provider", true)?;
     let distinct = first.token() != second.token();
-    first.stop();
+    first.stop()?;
     let _ = first_child.wait().await;
     let survived = second.is_running();
-    second.stop();
+    second.stop()?;
     let _ = second_child.wait().await;
     assert!(distinct, "each launch records its own process tree");
     assert!(

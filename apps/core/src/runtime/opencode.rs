@@ -128,17 +128,27 @@ struct Conn {
 
 struct Serve {
     launch: Launch,
-    conn: Conn,
+    conn: Option<Conn>,
     child: tokio::process::Child,
     tree: tree::Tree,
     pidfile: PathBuf,
 }
 
 impl Serve {
-    /// Asks the tree to stop, then the drop ends what is left after a grace period.
-    async fn stop(mut self) {
-        self.tree.ask_to_stop();
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+    /// Stops admitting requests, retaining this serve until its tree exit is confirmed.
+    async fn stop(&mut self) -> Result<()> {
+        ensure!(
+            self.conn.take().is_some(),
+            "the previous opencode tree exit is unconfirmed"
+        );
+        ensure!(
+            agent::terminate_process_tree(&mut self.child, &mut self.tree).await,
+            "the opencode process-tree exit is unconfirmed"
+        );
+        match std::fs::remove_file(&self.pidfile) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -146,32 +156,33 @@ impl Drop for Serve {
     /// The tools the serve started belong to its tree and end with it.
     fn drop(&mut self) {
         self.tree.kill();
-        let _ = std::fs::remove_file(&self.pidfile);
     }
 }
 
 /// A serve an earlier run of the Node left is killed, not adopted: its runs died with that Node
 /// and probes read them back from the store. Only a tree whose own command line is such a serve
 /// is touched, so a recorded identifier that now belongs to something else is left alone.
-fn kill_orphan(pidfile: &Path) {
-    let Ok(token) = std::fs::read_to_string(pidfile) else {
-        return;
+fn kill_orphan(pidfile: &Path) -> Result<()> {
+    let token = match std::fs::read_to_string(pidfile) {
+        Ok(token) => token,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read the recorded opencode tree"),
     };
-    match tree::stop_recorded(token.trim(), |member| {
+    if tree::stop_recorded(token.trim(), |member| {
         member.contains(" serve --hostname 127.0.0.1 --port ")
-    }) {
-        Ok(Some(_)) => tracing::info!(
+    })
+    .context("opencode tree exit is unconfirmed; the journal was retained")?
+    .is_some()
+    {
+        tracing::info!(
             event = "opencode.leftover_stopped",
             "stopping the opencode serve left by an earlier run"
-        ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            event = "opencode.leftover_left_alone",
-            %error,
-            "the opencode serve left by an earlier run was not ended"
-        ),
+        );
     }
-    let _ = std::fs::remove_file(pidfile);
+    match std::fs::remove_file(pidfile) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
 }
 
 /// A bot turn in progress.
@@ -251,7 +262,7 @@ impl Opencode {
         env: BTreeMap<String, String>,
     ) -> Result<Self> {
         let dir = data_dir.join("opencode");
-        kill_orphan(&dir.join(PIDFILE));
+        kill_orphan(&dir.join(PIDFILE))?;
         Ok(Self {
             dir,
             roots: ProviderRoots::new(data_dir),
@@ -342,10 +353,13 @@ impl Opencode {
     }
 
     /// Stops the serve; the Node calls this when it shuts down.
-    pub(crate) async fn stop(&self) {
-        if let Some(serve) = self.serve.lock().await.take() {
-            serve.stop().await;
+    pub(crate) async fn stop(&self) -> Result<()> {
+        let mut serve = self.serve.lock().await;
+        if let Some(running) = serve.as_mut() {
+            running.stop().await?;
         }
+        *serve = None;
+        Ok(())
     }
 
     /// The running serve and a use of it. A serve is started first when there is none or it
@@ -357,6 +371,10 @@ impl Opencode {
     async fn conn_for(&self, expected: Option<Launch>) -> Result<(Conn, Use)> {
         use std::sync::atomic::Ordering::SeqCst;
         let mut serve = self.serve.lock().await;
+        ensure!(
+            serve.as_ref().is_none_or(|running| running.conn.is_some()),
+            "the previous opencode tree exit is unconfirmed"
+        );
         let launch = self.launch.lock().expect("launch").current.clone();
         if let Some(expected) = &expected {
             ensure!(
@@ -378,14 +396,30 @@ impl Opencode {
                 .is_ok_and(|status| status.is_none())
         {
             self.users.fetch_add(1, SeqCst);
-            return Ok((running.conn.clone(), Use(self.users.clone())));
+            return Ok((
+                running
+                    .conn
+                    .as_ref()
+                    .expect("a running serve accepts requests")
+                    .clone(),
+                Use(self.users.clone()),
+            ));
         }
-        if let Some(old) = serve.take() {
-            old.stop().await;
+        if let Some(old) = serve.as_mut() {
+            old.stop().await?;
         }
+        *serve = None;
         let started = self.spawn(launch).await?;
         self.users.fetch_add(1, SeqCst);
-        Ok((serve.insert(started).conn.clone(), Use(self.users.clone())))
+        Ok((
+            serve
+                .insert(started)
+                .conn
+                .as_ref()
+                .expect("a started serve accepts requests")
+                .clone(),
+            Use(self.users.clone()),
+        ))
     }
 
     /// The serve running now, never started here.
@@ -395,9 +429,14 @@ impl Opencode {
         (running.child.try_wait())
             .is_ok_and(|status| status.is_none())
             .then(|| running.conn.clone())
+            .flatten()
     }
 
     async fn spawn(&self, launch: Launch) -> Result<Serve> {
+        ensure!(
+            !self.dir.join(PIDFILE).try_exists()?,
+            "the previous opencode tree exit is unconfirmed"
+        );
         config::private_dir(&self.dir)?;
         for (name, value) in self.roots.env(Provider::Opencode) {
             if value == "true" {
@@ -444,13 +483,10 @@ impl Opencode {
             .stderr(std::process::Stdio::piped());
         let (tree, mut child) = tree::Tree::spawn(command, SERVE_TREE_KEY, true)?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let started_ms = now_ms();
         let mut serve = Serve {
             launch,
-            conn: Conn {
-                base: String::new(),
-                password,
-                started_ms: now_ms(),
-            },
+            conn: None,
             child,
             pidfile: dir.join(PIDFILE),
             tree,
@@ -480,15 +516,20 @@ impl Opencode {
             }
             bail!("the opencode serve exited before it listened")
         };
-        serve.conn.base = tokio::time::timeout(READY_WAIT, listening)
+        let base = tokio::time::timeout(READY_WAIT, listening)
             .await
             .context("the opencode serve did not listen in time")??;
         // The password goes only to the loopback address the Node asked for.
         ensure!(
-            serve.conn.base.starts_with("http://127.0.0.1:"),
+            base.starts_with("http://127.0.0.1:"),
             "the opencode serve listens on {}",
-            serve.conn.base
+            base
         );
+        serve.conn = Some(Conn {
+            base,
+            password,
+            started_ms,
+        });
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
                 crate::logging::child_line(
@@ -974,7 +1015,7 @@ impl Opencode {
                 return Some(false);
             };
             match serve.child.try_wait() {
-                Ok(None) => serve.conn.clone(),
+                Ok(None) => serve.conn.clone()?,
                 Ok(Some(_)) => return Some(false),
                 Err(_) => return None,
             }
@@ -2631,6 +2672,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hard_killed_serve_is_reaped_before_its_record_is_removed() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-opencode-kill-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec /bin/sleep 120"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let (tree, mut child) = tree::Tree::spawn(command, "opencode-stop-fixture", true)?;
+        let token = tree.token().to_owned();
+        let stdout = child.stdout.take().context("controlled process stdout")?;
+        let mut serve = Serve {
+            launch: Launch {
+                bin: "/bin/sh".into(),
+                env: BTreeMap::new(),
+            },
+            conn: Some(Conn {
+                base: "http://127.0.0.1:9".into(),
+                password: "fixture".into(),
+                started_ms: now_ms(),
+            }),
+            child,
+            tree,
+            pidfile: dir.join(PIDFILE),
+        };
+        config::private_write(&serve.pidfile, token.as_bytes())?;
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut ready = String::new();
+        tokio::time::timeout(READY_WAIT, reader.read_line(&mut ready)).await??;
+        assert_eq!(ready, "ready\n");
+
+        serve.stop().await?;
+        let status = serve
+            .child
+            .try_wait()?
+            .context("the stopped root was reaped")?;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(!tree::token_is_running(&token));
+        assert!(!serve.pidfile.exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_stop_blocks_reusing_or_replacing_the_opencode_serve() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (_, using) = server.conn().await?;
+        drop(using);
+        let pidfile = server
+            .serve
+            .lock()
+            .await
+            .as_ref()
+            .context("running serve")?
+            .pidfile
+            .clone();
+        let started = place.recorded("argv");
+        assert!(!started.is_empty());
+        std::fs::remove_file(&pidfile)?;
+        std::fs::create_dir(&pidfile)?;
+        assert!(server.stop().await.is_err());
+        for _ in 0..2 {
+            assert!(server.conn().await.is_err());
+        }
+        assert_eq!(place.recorded("argv"), started);
+        assert!(
+            pidfile.is_dir(),
+            "a failed cleanup keeps the original record location"
+        );
+        assert!(
+            server
+                .serve
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|serve| serve.conn.is_none())
+        );
+        Ok(())
+    }
+
     fn bot(place: &Place, server: &Arc<Opencode>, client: &str, turns: &Turns) -> ManagerConfig {
         let turns = turns.clone();
         let launch = server.launch.lock().expect("launch").current.clone();
@@ -2864,7 +2992,7 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&user)?.count(), 0);
         for server in servers {
-            server.stop().await;
+            server.stop().await?;
         }
         Ok(())
     }
@@ -3865,6 +3993,8 @@ mod tests {
         (server.serve.lock().await.as_mut())
             .context("the serve")?
             .conn
+            .as_mut()
+            .context("the serve accepts requests")?
             .started_ms -= 3 * QUIET_MS;
         let id = work_message("w-1");
         let sent = now_ms() - 2 * QUIET_MS;
@@ -3984,7 +4114,7 @@ mod tests {
         assert!(server.run_ended(&session).await);
         assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!server.configuration_pending(&expected.bin, &expected.env));
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     }
 
@@ -4027,7 +4157,7 @@ mod tests {
             (running.base, running.started_ms),
             "an idle serve takes the new launch"
         );
-        server.stop().await;
+        server.stop().await?;
         Ok(())
     }
 

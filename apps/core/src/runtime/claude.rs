@@ -124,13 +124,13 @@ impl Processes {
     }
 
     /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
-    pub(super) fn open(pidfile: PathBuf) -> Self {
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
-        Self::new(pidfile)
+    pub(super) fn open(pidfile: PathBuf) -> Result<Self> {
+        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)?;
+        Ok(Self::new(pidfile))
     }
 
     /// Ends every recorded process; the Node calls this before it exits.
-    pub(super) async fn stop(&self) {
+    pub(super) async fn stop(self: &Arc<Self>) -> Result<()> {
         for input in self
             .inputs
             .lock()
@@ -139,11 +139,18 @@ impl Processes {
         {
             input.open.store(false, Ordering::SeqCst);
         }
-        let pidfile = self.pidfile.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
+        let processes = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut running = processes
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            vibeface_bridge::agent::SdkBridge::kill_orphan(&processes.pidfile)?;
+            running.clear();
+            Ok(())
         })
-        .await;
+        .await
+        .context("join the agent process-tree shutdown")?
     }
 
     pub(super) fn track(&self, token: &str, bin: &Path) -> Result<()> {
@@ -1393,13 +1400,13 @@ impl Claude {
     }
 
     /// Ends the processes an earlier Node run left, so their turns are read back as they are.
-    pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
-        Self {
-            processes: Arc::new(Processes::open(dir.join(PIDFILE))),
+    pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            processes: Arc::new(Processes::open(dir.join(PIDFILE))?),
             live: Default::default(),
             starting: Default::default(),
             projects: std::sync::Mutex::new(projects_dir(env)),
-        }
+        })
     }
 
     pub(super) fn processes(&self) -> Arc<Processes> {
@@ -1407,8 +1414,8 @@ impl Claude {
     }
 
     /// Ends every running Claude Code process; the Node calls this before it exits.
-    pub(super) async fn stop(&self) {
-        self.processes.stop().await;
+    pub(super) async fn stop(&self) -> Result<()> {
+        self.processes.stop().await
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
@@ -2448,7 +2455,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn bot_readback_requires_its_exact_message_and_explicit_ending() -> Result<()> {
         let place = Place::new()?;
-        let reader = Claude::open(&place.dir, &place.env());
+        let reader = Claude::open(&place.dir, &place.env())?;
         let session = uuid::Uuid::new_v4().to_string();
         let project = projects_dir(&place.env())
             .context("projects")?
@@ -2527,7 +2534,7 @@ pub(super) mod tests {
                 error: None,
             }
         );
-        let recovered = Claude::open(&place.dir, &place.env());
+        let recovered = Claude::open(&place.dir, &place.env())?;
         assert_eq!(
             recovered
                 .read_back(
@@ -2631,7 +2638,7 @@ pub(super) mod tests {
             assistant("initial-reply", "initial result", json!("end_turn")),
         ];
         write(&initial_rows)?;
-        let recovered = Claude::open(&place.dir, &place.env());
+        let recovered = Claude::open(&place.dir, &place.env())?;
         assert_eq!(
             recovered
                 .probe_reply(&session, Some(&initial), "tree-attempt")
@@ -2732,7 +2739,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn bot_readback_keeps_the_transcript_root_used_before_config_changed() -> Result<()> {
         let place = Place::new()?;
-        let reader = Claude::open(&place.dir, &place.env());
+        let reader = Claude::open(&place.dir, &place.env())?;
         let projects_a = reader.projects().context("initial transcript root")?;
         let (record, _) = recorder();
         let mut config = bot_config(&place, record);
@@ -2763,7 +2770,7 @@ pub(super) mod tests {
             reader.probe_reply(&session, None, "attempt-1").await?,
             expected
         );
-        let reopened = Claude::open(&place.dir, &place.env());
+        let reopened = Claude::open(&place.dir, &place.env())?;
         assert_eq!(reopened.projects(), Some(projects_a));
         assert_eq!(
             reopened.native_directory(&session).await?.canonicalize()?,
@@ -3424,7 +3431,7 @@ pub(super) mod tests {
             finished.text,
             format!("initial finished\n\ndone: {}", input.message("work-input"))
         );
-        let recovered = Claude::open(&place.dir.join("node"), &place.env());
+        let recovered = Claude::open(&place.dir.join("node"), &place.env())?;
         let pending = WorkRecord {
             state: WorkState::Starting {
                 thread: Some(target.thread_id.clone()),
