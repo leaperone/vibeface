@@ -10,18 +10,19 @@ test('desktop invitation fragments preserve the original join URL and origin, th
   let cleared: string | URL | null = null
   const history = { replaceState: (_state: unknown, _title: string, url?: string | URL | null) => { cleared = url ?? null } }
   Object.assign(globalThis, { location, history, addEventListener: () => {}, removeEventListener: () => {} })
+  const unavailable = async (): Promise<never> => { throw new Error('Node operation is outside this invitation test') }
   const native: ClientPreloadApi = {
     local: { discoverLocalSetup: async () => null, localEntry: async () => null },
     carrier: { open: async () => '', openGateway: async () => null, openLan: async () => '', send: async () => {}, receive: async () => null, close: () => {} },
     desktop: {
       getStatus: async () => ({ runtime: { kind: 'ready', corePath: '/core' }, core: { kind: 'none' }, clientVisible: true, preferences: { openBusinessOnConnect: true }, profileDir: '/profile', version: '0.0.1', attachOnly: false, clientAvailable: true, nodeMode: 'controller', selectedNode: null, discovery: { kind: 'idle' }, backgroundNode: { kind: 'absent' } }),
-      chooseDataDir: async () => null as never, useDataDir: async () => null as never, forgetDataDir: async () => null as never,
-      startOwned: async () => null as never, attachExisting: async () => null as never, stopOwned: async () => null as never,
-      focusClient: async () => null as never, setPreference: async () => null as never, openExternal: async () => {},
+      chooseDataDir: unavailable, useDataDir: unavailable, forgetDataDir: unavailable,
+      startOwned: unavailable, attachExisting: unavailable, stopOwned: unavailable,
+      focusClient: unavailable, setPreference: unavailable, openExternal: async () => {},
       reconnectClient: () => {},
-      onStatus: () => () => {}, discoverNodes: async () => null as never, connectDiscoveredNode: async () => null as never,
-      startDiscoveredNode: async () => null as never, chooseNodeMode: async () => null as never, installBackgroundNode: async () => null as never,
-      startBackgroundNode: async () => null as never, stopBackgroundNode: async () => null as never, removeBackgroundNode: async () => null as never,
+      onStatus: () => () => {}, discoverNodes: unavailable, connectDiscoveredNode: unavailable,
+      startDiscoveredNode: unavailable, chooseNodeMode: unavailable, installBackgroundNode: unavailable,
+      startBackgroundNode: unavailable, stopBackgroundNode: unavailable, removeBackgroundNode: unavailable, updateBackgroundNode: unavailable,
     },
     showNodePanel: async () => {},
   }

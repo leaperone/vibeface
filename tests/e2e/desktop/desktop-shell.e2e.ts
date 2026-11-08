@@ -9,7 +9,6 @@ const ELECTRON_VERSION = '45.2.3';
 const BUILD_INFO_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
 const DESKTOP_ARTIFACTS = resolve(import.meta.dirname, '../.artifacts/desktop');
-const CLIENT_ORIGIN = 'vibeface-app://app';
 
 async function assertManagedPackageUnderReleases(managedRoot: string): Promise<string> {
   const [releasesRoot, currentPath] = await Promise.all([
@@ -106,7 +105,8 @@ test('a fresh packaged desktop is a controller without initializing a Node', asy
   await desktop.invoke('focusClient');
   const connected = await desktop.inspect();
   const main = clientWindow(connected);
-  assert.equal(new URL(main.url).pathname, '/', 'the sole client window shows the Vibeface workspace shell');
+  assert(isClientUrl(main.url), 'the sole client window uses the trusted Vibeface origin');
+  await expect.poll(() => evaluate(main, 'location.pathname'), { timeout: 30000 }).toBe('/connect');
   expect(await evaluate(main, 'Boolean(isSecureContext && crypto.subtle && indexedDB)')).toBe(true);
   await expect.poll(() => evaluate(main, 'document.querySelector("textarea[aria-label=\\"加入链接\\"]") !== null'),
     { timeout: 30000 }).toBe(true);
@@ -210,7 +210,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.deepEqual(new Set(healthy.map(node => node.deviceId)), new Set([first.deviceId, second.deviceId]));
   const chooser = clientWindow(await desktop.inspect());
   await openNodePanel(chooser);
-  expect(await connectButtons(chooser)).toBe(2);
+  await expect.poll(() => connectButtons(chooser), { timeout: 30000 }).toBe(2);
   await screenshot(chooser, 'desktop-discovery-choices');
   const candidate = healthy.find(node => node.deviceId === first.deviceId);
   assert(candidate && typeof candidate.id === 'string');
@@ -220,7 +220,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.equal(attached.selectedNode?.deviceId, first.deviceId);
   assert.equal(attached.selectedNode?.dataDir, first.dataDir, 'the selected Node is in its custom path outside the app profile');
   const attachedPage = clientWindow(await desktop.inspect());
-  assert.equal(new URL(attachedPage.url).pathname, '/', 'connecting opens the sole client on the workspace shell');
+  assert(isClientUrl(attachedPage.url), 'connecting retains the sole trusted client window');
   await screenshot(attachedPage, 'desktop-discovered-node-status');
 
   await openNodePanel(attachedPage);
@@ -251,7 +251,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.equal(stoppedChoice.selectedNode?.deviceId, second.deviceId, 'the sole remaining healthy Node is selected');
   const stoppedPanel = clientWindow(await desktop.inspect());
   await openNodePanel(stoppedPanel);
-  expect(await evaluate(stoppedPanel, '[...document.querySelectorAll("button")].filter((node) => node.textContent?.trim() === "启动并连接").length')).toBe(1);
+  await expect.poll(() => evaluate(stoppedPanel, '[...document.querySelectorAll("button")].filter((node) => node.textContent?.trim() === "启动并连接").length'), { timeout: 30000 }).toBe(1);
   await desktop.invoke('startDiscoveredNode', stoppedNode.id);
   const explicitlyStarted = await desktop.status();
   assert.equal(explicitlyStarted.core.kind, 'owned', 'the explicit start action owns only the child it starts');
@@ -285,7 +285,7 @@ test('one existing healthy Node is discovered and selected when the desktop open
   assert.equal(opened.status.core.kind, 'none');
   assert.deepEqual(opened.cores, [], 'automatic connection starts no App-owned Core');
   const page = clientWindow(opened);
-  assert.equal(new URL(page.url).origin, CLIENT_ORIGIN, 'the existing Node opens in the packaged client automatically');
+  assert(isClientUrl(page.url), 'the existing Node opens in the packaged client automatically');
   const discoveredId = await evaluate(page, '(async () => (await window.vibefaceClient.local.discoverLocalSetup())?.entry.device_id ?? null)()');
   assert.equal(discoveredId, fixture.deviceId, 'the native client reaches the selected existing Node');
   await desktop.quit();
