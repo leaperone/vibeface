@@ -28,6 +28,7 @@ test('only a recovery link fills in the computer: join links, broken ids and oth
   assert.equal(recoveryTarget(`vibeface://join?recover=${mac}`), null, 'a computer with nowhere to reach it is no target')
   assert.equal(recoveryTarget('设备编号'), null)
   assert.equal(recoveryTarget(`vibeface://join?link=vibeface1test&recover=${mac}&address=https%3A%2F%2Fhome.example.com`), null, 'a link that is also an invitation means one thing only')
+  for (const suffix of ['&recover=' + mac, '&lan=192.168.1.4:7001', '#fragment']) assert.equal(recoveryTarget(recoveryLink({ kind: 'gateway', address: 'https://home.example.com', device_id: mac }) + suffix), null)
 })
 
 test('the phone is sent to a public entrance first, never to this computer\'s own loopback', () => {

@@ -1,5 +1,5 @@
 import { AppState, Platform as Native } from 'react-native'
-import { Directory, File, Paths } from 'expo-file-system'
+import { File } from 'expo-file-system'
 import * as DocumentPicker from 'expo-document-picker'
 import * as Notifications from 'expo-notifications'
 import * as SecureStore from 'expo-secure-store'
@@ -12,6 +12,7 @@ import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport
 import { sha256 } from '@vibeface/client/delivery/model.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import LanBrowser from '../../modules/lan-browser'
+import { privateFiles } from './files'
 
 const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
@@ -58,7 +59,7 @@ void Notifications.setNotificationChannelAsync(channelId, { name: '回答与进�
 const opens = new Map<string, () => void>()
 Notifications.addNotificationResponseReceivedListener((response) => {
   const tag = response.notification.request.content.data?.tag
-  if (typeof tag === 'string') opens.get(tag)?.()
+  if (typeof tag === 'string') { const open = opens.get(tag); opens.delete(tag); open?.() }
 })
 // Android 13+ reports a never-asked permission as denied; canAskAgain tells it apart from a real refusal.
 const permission = ({ status, canAskAgain }: { status: string; canAskAgain: boolean }): Permission =>
@@ -69,8 +70,10 @@ const notifier: Notifier = {
   permission: async () => permission(await Notifications.getPermissionsAsync()),
   request: async () => permission(await Notifications.requestPermissionsAsync()),
   show({ title, body, tag }, open) {
+    opens.delete(tag)
     opens.set(tag, open)
-    void Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { tag } }, trigger: { channelId } })
+    while (opens.size > 1000) { const first = opens.keys().next().value; if (first !== undefined) opens.delete(first) }
+    void privateFiles.run(async (current) => { if (current()) await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { tag } }, trigger: { channelId } }) }).catch(() => { if (opens.get(tag) === open) opens.delete(tag) })
   },
 }
 
@@ -107,37 +110,52 @@ export const mobilePlatform: Platform = {
     return () => subscription.remove()
   },
   foreground: () => AppState.currentState === 'active',
+  recoveryStorage: privateFiles.recoveryStorage,
   async saveRecovery(bytes, name) {
-    // Kept in the app's documents: the share sheet reports success even when dismissed, and the old file stops working.
-    const file = new File(Paths.document, name)
-    if (file.exists) file.delete()
-    file.write(bytes)
-    await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: '保存恢复文件' })
+    await privateFiles.run(async (current) => {
+      privateFiles.recovery.create({ idempotent: true, intermediates: true })
+      const file = new File(privateFiles.recovery, name)
+      await file.write(bytes)
+      if (!current()) return
+      if (!await Sharing.isAvailableAsync()) throw new Error('这个设备无法打开分享。应用内已保留恢复副本，请稍后重新另存。')
+      if (current()) await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: '另存恢复文件副本' })
+    })
   },
   files: {
     async pick() {
-      const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true, multiple: false })
-      const asset = picked.assets?.[0]
-      if (picked.canceled || !asset) return null
-      const file = new File(asset.uri)
-      return { name: asset.name, size: file.size, arrayBuffer: () => file.arrayBuffer() }
+      return privateFiles.run(async (current) => {
+        const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true, multiple: false })
+        const asset = picked.assets?.[0]
+        if (picked.canceled || !asset) return null
+        try {
+          if (!current()) return null
+          const file = privateFiles.retain(asset.uri)
+          return { name: asset.name, size: file.size, arrayBuffer: () => privateFiles.run(async () => file.arrayBuffer()) }
+        } finally { privateFiles.releasePicker(asset.uri) }
+      })
     },
     async save(bytes, name) {
-      const directory = new Directory(Paths.document, 'transfers')
-      directory.create({ idempotent: true, intermediates: true })
-      const file = new File(directory, `${crypto.randomUUID()}-${name}`)
-      file.create()
-      file.write(bytes)
-      const saved = await file.bytes()
-      if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件对不上，重新取回再试。')
-      if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(file.uri, { mimeType: 'application/octet-stream', dialogTitle: '导出文件副本' })
-      return 'saved'
+      return privateFiles.run<'saved'>(async (current) => {
+        const directory = privateFiles.transfers
+        directory.create({ idempotent: true, intermediates: true })
+        const file = new File(directory, `${crypto.randomUUID()}-${name}`)
+        file.create()
+        await file.write(bytes)
+        const saved = await file.bytes()
+        if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件对不上，重新取回再试。')
+        if (current() && await Sharing.isAvailableAsync() && current()) await Sharing.shareAsync(file.uri, { mimeType: 'application/octet-stream', dialogTitle: '导出文件副本' })
+        return 'saved'
+      })
     },
   },
   self,
   lan,
   async erase() {
-    await transport.forgetClient()
-    store.clearAll()
+    await privateFiles.erase(async () => {
+      await transport.forgetClient()
+      await Notifications.dismissAllNotificationsAsync()
+      opens.clear()
+      store.clearAll()
+    })
   },
 }

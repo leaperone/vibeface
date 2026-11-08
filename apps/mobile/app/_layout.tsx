@@ -13,6 +13,9 @@ import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
+import { mobilePlatform } from '@/platform'
+import { factoryReset } from '@/lib/factory-reset'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -49,7 +52,8 @@ function Screens() {
     const link = openedLink(url)
     if (!ready || !link || url === answered) return
     answered = url
-    if (device.linkTarget(link) === 'other') router.push('/switch-network')
+    const target = joinDestination(link, ticket => mobilePlatform.secure.ticketDecode(ticket))
+    if (target && device.linkTarget(link) === 'other') router.push({ pathname: '/switch-network', params: { link, entryId: target.entryId, address: target.address ?? '' } })
     else router.navigate('/')
   }, [url, ready])
   const wide = useWide()
@@ -57,6 +61,11 @@ function Screens() {
   const insets = useSafeAreaInsets()
   // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
   const root = wide ? { headerBackVisible: false, gestureEnabled: false } : {}
+  if (device.phase === 'erasing' || device.phase === 'erase_failed') return <View className="flex-1 justify-center gap-4 p-6">
+    <Text role="heading" className="text-heading font-semibold">{device.phase === 'erasing' ? '正在清除应用内数据' : '应用内数据尚未清除完成'}</Text>
+    <Text>{device.error || '等待文件选择、分享和保存结束后继续清除。'}</Text>
+    <Button disabled={device.phase === 'erasing'} onPress={() => void factoryReset(device).catch(() => {})}><Text>继续清除</Text></Button>
+  </View>
   // The Stack keeps its place in the tree whether or not the sidebar shows, so a rotation never resets the route.
   return <>
     <StatusBar style="auto" />

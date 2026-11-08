@@ -22,7 +22,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { Scanner } from '@/features/devices/scanner'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
-import { openedLink } from '@/lib/join-link'
+import { keepSwitchedLink, openedLink, switchedLink } from '@/lib/join-link'
 import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
@@ -108,12 +108,16 @@ function JoinForm() {
   const workspace = useWorkspace()
   const device = useDevice()
   const url = useLinkingURL()
-  const [invitation, setInvitation] = useState('')
+  const [switched] = useState(switchedLink)
+  useEffect(() => { if (switched) keepSwitchedLink(null) }, [switched])
+  const [invitation, setInvitation] = useState(switched ?? '')
+  const [openingUrl] = useState(url)
   // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
   const [edited, setEdited] = useState(false)
   const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
   // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
+    if (switched && url === openingUrl) return
     const link = openedLink(url)
     if (link && link !== spent) edit(link)
   }, [url])
