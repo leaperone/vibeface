@@ -12,6 +12,7 @@ export const docs = defineDocs({
       'user-guide.md',
       'comparison.md',
       'install.md',
+      'ios.md',
       'bot-and-execution.md',
       'history-sync.md',
       'privacy-security.md',

@@ -1,5 +1,5 @@
 use crate::terminal::{NodeStatus, RunState, age, safe_text, shorten, use_emphasis};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use crossterm::{
     cursor::{Hide, Show},
     event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::signal::unix::{SignalKind, signal};
+use vibeface_bridge::platform::stop::{self, Stops};
 use vibeface_control::ControlRequest;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -285,10 +285,12 @@ pub async fn run(data_dir: PathBuf) -> Result<()> {
         "tui requires a capable terminal; use vibeface status or status --json"
     );
     let core = crate::core_binary()?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut suspend = signal(SignalKind::from_raw(libc::SIGTSTP))?;
+    let mut stops = Stops::listen()?;
+    // A suspend would leave the terminal in the dashboard's raw mode with nothing to restore
+    // it, so it is swallowed here. Windows has no suspend to swallow.
+    #[cfg(unix)]
+    let mut suspend =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP))?;
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut events = EventStream::new();
@@ -300,14 +302,16 @@ pub async fn run(data_dir: PathBuf) -> Result<()> {
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clock = tokio::time::interval(Duration::from_secs(1));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let exit_signal = loop {
+    let stopped = loop {
         terminal.draw(|frame| draw(frame, &mut app, reading_active, palette))?;
+        #[cfg(unix)]
+        let suspended = suspend.recv();
+        #[cfg(windows)]
+        let suspended = std::future::pending::<()>();
         tokio::select! {
             biased;
-            _ = terminate.recv() => break Some(libc::SIGTERM),
-            _ = hangup.recv() => break Some(libc::SIGHUP),
-            _ = interrupt.recv() => break Some(libc::SIGINT),
-            _ = suspend.recv() => {},
+            stop = stops.next() => break Some(stop),
+            _ = suspended => {},
             event = events.next() => {
                 match event.context("terminal input ended")?? {
                     Event::Key(key) => match app.key(key) {
@@ -339,12 +343,8 @@ pub async fn run(data_dir: PathBuf) -> Result<()> {
     drop(reading);
     drop(terminal);
     drop(guard);
-    if let Some(signal) = exit_signal {
-        unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
-        }
-        bail!("terminal interrupted by signal {signal}");
+    if let Some(stopped) = stopped {
+        stop::exit_as_stopped(stopped);
     }
     Ok(())
 }
@@ -727,9 +727,17 @@ mod tests {
     use ratatui::backend::TestBackend;
     use serde_json::json;
 
+    fn test_data_dir() -> String {
+        if cfg!(windows) {
+            r"C:\vibeface\node\long directory\设备".to_owned()
+        } else {
+            "/node/long directory/设备".to_owned()
+        }
+    }
+
     fn node() -> NodeStatus {
         NodeStatus::parse(json!({
-            "status":"running", "device_id":"local-device-id", "data_dir":"/node/long directory/设备", "listen":"127.0.0.1:4790",
+            "status":"running", "device_id":"local-device-id", "data_dir":test_data_dir(), "listen":"127.0.0.1:4790",
             "web_enabled":true, "core_version":"0.0.1", "write_state":"writable",
             "peers":[
                 {"device_id":"peer-a", "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1},

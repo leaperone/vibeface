@@ -13,8 +13,190 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def startup_phase(name):
+    print("fake-cursor-sdk-bridge phase " + name, file=sys.stderr, flush=True)
+
+
+startup_phase("python-started")
+
+
+def append_observation(path, value):
+    """One record is one kernel append, including concurrent Windows fixture processes."""
+    if not path:
+        return
+    data = (value + "\n").encode("utf-8")
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError("incomplete observation append")
+        finally:
+            os.close(descriptor)
+        return
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    # FILE_APPEND_DATA without FILE_WRITE_DATA makes the kernel select the end atomically.
+    handle = kernel.CreateFileW(path, 0x0004, 0x0007, None, 4, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        written = ctypes.c_ulong()
+        buffer = ctypes.create_string_buffer(data)
+        if not kernel.WriteFile(handle, buffer, len(data), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value != len(data):
+            raise OSError("incomplete observation append")
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def argument(name):
     return sys.argv[sys.argv.index(name) + 1]
+
+
+def restrict_windows_private_file(path):
+    """Protected owner-only DACL for the fake bridge token, without spawning PowerShell."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+    class TRUSTEE_W(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", wintypes.LPVOID),
+            ("MultipleTrusteeOperation", wintypes.DWORD),
+            ("TrusteeForm", wintypes.DWORD),
+            ("TrusteeType", wintypes.DWORD),
+            ("ptstrName", wintypes.LPVOID),
+        ]
+
+    class EXPLICIT_ACCESS_W(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", wintypes.DWORD),
+            ("grfAccessMode", wintypes.DWORD),
+            ("grfInheritance", wintypes.DWORD),
+            ("Trustee", TRUSTEE_W),
+        ]
+
+    TOKEN_QUERY = 0x0008
+    TokenUser = 1
+    FILE_ALL_ACCESS = 0x001F01FF
+    SET_ACCESS = 2
+    NO_INHERITANCE = 0
+    TRUSTEE_IS_SID = 0
+    TRUSTEE_IS_USER = 1
+    NO_MULTIPLE_TRUSTEE = 0
+    SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION = 0x00000001
+    DACL_SECURITY_INFORMATION = 0x00000004
+    PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    ERROR_SUCCESS = 0
+    ERROR_INSUFFICIENT_BUFFER = 122
+
+    def check_bool(result):
+        if not result:
+            raise ctypes.WinError(ctypes.get_last_error()) from None
+
+    def check_error(code):
+        if code != ERROR_SUCCESS:
+            raise ctypes.WinError(code) from None
+
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel32.LocalFree.restype = wintypes.LPVOID
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.SetEntriesInAclW.argtypes = [
+        wintypes.ULONG,
+        ctypes.POINTER(EXPLICIT_ACCESS_W),
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    advapi32.SetEntriesInAclW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+
+    token = wintypes.HANDLE()
+    check_bool(advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)))
+    try:
+        length = wintypes.DWORD(0)
+        if not advapi32.GetTokenInformation(token, TokenUser, None, 0, ctypes.byref(length)):
+            error = ctypes.get_last_error()
+            if error != ERROR_INSUFFICIENT_BUFFER:
+                raise ctypes.WinError(error) from None
+        buffer = (ctypes.c_byte * length.value)()
+        check_bool(
+            advapi32.GetTokenInformation(
+                token, TokenUser, ctypes.byref(buffer), length.value, ctypes.byref(length)
+            )
+        )
+        user = TOKEN_USER.from_buffer(buffer)
+        user_sid = user.User.Sid
+
+        entry = EXPLICIT_ACCESS_W(
+            grfAccessPermissions=FILE_ALL_ACCESS,
+            grfAccessMode=SET_ACCESS,
+            grfInheritance=NO_INHERITANCE,
+            Trustee=TRUSTEE_W(
+                pMultipleTrustee=None,
+                MultipleTrusteeOperation=NO_MULTIPLE_TRUSTEE,
+                TrusteeForm=TRUSTEE_IS_SID,
+                TrusteeType=TRUSTEE_IS_USER,
+                ptstrName=user_sid,
+            ),
+        )
+        new_acl = wintypes.LPVOID()
+        check_error(advapi32.SetEntriesInAclW(1, ctypes.byref(entry), None, ctypes.byref(new_acl)))
+        try:
+            check_error(
+                advapi32.SetNamedSecurityInfoW(
+                    path,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    user_sid,
+                    None,
+                    new_acl,
+                    None,
+                )
+            )
+        finally:
+            kernel32.LocalFree(new_acl)
+    finally:
+        kernel32.CloseHandle(token)
 
 
 if not os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_SDK_CLIENT_LANGUAGE") != "rust":
@@ -22,15 +204,19 @@ if not os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_SDK_CLIENT_LAN
 local_store = json.loads(argument("--local-store"))
 if local_store.get("type") != "jsonl" or not os.path.isabs(local_store.get("rootDir", "")):
     sys.exit(4)
+startup_phase("arguments-validated")
 token = uuid.uuid4().hex
 token_file = os.path.join(argument("--state-root"), "fake-bridge-token")
 descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.write(descriptor, token.encode())
 os.close(descriptor)
 os.chmod(token_file, 0o600)
-if os.environ.get("FAKE_BRIDGE_LOG"):
-    with open(os.environ["FAKE_BRIDGE_LOG"], "a") as log:
-        log.write(f"{os.getpid()}\n")
+startup_phase("token-created")
+if os.name == "nt":
+    startup_phase("windows-acl-start")
+    restrict_windows_private_file(token_file)
+    startup_phase("windows-acl-complete")
+append_observation(os.environ.get("FAKE_BRIDGE_LOG"), str(os.getpid()))
 runs = {}
 store_log = os.environ.get("FAKE_BRIDGE_STORE_LOG")
 send_log = os.environ.get("FAKE_BRIDGE_SEND_LOG")
@@ -45,16 +231,14 @@ def record_store(body):
         return
     local = body.get("options", {}).get("local", {})
     store = local.get("store")
-    with open(store_log, "a") as log:
-        log.write(json.dumps(store, sort_keys=True) + "\n")
+    append_observation(store_log, json.dumps(store, sort_keys=True))
 
 
 def record_send(agent, text):
     if not send_log:
         return
-    with open(send_log, "a") as log:
-        log.write(json.dumps({"pid": os.getpid(), "agent": agent, "text": text,
-                              "callback": callback_token}) + "\n")
+    append_observation(send_log, json.dumps({"pid": os.getpid(), "agent": agent, "text": text,
+                                             "callback": callback_token}))
 
 
 def agent_file(agent):
@@ -105,8 +289,7 @@ class Bridge(BaseHTTPRequestHandler):
             return self.answer(401, b"{}")
         method = self.path.rsplit("/", 1)[-1]
         if request_log:
-            with open(request_log, "a") as log:
-                log.write(method + "\n")
+            append_observation(request_log, method)
         if method in ("Me", "ListModels"):
             if self.path != "/sdk.v1.SdkCursorService/" + method or json.loads(request or b"{}") != {}:
                 return self.answer(400, b'{"message":"metadata request must be empty"}')
@@ -234,6 +417,7 @@ class Bridge(BaseHTTPRequestHandler):
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+startup_phase("server-bound")
 server.daemon_threads = True
 time.sleep(int(os.environ.get("FAKE_BRIDGE_STARTUP_MS", "0")) / 1000)
 if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):

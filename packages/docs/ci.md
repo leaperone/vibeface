@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。`delivery_small` 的独立实验流程见下文。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。普通 `ci` 由 `main` push、定时、手动运行和 merge queue 触发。应用前缀 tag 交给独立的 `release.yml`，只构建和发布目标应用。合并、CI 通过、发布和部署各有自己的验收结果。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。普通 `ci` 由 `main` push、定时、手动运行和 merge queue 触发。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 独立构建官网。合并、CI 通过、发布和部署各有自己的验收结果。
 
 | 反馈层 | 入口 | 结果含义 |
 | --- | --- | --- |
@@ -155,13 +155,13 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 每四小时 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，以显式 `!cancelled()` 和 `ci-gate` success 作为条件，允许上游不适用的检查正常跳过。协调器使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每四小时机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
 
-协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，延迟启动或跨日重跑复用原批次 PR、版本、SHA 和留存制品。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则拒绝初始化，避免版本倒退。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、旧批次拒绝倒退、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
+协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，Android versionCode 与 iOS buildNumber 各递增一次；延迟启动或跨日重跑复用原批次 PR、版本、构建号、SHA 和留存制品。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则拒绝初始化，避免版本倒退。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、旧批次拒绝倒退、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
 | Rust 快、慢测试及 Clippy | 整个工作区；慢组为精确名称的 `SLOW_TESTS` |
 | 最低 Rust 版本 | 安装 Cargo 声明的 MSRV，检查整个工作区 |
-| 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64，分别校验身份并启动网页进程 |
+| 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64、Windows x64，分别校验身份；Windows 使用原生进程验收 |
 | 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
 | 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
@@ -169,13 +169,21 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | 公共入口与 relay 令牌验收 | Linux x64 一次，使用 `--public-entry` |
 | 仅发现、普通 relay 回退与无网页验收 | Linux x64 一次，使用 `--discovery` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
-| Nightly npm 包 | 组装三个原生包，三个平台分别安装、检查版本并执行 `--web-only` 冒烟 |
+| Nightly npm 包 | 组装四个原生包，四个平台分别安装并检查版本，POSIX 平台另执行 `--web-only` 冒烟 |
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品先并行构建 Web、三个原生平台和 Android，再按平台组包；只有完整汇总成功才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App；完整汇总成功后才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+
+Windows 运行包的定位可复用已完成 CI 中成功的 Windows package 制品，单独运行当前验收脚本：
+
+```sh
+gh workflow run ci.yml --ref <branch> -F windows_only=true -f windows_package_run=<run-id>
+```
+
+入口核对原运行、成功生产者、不可变 artifact ID、来源提交、有效期和文件摘要。诊断收据分别记录运行包与验收脚本的源码，并使用独立 artifact 名称。该模式跳过 Rust 编译与其他平台构建；最终交付仍需用最终提交构建并验收完整产品集。
 
 ## 本地按改动补充验收
 
@@ -282,3 +290,19 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与应用 tag 的制品、发布和部署检查分别记录。
 
 产品与官网 Tag 由 `release.yml` 独立校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
+
+
+## 桌面专项验收
+
+在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
+
+```sh
+	gh workflow run ci.yml --repo leaperone/vibeface --ref <branch> -f desktop_only=true
+```
+
+只定位 Windows Rust 问题时，使用 `windows_only=true`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
+
+桌面测试使用打包应用自身的 DevTools 页面，核对真实 Electron 版本、窗口隔离、内置包来源、自有 Core、退出和重启。测试预先用包内 CLI 建立关闭公共引导的独立 Node，随后由真实启动器启动并持有 Core；首次初始化逻辑另由桌面会话测试覆盖。Windows 另外核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程回收和当前用户服务。Unix shell、Unix 权限位及 Linux 证明宿主夹具保留在 Unix 测试中；协调器的协议测试在两端使用各自的私有 IPC。所有 Provider 均为受控夹具，不调用真实模型。
+
+
+原生移动端构建可使用 `ci.yml` 的 `mobile_apps=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；现有 `mobile.yml` 保留模拟器界面测试。手动移动端验收按运行编号隔离并行，避免新提交取消尚在验证的专用模拟器任务。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。

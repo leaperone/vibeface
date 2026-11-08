@@ -20,11 +20,13 @@ through another member Gateway.
 
 import argparse
 import base64
+import contextlib
 import copy
 import hashlib
 import hmac
 import http.client
 import http.server
+import io
 import ipaddress
 import json
 import os
@@ -45,6 +47,7 @@ import sys
 import time
 import traceback
 import threading
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -957,6 +960,122 @@ def native_provider_login(run, setup, command, bin_sha256):
             and json.loads((run / "native-provider-stage.json").read_text()) == "ready",
             "the controlled CLI records one private-root login and changes only fake authentication")
     return {"executed": True, "private_root_verified": True, "controlled_bin_verified": True, "login_count": len(records)}
+
+
+def native_provider_clipboard(invitation, *, env=None, cwd=None, runner=subprocess.run, system=None, xcrun_path=None):
+    """Paste only this fixture's invitation into its explicitly assigned hosted iOS simulator."""
+    env = os.environ if env is None else env
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    system = sys.platform if system is None else system
+    require(system == "darwin", "native clipboard is available only on the hosted macOS runner")
+    simulator = env.get("VIBEFACE_E2E_SIMULATOR", "")
+    require(re.fullmatch(r"[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}", simulator) is not None,
+            "native clipboard requires the explicit assigned simulator UUID")
+    run_id, attempt = env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", "")
+    require(re.fullmatch(r"[0-9]+", run_id) is not None and re.fullmatch(r"[0-9]+", attempt) is not None,
+            "native clipboard requires a hosted task run identity")
+    expected_name = f"vibeface-provider-{run_id}-{attempt}"
+    marker = cwd / ".artifacts/native/simulator.txt"
+    require(not marker.is_symlink(), "native clipboard requires the task's regular simulator marker")
+    marker = marker.resolve(strict=True)
+    root = cwd.resolve(strict=True)
+    require(marker.is_relative_to(root) and marker.is_file() and marker.read_text().strip() == simulator,
+            "native clipboard simulator matches this repository task marker")
+    xcrun = xcrun_path or shutil.which("xcrun")
+    require(xcrun is not None and Path(xcrun).is_absolute(), "native clipboard uses the installed absolute xcrun")
+    listed = runner([str(Path(xcrun).resolve()), "simctl", "list", "devices", "--json"],
+                    capture_output=True, timeout=15)
+    require(listed.returncode == 0, "native simulator inventory is readable")
+    try:
+        groups = json.loads(listed.stdout).get("devices", {}).values()
+        matches = [row for rows in groups for row in rows if row.get("udid", "").lower() == simulator.lower()]
+    except (AttributeError, TypeError, ValueError):
+        raise AssertionError("native simulator inventory is valid") from None
+    require(len(matches) == 1 and matches[0].get("state") == "Booted" and matches[0].get("name") == expected_name,
+            "native clipboard refuses a foreign, ambiguous, or unbooted simulator")
+    require(isinstance(invitation, str) and invitation and "\n" not in invitation and "\r" not in invitation,
+            "native clipboard receives the fixture's private invitation value")
+    pasted = runner([str(Path(xcrun).resolve()), "simctl", "pbcopy", simulator],
+                    input=invitation.encode(), capture_output=True, timeout=15)
+    require(pasted.returncode == 0, "native clipboard paste command succeeds")
+    return {"pasted": True}
+
+
+def native_clipboard_selfcheck(options):
+    simulator = "AABBCCDD-1111-2222-3333-ABCDEFABCDEF"
+    invitation = "fixture-private-invitation"
+    env = {"VIBEFACE_E2E_SIMULATOR": simulator, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
+    checks = []
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="native-clipboard-selfcheck-") as temporary:
+        cwd = Path(temporary)
+        marker = cwd / ".artifacts/native/simulator.txt"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(simulator + "\n")
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if "--json" in argv:
+                output = {"devices": {"iOS": [{"udid": simulator,
+                    "name": "vibeface-provider-123-2", "state": "Booted"}]}}
+            else:
+                output = invitation
+            completed = subprocess.CompletedProcess(argv, 0, json.dumps(output) if isinstance(output, dict) else output,
+                                                    "" if "--json" in argv else invitation)
+            return completed
+
+        public_output = io.StringIO()
+        with contextlib.redirect_stdout(public_output), contextlib.redirect_stderr(public_output):
+            result = native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
+                                               system="darwin", xcrun_path="/usr/bin/xcrun")
+        argv, kwargs = calls[-1]
+        require(argv == ["/usr/bin/xcrun", "simctl", "pbcopy", simulator]
+                and kwargs.get("input") == invitation.encode() and invitation not in argv
+                and kwargs.get("capture_output") is True
+                and result == {"pasted": True} and invitation not in public_output.getvalue(),
+                "private invitation is sent only on subprocess stdin")
+        checks.append("invitation_stdin_only")
+        target = cwd / "another-simulator-marker.txt"
+        target.write_text(simulator + "\n")
+        marker.unlink()
+        marker.symlink_to(target)
+        calls.clear()
+        try:
+            native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
+                                      system="darwin", xcrun_path="/usr/bin/xcrun")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("native clipboard must reject a symlinked marker")
+        require(not calls, "a symlinked marker is refused before invoking xcrun")
+        marker.unlink()
+        marker.write_text(simulator + "\n")
+        checks.append("symlinked_marker")
+        for name, altered_env, rows in (
+            ("foreign_simulator", {**env, "VIBEFACE_E2E_SIMULATOR": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF"},
+             [{"udid": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF", "name": "vibeface-provider-123-2", "state": "Booted"}]),
+            ("unbooted_simulator", env, [{"udid": simulator, "name": "vibeface-provider-123-2", "state": "Shutdown"}]),
+            ("mismatched_task_name", env, [{"udid": simulator, "name": "some-other-task", "state": "Booted"}]),
+        ):
+            negative_calls = []
+            def negative(argv, rows=rows, **kwargs):
+                negative_calls.append(argv)
+                if "--json" in argv:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"devices": {"iOS": rows}}), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            refused = False
+            try:
+                native_provider_clipboard(invitation, env=altered_env, cwd=cwd, runner=negative,
+                                          system="darwin", xcrun_path="/usr/bin/xcrun")
+            except AssertionError:
+                refused = True
+            require(refused, "native clipboard must refuse " + name)
+            require(not any("pbcopy" in argv for argv in negative_calls),
+                    "native clipboard must refuse before modifying " + name)
+            checks.append(name)
+        private_json(options.artifacts / "native-clipboard-selfcheck.json", {"status": "passed", "checks": checks})
+        print(json.dumps({"status": "passed", "checks": checks}), flush=True)
 
 
 def native_provider_selfcheck(options):
@@ -8553,6 +8672,7 @@ def e2e_fixture(options):
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
     native_ready = False
+    native_invitation = None
     native_provider = None
     native_queue = None
     workspace_gates = {name: run / ("workspace-release-" + name) for name in ("taskA", "taskB", "main", "channel")} \
@@ -8733,7 +8853,13 @@ def e2e_fixture(options):
                     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
                         output.write(invitation)
                     native_ready = True
+                    native_invitation = invitation
                     result = details()
+                elif op == "native_provider_clipboard":
+                    require(set(request) == {"op"} and native_ready and native_provider and native_invitation,
+                            "native clipboard belongs to its initialized provider fixture and accepts no secret input")
+                    native_provider_clipboard(native_invitation, cwd=Path.cwd())
+                    result = {"pasted": True}
                 elif op == "native_join":
                     require(native_ready, "native pairing requires the controlled initialized Node")
                     client = nodes["source" if workspace_gates else "receiver"].client
@@ -8794,23 +8920,29 @@ def e2e_fixture(options):
                     require(manager is not None and manager["provider"] == "codex",
                             "the native UI must enable the controlled manager before queue preparation")
                     native_queue = {"bot_id": "native-provider", "conversation_id": "native-provider",
-                                    "running_trigger": "message:native-running", "queued_trigger": "message:native-queued"}
+                                    "running_trigger": "message:native-running",
+                                    "deferred_message_id": "native-deferred-input"}
                     client.rpc("create_bot", bot_id=native_queue["bot_id"], conversation_id=native_queue["conversation_id"],
                                name="Native Provider", instructions="Controlled native acceptance", project=None)
-                    for label in ("native-running", "native-queued"):
-                        directive = {"phase1": True, "label": label}
-                        if label == "native-running":
-                            directive["gate"] = str(run / "native-never-release")
-                        receipt = client.rpc("message", conversation_id=native_queue["conversation_id"],
-                                             message_id=label, text=json.dumps(directive), report_results=False)
-                        require(receipt["trigger"] == "message:" + label, "native queue preserves the accepted trigger")
-                        wait_for("native message reaches its actual queue state", lambda:
-                            any(job["trigger"] == receipt["trigger"] and job["state"] == ("running" if label == "native-running" else "queued")
-                                for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
-                        if label == "native-running":
-                            wait_for("the native queue has one positive controlled invocation", lambda:
-                                len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
-                                     and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                    directive = {"phase1": True, "label": "native-running", "gate": str(run / "native-never-release")}
+                    running = client.rpc("message", conversation_id=native_queue["conversation_id"],
+                                         message_id="native-running", text=json.dumps(directive), report_results=False)
+                    require(running["trigger"] == native_queue["running_trigger"],
+                            "native running input preserves its accepted trigger")
+                    wait_for("native running input reaches its actual job state", lambda:
+                        any(job["trigger"] == running["trigger"] and job["state"] == "running"
+                            for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                    wait_for("the native queue has one positive controlled invocation", lambda:
+                        len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
+                             and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                    deferred = client.rpc("message", conversation_id=native_queue["conversation_id"],
+                        message_id=native_queue["deferred_message_id"], target={"kind": "bot_main", "bot_id": native_queue["bot_id"]},
+                        intent="defer", sequence=2, text="Native deferred input", report_results=False)
+                    require(deferred["accepted"] is True and deferred["message_id"] == native_queue["deferred_message_id"],
+                            "native deferred input is accepted through the signed message API")
+                    wait_for("native deferred input is persisted without becoming a job", lambda:
+                        any(row["input"]["message_id"] == native_queue["deferred_message_id"] and row["deferred"] and not row["cancelled"]
+                            for row in client.rpc("workspace_state")["inputs"]))
                     result = native_queue
                 elif op == "native_provider_inspect":
                     require(set(request) == {"op"} and native_provider, "native inspection reads only its controlled receiver")
@@ -8819,6 +8951,9 @@ def e2e_fixture(options):
                     provider = next(item for item in settings["providers"] if item["provider"] == "codex")
                     manager = settings["settings"]["manager"]
                     jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    inputs = client.rpc("workspace_state")["inputs"] if native_queue else []
+                    deferred_input = next((row for row in inputs
+                        if row["input"]["message_id"] == native_queue["deferred_message_id"]), None) if native_queue else None
                     calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
@@ -8827,10 +8962,15 @@ def e2e_fixture(options):
                               "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
                               "authentication": provider["probe"]["authentication"],
                               "checked_at_ms": provider["probe"]["checked_at_ms"],
-                              "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
-                                       if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
+                              "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs],
+                              "deferred_input": ({"message_id": deferred_input["input"]["message_id"],
+                                                  "target": deferred_input["input"]["target"],
+                                                  "deferred": deferred_input["deferred"], "cancelled": deferred_input["cancelled"]}
+                                                 if deferred_input else None),
+                              "total_invocations": len(calls),
                               "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
-                              "queued_invocations": sum(row["trigger"] == native_queue["queued_trigger"] for row in calls)}
+                              "deferred_invocations": sum(row["trigger"] == "message:" + native_queue["deferred_message_id"]
+                                                           for row in calls)}
                 elif op == "native_send":
                     require(native_ready, "native delivery is scoped to the initialized fixture")
                     intent = str(uuid.uuid4())
@@ -8891,6 +9031,7 @@ if __name__ == "__main__":
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
@@ -8905,7 +9046,8 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
-            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck)
+            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
+                                 or arguments.native_clipboard_selfcheck)
             if needs_process:
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
                 require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
@@ -8929,6 +9071,8 @@ if __name__ == "__main__":
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
             if arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)
+            elif arguments.native_clipboard_selfcheck:
+                native_clipboard_selfcheck(arguments)
             elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.e2e_fixture:

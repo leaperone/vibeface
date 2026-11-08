@@ -43,6 +43,8 @@ jobs:
           RELEASE_APP: ${{ inputs.app || (startsWith(github.ref_name, 'www-v') && 'www' || 'product') }}
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B - <<'PY'
@@ -57,6 +59,10 @@ jobs:
                   raise SystemExit('Publishing requires the exact existing tag as the workflow ref')
               command += ['--require-main', '--publish']
           result = json.loads(subprocess.check_output(command, text=True))
+          if scope == 'product' and result['channel'] == 'stable' and os.environ['WINDOWS_SIGNING_CONFIGURED'] != 'true':
+              raise SystemExit('Stable product builds require a Windows Authenticode certificate before any producers start')
+          if scope == 'product' and result['channel'] == 'stable' and os.environ['IOS_SIGNING_CONFIGURED'] != 'true':
+              raise SystemExit('Stable product builds require the iOS distribution identity and provisioning profile')
           if result['source_commit'] != os.environ['GITHUB_SHA']:
               raise SystemExit('Build source differs from the workflow commit')
           if publish:
@@ -147,6 +153,19 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: ubuntu-24.04-arm
       target: aarch64-unknown-linux-gnu
+  native-windows:
+    needs: [identity]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-native.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+    secrets:
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
   android:
     needs: [identity]
     if: needs.identity.outputs.app == 'product'
@@ -155,6 +174,17 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       version: ${{ needs.identity.outputs.version }}
       tag: ${{ needs.identity.outputs.tag }}
+  ios:
+    needs: [identity]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-ios.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      version: ${{ needs.identity.outputs.version }}
+    secrets:
+      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
   compose-macos:
     needs: [identity, static, native-macos]
     if: needs.identity.outputs.app == 'product'
@@ -185,13 +215,75 @@ jobs:
       target: aarch64-unknown-linux-gnu
       native_artifact_id: ${{ needs.native-linux-arm64.outputs.artifact_id }}
       app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  compose-windows:
+    needs: [identity, static, native-windows]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-compose.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      native_artifact_id: ${{ needs.native-windows.outputs.artifact_id }}
+      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  desktop-macos:
+    needs: [identity, compose-macos]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+      native_artifact_id: ${{ needs.compose-macos.outputs.artifact_id }}
+      sign: true
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  desktop-windows:
+    needs: [identity, compose-windows]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      native_artifact_id: ${{ needs.compose-windows.outputs.artifact_id }}
+      sign: true
+    secrets:
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+  desktop-linux-x64:
+    needs: [identity, compose-linux-x64]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      native_artifact_id: ${{ needs.compose-linux-x64.outputs.artifact_id }}
+  desktop-linux-arm64:
+    needs: [identity, compose-linux-arm64]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+      native_artifact_id: ${{ needs.compose-linux-arm64.outputs.artifact_id }}
   collect:
-    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, android]
+    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, desktop-linux-x64, desktop-linux-arm64, android, ios]
     if: >-
       always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success' &&
       (needs.identity.outputs.app == 'www' ||
       (needs.compose-macos.result == 'success' && needs.compose-linux-x64.result == 'success' &&
-      needs.compose-linux-arm64.result == 'success' && needs.android.result == 'success'))
+      needs.compose-linux-arm64.result == 'success' && needs.compose-windows.result == 'success' &&
+      needs.desktop-macos.result == 'success' && needs.desktop-windows.result == 'success' &&
+      needs.desktop-linux-x64.result == 'success' && needs.desktop-linux-arm64.result == 'success' &&
+      needs.ios.result == 'success' && needs.android.result == 'success'))
     runs-on: ubuntu-24.04
     outputs:
       release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
@@ -229,9 +321,45 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         if: needs.identity.outputs.app == 'product'
         with:
+          artifact-ids: ${{ needs.compose-windows.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/native/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-macos.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/aarch64-apple-darwin
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-windows.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-linux-x64.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-linux-arm64.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
           artifact-ids: ${{ needs.android.outputs.artifact_id }}
           merge-multiple: true
           path: .artifacts/input/mobile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.ios.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/ios
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
       - name: Assemble the complete release without rebuilding
@@ -251,7 +379,7 @@ jobs:
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           mkdir .artifacts/npm-input
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
             cp ".artifacts/release/vibeface-$VERSION-$target.tar.gz" ".artifacts/release/vibeface-$VERSION-$target.tar.gz.sha256" .artifacts/npm-input/
           done
           node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_SHA"

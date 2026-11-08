@@ -11,7 +11,9 @@ use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -340,6 +342,86 @@ mod workspace_overview_tests {
     }
 }
 
+type BackgroundFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+enum BackgroundCommand {
+    Spawn(BackgroundFuture),
+    Stop,
+}
+
+/// Owns the Runtime's long-lived tasks and continuously reaps completed jobs.
+struct BackgroundTasks {
+    commands: std::sync::Mutex<Option<mpsc::UnboundedSender<BackgroundCommand>>>,
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let supervisor = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut stopping = false;
+            loop {
+                if stopping && tasks.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    command = receiver.recv(), if !stopping => match command {
+                        Some(BackgroundCommand::Spawn(task)) => { tasks.spawn(task); }
+                        Some(BackgroundCommand::Stop) | None => {
+                            stopping = true;
+                            tasks.abort_all();
+                        }
+                    },
+                    result = tasks.join_next(), if !tasks.is_empty() => {
+                        if let Some(Err(error)) = result && !error.is_cancelled() {
+                            tracing::warn!(event = "runtime.background_task", %error, "background task failed");
+                        }
+                    },
+                }
+            }
+        });
+        Self {
+            commands: std::sync::Mutex::new(Some(sender)),
+            supervisor: Mutex::new(Some(supervisor)),
+        }
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        let commands = self
+            .commands
+            .lock()
+            .map_err(|_| anyhow::anyhow!("background task sender lock poisoned"))?;
+        let sender = commands
+            .as_ref()
+            .context("Node background tasks are shutting down")?;
+        sender
+            .send(BackgroundCommand::Spawn(Box::pin(future)))
+            .map_err(|_| anyhow::anyhow!("Node background task supervisor stopped"))
+    }
+
+    async fn shutdown(&self) {
+        if let Some(sender) = self
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            && sender.send(BackgroundCommand::Stop).is_err()
+        {
+            tracing::warn!(
+                event = "runtime.background_task",
+                "background task supervisor stopped before shutdown"
+            );
+        }
+        if let Some(supervisor) = self.supervisor.lock().await.take()
+            && let Err(error) = supervisor.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(event = "runtime.background_task", %error, "background task supervisor failed during shutdown");
+        }
+    }
+}
+
 /// What changed in a conversation, so each client session can push the affected records.
 pub(crate) enum Changed<'a> {
     /// A stored event, by hash.
@@ -376,6 +458,8 @@ pub struct Runtime {
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<iroh_relay::server::Server>>,
+    /// Runtime-owned workers, cancelled and joined by final shutdown.
+    background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
     peer_delivery_locks: peers::PeerDeliveryLocks,
     /// Two syncs downloading the same attachment would share one staging file.
@@ -643,6 +727,7 @@ impl Runtime {
             net: std::sync::OnceLock::new(),
             router: Mutex::new(None),
             relay: Mutex::new(None),
+            background_tasks: BackgroundTasks::new(),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
             blob_fetch: Mutex::new(()),
@@ -747,10 +832,12 @@ impl Runtime {
     /// wait lets the reply reach the local page first.
     pub(crate) fn request_rejoin(self: &Arc<Self>) {
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             node.rejoin.notify_one();
-        });
+        }) {
+            tracing::debug!(%error, "rejoin request skipped while the Node is shutting down");
+        }
     }
     pub async fn rejoin_requested(&self) {
         self.rejoin.notified().await
@@ -806,7 +893,7 @@ impl Runtime {
             self.start_writers(events);
         } else {
             let node = self.clone();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let mut state = node.write_state.subscribe();
                 if state
                     .wait_for(|state| *state == WriteState::Writable)
@@ -818,7 +905,7 @@ impl Runtime {
                         node.unverify_revoked_works(&state.genesis.network_id).await;
                     }
                 }
-            });
+            })?;
         }
         self.start_network().await
     }
@@ -882,6 +969,12 @@ impl Runtime {
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         self.store.lock().await.scheduler_maintenance_idle()
     }
+    pub(crate) fn spawn_background(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        self.background_tasks.spawn(task)
+    }
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
@@ -889,7 +982,11 @@ impl Runtime {
     /// bridge; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.delivery.shutdown().await;
+        self.background_tasks.shutdown().await;
         self.stop_network().await;
+        if let Ok(net) = self.net() {
+            net.close().await;
+        }
         self.codex.stop().await;
         self.claude.stop().await;
         self.pi.stop().await;

@@ -46,7 +46,9 @@ PATH_RULES = (
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
-    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
+    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py",
+              "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py",
+              "scripts/verify-windows-node.py")),
     ("control", ("crates/control/*",)),
     ("cli", ("apps/cli/*",)),
 )
@@ -59,8 +61,11 @@ PLATFORMS = (
     {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
+    {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+# Only an explicit dispatch runs the hosted Windows and desktop application checks.
+DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
@@ -341,7 +346,7 @@ def frozen_plan(plan):
     return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"])
 
 
-def gate(needs, plan=None, delivery_live=False):
+def gate(needs, plan=None, delivery_live=False, desktop=False):
     if needs.get("plan", {}).get("result") != "success":
         raise ValueError("CI plan did not succeed")
     if plan is None:
@@ -357,9 +362,12 @@ def gate(needs, plan=None, delivery_live=False):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     if delivery_live and plan["event"] != "workflow_dispatch":
         raise ValueError("Live delivery proofs require explicit workflow_dispatch")
-    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else [])
+    if desktop and plan["event"] != "workflow_dispatch":
+        raise ValueError("Windows native and desktop application checks require explicit workflow_dispatch")
+    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else []) + (DESKTOP_JOBS if desktop else [])
     failed = [job for job in required if needs.get(job, {}).get("result") != "success"]
-    failed.extend(job for job in (*JOBS, "delivery-live") if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
+    failed.extend(job for job in (*JOBS, "delivery-live", *DESKTOP_JOBS)
+                  if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
     if failed:
         raise ValueError(f"Required CI checks did not succeed: {', '.join(failed)}")
     print(f"CI gate passed: {', '.join(required)}")
@@ -397,7 +405,7 @@ def run_test(packages, tier):
         command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
-        command = ["cargo", "test", "--locked", *selected, "--", *skips]
+        command = ["cargo", "test", "--locked", "--no-fail-fast", *selected, "--", *skips]
     subprocess.run(command, check=True)
 
 
@@ -432,7 +440,8 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py"):
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py",
+                 "apps/desktop/electron-builder.cjs", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
@@ -553,6 +562,24 @@ def self_test():
         broken["delivery-live"] = {"result": result}
         expect_failure(lambda: gate(broken, delivery_live=True))
     expect_failure(lambda: gate(needs, delivery_live=True))
+    expect_failure(lambda: gate(complete, desktop=True))
+    for job in DESKTOP_JOBS:
+        complete[job] = {"result": "success"}
+    gate(complete, desktop=True)
+    gate(complete)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        for job in DESKTOP_JOBS:
+            broken = json.loads(json.dumps(complete))
+            broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, desktop=True))
+            # Without the dispatch input a skipped desktop job is expected, but a failed one still fails the gate.
+            if result in {"failure", "cancelled"}:
+                expect_failure(lambda: gate(broken))
+            else:
+                gate(broken)
+    expect_failure(lambda: gate(needs, desktop=True))
+    for job in DESKTOP_JOBS:
+        del complete[job]
     delivery_plan = make_plan(["crates/delivery/proof/fixtures/manifest.json"])
     delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
     delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
@@ -800,7 +827,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/package.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -895,6 +922,7 @@ def main():
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)
     final_gate.add_argument("--delivery-live", action="store_true", help="also require the explicitly dispatched live proof job")
+    final_gate.add_argument("--desktop", action="store_true", help="also require the explicitly dispatched Windows native and desktop jobs")
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
@@ -916,7 +944,8 @@ def main():
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
-        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live)
+        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live,
+             desktop=args.desktop)
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":

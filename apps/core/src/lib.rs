@@ -5,6 +5,7 @@ pub mod api;
 pub mod client;
 pub mod config;
 pub mod control;
+pub mod control_discovery;
 pub mod crypto;
 pub mod delivery;
 pub mod discovery;

@@ -392,9 +392,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_data_dir() -> String {
+        if cfg!(windows) {
+            r"C:\vibeface\node".to_owned()
+        } else {
+            "/node".to_owned()
+        }
+    }
+
     #[test]
     fn status_preserves_unknown_peers_and_validates_the_display_boundary() {
-        let value = json!({"status":"stopped","device_id":"local","data_dir":"/node","listen":"127.0.0.1:4790","web_enabled":true,"core_version":"0.0.1","peers":null});
+        let value = json!({"status":"stopped","device_id":"local","data_dir":test_data_dir(),"listen":"127.0.0.1:4790","web_enabled":true,"core_version":"0.0.1","peers":null});
         let node = NodeStatus::parse(value.clone()).unwrap();
         assert!(node.peers.is_none());
         assert_eq!(node.peer_summary(), "Peer status unavailable");

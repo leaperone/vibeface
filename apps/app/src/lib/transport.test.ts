@@ -17,7 +17,7 @@ async function key() {
 }
 
 /** A fake Gateway, or with `lan` a Node on the LAN, that answers as `serving` (normally the target) or refuses with a text frame. */
-async function harness({ local = false, lan = false, refuse = '', impostor = false } = {}) {
+async function harness({ local = false, lan = false, refuse = '', impostor = false, nativeLocal = false, nativeGateway = false } = {}) {
   await initCrypto({ module_or_path: readFileSync(new URL('../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
   const browser = await key(), target = await key(), serving = impostor ? await key() : target
   const urls: string[] = [], texts: string[] = []
@@ -88,14 +88,18 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
     }
   }
   const secure: SecureApi = wasm
+  const nativeCalls: { kind: string; deviceId: string; address?: string }[] = []
+  const nativeStream: LanStream = { send: () => {}, recv: async () => null, close: () => {} }
   const runtime = createTransport(secure, {
     load: async () => ({ deviceId: browser.deviceId }), remove: async () => {},
     sign: async (message) => hex(await crypto.subtle.sign({ name: 'Ed25519' }, browser.privateKey, new Uint8Array(message))),
-  }, lan ? dial : undefined)
+  }, lan ? dial : undefined,
+  nativeLocal ? async entry => { nativeCalls.push({ kind: entry.kind, deviceId: entry.device_id }); return nativeStream } : undefined,
+  nativeGateway ? async (entry, target) => { nativeCalls.push({ kind: entry.kind, deviceId: target, address: entry.address }); return null } : undefined)
   const address = 'https://gateway.example', device_id = target.deviceId
   const entry: ConnectionEntry = lan ? { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id } : { kind: local ? 'local' : 'gateway', address, device_id }
   return {
-    target: target.deviceId, urls, texts, dials, open: () => open,
+    target: target.deviceId, urls, texts, dials, nativeCalls, open: () => open,
     connect: (to = entry) => runtime.connectDevice(to, {}),
   }
 }
@@ -131,6 +135,24 @@ test('a local session uses the cookie endpoint and sends no connect frame', asyn
   assert.deepEqual(app.urls, ['wss://gateway.example/api/local/ws'])
   assert.deepEqual(app.texts, [])
   channel.close()
+})
+
+test('an explicit Desktop local carrier handles a local entry without weakening the browser origin guard', async () => {
+  const native = await harness({ local: true, nativeLocal: true })
+  await assert.rejects(native.connect(), /无法接通指定设备/)
+  assert.deepEqual(native.nativeCalls, [{ kind: 'local', deviceId: native.target }])
+  assert.deepEqual(native.urls, [])
+  const browser = await harness({ local: true })
+  await assert.rejects(browser.connect({ kind: 'local', address: 'https://other.example', device_id: browser.target }), /本机会话只能连接这个节点/)
+})
+
+test('the explicit Desktop gateway hook leaves remote gateways on the existing browser carrier', async () => {
+  const app = await harness({ nativeGateway: true })
+  const channel = await app.connect()
+  assert.deepEqual(app.nativeCalls, [{ kind: 'gateway', deviceId: app.target, address: 'https://gateway.example' }])
+  assert.deepEqual(app.urls, ['wss://gateway.example/api/client'])
+  assert.equal(channel.deviceId, app.target)
+  channel.close(); await settle()
 })
 
 test('the app reaches a Node on its LAN directly: no Gateway, no connect frame, and Noise still proves the device', async () => {

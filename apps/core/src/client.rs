@@ -1669,7 +1669,7 @@ pub(crate) struct NodeJoinTask {
     link: String,
     owner: JoinOwner,
     status: NodeJoin,
-    task: tokio::task::AbortHandle,
+    task: futures_util::future::AbortHandle,
     cancel: Arc<tokio::sync::Notify>,
 }
 
@@ -1760,7 +1760,8 @@ pub(crate) async fn start_node_join(
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
     let cancelled = cancel.clone();
-    let task = tokio::spawn(async move {
+    let (task, registration) = futures_util::future::AbortHandle::new_pair();
+    let joining_task = async move {
         let report = |status: NodeJoin| {
             if let Ok(mut slot) = runner.node_join.lock()
                 && let Some(current) = slot.as_mut()
@@ -1784,8 +1785,10 @@ pub(crate) async fn start_node_join(
                 report(NodeJoin::Failed { reason });
             }
         }
-    })
-    .abort_handle();
+    };
+    node.spawn_background(async move {
+        let _ = futures_util::future::Abortable::new(joining_task, registration).await;
+    })?;
     *slot = Some(NodeJoinTask {
         link,
         owner,
@@ -2529,6 +2532,8 @@ mod tests {
             .await
             .is_err()
         );
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2615,6 +2620,8 @@ mod tests {
                 .await
                 .is_err()
         );
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2759,7 +2766,7 @@ mod tests {
         assert!(Config::load(&dir)?.manager.is_none());
         let choose_cursor =
             json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
-        std::os::unix::fs::symlink(&project, &workspace)?;
+        vibeface_bridge::platform::privatefs::link_dir(&project, &workspace)?;
         assert!(
             dispatch(
                 &node,
@@ -2771,7 +2778,7 @@ mod tests {
             .is_err(),
             "the default workspace must be a real directory"
         );
-        std::fs::remove_file(&workspace)?;
+        vibeface_bridge::platform::privatefs::remove_dir_link(&workspace)?;
         let chosen = dispatch(
             &node,
             &mut manager_session,
@@ -2892,12 +2899,14 @@ mod tests {
             json!({"provider":"cursor","bot":true}),
         )
         .await?;
+        node.shutdown().await;
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         assert_eq!(
             serde_json::to_value(reopened.settings_snapshot())?,
             saved["settings"]
         );
+        reopened.shutdown().await;
         drop(reopened);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -3117,17 +3126,46 @@ mod tests {
             thread_id: None,
             fields: Default::default(),
         });
+
+        // The byte scan includes the live SQLite database, so release its Windows file locks
+        // while leaving the provider environment and logged key-containing event unchanged.
+        let retired_node = Arc::downgrade(&node);
+        node.shutdown().await;
+        drop(node);
+        ensure!(
+            retired_node.upgrade().is_none(),
+            "provider-key scan Runtime remained alive after shutdown and drop"
+        );
         let mut files = vec![dir.clone()];
         let mut checked = 0;
         while let Some(path) = files.pop() {
             if path.is_dir() {
-                files.extend(std::fs::read_dir(&path)?.map(|entry| entry.unwrap().path()));
+                let entries = std::fs::read_dir(&path).with_context(|| {
+                    format!(
+                        "list {} while checking provider-key persistence",
+                        path.display()
+                    )
+                })?;
+                for entry in entries {
+                    let entry = entry.with_context(|| {
+                        format!(
+                            "enumerate {} while checking provider-key persistence",
+                            path.display()
+                        )
+                    })?;
+                    files.push(entry.path());
+                }
                 continue;
             }
             if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
                 continue;
             }
-            let bytes = std::fs::read(&path)?;
+            let bytes = std::fs::read(&path).with_context(|| {
+                format!(
+                    "read {} while checking provider-key persistence",
+                    path.display()
+                )
+            })?;
             for key in [codex_key, cursor_key] {
                 assert!(
                     !bytes
@@ -3140,13 +3178,14 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 3 && logs.join("node.log").is_file());
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+        vibeface_bridge::platform::privatefs::ensure_private(
+            &dir.join(crate::providers::ENV_FILE),
+            "the saved provider environment",
+        )?;
+        let node = Arc::new(
+            Runtime::reopen(&dir)
+                .await
+                .context("reopen provider-key test Node after its persistence scan")?,
         );
 
         for invalid in [
@@ -3274,8 +3313,16 @@ mod tests {
         )
         .await?;
 
+        let retired_node = Arc::downgrade(&node);
+        node.shutdown().await;
         drop(node);
-        let reopened = Runtime::reopen(&dir).await?;
+        ensure!(
+            retired_node.upgrade().is_none(),
+            "provider-key test Runtime remained alive after shutdown and drop"
+        );
+        let reopened = Runtime::reopen(&dir)
+            .await
+            .context("reopen provider-key test Node after dropping the prior Runtime")?;
         let providers = reopened.providers();
         assert!(reopened.manager().is_none());
         assert!(providers.switches.execution.is_empty());
@@ -3287,8 +3334,12 @@ mod tests {
             reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
             cursor_key
         );
+        reopened.shutdown().await;
         drop(reopened);
-        std::fs::remove_dir_all(dir)?;
+        crate::logging::close_capture(&logs).context("close provider-key test log handle")?;
+
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove provider-key test directory {}", dir.display()))?;
         Ok(())
     }
 
@@ -3370,6 +3421,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -3485,6 +3537,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -4216,6 +4269,7 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result
