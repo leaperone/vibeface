@@ -22,10 +22,10 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 
 | 目标 | 交付内容 |
 | --- | --- |
-| `all` | Discovery、官方 Relay/Entry、国内纯 Relay 和 App，不含官网 |
+| `all` | Discovery、官方 Relay/Entry、国内 Relay 和 App，不含官网 |
 | `discovery` | 提供地址发现、签名目录和中继许可的 Core 容器 |
 | `relay` | 保留客户端接入 API 和中继的 Core 容器，不含前端文件 |
-| `relay-cn` | 国内纯 Relay Core 容器，关闭网页和浏览器 gateway，入口仅保留中继路径 |
+| `relay-cn` | 国内 Relay Core 容器，用运营者令牌准入，提供中继和浏览器接入 `/api/client`，不含前端文件 |
 | `app` | 独立网页静态容器，外层 Nginx 保留 API、发现和中继路由 |
 | `www` | 独立官网静态容器，使用精确 `www-v<version>` Tag |
 
@@ -59,6 +59,6 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 Discovery 和各 Relay 分别挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。首轮容器切换需要现有服务进入维护并正常退出，保存备份后再激活。
 
-国内入口移除网页 catchall，页面和静态资源不再返回前端；中继路径继续工作。官方 Entry 容器不包含网页文件，但保留 App 所需的客户端接入接口。App 外层反向代理继续保留这些路由。
+国内入口移除网页 catchall，页面和静态资源不再返回前端；中继路径和浏览器接入 `/api/client` 继续工作。官方 Entry 容器同样不包含网页文件，保留 App 所需的客户端接入接口。App 外层反向代理继续保留这些路由。
 
 部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表 Discovery 公网 UDP、Relay 连接、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。

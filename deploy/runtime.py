@@ -16,6 +16,7 @@ import urllib.request
 
 ROOT = Path('/opt/vibeface')
 DATA = Path('/data')
+APP_ORIGIN = 'https://app.vibeface.dev'
 
 
 def require(condition, message):
@@ -111,6 +112,8 @@ def guard(info):
         require(network.get('relay_mode', 'forward') == 'forward'
                 and network['relay_admission']['policy'] == ('grants' if role == 'entry' else 'operator-token'),
                 'relay admission does not match the selected role')
+        require(APP_ORIGIN in config.get('allowed_origins', []),
+                'browser access needs the App origin in allowed_origins')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
@@ -149,7 +152,7 @@ def health(info):
         result = inspect()
         require(result['status'] == 'running' and result['version'] == info['version']
                 and result['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE']
-                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] == 'entry'),
+                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] != 'discovery'),
                 'Core health, version, identity or browser mode differs')
         return {key: result[key] for key in ('status', 'version', 'device_id')}
     request = urllib.request.Request('http://127.0.0.1:8080/')
@@ -203,6 +206,18 @@ def self_test():
             else:
                 raise AssertionError('missing identity accepted')
             assert not (data / 'identity.json').exists()
+            (data / 'identity.json').write_text('fixture')
+            relay = dict(config, network={'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'operator-token'}})
+            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'relay'}):
+                (data / 'config.json').write_text(json.dumps(relay))
+                try:
+                    guard(info)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('Relay without the App origin accepted')
+                (data / 'config.json').write_text(json.dumps(dict(relay, allowed_origins=[APP_ORIGIN])))
+                assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')
 
 
@@ -225,7 +240,7 @@ def main():
             with (DATA / 'node.lock').open('rb') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
-            if os.environ['VIBEFACE_ROLE'] != 'entry':
+            if os.environ['VIBEFACE_ROLE'] == 'discovery':
                 args.append('--no-web')
             os.execv(args[0], args)
     else:

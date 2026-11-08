@@ -154,6 +154,19 @@ python3 scripts/verify-node.py --delivery-ui-selfcheck \
 
 UI 失败时可运行 `gh run rerun <run-id> --failed`，复用该 run 已成功构建的不可变输入，不重新构建 App。清理步骤同时判定最终 UI 结果，清理成功不能掩盖测试失败。每次验收使用新的专属模拟器，并上传带 attempt 的公开诊断。
 
+## 使用 Device Hub 验收本机 Apple 设备
+
+Device Hub 是 Xcode 自带的 Apple 设备管理应用，位于 Xcode 应用包的 `Contents/Applications/DeviceHub.app`。它用于查看和管理本机的真机与模拟器；自动验收仍由 e2e 驱动 App 并检查结果。simslim 用于精简模拟器后台服务，不负责判断产品验收是否通过。
+
+1. 在 Device Hub 中确认目标是真机还是模拟器，并记录型号、系统版本与 UDID。可用 `xcrun devicectl list devices` 交叉核对。设备名称可能重复，安装和操作必须绑定 UDID。
+2. 模拟器验收使用当前任务独立创建的设备。将其 UUID 传给 `VIBEFACE_E2E_SIMULATOR`，按下节运行原生 e2e。该入口会重新安装 App 并清除专属模拟器的钥匙串，不要使用日常设备或其他任务的模拟器。
+3. 真机验收使用明确指定的设备，并先检查配对、开发者模式和签名条件。真机需要签名有效的 `iphoneos` 构建，Simulator `.app` 不能安装到 iPhone。覆盖安装时保留原有身份和数据，不卸载、重置或清除钥匙串。
+4. 安装后实际启动 App，按本次改动验证界面和操作。在任务 planning 的证据目录记录源码提交、构建来源、目标设备和验收结果。设备可用、安装成功和 App 启动成功不能代替功能验收通过。
+
+本地 iPhone 真机、专属模拟器和 CI 创建的模拟器分别记录验收结果。Device Hub 不上传 TestFlight、不发布 App Store，也不替代签名或发布流程。CI 的模拟器创建与 e2e 仍按 workflow 执行，不依赖打开本机 Device Hub。
+
+本节 Device Hub 用于核对本机 Apple 设备。下方 Provider 用例仍由 `tests/e2e/e2e.native.config.ts` 中的本地 `DeviceProvider` 绑定 `VIBEFACE_E2E_SIMULATOR` 指定的任务专属 UUID，不调用 e2e device-hub。查看设备不代表自动验收通过。
+
 ## 验证原生接收和本地文件
 
 原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。
