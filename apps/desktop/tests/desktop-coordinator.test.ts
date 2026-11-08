@@ -288,13 +288,13 @@ describe('Desktop coordinator', () => {
     expect(subject.status().backgroundNode).toMatchObject({ kind: 'installed', nodeId: deviceId, dataDir: canonicalDataDir })
   })
 
-  it('updates an installed managed background Node only when bundled runtime is newer', async () => {
+  it('updates a stopped managed Node without starting it, only when bundled runtime is newer', async () => {
     const profile = await temp(), dataDir = await temp()
     const stale: ManagedNodeStatus = { ok: true, state: 'installed_stopped', device_id: deviceId, data_dir: dataDir,
       service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped',
       runtime_update: runtime('newer_available') }
-    const updated: ManagedNodeStatus = { ...stale, state: 'installed', service_running: true, core_status: 'running',
-      runtime_update: runtime('current', { installedVersion: '0.0.1-nightly.20261108.1', runningVersion: '0.0.1-nightly.20261108.1' }) }
+    const updated: ManagedNodeStatus = { ...stale,
+      runtime_update: runtime('current', { installedVersion: '0.0.1-nightly.20261108.1', runningVersion: null }) }
     const managed = {
       status: vi.fn().mockResolvedValueOnce(stale).mockResolvedValueOnce(stale).mockResolvedValue(updated),
       updateBackground: vi.fn(async () => updated),
@@ -311,8 +311,41 @@ describe('Desktop coordinator', () => {
     await subject.updateBackground()
     expect(managed.updateBackground).toHaveBeenCalledWith(deviceId)
     expect(subject.status().backgroundNode).toMatchObject({
-      kind: 'installed', runtimeUpdate: { availability: 'current', installedVersion: '0.0.1-nightly.20261108.1' },
+      kind: 'installed', health: 'stopped', runtimeUpdate: { availability: 'current', installedVersion: '0.0.1-nightly.20261108.1', runningVersion: null },
     })
     await expect(subject.updateBackground()).rejects.toThrow(/没有可更新的版本/)
   })
+  it.each(['identity', 'running-state', 'version'] as const)('refuses an update acknowledgement with an unexpected %s', async (failure) => {
+    const profile = await temp(), dataDir = await temp()
+    const stale: ManagedNodeStatus = { ok: true, state: 'installed_stopped', device_id: deviceId, data_dir: dataDir,
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped',
+      runtime_update: runtime('newer_available') }
+    const result: ManagedNodeStatus = { ...stale,
+      runtime_update: runtime('current', { installedVersion: '0.0.1-nightly.20261108.1', runningVersion: null }) }
+    if (failure === 'identity') result.device_id = 'b'.repeat(64)
+    if (failure === 'version') result.runtime_update = runtime('newer_available')
+    if (failure === 'running-state') {
+      result.state = 'installed'
+      result.service_running = true
+      result.core_status = 'running'
+      result.runtime_update.runningVersion = result.runtime_update.bundledVersion
+    }
+    const managed = {
+      status: vi.fn().mockResolvedValue(stale), updateBackground: vi.fn().mockResolvedValue(result),
+      installBackground: vi.fn(), start: vi.fn(), stop: vi.fn(), uninstall: vi.fn(),
+    } as unknown as ManagedNodeController
+    const subject = new DesktopCoordinator({
+      profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
+      discover: async () => ({ nodes: [], warnings: [] }),
+      inspect: async () => { throw new Error('unused') }, access: async () => { throw new Error('unused') },
+      prepareBackgroundNode: async () => { throw new Error('unused') },
+      startDiscovered: vi.fn(), startOwnedAppNode: vi.fn(),
+    })
+    await subject.initialize()
+    await expect(subject.updateBackground()).rejects.toThrow(failure === 'identity' ? /节点身份/ : /运行状态或版本/)
+    expect(managed.installBackground).not.toHaveBeenCalled()
+    expect(managed.start).not.toHaveBeenCalled()
+    expect(managed.stop).not.toHaveBeenCalled()
+  })
+
 })

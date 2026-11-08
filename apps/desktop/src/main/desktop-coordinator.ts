@@ -326,11 +326,16 @@ export class DesktopCoordinator {
       try { result = await this.options.managedNode.updateBackground(current.nodeId) }
       catch (error) { await this.refreshBackground(); throw error }
       this.backgroundNode = backgroundNodeFromStatus(result, this.platform)
-      if (this.backgroundNode.kind !== 'installed' && this.backgroundNode.kind !== 'partial') {
+      const updated = this.backgroundNode
+      if (updated.kind !== 'installed' || updated.nodeId !== current.nodeId || updated.dataDir !== current.dataDir) {
         throw new Error('后台节点更新后未能确认相同的节点身份。')
       }
-      if (this.backgroundNode.kind === 'installed' && this.backgroundNode.runtimeUpdate.availability === 'newer_available') {
-        throw new Error('后台节点更新后仍在使用旧运行时，请重新核对状态。')
+      const expectedHealth = fresh.service_running && fresh.core_status === 'running' ? 'running' : 'stopped'
+      const runtime = updated.runtimeUpdate
+      if (updated.health !== expectedHealth || runtime.availability !== 'current'
+          || runtime.installedVersion !== runtime.bundledVersion
+          || runtime.runningVersion !== (expectedHealth === 'running' ? runtime.bundledVersion : null)) {
+        throw new Error('后台节点更新后的运行状态或版本未能确认，请重新核对状态。')
       }
       await this.refreshBackground()
       await this.discoverInner()
