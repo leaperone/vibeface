@@ -20,29 +20,31 @@ export function SiteHeader() {
 
   return (
     <header className="site-header" lang="en">
-      <Link className="brand" to="/" aria-label="Vibeface home">
-        <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
-        <span>Vibeface</span>
-      </Link>
-      <nav aria-label="Primary navigation">
-        {NAV.map((item) => {
-          const active = navActive(pathname, item)
-          const className = active ? 'is-active' : undefined
-          if (item.kind === 'route') {
+      <div className="site-header-inner">
+        <Link className="brand" to="/" aria-label="Vibeface home">
+          <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
+          <span>Vibeface</span>
+        </Link>
+        <nav aria-label="Primary navigation">
+          {NAV.map((item) => {
+            const active = navActive(pathname, item)
+            const className = active ? 'is-active' : undefined
+            if (item.kind === 'route') {
+              return (
+                <Link key={item.label} className={className} to={item.to} params={{ _splat: item.splat }}>
+                  {item.label}
+                </Link>
+              )
+            }
             return (
-              <Link key={item.label} className={className} to={item.to} params={{ _splat: item.splat }}>
+              <a key={item.label} className={className} href={item.href}>
                 {item.label}
-              </Link>
+              </a>
             )
-          }
-          return (
-            <a key={item.label} className={className} href={item.href}>
-              {item.label}
-            </a>
-          )
-        })}
+          })}
+        </nav>
         <ThemeToggle />
-      </nav>
+      </div>
     </header>
   )
 }
