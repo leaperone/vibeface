@@ -71,7 +71,7 @@ W 是本机最多两个活动 claim 和一个历史复查槽的调度界；每�
 
 publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变签名 attempt。四种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、ExpiredUnrevealed。签好 raw 仍是私密状态。
 
-任何含 E 的 estimateGas、eth_call、simulation 都被禁止。有限两窗 reveal 使用离线固定 800000 gas：没有 verifier 调用，每项固定 80 字节及有界 storage/事件；相关真实有限形状和合成账务用例检查该上界。runtime 改变时须重新核对，不能用真实 E 去估算。首次外发前检查原 cap、原生币余额、固定 fee 足额和无低 nonce 阻塞；raw、nonce、claim 关联原子落盘。紧邻首次可能含 E 的 RPC 再检查 `now + W + I + F + S < economic_cutoff`，耐久记录可能披露，之后才广播。RPC 超时或错误仍是 Outstanding，不能按失败另付。
+产品 publication 路径禁止任何含 E 的 estimateGas、eth_call、simulation。公开固定材料的 `experiment-delivery.mjs` 故障对照会故意调用 `revealBatch.staticCall` 并绕过 Node gate；这些原始提前披露/回滚反例不构成产品 gate 通过，也不改写旧 FAIL。有限两窗 reveal 使用离线固定 800000 gas：没有 verifier 调用，每项固定 80 字节及有界 storage/事件；相关真实有限形状和合成账务用例检查该上界。runtime 改变时须重新核对，不能用真实 E 去估算。首次外发前检查原 cap、原生币余额、固定 fee 足额和无低 nonce 阻塞；raw、nonce、claim 关联原子落盘。紧邻首次可能含 E 的 RPC 再检查 `now + W + I + F + S < economic_cutoff`，耐久记录可能披露，之后才广播。RPC 超时或错误仍是 Outstanding，不能按失败另付。
 
 已可能披露的同一 claim 恢复只受原经济截止和原累计授权限制，不重新套完整首次余量；否则合法披露后的临界回滚会被本机错误阻断。canonical revert 消耗 nonce 后，先对账所有原 attempt 和窗口，再按同一 claim、固定收款人及原总 cap 生成新 nonce attempt。未知、pending nonce 前进都不证明失败。当前固定费率模式没有同 nonce 自动加价/替换承诺；原 raw 可在回滚后原 nonce 合法时原样重播。
 
@@ -98,4 +98,4 @@ R 拒绝 Hold 时没有 delivery earned，预算到期可退，P 的资源支出
 
 原 fee5 公益拒签、genuine17 提前披露/退款失败保留在固定旧源码及任务证据中，不因新名称变成通过。新 fee5 必须创建发送前选择的新 paid 订单并产生对应 genuine Source/Hold；旧17不能改成5，也不能变成不同订单的第二窗。最小两单样本需要一份 KeyBinding、A/B 各一份 Source/Hold，共五份真实证明。必须实际观察 reserve/hold/reveal 各自含两个不同 slot、payer 离线、R 恢复原文件及预算累计真实提款。
 
-旧 `--delivery-channel` 和 Strict/13-proof live 协议已撤下；旧 `verify-node.py --delivery`/`run-delivery-live.py` 明确拒绝原启动方式。正式 native 入口是 `run-delivery-live.py --protected-config <owner-only-final-config>`，也可使用 `verify-node.py --delivery-protected`；配置、资源和命令见 [e2e](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 只自检配置与公开证据边界，不启动进程或证明。genuine5/双单运行、实际重启、渲染及制品证据必须分别完成；只读 schema2 observer、genuine17 重验或本地单元通过不能替代这些覆盖。
+旧 `--delivery-channel` 和 Strict/13-proof live 协议已撤下；旧 `verify-node.py --delivery`/`run-delivery-live.py` 明确拒绝原启动方式。正式 native 入口是 `run-delivery-live.py --protected-package <same-head-linux-package> --source-commit <HEAD>`，由宿主或默认关闭的手动 CI 共用；已准备受限环境和核验制品时，也可使用低层 `--protected-config` 或 `verify-node.py --delivery-protected`；配置、资源和命令见 [e2e](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 只自检配置与公开证据边界，不启动进程或证明。genuine5/双单运行、实际重启、渲染及制品证据必须分别完成；只读 schema2 observer、genuine17 重验或本地单元通过不能替代这些覆盖。

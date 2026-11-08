@@ -665,20 +665,28 @@ impl Delivery {
         &self,
         order: &Order,
     ) -> Result<(chain::OrderState, budget::BudgetSnapshot)> {
+        let chain = self.chain().await?;
+        let position = chain.confirmed_position().await?;
+        self.paid_state_at(&chain, &position, order).await
+    }
+    pub(super) async fn paid_state_at(
+        &self,
+        chain: &chain::Chain,
+        position: &chain::ChainPosition,
+        order: &Order,
+    ) -> Result<(chain::OrderState, budget::BudgetSnapshot)> {
         ensure!(
             order.unsigned.terms.acceptance == vibeface_delivery::Acceptance::Recoverable,
             "protected delivery supports Recoverable only"
         );
-        let chain = self.chain().await?;
         let id = order.unsigned.terms.order_id()?;
-        let position = chain.confirmed_position().await?;
-        let state = chain.order_at(&position, id).await?;
-        let budget_id = chain.order_budget_at(&position, id).await?;
+        let state = chain.order_at(position, id).await?;
+        let budget_id = chain.order_budget_at(position, id).await?;
         ensure!(
             budget_id != [0; 32],
             "paid delivery has no irrevocable protected allocation"
         );
-        let budget = chain.budget_at(&position, budget_id.into()).await?;
+        let budget = chain.budget_at(position, budget_id.into()).await?;
         ensure!(
             state.windows.len() == order.unsigned.windows.len()
                 && state.payer == chain::address_hex(order.unsigned.terms.payer.into())
@@ -692,13 +700,13 @@ impl Delivery {
         for window in &order.unsigned.windows {
             ensure!(
                 chain
-                    .public_values_at(&position, id, window.index, Relation::Source)
+                    .public_values_at(position, id, window.index, Relation::Source)
                     .await?
                     == Statement::window(&order.unsigned, window.index, Relation::Source)?,
                 "chain public values differ from the signed order"
             );
         }
-        chain.verify_position(&position).await?;
+        chain.verify_position(position).await?;
         Ok((state, budget))
     }
     pub(super) async fn run_provider(&self) -> Result<()> {
@@ -792,7 +800,10 @@ impl Delivery {
     }
 }
 
-fn apply_paid_snapshot(view: &mut DeliveryOrder, state: &chain::OrderState) -> Result<()> {
+pub(super) fn apply_paid_snapshot(
+    view: &mut DeliveryOrder,
+    state: &chain::OrderState,
+) -> Result<()> {
     ensure!(
         !state.windows.is_empty() && state.windows.len() == view.windows.len(),
         "chain delivery window coverage changed"

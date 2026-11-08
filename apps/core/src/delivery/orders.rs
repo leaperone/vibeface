@@ -8,6 +8,13 @@ struct SourceDraft {
     binding_signature: vibeface_delivery::PeerSignature,
     randomness: Vec<WindowRandomness>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum AllocationRecovery {
+    Unallocated,
+    Pending,
+    Allocated,
+}
 #[derive(Deserialize)]
 pub(super) struct Announcement {
     pub peer_id: String,
@@ -946,6 +953,96 @@ impl Delivery {
         })?;
         Ok(stored)
     }
+    async fn recover_allocation(
+        &self,
+        chain: &chain::Chain,
+        order: &mut StoredOrder,
+    ) -> Result<AllocationRecovery> {
+        let budget_id = order
+            .view
+            .payment
+            .budget_id
+            .as_deref()
+            .context("protected budget missing")?;
+        let ids = if order.allocation_batch.is_empty() {
+            vec![order.view.order_id.clone()]
+        } else {
+            order.allocation_batch.clone()
+        };
+        let transaction_id = format!(
+            "budget-{budget_id}/reserve-{}",
+            hex::encode(hash(&serde_json::to_vec(&ids)?))
+        );
+        let transaction = self.with_store(|store| store.find_transaction(&transaction_id))?;
+        let position = chain.confirmed_position().await?;
+        let expected_budget = parse_word(budget_id)?;
+        let mut batch = Vec::new();
+        let mut allocated = 0;
+        for id in &ids {
+            let pending = self.with_store(|store| store.order(id))?;
+            ensure!(
+                pending.confirmed
+                    && pending.view.role == Role::Sender
+                    && pending.allocation_batch == order.allocation_batch
+                    && pending.view.payment.budget_id.as_deref() == Some(budget_id),
+                "confirmed source batch changed"
+            );
+            let actual = chain.order_budget_at(&position, parse_word(id)?).await?;
+            ensure!(
+                actual == [0; 32] || actual == expected_budget,
+                "order allocation belongs to another budget"
+            );
+            allocated += usize::from(actual == expected_budget);
+            batch.push(pending);
+        }
+        ensure!(
+            allocated == 0 || allocated == batch.len(),
+            "original allocation batch is only partially observed; reconcile before spending"
+        );
+        if allocated == batch.len() {
+            for pending in &mut batch {
+                let (state, budget) = self.paid_state_at(chain, &position, &pending.order).await?;
+                ensure!(
+                    budget.terms.budget_id == budget_id,
+                    "original allocation budget changed"
+                );
+                provider::apply_paid_snapshot(&mut pending.view, &state)?;
+                pending.view.payment.tx_hash = transaction
+                    .as_ref()
+                    .and_then(|tx| tx.tx_hash.clone())
+                    .or_else(|| pending.view.payment.tx_hash.clone());
+                pending.view.error = None;
+                pending.view.updated_at_ms = crate::runtime::now_ms();
+            }
+            chain.verify_position(&position).await?;
+            self.with_store(|store| store.save_authorized_batch(&batch))?;
+            *order = batch
+                .into_iter()
+                .find(|item| item.view.order_id == order.view.order_id)
+                .context("original order missing from allocation batch")?;
+            return Ok(AllocationRecovery::Allocated);
+        }
+        chain.verify_position(&position).await?;
+        if let Some(transaction) = transaction.filter(|tx| tx.raw_tx.is_some()) {
+            let observed = chain.observe(&transaction).await;
+            if !observed.as_ref().is_ok_and(|value| {
+                matches!(value.phase.as_str(), "reverted" | "conflicted" | "failed")
+            }) {
+                order.view.payment.tx_hash = transaction.tx_hash;
+                order.view.chain_unknown();
+                self.save(order)?;
+                return Ok(AllocationRecovery::Pending);
+            }
+        }
+        ensure!(
+            batch
+                .iter()
+                .all(|pending| position.timestamp <= pending.order.unsigned.terms.quote_expires_at),
+            "quotation expired; no new allocation will be submitted"
+        );
+        Ok(AllocationRecovery::Unallocated)
+    }
+
     pub(super) async fn confirm(
         &self,
         node: &Runtime,
@@ -964,11 +1061,12 @@ impl Delivery {
             return self.reconcile(node, order).await;
         }
         if order.view.mode == Mode::Paid {
-            ensure!(
-                self.chain().await?.confirmed_position().await?.timestamp
-                    <= order.order.unsigned.terms.quote_expires_at,
-                "quotation expired; this intent will not be paid"
-            );
+            let chain = self.chain().await?;
+            match self.recover_allocation(&chain, &mut order).await? {
+                AllocationRecovery::Allocated => return self.reconcile(node, order).await,
+                AllocationRecovery::Pending => return Ok(order),
+                AllocationRecovery::Unallocated => {}
+            }
             let config = self.config();
             let prover = config.prover.context("paid prover is not configured")?;
             if order.source_seals.len() < order.order.unsigned.windows.len() {
@@ -1130,4 +1228,258 @@ pub(super) fn view(
         updated_at_ms: crate::runtime::now_ms(),
         error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use alloy_sol_types::{SolCall, SolValue};
+    use std::collections::BTreeMap;
+
+    #[allow(dead_code)]
+    mod support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/delivery/examples/support/mod.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_reservation_recovers_both_original_orders_after_quote_expiry_without_new_payment()
+    -> Result<()> {
+        let mut config = chain::tests::config();
+        config.escrow = format!("0x{}", "44".repeat(20));
+        config.asset = format!("0x{}", "33".repeat(20));
+        let original = support::fixture_with_profile(&[4], config.profile.clone());
+        let mut orders = Vec::new();
+        for nonce in [1, 2, 3] {
+            let mut terms = original.order.unsigned.terms.clone();
+            terms.payer_order_nonce = [nonce; 32];
+            let fixture = support::fixture_from_terms(
+                config.profile.clone(),
+                terms,
+                vec![SecretBytes::new(vec![nonce; 4])],
+                Amount::from_u64(2),
+                Amount::from_u64(1),
+            );
+            let order = fixture.order;
+            let intent = uuid::Uuid::new_v4().to_string();
+            let mut view = view(&intent, Role::Sender, Mode::Paid, &order, 4)?;
+            view.payment.budget_id = Some("77".repeat(32));
+            view.chain_unknown();
+            let mut source_seal = vec![0x22; 260];
+            source_seal[..4].copy_from_slice(&[0x73, 0xc4, 0x57, 0xba]);
+            orders.push(StoredOrder {
+                network_id: Some("fixture-network".into()),
+                authorized_by: Some("fixture-member".into()),
+                confirmed: true,
+                resume_requested: true,
+                request_hash: "88".repeat(32),
+                view,
+                order,
+                wallet_signature: vec![0x11; 65],
+                source_seals: vec![source_seal],
+                grants: Vec::new(),
+                accepted: false,
+                notified: false,
+                allocation_batch: Vec::new(),
+            });
+        }
+        let ids: Vec<_> = orders[..2]
+            .iter()
+            .map(|order| order.view.order_id.clone())
+            .collect();
+        for order in &mut orders[..2] {
+            order.allocation_batch = ids.clone();
+        }
+        let budget_id = B256::repeat_byte(0x77);
+        let mut responses = BTreeMap::<String, Value>::new();
+        let encoded = |value: Vec<u8>| json!(format!("0x{}", hex::encode(value)));
+        for (index, order) in orders.iter().enumerate() {
+            let id = B256::from(parse_word(&order.view.order_id)?);
+            responses.insert(
+                hex::encode(chain::abi::orderBudgetCall { id }.abi_encode()),
+                encoded(if index < 2 { budget_id } else { B256::ZERO }.abi_encode()),
+            );
+            if index >= 2 {
+                continue;
+            }
+            let statement = Statement::window(&order.order.unsigned, 0, Relation::Source)?;
+            let terms = chain::abi::DeliveryStatement::abi_decode(statement.abi_bytes())?;
+            let spec = &order.order.unsigned.windows[0];
+            let state = chain::abi::ChainOrder {
+                terms,
+                windows: vec![chain::abi::ChainWindow {
+                    spec: chain::abi::WindowSpec {
+                        index: 0,
+                        offset: 0,
+                        plaintextBytes: 4,
+                        ciphertextBytes: 72,
+                        ciphertextHash: spec.ciphertext_hash.into(),
+                        capsuleHash: spec.capsule_hash.into(),
+                        plaintextCommitment: spec.plaintext_commitment.into(),
+                        deliveryFee: U256::from(2),
+                        reservationFee: U256::from(1),
+                    },
+                    phase: 0,
+                    decryptionProven: false,
+                    capsule: Vec::new().into(),
+                }],
+                earned: U256::ZERO,
+                withdrawn: U256::ZERO,
+                refunded: U256::ZERO,
+                earnedWindows: 0,
+                refundedWindows: 0,
+                assetDecimals: 6,
+                bonusEarned: false,
+                bonusRefunded: false,
+            };
+            responses.insert(
+                hex::encode(chain::abi::getOrderCall { id }.abi_encode()),
+                encoded(chain::abi::getOrderCall::abi_encode_returns(&state)),
+            );
+            responses.insert(
+                hex::encode(
+                    chain::abi::publicValuesCall {
+                        id,
+                        index: 0,
+                        relation: 2,
+                    }
+                    .abi_encode(),
+                ),
+                encoded(chain::abi::publicValuesCall::abi_encode_returns(
+                    &chain::abi::DeliveryStatement::abi_decode(statement.abi_bytes())?,
+                )),
+            );
+        }
+        let budget = chain::abi::ChainBudget {
+            payer: Address::repeat_byte(0x11),
+            payee: Address::repeat_byte(0x22),
+            providerPeer: orders[0].order.unsigned.terms.provider_peer.into(),
+            asset: Address::repeat_byte(0x33),
+            deposit: U256::from(8),
+            locked: U256::from(8),
+            earned: U256::ZERO,
+            withdrawn: U256::ZERO,
+            refunded: U256::ZERO,
+            maxClaimUntil: 400,
+            assetDecimals: 6,
+            state: 1,
+        };
+        responses.insert(
+            hex::encode(chain::abi::getBudgetCall { id: budget_id }.abi_encode()),
+            encoded(chain::abi::getBudgetCall::abi_encode_returns(&budget)),
+        );
+        let rpc = chain::tests::rpc_fixture(config, move |request| match request["method"].as_str().unwrap() {
+            "eth_blockNumber" => json!("0xb"),
+            "eth_getBlockByNumber" => json!({"number":"0xa","hash":format!("0x{}","55".repeat(32)),"timestamp":"0xc9"}),
+            "eth_call" => responses.get(request["params"][0]["data"].as_str().unwrap().strip_prefix("0x").unwrap()).cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        }).await?;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("allocation-recovery-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(rpc.chain.config().clone()),
+            ..Default::default()
+        })?;
+        for order in &orders {
+            delivery.with_store(|store| store.save_order(order))?;
+        }
+        let mut intent = chain::tests::approval_intent(Address::repeat_byte(0x11))?;
+        intent.id = format!(
+            "budget-{}/reserve-{}",
+            "77".repeat(32),
+            hex::encode(hash(&serde_json::to_vec(&ids)?))
+        );
+        let (target, calldata) = budget::BudgetAction::Reserve {
+            budget_id: budget_id.into(),
+            reservations: orders[..2]
+                .iter()
+                .map(|order| budget::Reservation {
+                    order: order.order.clone(),
+                    source_seals: order.source_seals.clone(),
+                    wallet_signature: order.wallet_signature.clone(),
+                })
+                .collect(),
+        }
+        .encode(rpc.chain.config(), Address::repeat_byte(0x11))?;
+        intent.to = chain::address_hex(target);
+        intent.calldata = format!("0x{}", hex::encode(calldata));
+        let transaction_id = intent.id.clone();
+        delivery.with_store(|store| {
+            store.reserve_budget_transaction(
+                &intent,
+                7,
+                &format!("budget-{}", "77".repeat(32)),
+                &intent.gas_cap,
+            )?;
+            store.sign_transaction(&transaction_id, "0x02", &format!("0x{}", "99".repeat(32)))?;
+            store.observe_transaction(
+                &transaction_id,
+                "unknown",
+                None,
+                None,
+                Some("synthetic lost allocation response"),
+            )
+        })?;
+        let before = delivery.with_store(|store| store.transaction(&transaction_id))?;
+        let mut recovering = orders[0].clone();
+        assert_eq!(
+            delivery
+                .recover_allocation(&rpc.chain, &mut recovering)
+                .await?,
+            AllocationRecovery::Allocated
+        );
+        for id in &ids {
+            let restored = delivery.with_store(|store| store.order(id))?;
+            assert_eq!(restored.view.phase, Phase::Funded);
+            assert_eq!(restored.allocation_batch, ids);
+            assert_eq!(restored.view.payment.tx_hash, before.tx_hash);
+            assert_eq!(restored.source_seals, orders[0].source_seals);
+            assert_eq!(restored.order.unsigned.terms.quote_expires_at, 200);
+        }
+        assert_eq!(
+            delivery.with_store(|store| store.transaction(&transaction_id))?,
+            before,
+            "restoring canonical allocations must preserve the original nonce, raw, cap and transaction identity"
+        );
+        let mut expired = orders[2].clone();
+        assert!(
+            delivery
+                .recover_allocation(&rpc.chain, &mut expired)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no new allocation")
+        );
+        assert_eq!(
+            delivery
+                .with_store(|store| store.order(&expired.view.order_id))?
+                .view
+                .phase,
+            Phase::Reconciling
+        );
+        assert!(rpc.requests.lock().unwrap().iter().all(|request| matches!(
+            request["method"].as_str(),
+            Some("eth_blockNumber" | "eth_getBlockByNumber" | "eth_call")
+        )));
+        let database = rusqlite::Connection::open_with_flags(
+            dir.join("delivery/service.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        assert_eq!(
+            database.query_row("SELECT count(*) FROM transactions", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        drop(database);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }

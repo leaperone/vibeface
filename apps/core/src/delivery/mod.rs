@@ -295,16 +295,19 @@ impl Delivery {
             let _ = executor.await;
         }
     }
-    pub(crate) async fn authorize_spend(&self, intent: &str) -> Result<()> {
+    pub(crate) async fn authorize_spend(
+        &self,
+        intent: &str,
+        chain: &chain::ChainConfig,
+    ) -> Result<()> {
         self.ensure_mode(Mode::Paid)?;
         let group = intent
             .split('/')
             .next()
             .context("spend intent has no order")?;
         if group.starts_with("budget-") {
-            return self.authorize_budget_spend(intent).await;
-        }
-        if let Some(serial) = group.strip_prefix("key-") {
+            self.authorize_budget_spend(intent, chain).await?;
+        } else if let Some(serial) = group.strip_prefix("key-") {
             ensure!(
                 !serial.is_empty()
                     && self
@@ -312,23 +315,28 @@ impl Delivery {
                         .is_some(),
                 "key registration requires a local owner intent"
             );
-            return Ok(());
+        } else {
+            let order = self.with_store(|store| store.order(group))?;
+            if order.view.role != Role::Provider || order.network_id.is_some() {
+                let actor = order
+                    .authorized_by
+                    .context("delivery spend has no managing member authorization")?;
+                self.authorize_effect(
+                    order
+                        .network_id
+                        .as_deref()
+                        .context("delivery spend has no network")?,
+                    &actor,
+                )
+                .await?;
+            }
         }
-        let order = self.with_store(|store| store.order(group))?;
-        if order.view.role == Role::Provider && order.network_id.is_none() {
-            return Ok(());
-        }
-        let actor = order
-            .authorized_by
-            .context("delivery spend has no managing member authorization")?;
-        self.authorize_effect(
-            order
-                .network_id
-                .as_deref()
-                .context("delivery spend has no network")?,
-            &actor,
-        )
-        .await
+        let current = self.config();
+        ensure!(
+            current.enabled && current.paid_enabled && current.chain.as_ref() == Some(chain),
+            "delivery configuration changed; preserve the original transaction for read-only reconciliation"
+        );
+        Ok(())
     }
     pub(super) async fn authorize_effect(&self, network: &str, actor: &str) -> Result<()> {
         let runtime = self

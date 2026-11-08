@@ -125,7 +125,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
       {delivery.budgets.map(budget => <View key={budget.budget_id} className="gap-2">
         <Info label="预算" value={budget.budget_id} />
         <Info label="可分配 / 已占用" value={`${budget.free} / ${budget.locked}`} />
-        <Info label="已收到待批次核验的窗口" value={budget.ready_windows.length.toString()} />
+        <Info label="已收到待结算的文件片段" value={budget.ready_windows.length.toString()} />
         <Info label="累计赚取 / 提款 / 退款" value={`${budget.earned} / ${budget.withdrawn} / ${budget.refunded}`} />
         {budget.payee.toLowerCase() === status?.wallet.address?.toLowerCase() ? <Button variant="outline" disabled={working || budget.ready_windows.length === 0 || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onPress={() => { setOrigin('page'); void delivery.flushBudget(budget.budget_id) }}><Text>结算已就绪批次（最多两窗）</Text></Button> : null}
       </View>)}

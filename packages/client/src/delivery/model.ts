@@ -81,7 +81,7 @@ export function parseBudgets(value: unknown): DeliveryBudget[] {
       ready_windows: array(b.ready_windows).map(item => { const window = record(item); return { order_id: peer(window.order_id), index: integer(window.index, 1) } }) }
     if (BigInt(budget.free) + BigInt(budget.locked) + BigInt(budget.earned) + BigInt(budget.refunded) !== BigInt(budget.deposit)
       || BigInt(budget.withdrawn) > BigInt(budget.earned) || budget.payer.toLowerCase() === budget.payee.toLowerCase()) throw new Error('预算账目或固定收付款人对不上。')
-    if (budget.ready_windows.length > 256 || new Set(budget.ready_windows.map(window => `${window.order_id}:${window.index}`)).size !== budget.ready_windows.length) throw new Error('待结算窗口重复或超过设备容量。')
+    if (budget.ready_windows.length > 256 || new Set(budget.ready_windows.map(window => `${window.order_id}:${window.index}`)).size !== budget.ready_windows.length) throw new Error('待结算文件片段重复或超过设备容量。')
     return budget
   })
   if (new Set(budgets.map(b => b.budget_id)).size !== budgets.length) throw new Error('预算列表包含重复记录。')
@@ -181,7 +181,7 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
 }
 
 export const phaseLabels: Record<DeliveryPhase, string> = {
-  prepared: '待确认', funding_pending: '正在分配预算', proving: '正在确认付款条件', funded: '预算已占用', transferring: '传输中', cipher_held: '密文已收到，等待批次解锁', key_published: '正在解锁',
+  prepared: '待确认', funding_pending: '正在分配预算', proving: '正在确认付款条件', funded: '预算已占用', transferring: '传输中', cipher_held: '文件已收到，等待批次解锁', key_published: '正在解锁',
   recoverable: '已送达', paid: '已完成', partial: '部分完成', refundable: '可以退款', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
 }
 export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '还没送达', charity_receipt: '对方已收到', ciphertext_held: '对方已收到，还没解锁', recoverable: '对方可以打开', decryption_proven: '对方已打开' }
@@ -199,8 +199,8 @@ export function publicationLabel(order: DeliveryOrder): string {
   if (settlementUncertain(order)) return '批次状态待确认，请检查原交易'
   const publication = order.payment.settlement?.publication
   if (!publication) {
-    if (BigInt(order.payment.earned) > 0n) return '本单链上已赚取'
-    if (BigInt(order.payment.refunded) > 0n) return '本单链上已退款'
+    if (BigInt(order.payment.earned) > 0n) return '本单费用已赚取'
+    if (BigInt(order.payment.refunded) > 0n) return '本单费用已退款'
     return '等待中转设备结算已就绪批次'
   }
   switch (publication.state) {
@@ -294,7 +294,7 @@ export const transferCopy = {
   gasCap: '预算累计链费上限',
   serviceTotal: '服务费合计',
   units: '金额按测试代币和测试链原生币的最小单位计。',
-  protected: '发送前不可撤销地占用预算；接收方证明持有正确密文后，中转设备按批次公开恢复材料并赚取费用，无需发送方再签名。可恢复不表示真人已读。',
+  protected: '文件全程加密。发送前会不可撤销地占用预算。接收设备完成文件完整性检查后，中转设备按批次解锁文件并赚取费用，发送设备无需再次确认。可恢复不表示真人已读。',
   walletFirst: '先在发送设备本机创建或解锁钱包，再刷新。',
   unknownPayment: '付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。',
   walletDetails: '钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。',

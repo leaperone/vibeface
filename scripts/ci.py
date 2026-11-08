@@ -679,6 +679,14 @@ def self_test():
     package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert "    needs: [plan, crypto-web, web]\n" in package
     assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
+    live_input = workflow.split("      delivery_live:\n", 1)[1].split("      delivery_small:", 1)[0]
+    assert "type: boolean" in live_input and "default: false" in live_input
+    live = re.search(r"(?ms)^  delivery-live:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "github.event_name == 'workflow_dispatch' && inputs.delivery_live" in live
+    assert "needs: [plan, package, crypto-web, web]" in live
+    assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live
+    assert all(retired not in live for retired in ("--package ", "--android ", "delivery-android", "ffmpeg", "/dev/kvm", "continue-on-error"))
+    assert "path: ${{ steps.protected.outputs.public-directory }}" in live and "if-no-files-found: error" in live
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))

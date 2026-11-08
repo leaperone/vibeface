@@ -107,7 +107,7 @@ def checked_package(package, expected):
     return info
 
 
-def unpack_package(directory):
+def unpack_package(directory, destination=None):
     archives = list(directory.glob("*.tar.gz"))
     if len(archives) != 1:
         raise ValueError("Exactly one same-run Linux package archive is required")
@@ -115,7 +115,7 @@ def unpack_package(directory):
     checksum = regular(archive.with_name(archive.name + ".sha256")).decode().strip().split()
     if len(checksum) != 2 or checksum[0] != digest(archive) or checksum[1].lstrip("*") != archive.name:
         raise ValueError("Linux package archive checksum mismatch")
-    destination = ARTIFACTS / "live-input/unpacked"
+    destination = destination or ARTIFACTS / "live-input/unpacked"
     destination.mkdir(parents=True, exist_ok=False)
     with tarfile.open(archive) as contents:
         members = contents.getmembers()
@@ -2269,7 +2269,193 @@ def self_test():
             else:
                 raise AssertionError("A different crypto artifact must fail")
     assert len(PROOFS) == len(set(PROOFS)) == 7
-    print("Live dispatch, APK/ABI, UI/video evidence, process join/cleanup, capacity, OOM and GLIBC self-tests passed; no Android, UI, recording, container or proof ran")
+    self_test_protected(original)
+    print("Live artifact and protected dispatch/export self-tests passed; no Node, Android, UI, container or proof ran")
+
+
+def protected_container(original, package, expected, run, common, git_directory, name):
+    relative_git = git_directory.relative_to(common)
+    for value in (ROOT, ROOT / ".git", common):
+        if "," in str(value):
+            raise ValueError("Docker bind paths cannot contain commas")
+    result = original[:-4]
+    result += ["--name", name, "--user", f"{os.getuid()}:{os.getgid()}", "--mount", f"type=bind,source={ROOT / '.git'},target=/work/.git,readonly",
+               "--mount", f"type=bind,source={common},target=/git-common,readonly"]
+    for key, value in {
+        "TOKIO_WORKER_THREADS": "2", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_DIR": str(Path("/git-common") / relative_git), "GIT_WORK_TREE": "/work",
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "/work",
+    }.items():
+        result += ["--env", key + "=" + value]
+    return result + [original[-4], "python3", "scripts/run-delivery-live.py", "--protected-inside",
+        "--protected-package", str(Path("/work") / package.relative_to(ROOT)), "--source-commit", expected,
+        "--protected-run-dir", str(Path("/work") / run.relative_to(ROOT))]
+
+
+def protected_public(run, expected, returncode):
+    source, output = run / "native/public", run / "public"
+    files = {"progress.json", "before-source-offline.json", "confirmed-chain.json", "settlement.json", "settlement-observation.json"}
+    progress = None
+    if (source / "progress.json").exists():
+        progress = json.loads(regular(source / "progress.json", 131072))
+        if progress.get("source_commit") != expected or progress.get("scope") != "fresh-two-order-protected-native-only":
+            raise ValueError("Protected evidence differs from the expected source or scope")
+        for fact in progress["genuine_receipts"]:
+            public, receipt = fact["public"], fact["receipt"]
+            basename = "key-binding" if fact["relation"] == 1 else f"order-{fact['orderId'][2:]}-relation-{fact['relation']}-window-{fact['windowIndex']}"
+            if not re.fullmatch(r"key-binding|order-[0-9a-f]{64}-relation-[23]-window-0", basename) or public != basename + ".json" or receipt != basename + ".receipt":
+                raise ValueError("Protected proof export has an unexpected public filename")
+            if fact.get("official_host_verified") is not True or fact.get("wrong_journal_receipt_comparison_rejected") is not True:
+                raise ValueError("Only independently verified binary receipts may be exported")
+            if digest(source / receipt) != fact["receiptSha256"] or json.loads(regular(source / public, 16384))["journalHash"] != fact["journalHash"]:
+                raise ValueError("Protected receipt or metadata changed after verification")
+            files.update((public, receipt))
+        if any(path.name not in files or path.is_symlink() or not path.is_file() for path in source.iterdir()):
+            raise ValueError("Protected public directory contains an unapproved file")
+        if progress["status"] == "PASS":
+            facts = progress["genuine_receipts"]
+            sources = {fact["orderId"] for fact in facts if fact["relation"] == 2}
+            holds = {fact["orderId"] for fact in facts if fact["relation"] == 3}
+            if len(facts) != 5 or sum(fact["relation"] == 1 for fact in facts) != 1 or len(sources) != 2 or sources != holds:
+                raise ValueError("Protected native success requires five verified receipts for two distinct orders")
+    provenance = json.loads(regular(run / "artifact-provenance.json")) if (run / "artifact-provenance.json").exists() else None
+    resource = json.loads(regular(run / "resources.json")) if (run / "resources.json").exists() else None
+    if provenance is not None and provenance.get("sourceCommit") != expected:
+        raise ValueError("Protected artifact provenance differs from the final source")
+    passed = returncode == 0 and progress is not None and progress["status"] == "PASS" and provenance is not None and provenance["status"] == "PASS" and resource is not None and resource["status"] == "PASS"
+    if output.is_symlink(): raise ValueError("Protected export cannot follow a symlink")
+    output.mkdir(mode=0o755, exist_ok=True)
+    output.chmod(0o755)
+    if progress is not None:
+        for name in files:
+            if (source / name).exists(): publish_file(source / name, output / name, 131072)
+    for name in ("artifact-provenance.json", "resources.json"):
+        if (run / name).exists(): publish_file(run / name, output / name, 131072)
+    replace_public(output / "summary.json", {"schemaVersion": 1, "status": "PASS" if passed else "FAIL", "sourceCommit": expected,
+        "scope": "fresh-two-order-protected-native-only", "genuineReceipts": len(progress["genuine_receipts"]) if progress else 0,
+        "nativeStatus": progress["status"] if progress else "UNVERIFIED", "containerExitCode": returncode,
+        "notChecked": ["rendered Web or Android UI", "old fee5 identical bytes or maximum capacity", "forced reorg/nonce-revert/near-cutoff/token faults", "public chain or real assets"]})
+    return output, passed
+
+
+def protected_package_dispatch(package_input, expected, run_directory):
+    source_commit(expected)
+    if "trash" in str(package_input).lower() or run_directory is not None and "trash" in str(run_directory).lower():
+        raise ValueError("Forbidden protected artifact path")
+    package_input = package_input.resolve(strict=True)
+    if not package_input.is_relative_to(ROOT / ".artifacts"):
+        raise ValueError("Protected package inputs stay in this task's .artifacts")
+    run = (run_directory or ARTIFACTS / "protected-runs" / uuid.uuid4().hex).resolve()
+    if not run.is_relative_to(ROOT / ".artifacts") or run.exists():
+        raise ValueError("Protected acceptance requires a fresh task artifact directory")
+    run.mkdir(mode=0o700, parents=True)
+    package = package_input if (package_input / "BUILD-INFO.json").exists() else unpack_package(package_input, run / "package")
+    checked_package(package, expected)
+    common = Path(subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip()).resolve()
+    git_directory = Path(subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], cwd=ROOT, text=True).strip()).resolve()
+    checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
+    for name in ("cargo", "risc0", "canonical"): (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="protected-build-context-", dir=ARTIFACTS) as directory:
+        context = Path(directory)
+        for name in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
+            target = context / name; target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / name, target)
+        build, original = checks["sandbox_commands"](context)
+        command("build canonical protected sandbox", build, run / "host-private.log")
+    name = "vdp-protected-" + uuid.uuid4().hex
+    container = protected_container(original, package, expected, run, common, git_directory, name)
+    process = None
+    returncode = 1
+    try:
+        process = subprocess.Popen(container, cwd=ROOT, start_new_session=True)
+        returncode = process.wait()
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                subprocess.run(["docker", "stop", "--time", "20", name], capture_output=True, timeout=30)
+            removed = subprocess.run(["docker", "rm", "--force", name], capture_output=True, timeout=20)
+            if removed.returncode and not any(text in removed.stderr for text in (b"No such container", b"No such object")):
+                returncode = returncode or 1
+        except (OSError, subprocess.SubprocessError):
+            returncode = returncode or 1
+        finally:
+            terminate_owned(process)
+        public, passed = protected_public(run, expected, returncode)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output: output.write("public-directory=" + str(public) + "\n")
+        print(json.dumps({"event":"protected_native_result","status":"PASS" if passed else "FAIL","public_directory":str(public),"source_commit":expected}), flush=True)
+    if not passed:
+        raise RuntimeError("Protected native acceptance failed; verified public parts and private task diagnostics were retained")
+
+
+def protected_package_inside(package, expected, run):
+    os.umask(0o077)
+    if any("trash" in str(path).lower() for path in (package, run)) or not package.resolve().is_relative_to(ROOT / ".artifacts"):
+        raise ValueError("Forbidden protected artifact path")
+    source_commit(expected)
+    if os.environ.get("TOKIO_WORKER_THREADS") != "2" or any(name.startswith(("RISC0_DEV", "RISC0_SKIP")) for name in os.environ):
+        raise ValueError("Protected acceptance requires two Tokio workers and the official proof mode")
+    if not run.resolve().is_relative_to(ROOT / ".artifacts") or not run.is_dir() or (run / "native").exists():
+        raise ValueError("Protected sandbox requires its fresh task run directory")
+    _, initial = resources()
+    provenance = {"schemaVersion":1,"sourceCommit":expected,"status":"FAIL",
+        "runtimeIdentity":{"uid":os.getuid(),"gid":os.getgid(),"runDirectoryUid":run.stat().st_uid,
+            "rustupReadable":os.access(os.environ.get("RUSTUP_HOME","/usr/local/rustup"),os.R_OK),
+            "rustupWritable":os.access(os.environ.get("RUSTUP_HOME","/usr/local/rustup"),os.W_OK)}}
+    failure = None
+    environment = {**os.environ, "CARGO_BUILD_JOBS":"2", "TOKIO_WORKER_THREADS":"2", "VIBEFACE_APP_DIR":str(package / "web")}
+    log = run / "sandbox-private.log"
+    previous = signal.getsignal(signal.SIGTERM)
+    def interrupt(_signum, _frame): raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        for component in ("crypto", "web"): command("verify " + component + " inputs", ["python3","scripts/build-inputs.py","check",component], log, env=environment)
+        info = checked_package(package, expected)
+        binary, core, module = package / "vibeface", package / "vibeface-core", package / "web/vibeface_secure.js"
+        provenance["package"] = {"buildInfo":info,"binarySha256":digest(binary),"coreSha256":digest(core),"cryptoSha256":digest(module),"wasmSha256":digest(module.with_name("vibeface_secure_bg.wasm"))}
+        packaged_runtime = runtime(binary, module, run / "packaged-runtime", log, environment)
+        provenance["packageRuntime"] = "PASS" if packaged_runtime else "GLIBC_INCOMPATIBLE"
+        provenance["testedBinaryOrigin"] = "exact-head Linux package"
+        if not packaged_runtime:
+            flags = subprocess.check_output(["python3","scripts/release-rustflags.py"], cwd=ROOT, env={**environment,"CARGO_TARGET_DIR":"/artifacts/node-target"}, text=True).strip()
+            command("rebuild current CLI/Core after measured GLIBC incompatibility", ["cargo","+1.98.1","build","--release","--locked","-p","vibeface","-p","vibeface-core","--target-dir","/artifacts/node-target"], log,
+                env={**environment,"CARGO_ENCODED_RUSTFLAGS":flags})
+            binary, core = Path("/artifacts/node-target/release/vibeface"), Path("/artifacts/node-target/release/vibeface-core")
+            if not runtime(binary, module, run / "rebuilt-runtime", log, environment): raise RuntimeError("Current-source binaries cannot run in the canonical sandbox")
+            provenance["testedBinaryOrigin"] = "clean exact-head source rebuild after measured package GLIBC incompatibility"
+        command("install fixed guest compiler", ["python3","scripts/install-delivery-toolchain.py"], log, env=environment)
+        command("build official current guest and host", ["bash","crates/delivery/proof/build.sh"], log, env=environment)
+        prover, r0vm = Path("/artifacts/proof-target/release/vibeface-delivery-prover"), Path("/opt/vdp/bin/r0vm")
+        compiled = json.loads(subprocess.check_output([str(prover),"info"], cwd=ROOT, env=environment, timeout=30))
+        runpy.run_path(str(ROOT / "scripts/check-delivery.py"))["load_profile"](compiled)
+        command("install pinned local contract dependencies", ["node","contracts/delivery/install.mjs"], log, env=environment)
+        paths = {"repository":str(ROOT),"binary":str(binary),"core_binary":str(core),"crypto_module":str(module),"prover":str(prover),"r0vm":str(r0vm)}
+        hashes = {name:digest(Path(path)) for name,path in paths.items() if name != "repository"}
+        hashes.update(crypto_wasm=digest(module.with_name("vibeface_secure_bg.wasm")),profile=digest(ROOT / "crates/delivery/proof/profile.json"))
+        driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+        configuration = driver["validate_config"]({"schema_version":1,"source_commit":expected,"paths":paths,"sha256":hashes,"elf_sha256":compiled["elfSha256"],
+            "caps":{"deposit":"10","max_service_amount":"5","source_gas_cap_wei":driver["CAP"],"provider_gas_cap_wei":driver["CAP"],"register_key_gas_cap_wei":driver["CAP"],"native_funding_wei_each":str(10**19)},"publication_policy":driver["POLICY"]})
+        configuration_path = run / "configuration.json"
+        write_private(configuration_path, configuration)
+        provenance.update(testedArtifactSha256=hashes,guestInfo=compiled)
+        os.environ["VIBEFACE_APP_DIR"] = str(package / "web")
+        protected_dispatch(configuration_path, run / "native")
+        source_commit(expected)
+        provenance["status"] = "PASS"
+    except BaseException as error:
+        failure = error; provenance["failureCode"] = type(error).__name__
+    finally:
+        try:
+            _, final = resources(); delta = oom_delta(initial, final)
+            resource = {"status":"PASS" if not any(delta.values()) else "FAIL","initial":initial,"final":final,"oomDelta":delta,"scope":"entire protected sandbox including artifact preparation"}
+        except BaseException:
+            resource = {"status":"UNVERIFIED","initial":initial}
+        if resource["status"] != "PASS": provenance["status"] = "FAIL"
+        write_private(run / "artifact-provenance.json", provenance)
+        write_private(run / "resources.json", resource)
+        signal.signal(signal.SIGTERM, previous)
+    if failure is not None or provenance["status"] != "PASS":
+        raise RuntimeError("Protected sandbox failed; only independently verified partial evidence may be exported") from None
 
 
 def protected_dispatch(configuration, run_directory):
@@ -2284,6 +2470,84 @@ def protected_dispatch(configuration, run_directory):
     driver["delivery_protected_acceptance"](options)
 
 
+def self_test_protected(original):
+    from unittest.mock import Mock, patch
+    expected = "1" * 40
+    package, run = ROOT / ".artifacts/package", ROOT / ".artifacts/protected-run"
+    common = Path("/fixture/repository.git")
+    for git_directory in (common, common / "worktrees/task"):
+        command_line = protected_container(original, package, expected, run, common, git_directory, "protected-fixture")
+        mounts = [command_line[i+1] for i,item in enumerate(command_line) if item == "--mount"]
+        assert f"type=bind,source={common},target=/git-common,readonly" in mounts
+        assert f"type=bind,source={ROOT / '.git'},target=/work/.git,readonly" in mounts
+        environment = dict(command_line[i+1].split("=",1) for i,item in enumerate(command_line) if item == "--env")
+        assert environment["GIT_DIR"] == str(Path("/git-common") / git_directory.relative_to(common))
+        assert environment["GIT_WORK_TREE"] == "/work" and environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert environment["TOKIO_WORKER_THREADS"] == "2"
+        assert "VIBEFACE_DELIVERY_DEADLINE_UNIX_MS" not in environment
+        assert command_line[command_line.index("--user")+1] == f"{os.getuid()}:{os.getgid()}"
+        assert "--network" not in command_line and "--privileged" not in command_line
+        assert "--protected-package" in command_line and "--protected-inside" in command_line
+        assert "--android" not in command_line and "--package" not in command_line
+        assert command_line[command_line.index("--memory")+1] == command_line[command_line.index("--memory-swap")+1] == "11g"
+        assert command_line[command_line.index("--pids-limit")+1] == "64"
+    with tempfile.TemporaryDirectory(prefix="protected-stage-bound-selftest-", dir=ARTIFACTS) as temporary:
+        package = Path(temporary) / "package"; package.mkdir()
+        (package / "BUILD-INFO.json").write_text("{}")
+        run = Path(temporary) / "run"
+        process = Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
+        def forbidden(*_args, **_kwargs): raise AssertionError("stage-bound selfcheck opened a network socket")
+        with patch(f"{__name__}.source_commit"), patch(f"{__name__}.checked_package"), \
+             patch(f"{__name__}.command") as build, patch(f"{__name__}.protected_public", return_value=(run / "public", True)), \
+             patch("runpy.run_path", return_value={"sandbox_commands": lambda _context: (["synthetic", "build"], original)}), \
+             patch("subprocess.check_output", side_effect=[str(common) + "\n", str(common / "worktrees/task") + "\n"]), \
+             patch("subprocess.Popen", return_value=process), \
+             patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, b"", b"No such container")), \
+             patch("socket.socket", forbidden), patch("time.time", side_effect=[0, LIVE_TIMEOUT_SECONDS + 1]), \
+             patch.dict(os.environ, {"GITHUB_OUTPUT": ""}), patch("builtins.print"):
+            protected_package_dispatch(package, expected, run)
+        process.wait.assert_called_once_with()
+        assert "timeout" not in build.call_args.kwargs, "the native stages must not inherit the old UI total timeout"
+    driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
+    assert "BootstrapSite" in driver and "BootstrapSite" in driver["e2e_fixture"].__code__.co_names
+    def forbidden(*_args, **_kwargs): raise AssertionError("retired UI selfcheck started work")
+    with patch("subprocess.Popen", forbidden), patch("subprocess.run", forbidden), patch("socket.socket", forbidden):
+        try: driver["delivery_ui_selfcheck"](argparse.Namespace())
+        except ValueError as error: assert "retired" in str(error)
+        else: raise AssertionError("Retired UI selfcheck was accepted")
+    with tempfile.TemporaryDirectory(prefix="protected-export-selftest-", dir=ARTIFACTS) as temporary:
+        run = Path(temporary); public = run / "native/public"; public.mkdir(parents=True)
+        facts = []
+        for relation, order in [(1,None),(2,"ab"*32),(3,"ab"*32),(2,"cd"*32),(3,"cd"*32)]:
+            name = "key-binding" if relation == 1 else f"order-{order}-relation-{relation}-window-0"
+            receipt = public / (name+".receipt"); receipt.write_bytes(b"synthetic exporter selfcheck only: "+name.encode())
+            (public / (name+".json")).write_text(json.dumps({"journalHash":"a"*64}))
+            fact = {"relation":relation,"public":name+".json","receipt":name+".receipt","receiptSha256":digest(receipt),"journalHash":"a"*64,
+                "official_host_verified":True,"wrong_journal_receipt_comparison_rejected":True}
+            if order: fact.update(orderId="0x"+order,windowIndex=0)
+            facts.append(fact)
+        progress = {"source_commit":expected,"scope":"fresh-two-order-protected-native-only","status":"PASS","genuine_receipts":facts}
+        (public / "progress.json").write_text(json.dumps(progress))
+        (run / "artifact-provenance.json").write_text(json.dumps({"sourceCommit":expected,"status":"PASS"}))
+        (run / "resources.json").write_text(json.dumps({"status":"PASS"}))
+        unexpected = public / "private-runtime.json"; unexpected.write_text("synthetic forbidden file")
+        try: protected_public(run, expected, 0)
+        except ValueError: pass
+        else: raise AssertionError("Private files entered the public export")
+        unexpected.unlink()
+        facts[0]["official_host_verified"] = False; (public / "progress.json").write_text(json.dumps(progress))
+        try: protected_public(run, expected, 0)
+        except ValueError: pass
+        else: raise AssertionError("Unverified receipts entered the public export")
+        facts[0]["official_host_verified"] = True; (public / "progress.json").write_text(json.dumps(progress))
+        output, passed = protected_public(run, expected, 0)
+        assert passed and (output / "key-binding.receipt").read_bytes().startswith(b"synthetic exporter selfcheck")
+        assert not (output / "configuration.json").exists() and not (output / "private-runtime.json").exists()
+        assert (output / "key-binding.receipt").stat().st_mode & 0o777 == 0o644
+        _, passed = protected_public(run, expected, 1)
+        assert not passed and json.loads((output / "summary.json").read_text())["status"] == "FAIL"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path)
@@ -2296,9 +2560,20 @@ if __name__ == "__main__":
     parser.add_argument("--protected-config", type=Path, help="owner-only final config for fresh protected native acceptance inside the bounded Linux proof sandbox")
     parser.add_argument("--protected-run-dir", type=Path, help="fresh evidence directory inside this worktree's .artifacts")
     parser.add_argument("--protected-selfcheck", action="store_true", help="check the current protected driver without starting processes or proofs")
+    parser.add_argument("--protected-package", type=Path, help="run protected native acceptance from an exact-head Linux package in the canonical bounded sandbox")
+    parser.add_argument("--protected-inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     historical_action = any((args.package, args.android, args.record_android_apk, args.source_commit, args.inside, args.self_test, args.verify_source_commit))
-    if args.protected_config or args.protected_selfcheck or args.protected_run_dir:
+    if args.protected_package:
+        if not args.source_commit or any((args.package, args.android, args.record_android_apk, args.inside, args.self_test, args.verify_source_commit, args.protected_config, args.protected_selfcheck)) or (args.protected_inside and not args.protected_run_dir):
+            parser.error("Provide --protected-package and --source-commit, with an optional fresh --protected-run-dir")
+        if args.protected_inside:
+            protected_package_inside(args.protected_package, args.source_commit, args.protected_run_dir)
+        else:
+            protected_package_dispatch(args.protected_package, args.source_commit, args.protected_run_dir)
+    elif args.protected_inside:
+        parser.error("--protected-inside requires the canonical protected package launcher")
+    elif args.protected_config or args.protected_selfcheck or args.protected_run_dir:
         if historical_action or bool(args.protected_config) == args.protected_selfcheck or (args.protected_run_dir and not args.protected_config):
             parser.error("Provide --protected-config with optional --protected-run-dir, or --protected-selfcheck")
         if args.protected_selfcheck:
@@ -2317,4 +2592,4 @@ if __name__ == "__main__":
     elif args.package and args.source_commit and (args.inside or args.android) and not args.record_android_apk:
         parser.error("the old Strict/13-proof live protocol is retired; protected acceptance uses normal budget confirm_batch/flush, five genuine Source/Hold receipts and schema-2 observation; this historical artifact inspector does not start a replacement paid test")
     else:
-        parser.error("Provide --protected-config, --protected-selfcheck, --record-android-apk and --source-commit, or --verify-source-commit")
+        parser.error("Provide --protected-package and --source-commit, --protected-config, --protected-selfcheck, --record-android-apk and --source-commit, or --verify-source-commit")

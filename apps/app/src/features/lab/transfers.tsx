@@ -115,7 +115,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
       {delivery.budgets.map(budget => <div key={budget.budget_id} className="grid gap-2">
         <Info label="预算" value={budget.budget_id} />
         <Info label="可分配 / 已占用" value={`${budget.free} / ${budget.locked}`} />
-        <Info label="已收到待批次核验的窗口" value={budget.ready_windows.length.toString()} />
+        <Info label="已收到待结算的文件片段" value={budget.ready_windows.length.toString()} />
         <Info label="累计赚取 / 提款 / 退款" value={`${budget.earned} / ${budget.withdrawn} / ${budget.refunded}`} />
         {budget.payee.toLowerCase() === status?.wallet.address?.toLowerCase() ? <Button type="button" variant="outline" disabled={working || budget.ready_windows.length === 0 || !delivery.canManage || !status?.enabled || !status.paid_enabled || status.wallet.state !== 'unlocked'} onClick={() => { setOrigin('page'); void delivery.flushBudget(budget.budget_id) }}>结算当前已就绪批次（最多两窗）</Button> : null}
       </div>)}

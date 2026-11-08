@@ -643,7 +643,7 @@ impl Delivery {
         chain.verify_position(&position).await?;
         Ok(result)
     }
-    pub(super) async fn authorize_budget_spend(&self, id: &str) -> Result<()> {
+    pub(super) async fn authorize_budget_spend(&self, id: &str, chain: &ChainConfig) -> Result<()> {
         let (prefix, _) = id
             .split_once('/')
             .context("invalid budget transaction id")?;
@@ -652,6 +652,12 @@ impl Delivery {
                 .strip_prefix("budget-")
                 .context("invalid budget spend group")?,
         )?;
+        ensure!(
+            record.terms.chain_id == chain.chain_id
+                && chain::address(&record.terms.escrow)? == chain::address(&chain.escrow)?
+                && chain::address(&record.terms.asset)? == chain::address(&chain.asset)?,
+            "budget belongs to another delivery deployment; preserve its original transaction"
+        );
         let wallet = self
             .wallet
             .lock()
@@ -1564,7 +1570,7 @@ impl Delivery {
                     .is_some_and(|needed| needed <= fee),
                 "fixed publication fee is below the local chain requirement"
             );
-            self.authorize_spend(&id).await?;
+            self.authorize_spend(&id, chain.config()).await?;
             let current = self.config();
             ensure!(
                 current.publication_policy.as_ref() == Some(&claim.terms.policy)
@@ -1638,7 +1644,8 @@ impl Delivery {
             )?,
             "original disclosure gate expired at the RPC boundary"
         );
-        self.authorize_spend(&transaction.intent.id).await?;
+        self.authorize_spend(&transaction.intent.id, chain.config())
+            .await?;
         let current = self.config();
         ensure!(
             current.publication_policy.as_ref() == Some(&claim.terms.policy)

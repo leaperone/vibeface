@@ -111,7 +111,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       manage()
       if (orders.length !== 2 || orders.some(order => order.role !== 'sender' || order.mode !== 'paid' || order.phase !== 'prepared')
         || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
-        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('批次需要同一预算内两笔待确认的单窗口订单。')
+        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('请选择同一预算内两笔待确认且各含一个文件片段的订单。')
       const confirmed = parseOrders(await request('confirm_batch', { intent_ids: orders.map(order => order.intent_id) }))
       if (confirmed.length !== orders.length || confirmed.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('批次返回的条款与原订单不同，请查询原订单。')
       return confirmed
@@ -122,7 +122,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       manage()
       if (orders.length !== 2 || orders.some(order => order.role !== 'receiver' || order.mode !== 'paid' || !orderActions(order).accept)
         || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
-        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('同时接收需要同一预算内两笔单窗口订单。')
+        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('同时接收需要同一预算内两笔各含一个文件片段的订单。')
       const accepted = parseOrders(await request('accept_batch', { order_ids: orders.map(order => order.order_id) }))
       if (accepted.length !== orders.length || accepted.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('接收批次与原订单不一致，请先刷新。')
       return accepted

@@ -79,13 +79,27 @@ python3 scripts/verify-node.py --delivery-charity \
 
 本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。界面验收按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
 
-正式驱动在已配置上述资源上限的 Linux amd64 sandbox 内运行。它复用当前 `verify-node.py` 的 Node/连接实现和 `run-delivery-live.py` 的资源检查，不启动 Docker、不下载或构建制品。先运行纯自检：
+宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
 ```sh
 python3 scripts/run-delivery-live.py --protected-selfcheck
+
+python3 scripts/run-delivery-live.py \
+  --protected-package "$PWD/.artifacts/exact-head-linux-package" \
+  --source-commit "$(git rev-parse HEAD)"
 ```
 
-最终 clean HEAD 的 CLI/Core、JS/WASM、官方 prover/r0vm 和 profile 摘要确定后，在本任务 `.artifacts/` 写入权限 `0600` 的配置。配置 schema 为 `scripts/verify-delivery-protected.py` 的 `validate_config`，字段如下；所有摘要必须填实际值，不能沿用其他源码或旧 receipt。
+该入口复用 `check-delivery.py` 的 canonical sandbox 构建配方，固定 Linux amd64、11GiB、zero swap、64 PIDs 和两个 Tokio workers。源码与任务缓存仍在本 worktree 的 `.artifacts/`；linked worktree 的 common Git metadata 和 `.git` 只读挂载，显式设置 `GIT_DIR`、`GIT_WORK_TREE` 和 `GIT_OPTIONAL_LOCKS=0`，始终核对 clean exact HEAD。容器以宿主 UID/GID 运行，配置在容器内以 `0600` 创建；不会改变既有缓存权限或复制工具链。
+
+本机入口按原生驱动既有阶段和业务期限等待，不再套用旧 Strict/UI 的 20700 秒整轮截止。KeyBinding 观察上限仍为 7400 秒，Source、Hold 各为 16000 秒；每次证明的 7200 秒硬界、原 UUID、报价/持有/密钥截止、费用与 W/I/F/S 均不变。每份完成的证明仍立即独立验真并保存。同一个运行容器可以跨宿主工具轮次继续等待；停止容器后不支持恢复原链/订单，不能把已保存分项称为已支持跨容器续跑。
+
+GitHub Actions job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表单项失败或完整实验通过。需要继续同一合法原生运行时，应保留本机的原容器、原链和原业务期限；不得靠新 UUID、延长期限或重部署链绕过原边界。
+
+容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置并调用现有 `verify-node.py --delivery-protected`。Web 资源进程检查不代表渲染验收。
+
+输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只有 `public/` 的白名单内容可上传，包括已独立 host 验真的 receipts/metadata、原链公开观察、进度、制品来源、资源状态和最终摘要。失败保留已验真分项；任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能整目录上传。
+
+已准备好受限 sandbox 和全部精确制品时，也可以使用不构建、不下载或启动 Docker 的低层 `--protected-config`。配置 schema 为 `scripts/verify-delivery-protected.py` 的 `validate_config`；在本任务 `.artifacts/` 写入 `0600` 配置，所有摘要必须填实际值，不能沿用其他源码或旧 receipt：
 
 ```json
 {
@@ -126,7 +140,7 @@ python3 scripts/run-delivery-live.py \
   --protected-run-dir "$PWD/.artifacts/protected/run"
 ```
 
-每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。公开结果保存在该 run 的 `public/`，包括逐份独立 host 验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`；失败保留当前已验真分项。原始私有日志留在 run 内，不可整目录上传。
+每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。低层驱动在其 run 的 `public/` 保留逐份验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`，但它本身不核验 bare binary 的构建来源；调用方必须先完成上文的制品来源检查。
 
 该运行只证明新的 4096 字节双单场景。它核对 S 离线后 nonce 不增、P 自动累计提款、R 实际读取，以及 S/R/P 真正重启、locked/off 后拒写与历史读取；不覆盖 UI 渲染、旧 fee5 同字节或最大容量、强制 reorg、nonce-consuming revert、临近截止和异常代币矩阵。这些仍需独立证据。
 

@@ -6407,252 +6407,8 @@ def delivery_charity_acceptance(options):
 
 
 
-def delivery_ui_selfcheck(options):
-    root = Path(__file__).resolve().parents[1]
-    require(options.artifacts.resolve().is_relative_to(root / ".artifacts"), "UI selfcheck stays in ignored task artifacts")
-    run = options.artifacts.resolve() / ("controller-selfcheck-" + uuid.uuid4().hex)
-    run.mkdir(mode=0o700, parents=True)
-    source_file = run / "ordinary-paid-ui.bin"
-    source_file.write_bytes(os.urandom(4096))
-
-    class Fixture:
-        def __init__(self, role, index):
-            self.directory = run / role
-            self.url = f"http://127.0.0.1:{10000 + index}"
-            self.device_id = format(index, "064x")
-            self.client = self
-
-        def invite(self):
-            return "controller-selfcheck-invitation"
-
-    nodes = {role: Fixture(role, index) for index, role in enumerate(("web", "android", "provider"), 1)}
-    control = DeliveryUiControl(run / "control.json", root, source_file, nodes,
-                                {"max_service_amount": "1000000", "source_gas_cap_wei": "1000000000000000000"})
-    verified = {"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True,
-                "transactionIntentsUnchanged": True, "canonicalRestored": True}
-    require(control.inspection_verified(verified), "zero broadcasts with all four actual invariants passes the inspection aggregate")
-    for name in ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored"):
-        require(not control.inspection_verified({**verified, name: False}), "each failed inspection invariant rejects the aggregate")
-    for invalid in (1, False):
-        require(not control.inspection_verified({**verified, "rawBroadcastDelta": invalid}),
-                "a real broadcast or boolean cannot masquerade as a verified zero integer")
-    count = 0
-
-    def check(path, *, body=None, token=True, origin=None, expected=400):
-        nonlocal count
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = "Bearer " + control.token
-        if origin:
-            headers["Origin"] = origin
-        request = urllib.request.Request(control.url + path, None if body is None else json.dumps(body).encode(), headers)
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                status, value = response.status, json.load(response)
-        except urllib.error.HTTPError as error:
-            status, value = error.code, json.load(error)
-        require(status == expected and value["ok"] == (expected == 200), "pure controller selfcheck observes its expected HTTP boundary")
-        count += 1
-        return value.get("result")
-
-    try:
-        control.start()
-        first_inode = control.path.stat().st_ino
-        control.publish()
-        require(control.path.stat().st_ino != first_inode and control.path.stat().st_uid == control.uid
-                and control.path.stat().st_gid == control.gid and (control.path.stat().st_mode & 0o077) == 0,
-                "atomic descriptor republication retains its explicit host owner and private mode")
-        require(source_file.stat().st_uid == control.uid and source_file.stat().st_gid == control.gid
-                and (source_file.stat().st_mode & 0o077) == 0 and control.path.parent.stat().st_uid == control.uid,
-                "only the dedicated UI directory and single synthetic fixture receive the host owner")
-        facts = check("/facts", expected=200)
-        require(facts["source"] is None and facts["bytes"] == 4096 and not facts["settled"]
-                and control.token not in json.dumps(facts), "facts contain public values and no task bearer")
-        check("/facts", token=False)
-        check("/facts", origin="http://127.0.0.1")
-        check("/facts?token=forbidden")
-        check("/wallet")
-        check("/facts", body={})
-        check("/invitation/web", expected=200)
-        check("/pairing", body={"role": "other"})
-        check("/pairing", body={"role": "web", "extra": True})
-        check("/approve", body={"role": "web", "peer": "0" * 64, "code": "000000"})
-        check("/event", body={"name": "saved", "bytes": 4096, "sha256": control.digest})
-        check("/event", body={"name": "prepared", "extra": True})
-        check("/event", body={"name": "confirm"})
-        check("/abort", body={"role": "other"})
-        check("/abort", body={"role": "android"}, expected=200)
-        require(control.finished.is_set() and control.failure == "android_ui_failed" and not control.events,
-                "abort completes no acceptance stage")
-        control.finished.clear()
-        control.failure = None
-        control.pairings = {role: {"peer": format(index, "064x"), "code": "123456", "approved": True}
-                            for index, role in enumerate(("web", "android"), 4)}
-        check("/event", body={"name": "observer-ready", "role": "other"})
-        check("/event", body={"name": "observer-ready", "role": "web", "extra": True})
-        check("/event", body={"name": "observer-ready", "role": "web"}, expected=200)
-        check("/event", body={"name": "observer-ready", "role": "android"}, expected=200)
-        check("/event", body={"name": "prepared"})
-        control.set_stage("inspections")
-        inspection = {"id": str(uuid.uuid4()), "kind": "receiver-key-before", "role": "android",
-                      "nodePeer": nodes["android"].device_id, "orderId": None, "intentId": None,
-                      "keyId": "c" * 64, "keySerial": 1, "expectedPhase": None, "expectedPaymentState": None,
-                      "earned": None, "withdrawn": None, "refunded": None, "evidence": None, "windows": [],
-                      "screenshot": "android-key-before.png", "timeoutMs": 120000}
-        control.begin_inspection(inspection)
-        screenshot = run / "public" / inspection["screenshot"]
-        screenshot.parent.mkdir(mode=0o700)
-        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pure-controller-boundary-fixture")
-        acknowledgement = {"name": "inspection-observed", "role": "android", "id": inspection["id"],
-                           "screenshot": inspection["screenshot"], "sha256": file_sha256(screenshot), "bytes": screenshot.stat().st_size}
-        check("/event", body={**acknowledgement, "id": str(uuid.uuid4())})
-        check("/event", body={**acknowledgement, "role": "web"})
-        check("/event", body={**acknowledgement, "screenshot": "../other.png"})
-        check("/event", body={**acknowledgement, "sha256": "f" * 64})
-        check("/event", body={**acknowledgement, "bytes": True})
-        check("/event", body={"name": "prepared"})
-        check("/event", body=acknowledgement, expected=200)
-        check("/event", body=acknowledgement, expected=200)
-        require(control.end_inspection() == acknowledgement and not control.events,
-                "pure inspection acknowledgement cannot authorize any ordinary order action")
-        check("/event", body=acknowledgement)
-        control.set_stage("ordinary")
-        identifier = "a" * 64
-        view = {"order_id": identifier, "intent_id": str(uuid.uuid4()), "role": "sender", "mode": "paid",
-                "acceptance": "recoverable", "windows": [{"decryption_proven": False}], "bytes": 4096,
-                "name": source_file.name, "sha256": control.digest, "phase": "prepared", "evidence": "none",
-                "source_peer": nodes["web"].device_id, "receiver_peer": nodes["android"].device_id,
-                "provider_peer": nodes["provider"].device_id,
-                "payment": {"total": "17", "earned": "0", "withdrawn": "0", "refunded": "0"}}
-        synthetic_source = {"view": view, "confirmed": False, "authorized_by": None}
-
-        def synthetic_order(role, value):
-            directory = nodes[role].directory / "delivery"
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with sqlite3.connect(directory / "service.sqlite3") as database:
-                database.execute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,body TEXT NOT NULL)")
-                database.execute("CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY)")
-                database.execute("INSERT OR REPLACE INTO orders(id,body) VALUES(?,?)", (identifier, json.dumps(value)))
-
-        invalid = copy.deepcopy(synthetic_source)
-        invalid["view"]["acceptance"] = "strict"
-        synthetic_order("web", invalid)
-        check("/event", body={"name": "prepared"})
-        invalid["view"]["acceptance"] = "recoverable"
-        invalid["view"]["sha256"] = "b" * 64
-        synthetic_order("web", invalid)
-        check("/event", body={"name": "prepared"})
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "prepared"}, expected=200)
-        check("/event", body={"name": "prepared"}, expected=200)
-        check("/event", body={"name": "confirmed"})
-        synthetic_source.update(confirmed=True, authorized_by="f" * 64)
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "confirmed"})
-        synthetic_source["authorized_by"] = control.pairings["web"]["peer"]
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "confirmed"}, expected=200)
-        check("/event", body={"name": "accepted"})
-        synthetic_receiver = {"view": copy.deepcopy(view), "accepted": True, "authorized_by": "f" * 64}
-        synthetic_receiver["view"]["role"] = "receiver"
-        synthetic_order("android", synthetic_receiver)
-        check("/event", body={"name": "accepted"})
-        synthetic_receiver["authorized_by"] = control.pairings["android"]["peer"]
-        synthetic_order("android", synthetic_receiver)
-        check("/event", body={"name": "accepted"}, expected=200)
-        check("/event", body={"name": "settled-offline"})
-        check("/event", body={"name": "offline-visible"}, expected=200)
-        check("/event", body={"name": "settled-offline"})
-        synthetic_provider = {"view": copy.deepcopy(view)}
-        synthetic_provider["view"]["role"] = "provider"
-        synthetic_provider["view"]["payment"].update(earned="17", withdrawn="16")
-        synthetic_receiver["view"]["evidence"] = "decryption_proven"
-        synthetic_receiver["view"]["windows"][0]["decryption_proven"] = True
-        synthetic_order("android", synthetic_receiver)
-        synthetic_order("provider", synthetic_provider)
-        check("/event", body={"name": "settled-offline"})
-        synthetic_provider["view"]["payment"]["withdrawn"] = "17"
-        synthetic_order("provider", synthetic_provider)
-        check("/event", body={"name": "settled-offline"}, expected=200)
-        check("/event", body={"name": "saved", "sha256": control.digest, "bytes": True})
-        check("/event", body={"name": "saved", "sha256": "f" * 64, "bytes": 4096})
-        check("/event", body={"name": "saved", "sha256": control.digest, "bytes": 4096}, expected=200)
-        check("/event", body={"name": "saved", "sha256": "f" * 64, "bytes": 4096})
-        require(control.finished.is_set() and list(control.events) == list(control.sequence),
-                "synthetic state-machine selfchecks reach exactly the six expected event stages")
-    finally:
-        control.close()
-        source_file.unlink()
-    require(not control.path.exists(), "UI control teardown removes its bearer descriptor")
-    target_calls = []
-
-    class Stub(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def do_POST(self):
-            value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            target_calls.append(value["method"])
-            output = json.dumps({"jsonrpc": "2.0", "id": value["id"], "result": "0x1"}).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(output)))
-            self.end_headers()
-            self.wfile.write(output)
-
-    target = http.server.HTTPServer(("127.0.0.1", 0), Stub)
-    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
-    target_thread.start()
-    recorder = DeliveryRpcForwarder(f"http://127.0.0.1:{target.server_port}")
-    results = []
-
-    def synthetic_rpc(method, params):
-        request = urllib.request.Request(recorder.url, json.dumps({"jsonrpc": "2.0", "id": 1,
-            "method": method, "params": params}).encode(), {"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status, json.load(response)
-        except urllib.error.HTTPError as error:
-            return error.code, json.load(error)
-
-    try:
-        require(synthetic_rpc("eth_chainId", [])[0] == 200 and recorder.broadcasts() == 0,
-                "pure forwarder selfcheck preserves an actual local read without labeling it a broadcast")
-        require(synthetic_rpc("eth_sendRawTransaction", ["0x00"])[0] == 200 and recorder.broadcasts() == 1,
-                "pure forwarder selfcheck counts its synthetic RPC method without storing its payload")
-        wallet, asset = "0x" + "11" * 20, "0x" + "22" * 20
-        reached = recorder.arm_approval(wallet, asset)
-        other = {"from": "0x" + "33" * 20, "to": asset, "data": "0x095ea7b3" + "00" * 64}
-        require(synthetic_rpc("eth_estimateGas", [other])[0] == 200 and not reached.is_set(),
-                "pre-approval barrier never intercepts a different wallet")
-        call_count = len(target_calls)
-        operation = threading.Thread(target=lambda: results.append(synthetic_rpc("eth_estimateGas", [{**other, "from": wallet}])), daemon=True)
-        operation.start()
-        require(reached.wait(5) and operation.is_alive() and len(target_calls) == call_count,
-                "pure pre-approval barrier really blocks only the fixed Source estimate before forwarding")
-        recorder.release_approval()
-        operation.join(timeout=5)
-        require(results and results[0][0] == 502 and len(target_calls) == call_count and recorder.broadcasts() == 1,
-                "abandoned pre-approval request is released as failure and never reaches the synthetic upstream")
-        require(synthetic_rpc("eth_estimateGas", [{**other, "from": wallet}])[0] == 200,
-                "a fresh request after checkpoint release uses the actual upstream again")
-        fault = recorder.fail_reads(asset)
-        call_count = len(target_calls)
-        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 502
-                and fault["blocked"] == 1 and len(target_calls) == call_count and recorder.broadcasts() == 1,
-                "the finite Node read fault returns a real transport failure without fabricating a receipt")
-        require(synthetic_rpc("eth_call", [{"to": wallet, "data": "0x00"}, "latest"])[0] == 200
-                and synthetic_rpc("eth_chainId", [])[0] == 200,
-                "the bounded fault leaves other targets and non-call methods untouched")
-        fault["expires"] = time.monotonic() - 1
-        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 200,
-                "an expired transport fault cannot leave a live Node read blocked")
-        recorder.restore_reads()
-    finally:
-        recorder.close()
-        target.shutdown()
-        target.server_close()
-        target_thread.join(timeout=5)
-    print(f"PASS pure delivery-ui selfcheck {count} HTTP cases plus forwarding/barrier/owner checks; no Node, UI, chain or proof started", flush=True)
+def delivery_ui_selfcheck(_options):
+    raise ValueError("the former Strict delivery UI controller selfcheck is retired; use --delivery-protected-selfcheck for the current driver without starting processes or proofs")
 
 
 def delivery_paid_acceptance(options):
@@ -6668,6 +6424,59 @@ def delivery_protected_acceptance(options):
     driver = runpy.run_path(str(Path(__file__).resolve().with_name("verify-delivery-protected.py")))
     require(driver["run_from_options"](options, globals()) == 0,
             "fresh protected delivery reaches its five genuine receipts and actual budget settlement")
+
+
+class BootstrapSite:
+    """Serves the entry UI and Discovery on one origin, with its own client socket unavailable."""
+    def __init__(self, port, entry, discovery):
+        site = self
+        self.catalog_reads = 0
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = urllib.parse.urlsplit(self.path).path
+                if path == "/api/client":
+                    self.send_error(503, "fixture direct gateway is unavailable")
+                    return
+                if path.startswith("/bootstrap/"):
+                    upstream = discovery.url
+                    if path == "/bootstrap/catalog":
+                        site.catalog_reads += 1
+                else:
+                    upstream = entry.url
+                try:
+                    try:
+                        response = opener.open(upstream + self.path, timeout=15)
+                    except urllib.error.HTTPError as error:
+                        response = error
+                    with response:
+                        body = response.read(4 * 1024 * 1024 + 1)
+                        require(len(body) <= 4 * 1024 * 1024, "fixture proxy response is bounded")
+                        self.send_response(response.status)
+                        for name in ("Content-Type", "Content-Security-Policy", "Cache-Control", "X-Vibeface-Source"):
+                            value = response.headers.get(name)
+                            if value:
+                                self.send_header(name, value)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                except (OSError, ValueError):
+                    self.send_error(502)
+
+            def log_message(self, *_):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        require(not self.thread.is_alive(), "bootstrap site stops its own thread")
 
 
 def e2e_fixture(options):
@@ -7051,7 +6860,7 @@ if __name__ == "__main__":
         modes.add_argument("--delivery", action="store_true", help="retired Strict full-delivery runner; fails explicitly without starting paid work")
         modes.add_argument("--delivery-protected", action="store_true", help="run fresh two-order protected budgets with five genuine receipts in the bounded Linux proof sandbox")
         modes.add_argument("--delivery-protected-selfcheck", action="store_true", help="check the protected driver without starting a Node, chain, proof or socket")
-        modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
+        modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="retired Strict UI controller selfcheck; rejects before writing or starting work")
         parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
         parser.add_argument("--delivery-source-root", type=Path, default=Path(__file__).resolve().parents[1])
         parser.add_argument("--delivery-probe", type=Path)

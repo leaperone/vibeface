@@ -688,11 +688,12 @@ impl Chain {
             );
             transaction
         } else {
-            delivery.authorize_spend(id).await?;
+            delivery.authorize_spend(id, &self.config).await?;
             let intent = self
                 .prepare_intent(id.to_owned(), wallet, call, gas_cap.to_owned())
                 .await?;
             let pending_nonce = self.pending_nonce(wallet).await?;
+            delivery.authorize_spend(id, &self.config).await?;
             let group = id
                 .split('/')
                 .next()
@@ -709,7 +710,7 @@ impl Chain {
             })?
         };
         if transaction.raw_tx.is_none() {
-            delivery.authorize_spend(id).await?;
+            delivery.authorize_spend(id, &self.config).await?;
             let signed = delivery
                 .wallet
                 .lock()
@@ -752,7 +753,7 @@ impl Chain {
             let pending_nonce = self.pending_nonce(wallet).await;
             let nonce_available =
                 matches!(&pending_nonce, Ok(nonce) if *nonce <= transaction.nonce);
-            let authorized = delivery.authorize_spend(id).await.is_ok();
+            let authorized = delivery.authorize_spend(id, &self.config).await.is_ok();
             let unlocked = matches!(delivery.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), super::wallet::WalletStatus::Unlocked { address } if address == transaction.intent.wallet);
             if !authorized || !unlocked || !nonce_available {
                 result.phase = "unknown".into();
@@ -1435,6 +1436,52 @@ fn verify_code_template(actual: &[u8], template: &CodeTemplate) -> Result<()> {
 pub(super) mod tests {
     use super::*;
 
+    pub struct RpcFixture {
+        pub chain: Chain,
+        pub requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for RpcFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    pub async fn rpc_fixture(
+        mut config: ChainConfig,
+        response: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> Result<RpcFixture> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        config.rpc_url = format!("http://{}/", listener.local_addr()?);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let response = std::sync::Arc::new(response);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let captured = captured.clone();
+                let response = response.clone();
+                async move {
+                    captured.lock().unwrap().push(request.clone());
+                    axum::Json(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":response(&request)}),
+                    )
+                }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok(RpcFixture {
+            chain: Chain {
+                config,
+                client: reqwest::Client::new(),
+                request_id: AtomicU64::new(1),
+            },
+            requests,
+            task,
+        })
+    }
+
     pub fn config() -> ChainConfig {
         ChainConfig {
             rpc_url: "http://127.0.0.1:8545".into(),
@@ -1493,6 +1540,151 @@ pub(super) mod tests {
             max_fee_per_gas: "1000000000".into(),
             max_priority_fee_per_gas: "1".into(),
         })
+    }
+
+    #[tokio::test]
+    async fn changing_deployment_during_nonce_or_receipt_wait_stops_signing_and_rebroadcast()
+    -> Result<()> {
+        use super::super::wallet::SecretString;
+        use super::super::{
+            Delivery, DeliveryConfig,
+            budget::{BudgetSnapshot, BudgetTerms},
+        };
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("chain-configuration-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Arc::new(Delivery::open(
+            &dir,
+            crate::crypto::LocalIdentity::generate(),
+        )?);
+        let password = SecretString::new("synthetic configuration regression wallet".into());
+        let wallet = {
+            let mut wallet = delivery.wallet.lock().unwrap();
+            wallet.create(&password)?;
+            wallet.unlock(&password)?;
+            wallet.address()?
+        };
+        let on_nonce = Arc::new(AtomicBool::new(true));
+        let on_receipt = Arc::new(AtomicBool::new(false));
+        let captured_delivery = delivery.clone();
+        let nonce_switch = on_nonce.clone();
+        let receipt_switch = on_receipt.clone();
+        let rpc = rpc_fixture(config(), move |request| {
+            let method = request["method"].as_str().unwrap();
+            if method == "eth_getTransactionCount" && nonce_switch.swap(false, Ordering::SeqCst)
+                || method == "eth_getTransactionReceipt"
+                    && receipt_switch.swap(false, Ordering::SeqCst)
+            {
+                let mut changed = captured_delivery.config();
+                changed.chain.as_mut().unwrap().rpc_url = "http://127.0.0.1:9/".into();
+                captured_delivery.configure_local(changed).unwrap();
+            }
+            match method {
+                "eth_estimateGas" => json!("0x5208"),
+                "eth_gasPrice" | "eth_maxPriorityFeePerGas" => json!("0x1"),
+                "eth_getTransactionCount" => json!("0x0"),
+                _ => Value::Null,
+            }
+        })
+        .await?;
+        let settings = DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(rpc.chain.config.clone()),
+            ..Default::default()
+        };
+        delivery.configure_local(settings.clone())?;
+        let budget_id = "44".repeat(32);
+        let cap = "100000000000000";
+        delivery.register_budget(
+            &BudgetSnapshot {
+                terms: BudgetTerms {
+                    budget_id: budget_id.clone(),
+                    chain_id: rpc.chain.config.chain_id,
+                    escrow: rpc.chain.config.escrow.clone(),
+                    asset: rpc.chain.config.asset.clone(),
+                    payer: address_hex(wallet),
+                    payee: address_hex(Address::repeat_byte(3)),
+                    provider_peer: "55".repeat(32),
+                    deposit: "100".into(),
+                },
+                locked: "0".into(),
+                earned: "0".into(),
+                withdrawn: "0".into(),
+                refunded: "0".into(),
+                free: "100".into(),
+                max_claim_until: 0,
+                state: "open".into(),
+                position: ChainPosition {
+                    block_number: 1,
+                    block_hash: data_hex(&[0x55; 32]),
+                    timestamp: 1,
+                },
+            },
+            cap,
+        )?;
+        let fresh_id = format!("budget-{budget_id}/fresh");
+        let resume_id = format!("budget-{budget_id}/resume");
+        for id in [&fresh_id, &resume_id] {
+            delivery.with_store(|s| s.put_value(&format!("local-spend:{id}"), b"owner"))?;
+        }
+        assert!(
+            rpc.chain
+                .execute(
+                    &delivery,
+                    &fresh_id,
+                    Call::Approve {
+                        amount: Amount::from_u64(100)
+                    },
+                    cap
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            delivery
+                .with_store(|s| s.find_transaction(&fresh_id))?
+                .is_none(),
+            "a changed route cannot reserve or sign a new transaction"
+        );
+        delivery.configure_local(settings)?;
+        let mut intent = approval_intent(wallet)?;
+        intent.id = resume_id.clone();
+        let reserved = delivery.with_store(|s| {
+            s.reserve_budget_transaction(&intent, 0, &format!("budget-{budget_id}"), cap)
+        })?;
+        let signed = delivery.wallet.lock().unwrap().sign_transaction(
+            rpc.chain.config(),
+            &intent,
+            reserved.nonce,
+        )?;
+        delivery.with_store(|s| s.sign_transaction(&resume_id, &signed.raw_tx, &signed.tx_hash))?;
+        let before = delivery.with_store(|s| s.transaction(&resume_id))?;
+        on_receipt.store(true, Ordering::SeqCst);
+        assert_eq!(
+            rpc.chain
+                .reconcile_transaction(&delivery, &resume_id)
+                .await?
+                .phase,
+            "unknown"
+        );
+        let after = delivery.with_store(|s| s.transaction(&resume_id))?;
+        assert_eq!(after.intent, before.intent);
+        assert_eq!(after.nonce, before.nonce);
+        assert_eq!(after.raw_tx, before.raw_tx);
+        assert_eq!(after.tx_hash, before.tx_hash);
+        assert!(
+            !rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "eth_sendRawTransaction"),
+            "configuration changes during awaits cannot reach broadcast"
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

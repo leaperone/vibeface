@@ -90,7 +90,7 @@ python3 scripts/check-delivery.py --sandbox
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
-普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 `delivery_live` Strict/十三证明流程明确拒绝启动，不能用其成功状态为新预算背书；受保护真实 Node/证明验收须独立执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 Strict/十三证明启动协议明确拒绝，不能用历史成功状态为新预算背书；当前受保护真实 Node/证明验收由显式选择的 `delivery_live` 手动 job 或同一宿主命令执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
 
 当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复及私人协议拒绝使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
 
@@ -122,9 +122,13 @@ python3 scripts/check-delivery.py --sandbox --prove-small prepare
 
 完整验收候选通过独立二进制检查后，`proofs/` 恰好保留原四关系的九个文件，manifest 和核心 loader 不放宽。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的完整 bundle，摘要将 `VERIFIED_BUNDLE` 与整体 `FAIL` 分开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`。原文、恢复文件、E、witness、接收秘密、私钥、vectors、Succinct checkpoint、calldata 与原始日志均不上传。CPU 是整个 sandbox 区间增量，`memory.peak` 是容器生命周期累计峰值，复用验证耗用不替代原证明耗用。任何证明、结算、恢复、清理或资源检查失败都不能报告完整实验通过。
 
-旧 `delivery_live` 与 `verify-node.py --delivery` 依赖 Strict/十三证明和逐单 fund/publish，已明确拒绝其原启动协议。相关历史 artifact/控制器纯自检可继续用于识别旧证据，但不运行当前受保护付费，也不计入当前产品完成项。该手动选项不得被当成新预算验收；普通核心 CI 不自动生成新证明。
+旧 Strict/十三证明、逐单 fund/publish 和 UI 控制器协议已退休。`verify-node.py --delivery`、`--delivery-ui-selfcheck` 和旧 run-live 的 package/Android 参数组合都在写入或启动工作前明确拒绝；历史 artifact 工具纯自检只用于识别旧证据，不代表当前产品验收。
 
-当前预算真实进程入口为 `run-delivery-live.py --protected-config <0600-final-config>`，内部调用当前 `verify-node.py --delivery-protected`。它要求 clean HEAD、精确 Linux CLI/Core/crypto/host/r0vm/profile/ELF 摘要与原资源硬界，新建五份 genuine receipt、两笔订单和三种真正2slot批次，并核对自动提款与真实重启。详细配置见 [受保护交付验收](e2e.md#验证受保护付费交付)。`run-delivery-live.py --protected-selfcheck` 不启动链、Node、套接字或证明，不等于执行该验收；该模式没有自动接入旧 `delivery_live` job，也不替代独立渲染证据。
+`delivery_live` 仍只在手动 workflow_dispatch 且输入为 true 时执行，默认 false。该 job 现在使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`，复用 canonical Linux sandbox 并在容器内生成 `0600` 最终配置，再调用 `verify-node.py --delivery-protected`。它依赖同源 package/crypto/web 检查，不再启动旧专属 Android、KVM 或录像前置。现有 gate 在显式选中该模式时仍要求 job success；任何失败都不能忽略。
+
+protected 宿主入口不继承旧 Strict/UI 的 20700 秒整轮截止，而由既有原生阶段和业务期限决定退出；单项证明仍限 7200 秒，11GiB/zero swap/64 PIDs、原订单期限和 W/I/F/S 均不变。Actions 的 `timeout-minutes: 360` 是独立外部限制，可能截断尚在合法阶段内的运行，不能据此宣称完整实验通过。分项保存保留已验真的公开材料，但当前驱动不支持停止容器后的原链/订单续跑。
+
+入口核对 clean HEAD、package 来源、GLIBC 实测、实际使用的 CLI/Core/crypto/host/r0vm/profile/ELF 摘要与原资源硬界，新建五份 genuine receipt、两笔订单和三种真正2slot批次，并核对自动提款与真实重启。宿主本机可直接复用同一命令，linked worktree Git metadata 只读挂载；低层 `--protected-config` 仍可消费已核验制品。只上传新 driver `public/` 中受审白名单，原始日志、配置、钱包和整个 run 都不上传。详细配置与边界见 [受保护交付验收](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 不启动链、Node、套接字或证明；此 native job 不代表 Web/Android 渲染验收，普通核心 CI 不自动生成新证明。
 
 当前受保护验收通过正式产品入口完成：两个 paid/recoverable 单窗口订单、同一预付预算、`confirm_batch`、P 的 `ready_windows` 与显式 `budget flush`。实际 reserveBatch、holdBatch、revealBatch 均须至少一笔含两个不同 slot；S 上传完必要对象并离线后，P 独立 earned/withdraw，R 实际恢复原文件。新的最小五份真实证明驱动、真实重启、同 HEAD 制品及界面渲染需分别验收，不能用合约探针、旧17 fixture 或 parser 自检替代。正式公开 bundle 使用 schema2，`observe-settlement.mjs` 只读原链，核对 pinned runtime、逐窗 genuine Source/Hold、同 canonical anchor 的预算与订单、实际方法/事件/金额/余额和 gas。binary receipt 还必须由官方 host 独立验真。
 

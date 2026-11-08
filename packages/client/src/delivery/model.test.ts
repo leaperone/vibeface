@@ -61,7 +61,7 @@ test('uncertain chain results label retained settlement amounts as the last reco
   assert.equal(publicationLabel(confirmed), '本批约定费用已赚取')
   assert.equal(publicationLabel(uncertain), '批次状态待确认，请检查原交易')
   assert.equal(publicationLabel({ ...confirmed, phase: 'failed' }), publicationLabel(uncertain))
-  assert.equal(publicationLabel({ ...confirmed, payment: { ...confirmed.payment, settlement: null } }), '本单链上已赚取')
+  assert.equal(publicationLabel({ ...confirmed, payment: { ...confirmed.payment, settlement: null } }), '本单费用已赚取')
 })
 
 test('a received file is saved only after exact content, length, name and digest agree', async () => {
