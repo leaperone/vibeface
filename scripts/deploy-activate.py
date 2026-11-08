@@ -152,7 +152,9 @@ def container_info(manifest):
     info = json.loads(docker('container', 'inspect', ids[0]))[0]
     labels = info['Config']['Labels']
     require(labels.get('com.docker.compose.project') == manifest['project']
-            and labels.get('com.docker.compose.service') == 'service', 'container ownership differs')
+            and labels.get('com.docker.compose.service') == 'service'
+            and labels.get('dev.vibeface.deployment') == manifest['fingerprint']
+            and info['Image'] == manifest['image'], 'container ownership or deployment configuration differs')
     return ids[0], info
 
 
@@ -185,6 +187,8 @@ def stopped(manifest):
 
 
 def stop(manifest):
+    if containers(manifest):
+        container_info(manifest)
     compose(manifest, 'stop', '--timeout', '90', 'service')
     stopped(manifest)
 
@@ -195,8 +199,8 @@ def core_environment(config, version, source):
             'VIBEFACE_LISTEN': config['listen']}
 
 
-def compose_runtime(config, image, version, source):
-    service = {'image': image, 'tmpfs': ['/tmp:rw,nosuid,noexec,size=64m,mode=1777']}
+def compose_runtime(config, image, version, source, fingerprint):
+    service = {'image': image, 'labels': {'dev.vibeface.deployment': fingerprint}, 'tmpfs': ['/tmp:rw,nosuid,noexec,size=64m,mode=1777']}
     if config['role'] in CORE_ROLES:
         service.update(network_mode='host', user=f'{config["uid"]}:{config["gid"]}',
                        environment=core_environment(config, version, source),
@@ -408,6 +412,19 @@ def nginx_apply(config, data, metadata):
     command('systemctl', 'reload', 'nginx.service')
 
 
+def restored_previous(previous):
+    if not previous:
+        return False
+    try:
+        _, info = container_info(previous)
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return False
+    if not info['State']['Running']:
+        return False
+    wait_healthy(previous)
+    return True
+
+
 def rollback(journal, journal_path):
     target, config = journal['target'], journal['config']
     phase = journal['phase']
@@ -416,13 +433,7 @@ def rollback(journal, journal_path):
         write_json(journal_path, journal)
         return
     previous = journal['previous']
-    restored = False
-    if previous:
-        try:
-            healthy(previous)
-            restored = True
-        except (ValueError, KeyError, json.JSONDecodeError):
-            pass
+    restored = restored_previous(previous)
     if phase != 'stopping_previous' and not restored:
         stop(target)
     if phase == 'switching_nginx' and journal.get('nginx_backup'):
@@ -494,7 +505,7 @@ def activate(config, image, tag, source, version):
         require(template is not None, 'deployment Compose template is missing')
         shutil.copyfile(template, release / 'compose.yaml')
         atomic_write(release / 'image.env', ('VIBEFACE_IMAGE=' + image + '\n').encode())
-        write_json(release / 'runtime.json', compose_runtime(config, image, version, source))
+        write_json(release / 'runtime.json', compose_runtime(config, image, version, source, fingerprint))
         target = {'schema': 1, 'directory': str(release), 'project': config['project'], 'role': config['role'],
                   'image': image, 'tag': tag, 'source_sha': source, 'version': version, 'fingerprint': fingerprint}
         if config['role'] in CORE_ROLES:
@@ -574,7 +585,7 @@ def self_test():
             pass
         else:
             raise AssertionError(field)
-    runtime = compose_runtime(config, 'sha256:' + 'b' * 64, '1.0.0', 'c' * 40)['services']['service']
+    runtime = compose_runtime(config, 'sha256:' + 'b' * 64, '1.0.0', 'c' * 40, 'd' * 64)['services']['service']
     assert runtime['network_mode'] == 'host' and runtime['user'] == '1001:1001'
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
     assert runtime['environment']['VIBEFACE_ROLE'] == 'entry'
@@ -630,6 +641,19 @@ server {
             pass
         else:
             raise AssertionError('invalid nginx configuration accepted')
+    previous_manifest = {'project': 'owned', 'fingerprint': 'old-config', 'image': 'sha256:' + 'b' * 64}
+    actual_container = {'Config': {'Labels': {'com.docker.compose.project': 'owned',
+                        'com.docker.compose.service': 'service', 'dev.vibeface.deployment': 'new-config'}},
+                        'Image': previous_manifest['image'], 'State': {'Running': True}}
+    with patch(__name__ + '.containers', return_value=['c' * 64]), \
+            patch(__name__ + '.docker', return_value=json.dumps([actual_container])):
+        assert not restored_previous(previous_manifest), 'same image with changed config treated as restored'
+        actual_container['Config']['Labels']['dev.vibeface.deployment'] = 'old-config'
+    with patch(__name__ + '.containers', return_value=['c' * 64]), \
+            patch(__name__ + '.docker', return_value=json.dumps([actual_container])), \
+            patch(__name__ + '.wait_healthy') as waiting:
+        assert restored_previous(previous_manifest)
+        waiting.assert_called_once_with(previous_manifest)
     events = []
     artifact_root = Path(__file__).resolve().parent.parent / '.artifacts'
     artifact_root.mkdir(exist_ok=True)
@@ -647,7 +671,7 @@ server {
             raise AssertionError('nginx drift reported as already active')
         state = {'schema': 1, 'phase': 'starting', 'target': {'project': 'owned'}, 'config': {'role': 'app'},
                  'previous': {'project': 'previous'}}
-        with patch(__name__ + '.healthy', side_effect=ValueError('previous not running')), \
+        with patch(__name__ + '.restored_previous', return_value=False), \
                 patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('start-previous')), \
                 patch(__name__ + '.wait_healthy', side_effect=lambda *a: events.append('check-previous')):
@@ -656,7 +680,7 @@ server {
         assert read_json(directory / 'activation.json')['phase'] == 'rolled_back'
         assert read_json(directory / 'current.json') == state['previous']
         events.clear()
-        with patch(__name__ + '.healthy', return_value='restored'), \
+        with patch(__name__ + '.restored_previous', return_value=True), \
                 patch(__name__ + '.stop', side_effect=lambda *a: events.append('unsafe-stop')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-restart')):
             rollback(copy.deepcopy(state), directory / 'activation.json')
@@ -666,7 +690,7 @@ server {
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
         events.clear()
-        with patch(__name__ + '.healthy', side_effect=ValueError('previous not running')), \
+        with patch(__name__ + '.restored_previous', return_value=False), \
                 patch(__name__ + '.stop', side_effect=ValueError('new process still running')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-start')):
             try:
