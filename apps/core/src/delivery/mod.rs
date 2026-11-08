@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod channel;
 mod charity;
 mod keys;
 mod orders;
@@ -263,6 +264,9 @@ impl Delivery {
             .split('/')
             .next()
             .context("spend intent has no order")?;
+        if group.starts_with("channel-") {
+            return self.authorize_channel_spend(intent);
+        }
         if let Some(serial) = group.strip_prefix("key-") {
             ensure!(
                 !serial.is_empty()

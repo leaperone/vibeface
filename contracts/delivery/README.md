@@ -9,6 +9,7 @@ Run from the repository root.
 ```sh
 node contracts/delivery/install.mjs
 node contracts/delivery/run.mjs
+node contracts/delivery/verify-channel.mjs
 node contracts/delivery/verify-risc0.mjs
 node contracts/delivery/compare-vectors.mjs /absolute/path/to/public-vectors.json
 ```
@@ -22,6 +23,30 @@ Dependencies, bytecode, ABI, cross-language vectors and machine-readable results
 `run.mjs` checks money conservation after each scenario using a deterministic **test** verifier. Its 64 KiB cases validate accounting bounds, not 64 KiB cryptographic capacity. `verify-risc0.mjs` verifies the official published Groth16 receipt on a genuine local EVM, including altered seal, image, journal and selector rejection. That fixture is not a newly generated delivery proof. New delivery guest receipts must still be tested separately with `DeliveryEscrow` and the selected guest image.
 
 `node contracts/delivery/verify-delivery.mjs [fixture-directory]` requires a current guest fixture manifest, all four binary receipts and the matching host `prove` JSON outputs. The default directory is `crates/delivery/proof/fixtures`. Missing artifacts fail; there is no mock fallback. It checks the exact schema, canonical journals and coherent order/key/profile, then verifies each seal with the production adapter and mutated seal/journal/image/selector negatives. Its result describes adapter proof acceptance only. The host fixture verifier must separately bind each binary receipt and metadata to the freshly built guest ELF; complete escrow funding acceptance remains a separate test.
+
+## Independent cumulative-channel experiment
+
+`CumulativeChannel(TestToken)` is a separate local settlement model. `deploy-local.mjs --channel` adds its address as `channel_escrow` while preserving the proof escrow. Node requires manual lab and paid enablement, a pinned runtime and the local wallet for new money actions. Charity and discovery stay free. Each channel fixes payer, payee, provider PeerID, asset and deposit. The contract derives a never-reused ID from chain, contract, actual payer and salt. EIP-712 vouchers bind that domain, channel, increasing sequence, cumulative integer amount and receipt commitment. Anyone may redeem only the delta to the fixed payee. Payer starts closing; providers must claim before the fixed 3600-second challenge window expires. Any keeper can then refund the remainder to the fixed payer.
+
+The owner explicitly authorizes an existing Source order's fee. The Node issues a voucher only after checking its saved full receiver receipt, completed windows, Source identity and actual Provider. Reservations, global order deduplication, cumulative totals and highest signed vouchers are durable. Messages do not generate charges automatically. CLI examples and unit precision are in `packages/docs/paid-delivery.md`.
+
+`verify-channel.mjs` tests synthetic local accounting, replay/domain/amount/closing bounds and malicious token behavior. It shares an EIP-712 vector with Rust tests and runs in `check-delivery.py`. Actual delivery evidence uses this opt-in process run:
+
+```sh
+node contracts/delivery/install.mjs
+CARGO_TARGET_DIR="$PWD/.artifacts/channel-settlement/cargo" cargo build -p vibeface-core -p vibeface --locked
+CARGO_TARGET_DIR="$PWD/.artifacts/channel-settlement/cargo" bash scripts/build-web-crypto.sh
+VIBEFACE_PROBE_SOURCE_ROOT="$PWD" CARGO_TARGET_DIR="$PWD/.artifacts/delivery-probe/target" \
+  cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
+python3 scripts/verify-node.py --delivery-channel \
+  --binary .artifacts/channel-settlement/cargo/debug/vibeface \
+  --core-binary .artifacts/channel-settlement/cargo/debug/vibeface-core \
+  --crypto-module apps/app/generated/vibeface_secure.js \
+  --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe \
+  --artifacts .artifacts/channel-settlement/process
+```
+
+The process run first checks the free charity path has no wallet, transactions or chain calls. It then explicitly enables the paid lab and exercises three actual Source receipts, durable retries after restart, partial and accumulated claims, duplicate-order rejection across channels, lock/off gates, close and keeper refund. Ordinary `--delivery-charity` never runs this supplement. This model leaves a credit risk: a payer can refuse to sign after delivery. It provides no ZK delivery fairness, mainnet finality or production token assurance.
 
 ## API
 

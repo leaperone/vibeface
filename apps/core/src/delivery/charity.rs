@@ -470,6 +470,50 @@ impl Delivery {
         Ok(stored)
     }
 
+    pub(super) fn channel_source(
+        &self,
+        id: &str,
+        provider: &str,
+        completed: bool,
+    ) -> Result<String> {
+        let stored = self.charity_stored(id)?;
+        let terms = &stored.order.terms;
+        ensure!(
+            stored.view.role == Role::Sender
+                && terms.source_peer == self.identity.device_id()?
+                && terms.provider_peer == provider
+                && stored.view.source_peer == terms.source_peer
+                && stored.view.provider_peer == terms.provider_peer
+                && stored.view.receiver_peer == terms.receiver_peer,
+            "channel fees require this Node's Source order and its actual Provider"
+        );
+        if completed {
+            ensure!(
+                stored.confirmed
+                    && stored.notified
+                    && stored.view.phase == Phase::Recoverable
+                    && stored.view.windows.len() == stored.order.windows.len()
+                    && stored
+                        .view
+                        .windows
+                        .iter()
+                        .zip(&stored.order.windows)
+                        .all(|(view, spec)| view.index == spec.index
+                            && view.committed_bytes == spec.ciphertext_bytes),
+                "channel charge requires a completed Source delivery"
+            );
+            let receipt = stored
+                .receipt
+                .as_ref()
+                .context("Source has no saved receiver receipt")?;
+            receipt.verify(&stored.order, now())?;
+            return Ok(hex::encode(vibeface_delivery::hash(&serde_json::to_vec(
+                receipt,
+            )?)));
+        }
+        Ok(hex::encode(stored.order.digest()?))
+    }
+
     fn charity_scoped(&self, network: &str, id: &str) -> Result<StoredCharity> {
         let stored = self.charity_stored(id)?;
         ensure!(
@@ -1944,6 +1988,63 @@ mod tests {
                 .verify(&order, order.terms.retain_until + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn channel_source_requires_saved_full_receipt_and_actual_source_and_provider() {
+        let (order, _, _, _, receiver, source) = fixture();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/channel-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&dir).unwrap();
+        let delivery = Delivery::open(&dir, source).unwrap();
+        delivery
+            .configure_local(super::super::DeliveryConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let id = order.terms.order_id.clone();
+        let provider = order.terms.provider_peer.clone();
+        let mut stored = new_record(
+            order,
+            Role::Sender,
+            Some("source-network".into()),
+            "request".into(),
+        );
+        stored.confirmed = true;
+        stored.notified = true;
+        mark_received(&mut stored);
+        delivery.charity_save(&mut stored).unwrap();
+        assert!(
+            delivery.channel_source(&id, &provider, true).is_err(),
+            "an evidence enum alone never authorizes signing"
+        );
+        let mut receipt = CharityReceipt {
+            order_id: id.clone(),
+            manifest_hash: hex::encode(stored.order.digest().unwrap()),
+            receiver_peer: receiver.device_id().unwrap(),
+            key_id: stored.order.terms.receiving_key.key_id.clone(),
+            received_at: 2000,
+            signature: String::new(),
+        };
+        receipt.signature = receiver
+            .sign_payload("delivery-charity-received", &receipt.payload().unwrap())
+            .unwrap();
+        stored.receipt = Some(receipt.clone());
+        delivery.charity_save(&mut stored).unwrap();
+        delivery.channel_source(&id, &provider, true).unwrap();
+        assert!(
+            delivery
+                .channel_source(&id, &"88".repeat(32), true)
+                .is_err()
+        );
+        receipt.signature = "invalid".into();
+        stored.receipt = Some(receipt);
+        delivery.charity_save(&mut stored).unwrap();
+        assert!(delivery.channel_source(&id, &provider, true).is_err());
+        drop(delivery);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

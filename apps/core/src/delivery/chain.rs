@@ -19,16 +19,17 @@ const MAX_GAS_LIMIT: u64 = 30_000_000;
 const CONTROL_ROOT: &str = "0xa54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56";
 const BN254_CONTROL_ID: &str = "0x04446e66d300eb7fb45c9726bb53c793dda407a62e9601618bb43c5c14657ac0";
 
-mod abi {
+pub(super) mod abi {
     include!(concat!(env!("OUT_DIR"), "/delivery_abi.rs"));
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub rpc_url: String,
     pub chain_id: u64,
     pub escrow: String,
+    pub channel_escrow: Option<String>,
     pub asset: String,
     pub profile: ProofProfile,
     pub confirmations: u64,
@@ -67,6 +68,13 @@ impl ChainConfig {
             escrow != Address::ZERO && asset != Address::ZERO && escrow != asset,
             "invalid delivery deployment addresses"
         );
+        if let Some(channel) = &self.channel_escrow {
+            let channel = address(channel)?;
+            ensure!(
+                channel != Address::ZERO && channel != asset && channel != escrow,
+                "invalid channel deployment address"
+            );
+        }
         self.profile.validate()?;
         let expected: ProofProfile = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -81,6 +89,7 @@ impl ChainConfig {
 }
 
 pub enum Call {
+    Channel(Box<super::channel::ChannelAction>),
     Approve {
         amount: Amount,
     },
@@ -229,6 +238,17 @@ impl Chain {
         let asset = address(&self.config.asset)?;
         self.verify_code(&trust, "DeliveryEscrow", escrow).await?;
         self.verify_code(&trust, "TestToken", asset).await?;
+        if let Some(channel) = &self.config.channel_escrow {
+            let channel = address(channel)?;
+            self.verify_code(&trust, "CumulativeChannel", channel)
+                .await?;
+            ensure!(
+                self.call(channel, abi::assetCall {}).await? == asset
+                    && self.call(channel, abi::CHALLENGE_WINDOWCall {}).await?
+                        == super::channel::CHALLENGE_WINDOW,
+                "channel escrow uses another asset or challenge window"
+            );
+        }
         let adapter = self.call(escrow, abi::adapterCall {}).await?;
         ensure!(
             adapter != Address::ZERO && adapter != escrow && adapter != asset,
@@ -355,6 +375,30 @@ impl Chain {
             )
             .await?
             .to_string())
+    }
+
+    pub async fn channel_allowance(&self, wallet: Address) -> Result<U256> {
+        self.call(
+            address(&self.config.asset)?,
+            abi::allowanceCall {
+                owner: wallet,
+                spender: super::channel::escrow(&self.config)?,
+            },
+        )
+        .await
+    }
+
+    pub async fn channel(&self, id: B256) -> Result<super::channel::ChannelSnapshot> {
+        let position = self.confirmed_position().await?;
+        let value = self
+            .call_at(
+                super::channel::escrow(&self.config)?,
+                abi::getChannelCall { id },
+                &position,
+            )
+            .await?;
+        self.verify_position(&position).await?;
+        super::channel::ChannelSnapshot::from_chain(value, position)
     }
 
     pub async fn current_key(&self, receiver_peer: Word) -> Result<KeyRecord> {
@@ -936,6 +980,7 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
     config.validate()?;
     let escrow = address(&config.escrow)?;
     let calldata = match call {
+        Call::Channel(action) => return action.encode(config, wallet),
         Call::Approve { amount } => {
             return Ok((
                 address(&config.asset)?,
@@ -1162,12 +1207,23 @@ fn validate_calldata(
         );
         let call = abi::approveCall::abi_decode_validate(input)?;
         ensure!(
-            call.spender == address(&config.escrow)?
+            (call.spender == address(&config.escrow)?
+                || config
+                    .channel_escrow
+                    .as_ref()
+                    .is_some_and(|channel| address(channel).ok() == Some(call.spender)))
                 && call.amount != U256::MAX
                 && call.abi_encode() == input,
             "delivery approval must name the fixed escrow and an exact amount"
         );
         return Ok(());
+    }
+    if config
+        .channel_escrow
+        .as_ref()
+        .is_some_and(|channel| address(channel).ok() == Some(target))
+    {
+        return super::channel::validate_calldata(config, input, wallet);
     }
     ensure!(
         target == address(&config.escrow)?,
@@ -1360,7 +1416,7 @@ fn word(value: &str) -> Result<B256> {
     ensure!(bytes.len() == 32, "invalid delivery bytes32 length");
     Ok(B256::from_slice(&bytes))
 }
-fn amount(value: &str) -> Result<U256> {
+pub(super) fn amount(value: &str) -> Result<U256> {
     Ok(U256::from_be_bytes(
         Amount::from_decimal_str(value)?.to_be_bytes(),
     ))
@@ -1500,6 +1556,7 @@ pub(super) mod tests {
             rpc_url: "http://127.0.0.1:8545".into(),
             chain_id: LOCAL_CHAIN_ID,
             escrow: "0x1111111111111111111111111111111111111111".into(),
+            channel_escrow: None,
             asset: "0x2222222222222222222222222222222222222222".into(),
             confirmations: 2,
             profile: serde_json::from_str(include_str!(concat!(

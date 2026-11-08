@@ -234,6 +234,17 @@ impl Wallet {
         })
     }
 
+    pub(super) fn sign_channel_voucher(
+        &self,
+        voucher: &super::channel::CumulativeVoucher,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.address()? == chain::address(&voucher.terms.payer)?,
+            "channel payer differs from local wallet"
+        );
+        Ok(self.sign_hash(voucher.digest()?)?.as_bytes().to_vec())
+    }
+
     fn sign_hash(&self, digest: B256) -> Result<Signature> {
         self.require_loaded()?;
         let key = self.key.as_ref().context(

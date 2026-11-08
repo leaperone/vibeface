@@ -312,6 +312,11 @@ struct WalletOptions {
 
 #[derive(Subcommand)]
 enum WalletAction {
+    /// Run the manually enabled local cumulative-channel experiment.
+    Channel {
+        #[command(subcommand)]
+        command: WalletChannelAction,
+    },
     /// Show wallet and receiving-key status.
     Status,
     /// Create a wallet using a protected passphrase descriptor.
@@ -366,6 +371,81 @@ enum WalletAction {
     Backup {
         /// Destination backup file.
         output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum WalletChannelAction {
+    /// Lock a fixed token deposit for one Provider. Retry with the same UUID and terms.
+    Open {
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        payee: String,
+        #[arg(long)]
+        provider_peer: String,
+        #[arg(long)]
+        budget: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Authorize one existing Source order's exact fee, once, in whole smallest token units.
+    Authorize {
+        #[arg(long)]
+        channel_id: String,
+        #[arg(long)]
+        order_id: String,
+        #[arg(long)]
+        amount: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Sign only after the Source has saved and verified the receiver's complete receipt.
+    Issue {
+        #[arg(long)]
+        order_id: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Export the latest compact public signed voucher.
+    Export {
+        #[arg(long)]
+        channel_id: String,
+        output: PathBuf,
+    },
+    /// Import a public voucher on its Provider Node.
+    Import { file: PathBuf },
+    /// Redeem the imported cumulative amount to the fixed payee.
+    Redeem {
+        #[arg(long)]
+        channel_id: String,
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Start the fixed challenge window as payer.
+    Close {
+        #[arg(long)]
+        channel_id: String,
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Return the remainder to the fixed payer after the challenge window.
+    Refund {
+        #[arg(long)]
+        channel_id: String,
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Read local history and confirmed on-chain accounting.
+    Status {
+        #[arg(long)]
+        channel_id: String,
     },
 }
 
@@ -1045,6 +1125,7 @@ fn join_failure_text(reason: &str) -> String {
 async fn wallet(options: WalletOptions) -> Result<()> {
     let dir = options.data_dir.clone();
     match options.command {
+        WalletAction::Channel { command } => wallet_channel(&dir, command).await,
         WalletAction::Status => wallet_request(&dir, WalletCommand::Status).await,
         WalletAction::Create { passphrase_fd } => {
             wallet_request(
@@ -1105,6 +1186,81 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn wallet_channel(dir: &Path, command: WalletChannelAction) -> Result<()> {
+    let mut output = None;
+    let command = match command {
+        WalletChannelAction::Open {
+            intent_id,
+            payee,
+            provider_peer,
+            budget,
+            gas_cap,
+        } => {
+            json!({"op":"open","intent_id":intent_id,"payee":payee,"provider_peer":provider_peer,"budget":budget,"gas_cap":gas_cap})
+        }
+        WalletChannelAction::Authorize {
+            channel_id,
+            order_id,
+            amount,
+            intent_id,
+        } => {
+            json!({"op":"authorize","channel_id":channel_id,"order_id":order_id,"amount":amount,"intent_id":intent_id})
+        }
+        WalletChannelAction::Issue {
+            order_id,
+            intent_id,
+        } => json!({"op":"issue","order_id":order_id,"intent_id":intent_id}),
+        WalletChannelAction::Export {
+            channel_id,
+            output: file,
+        } => {
+            output = Some(file);
+            json!({"op":"export","channel_id":channel_id})
+        }
+        WalletChannelAction::Import { file } => {
+            let voucher: Value = serde_json::from_slice(&read_bounded_local(&file, 2048)?)
+                .context("invalid public channel voucher")?;
+            json!({"op":"import","voucher":voucher})
+        }
+        WalletChannelAction::Redeem {
+            channel_id,
+            intent_id,
+            gas_cap,
+        } => json!({"op":"redeem","channel_id":channel_id,"intent_id":intent_id,"gas_cap":gas_cap}),
+        WalletChannelAction::Close {
+            channel_id,
+            intent_id,
+            gas_cap,
+        } => json!({"op":"close","channel_id":channel_id,"intent_id":intent_id,"gas_cap":gas_cap}),
+        WalletChannelAction::Refund {
+            channel_id,
+            intent_id,
+            gas_cap,
+        } => json!({"op":"refund","channel_id":channel_id,"intent_id":intent_id,"gas_cap":gas_cap}),
+        WalletChannelAction::Status { channel_id } => {
+            json!({"op":"status","channel_id":channel_id})
+        }
+    };
+    let socket = inspect_socket(dir).await?;
+    let response =
+        maintenance::request(&socket, MaintenanceCommand::DeliveryChannel(command)).await?;
+    let value = response
+        .delivery
+        .context("Node returned no channel result")?;
+    if let Some(output) = output {
+        let encoded = serde_json::to_vec(&value)?;
+        ensure!(
+            encoded.len() <= 2048,
+            "public channel voucher exceeds its limit"
+        );
+        privatefs::create_durable(&output, &encoded)?;
+        println!("Public signed channel voucher saved.");
+    } else {
+        println!("{}", serde_json::to_string(&value)?);
+    }
+    Ok(())
 }
 
 async fn wallet_request(dir: &Path, command: WalletCommand) -> Result<()> {

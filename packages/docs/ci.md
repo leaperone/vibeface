@@ -66,6 +66,8 @@ Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证�
 
 合约检查使用锁定的 solc、Ganache 和 ethers。官方 verifier 源码逐项校验摘要，`compile.mjs --check-trust` 对比重新编译的 runtime 与已提交的 `trust.json`，不改 tracked 文件。检查还包括账务正反例、官方 published fixture、两连续窗口的 Rust 与 Solidity 编码比较，以及当前 delivery image 的真实 seal 在生产 adapter 上的验真和篡改拒绝。
 
+独立累计通道的 `verify-channel.mjs` 也由同一检查入口执行，覆盖合成累计券、重复与跨域重放、预算、挑战期退出和异常代币。它不生成证明。真实 Node 通道验收是另行显式选择的 `verify-node.py --delivery-channel`；默认公益验收仍不启动链或钱包。
+
 这些结果分别保留在 `.artifacts/vdp/` 和 `.artifacts/vdp/contracts/`。CI 只上传公开 journal、结果和合成公开向量，不上传私密见证、密钥、Node 数据或工具链。官方 published fixture 和账务测试有各自的标签，它们不能替代当前 delivery image 的证明。
 
 在上述固定路径的 Linux sandbox 中执行同一核心检查：

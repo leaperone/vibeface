@@ -6377,6 +6377,9 @@ def delivery_charity_acceptance(options):
         passed("free-directory-failover-preserves-membership-and-no-finance", unavailable_reads=fault_directory.reads,
                unavailable_writes=fault_directory.writes, available_reads=relay.reads, available_writes=relay.writes,
                member_counts={name: len(members) for name, members in initial_members.items()}, **delivery_free_state(nodes, spy))
+        if getattr(options, "delivery_channel", False):
+            report["mode"] = "charity-and-cumulative-channel"
+            delivery_channel_run(options, run, source, receiver, provider, order_id, passed, restart)
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"
@@ -6392,6 +6395,207 @@ def delivery_charity_acceptance(options):
         private_json(run / "summary.json", report)
         print("Delivery report: " + str(run / "summary.json"), flush=True)
     return report
+
+
+def delivery_channel_run(options, run, source, receiver, provider, first_order, passed, restart):
+    """Opt-in local settlement after the ordinary free-path assertions have all passed."""
+    repository = Path(__file__).resolve().parents[1]
+    deployment_path = run / "channel-deployment.json"
+    log = (run / "channel-chain.log").open("xb")
+    process = subprocess.Popen(["node", str(repository / "contracts/delivery/deploy-local.mjs"),
+        "--listen", "127.0.0.1:0", "--output", str(deployment_path), "--channel"],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    cap = "100000000000000000"
+    passwords = {}
+
+    def cli(node, arguments, *, password=None, success=True, error_contains=None):
+        def invoke():
+            descriptor, password_path = None, None
+            command = [str(options.binary), "wallet", "--data-dir", str(node.directory), *arguments]
+            try:
+                if password is not None:
+                    password_path = run / ("channel-password-" + uuid.uuid4().hex)
+                    descriptor = os.open(password_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.write(descriptor, password.encode() + b"\n")
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    command += ["--passphrase-fd", str(descriptor)]
+                result = subprocess.run(command, capture_output=True, timeout=30,
+                    pass_fds=(() if descriptor is None else (descriptor,)))
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                    password_path.unlink(missing_ok=True)
+            if result.returncode and b"another delivery operation is in progress" in result.stderr:
+                return None
+            require((result.returncode == 0) == success,
+                    "channel owner CLI outcome: " + result.stderr.decode(errors="replace")[:512])
+            if error_contains:
+                require(error_contains.encode() in result.stderr, "channel refusal names the expected boundary")
+            return {"value": json.loads(result.stdout) if success and result.stdout.lstrip().startswith(b"{") else None}
+        return wait_for("channel local operation ownership", invoke, timeout=45)["value"]
+
+    def channel(node, action, **fields):
+        args = ["channel", action]
+        for key, value in fields.items():
+            args += ["--" + key.replace("_", "-"), str(value)]
+        return cli(node, args)
+
+    def settled(node, action, **fields):
+        def check():
+            value = channel(node, action, **fields)
+            result = value.get("result", value)
+            observation = result.get("transaction", {})
+            require(observation.get("phase") not in ("reverted", "failed", "conflicted"), "channel transaction must succeed")
+            return value if result.get("step") == "execute" and observation.get("phase") == "confirmed" else None
+        return wait_for("channel original transaction confirmation", check, timeout=60)
+
+    try:
+        def deployed():
+            require(process.poll() is None, "local channel deployment process remains alive")
+            try:
+                value = json.loads(deployment_path.read_text())
+                return value if value.get("channel_escrow") else None
+            except (FileNotFoundError, json.JSONDecodeError):
+                return None
+        deployment = wait_for("pinned local channel deployment", deployed, timeout=180)
+        chain = {key: deployment[key] for key in ("rpc_url", "chain_id", "escrow", "channel_escrow", "asset", "profile", "confirmations")}
+
+        def rpc(method, params):
+            request = urllib.request.Request(chain["rpc_url"], json.dumps({"jsonrpc": "2.0", "id": 1,
+                "method": method, "params": params}).encode(), {"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                value = json.loads(response.read(1024 * 1024))
+            require(value.get("id") == 1 and "error" not in value, "local channel RPC succeeds")
+            return value["result"]
+
+        def confirmed(tx_hash):
+            receipt = rpc("eth_getTransactionReceipt", [tx_hash])
+            require(receipt is None or receipt["status"] == "0x1", "test-only wallet funding succeeds")
+            return receipt if receipt and int(rpc("eth_blockNumber", []), 16) >= int(receipt["blockNumber"], 16) + 1 else None
+
+        def balance(address):
+            return int(rpc("eth_call", [{"to":chain["asset"], "data":"0x70a08231" + address[2:].zfill(64)}, "latest"]), 16)
+
+        settings = {"enabled":True, "charity_enabled":True, "paid_enabled":True, "chain":chain, "prover":None}
+        for node in (source, provider):
+            path = run / ("channel-settings-" + node.name + ".json")
+            private_json(path, settings)
+            cli(node, ["configure", str(path)])
+            passwords[node.name] = base64.urlsafe_b64encode(os.urandom(32)).decode()
+            wallet = cli(node, ["create"], password=passwords[node.name])
+            node.wallet_address = wallet["address"]
+            cli(node, ["unlock"], password=passwords[node.name])
+            gas = rpc("eth_sendTransaction", [{"from":deployment["funder"], "to":node.wallet_address,"value":hex(10**18)}])
+            wait_for("channel test-only gas funding", lambda: confirmed(gas), timeout=30)
+        funding = rpc("eth_sendTransaction", [{"from":deployment["funder"], "to":chain["asset"],
+            "data":"0xa9059cbb" + source.wallet_address[2:].zfill(64) + format(1000,"064x")}])
+        wait_for("channel test-only token funding", lambda: confirmed(funding), timeout=30)
+        open_fields = {"intent_id":str(uuid.uuid4()), "payee":provider.wallet_address,
+            "provider_peer":provider.device_id, "budget":"100", "gas_cap":cap}
+        opened = settled(source, "open", **open_fields)
+        identifier = opened["channel_id"]
+        require(balance(chain["channel_escrow"]) == 100, "deposit is locked independently in channel escrow")
+        before = balance(provider.wallet_address)
+        fees = []
+        for index, fee in enumerate((7, 11, 13)):
+            if index == 0:
+                order = first_order
+            else:
+                intent_id = str(uuid.uuid4())
+                content = ("actual-channel-source-" + str(index)).encode()
+                request = {"intent_id":intent_id,"receiver_peer":receiver.device_id,"provider_peer":provider.device_id,
+                    "mode":"charity","acceptance":"recoverable","name":"channel.bin","content_base64":base64.b64encode(content).decode(),
+                    "max_service_amount":"0","max_gas_amount":"0"}
+                prepared = delivery_call(source, "prepare", **request)
+                order = prepared["order_id"]
+            authorization = str(uuid.uuid4())
+            channel(source, "authorize", channel_id=identifier, order_id=order, amount=str(fee), intent_id=authorization)
+            if index:
+                cli(source, ["channel","issue","--order-id",order,"--intent-id",authorization], success=False,
+                    error_contains="completed Source delivery")
+                delivery_call(source, "confirm", intent_id=intent_id)
+                wait_for("channel receiver gets actual offer", lambda: any(item["order_id"] == order
+                    for item in delivery_call(receiver,"list")["orders"]), timeout=60)
+                delivery_call(receiver,"accept",order_id=order)
+                wait_for("channel receiver recovers its actual file", lambda:
+                    delivery_call(receiver,"get",order_id=order)["evidence"] == "charity_receipt", timeout=60)
+                actual = delivery_call(receiver,"read",order_id=order)
+                require(base64.b64decode(actual["content_base64"]) == content, "channel charge follows exact recovered original")
+                wait_for("channel Source saves actual receiver receipt",lambda:
+                    delivery_call(source,"get",order_id=order)["evidence"] == "charity_receipt",timeout=60)
+            voucher = channel(source,"issue",order_id=order,intent_id=authorization)
+            require(voucher["sequence"] == index + 1 and int(voucher["total_amount"]) == sum((7,11,13)[:index+1]),
+                    "actual Source fees advance exact cumulative amount and sequence")
+            require(channel(source,"issue",order_id=order,intent_id=authorization) == voucher,
+                    "same Source receipt retry returns identical durable voucher")
+            if index == 0:
+                restart(source)
+                exported = run / "channel-voucher-after-restart.json"
+                cli(source,["channel","export","--channel-id",identifier,str(exported)])
+                require(json.loads(exported.read_text()) == voucher, "crash restart preserves voucher before any new signatures")
+                cli(source,["channel","issue","--order-id",order,"--intent-id",authorization],success=False,error_contains="unlock")
+                cli(source,["unlock"],password=passwords[source.name])
+            voucher_path = run / ("channel-voucher-" + str(index) + ".json")
+            cli(source,["channel","export","--channel-id",identifier,str(voucher_path)])
+            cli(provider,["channel","import",str(voucher_path)])
+            if index != 1:
+                settled(provider,"redeem",channel_id=identifier,intent_id=str(uuid.uuid4()),gas_cap=cap)
+            fees.append({"order_id":order,"amount":fee,"sequence":voucher["sequence"],"receipt_commitment":voucher["receipt_commitment"]})
+        require(balance(provider.wallet_address) - before == 31, "actual Provider independently redeems only cumulative delta")
+        second = settled(source,"open",**{**open_fields,"intent_id":str(uuid.uuid4())})["channel_id"]
+        cli(source,["channel","authorize","--channel-id",second,"--order-id",first_order,"--amount","7","--intent-id",str(uuid.uuid4())],
+            success=False,error_contains="immutable")
+        cli(source,["lock"])
+        cli(source,["channel","close","--channel-id",identifier,"--intent-id",str(uuid.uuid4()),"--gas-cap",cap],success=False,error_contains="unlock")
+        cli(source,["unlock"],password=passwords[source.name])
+        settled(source,"close",channel_id=identifier,intent_id=str(uuid.uuid4()),gas_cap=cap)
+        cli(source,["channel","refund","--channel-id",identifier,"--intent-id",str(uuid.uuid4()),"--gas-cap",cap],success=False)
+        state = channel(source,"status",channel_id=identifier)
+        require(state["chain"]["state"] == "closing", "confirmed closing records its pinned challenge cutoff")
+        rpc("evm_increaseTime", [3601]); rpc("evm_mine", []); rpc("evm_mine", [])
+        settled(provider,"refund",channel_id=identifier,intent_id=str(uuid.uuid4()),gas_cap=cap)
+        require(channel(source,"status",channel_id=identifier)["chain"]["state"] == "closed"
+            and balance(chain["channel_escrow"]) == 100 and balance(source.wallet_address) == 869,
+            "untrusted keeper refunds only the fixed payer and preserves the other channel deposit")
+        wrong = settled(source,"open",**{**open_fields,"intent_id":str(uuid.uuid4()),"payee":deployment["funder"],"budget":"1"})["channel_id"]
+        wrong_intent = str(uuid.uuid4())
+        prepared = delivery_call(source,"prepare",intent_id=wrong_intent,receiver_peer=receiver.device_id,provider_peer=provider.device_id,
+            mode="charity",acceptance="recoverable",name="payee-boundary.bin",content_base64=base64.b64encode(b"payee-boundary").decode(),
+            max_service_amount="0",max_gas_amount="0")
+        wrong_order = prepared["order_id"]
+        delivery_call(source,"confirm",intent_id=wrong_intent)
+        wait_for("payee-boundary actual receiver offer",lambda:any(item["order_id"] == wrong_order
+            for item in delivery_call(receiver,"list")["orders"]),timeout=60)
+        delivery_call(receiver,"accept",order_id=wrong_order)
+        wait_for("payee-boundary actual Source receipt",lambda:
+            delivery_call(source,"get",order_id=wrong_order)["evidence"] == "charity_receipt",timeout=60)
+        wrong_authorization = str(uuid.uuid4())
+        channel(source,"authorize",channel_id=wrong,order_id=wrong_order,amount="1",intent_id=wrong_authorization)
+        channel(source,"issue",order_id=wrong_order,intent_id=wrong_authorization)
+        wrong_file = run / "wrong-payee-voucher.json"
+        cli(source,["channel","export","--channel-id",wrong,str(wrong_file)])
+        cli(provider,["channel","import",str(wrong_file)],success=False,error_contains="fixed payee")
+        cli(provider,["lock"])
+        cli(provider,["channel","import",str(voucher_path)])
+        disabled = {**settings,"paid_enabled":False}
+        path = run / "channel-disabled.json"; private_json(path,disabled); cli(source,["configure",str(path)])
+        cli(provider,["configure",str(path)])
+        cli(provider,["channel","import",str(voucher_path)],success=False,error_contains="disabled")
+        cli(source,["channel","open","--intent-id",str(uuid.uuid4()),"--payee",provider.wallet_address,
+            "--provider-peer",provider.device_id,"--budget","1","--gas-cap",cap],success=False,error_contains="disabled")
+        public = run / "channel-voucher-while-disabled.json"
+        cli(source,["channel","export","--channel-id",identifier,str(public)])
+        passed("actual-source-receipt-cumulative-channel", channel_id=identifier, fees=fees, redeemed="31", refunded="69",
+               restart_same_voucher=True, cross_channel_double_charge_rejected=True, closed=True,
+               wrong_payee_import_rejected=True, locked_public_import=True, disabled_import_rejected=True,
+               chain_deployment=chain["channel_escrow"], scope="real Node charity receipts plus local test-token settlement; no ZK fairness")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try: process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=5)
+        log.close()
 
 
 class DeliveryRpcForwarder:
@@ -9033,6 +9237,7 @@ if __name__ == "__main__":
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
+        modes.add_argument("--delivery-channel", action="store_true", help="after free charity checks, explicitly enable the local cumulative payment channel and settle actual Source receipts")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
         parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
@@ -9080,7 +9285,7 @@ if __name__ == "__main__":
                 e2e_fixture(arguments)
             elif arguments.delivery:
                 delivery_paid_acceptance(arguments)
-            elif arguments.delivery_charity:
+            elif arguments.delivery_charity or arguments.delivery_channel:
                 delivery_charity_acceptance(arguments)
             elif arguments.discovery:
                 discovery_acceptance(arguments)

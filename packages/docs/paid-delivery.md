@@ -8,9 +8,54 @@ VDP-1 为本人文件增加独立的免费传输和付费传输。传输默认�
 
 ## 累计小额结算实验
 
-累计支付通道正在开发，尚未接入现有交付流程。目标是预存服务预算，按消息或中继服务在链下累计应付金额，再由服务节点凭有效支付凭证结算。每次计费不单独发送链上交易，发现和普通私人网络同步继续免费。
+累计支付通道是独立的本地链实验。付款人预存固定预算，为已有 Source 文件订单显式授权费用，完整接收收据落盘后再签发累计券。服务 Node 导入公开签名券后自行兑付。普通聊天、发现、公益传输和私人网络同步均不会自动计费；原逐窗口 ZK 托管继续独立运行。
 
-实验沿用手动开启的实验室边界和本地测试链。资金分配必须防止同一余额被重复承诺；凭证必须绑定部署、付款人、收款节点及累计金额，并支持重复提交只支付差额、服务节点独立兑付与未使用资金退出。累计结算不等于交付证明聚合，也不解决密钥暴露后交易失败或接收方拒绝提供证明的公平交换问题。
+S 和 P 的本机所有者须分别手动设置 `enabled=true`、`paid_enabled=true`，配置同一回环 HTTP `chain_id=31337` 部署，并解锁各自的钱包。`chain.escrow` 仍指向 `DeliveryEscrow`，新增的可选 `chain.channel_escrow` 指向独立 `CumulativeChannel`。合约和资产 runtime 均由本次构建的 `trust.json` 固定，挑战窗口为 3600 秒，资产仅为六位精度的本地 `TestToken`。通道不需要启动 prover。
+
+每个通道固定付款钱包、服务钱包、服务 PeerID、资产和一次性押金，不追加押金。ID 在合约内由链、合约、实际付款人和唯一 salt 派生，关闭后不能复用。EIP-712 累计券绑定链、合约、通道、递增序号、累计金额及最后一笔完整收据承诺。任何人可提交券，合约只将尚未兑付的差额付给固定服务钱包；过期或重复券不能重复扣款。
+
+费用只接受最小代币单位的十进制整数。六位精度下 `1` 表示 `0.000001 TestToken`。比一个最小单位更细的业务费用须先累计用量，再显式授权整数单位；CLI 不做小数换算，也不会逐消息向上取整。示例费率不表示商业价格或主网成本。
+
+以下命令均经同用户维护 socket 执行。先按下文配置、创建并解锁 S/P 各自钱包，测试链账户还需为两个钱包提供测试 gas，并为 S 提供测试代币。各 UUID 使用本轮唯一、重试保持不变的值。
+
+```sh
+# 持续运行的本地链，公开输出包含原 escrow、channel_escrow、asset 和 profile。
+node contracts/delivery/deploy-local.mjs --channel --listen 127.0.0.1:0 \
+  --output "$PWD/.artifacts/channel-deployment.json"
+
+# 在另一终端把输出部署字段写入 S/P 的 delivery 配置后，分别应用。
+vibeface wallet --data-dir /absolute/source configure /absolute/source-delivery.json
+vibeface wallet --data-dir /absolute/provider configure /absolute/provider-delivery.json
+vibeface wallet --data-dir /absolute/source channel open --intent-id "$OPEN_UUID" \
+  --payee "$PROVIDER_WALLET" --provider-peer "$PROVIDER_PEER" --budget 100 \
+  --gas-cap 100000000000000000
+
+# 保存返回的 CHANNEL_ID，显式授权已有 Source 订单的一笔费用。
+vibeface wallet --data-dir /absolute/source channel authorize --channel-id "$CHANNEL_ID" \
+  --order-id "$SOURCE_ORDER_ID" --amount 7 --intent-id "$CHARGE_UUID"
+# 仅在 Source 保存接收方的完整文件签名收据后签发。
+vibeface wallet --data-dir /absolute/source channel issue \
+  --order-id "$SOURCE_ORDER_ID" --intent-id "$CHARGE_UUID"
+vibeface wallet --data-dir /absolute/source channel export \
+  --channel-id "$CHANNEL_ID" /absolute/public-voucher.json
+vibeface wallet --data-dir /absolute/provider channel import /absolute/public-voucher.json
+vibeface wallet --data-dir /absolute/provider channel redeem --channel-id "$CHANNEL_ID" \
+  --intent-id "$REDEEM_UUID" --gas-cap 100000000000000000
+vibeface wallet --data-dir /absolute/source channel close --channel-id "$CHANNEL_ID" \
+  --intent-id "$CLOSE_UUID" --gas-cap 100000000000000000
+# 到达 closes_at 后退回剩余押金，接收地址固定为付款钱包。
+vibeface wallet --data-dir /absolute/provider channel refund --channel-id "$CHANNEL_ID" \
+  --intent-id "$REFUND_UUID" --gas-cap 100000000000000000
+vibeface wallet --data-dir /absolute/source channel status --channel-id "$CHANNEL_ID"
+```
+
+链上动作可能先返回 `included` 或 `unknown`。保留 UUID、通道、金额和 gas cap，重试原命令对账；不得换 UUID 当作原交易失败。一次 open 的精确 approval 和 deposit 共用同一 gas cap。费用授权原子占用通道预算，不可通过改金额、UUID 或换通道覆盖；同一 Source 订单只能收费一次。issue 重试返回原券，后续订单增加累计序号与金额。Node 在返回券前原子保存订单去重、累计状态和签名券。
+
+export 仅包含公开条款和签名，不含钱包或接收密钥，锁定或关闭实验后仍可导出。新 import 需要两个实验开关，但不要求解锁钱包。钱包锁定、付费开关关闭或部署改变会阻止新签名和广播。
+
+付款人发起关闭后，P 必须在链上 `closes_at` 之前提交最高券；到达截止时间后仅退未兑付余额。服务先完成、付款人后签券，付款人仍可拒签，P 承担这次服务的信用风险。收据是接收 Node 对完整清单的签名确认，不是链上 ZK 交付证明，不能保证公平交换、独有带宽贡献或永久离线兑付。
+
+`verify-channel.mjs` 验证合成本地结算。真实 Node 验收使用 `verify-node.py --delivery-channel`：先执行默认免费的公益验收，再显式开启通道，用真实 Source 订单和实际恢复文件的收据签发三笔费用。构建命令见 `contracts/delivery/README.md`。普通 `--delivery-charity` 不启动链、不创建钱包、不收费。
 
 ## 角色与信任
 
@@ -39,7 +84,7 @@ S 和 R 可以属于不同个人网络。P 可以是没有个人网络成员关�
 | guest cycles | 64000000。 |
 | profile 内存上限 | 17179869184 字节，实际运行还必须受 Linux cgroup 硬限制。 |
 
-付费 S 和 R 需要匹配 profile 的本机 prover、可信 `r0vm` 和 Linux cgroup v2。cgroup 必须禁用 swap，并限制进程数不超过 64。P 只验证和转交证明，不需要本机 prover。构建、guest 执行、真实 Groth16 证明、资源限制和链上结算是分别验收的结果。
+逐窗口付费传输的 S 和 R 需要匹配 profile 的本机 prover、可信 `r0vm` 和 Linux cgroup v2。cgroup 必须禁用 swap，并限制进程数不超过 64。P 只验证和转交证明，不需要本机 prover。构建、guest 执行、真实 Groth16 证明、资源限制和链上结算是分别验收的结果。
 
 公益采用独立签名条款和加密上下文，当前 Node 使用相同的文件容量边界。它不伪造链地址、钱包、registry 或付费证明，只有公益签名收据。
 
@@ -92,7 +137,7 @@ S 和 R 可以属于不同个人网络。P 可以是没有个人网络成员关�
 | `paid_enabled` | `false`。 |
 | `storage_limit_bytes` | `67108864`。对象、私密材料和证明收据共享配额，允许范围为 131208 至 1073741824。 |
 | `max_orders` | `128`，允许范围为 1 至 128，历史终态订单也占用槽位。 |
-| `chain` | 默认 `null`。付费时必须指定 `rpc_url`、`chain_id`、`escrow`、`asset`、完整 `profile` 和 `confirmations`。 |
+| `chain` | 默认 `null`。付费时指定 `rpc_url`、`chain_id`、`escrow`、`asset`、完整 `profile` 和 `confirmations`。独立通道另需 `channel_escrow`，不替换原 escrow。 |
 | `prover` | 默认 `null`。证明端指定绝对路径 `program`、`r0vm`、`cgroup` 和完整 `profile`。 |
 | `delivery_fee_per_window` | `"10"`，测试代币最小单位。 |
 | `reservation_fee_per_window` | `"2"`，测试代币最小单位。 |

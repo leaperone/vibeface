@@ -10,13 +10,15 @@ const { values } = parseArgs({ options: {
   listen: { type: 'string', default: '127.0.0.1:0' },
   output: { type: 'string' },
   'experiment-fixture': { type: 'boolean', default: false },
+  channel: { type: 'boolean', default: false },
   help: { type: 'boolean', default: false },
 }, strict: true, allowPositionals: false });
 if (values.help) {
-  console.log('Usage: node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output /absolute/path/deployment.json [--experiment-fixture]');
+  console.log('Usage: node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output /absolute/path/deployment.json [--experiment-fixture | --channel]');
   process.exit(0);
 }
 assert(values.output && path.isAbsolute(values.output), '--output must be an absolute path for a new public deployment file');
+assert(!(values.channel && values['experiment-fixture']), '--channel is independent of the pinned delivery-small fixture');
 const match = /^(?:\[([a-fA-F0-9:]+)\]|([0-9.]+)):(0|[1-9][0-9]{0,4})$/.exec(values.listen);
 assert(match, '--listen must be a literal loopback IP and port');
 const host = match[1] || match[2];
@@ -170,6 +172,8 @@ try {
   const asset = await deploy('TestToken', [funder]);
   const escrow = await deploy('DeliveryEscrow', [publicProfile]);
   const assetAddress = (await asset.contract.getAddress()).toLowerCase();
+  const channel = values.channel ? await deploy('CumulativeChannel', [assetAddress]) : null;
+  const channelAddress = channel ? (await channel.contract.getAddress()).toLowerCase() : null;
   const escrowAddress = (await escrow.contract.getAddress()).toLowerCase();
   const adapterAddress = (await escrow.contract.adapter()).toLowerCase();
   const adapterAbi = artifact('RiscZeroAdapter').abi;
@@ -200,6 +204,7 @@ try {
   const receiptValue = receipt => ({ hash: receipt.hash, block_number: receipt.blockNumber, block_hash: receipt.blockHash, gas_used: receipt.gasUsed.toString() });
   const deployment = {
     schema_version: 1, rpc_url: rpcUrl, chain_id: 31337, escrow: escrowAddress, asset: assetAddress,
+    ...(channelAddress ? { channel_escrow: channelAddress } : {}),
     profile, confirmations: 2, funder, profile_id: profileId, adapter: adapterAddress, verifier: verifierAddress,
     runtime_code_hashes: codeHashes, baseline_block: baseline,
     baseline_balances: {

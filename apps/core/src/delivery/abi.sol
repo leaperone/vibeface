@@ -50,3 +50,27 @@
         function allowance(address owner, address spender) external view returns (uint256);
         function approve(address spender, uint256 amount) external returns (bool);
         function decimals() external view returns (uint8);
+
+struct CumulativeVoucher {
+    bytes32 channelId;
+    uint64 sequence;
+    uint256 totalAmount;
+    bytes32 receiptCommitment;
+}
+struct ChainChannel {
+    address payer;
+    address payee;
+    bytes32 providerPeer;
+    uint256 budget;
+    uint256 redeemed;
+    uint64 sequence;
+    uint64 closesAt;
+    uint8 state;
+}
+function asset() external view returns (address);
+function CHALLENGE_WINDOW() external view returns (uint64);
+function getChannel(bytes32 id) external view returns (ChainChannel);
+function openChannel(bytes32 salt, address payee, bytes32 providerPeer, uint256 budget) external returns (bytes32);
+function redeemChannel(bytes32 id, uint64 sequence, uint256 totalAmount, bytes32 receiptCommitment, bytes signature) external;
+function closeChannel(bytes32 id) external;
+function refundChannel(bytes32 id) external;
