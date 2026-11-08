@@ -281,8 +281,8 @@ jobs:
               attempts = details.get("startupAttempts")
               if type(attempts) is int and 1 <= attempts <= 2:
                   projected["startupAttempts"] = attempts
-              xcodebuild = details.get("xcodebuild")
-              value = xcodebuild.get("exitCode") if isinstance(xcodebuild, dict) else None
+              xcodebuild_result = details.get("xcodebuild")
+              value = xcodebuild_result.get("exitCode") if isinstance(xcodebuild_result, dict) else None
               if type(value) is int and 0 <= value <= 255:
                   projected["xcodebuild"] = {"exitCode": value}
               if projected:
@@ -668,8 +668,8 @@ jobs:
               attempts = details.get("startupAttempts")
               if type(attempts) is int and 1 <= attempts <= 2:
                   projected["startupAttempts"] = attempts
-              xcodebuild = details.get("xcodebuild")
-              value = xcodebuild.get("exitCode") if isinstance(xcodebuild, dict) else None
+              xcodebuild_result = details.get("xcodebuild")
+              value = xcodebuild_result.get("exitCode") if isinstance(xcodebuild_result, dict) else None
               if type(value) is int and 0 <= value <= 255:
                   projected["xcodebuild"] = {"exitCode": value}
               if projected:
