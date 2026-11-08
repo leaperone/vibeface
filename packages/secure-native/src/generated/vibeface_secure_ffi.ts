@@ -6,7 +6,7 @@
 import nativeModule from "./vibeface_secure_ffi-ffi";
 import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct,
 } from "./vibeface_secure_ffi-ffi";
-import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterObject, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiRustCallAsync, uniffiTypeNameSymbol, variantOrdinalSymbol,
+import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterFloat64, FfiConverterObject, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiRustCallAsync, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
 const uniffiCaller = new UniffiRustCaller(() => ({ code: 0 }));
 
@@ -315,13 +315,14 @@ export function verify(deviceId: string, domain: string, payload: ArrayBuffer, s
     );
     }
 
-export function verifyMembership(stateJson: string, expectedNetwork: string): MembershipLike /*throws*/ {
+export function verifyMembership(stateJson: string, expectedNetwork: string, now: number | undefined): MembershipLike /*throws*/ {
     return FfiConverterTypeMembership.lift(uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership(
         FfiConverterString.lower(stateJson, nativeModule().rustbuffer_alloc),
         FfiConverterString.lower(expectedNetwork, nativeModule().rustbuffer_alloc),
+        FfiConverterOptionalFloat64.lower(now, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -1386,6 +1387,9 @@ const FfiConverterOptionalTypeLanFrame = new FfiConverterOptional(FfiConverterTy
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
+// FfiConverter for number | undefined
+const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
+
 
 /**
  * This should be called before anything else.
@@ -1450,7 +1454,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_verify() !== 20231) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_verify");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_verify_membership() !== 29750) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_verify_membership() !== 21364) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_verify_membership");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_channel_open_record() !== 29276) {
