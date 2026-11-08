@@ -175,7 +175,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App；完整汇总成功后才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 Windows 运行包的定位可复用已完成 CI 中成功的 Windows package 制品，单独运行当前验收脚本：
 

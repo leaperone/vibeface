@@ -1,0 +1,33 @@
+name: Publish verified release part
+on:
+  workflow_call:
+    inputs:
+      label: {type: string, required: true}
+      kind: {type: string, required: true}
+      target: {type: string, required: false, default: ''}
+      artifact_id: {type: string, required: true}
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish-part:
+    name: ${{ inputs.label }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/part
+      - name: Append this part's immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          arguments=(publish-part --kind "$KIND" --input .artifacts/part)
+          if [[ -n "$TARGET" ]]; then arguments+=(--target "$TARGET"); fi
+          if [[ "$KIND" == android ]]; then python3 -B scripts/check-android-manifest-tool.py; fi
+          python3 -B scripts/release.py "${arguments[@]}"

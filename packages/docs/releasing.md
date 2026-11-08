@@ -20,7 +20,7 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 身份检查后，Web、macOS 原生程序、Windows 原生程序、Linux x64 原生程序、Linux ARM64 原生程序、Android 和 iOS 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
 
-流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后，按 `scripts/release.py` 定义的完整文件集合汇总制品与 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。文件集合包含所有平台安装包、校验和、来源收据及可选的签名 IPA。缺失、错源、损坏或失败目标都会阻止公开。
+流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。各组通过本地校验后，按自己独占的文件集合向同一个公开 Release 追加附件，供用户先手动下载。`collect` 同时在后台审计完整产品制品，最终任务核对全部公开字节并最后追加全局 `release.json`。文件集合包含所有平台安装包、校验和、来源收据及可选的签名 IPA。缺失、错源、损坏或失败目标会阻止整套完成标记、自动更新、npm 和部署，不把部分可下载当作整套完成。
 
 `COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
@@ -125,7 +125,7 @@ pnpm --filter vibeface-www run check:static
 
 1. 在同一 PR 更新所有产品组件版本及必要的 Cargo.lock，完成检查并按授权合并。
 2. 核对该完整提交的 main push CI success，再创建并推送 `v<version>`。一个产品 Tag 构建全部产品目标。
-3. 核对流水线全部生产者、组包和完整汇总成功，确认唯一 publisher 公开 Release。
+3. 跟踪各平台追加发布和后台完整审计；全局 `release.json` 最后出现，才确认整套发布完成。
 4. 下载并验证完整清单、包内来源、SHA-256 和实际运行结果。npm 与部署分别核对。
 
 手动验证默认只构建，既不创建 Tag，也不公开 Release：
@@ -140,7 +140,7 @@ gh workflow run release.yml --ref <branch> -f app=product -F publish=false
 
 npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 更新，不使用本节的 Rust 自更新器。
 
-Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
+Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。新版更新器跳过缺少完整 `release.json` 的构建中 Release，再比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。已安装旧客户端可能先消费自己平台已经齐备的完整包与校验文件；目标不齐时失败并保留现版。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
 更新器没有默认策略；先用 `update configure` 明确指定渠道、是否自动更新及安装根目录，再检查或应用更新。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
 
@@ -154,7 +154,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## 首次安装
 
-公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。如果尚无正式版，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
+公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc、draft 和缺少完整清单的构建中版本，不使用 `/releases/latest` 获取 Nightly。如果尚无正式版，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
 
 安装器只依赖 Bash、curl、tar、gzip、系统文本工具及 `sha256sum` 或 `shasum`，不需要 jq、Python、Node.js 或 Rust。它解析公开 Releases 和 tag 对应的源码提交，下载完整包与准确同名的 SHA256，校验版本、target、源码身份、协议和 data epoch，并拒绝危险包路径、符号链接和特殊文件。校验通过后建立 `releases/<version>`、`current` 与用户 bin 链接，不覆盖已有安装、身份或服务。
 
