@@ -104,8 +104,8 @@ pub(crate) struct Receipt {
     data_epoch: u32,
 }
 
+/// The identity and runtime fields this CLI needs from Core's full health report.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct InspectResult {
     data_dir: PathBuf,
     device_id: String,
@@ -1468,6 +1468,41 @@ mod tests {
         fs::write(package.join("web/index.html"), b"modified").unwrap();
         assert!(crate::update::release::verify_sealed_package(&package, version, &target).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_projects_required_fields_from_cores_full_health_report() {
+        let report = serde_json::json!({
+            "data_dir": "/fixture/node",
+            "device_id": "a".repeat(64),
+            "status": "running",
+            "core_version": "0.0.1-nightly.20261108.1",
+            "version": "0.0.1-nightly.20261108.1",
+            "maintenance_socket": "/fixture/node/maintenance.sock",
+            "listen": "127.0.0.1:4790",
+            "local_listen": "127.0.0.1:4791",
+            "public_url": null,
+            "public_entry": false,
+            "web_enabled": true,
+            "write_state": null,
+            "bootstrap": { "mode": "default", "status": null },
+            "peers": [],
+            "error": null
+        });
+        let inspected: InspectResult = serde_json::from_value(report.clone()).unwrap();
+        assert_eq!(inspected.data_dir, Path::new("/fixture/node"));
+        assert_eq!(inspected.device_id, "a".repeat(64));
+        assert_eq!(inspected.status, "running");
+        assert_eq!(
+            running_core_version(&inspected).unwrap(),
+            "0.0.1-nightly.20261108.1"
+        );
+        let mut missing_identity = report;
+        missing_identity
+            .as_object_mut()
+            .unwrap()
+            .remove("device_id");
+        assert!(serde_json::from_value::<InspectResult>(missing_identity).is_err());
     }
 
     #[test]
