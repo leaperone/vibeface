@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { access, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep, toNamespacedPath } from 'node:path';
 import { expect } from 'e2e';
 import { evaluate, screenshot, test, type Inspection, type Page } from '../desktop';
 
@@ -43,14 +43,15 @@ function isClientUrl(raw: string): boolean {
   return url.protocol === 'vibeface-app:' && url.host === 'app';
 }
 
-function windows(current: Inspection) {
+function clientWindow(current: Inspection): Page {
   const pages = current.pages.filter(entry => entry.type === 'page');
-  const client = pages.filter(entry => isClientUrl(entry.url));
-  const launcher = pages.filter(entry => entry.url.startsWith('vibeface-launcher://app/'));
-  assert.equal(launcher.length, 1, 'exactly one trusted launcher window exists');
-  const launcherPage = launcher[0];
-  assert(launcherPage);
-  return { client: client[0], launcher: launcherPage };
+  const clients = pages.filter(entry => isClientUrl(entry.url));
+  assert.equal(clients.length, 1, 'exactly one trusted client window exists');
+  const client = clients[0];
+  assert(client);
+  const foreign = pages.filter(entry => entry.type === 'page' && !isClientUrl(entry.url));
+  assert.equal(foreign.length, 0, 'no extra browser windows are opened for desktop node control');
+  return client;
 }
 
 async function text(target: Page, expression: string) {
@@ -61,6 +62,15 @@ async function text(target: Page, expression: string) {
 
 async function noPath(path: string, message: string) {
   await assert.rejects(access(path), { code: 'ENOENT' }, message);
+}
+
+async function openNodePanel(page: Page) {
+  await evaluate(page, 'window.vibefaceClient.showNodePanel()');
+  await expect.poll(() => evaluate(page, 'location.pathname'), { timeout: 30000 }).toBe('/settings/desktop-node');
+}
+
+async function connectButtons(page: Page) {
+  return Number(await evaluate(page, '[...document.querySelectorAll("button")].filter((node) => node.textContent?.trim() === "连接").length'));
 }
 
 test('a fresh packaged desktop is a controller without initializing a Node', async ({ desktop }) => {
@@ -77,38 +87,38 @@ test('a fresh packaged desktop is a controller without initializing a Node', asy
   assert.equal(before.status.nodeMode, 'undecided');
   await noPath(join(before.profile, 'node'), 'a fresh controller profile has no Node data directory');
 
-  const { launcher } = windows(before);
-  const agent = await text(launcher, 'navigator.userAgent');
+  const page = clientWindow(before);
+  const agent = await text(page, 'navigator.userAgent');
   assert.match(agent, new RegExp(`Electron/${ELECTRON_VERSION.replace(/\./g, '\\.')}`));
   for (const global of ['require', 'process', 'module', 'Buffer', 'global', '__dirname']) {
-    expect(await evaluate(launcher, `typeof ${global}`)).toBe('undefined');
+    expect(await evaluate(page, `typeof ${global}`)).toBe('undefined');
   }
-  expect(await evaluate(launcher, 'typeof window.vibefaceLauncher')).toBe('object');
-  await screenshot(launcher, 'desktop-welcome');
+  expect(await evaluate(page, 'typeof window.vibefaceClient')).toBe('object');
+  expect(await evaluate(page, 'typeof window.vibefaceClient.desktop')).toBe('object');
+  await screenshot(page, 'desktop-welcome');
 
   await desktop.invoke('chooseNodeMode', 'controller');
   const selected = await desktop.status();
   assert.equal(selected.nodeMode, 'controller');
   assert.equal(selected.core.kind, 'none');
   assert.equal((await desktop.inspect()).cores.length, 0);
-  await desktop.invoke('openBusiness');
+  await desktop.invoke('focusClient');
   const connected = await desktop.inspect();
-  const client = windows(connected).client;
-  assert(client, 'the controller opens its packaged private client page');
-  assert(isClientUrl(client.url));
-  expect(await evaluate(client, 'typeof window.vibefaceClient')).toBe('object');
-  expect(await evaluate(client, 'Boolean(isSecureContext && crypto.subtle && indexedDB)')).toBe(true);
-  await expect.poll(() => evaluate(client, 'document.querySelector("textarea[aria-label=\\"加入链接\\"]") !== null'),
+  const main = clientWindow(connected);
+  assert(isClientUrl(main.url), 'the sole client window uses the trusted Vibeface origin');
+  await expect.poll(() => evaluate(main, 'location.pathname'), { timeout: 30000 }).toBe('/connect');
+  expect(await evaluate(main, 'Boolean(isSecureContext && crypto.subtle && indexedDB)')).toBe(true);
+  await expect.poll(() => evaluate(main, 'document.querySelector("textarea[aria-label=\\"加入链接\\"]") !== null'),
     { timeout: 30000 }).toBe(true);
-  const clientBridge = await evaluate(client, 'Object.keys(window.vibefaceClient).sort().join(",")');
+  const clientBridge = await evaluate(main, 'Object.keys(window.vibefaceClient).sort().join(",")');
   assert(typeof clientBridge === 'string');
   const bridgeKeys = clientBridge.split(',');
-  assert.deepEqual(bridgeKeys, ['carrier', 'local', 'showNodePanel'],
+  assert.deepEqual(bridgeKeys, ['carrier', 'desktop', 'local', 'showNodePanel'],
     'the private client bridge contains only its purpose-specific controller operations');
   for (const global of ['require', 'process', 'module', 'Buffer', 'global', '__dirname']) {
-    expect(await evaluate(client, `typeof ${global}`)).toBe('undefined');
+    expect(await evaluate(main, `typeof ${global}`)).toBe('undefined');
   }
-  await screenshot(client, 'desktop-client-welcome');
+  await screenshot(main, 'desktop-client-welcome');
   assert.equal(connected.cores.length, 0, 'opening the client leaves Node startup explicit');
   await noPath(join(before.profile, 'node', 'identity.json'), 'controller selection does not create Node identity');
   await noPath(join(before.profile, 'node', 'config.json'), 'controller selection does not create Node configuration');
@@ -122,6 +132,8 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
 
   await desktop.invoke('startOwned');
   const started = await desktop.inspect();
+  assert.equal(clientWindow(started).webSocketDebuggerUrl, clientWindow(before).webSocketDebuggerUrl,
+    'enabling and reconnecting the Node retains the same BrowserWindow');
   assert.equal(started.cores.length, 1, 'the explicit enable action starts one app-owned Core');
   assert.equal(started.status.core.kind, 'owned');
   const nodeId = started.status.core.deviceId;
@@ -139,17 +151,18 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
   assert.equal(identity.status, 'running', 'Core control observes the live app-owned Node');
   assert.equal(identity.version, started.runtime.core_version);
   assert.equal(identity.coreVersion, started.runtime.core_version);
-  await desktop.invoke('openBusiness');
-  await screenshot(windows(started).launcher, 'desktop-local-node-status');
+  const panel = clientWindow(started);
+  await openNodePanel(panel);
+  await screenshot(panel, 'desktop-local-node-status');
 
   const closed = await desktop.closeWindows();
-  assert.equal(closed.length, 2, 'the real launcher and client windows were closed');
-  assert(closed.every(page => page.visibility === 'hidden'), 'the window close action hides the windows into the tray');
+  assert.equal(closed.length, 1, 'the sole client window was closed to the tray');
+  assert(closed.every(page => page.visibility === 'hidden'), 'the window close action hides the window into the tray');
   const tray = await desktop.inspect();
   assert.equal(tray.pid, started.pid, 'closing windows leaves the same desktop process in its tray lifecycle');
   assert.deepEqual(tray.cores, started.cores, 'closing windows keeps the app-owned child running');
   const closedWindowState = await desktop.status();
-  assert.equal(closedWindowState.businessOpen, false);
+  assert.equal(closedWindowState.clientVisible, false);
   assert.equal(closedWindowState.core.kind, 'owned');
   assert.equal(closedWindowState.core.deviceId, nodeId);
   const stopped = await desktop.invoke('stopOwned');
@@ -195,8 +208,9 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   const healthy = choice.discovery.nodes.filter(node => node.kind === 'running');
   assert.equal(healthy.length, 2, `the chooser presents both healthy fixture Nodes exactly once; warnings=${JSON.stringify(choice.discovery.warnings)}`);
   assert.deepEqual(new Set(healthy.map(node => node.deviceId)), new Set([first.deviceId, second.deviceId]));
-  const chooser = windows(await desktop.inspect()).launcher;
-  expect(await evaluate(chooser, 'document.querySelectorAll("#nodes li").length')).toBe(2);
+  const chooser = clientWindow(await desktop.inspect());
+  await openNodePanel(chooser);
+  await expect.poll(() => connectButtons(chooser), { timeout: 30000 }).toBe(2);
   await screenshot(chooser, 'desktop-discovery-choices');
   const candidate = healthy.find(node => node.deviceId === first.deviceId);
   assert(candidate && typeof candidate.id === 'string');
@@ -205,9 +219,26 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.equal(attached.core.kind, 'none', 'selecting a client target does not change App child ownership');
   assert.equal(attached.selectedNode?.deviceId, first.deviceId);
   assert.equal(attached.selectedNode?.dataDir, first.dataDir, 'the selected Node is in its custom path outside the app profile');
-  const attachedWindows = windows(await desktop.inspect());
-  assert(attachedWindows.client);
-  await screenshot(attachedWindows.client, 'desktop-discovered-node-status');
+  const attachedPage = clientWindow(await desktop.inspect());
+  assert(isClientUrl(attachedPage.url), 'connecting retains the sole trusted client window');
+  await screenshot(attachedPage, 'desktop-discovered-node-status');
+
+  await openNodePanel(attachedPage);
+  const selectedDocument = await evaluate(attachedPage, 'performance.timeOrigin');
+  expect(await evaluate(attachedPage, `(() => {
+    const clear = [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === '清除');
+    if (!clear || clear.disabled) return false;
+    clear.click();
+    return true;
+  })()`)).toBe(true);
+  await expect.poll(() => evaluate(attachedPage, 'performance.timeOrigin'), { timeout: 30000 }).not.toBe(selectedDocument);
+  await expect.poll(() => evaluate(attachedPage, 'location.pathname'), { timeout: 30000 }).toBe('/settings/desktop-node');
+  const cleared = await desktop.inspect();
+  assert.equal(cleared.status.selectedNode, null, 'clearing selection also replaces the old client session');
+  assert.equal(clientWindow(cleared).webSocketDebuggerUrl, attachedPage.webSocketDebuggerUrl,
+    'clearing selection reloads the same window');
+  assert.equal((await desktop.snapshotNode(first.dataDir)).status, 'running', 'clearing access leaves the Node running');
+  await desktop.invoke('connectDiscoveredNode', candidate.id);
 
   await desktop.stopFixture(first.dataDir);
   await desktop.invoke('discoverNodes');
@@ -218,8 +249,9 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert(stoppedNode);
   assert.equal(stoppedChoice.core.kind, 'none', 'rescanning never starts a child');
   assert.equal(stoppedChoice.selectedNode?.deviceId, second.deviceId, 'the sole remaining healthy Node is selected');
-  const stoppedLauncher = windows(await desktop.inspect()).launcher;
-  expect(await evaluate(stoppedLauncher, 'document.querySelectorAll("#nodes button[data-action=\\"start-discovered\\"]").length')).toBe(1);
+  const stoppedPanel = clientWindow(await desktop.inspect());
+  await openNodePanel(stoppedPanel);
+  await expect.poll(() => evaluate(stoppedPanel, '[...document.querySelectorAll("button")].filter((node) => node.textContent?.trim() === "启动并连接").length'), { timeout: 30000 }).toBe(1);
   await desktop.invoke('startDiscoveredNode', stoppedNode.id);
   const explicitlyStarted = await desktop.status();
   assert.equal(explicitlyStarted.core.kind, 'owned', 'the explicit start action owns only the child it starts');
@@ -252,9 +284,9 @@ test('one existing healthy Node is discovered and selected when the desktop open
   assert.deepEqual(opened.status.selectedNode, { dataDir: fixture.dataDir, deviceId: fixture.deviceId });
   assert.equal(opened.status.core.kind, 'none');
   assert.deepEqual(opened.cores, [], 'automatic connection starts no App-owned Core');
-  const client = windows(opened).client;
-  assert(client, 'the existing Node opens in the packaged client automatically');
-  const discoveredId = await evaluate(client, '(async () => (await window.vibefaceClient.local.discoverLocalSetup())?.entry.device_id ?? null)()');
+  const page = clientWindow(opened);
+  assert(isClientUrl(page.url), 'the existing Node opens in the packaged client automatically');
+  const discoveredId = await evaluate(page, '(async () => (await window.vibefaceClient.local.discoverLocalSetup())?.entry.device_id ?? null)()');
   assert.equal(discoveredId, fixture.deviceId, 'the native client reaches the selected existing Node');
   await desktop.quit();
   assert.deepEqual(await desktop.snapshotNode(fixture.dataDir), before, 'connecting and quitting preserve the existing running Node');
@@ -287,6 +319,34 @@ test('the optional background Node survives app quit and removal preserves its N
     const managedHash = createHash('sha256').update(await readFile(join(managedPackage, binary))).digest('hex');
     assert.equal(managedHash, sourceHash, `the durable service runtime preserves the verified ${binary} bytes`);
   }
+
+  await desktop.invoke('stopBackgroundNode');
+  const beforeRecovery = await desktop.snapshotNode(installedData);
+  const canonicalPackage = process.platform === 'win32' ? toNamespacedPath(managedPackage) : managedPackage;
+  const pending = join(installedData, 'update-pending.json');
+  await writeFile(pending, JSON.stringify({
+    phase: 'prepared', previous: canonicalPackage, candidate: canonicalPackage, device_id: nodeId,
+    backup: join(service.managed_root, 'backups', 'e2e-interrupted'), resume_service: true,
+  }), { mode: 0o600 });
+  const pendingBytes = await readFile(pending, 'utf8');
+  const recoveryObserved = await desktop.invoke('discoverNodes');
+  assert.equal(recoveryObserved.backgroundNode.kind, 'installed');
+  assert.equal(recoveryObserved.backgroundNode.runtimeUpdate.recoveryRequired, true);
+  await assert.rejects(desktop.invoke('startBackgroundNode'), /继续更新/);
+  await assert.rejects(desktop.invoke('removeBackgroundNode'), /继续更新/);
+  assert.equal((await desktop.serviceStatus(nodeId)).service_running, false, 'pending controls never start the unconfirmed package');
+  assert.equal(await readFile(pending, 'utf8'), pendingBytes, 'observation and refusals retain the interrupted operation');
+  const repaired = await desktop.invoke('updateBackgroundNode');
+  assert.equal(repaired.backgroundNode.kind, 'installed');
+  assert.equal(repaired.backgroundNode.health, 'stopped', 'recovery respects the explicit stopped state');
+  assert.equal(repaired.backgroundNode.runtimeUpdate.recoveryRequired, false);
+  await noPath(pending, 'the confirmed stopped recovery clears only its update journal');
+  const afterRecovery = await desktop.snapshotNode(installedData);
+  assert.equal(afterRecovery.status, 'stopped');
+  assert.equal(afterRecovery.deviceId, nodeId);
+  assert.deepEqual(afterRecovery.values, beforeRecovery.values, 'recovery preserves identity, configuration and update policy');
+  await desktop.invoke('startBackgroundNode');
+  assert.equal((await desktop.serviceStatus(nodeId)).core_status, 'running');
 
   const firstRemoval = await desktop.invoke('removeBackgroundNode');
   assert.equal(firstRemoval.backgroundNode.kind, 'absent');

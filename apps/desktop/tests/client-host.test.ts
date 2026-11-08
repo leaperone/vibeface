@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import { once } from 'node:events'
 import { createHash } from 'node:crypto'
+import { symlink } from 'node:fs/promises'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -89,6 +90,21 @@ function json(response: import('node:http').ServerResponse, status: number, valu
   response.end(JSON.stringify(value))
 }
 
+const fixtureCsp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: ws: wss; object-src 'none'"
+
+async function writeClientAssetFixture(base: string, indexBody = '<!doctype html><title>vibeface-app</title>'): Promise<void> {
+  await writeFile(join(base, '.vibeface-build.json'), JSON.stringify({ version: 1, component: 'web', content_security_policy: fixtureCsp }))
+  await writeFile(join(base, 'index.html'), indexBody)
+}
+
+async function protocolHandler(runtimeRoot: string): Promise<(request: Request) => Promise<Response>> {
+  const host = createClientHost({ runtimeRoot, resolveSelectedNode: async () => null, getClientContents: () => null, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
+  host.registerProtocol()
+  const handler = mocks.protocolHandler
+  if (!handler) throw new Error('protocol handler missing')
+  return handler
+}
+
 beforeEach(() => { mocks.handlers.clear(); mocks.protocolHandler = null })
 afterEach(async () => {
   for (const socket of upgradeSockets) socket.destroy()
@@ -103,14 +119,9 @@ describe('Desktop client host', () => {
   it('serves only confined GET/HEAD assets with CSP from the signed app receipt', async () => {
     rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
     await mkdir(join(rootDir, 'assets'))
-    await writeFile(join(rootDir, '.vibeface-build.json'), JSON.stringify({
-      version: 1, component: 'web', content_security_policy: "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: ws: wss; object-src 'none'",
-    }))
+    await writeClientAssetFixture(rootDir, '<!doctype html>fixture')
     await writeFile(join(rootDir, 'assets', 'crypto.wasm'), Buffer.from([0, 97, 115, 109]))
-    const host = createClientHost({ runtimeRoot: rootDir, resolveSelectedNode: async () => null, getClientContents: () => null, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
-    host.registerProtocol()
-    const handler = mocks.protocolHandler
-    if (!handler) throw new Error('protocol handler missing')
+    const handler = await protocolHandler(rootDir)
     const wasm = await handler(new Request(`${CLIENT_ORIGIN}/assets/crypto.wasm`))
     expect(wasm.status).toBe(200)
     expect(wasm.headers.get('content-type')).toBe('application/wasm')
@@ -296,6 +307,93 @@ describe('Desktop client host', () => {
     expect(streamId).not.toContain(cookieValue)
     await invoke(CLIENT_IPC.carrierClose, call, streamId)
     await expect(invoke(CLIENT_IPC.carrierSend, call, streamId, sent)).rejects.toThrow('closed')
+    const second = await invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)
+    host.disconnect()
+    await expect(invoke(CLIENT_IPC.carrierReceive, call, second)).rejects.toThrow('closed')
+    await expect(invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)).rejects.toThrow('A local session is required')
+    await invoke(CLIENT_IPC.localEntry, call, clientId, { token: localToken, deviceId: nodeId, rejoin: false })
+    const refreshed = await invoke(CLIENT_IPC.carrierOpen, call, nodeId, 1000)
+    expect(refreshed).not.toBe(second)
     host.dispose()
+  })
+
+  it('maps this Node public invitation origins onto its pinned private Gateway listener', async () => {
+    const fixture = await localFixture((_request, response) => json(response, 404, {}))
+    const connects: unknown[] = []
+    fixture.server.on('upgrade', (request, socket) => {
+      upgradeSockets.add(socket)
+      socket.on('close', () => upgradeSockets.delete(socket))
+      expect(request.url).toBe('/api/client')
+      expect(request.headers.host).toBe(new URL(fixture.origin).host)
+      expect(request.headers.origin).toBe(fixture.origin)
+      expect(request.headers.cookie).toBeUndefined()
+      const key = request.headers['sec-websocket-key']
+      if (typeof key !== 'string') throw new Error('Gateway key missing')
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      socket.once('data', (raw: Buffer) => {
+        const length = (raw[1] ?? 0) & 0x7f
+        const mask = raw.subarray(2, 6), bytes = Buffer.from(raw.subarray(6, 6 + length))
+        for (let i = 0; i < bytes.length; i++) bytes[i] = (bytes[i] ?? 0) ^ (mask[i % 4] ?? 0)
+        connects.push(JSON.parse(bytes.toString('utf8')))
+      })
+    })
+    const selected = inspected(fixture.origin)
+    selected.inspect.listen = '127.0.0.1:30479'
+    const window = contents()
+    const host = createClientHost({ runtimeRoot: '/unused', getClientContents: () => window.value as never,
+      resolveSelectedNode: async () => selected, showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core' })
+    host.installIpc()
+    const call = trustedEvent(window.value, window.frame)
+    for (const address of ['http://localhost:30479', 'http://127.0.0.1:30479']) {
+      const stream = await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, address, 1000)
+      expect(typeof stream).toBe('string')
+      await invoke(CLIENT_IPC.carrierClose, call, stream)
+    }
+    await expect.poll(() => connects.length).toBe(2)
+    expect(connects).toEqual([{ type: 'connect', target: nodeId }, { type: 'connect', target: nodeId }])
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, 'http://127.0.0.1:30480', 1000)).toBeNull()
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, nodeId, 'http://192.168.1.1:30479', 1000)).toBeNull()
+    expect(await invoke(CLIENT_IPC.gatewayOpen, call, 'e'.repeat(64), 'http://127.0.0.1:30479', 1000)).toBeNull()
+    host.dispose()
+  })
+
+  it('serves the signed SPA shell for client routes and preserves 404 for APIs and missing assets', async () => {
+    rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
+    await writeClientAssetFixture(rootDir)
+    const handler = await protocolHandler(rootDir)
+    const shell = await handler(new Request(`${CLIENT_ORIGIN}/`))
+    expect(shell.status).toBe(200)
+    expect(shell.headers.get('content-type')).toBe('text/html; charset=utf-8')
+    expect(shell.headers.get('cache-control')).toBe('no-store')
+    expect(await shell.text()).toContain('vibeface-app')
+    for (const path of ['/join', '/tasks', '/settings/desktop-node', '/devices', `/b/${'a'.repeat(32)}`, '/b/room/work/item']) {
+      const route = await handler(new Request(`${CLIENT_ORIGIN}${path}`))
+      expect(route.status).toBe(200)
+      expect(route.headers.get('content-type')).toBe('text/html; charset=utf-8')
+      expect(route.headers.get('content-security-policy')).toContain(CLIENT_ORIGIN)
+      expect(await route.text()).toContain('vibeface-app')
+    }
+    const head = await handler(new Request(`${CLIENT_ORIGIN}/settings/desktop-node`, { method: 'HEAD' }))
+    expect(head.status).toBe(200)
+    expect(head.headers.get('content-length')).toBe(String(Buffer.byteLength('<!doctype html><title>vibeface-app</title>')))
+    expect(await head.text()).toBe('')
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/api/local/setup`))).status).toBe(404)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/assets/missing.js`))).status).toBe(404)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/unknown/route`))).status).toBe(404)
+  })
+
+  it('rejects traversal, encoded traversal, and symlinks outside the signed asset root', async () => {
+    rootDir = await mkdtemp(join(tmpdir(), 'vibeface-client-assets-'))
+    await writeClientAssetFixture(rootDir)
+    const outside = await mkdtemp(join(tmpdir(), 'vibeface-client-outside-'))
+    await writeFile(join(outside, 'secret.txt'), 'leak')
+    await symlink(join(outside, 'secret.txt'), join(rootDir, 'escape-link'))
+    const handler = await protocolHandler(rootDir)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/../.vibeface-build.json`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/%2e%2e/.vibeface-build.json`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/escape-link`))).status).toBe(403)
+    expect((await handler(new Request(`${CLIENT_ORIGIN}/.vibeface-build.json`))).status).toBe(403)
+    await rm(outside, { recursive: true, force: true })
   })
 })

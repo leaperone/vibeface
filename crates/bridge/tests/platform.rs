@@ -92,6 +92,10 @@ fn private_paths_belong_to_this_account_and_are_written_whole() -> Result<()> {
     privatefs::ensure_private(&directory, "the scratch directory")?;
 
     let inside = directory.join("名前 with spaces");
+    #[cfg(windows)]
+    let inside = inside.join("nested-".repeat(30));
+    #[cfg(windows)]
+    assert!(inside.to_string_lossy().encode_utf16().count() > 260);
     privatefs::create_dir(&inside)?;
     privatefs::ensure_private(&inside, "a nested private directory")?;
 

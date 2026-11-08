@@ -23,6 +23,10 @@ import sys
 import time
 import uuid
 
+if sys.argv[1:] == ["auth", "status", "--json"]:
+    print(json.dumps({"loggedIn": True}))
+    sys.exit(0)
+
 INPUT = queue.Queue()
 INPUT_EOF = object()
 

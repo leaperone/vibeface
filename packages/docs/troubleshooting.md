@@ -15,7 +15,7 @@ description: 从日志、状态和连接信息定位 Vibeface 常见问题。
 | 本机页面打不开 | `vibeface` 进程或后台服务是否运行，地址是否是这台电脑的 `http://localhost:4790`。 |
 | 手机上打不开电脑的 localhost | localhost 指手机本身；用原生 App 的局域网加入方式或已配置的 HTTPS 入口。 |
 | 终端能运行 Codex，后台显示未安装 | 在设备页点**自动接入**，会检查常用安装位置与 NVM；仍找不到时在详细设置检查实际程序路径及同目录 Node.js。找到程序不等于已登录。 |
-| 程序已经登录，Bot 仍提示需要登录 | 先用**自动接入**补齐可复用的声明变量，再检查认证。默认 Codex、Claude Code 和 OpenCode 使用私有目录；个人 OAuth 登录不会自动复制，按页面命令为独立目录登录。Cursor 只复用或填写 `CURSOR_API_KEY`，桌面登录不代表已有该密钥；pi 沿用本机认证。 |
+| 程序已经登录，Bot 仍提示需要登录 | 先用**自动接入**并检查认证。Codex、Claude Code 可准备官方 CLI 访问令牌镜像，不消费源刷新令牌；源快照过期时先在原 CLI 刷新再检查，或使用页面的私有登录命令。Codex Keychain-only、Claude 显式自定义目录的 Keychain 不自动导入。Cursor 复用 `agent login`，桌面 GUI 登录不等于 CLI 已登录；显式环境认证优先。OpenCode 仍需私有登录，pi 沿用本机认证。 |
 | 自动接入提示读取设置失败 | 重试或在详细设置手动填写。读取登录 shell 超时、输出超限或启动异常会明确失败，不表示未安装或没有密钥；Node 启动时遇到此问题仍会继续运行。 |
 | 能创建 Bot，但没有回答 | 是否启用了 **运行 Bot**，模型和额度是否可用。创建 Bot 本身不验证模型调用。 |
 | 第二台电脑看不到原来的 Bot | 是否加入了原来的个人网络，是否已批准安全码并完成同步；不要另建网络。 |
@@ -67,7 +67,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 - 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话；
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
-- Codex App Server、Codex SDK 和 Cursor 桥的标准错误逐行记录，能看出 thread 时带上 `thread_id`。
+- Codex App Server 和 Codex SDK 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
 
 每条外来记录不超过 8 KiB，一次最多 20 条，每个来源每分钟最多 120 条，超出整批拒绝。
 

@@ -693,7 +693,19 @@ class Node:
         """A private HOME, so session scans and hooks never see the operator's own ~/.codex or ~/.claude."""
         home = self.directory / "home"
         (home / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
-        return {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+        environment = {name: value for name, value in os.environ.items()
+                       if not name.startswith(("CURSOR_", "CLAUDE_", "ANTHROPIC_", "OPENAI_", "CODEX_"))
+                       and not name.endswith(("_API_KEY", "_AUTH_TOKEN"))
+                       and name != "AGENT_CLI_CREDENTIAL_STORE"}
+        environment.update({"HOME": str(home), "USERPROFILE": str(home),
+                            "CODEX_HOME": str(home / ".codex"),
+                            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+                            "CURSOR_CONFIG_DIR": str(home / ".cursor-config"),
+                            "CURSOR_DATA_DIR": str(home / ".cursor-data"),
+                            "XDG_CONFIG_HOME": str(home / ".config"),
+                            "XDG_DATA_HOME": str(home / ".local/share"),
+                            "AGENT_CLI_CREDENTIAL_STORE": "file"})
+        return environment
 
     def start(self, *, env=None, no_web=False, bare=False):
         require(self.process is None, f"{self.name}: process is stopped before start")

@@ -28,6 +28,7 @@ pub(crate) mod scope_projection;
 mod sync;
 pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
+mod schema_guard;
 #[cfg(test)]
 mod tests;
 pub(crate) mod work;
@@ -249,7 +250,9 @@ impl Store {
                     "BEGIN IMMEDIATE;{INITIAL_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
                 ))?;
             }
-            SCHEMA_VERSION => {}
+            SCHEMA_VERSION => {
+                schema_guard::validate_application_schema(&connection)?;
+            }
             _ => bail!(
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
             ),
@@ -296,6 +299,7 @@ impl Store {
             version == SCHEMA_VERSION,
             "unsupported database schema version {version}"
         );
+        schema_guard::validate_application_schema(&connection)?;
         Ok(Self {
             connection,
             blob_dir: blob_dir_for(path),

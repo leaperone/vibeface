@@ -79,7 +79,7 @@ cd vibeface-<version>-<target>
 
 自定义 Rust 编译参数通过 `RUSTFLAGS` 或 `CARGO_ENCODED_RUSTFLAGS` 传入，后者优先。发布脚本保留这些参数并追加路径映射；按 Cargo 的优先级，此时不使用配置文件中的 `rustflags`。
 
-运行任务前须另装并登录相应 Provider。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
+运行任务前须另装并登录相应 Provider。Cursor 管理路径使用已安装的官方 Agent CLI 及其订阅登录，显式环境认证仍可使用。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
 产品发布的 static 任务复用 pnpm 与 Rust 工具缓存。`build-web.sh` 自身执行冻结的按需依赖安装，因此 Product 不再提前安装整个 workspace；www 仍独立安装。工具版本和生成物来源校验照常执行。
 

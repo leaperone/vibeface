@@ -44,6 +44,46 @@ pub fn wide(path: &OsStr) -> Vec<u16> {
     path.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+// Atomic journal writes can exceed MAX_PATH even when their final file name does not.
+fn file_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::path::{Component, Prefix};
+    let absolute = std::path::absolute(path)?;
+    let (prefix, skip) = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+            _ => ("", 0),
+        },
+        _ => ("", 0),
+    };
+    Ok(prefix
+        .encode_utf16()
+        .chain(absolute.as_os_str().encode_wide().skip(skip))
+        .chain(std::iter::once(0))
+        .collect())
+}
+
+#[cfg(test)]
+#[test]
+fn file_paths_preserve_unicode_unc_and_existing_extended_names() -> io::Result<()> {
+    for (path, expected) in [
+        (r"C:\folder\名前.json", r"\\?\C:\folder\名前.json"),
+        (
+            r"\\server\share\folder\file",
+            r"\\?\UNC\server\share\folder\file",
+        ),
+        (r"\\?\C:\folder\file", r"\\?\C:\folder\file"),
+    ] {
+        let name = file_path(Path::new(path))?;
+        assert_eq!(name.last(), Some(&0));
+        assert_eq!(
+            String::from_utf16(&name[..name.len() - 1]).unwrap(),
+            expected
+        );
+    }
+    Ok(())
+}
+
 fn win32_error(code: u32) -> io::Error {
     io::Error::from_raw_os_error(code as i32)
 }
@@ -267,7 +307,7 @@ unsafe fn SetSecurityDescriptorProtected(descriptor: &mut SECURITY_DESCRIPTOR) -
 /// entry inherited from a permissive parent.
 pub fn restrict_path(path: &Path, container: bool) -> io::Result<()> {
     let owner_only = OwnerOnly::new(container)?;
-    let name = wide(path.as_os_str());
+    let name = file_path(path)?;
     // SAFETY: `name` is NUL-terminated and the list outlives the call.
     checked(unsafe {
         SetNamedSecurityInfoW(
@@ -300,7 +340,7 @@ impl Drop for ReadDescriptor {
 
 impl ReadDescriptor {
     fn of_path(path: &Path) -> io::Result<Self> {
-        let name = wide(path.as_os_str());
+        let name = file_path(path)?;
         let mut read = Self {
             raw: std::ptr::null_mut(),
             owner: std::ptr::null_mut(),
@@ -963,7 +1003,7 @@ pub fn create_private_file(path: &Path, disposition: Disposition) -> io::Result<
     };
     let owner_only = OwnerOnly::new(false)?;
     let attributes = owner_only.attributes();
-    let name = wide(path.as_os_str());
+    let name = file_path(path)?;
     // SAFETY: `name` is NUL-terminated and the attributes outlive the call.
     let handle = unsafe {
         CreateFileW(
@@ -999,7 +1039,7 @@ pub fn open_no_reparse(path: &Path) -> io::Result<File> {
             OPEN_EXISTING,
         },
     };
-    let name = wide(path.as_os_str());
+    let name = file_path(path)?;
     // SAFETY: `name` is NUL-terminated and no attributes are supplied for an existing file.
     let handle = unsafe {
         CreateFileW(
@@ -1023,7 +1063,7 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
     let owner_only = OwnerOnly::new(true)?;
     let attributes = owner_only.attributes();
-    let name = wide(path.as_os_str());
+    let name = file_path(path)?;
     // SAFETY: `name` is NUL-terminated and the attributes outlive the call.
     if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
         return Err(io::Error::last_os_error());
@@ -1036,8 +1076,8 @@ pub fn durable_move(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    let from = wide(from.as_os_str());
-    let to = wide(to.as_os_str());
+    let from = file_path(from)?;
+    let to = file_path(to)?;
     // SAFETY: both names are NUL-terminated and alive for the call.
     if unsafe {
         MoveFileExW(
@@ -1061,7 +1101,7 @@ pub fn flush_directory(dir: &Path) -> io::Result<()> {
             FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FlushFileBuffers, OPEN_EXISTING,
         },
     };
-    let name = wide(dir.as_os_str());
+    let name = file_path(dir)?;
     // SAFETY: `name` is NUL-terminated; backup semantics are what open a directory handle.
     let handle = unsafe {
         CreateFileW(
@@ -1166,7 +1206,7 @@ pub fn point_junction(target: &Path, alias: &Path) -> io::Result<()> {
         System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
     };
     {
-        let name = wide(alias.as_os_str());
+        let name = file_path(alias)?;
         // SAFETY: `name` is NUL-terminated; backup semantics open the directory itself.
         let handle = unsafe {
             CreateFileW(
@@ -1217,7 +1257,7 @@ pub fn read_junction(alias: &Path) -> io::Result<std::path::PathBuf> {
             SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
         },
     };
-    let name = wide(alias.as_os_str());
+    let name = file_path(alias)?;
     // SAFETY: `name` is NUL-terminated; the flags open the reparse point itself.
     let handle = unsafe {
         CreateFileW(

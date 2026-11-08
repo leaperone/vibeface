@@ -1577,10 +1577,10 @@ test('native chat glass follows accessibility events without replacing its input
   } finally { app.close() }
 })
 
-test("automatic connection checks both services without changing uses and reads back unknown writes", async (t) => {
+test("automatic connection checks the three local services without changing uses and reads back unknown writes", async (t) => {
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {
-      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
+      provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
       execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
       state: 'starting', issues: [], readiness: { state: 'starting' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'starting' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
@@ -1615,7 +1615,7 @@ test("automatic connection checks both services without changing uses and reads 
     try {
       render(); await settleComponent()
       let elements = render()
-      assert.ok(elements.some((element) => elementText(element).includes('在「远端工作机」上检测 Codex 和 Cursor')))
+      assert.ok(elements.some((element) => elementText(element).includes('在「远端工作机」上检测 Codex、Claude Code 和 Cursor')))
       const connect = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
       assert.ok(connect?.props.onClick)
       connect.props.onClick(); connect.props.onClick()
@@ -1644,7 +1644,7 @@ test("automatic connection checks both services without changing uses and reads 
       }
       await settleComponent(); await settleComponent()
       const writes = calls.filter((call) => call.method === 'configure_provider').map((call) => JSON.parse(JSON.stringify(call.params)))
-      assert.deepEqual(writes, [{ provider: 'codex', connect_local: true }, { provider: 'cursor', connect_local: true }])
+      assert.deepEqual(writes, [{ provider: 'codex', connect_local: true }, { provider: 'claude', connect_local: true }, { provider: 'cursor', connect_local: true }])
       elements = render()
       const button = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
       assert.equal(button?.props.disabled, outcome === 'unreadable', 'a failed read blocks another attempt until the settings can be read')
@@ -1658,7 +1658,7 @@ test("automatic connection checks both services without changing uses and reads 
 test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
   for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
     const item: ProviderStatus = {
-      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
+      provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
       app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
       execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
       env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
@@ -1712,7 +1712,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
   const kit = { toneText: { neutral: 'neutral', success: 'success', warning: 'warning' }, providerIcons: { codex: 'CodexIcon' }, Details: 'Details', FolderPath: 'FolderPath', CopyableId: 'CopyableId', BusyIcon: 'BusyIcon' }
   for (const platform of ['web', 'mobile']) for (const example of cases) await t.test(`${platform} ${example.name}`, () => {
     const item: ProviderStatus = {
-      provider: 'codex', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
+      provider: 'codex', authentication_source: 'private_login', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
       execution_model: 'saved-model', execution_readiness: example.execution_readiness,
       setup: { directory: '/private/provider', command: 'codex --home /private/provider login' }, installed: true,
       home: null, sessions: null, env: [], state: example.readiness.state, issues: [], readiness: example.readiness,

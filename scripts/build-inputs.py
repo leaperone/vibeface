@@ -22,7 +22,7 @@ OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("apps/app/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
+    "web": ("apps/app/", "apps/desktop/src/shared/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 CACHE_POLICIES = (
@@ -389,6 +389,9 @@ def self_test():
         defaults = repo / "config/public-bootstrap.json"
         defaults.parent.mkdir()
         defaults.write_text('{"issuer":"fixture-one"}')
+        shared = repo / "apps/desktop/src/shared/node-view.ts"
+        shared.parent.mkdir(parents=True)
+        shared.write_text("export const state = 1;\n")
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
@@ -458,6 +461,27 @@ def self_test():
         else:
             raise AssertionError("changed public bootstrap defaults reused stale web output")
         defaults.write_text('{"issuer":"fixture-one"}')
+        check(repo, "web")
+        shared.write_text("export const state = 2;\n")
+        try:
+            check(repo, "web")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed desktop shared source reused stale web output")
+        shared.write_text("export const state = 1;\n")
+        check(repo, "web")
+        prepare(repo, "web")
+        (repo / OUTPUTS["web"] / "_shell.html").write_text("<script>fixture</script>")
+        shared.write_text("export const state = 2;\n")
+        try:
+            finish(repo, "web")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("desktop shared source changed during web build was accepted")
+        shared.write_text("export const state = 1;\n")
+        finish(repo, "web")
         check(repo, "web")
         (repo / "Cargo.toml").write_text("changed source")
         for component in OUTPUTS:

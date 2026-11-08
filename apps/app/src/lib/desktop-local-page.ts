@@ -1,4 +1,5 @@
 import type { LocalPage } from '@vibeface/client/lib/platform.ts'
+import type { LanStream, NativeLocalGatewayCarrier } from '@vibeface/client/lib/transport.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import type { ClientPreloadApi } from '../../../desktop/src/shared/client-contract.ts'
 
@@ -8,6 +9,17 @@ const invitationIn = () => {
   return joinTicket(invitation) ? invitation : ''
 }
 const DEVICE_ID = /^[a-f0-9]{64}$/
+
+/** The native broker decides whether a Gateway belongs to the selected local Node. */
+export function desktopGatewayCarrier(
+  native: Pick<ClientPreloadApi['carrier'], 'openGateway'>,
+  stream: (id: string) => LanStream,
+): NativeLocalGatewayCarrier {
+  return async (entry, target, timeoutMs) => {
+    const id = await native.openGateway(target, entry.address, timeoutMs)
+    return id === null ? null : stream(id)
+  }
+}
 
 export function desktopLocalPage(native: ClientPreloadApi, rememberLocalOrigin: (origin: string) => void = () => {}): LocalPage {
   return {
