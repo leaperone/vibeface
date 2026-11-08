@@ -339,7 +339,9 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
 .site-docs main { color: var(--site-ink); }
 .site-docs article { line-height: 1.85; }
 .site-docs article h1 { letter-spacing: -.045em; }
-.site-docs .prose a { color: var(--site-accent); text-decoration: underline; text-underline-offset: 3px; }
+.site-docs .prose :is(p, li, td, th, blockquote) a { color: var(--site-accent); text-decoration: underline; text-underline-offset: 3px; }
+.section-copy a, .page-hero-copy a { color: var(--site-accent); text-decoration: underline; text-decoration-color: rgb(74 222 128 / .45); text-underline-offset: .2em; transition: text-decoration-color .18s ease; }
+.section-copy a:hover, .page-hero-copy a:hover { text-decoration-color: currentColor; }
 .site-docs article code, .site-docs pre { border-color: var(--site-line); }
 @media (max-width: 960px) { .site-header { padding-inline: 24px; } .site--page main { padding-inline: 24px; } .site-footer { margin-inline: 24px; } }
 @media (max-width: 640px) { .site-header { gap: 16px; padding: 10px 20px; } .site-header nav { column-gap: 14px; font-size: 12px; } .site--page main { padding-inline: 20px; } .page-hero { padding-block: 64px 72px; } .page-hero h1 { font-size: clamp(38px, 10vw, 56px); } .page-hero-copy { font-size: 16px; } .site-footer { flex-wrap: wrap; margin-inline: 20px; } }
