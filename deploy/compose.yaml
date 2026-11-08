@@ -1,0 +1,14 @@
+services:
+  service:
+    image: ${VIBEFACE_IMAGE:?immutable image ID required}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
