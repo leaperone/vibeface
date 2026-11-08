@@ -175,7 +175,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await browser.goto(`${node.url}/inbox`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);
-    await expect(screen.getByLabel('你的回答')).toBeVisible();
+    await expect(screen.getByRole('textbox', '你的回答')).toBeVisible();
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toBeDisabled();
     await expect(screen.getByRole('button', '忽略', { exact: true })).toBeVisible();
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-three'), undefined);
@@ -193,16 +193,16 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
     await expect(screen.getByText('问题待确认', { exact: true })).toHaveCount(0);
     await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
-    await expect(screen.getByLabel('你的回答')).toHaveCount(1);
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(1);
     await app.screenshot('task-overview-single-question-and-turn');
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(4);
-    await screen.getByLabel('你的回答').fill('1');
-    await screen.getByLabel('你的回答').press('Enter');
-    await expect(screen.getByLabel('你的回答')).toHaveValue('1\n');
-    await screen.getByLabel('你的回答').fill('1\n１');
-    await expect(screen.getByLabel('你的回答')).toHaveValue('1\n１');
+    await screen.getByRole('textbox', '你的回答').fill('1');
+    await screen.getByRole('textbox', '你的回答').press('Enter');
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveValue('1\n');
+    await screen.getByRole('textbox', '你的回答').fill('1\n１');
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveValue('1\n１');
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-four'), undefined);
     await app.screenshot('decision-four-custom-narrow');
     await screen.getByRole('button', '发送回答', { exact: true }).click();
@@ -212,10 +212,10 @@ test('creates a persistent Bot without a model and shows triage budget state', a
 
     seed('q-decision-text', []);
     await browser.reload();
-    await expect(screen.getByLabel('你的回答')).toBeVisible();
-    await screen.getByLabel('你的回答').fill('先说明收件人是否能编辑，再确认交付格式。');
+    await expect(screen.getByRole('textbox', '你的回答')).toBeVisible();
+    await screen.getByRole('textbox', '你的回答').fill('先说明收件人是否能编辑，再确认交付格式。');
     await screen.getByRole('button', '发送回答', { exact: true }).click();
-    await expect(screen.getByLabel('你的回答')).toHaveCount(0);
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-text')?.text, '先说明收件人是否能编辑，再确认交付格式。');
   } finally { decisionDb.close(); }
