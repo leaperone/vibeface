@@ -183,26 +183,23 @@ test('a browser has no LAN path', async () => {
   await assert.rejects(app.connect({ kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: app.target }), /这里不能在局域网里直连设备/)
 })
 
-test("the app's join QR code, a bare ticket and the web link name the same ticket", () => {
-  const link = 'https://node.example/join#vibeface1test', web = { ticket: 'vibeface1test', origin: 'https://node.example' }
-  assert.deepEqual(joinTicket(link), web)
-  assert.deepEqual(joinTicket(`vibeface://join?link=${encodeURIComponent(link)}`), web)
-  assert.deepEqual(joinTicket('vibeface://join?link=vibeface1test'), { ticket: 'vibeface1test', origin: null })
-  assert.deepEqual(joinTicket(' vibeface1test '), { ticket: 'vibeface1test', origin: null })
-  assert.equal(joinTicket(`vibeface://join?link=${encodeURIComponent('vibeface://join?link=vibeface1test')}`), null)
-  assert.equal(joinTicket('https://node.example/#vibeface1test'), null)
+test('a join link and a bare ticket name the same ticket, and no other shape is one', () => {
+  assert.equal(joinTicket('vibeface://join/vibeface1test'), 'vibeface1test')
+  assert.equal(joinTicket(' vibeface1test '), 'vibeface1test')
+  for (const text of ['https://node.example/join#vibeface1test', 'vibeface://join?link=vibeface1test', 'vibeface://join/vibeface1test?x=1', 'vibeface://other/vibeface1test', 'https://node.example/#vibeface1test', '']) {
+    assert.equal(joinTicket(text), null, text)
+  }
 })
 
-test('a join link keeps the App origin apart from the relay origin its ticket names', async () => {
+test('a join link names the entry Node only by device ID', async () => {
   const app = await harness()
-  const ticket = wasm.ticketEncode(app.target, '1'.repeat(64), 'https://relay.example/', [])
-  const link = await app.parseJoinLink(`https://app.vibeface.dev/join#${ticket}`)
-  assert.equal(link.origin, 'https://app.vibeface.dev')
-  assert.equal(link.relay, 'https://relay.example')
+  const ticket = wasm.ticketEncode(app.target, '1'.repeat(64))
+  const link = await app.parseJoinLink(`vibeface://join/${ticket}`)
+  assert.deepEqual(Object.keys(link).sort(), ['entryId', 'inviteHash', 'inviteId', 'secret'])
   assert.equal(link.entryId, app.target)
-  const bare = await app.parseJoinLink(wasm.ticketEncode(app.target, '1'.repeat(64), undefined, []))
-  assert.equal(bare.origin, null)
-  assert.equal(bare.relay, null)
+  assert.equal(link.secret, '1'.repeat(64))
+  assert.deepEqual(await app.parseJoinLink(ticket), link)
+  await assert.rejects(app.parseJoinLink(`https://app.vibeface.dev/join#${ticket}`), /不是 Vibeface 加入链接/)
 })
 
 test('the device key cannot be exported', async () => {

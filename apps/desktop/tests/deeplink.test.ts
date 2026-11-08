@@ -4,38 +4,19 @@ import { deepLinkFromArgv, parseDeepLink } from '../src/main/deeplink.js'
 const TICKET = 'vibeface1qq2ww3ee4'
 
 describe('parseDeepLink', () => {
-  it('accepts a bare ticket', () => {
-    expect(parseDeepLink(TICKET)).toEqual({ kind: 'join', ticket: TICKET, origin: null })
-  })
-
-  it('accepts a published join URL and keeps its entry origin', () => {
-    expect(parseDeepLink(`https://vb.example.com/join#${TICKET}`)).toEqual({
-      kind: 'join',
-      ticket: TICKET,
-      origin: 'https://vb.example.com',
-    })
-  })
-
-  it('accepts the app wrapper around either form', () => {
-    expect(parseDeepLink(`vibeface://join?link=${encodeURIComponent(`http://127.0.0.1:4790/join#${TICKET}`)}`)).toEqual({
-      kind: 'join',
-      ticket: TICKET,
-      origin: 'http://127.0.0.1:4790',
-    })
-    expect(parseDeepLink(`vibeface://join?link=${TICKET}`)).toEqual({ kind: 'join', ticket: TICKET, origin: null })
-  })
-
-  it('refuses a wrapper nested inside a wrapper', () => {
-    const inner = encodeURIComponent(`vibeface://join?link=${TICKET}`)
-    expect(parseDeepLink(`vibeface://join?link=${inner}`).kind).toBe('ignored')
+  it('accepts a bare ticket and the join link', () => {
+    expect(parseDeepLink(TICKET)).toEqual({ kind: 'join', ticket: TICKET })
+    expect(parseDeepLink(` vibeface://join/${TICKET} `)).toEqual({ kind: 'join', ticket: TICKET })
   })
 
   it('refuses anything that is not an invite', () => {
     for (const hostile of [
       'file:///etc/passwd',
       'vibeface://run?cmd=/bin/sh',
-      'vibeface://join?link=file:///etc/passwd',
-      `vibeface://join?data-dir=/tmp/other#${TICKET}`,
+      `vibeface://join?link=${TICKET}`,
+      `vibeface://join/${TICKET}?data-dir=/tmp/other`,
+      `vibeface://join/${TICKET}/../../etc/passwd`,
+      `https://vb.example.com/join#${TICKET}`,
       'https://vb.example.com/admin#vibeface1abc',
       `https://vb.example.com/join#${TICKET.toUpperCase()}`,
       'https://vb.example.com/join#../../etc/passwd',
@@ -50,8 +31,8 @@ describe('parseDeepLink', () => {
 
 describe('deepLinkFromArgv', () => {
   it('finds the invite among normal arguments', () => {
-    const found = deepLinkFromArgv(['--profile-dir', '/tmp/profile', `vibeface://join?link=${TICKET}`])
-    expect(found).toEqual({ kind: 'join', ticket: TICKET, origin: null })
+    const found = deepLinkFromArgv(['--profile-dir', '/tmp/profile', `vibeface://join/${TICKET}`])
+    expect(found).toEqual({ kind: 'join', ticket: TICKET })
   })
 
   it('never reads a path or a flag value as a link', () => {

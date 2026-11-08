@@ -186,7 +186,7 @@ async function handleJoin(link: DeepLink): Promise<void> {
   try {
     if (!clientHost) throw new Error('客户端界面尚未就绪。')
     const target = new URL('/join', clientHost.clientUrl)
-    target.hash = new URLSearchParams({ invitation: link.origin === null ? link.ticket : `${link.origin}/join#${link.ticket}` }).toString()
+    target.hash = new URLSearchParams({ invitation: link.ticket }).toString()
     await ensureClientWindow()
     await clientWindow!.loadURL(target.toString())
     clientWindow!.show()
