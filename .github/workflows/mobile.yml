@@ -217,6 +217,10 @@ jobs:
           subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.7'
+          cache: false
       - name: Apply the local simslim profile to this simulator
         env:
           GOTOOLCHAIN: auto
@@ -227,9 +231,12 @@ jobs:
           export GOMODCACHE="$PWD/.artifacts/native/simslim/mod"
           export GOCACHE="$PWD/.artifacts/native/simslim/cache"
           export GOBIN="$PWD/.artifacts/native/simslim/bin"
+          printf '%s\n' install > .artifacts/native/private/simslim-phase.txt
           go install github.com/mobai-app/simslim/cmd/simslim@v0.13.0 > .artifacts/native/private/simslim-install.log 2>&1
+          printf '%s\n' ownership > .artifacts/native/private/simslim-phase.txt
           python3 - <<'PY' > .artifacts/native/private/simslim.log 2>&1
           import json, os, pathlib, re, subprocess
+          phase_path = pathlib.Path(".artifacts/native/private/simslim-phase.txt")
           simulator = pathlib.Path(".artifacts/native/simulator.txt").read_text().strip()
           assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator) and simulator == os.environ["VIBEFACE_E2E_SIMULATOR"]
           devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"]))["devices"]
@@ -237,28 +244,34 @@ jobs:
           expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
           assert len(matches) == 1 and matches[0]["name"] == expected and matches[0]["state"] == "Booted"
           tool = str(pathlib.Path(os.environ["GOBIN"]) / "simslim")
+          phase_path.write_text("build-identity\n")
           build = subprocess.check_output(["go", "version", "-m", tool], text=True)
           pathlib.Path(".artifacts/native/private/simslim-build.txt").write_text(build)
           version = re.search(r": go1\.(\d+)(?:\.\d+)?\n", build)
           assert version and int(version[1]) >= 26
           profile = {"name": "provider-ci", "except": ["siri", "icloud", "store", "pim", "web", "family", "health",
                      "photos", "apps", "messaging", "connectivity", "telemetry", "other"], "keep": []}
+          phase_path.write_text("profiles\n")
           profiles = json.loads(subprocess.run([tool, "profiles", "--json"], check=True, capture_output=True, text=True).stdout)
           categories = [row["id"] for row in profiles]
           assert len(categories) == len(set(categories)) and set(profile["except"]) <= set(categories)
           assert set(categories) - set(profile["except"]) == {"widgets", "search"}
           profile_path = pathlib.Path(".artifacts/native/private/simslim-profile.json")
           profile_path.write_text(json.dumps(profile) + "\n")
+          phase_path.write_text("apply\n")
           subprocess.run([tool, "on", simulator, "--profile", str(profile_path)], check=True)
+          phase_path.write_text("verify\n")
           verified = json.loads(subprocess.run([tool, "verify", simulator, "--profile", str(profile_path), "--json"], check=True, capture_output=True, text=True).stdout)
           assert verified["udid"] == simulator and verified["ok"] is True
           assert verified.get("missing", []) == [] and verified.get("extra", []) == []
           required = ("universal-links", "push", "photos", "contacts", "calendar", "siri")
+          phase_path.write_text("doctor\n")
           doctor = json.loads(subprocess.run([tool, "doctor", simulator, "--requires", ",".join(required), "--json"], check=True, capture_output=True, text=True).stdout)
           assert doctor["udid"] == simulator and doctor["ok"] is True
           features = doctor["features"]
           assert len(features) == len(required) and {row["id"] for row in features} == set(required)
           assert all(row["ok"] is True and row.get("disabled", []) == [] for row in features)
+          phase_path.write_text("complete\n")
           PY
           printf '%s\n' '{"stage":"simulator-profile","profile_verified":true,"required_services_passed":true,"siri_kept":true}'
       - name: Verify Provider settings and cancellation in the installed iOS app
@@ -303,6 +316,13 @@ jobs:
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
           stages = {"host-source", "host-build", "simulator-create", "simulator-profile", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
+          simslim_phases = {b"install\n", b"ownership\n", b"build-identity\n", b"profiles\n", b"apply\n", b"verify\n", b"doctor\n", b"complete\n"}
+          try:
+              with (root / "private/simslim-phase.txt").open("rb") as phase_file:
+                  phase = phase_file.read(32)
+              diagnostics["simslim_phase"] = phase[:-1].decode("ascii") if phase in simslim_phases else "unknown"
+          except OSError:
+              diagnostics["simslim_phase"] = "unavailable"
           ui_log = root / "private/ui.log"
           if ui_log.exists():
               diagnostics["runner_prepare_fallback_reported"] = "automation runner not prepared" in ui_log.read_text(errors="replace")
