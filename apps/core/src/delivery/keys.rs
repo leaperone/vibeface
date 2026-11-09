@@ -506,6 +506,12 @@ mod tests {
     fn receiving_key_intents_keep_the_same_binding_across_retries_and_restarts() {
         let (node, identity, dir) = node();
         let original = node.key_binding(Mode::Paid).unwrap();
+        let missing = node
+            .receiver_secret([0x99; 32])
+            .err()
+            .expect("old key must stay unavailable");
+        assert!(missing.is::<ReceivingKeyUnavailable>());
+        assert_eq!(node.key_binding(Mode::Paid).unwrap(), original);
         let current = record(&original.binding);
         let intent = uuid::Uuid::new_v4().to_string();
         let operation = node

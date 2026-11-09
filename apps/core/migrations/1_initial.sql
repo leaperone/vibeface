@@ -8,7 +8,8 @@ CREATE INDEX `events_kind` ON `events` (`network_id`, `scope_id`, `kind`, `subje
 CREATE TABLE `event_blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `blob` text NOT NULL, `size` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`, `blob`));
 CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
 CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));
-CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `envelope` text NOT NULL, `missing` text NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `envelope` text NOT NULL, `author` text NOT NULL DEFAULT '', `missing` text NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+CREATE INDEX `pending_events_author` ON `pending_events` (`network_id`, `author`);
 CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `attachments` text NOT NULL, `sender` text NULL, `steered_into` text NULL, `failure` text NULL, `target` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
@@ -37,8 +38,12 @@ CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL,
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 CREATE TABLE `triage_seen` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, PRIMARY KEY (`event_id`));
 CREATE TABLE `triage_queue` (`ts_ms` integer NOT NULL, `event_id` text NOT NULL, `request_id` text NULL, `event` text NOT NULL, PRIMARY KEY (`ts_ms`, `event_id`));
+CREATE INDEX `triage_queue_pending` ON `triage_queue` (`ts_ms`, `event_id`) WHERE json_type(event,'$._triage') IS NULL;
+CREATE INDEX `triage_queue_claim` ON `triage_queue` (json_extract(event,'$._triage.boot'), json_extract(event,'$._triage.attempt'), json_extract(event,'$._triage.state'), `ts_ms`, `event_id`);
+CREATE INDEX `triage_queue_event` ON `triage_queue` (`event_id`);
 CREATE TABLE `triage_handled` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, `result` text NOT NULL, PRIMARY KEY (`event_id`));
 CREATE TABLE `triage_outbox` (`event_id` text NOT NULL, `body` text NOT NULL, `state` text NOT NULL, `attempts` integer NOT NULL, `next_ms` integer NOT NULL, PRIMARY KEY (`event_id`));
+CREATE INDEX `triage_outbox_due` ON `triage_outbox` (`state`, `next_ms`, `event_id`);
 CREATE TABLE `triage_scans` (`rollout` text NOT NULL, `scanned_to` integer NOT NULL, PRIMARY KEY (`rollout`));
 CREATE TABLE `coordination_threads` (`thread_id` text NOT NULL, PRIMARY KEY (`thread_id`));
 CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`device_id`));

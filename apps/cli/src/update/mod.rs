@@ -91,6 +91,16 @@ struct Journal {
     resume_service: bool,
 }
 
+const BACKUP_RETENTION: usize = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedBackup {
+    data_dir: PathBuf,
+    device_id: String,
+    sequence: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct InspectResult {
     status: String,
@@ -98,6 +108,7 @@ struct InspectResult {
     data_dir: PathBuf,
     maintenance_socket: PathBuf,
     listen: SocketAddr,
+    http_enabled: bool,
     version: Option<String>,
     core_version: Option<String>,
     #[serde(default)]
@@ -346,15 +357,7 @@ pub async fn run(options: Update) -> Result<()> {
                 !root.starts_with(&data),
                 "install-root must not be inside the node data directory"
             );
-            let backups = root.join("backups");
-            if !backups.exists() {
-                fs::create_dir(&backups)?;
-            }
-            ensure!(
-                fs::symlink_metadata(&backups)?.is_dir(),
-                "backup directory must not be a symlink"
-            );
-            private_dir(&backups)?;
+            let backups = backup_directory(&root)?;
             let mut journal = Journal {
                 phase: Phase::Prepared,
                 previous,
@@ -615,6 +618,7 @@ async fn handoff(
 
 /// Confirm and open admission only after the caller has proved the final state.
 async fn acknowledge(
+    policy: &Policy,
     data: &Path,
     service: &impl ServiceControl,
     journal: &mut Journal,
@@ -622,6 +626,7 @@ async fn acknowledge(
     journal.phase = Phase::Confirmed;
     persist(&data.join("update-pending.json"), journal)?;
     service.commit(data).await?;
+    retain_committed_backups(policy, data, journal);
     Ok(())
 }
 
@@ -632,7 +637,7 @@ async fn activate(
     journal: &mut Journal,
 ) -> Result<()> {
     handoff(policy, data, service, journal).await?;
-    acknowledge(data, service, journal).await?;
+    acknowledge(policy, data, service, journal).await?;
     Ok(())
 }
 
@@ -724,6 +729,7 @@ async fn recover_with_service(
             .is_ok()
     {
         service.commit(data).await?;
+        retain_committed_backups(policy, data, &journal);
         return Ok(());
     }
     service.stop().await?;
@@ -736,6 +742,9 @@ async fn recover_with_service(
     journal.phase = Phase::Confirmed;
     persist(&pending, &journal)?;
     service.commit(data).await?;
+    if confirmed {
+        retain_committed_backups(policy, data, &journal);
+    }
     eprintln!(
         "Recovered {} program; business data was kept.",
         if confirmed { "confirmed" } else { "previous" }
@@ -985,7 +994,7 @@ where
         if let Err(error) = prove(journal.candidate.clone()).await {
             return reconcile_running(&policy, data, &service, error).await;
         }
-        acknowledge(data, &service, &mut journal).await?;
+        acknowledge(&policy, data, &service, &mut journal).await?;
         drop(lease);
         return Ok(());
     }
@@ -1074,6 +1083,9 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
                         Ok(health)
                             if health.device_id == device_id && health.version == version =>
                         {
+                            if !inspected.http_enabled {
+                                return Ok(());
+                            }
                             let mut listen = inspected.listen;
                             if listen.ip().is_unspecified() {
                                 listen.set_ip(if listen.is_ipv6() {
@@ -1130,6 +1142,125 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     bail!("node failed its private health check: {last}")
+}
+
+fn owned_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.is_symlink()
+            && fs::canonicalize(path)? == path
+            && privatefs::owner_of(path)? == privatefs::current_account()?,
+        "{} is not a directory owned by this account without links",
+        path.display()
+    );
+    Ok(())
+}
+
+fn backup_directory(root: &Path) -> Result<PathBuf> {
+    owned_directory(root)?;
+    let backups = root.join("backups");
+    match fs::symlink_metadata(&backups) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            privatefs::create_dir_new(&backups)?;
+            privatefs::sync_dir(root)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    owned_directory(&backups)?;
+    privatefs::ensure_private(&backups, "the updater backup directory")?;
+    Ok(backups)
+}
+
+fn backup_receipt(backups: &Path, backup: &Path) -> Result<PathBuf> {
+    let name = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("backup directory has no name")?;
+    ensure!(
+        backup.parent() == Some(backups) && uuid::Uuid::parse_str(name)?.to_string() == name,
+        "backup directory is outside the updater namespace"
+    );
+    Ok(backups.join(format!(".updater-{name}.json")))
+}
+
+fn retain_committed_backups(policy: &Policy, data: &Path, journal: &Journal) {
+    // Recovery pins candidate to previous before committing a rollback; that backup is evidence.
+    if journal.candidate == journal.previous {
+        return;
+    }
+    if let Err(error) = prune_committed_backups(policy, data, journal) {
+        eprintln!("Update committed; backup retention could not finish: {error:#}");
+    }
+}
+
+fn prune_committed_backups(policy: &Policy, data: &Path, journal: &Journal) -> Result<()> {
+    // A failed or interrupted activation keeps its whole snapshot and diagnostic journal.
+    match fs::symlink_metadata(data.join("update-pending.json")) {
+        Ok(_) => bail!("an activation journal still references this Node's backups"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let backups = backup_directory(&policy.install_root)?;
+    let receipt = backup_receipt(&backups, &journal.backup)?;
+    owned_directory(&journal.backup)?;
+    privatefs::ensure_private(&journal.backup, "the completed updater snapshot")?;
+    let mut completed = Vec::new();
+    for entry in fs::read_dir(&backups)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".updater-"))
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let snapshot = backups.join(id);
+        if backup_receipt(&backups, &snapshot).is_err()
+            || owned_directory(&snapshot).is_err()
+            || !privatefs::is_private(&snapshot)?
+        {
+            continue;
+        }
+        let Ok(bytes) = privatefs::read_private_bounded(&entry.path(), 4096, "backup receipt")
+        else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<CommittedBackup>(&bytes) else {
+            continue;
+        };
+        if record.data_dir == data && record.device_id == journal.device_id {
+            completed.push((snapshot, entry.path(), record.sequence));
+        }
+    }
+    if !completed.iter().any(|(path, _, _)| path == &journal.backup) {
+        let sequence = completed
+            .iter()
+            .map(|(_, _, sequence)| *sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("updater backup sequence is exhausted")?;
+        let record = CommittedBackup {
+            data_dir: data.to_path_buf(),
+            device_id: journal.device_id.clone(),
+            sequence,
+        };
+        privatefs::create_durable(&receipt, &serde_json::to_vec(&record)?)?;
+        completed.push((journal.backup.clone(), receipt, sequence));
+    }
+    completed
+        .sort_by_key(|(path, _, sequence)| (path != &journal.backup, std::cmp::Reverse(*sequence)));
+    for (snapshot, receipt, _) in completed.into_iter().skip(BACKUP_RETENTION) {
+        owned_directory(&snapshot)?;
+        privatefs::ensure_private(&snapshot, "the old updater snapshot")?;
+        fs::remove_dir_all(snapshot)?;
+        fs::remove_file(receipt)?;
+        privatefs::sync_dir(&backups)?;
+    }
+    Ok(())
 }
 
 fn backup(source: &Path, destination: &Path) -> Result<()> {
@@ -1684,6 +1815,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn update_health_inspects_the_candidate_core() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use vibeface_bridge::platform::ipc::{Endpoint, Listener};
+
         let root = sandbox();
         let candidate = package(&root, "9.0.0");
         let data = root.join("data");
@@ -1691,6 +1825,7 @@ mod tests {
         let response = serde_json::json!({"ok":true,"result":{
             "status":"running","device_id":"unexpected","data_dir":data,
             "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
+            "http_enabled":false,
             "version":"9.0.0","core_version":"9.0.0"
         }});
         let core = candidate.join(PROGRAMS[1]);
@@ -1706,6 +1841,82 @@ mod tests {
         let error = healthy(&data, &candidate, "expected").await.unwrap_err();
         assert!(marker.exists(), "health must execute the candidate Core");
         assert!(error.to_string().contains("unexpected version or identity"));
+        for (case, (web_enabled, http_enabled, http_device, succeeds)) in [
+            (false, false, "other", true),
+            (true, true, "expected", true),
+            (false, true, "expected", true),
+            (false, true, "other", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let endpoint = Endpoint::in_private_dir(&root, &format!("health-{case}.sock"))?;
+            let mut listener = Listener::bind(&endpoint).await?;
+            let maintenance_server = tokio::spawn(async move {
+                let mut stream = listener.accept().await?;
+                while stream.read_u8().await? != b'\n' {}
+                let response = serde_json::json!({
+                    "protocol":maintenance::PROTOCOL,"status":"healthy",
+                    "health":{"device_id":"expected","version":"9.0.0"}
+                });
+                stream.write_all(&serde_json::to_vec(&response)?).await?;
+                stream.write_all(b"\n").await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let listen = listener.local_addr()?;
+            let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = requests.clone();
+            let http_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _request_bytes = stream.read(&mut request).await?;
+                let body = serde_json::json!({"device_id":http_device,"version":"9.0.0"});
+                let body = serde_json::to_vec(&body)?;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let response = serde_json::json!({"ok":true,"result":{
+                "status":"running","device_id":"expected","data_dir":data,
+                "maintenance_socket":endpoint.path(),"listen":listen,
+                "web_enabled":web_enabled,"http_enabled":http_enabled,
+                "version":"9.0.0","core_version":"9.0.0"
+            }});
+            fs::write(
+                &core,
+                format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{response}'\n"),
+            )?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                healthy(&data, &candidate, "expected"),
+            )
+            .await?;
+            maintenance_server.await??;
+            if http_enabled {
+                http_server.await??;
+            } else {
+                http_server.abort();
+            }
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(http_enabled),
+                "web={web_enabled}, http={http_enabled}"
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("HTTP listener belongs"));
+            }
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2100,7 +2311,7 @@ mod tests {
             previous,
             candidate,
             device_id: "device".into(),
-            backup: root.join("backups/fixture"),
+            backup: root.join("backups").join(uuid::Uuid::new_v4().to_string()),
             resume_service: true,
         };
         persist(&data.join("update-pending.json"), &journal).unwrap();
@@ -2151,6 +2362,12 @@ mod tests {
                 .unwrap();
             assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
             assert!(!data.join("update-pending.json").exists());
+            assert!(
+                !backup_receipt(&policy.install_root.join("backups"), &journal.backup)
+                    .unwrap()
+                    .exists(),
+                "a restored failure keeps its snapshot as diagnostics"
+            );
             for (name, bytes) in filenames.iter().zip(before) {
                 assert_eq!(fs::read(data.join(name)).unwrap(), bytes);
             }
@@ -2281,6 +2498,142 @@ mod tests {
             fs::read(data.join("node.sqlite3")).unwrap(),
             b"new-user-writes-must-survive"
         );
+        let backups = policy.install_root.join("backups");
+        let receipt = backup_receipt(&backups, &journal.backup).unwrap();
+        let record: CommittedBackup = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+        assert_eq!(record.data_dir, data);
+        assert_eq!(record.device_id, journal.device_id);
+        let mut successful = vec![journal.backup.clone()];
+        let unknown = backups.join(uuid::Uuid::new_v4().to_string());
+        private_dir(&unknown).unwrap();
+        fs::write(unknown.join("keep"), b"unknown snapshot").unwrap();
+        let mut other_nodes = Vec::new();
+        for (data_dir, device_id) in [
+            (data.clone(), "other-device"),
+            (data.with_file_name("other-node-data"), "device"),
+        ] {
+            let snapshot = backups.join(uuid::Uuid::new_v4().to_string());
+            private_dir(&snapshot).unwrap();
+            persist(
+                &backup_receipt(&backups, &snapshot).unwrap(),
+                &CommittedBackup {
+                    data_dir,
+                    device_id: device_id.into(),
+                    sequence: 0,
+                },
+            )
+            .unwrap();
+            other_nodes.push(snapshot);
+        }
+        let outside = policy.install_root.join("outside-backups");
+        private_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"link target").unwrap();
+        let linked = backups.join(uuid::Uuid::new_v4().to_string());
+        privatefs::link_dir(&outside, &linked).unwrap();
+        persist(
+            &backup_receipt(&backups, &linked).unwrap(),
+            &CommittedBackup {
+                data_dir: data.clone(),
+                device_id: journal.device_id.clone(),
+                sequence: 0,
+            },
+        )
+        .unwrap();
+        journal.previous = journal.candidate.clone();
+        journal.candidate = package(&policy.install_root, "1.2.0");
+        journal.phase = Phase::Prepared;
+        journal.backup = backups.join(uuid::Uuid::new_v4().to_string());
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        let failing = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "health",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            activate(&policy, &data, &failing, &mut journal)
+                .await
+                .is_err()
+        );
+        recover_with_service(&policy, &data, &failing, RecoveryMode::ResumeJournal)
+            .await
+            .unwrap();
+        let failed = journal.backup.clone();
+        journal.candidate = journal.previous.clone();
+        journal.phase = Phase::Confirmed;
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
+            .await
+            .unwrap();
+        assert!(!backup_receipt(&backups, &failed).unwrap().exists());
+        fs::write(data.join("new-private-snapshot"), b"must be copied whole").unwrap();
+        for version in ["1.3.0", "1.4.0", "1.5.0"] {
+            journal.previous = installed(&policy.install_root).unwrap();
+            journal.candidate = package(&policy.install_root, version);
+            journal.phase = Phase::Prepared;
+            journal.backup = backups.join(uuid::Uuid::new_v4().to_string());
+            persist(&data.join("update-pending.json"), &journal).unwrap();
+            activate(&policy, &data, &service, &mut journal)
+                .await
+                .unwrap();
+            successful.push(journal.backup.clone());
+            assert_eq!(
+                fs::read(journal.backup.join("new-private-snapshot")).unwrap(),
+                b"must be copied whole"
+            );
+            assert_eq!(
+                successful.iter().filter(|path| path.exists()).count(),
+                BACKUP_RETENTION
+            );
+        }
+        let referenced = backups.join(uuid::Uuid::new_v4().to_string());
+        backup(&data, &referenced).unwrap();
+        persist(
+            &backup_receipt(&backups, &referenced).unwrap(),
+            &CommittedBackup {
+                data_dir: data.clone(),
+                device_id: journal.device_id.clone(),
+                sequence: 0,
+            },
+        )
+        .unwrap();
+        let pending = Journal {
+            phase: Phase::Prepared,
+            previous: journal.previous.clone(),
+            candidate: journal.candidate.clone(),
+            device_id: journal.device_id.clone(),
+            backup: referenced.clone(),
+            resume_service: true,
+        };
+        persist(&data.join("update-pending.json"), &pending).unwrap();
+        assert!(prune_committed_backups(&policy, &data, &journal).is_err());
+        assert!(
+            referenced.is_dir(),
+            "a live journal prevents all pruning for its Node"
+        );
+        fs::remove_file(data.join("update-pending.json")).unwrap();
+        prune_committed_backups(&policy, &data, &journal).unwrap();
+        assert!(!referenced.exists());
+        assert!(!backup_receipt(&backups, &referenced).unwrap().exists());
+        assert!(failed.is_dir() && unknown.is_dir());
+        assert!(other_nodes.iter().all(|path| path.is_dir()));
+        assert!(privatefs::is_dir_link(&linked).unwrap());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"link target");
+        let root_alias = policy.install_root.join("root-alias");
+        privatefs::link_dir(&policy.install_root, &root_alias).unwrap();
+        let linked_policy = Policy {
+            install_root: root_alias.clone(),
+            channel: policy.channel,
+            automatic: policy.automatic,
+        };
+        assert!(prune_committed_backups(&linked_policy, &data, &journal).is_err());
+        privatefs::remove_dir_link(&root_alias).unwrap();
+        let moved_backups = policy.install_root.join("kept-backups");
+        fs::rename(&backups, &moved_backups).unwrap();
+        privatefs::link_dir(&moved_backups, &backups).unwrap();
+        assert!(prune_committed_backups(&policy, &data, &journal).is_err());
+        privatefs::remove_dir_link(&backups).unwrap();
+        fs::rename(&moved_backups, &backups).unwrap();
         fs::remove_dir_all(policy.install_root).unwrap();
     }
 
@@ -2321,7 +2674,9 @@ mod tests {
         assert_eq!(stored.phase, Phase::Prepared);
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
-        acknowledge(&data, &service, &mut journal).await.unwrap();
+        acknowledge(&policy, &data, &service, &mut journal)
+            .await
+            .unwrap();
         assert!(!data.join("update-pending.json").exists());
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);

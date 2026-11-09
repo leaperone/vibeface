@@ -94,7 +94,6 @@ cd vibeface-<version>-<target>
 ```sh
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface -p vibeface-core --locked
 bash scripts/package-node.sh
 ```
 
@@ -152,7 +151,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。
 
-`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=1`，两者取自共享控制 crate `crates/control/src/lib.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 的 BUILD-INFO 只接受 `version`、`target`、`source_commit`、`update_protocol`、`data_epoch`、`core_version`、`core_source_commit`、`app_version` 和 `app_source_commit` 这 9 个字段。校验涵盖同目录 CLI、Core 和完整 `web/` 的版本、源码及文件摘要。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=1`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=1`，两者取自共享控制 crate `crates/control/src/lib.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 的 BUILD-INFO 只接受 `version`、`target`、`source_commit`、`update_protocol`、`data_epoch`、`core_version`、`core_source_commit`、`app_version` 和 `app_source_commit` 这 9 个字段。校验涵盖同目录 CLI、Core 和完整 `web/` 的版本、源码及文件摘要。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=1`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态，Node 不提供网页（`--no-web` 或 `web_enabled` 为 false；`inspect` 的 `http_enabled` 恒等于 `web_enabled`）时只经维护 socket 以维护身份核验；失败时恢复上一份程序入口。每次激活先把 `current` 目标快照到安装根目录私有的 `backups/<uuid>/`，并在数据目录写 `update-pending.json`；确认成功并删除该 journal 后，只保留同一 Node 最近两份有旁记录 `.updater-<uuid>.json` 的成功快照。失败、中断、没有旁记录或归属其他 Node 的快照一律保留，总占用不承诺两份封顶。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
@@ -194,7 +193,7 @@ node scripts/package-npm.mjs --input /absolute/path/to/verified-packages --sourc
 node scripts/package-npm.mjs --verify /absolute/path/to/leaperone-vibeface-<version>.tgz --source-commit <full-commit-sha>
 ```
 
-`release.yml` 在产品 Nightly 的 `publish` 成功后自动调用可复用的 `npm-publish.yml` 并公开发布。两个工作流保留同一 tag 的 `GITHUB_SHA` 和 `GITHUB_REF`，npm provenance 对应制品源码。发布前核对来源仓库、run id、源码 SHA、tag、artifact id、有效期、名称和 producer attempt，再执行 `package-npm.mjs --verify`；发布阶段不重新构建。
+`release.yml` 在产品 Nightly 的 `publish-product` 成功后自动调用可复用的 `npm-publish.yml` 并公开发布。两个工作流保留同一 tag 的 `GITHUB_SHA` 和 `GITHUB_REF`，npm provenance 对应制品源码。发布前核对来源仓库、run id、源码 SHA、tag、artifact id、有效期、名称和 producer attempt，再执行 `package-npm.mjs --verify`；发布阶段不重新构建。
 
 发布使用 GitHub-hosted Ubuntu、Node.js 24 和 npm 12.2.2。调用方与被调用方都授予 `id-token: write`，发布 job 使用 `npm-release` environment，不配置 `NODE_AUTH_TOKEN` 或长期 npm token。
 

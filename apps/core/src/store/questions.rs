@@ -71,6 +71,14 @@ fn questions_from(
                 if let Some(object) = question.as_object_mut() {
                     object.remove("type");
                 }
+                question["target"] = json!(super::scope_projection::question_input_target_from(
+                    connection,
+                    network,
+                    &scope,
+                    question["question_id"]
+                        .as_str()
+                        .context("question has no ID")?,
+                )?);
                 let bot = bot_for_conversation_from(connection, network, &scope)?
                     .map(|bot| json!({"bot_id":bot.bot_id,"name":bot.name}));
                 question["conversation_id"] = json!(scope);

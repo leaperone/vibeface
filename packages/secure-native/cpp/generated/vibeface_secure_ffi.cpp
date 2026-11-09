@@ -350,6 +350,7 @@ extern "C" {
     /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_verify_membership(
         RustBuffer state_json, 
         RustBuffer expected_network, 
+        RustBuffer now, 
         RustCallStatus *uniffi_out_err
     );
     /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_lan_connect(
@@ -2513,7 +2514,7 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
     props["ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership"),
-        2,
+        3,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(rt, thisVal, args, count);
         }
@@ -3953,7 +3954,7 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_verif
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_vibeface_secure_ffi_fn_func_verify_membership(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), 
+        auto value = uniffi_vibeface_secure_ffi_fn_func_verify_membership(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
             &status
         );
         uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);

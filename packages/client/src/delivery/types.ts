@@ -1,8 +1,8 @@
 export type DeliveryMode = 'charity' | 'paid'
 export type Acceptance = 'recoverable' | 'strict'
-export type DeliveryPhase = 'prepared' | 'funding_pending' | 'proving' | 'funded' | 'transferring' | 'cipher_held' | 'key_published' | 'recoverable' | 'paid' | 'partial' | 'refundable' | 'refunded' | 'reconciling' | 'key_unavailable' | 'failed'
+export type DeliveryPhase = 'prepared' | 'funding_pending' | 'proving' | 'funded' | 'transferring' | 'cipher_held' | 'key_published' | 'recoverable' | 'paid' | 'partial' | 'refunded' | 'reconciling' | 'key_unavailable' | 'failed'
 export type DeliveryEvidence = 'none' | 'charity_receipt' | 'ciphertext_held' | 'recoverable' | 'decryption_proven'
-export type PaymentState = 'free' | 'prepared' | 'submitted' | 'included' | 'confirmed' | 'earned' | 'withdrawn' | 'refunded' | 'unknown' | 'failed'
+export type PaymentState = 'free' | 'prepared' | 'confirmed' | 'earned' | 'withdrawn' | 'refunded' | 'unknown' | 'failed'
 export type DeliverySettings = { enabled: boolean; charity_enabled: boolean; paid_enabled: boolean }
 /** What a paid provider asks, as it announces it; `price` is per window in the asset's smallest unit. */
 /** Where an offer settles: the delivery chain's ID, escrow and asset. */

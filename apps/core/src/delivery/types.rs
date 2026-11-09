@@ -38,7 +38,6 @@ pub enum Phase {
     Recoverable,
     Paid,
     Partial,
-    Refundable,
     Refunded,
     Reconciling,
     KeyUnavailable,
@@ -58,8 +57,6 @@ pub enum Evidence {
 pub enum PaymentState {
     Free,
     Prepared,
-    Submitted,
-    Included,
     Confirmed,
     Earned,
     Withdrawn,
@@ -185,6 +182,39 @@ pub struct StoredOrder {
     pub grants: Vec<ServiceGrant>,
     pub accepted: bool,
     pub notified: bool,
+    #[serde(skip)]
+    pub chain_observed_at_ms: i64,
+    #[serde(skip)]
+    pub settlement_complete: bool,
+}
+impl StoredOrder {
+    pub(super) fn historical(&self) -> bool {
+        self.settlement_complete
+            && self.view.payment.earned == self.view.payment.withdrawn
+            && self
+                .view
+                .windows
+                .iter()
+                .all(|window| matches!(window.state, WindowState::Earned | WindowState::Refunded))
+            && !self.resume_requested
+            && self.view.error.is_none()
+            && !matches!(
+                self.view.phase,
+                Phase::Reconciling | Phase::KeyUnavailable | Phase::Failed
+            )
+            && self.view.payment.state != PaymentState::Unknown
+            && (self.view.role != Role::Receiver
+                || self
+                    .view
+                    .windows
+                    .iter()
+                    .all(|window| window.state == WindowState::Refunded)
+                || self.view.name.is_some()
+                    && self.view.sha256.is_some()
+                    && self.view.windows.iter().all(|window| {
+                        window.decryption_proven || window.state == WindowState::Refunded
+                    }))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

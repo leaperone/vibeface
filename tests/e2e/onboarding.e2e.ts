@@ -6,7 +6,7 @@ import { test } from './fixtures';
 import { expect, secrets } from 'e2e';
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
-  await app.open(node.url);
+  await app.open(node.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();
@@ -172,6 +172,10 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     };
     const three = ['导出 Markdown，保留可编辑内容', '导出 PDF，保留当前排版', '同时导出两种格式'];
     seed('q-decision-three', three);
+    decisionDb.prepare('INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,muted,created_at_ms) VALUES(?,?,?,?,?,?,0,?)')
+      .run(identity.network_id, node.peer, 'q-decision-three', identity.conversation_id, '0', JSON.stringify({ agent: 'codex', cwd: 'workspace', summary: '' }), Date.now());
+    decisionDb.prepare("UPDATE questions SET body=json_remove(body,'$.target') WHERE network_id=? AND question_id=?")
+      .run(identity.network_id, 'q-decision-three');
     await browser.goto(`${node.url}/inbox`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);

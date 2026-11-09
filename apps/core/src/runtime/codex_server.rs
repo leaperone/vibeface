@@ -517,7 +517,19 @@ fn stale(error: &str) -> bool {
 pub(crate) async fn discover(candidates: &[PathBuf]) -> Discovery {
     let mut failed = None;
     for socket in candidates {
-        match vibeface_bridge::codex::DirectSession::connect(socket).await {
+        let session = tokio::time::timeout(
+            Duration::from_secs(3),
+            vibeface_bridge::codex::DirectSession::connect(socket),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(CodexError {
+                uncertain: false,
+                answered: false,
+                message: "Codex App Server connection probe timed out".into(),
+            })
+        });
+        match session {
             Ok(session) => {
                 let user_agent = session.user_agent.clone();
                 session.close().await;
@@ -1949,6 +1961,32 @@ mod tests {
             discover(&[stale, mute.clone()]).await,
             Discovery::HandshakeFailed { socket, .. } if socket == mute
         ));
+        let stalled = dir.join("stalled.sock");
+        let listener = tokio::net::UnixListener::bind(&stalled)?;
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(
+                stream.next().await.is_some(),
+                "the initialize request reached the fixture"
+            );
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            discover(&[stalled.clone(), live.clone()]).await,
+            Discovery::Live {
+                socket: live,
+                user_agent: "codex/fixture".into(),
+            },
+            "a silent initialize does not prevent checking the next candidate"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(discover(std::slice::from_ref(&stalled)).await, Discovery::HandshakeFailed { socket, reason }
+            if socket == stalled && reason == "Codex App Server connection probe timed out")
+        );
+        silent.abort();
         fixture.abort();
         closer.abort();
         std::fs::remove_dir_all(dir)?;

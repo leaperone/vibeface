@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
+import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
@@ -52,7 +53,7 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -159,8 +160,9 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const sandbox = createContext({
     Date: class extends Date { static now = now },
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
+    sessionStorage: { getItem: (key: string) => tabStorage.get(key) ?? null, setItem: (key: string, value: string) => tabStorage.set(key, value), removeItem: (key: string) => tabStorage.delete(key) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
-    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
+    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, btoa, atob, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
@@ -200,17 +202,20 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     return module.exports
   }
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
-  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery() {} }
+  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+  let tabReceive: ((serialized: string) => void) | undefined
+  const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
+  let restarts = 0
   assert.equal(typeof Provider, 'function')
   type Device = ReturnType<typeof import('@vibeface/client/identity/context.tsx').useDevice>
   const render = (): Device => {
     cursor = 0
     assert.ok(typeof Provider === 'function')
-    const props = Provider({ platform, children: null })
+    const props = Provider({ platform, children: null, restart: () => { restarts++ } })
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, platform, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -363,8 +368,10 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   } finally { app.close() }
 })
 
-test('fresh localhost discovers its one-time capability and creates the network through recover', async () => {
-  const app = deviceHarness({ local: 'fresh', saved: true })
+test('an owner bootstrap link creates the network through recover without HTTP credential issuance', async () => {
+  const fragment = `#bootstrap=${Buffer.from(JSON.stringify(localInvitation)).toString('base64url')}`
+  const app = deviceHarness({ local: 'fresh', saved: true, fragment })
+  app.localState.setup = { kind: 'owner_required', initialized: false }
   try {
     app.render(); await settle()
     assert.equal(app.render().localSetup?.kind, 'uninitialized')
@@ -387,6 +394,21 @@ test('fresh localhost discovers its one-time capability and creates the network 
     assert.equal(recover[0].params.capability, localCapability)
     assert.deepEqual(plain(recover[0].params.genesis), genesis)
   } finally { app.close() }
+})
+
+test('anonymous localhost status cannot initialize a node or obtain a local launch', async () => {
+  for (const fragment of ['', '#bootstrap=not-json', `#bootstrap=${Buffer.from(JSON.stringify({ ...localInvitation, url: 'https://remote.example' })).toString('base64url')}`]) {
+    const app = deviceHarness({ local: 'fresh', fragment })
+    app.localState.setup = { kind: 'owner_required', initialized: false }
+    try {
+      app.render(); await settle()
+      assert.equal(app.render().localSetup, null)
+      assert.equal(app.render().ready, null)
+      assert.equal(app.calls.includes('local-exchange'), false)
+      assert.equal(app.calls.includes('recover'), false)
+      assert.equal(app.navigations.length, 0)
+    } finally { app.close() }
+  }
 })
 
 test('initialized localhost requires member authorization and cannot create a second network', async () => {
@@ -1452,5 +1474,133 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
     assert.equal(app.timers.size, 0)
     assert.equal(app.calls.filter(call => call === `open:${target}`).length, 2)
     assert.equal(app.calls.filter(call => ['recover', 'join', 'rpc'].includes(call)).length, 0)
+  } finally { app.close() }
+})
+
+for (const stage of ['open', 'info', 'authenticate']) for (const outcome of ['reject', 'success', 'disconnect', 'unmount', 'manual']) test(`a tab entrance during ${stage} ${outcome} only resumes the current connection`, async () => {
+  const app = deviceHarness({ saved: true })
+  app.enableTabs()
+  const next = { ...entry, address: 'https://new-entry.example' }
+  const manual = { ...entry, address: 'https://manual-entry.example' }
+  try {
+    app.render(); await settle()
+    app.sockets[0].drop()
+    const hold = deferred()
+    app.holds.set(stage, hold)
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    const attempts = app.sockets.length
+    app.broadcast({ type: 'entrance', networkId: network, entry: next })
+    app.broadcast({ type: 'entrance', networkId: network, entry: next })
+    assert.equal(app.timers.size, 0, 'broadcasts wait for the active attempt')
+    if (outcome === 'disconnect') app.render().disconnect()
+    if (outcome === 'unmount') app.close()
+    app.holds.delete(stage)
+    if (outcome === 'manual') await app.render().connect(manual)
+    if (outcome === 'success') hold.resolve(stage === 'info' ? { device_id: target, name: 'Node', version: 'test', initialized: true, network_id: null } : stage === 'authenticate' ? { principal: { network_id: network } } : undefined)
+    else hold.reject(new Error('controlled old entrance failure'))
+    await settle()
+    if (outcome === 'reject') {
+      assert.equal(app.timers.size, 1)
+      const [nextId, reconnect] = [...app.timers.entries()][0]
+      app.timers.delete(nextId); reconnect(); await settle()
+      const active = app.render().ready?.entry
+      assert.equal(active?.kind !== 'lan' && active?.address, next.address)
+      assert.equal(app.sockets.length, attempts + 1)
+      assert.equal(app.timers.size, 0)
+    } else if (outcome === 'success') {
+      assert.equal(app.render().ready?.isCurrent(), true)
+      assert.equal(app.timers.size, 0)
+      assert.equal(app.sockets.length, attempts)
+    } else {
+      assert.equal(app.timers.size, 0)
+      assert.equal(app.sockets.length, attempts + (outcome === 'manual' ? 1 : 0))
+      if (outcome === 'manual') { const active = app.render().ready?.entry; assert.equal(active?.kind !== 'lan' && active?.address, manual.address) }
+    }
+    assert.equal(app.requests.some(({ method }) => !['info', 'authenticate', 'subscribe', 'entrances'].includes(method)), false, 'reconnect never replays business writes')
+  } finally { app.close() }
+})
+
+for (const flow of ['recovery', 'rotation']) test(`${flow} persists the same sealed copy before submission and can share it after remount`, async () => {
+  const app = deviceHarness({ saved: true }), kept = new Map<string, string>(), handed: Uint8Array[] = []
+  let fail = true
+  const storage = { read: () => kept.get('copy') ?? null, write(value: string | null) { if (fail) throw new Error('private disk full'); if (value === null) kept.delete('copy'); else kept.set('copy', value) } }
+  app.platform.recoveryStorage = storage
+  app.platform.saveRecovery = async (bytes) => { handed.push(bytes.slice()); throw new Error('share dismissed') }
+  try {
+    app.render(); await settle()
+    const input = () => ({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', oldPassword: 'test-only-passphrase', name: 'phone', entry })
+    if (flow === 'recovery') await app.render().beginRecovery(input())
+    const submit = () => { const review = app.render().review; return flow === 'rotation' ? app.render().replaceRecoveryFile(input()) : app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : []) }
+    await assert.rejects(submit(), /private disk full/)
+    assert.equal(app.calls.includes('recover'), false)
+    assert.equal(handed.length, 0)
+    fail = false
+    await submit()
+    assert.equal(app.calls.filter(method => method === 'recover').length, 1)
+    assert.equal(handed.length, 1)
+    const value = storage.read()
+    assert.ok(value)
+    assert.equal(/test-only-passphrase|private-test-key/.test(value), false)
+    const reloaded = deviceHarness()
+    reloaded.platform.recoveryStorage = storage
+    reloaded.platform.saveRecovery = (bytes) => { handed.push(bytes.slice()) }
+    try {
+      reloaded.render(); await settle()
+      assert.equal(reloaded.render().unsavedRecovery?.attempted, false)
+      await reloaded.render().downloadUnsavedRecovery()
+      assert.deepEqual(handed[1], handed[0])
+      assert.equal(reloaded.render().unsavedRecovery?.attempted, true)
+      reloaded.render().forgetUnsavedRecovery()
+      assert.equal(storage.read(), null)
+    } finally { reloaded.close() }
+  } finally { app.close() }
+})
+
+test('a local erase failure stays retryable and a pending erase never reconnects after restart', async () => {
+  const app = deviceHarness({ saved: true })
+  let attempts = 0
+  app.platform.erase = async () => { if (++attempts === 1) throw new Error('controlled delete failure'); app.stored.clear() }
+  try {
+    app.render(); await settle()
+    await assert.rejects(app.render().factoryReset(), /controlled delete failure/)
+    assert.equal(app.render().phase, 'erase_failed')
+    assert.equal(app.restarts(), 0)
+    assert.equal(app.stored.get('vibeface.erase-pending'), 'true')
+    const reloaded = deviceHarness({ storage: app.stored })
+    try { reloaded.render(); await settle(); assert.equal(reloaded.render().phase, 'erase_failed'); assert.equal(reloaded.sockets.length, 0) } finally { reloaded.close() }
+    await app.render().factoryReset()
+    assert.equal(app.restarts(), 1)
+  } finally { app.close() }
+})
+
+test('web sealed recovery copies survive a tab reload and disappear with that tab', async () => {
+  const tabStorage = new Map<string, string>(), app = deviceHarness({ saved: true, tabStorage })
+  try {
+    app.render(); await settle()
+    await app.render().replaceRecoveryFile({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', oldPassword: 'test-only-passphrase' })
+    assert.equal(app.render().unsavedRecovery?.attempted, true)
+    const reload = deviceHarness({ tabStorage }), newTab = deviceHarness()
+    try {
+      assert.equal(reload.render().unsavedRecovery?.code, app.render().unsavedRecovery?.code)
+      assert.equal(newTab.render().unsavedRecovery, null)
+      reload.render().forgetUnsavedRecovery()
+      assert.equal(tabStorage.size, 0)
+    } finally { reload.close(); newTab.close() }
+  } finally { app.close() }
+})
+
+test('a failed remote leave still allows the authorized local erase', async () => {
+  const app = deviceHarness({ saved: true }), refusal = deferred()
+  let erased = false
+  app.platform.erase = async () => { erased = true; app.stored.clear() }
+  try {
+    app.render(); await settle()
+    app.holds.set('revoke', refusal)
+    refusal.promise.catch(() => {}); refusal.reject(new Error('controlled remote refusal'))
+    await app.render().factoryReset()
+    assert.equal(erased, true)
+    assert.equal(app.restarts(), 1)
+    assert.equal(app.requests.filter(request => request.method === 'revoke').length, 1)
   } finally { app.close() }
 })

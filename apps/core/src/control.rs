@@ -125,6 +125,7 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
             remembered_data_dirs,
         } => crate::control_discovery::discover(&app_profile_dir, &remembered_data_dirs).await,
         vibeface_control::ControlRequest::Access { data_dir, json: _ } => access(&data_dir).await,
+        vibeface_control::ControlRequest::LocalSetup { data_dir } => local_setup(&data_dir).await,
         vibeface_control::ControlRequest::SetLocalAccess { data_dir, enabled } => {
             set_local_access(&data_dir, enabled)
                 .await
@@ -320,6 +321,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         "local_listen": configuration.local_listen,
         "public_url": configuration.public_url,
         "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
+        "http_enabled": health.as_ref().is_ok_and(|health| health.http_enabled),
         "version": health.as_ref().ok().map(|health| &health.version),
         "write_state": health.as_ref().ok().and_then(|health| health.write_state),
         "mesh": {
@@ -358,8 +360,12 @@ async fn access(data_dir: &Path) -> Result<Value> {
         None
     } else {
         let capability: crate::identity::local::BootstrapCapability =
-            serde_json::from_slice(&read_bounded(&data_dir.join("bootstrap.json"), 4096)?)
-                .context("initial bootstrap capability is unavailable")?;
+            serde_json::from_slice(&privatefs::read_private_bounded(
+                &data_dir.join("bootstrap.json"),
+                4096,
+                "the bootstrap capability",
+            )?)
+            .context("initial bootstrap capability is unavailable")?;
         ensure!(
             capability.capability.len() == 64 && hex::decode(&capability.capability).is_ok(),
             "invalid local bootstrap capability"
@@ -367,26 +373,15 @@ async fn access(data_dir: &Path) -> Result<Value> {
         Some(capability.capability)
     };
     if initialized && configuration.local_auto_access {
-        let path = data_dir.join("local-access.json");
-        let metadata = fs::symlink_metadata(&path)
-            .context("start the node before opening local browser access")?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "local launcher credential must be a private regular file"
-        );
-        privatefs::ensure_private(&path, "the local launcher credential")?;
-        let launcher: Launcher = serde_json::from_slice(&read_bounded(&path, 4096)?)?;
+        let launcher = Launcher::read(data_dir)?;
         let mut url = config::http_origin(&launcher.origin)?;
         ensure!(
-            url.scheme() == "http"
-                && url.host_str() == Some("127.0.0.1")
-                && launcher.node_id == device_id
-                && launcher.capability.len() == 64
-                && hex::decode(&launcher.capability).is_ok(),
+            launcher.node_id == device_id,
             "local launcher does not match this node"
         );
         let entry: Value = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()?
             .post(url.join("/api/local/launch")?)
@@ -406,15 +401,19 @@ async fn access(data_dir: &Path) -> Result<Value> {
             entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
             "local browser entry does not match this node"
         );
-        let listen = configuration.listen.ip();
-        if listen.is_loopback() || listen.is_unspecified() {
-            url =
-                config::http_origin(&format!("http://localhost:{}", configuration.listen.port()))?;
-        }
         url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
         return Ok(json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true}));
     }
-    let mut url = config::http_origin(&configuration.public_url)?;
+    let mut url = if capability.is_some() {
+        let launcher = Launcher::read(data_dir)?;
+        ensure!(
+            launcher.node_id == device_id,
+            "local launcher does not match this node"
+        );
+        config::http_origin(&launcher.origin)?
+    } else {
+        config::http_origin(&configuration.public_url)?
+    };
     if url.scheme() == "http" && !is_loopback(&url) {
         ensure!(
             configuration.listen.ip().is_unspecified() || configuration.listen.ip().is_loopback(),
@@ -437,6 +436,43 @@ async fn access(data_dir: &Path) -> Result<Value> {
     Ok(
         json!({"url":url.to_string(),"device_id":device_id,"local":false,"capability":capability,"maintenance_socket":info["maintenance_socket"]}),
     )
+}
+
+async fn local_setup(data_dir: &Path) -> Result<Value> {
+    let info = inspect(data_dir).await?;
+    ensure!(
+        info["web_enabled"] == true && !Config::load(data_dir)?.forwarding.any,
+        "this Node has no local browser setup"
+    );
+    let launcher = Launcher::read(data_dir)?;
+    ensure!(
+        info["device_id"] == launcher.node_id,
+        "local launcher does not match this node"
+    );
+    let result: Value = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("{}/api/local/setup", launcher.origin))
+        .header(reqwest::header::ORIGIN, &launcher.origin)
+        .bearer_auth(launcher.capability)
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let device = if result["kind"] == "uninitialized" {
+        &result["invitation"]["device_id"]
+    } else {
+        &result["entry"]["device_id"]
+    };
+    ensure!(
+        device == &info["device_id"],
+        "local setup does not match this node"
+    );
+    Ok(result)
 }
 
 fn is_loopback(url: &reqwest::Url) -> bool {
@@ -624,10 +660,8 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         } else {
             configuration.public_url.clone()
         };
+    configuration.provider_env = provider_env;
     initialize(&options.data_dir, configuration)?;
-    if provider_env != ProviderEnv::default() {
-        provider_env.save(&options.data_dir)?;
-    }
     let data_dir = fs::canonicalize(&options.data_dir)?;
     let device_id = config::identity(&data_dir)?.device_id()?;
     Ok(json!({
@@ -654,10 +688,8 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
     configuration.network.validate()?;
     let identity = LocalIdentity::generate();
     config::private_dir(dir)?;
-    create_private(
-        &dir.join("identity.json"),
-        &serde_json::to_vec_pretty(&identity)?,
-    )?;
+    let identity_bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&identity)?);
+    create_private(&dir.join("identity.json"), &identity_bytes)?;
     create_private(
         &dir.join("config.json"),
         &serde_json::to_vec_pretty(&configuration)?,
@@ -764,6 +796,7 @@ mod tests {
             device_id: "device-fixture".into(),
             version: running.into(),
             web_enabled: true,
+            http_enabled: true,
             write_state: None,
             peers: vec![],
             mesh: None,

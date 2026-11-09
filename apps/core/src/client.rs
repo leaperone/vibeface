@@ -23,7 +23,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
     path::Path,
@@ -31,9 +31,9 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_secure::{
     Channel,
@@ -648,6 +648,7 @@ async fn serve_session(
                                 Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
                             };
                             send_value(&mut socket, &mut channel, &response).await?;
+                            received = Instant::now();
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
                     Message::Ping(_) | Message::Pong(_) => {},
@@ -1088,7 +1089,7 @@ async fn dispatch(
                     .await
             }
         }
-        // A manager revokes any device; any client may revoke itself, which the history checks.
+        // A manager revokes any device; any client may revoke itself.
         "revoke" => {
             let view = node.membership_state().await?.project()?;
             view.client(&session.device_id)?;
@@ -1099,6 +1100,7 @@ async fn dispatch(
                     && matches!(event.action, GovernanceAction::Revoke(_)),
                 "invalid revoke signer or action"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(
@@ -1125,6 +1127,7 @@ async fn dispatch(
                     .is_ok_and(|current| current.kind == member.kind),
                 "device is not a member of this personal network"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(
@@ -1273,9 +1276,8 @@ async fn dispatch(
     }
 }
 
-/// The history a recovery file carries, on top of `state`'s genesis. Anyone may send it, so of
-/// its events only the vetoes of its own checkpoints count: they let a recovery key sign again.
-/// Any other event, and with it any way to sign into an older epoch, is dropped.
+/// A recovery file carries its checkpoint vetoes and their complete signed dependencies.
+/// Dependencies establish history, and receive the same authorization projection as any sync.
 fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
     let checkpoints: Vec<RootCheckpoint> = optional(params, "checkpoints")?;
     let hashes = checkpoints
@@ -1283,15 +1285,35 @@ fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
         .map(RootCheckpoint::hash)
         .collect::<Result<Vec<_>>>()?;
     let events: Vec<GovernanceEvent> = optional(params, "events")?;
+    let mut available = BTreeMap::new();
+    for event in state.events.iter().chain(&events) {
+        available.insert(event.hash()?, event);
+    }
+    let mut pending = events.iter().filter(|event| {
+        matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
+    }).map(GovernanceEvent::hash).collect::<Result<Vec<_>>>()?;
+    let mut selected = BTreeSet::new();
+    while let Some(hash) = pending.pop() {
+        if !selected.insert(hash.clone()) {
+            continue;
+        }
+        let event = available
+            .get(&hash)
+            .context("missing carried governance dependency")?;
+        pending.extend(event.parents.iter().cloned());
+    }
+    let mut events: Vec<_> = selected
+        .into_iter()
+        .map(|hash| {
+            let event = available[&hash];
+            ((event.epoch, hash), event.clone())
+        })
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(NetworkState {
         genesis: state.genesis.clone(),
         checkpoints,
-        events: events
-            .into_iter()
-            .filter(|event| {
-                matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
-            })
-            .collect(),
+        events: events.into_iter().map(|(_, event)| event).collect(),
     })
 }
 
@@ -2261,6 +2283,154 @@ mod tests {
     /// A ticket entry known only by device ID, found on the mesh or through relays.
     fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
         vibeface_secure::link::NodeLink::new(device_id, vec![], None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn slow_dispatch_resets_idle_but_idle_and_partial_messages_still_expire() -> Result<()> {
+        use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::Role};
+
+        async fn connect(
+            node: Arc<Runtime>,
+            admin: &LocalIdentity,
+        ) -> Result<(Client, tokio::task::JoinHandle<Result<()>>)> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let (client, accepted) = tokio::join!(
+                tokio::net::TcpStream::connect(listener.local_addr()?),
+                listener.accept()
+            );
+            // Real clients get this from `connect_async`; with Nagle on, Linux holds a small
+            // request behind the client's unacknowledged pong for up to 40ms.
+            let client = client?;
+            client.set_nodelay(true)?;
+            let client =
+                WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client), Role::Client, None)
+                    .await;
+            let server = WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(accepted?.0),
+                Role::Server,
+                None,
+            )
+            .await;
+            let target = node.identity.device_id()?;
+            let serving = tokio::spawn(serve_session(
+                node,
+                ClientSocket::Client(Box::new(server)),
+                None,
+            ));
+            Ok((
+                Client::from_socket(ClientSocket::Client(Box::new(client)), admin, &target).await?,
+                serving,
+            ))
+        }
+
+        /// Sends a ping and then `frames` in one flush and waits for the pong. The server
+        /// writes the pong inside the read that hands it the next buffered frame, so once the
+        /// pong is back it has read every frame in order, even one whose dispatch then blocks.
+        /// Returns whether a heartbeat ping arrived first: tungstenite answers that with a pong
+        /// of its own, which is then still on the wire.
+        async fn ping(client: &mut Client, frames: &[Vec<u8>]) -> Result<bool> {
+            let ClientSocket::Client(socket) = &mut client.socket else {
+                unreachable!()
+            };
+            socket.feed(NativeMessage::Ping(Vec::new().into())).await?;
+            for frame in frames {
+                socket
+                    .feed(NativeMessage::Binary(frame.clone().into()))
+                    .await?;
+            }
+            socket.flush().await?;
+            let mut heartbeat = false;
+            loop {
+                match client
+                    .socket
+                    .next()
+                    .await
+                    .context("client disconnected")??
+                {
+                    Message::Pong(_) => return Ok(heartbeat),
+                    Message::Ping(_) => heartbeat = true,
+                    other => bail!("unexpected {other:?} before the pong"),
+                }
+            }
+        }
+
+        /// Jumps the clock while nothing is on the wire and lets the heartbeat run, then returns
+        /// to real time: a paused runtime that waits on a socket auto-advances to the next timer.
+        async fn jump(duration: Duration) {
+            tokio::time::pause();
+            tokio::time::advance(duration).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::resume();
+        }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("client-idle-{}", uuid::Uuid::new_v4()));
+        crate::control::prepare_start(&dir)?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let admin = LocalIdentity::generate();
+        node.install_membership(NetworkState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?)
+        .await?;
+        let result = async {
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let save = node.config_save.lock().await;
+            let slow = client.channel.seal_message(&serde_json::to_vec(&Request {
+                id: "slow".into(),
+                method: "configure_node".into(),
+                params: json!({"roots":[],"manager":null}),
+            })?)?;
+            ping(&mut client, &slow).await?;
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            drop(save);
+            let reply: Value = serde_json::from_slice(
+                &receive_value(&mut client.socket, &mut client.channel).await?,
+            )?;
+            assert_eq!(reply["id"], "slow");
+            assert!(reply["error"].is_null(), "{reply}");
+            jump(HEARTBEAT).await;
+            assert!(
+                !serving.is_finished(),
+                "a completed slow dispatch starts a fresh idle interval"
+            );
+            client.call("authenticate", json!({})).await?;
+            // Nothing of the client's may still be on the wire when the clock jumps.
+            while ping(&mut client, &[]).await? {}
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            assert!(
+                serving
+                    .await?
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client channel idle")
+            );
+
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let records = client.channel.seal_message(&vec![b'x'; 70_000])?;
+            assert!(records.len() > 1);
+            send_frame(&mut client.socket, records[0].clone()).await?;
+            ping(&mut client, &[]).await?;
+            for _ in 0..4 {
+                jump(HEARTBEAT).await;
+                ping(&mut client, &[]).await?;
+            }
+            jump(HEARTBEAT * 2).await;
+            let error = serving.await?.unwrap_err().to_string();
+            assert!(error.contains("fragmented message timed out"), "{error}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[test]
@@ -3304,7 +3474,6 @@ mod tests {
                 .is_err(),
             "only the owner changes providers"
         );
-        assert!(!dir.join(crate::providers::ENV_FILE).exists());
 
         let mut owner = session(&admin)?;
         let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
@@ -3319,11 +3488,9 @@ mod tests {
             let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
             assert!(futures_util::poll!(queued.as_mut()).is_pending());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
             drop(queued);
             drop(active);
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
             assert_eq!(
                 serde_json::to_value(node.settings_snapshot())?,
                 before_settings
@@ -3350,7 +3517,7 @@ mod tests {
             Config::load(&dir)?.bins.get(&Provider::Codex),
             Some(&std::path::PathBuf::from("/fixture/codex"))
         );
-        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
+        assert!(Config::load(&dir)?.provider_env == node.providers().env);
         let cursor = dispatch(
             &node,
             &mut owner,
@@ -3359,9 +3526,8 @@ mod tests {
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
-        let private_env = std::fs::read(dir.join(crate::providers::ENV_FILE))?;
-        let private_env_modified =
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?;
+        let private_env = std::fs::read(dir.join("config.json"))?;
+        let private_env_modified = std::fs::metadata(dir.join("config.json"))?.modified()?;
         let repeated = dispatch(
             &node,
             &mut owner,
@@ -3370,9 +3536,9 @@ mod tests {
         )
         .await?;
         assert_eq!(repeated["providers"][1]["roles"], json!([]));
-        assert!(std::fs::read(dir.join(crate::providers::ENV_FILE))? == private_env);
+        assert!(std::fs::read(dir.join("config.json"))? == private_env);
         assert_eq!(
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?,
+            std::fs::metadata(dir.join("config.json"))?.modified()?,
             private_env_modified
         );
         for reply in [&saved, &cursor, &read] {
@@ -3483,7 +3649,7 @@ mod tests {
                 }
                 continue;
             }
-            if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
+            if path.file_name() == Some(std::ffi::OsStr::new("config.json")) {
                 continue;
             }
             let bytes = std::fs::read(&path).with_context(|| {
@@ -3505,8 +3671,8 @@ mod tests {
         }
         assert!(checked >= 3 && logs.join("node.log").is_file());
         vibeface_bridge::platform::privatefs::ensure_private(
-            &dir.join(crate::providers::ENV_FILE),
-            "the saved provider environment",
+            &dir.join("config.json"),
+            "the saved private configuration",
         )?;
         let node = Arc::new(
             Runtime::reopen(&dir)

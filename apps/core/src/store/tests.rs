@@ -54,6 +54,52 @@ fn first_release_schema_reopens_and_rejects_old_databases_without_modifying_them
     Ok(())
 }
 
+#[test]
+fn one_personal_network_is_enforced_before_writes_and_on_reads() -> Result<()> {
+    let other = net()?;
+    let net = net()?;
+    let dir = std::env::temp_dir().join(format!("vibeface-one-network-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("node.sqlite3");
+    let mut store = Store::open(&path)?;
+    store.install_trust_bundle(&net.network, &net.state)?;
+    let before: Vec<(String, String)> = store
+        .connection
+        .prepare("SELECT key,value FROM identity_meta ORDER BY key")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(!store.install_trust_bundle(&net.network, &net.state)?);
+    assert!(
+        store
+            .install_trust_bundle(&other.network, &other.state)
+            .is_err()
+    );
+    assert_eq!(store.network()?, Some(net.network.clone()));
+    assert_eq!(store.public_state()?, net.state);
+    let after: Vec<(String, String)> = store
+        .connection
+        .prepare("SELECT key,value FROM identity_meta ORDER BY key")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(after, before, "a foreign bundle has no local side effects");
+    store.connection.execute(
+        "INSERT INTO networks(network_id,bundle) VALUES(?,?)",
+        params![other.network, serde_json::to_string(&other.state)?],
+    )?;
+    assert!(store.network().is_err());
+    assert!(store.public_state().is_err());
+    assert!(store.has_network().is_err());
+    assert!(
+        store
+            .install_trust_bundle(&net.network, &net.state)
+            .is_err()
+    );
+    drop(store);
+    assert!(Store::open(&path).is_err());
+    assert!(Store::open_readonly(&path).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn accept_work_fixture(
         &mut self,
@@ -442,6 +488,122 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         target.ingest_events(&net.network, &[tampered])?.statuses[0],
         IngestStatus::Rejected(_)
     ));
+
+    let dir = std::env::temp_dir().join(format!("vibeface-pending-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("node.sqlite3");
+    let mut waiting = Store::open(&path)?;
+    waiting.install_trust_bundle(&net.network, &net.state)?;
+    let child = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![first.hash.clone()],
+        scope_id: "child".into(),
+        created_at_ms: 2,
+        body: EventBody::ConversationCreated {
+            title: "waiting".into(),
+        },
+        blobs: vec![],
+    })?;
+    assert_eq!(
+        waiting
+            .ingest_events(&net.network, std::slice::from_ref(&child))?
+            .statuses,
+        [IngestStatus::Pending]
+    );
+    let mut forged_parent = first.clone();
+    forged_parent.signature = "00".repeat(64);
+    assert!(matches!(
+        waiting
+            .ingest_events(&net.network, &[forged_parent])?
+            .statuses[0],
+        IngestStatus::Rejected(_)
+    ));
+    drop(waiting);
+    let mut waiting = Store::open(&path)?;
+    let placed = waiting.ingest_events(&net.network, std::slice::from_ref(&first))?;
+    assert_eq!(placed.statuses, [IngestStatus::Accepted]);
+    assert_eq!(
+        placed
+            .stored
+            .iter()
+            .map(|event| event.hash.as_str())
+            .collect::<Vec<_>>(),
+        [first.hash.as_str(), child.hash.as_str()]
+    );
+    assert!(waiting.work_records()?.is_empty());
+    assert!(waiting.scheduler_jobs("child")?.is_empty());
+    drop(waiting);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn pending_capacity_is_reserved_for_verified_authorized_authors() -> Result<()> {
+    let mut net = net()?;
+    let mut nodes = vec![net.a.device_id()?, net.b.device_id()?];
+    for _ in nodes.len()..crate::identity::MAX_MEMBERS - 1 {
+        nodes.push(LocalIdentity::generate().device_id()?);
+    }
+    let share = log::MAX_PENDING_EVENTS / nodes.len() as i64;
+    net.state = net.a.sign_network_fixture(1, nodes)?;
+    let mut store = store(&net)?;
+    let missing = crate::crypto::digest(b"not yet received");
+    let pending = |author: &LocalIdentity, at: i64| -> Result<SignedEvent> {
+        author.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: net.network.clone(),
+            author: author.device_id()?,
+            seq: 1,
+            prev: None,
+            deps: vec![missing.clone()],
+            scope_id: format!("waiting-{at}"),
+            created_at_ms: at,
+            body: EventBody::ConversationCreated {
+                title: "waiting".into(),
+            },
+            blobs: vec![],
+        })
+    };
+    for index in 0..share {
+        assert_eq!(
+            store
+                .ingest_events(&net.network, &[pending(&net.a, index)?])?
+                .statuses,
+            [IngestStatus::Pending]
+        );
+    }
+    assert!(matches!(
+        store
+            .ingest_events(&net.network, &[pending(&net.a, share)?])?
+            .statuses[0],
+        IngestStatus::Rejected(_)
+    ));
+    let outsider = LocalIdentity::generate();
+    assert!(
+        matches!(store.ingest_events(&net.network, &[pending(&outsider, share + 1)?])?.statuses[0], IngestStatus::Rejected(ref why) if why.contains("unknown author"))
+    );
+    let mut forged = pending(&net.b, share + 2)?;
+    forged.signature = "00".repeat(64);
+    assert!(matches!(
+        store.ingest_events(&net.network, &[forged])?.statuses[0],
+        IngestStatus::Rejected(_)
+    ));
+    assert_eq!(
+        store
+            .ingest_events(&net.network, &[pending(&net.b, share + 3)?])?
+            .statuses,
+        [IngestStatus::Pending]
+    );
+    let counts: (i64, i64, i64) = store.connection.query_row(
+        "SELECT count(*),count(*) FILTER (WHERE author=?1),count(*) FILTER (WHERE author=?2) FROM pending_events",
+        params![net.a.device_id()?, net.b.device_id()?],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(counts, (share + 1, share, 1));
+    assert!(counts.0 <= log::MAX_PENDING_EVENTS);
     Ok(())
 }
 
@@ -1599,7 +1761,12 @@ fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
 
 #[test]
 fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<()> {
-    let net = net()?;
+    let mut net = net()?;
+    let third = LocalIdentity::generate();
+    net.state = net.a.sign_network_fixture(
+        1,
+        vec![net.a.device_id()?, net.b.device_id()?, third.device_id()?],
+    )?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
     store.accept_message(
@@ -1649,6 +1816,25 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
     };
     let remote = spec("remote", &net.b)?;
     store.accept_work_fixture(&net.b, &net.network, remote.clone(), 3)?;
+    let refused = store
+        .append_event(
+            &third,
+            &net.network,
+            "c",
+            EventBody::WorkFinished {
+                work_id: remote.work_id.clone(),
+                outcome: WorkOutcome::Unverified,
+                result_text: "not this member's report".into(),
+                failure_reason: None,
+                failure: None,
+                attestation: None,
+            },
+            vec![],
+            4,
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains("scheduling Node"), "{refused}");
+    assert_eq!(outcome(&store, &remote.work_id)?, None);
     let unknown = store.unverify_removed_works(&net.a, &net.network, &[net.b.device_id()?], 4)?;
     assert_eq!(unknown, vec![("c".to_owned(), remote.work_id.clone())]);
     let work = store
@@ -1842,6 +2028,19 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         outcome(&store, &running.work_id)?,
         Some(WorkOutcome::Interrupted),
         "the user's settlement stands"
+    );
+    let target_report = spec("target-unverified", &net.b)?;
+    store.accept_work_fixture(&net.b, &net.network, target_report.clone(), 16)?;
+    store.apply_work_signal(
+        &net.b,
+        &net.network,
+        &target_report.work_id,
+        concluded(WorkOutcome::Unverified),
+        17,
+    )?;
+    assert_eq!(
+        outcome(&store, &target_report.work_id)?,
+        Some(WorkOutcome::Unverified)
     );
     Ok(())
 }
@@ -2242,6 +2441,33 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
     conversation(&mut a_side, &net)?;
     let mut b_side = store(&net)?;
     sync(&a_side, &mut b_side, &net)?;
+    for work_id in ["unknown-back", "unknown-late"] {
+        b_side.append_event(
+            &net.b,
+            &net.network,
+            "c",
+            EventBody::WorkDispatched {
+                work_id: work_id.into(),
+                trigger: "message:request".into(),
+                dispatcher: net.a.device_id()?,
+                call_ref: work_id.into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: ResolvedModel {
+                    provider: Provider::Codex,
+                    model: None,
+                },
+                cwd: "/tmp".into(),
+                title: "unknown result".into(),
+                prompt: "work".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            },
+            vec![],
+            1,
+        )?;
+    }
     b_side.append_event(
         &net.b,
         &net.network,
@@ -2264,6 +2490,22 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
         &net.network,
         "c",
         checkpoint_body("back"),
+        vec![],
+        4,
+    )?;
+    let unknown = |work_id: &str| EventBody::WorkFinished {
+        work_id: work_id.into(),
+        outcome: WorkOutcome::Unverified,
+        result_text: "the target's result is unknown".into(),
+        failure_reason: None,
+        failure: None,
+        attestation: None,
+    };
+    a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        unknown("unknown-back"),
         vec![],
         4,
     )?;
@@ -2294,6 +2536,14 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
         vec![],
         6,
     )?;
+    let late_unknown = a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        unknown("unknown-late"),
+        vec![],
+        6,
+    )?;
     replica.ingest_events(&net.network, std::slice::from_ref(&moved))?;
     assert_eq!(
         replica
@@ -2301,6 +2551,31 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
             .statuses,
         [IngestStatus::Accepted]
     );
+    assert_eq!(
+        replica
+            .ingest_events(&net.network, std::slice::from_ref(&late_unknown))?
+            .statuses,
+        [IngestStatus::Accepted]
+    );
+    let a_log = a_log(&a_side)?;
+    let b_log = b_side.events_from(&net.network, &net.b.device_id()?, 1, 500)?;
+    for order in [[&a_log, &b_log], [&b_log, &a_log]] {
+        let mut reordered = store(&net)?;
+        for log in order {
+            reordered.ingest_events(&net.network, log)?;
+        }
+        for work in ["unknown-back", "unknown-late"] {
+            assert_eq!(
+                reordered
+                    .works(&net.network, "c")?
+                    .into_iter()
+                    .find(|row| row.work_id == work)
+                    .context("unknown result")?
+                    .outcome,
+                Some(WorkOutcome::Unverified)
+            );
+        }
+    }
 
     sync(&b_side, &mut a_side, &net)?;
     let refused = a_side
@@ -2314,12 +2589,24 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
         )
         .unwrap_err();
     assert!(refused.to_string().contains("scheduling Node"), "{refused}");
+    assert!(
+        a_side
+            .append_event(
+                &net.a,
+                &net.network,
+                "c",
+                unknown("unknown-stale"),
+                vec![],
+                7
+            )
+            .is_err()
+    );
     let forged = net.a.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
         author: net.a.device_id()?,
-        seq: seq_of(&late)? + 1,
-        prev: Some(late.hash.clone()),
+        seq: seq_of(&late_unknown)? + 1,
+        prev: Some(late_unknown.hash.clone()),
         deps: vec![moved.hash.clone()],
         scope_id: "c".into(),
         created_at_ms: 7,
@@ -2331,6 +2618,154 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
         IngestStatus::Rejected(error) if error.contains("scheduling Node")
     ));
     assert_eq!(checkpoints(&replica, &net)?, ["back", "late"]);
+    Ok(())
+}
+
+#[test]
+fn internal_authorization_errors_roll_back_the_whole_ingested_batch() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    let mut replica = store(&net)?;
+    sync(&origin, &mut replica, &net)?;
+    let before = replica.heads(&net.network)?;
+    replica.connection.execute(
+        "UPDATE events SET envelope='{' WHERE kind='conversation_owner'",
+        [],
+    )?;
+    let created = origin.append_event(
+        &net.b,
+        &net.network,
+        "other",
+        EventBody::ConversationCreated {
+            title: "must roll back".into(),
+        },
+        vec![],
+        2,
+    )?;
+    let checkpoint = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        checkpoint_body("must roll back"),
+        vec![],
+        3,
+    )?;
+    assert!(
+        replica
+            .ingest_events(&net.network, &[created, checkpoint])
+            .is_err()
+    );
+    assert_eq!(replica.heads(&net.network)?, before);
+    assert!(replica.conversation(&net.network, "other")?.is_none());
+    Ok(())
+}
+
+#[test]
+fn narrowed_attesters_disable_stored_signatures_and_their_causes_without_erasing_history()
+-> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let request = store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "request", "go"),
+        vec![],
+        2,
+    )?;
+    let deleted = store.append_event(
+        &net.b,
+        &net.network,
+        "other-bot",
+        EventBody::BotDeleted {
+            attestation: None,
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "request".into(),
+            }),
+        },
+        vec![],
+        3,
+    )?;
+    let parent = net.a.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.a.device_id()?,
+        seq: seq_of(&request)? + 1,
+        prev: Some(request.hash.clone()),
+        deps: vec![],
+        scope_id: "other".into(),
+        created_at_ms: 4,
+        body: EventBody::ConversationCreated {
+            title: "dependency".into(),
+        },
+        blobs: vec![],
+    })?;
+    let waiting = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: seq_of(&deleted)? + 1,
+        prev: Some(deleted.hash.clone()),
+        deps: vec![parent.hash.clone()],
+        scope_id: "c".into(),
+        created_at_ms: 5,
+        body: user(&net, "waiting", "wait"),
+        blobs: vec![],
+    })?;
+    assert_eq!(
+        store
+            .ingest_events(&net.network, std::slice::from_ref(&waiting))?
+            .statuses,
+        [IngestStatus::Pending]
+    );
+    let original = net.state.project()?;
+    let mut narrowed = original.clone();
+    let client = net.a.fixture_admin().device_id()?;
+    narrowed.attesters.retain(|id| id != &client);
+    let rejected = net.b.sign_event(Event {
+        body: user(&net, "new", "not authorized"),
+        ..serde_json::from_str::<Event>(&waiting.canonical_body)?
+    })?;
+    assert!(matches!(
+        log::ingest_from(
+            &store.connection,
+            &narrowed,
+            &rejected,
+            6,
+            &mut log::Placed::default()
+        )?,
+        IngestStatus::Rejected(_)
+    ));
+    assert!(log::recompute(&store.connection, &narrowed)?);
+    assert!(store.messages(&net.network, "c")?.is_empty());
+    let deleted_count: i64 =
+        store
+            .connection
+            .query_row("SELECT count(*) FROM bot_deletions", [], |row| row.get(0))?;
+    assert_eq!(deleted_count, 0);
+    let mut placed = log::Placed::default();
+    assert_eq!(
+        log::ingest_from(&store.connection, &narrowed, &parent, 7, &mut placed)?,
+        IngestStatus::Accepted
+    );
+    for envelope in [&request, &deleted, &waiting] {
+        let stored: (bool, String) = store.connection.query_row(
+            "SELECT effective,envelope FROM events WHERE network_id=? AND hash=?",
+            params![net.network, envelope.hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(!stored.0);
+        assert_eq!(stored.1, serde_json::to_string(envelope)?);
+    }
+    assert!(store.work_records()?.is_empty());
+    assert!(store.scheduler_jobs("c")?.is_empty());
+    assert!(log::recompute(&store.connection, &original)?);
+    assert_eq!(store.messages(&net.network, "c")?.len(), 2);
+    assert!(store.work_records()?.is_empty());
+    assert!(store.scheduler_jobs("c")?.is_empty());
     Ok(())
 }
 
@@ -6466,6 +6901,17 @@ fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<(
             },
         )?;
         origin.append_event(&net.a, &net.network, "c", input, vec![], 5)?;
+        let mut unscoped = question(
+            &origin,
+            &net,
+            "c",
+            "q-native-unscoped",
+            "exact-native-thread",
+        )?;
+        if let EventBody::QuestionAsked { target, about, .. } = &mut unscoped {
+            *target = None;
+            origin.claim_session(&net.a, &net.network, "c", about, 5)?;
+        }
         super::scheduler::admit_from(
             &origin.connection,
             &net.network,
@@ -6607,6 +7053,34 @@ fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<(
                 assert!(in_scope.is_err(), "{case}: invalid bindings stay rejected");
             }
         }
+        origin.ask(&net.a, &net.network, "c", unscoped, 8)?;
+        let mut replica = store(&net)?;
+        all_accepted(&mut replica, &net, &origin)?;
+        for node in [&mut origin, &mut replica] {
+            assert!(
+                node.question(&net.network, "q-native-unscoped")?
+                    .context("unscoped native question")?["target"]
+                    .is_null(),
+                "{case}: shared native Work bindings cannot become Main through attribution"
+            );
+            assert!(
+                node.accept_answer(
+                    &net.a,
+                    &net.network,
+                    "q-native-unscoped",
+                    "continue",
+                    Some(answer_signature(
+                        &net,
+                        "c",
+                        "q-native-unscoped",
+                        "continue"
+                    )?),
+                    9,
+                )
+                .is_err(),
+                "{case}: an unknown native target stays rejected on every device"
+            );
+        }
     }
     Ok(())
 }
@@ -6717,6 +7191,254 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
                 .count(),
             1
         );
+    }
+    let rejected = origin
+        .accept_answer(
+            &net.a,
+            &net.network,
+            "q-unknown-scope",
+            "continue",
+            Some(answer_signature(&net, "c", "q-unknown-scope", "continue")?),
+            8,
+        )
+        .err()
+        .context("an unowned session cannot borrow Main")?;
+    assert!(rejected.to_string().contains("trigger target is unknown"));
+    assert!(
+        origin
+            .message(&net.network, "c", "a-q-unknown-scope")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn colliding_question_events_keep_their_own_scope_in_history_and_notifications() -> Result<()> {
+    use crate::workspace::InputTarget;
+    for target in [
+        Some(InputTarget::Task {
+            task_id: "private-task".into(),
+        }),
+        Some(InputTarget::Work {
+            work_id: "private-work".into(),
+        }),
+        None,
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        isolated_task(&mut origin, &net, "private-work")?;
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "task",
+            workspace_task_command("private-task", None),
+            5,
+        )?;
+        let main = question(&origin, &net, "c", "q-collision", "public-thread")?;
+        origin.append_event(&net.a, &net.network, "c", main, vec![], 6)?;
+        let mut private = question(&origin, &net, "c", "q-collision", "private-thread")?;
+        if let EventBody::QuestionAsked {
+            target: destination,
+            text,
+            ..
+        } = &mut private
+        {
+            *destination = target.clone();
+            *text = "private question must stay outside Main".into();
+        }
+        origin.append_event(&net.a, &net.network, "c", private, vec![], 7)?;
+        origin.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            "after-collision",
+            "public input",
+            vec![],
+            true,
+            signature(&net, "after-collision", "public input")?,
+            8,
+        )?;
+        let job = origin
+            .scheduler_job("c", "message:after-collision")?
+            .context("Main job")?;
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        for node in [&origin, &replica] {
+            let events = node.context(&net.network, "c", None)?.events;
+            let questions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.event.body,
+                        EventBody::QuestionAsked { question_id, .. } if question_id == "q-collision"
+                    )
+                })
+                .collect();
+            assert_eq!(questions.len(), 2, "both signed events remain effective");
+            assert!(node.main_event_allowed(&net.network, "c", questions[0])?);
+            assert!(
+                !node.main_event_allowed(&net.network, "c", questions[1])?,
+                "{target:?}: a losing event cannot borrow the winner's Main target"
+            );
+            assert_eq!(
+                node.question(&net.network, "q-collision")?
+                    .context("winning card")?["text"],
+                "要继续吗？"
+            );
+            let history = node.turn_history(&net.network, "c", &job, None)?;
+            assert!(!history.recent.events.iter().any(|event| matches!(
+                &event.event.body,
+                EventBody::QuestionAsked { text, .. } if text == "private question must stay outside Main"
+            )), "{target:?}: Main never sees the losing event's private text");
+            let notes = node.pending_notifications(&net.network, "web")?;
+            let private = notes
+                .iter()
+                .find(|note| note.text == "private question must stay outside Main")
+                .context("private question notification")?;
+            assert_eq!(
+                private.target, target,
+                "a notification's target must describe its own text"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn targetless_questions_require_current_matching_session_attributions() -> Result<()> {
+    for case in [
+        "attributed",
+        "node",
+        "provider",
+        "session",
+        "conversation",
+        "muted",
+        "deleted",
+        "handed-over",
+        "late-attribution",
+        "other-node-work",
+        "other-provider-work",
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        second_bot(&mut origin, &net, "Other")?;
+        let mut card = question(&origin, &net, "c", "q-attributed", "external-thread")?;
+        let EventBody::QuestionAsked { target, about, .. } = &mut card else {
+            unreachable!()
+        };
+        *target = None;
+        let mut attribution = about.clone();
+        match case {
+            "node" => attribution.node = net.b.device_id()?,
+            "provider" => attribution.agent = Some(Provider::Claude),
+            "session" => attribution.session_id = "another-session".into(),
+            _ => {}
+        }
+        if case != "late-attribution" {
+            origin.claim_session(
+                if case == "node" { &net.b } else { &net.a },
+                &net.network,
+                if case == "conversation" { "d" } else { "c" },
+                &attribution,
+                4,
+            )?;
+        }
+        if matches!(case, "other-node-work" | "other-provider-work") {
+            let identity = if case == "other-node-work" {
+                &net.b
+            } else {
+                &net.a
+            };
+            let provider = if case == "other-provider-work" {
+                Provider::Claude
+            } else {
+                Provider::Codex
+            };
+            origin.accept_work_fixture(
+                identity,
+                &net.network,
+                WorkSpec {
+                    work_id: "unrelated-native-work".into(),
+                    conversation: "d".into(),
+                    trigger: "message:unrelated".into(),
+                    target: identity.device_id()?,
+                    dispatcher: identity.device_id()?,
+                    call_ref: "unrelated".into(),
+                    kind: WorkKind::Agent(provider),
+                    model: None,
+                    resolved: ResolvedModel {
+                        provider,
+                        model: None,
+                    },
+                    cwd: "/w".into(),
+                    title: "unrelated".into(),
+                    prompt: "unrelated".into(),
+                    continues: None,
+                    parent: None,
+                    thread: Some("external-thread".into()),
+                },
+                5,
+            )?;
+        }
+        origin.ask(&net.a, &net.network, "c", card, 6)?;
+        match case {
+            "muted" | "handed-over" => {
+                let version = session_version(&origin, &net, "external-thread")?;
+                origin.hand_over_session(
+                    &net.a,
+                    &net.network,
+                    "c",
+                    "external-thread",
+                    &version,
+                    (case == "handed-over").then_some("d"),
+                    7,
+                )?;
+            }
+            "deleted" => {
+                let deleted = net.a.fixture_admin().attest(
+                    &net.network,
+                    "c",
+                    EventBody::BotDeleted {
+                        cause: None,
+                        attestation: None,
+                    },
+                )?;
+                origin.append_event(&net.a, &net.network, "c", deleted, vec![], 7)?;
+            }
+            "late-attribution" => {
+                origin.claim_session(&net.a, &net.network, "c", &attribution, 7)?;
+            }
+            _ => {}
+        }
+        let expected = matches!(
+            case,
+            "attributed" | "other-node-work" | "other-provider-work"
+        )
+        .then(|| crate::workspace::InputTarget::BotMain {
+            bot_id: "bot".into(),
+        });
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        for node in [&mut origin, &mut replica] {
+            assert_eq!(
+                node.question(&net.network, "q-attributed")?
+                    .context("attributed question")?["target"],
+                json!(expected),
+                "{case}: only this question's current signed attribution proves Main"
+            );
+            let answered = node.accept_answer(
+                &net.a,
+                &net.network,
+                "q-attributed",
+                "continue",
+                Some(answer_signature(&net, "c", "q-attributed", "continue")?),
+                8,
+            );
+            assert_eq!(answered.is_ok(), expected.is_some(), "{case}");
+            if expected.is_none() {
+                assert!(node.message(&net.network, "c", "a-q-attributed")?.is_none());
+            }
+        }
     }
     Ok(())
 }
@@ -7073,13 +7795,12 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
         let mut store = Store::open(&path)?;
         store.install_trust_bundle(&net.network, &net.state)?;
         question_conversation(&mut store, &net)?;
-        store.ask(
-            &net.a,
-            &net.network,
-            "c",
-            question(&store, &net, "c", "q-1", "t1")?,
-            2,
-        )?;
+        let mut card = question(&store, &net, "c", "q-1", "t1")?;
+        if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+            *target = None;
+            store.claim_session(&net.a, &net.network, "c", about, 2)?;
+        }
+        store.ask(&net.a, &net.network, "c", card, 2)?;
         let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
         let first = store.accept_answer(&net.a, &net.network, "q-1", "允许", signed.clone(), 3)?;
         assert!(!first.already_answered && first.receipt.is_some());
@@ -7087,6 +7808,62 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
         assert!(!retry.already_answered && retry.message == first.message);
         let webhook = store.accept_answer(&net.a, &net.network, "q-1", "拒绝", None, 5)?;
         assert!(webhook.already_answered && webhook.message.text == "允许");
+        let trigger = message_trigger(&questions::answer_id("q-1"));
+        store.accept_work_fixture(
+            &net.a,
+            &net.network,
+            WorkSpec {
+                work_id: "answered-external-session".into(),
+                conversation: "c".into(),
+                trigger: trigger.clone(),
+                target: net.a.device_id()?,
+                dispatcher: net.a.device_id()?,
+                call_ref: "answer".into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: ResolvedModel {
+                    provider: Provider::Codex,
+                    model: None,
+                },
+                cwd: "/w".into(),
+                title: "answer".into(),
+                prompt: "continue".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t1".into()),
+            },
+            6,
+        )?;
+        let job = store.scheduler_job("c", &trigger)?.context("answer job")?;
+        assert_eq!(job.scope, SessionScope::Main);
+        let history = store.turn_history(&net.network, "c", &job, None)?;
+        assert!(
+            history.recent.events.iter().any(|event| matches!(
+                &event.event.body,
+                EventBody::QuestionAsked { question_id, text, target: None, .. }
+                    if question_id == "q-1" && text == "要继续吗？"
+            )),
+            "the original question remains in Main after its answer starts Work"
+        );
+        let expected = crate::workspace::InputTarget::BotMain {
+            bot_id: "bot".into(),
+        };
+        assert_eq!(
+            store
+                .question(&net.network, "q-1")?
+                .context("projected question")?["target"],
+            json!(expected)
+        );
+        assert_eq!(
+            store.trigger_input_target(&net.network, "c", &trigger)?,
+            Some(expected.clone())
+        );
+        assert!(
+            store
+                .pending_notifications(&net.network, "web")?
+                .iter()
+                .any(|note| note.kind == "question" && note.target.as_ref() == Some(&expected))
+        );
         drop(store);
         let mut store = Store::open(&path)?;
         let trigger = message_trigger(&questions::answer_id("q-1"));
@@ -7172,13 +7949,12 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
     let (mut a, mut b) = (store(&net)?, store(&net)?);
     question_conversation(&mut a, &net)?;
-    a.ask(
-        &net.a,
-        &net.network,
-        "c",
-        question(&a, &net, "c", "q-1", "t1")?,
-        2,
-    )?;
+    let mut card = question(&a, &net, "c", "q-1", "t1")?;
+    if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+        *target = None;
+        a.claim_session(&net.a, &net.network, "c", about, 2)?;
+    }
+    a.ask(&net.a, &net.network, "c", card, 2)?;
     sync(&a, &mut b, &net)?;
     assert_eq!(unanswered(&b, &net)?, vec!["q-1".to_owned()]);
     let signed = answer_signature(&net, "c", "q-1", "继续")?;
@@ -10871,6 +11647,276 @@ fn held_tasks_leave_room_for_humans_and_machine_slots_are_real() -> Result<()> {
         )?
         .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn abandoned_claims_requeue_only_without_execution_evidence_and_fence_the_old_attempt() -> Result<()>
+{
+    use crate::scheduling::{SessionScope, TurnExecution, TurnRuntime};
+    use vibeface_bridge::failure::ProviderStage;
+
+    for evidence in [
+        "missing_runtime",
+        "not_started",
+        "unknown",
+        "started",
+        "tool",
+        "process",
+        "native",
+        "pending",
+        "running",
+        "cancelling",
+    ] {
+        for restarted in [false, true] {
+            let net = net()?;
+            let (mut store, _) = bot_with_message(&net)?;
+            say(&mut store, &net, "abandoned", true)?;
+            let claimed = isolated_claim(
+                &mut store,
+                &net,
+                SessionScope::Main,
+                Provider::Codex,
+                crate::config::SchedulingLimits::default(),
+            )?
+            .context("claim")?;
+            let job = claimed.job;
+            let attempt = job.state.attempt().context("attempt")?.clone();
+            if evidence != "missing_runtime" {
+                store.record_turn_runtime(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    &TurnRuntime {
+                        provider: Provider::Codex,
+                        model: None,
+                        reasoning_effort: None,
+                        generation: "fixture".into(),
+                        session_generation: claimed.session_generation,
+                        delivery_id: attempt.id.clone(),
+                        stage: ProviderStage::Validate,
+                        execution: TurnExecution::NotStarted,
+                        attempted_at_ms: 0,
+                        switched_from: None,
+                        switch_reason: None,
+                    },
+                )?;
+            }
+            match evidence {
+                "unknown" | "started" => {
+                    store.update_turn_runtime(
+                        "c",
+                        &job.trigger,
+                        &attempt.id,
+                        ProviderStage::TurnStart,
+                        if evidence == "unknown" {
+                            TurnExecution::Unknown
+                        } else {
+                            TurnExecution::Started
+                        },
+                    )?;
+                }
+                "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
+                "process" => store.record_manager_process(&attempt.id, 123)?,
+                "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
+                "pending" => {
+                    store.connection.execute(
+                    "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
+                    params![attempt.id, job.trigger])?;
+                }
+                "running" => {
+                    store.mark_started("c", &job.trigger, &attempt.id)?;
+                }
+                "cancelling" => {
+                    store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
+                }
+                _ => {}
+            }
+            let unstarted = matches!(evidence, "missing_runtime" | "not_started");
+            if restarted {
+                store.recover_scheduler_jobs(&net.a, &net.network, "next-boot")?;
+            } else {
+                assert_eq!(
+                    store.requeue_abandoned_scheduler_claim(
+                        "c",
+                        &job.trigger,
+                        &attempt.id,
+                        "boot"
+                    )?,
+                    unstarted,
+                    "{evidence}"
+                );
+            }
+            let current = store
+                .scheduler_job("c", &job.trigger)?
+                .context("retained job")?;
+            if unstarted {
+                assert_eq!(current.state, JobState::Queued, "{evidence}");
+                assert!(current.runtime.is_none());
+                assert!(store.pending_checks()?.is_empty());
+                assert!(!store.manager_attempt_allowed(
+                    &net.network,
+                    &net.a.device_id()?,
+                    "c",
+                    &job.trigger,
+                    &attempt.id
+                )?);
+                assert!(!store.requeue_abandoned_scheduler_claim(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    "boot"
+                )?);
+                store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
+                store.scheduler_maintenance_idle()?;
+            } else if restarted {
+                assert!(
+                    matches!(current.state, JobState::Reconciling { .. }),
+                    "{evidence}"
+                );
+                assert_eq!(store.pending_checks()?.len(), 1, "{evidence}");
+            } else {
+                assert_ne!(current.state, JobState::Queued, "{evidence}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_refunds_only_live_unstarted_reservations_on_their_original_utc_day() -> Result<()> {
+    use crate::scheduling::TurnExecution;
+    use vibeface_bridge::failure::ProviderStage;
+
+    for evidence in [
+        "not_started",
+        "unknown",
+        "started",
+        "tool",
+        "process",
+        "native",
+        "pending",
+        "restarted",
+    ] {
+        let net = net()?;
+        let (mut store, _) = bot_with_message(&net)?;
+        say(&mut store, &net, "budget", true)?;
+        let job = store
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "budget")?
+            .context("claim")?
+            .job;
+        let attempt = job.state.attempt().context("attempt")?;
+        let reservation = store.reserve_scheduler_budget(&net.network, &job, 3, 5, 86_399_999)?;
+        assert!(
+            store
+                .reserve_scheduler_budget(&net.network, &job, 3, 5, 86_399_999)
+                .is_err()
+        );
+        store.connection.execute(
+            "INSERT INTO budget_days(network_id,day,used) VALUES(?,'1970-01-02',4)",
+            [&net.network],
+        )?;
+        match evidence {
+            "unknown" | "started" => {
+                store.update_turn_runtime(
+                    "c",
+                    &job.trigger,
+                    &attempt.id,
+                    ProviderStage::TurnStart,
+                    if evidence == "unknown" {
+                        TurnExecution::Unknown
+                    } else {
+                        TurnExecution::Started
+                    },
+                )?;
+            }
+            "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
+            "process" => store.record_manager_process(&attempt.id, 123)?,
+            "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
+            "pending" => {
+                store.connection.execute(
+                "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
+                params![attempt.id, job.trigger])?;
+            }
+            _ => {}
+        }
+        let refunded = evidence == "not_started";
+        assert_eq!(
+            store.refund_scheduler_budget(
+                reservation,
+                if evidence == "restarted" {
+                    "next-boot"
+                } else {
+                    "boot"
+                }
+            )?,
+            refunded,
+            "{evidence}"
+        );
+        let used = |day: &str| -> Result<u64> {
+            Ok(store.connection.query_row(
+                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
+                params![net.network, day],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(
+            used("1970-01-01")?,
+            if refunded { 0 } else { 3 },
+            "{evidence}"
+        );
+        assert_eq!(
+            used("1970-01-02")?,
+            4,
+            "refund cannot debit the next UTC day"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_budget_reservations_share_an_atomic_daily_limit() -> Result<()> {
+    let net = net()?;
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("scheduler-budget-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&directory)?;
+    let path = directory.join("node.sqlite3");
+    let mut original = Store::open(&path)?;
+    original.install_trust_bundle(&net.network, &net.state)?;
+    conversation(&mut original, &net)?;
+    original.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    say(&mut original, &net, "concurrent-budget", true)?;
+    let job = original
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "budget")?
+        .context("claim")?
+        .job;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let mut connection = Store::open(&path)?;
+        let (network, job, barrier) = (net.network.clone(), job.clone(), barrier.clone());
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            connection
+                .reserve_scheduler_budget(&network, &job, 1, 3, 0)
+                .is_ok()
+        }));
+    }
+    let accepted = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("budget thread"))
+        .filter(|accepted| *accepted)
+        .count();
+    assert_eq!(accepted, 3);
+    let used: u64 = original.connection.query_row(
+        "SELECT used FROM budget_days WHERE network_id=? AND day='1970-01-01'",
+        [&net.network],
+        |row| row.get(0),
+    )?;
+    assert_eq!(used, 3);
+    drop(original);
+    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 

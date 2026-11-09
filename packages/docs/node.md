@@ -60,15 +60,15 @@ bash scripts/build-web.sh
 
 ### 本机自动访问
 
-个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，点击**打开本机访问**，网页重新取得短期入口并导航到独立回环页面，无需配对新的永久成员。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。会话保存在数据目录的 `local-sessions.json`（只存 cookie 摘要），Node 重启后刷新页面即可继续，无需重新兑换；会话失效或本机访问被关闭后，重新打开本机网页并点击该入口。本机会话在网页顶部显示为“本机管理”；网页入口是回环地址时，点其中的**加入**会转到 `http://localhost:<listen 端口>/join` 加入，让浏览器身份留在之后常用的地址上；`serve` 在网页只听回环或全部接口时也只打印这个地址。
+个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，在桌面应用里点击**打开本机访问**，或在终端运行 `vibeface access` 并打开它输出的链接：两者都以数据目录所有者的身份取得短期入口并导航到独立回环页面，无需配对新的永久成员；直接在浏览器输入地址打开的 localhost 页面没有这份所有者凭据，拿不到启动材料。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。会话保存在数据目录的 `local-sessions.json`（只存 cookie 摘要），Node 重启后刷新页面即可继续，无需重新兑换；会话失效或本机访问被关闭后，重新打开本机网页并点击该入口。本机会话在网页顶部显示为“本机管理”；网页入口是回环地址时，点其中的**加入**会转到 `http://localhost:<listen 端口>/join` 加入，让浏览器身份留在之后常用的地址上；`serve` 在网页只听回环或全部接口时也只打印这个地址。
 
-`vibeface access` 保留为备用方式，它输出的链接先打开 `http://localhost:<listen 端口>`。这个浏览器已在该地址加入时直接沿用已加入的身份，不开本机会话；没加入时才转到回环页面开本机会话。两个地址是不同 origin，浏览器存储各自独立。
+`vibeface access` 是桌面应用之外的备用方式，它输出的链接直接打开 `http://127.0.0.1:<local-listen 端口>` 的回环页面并开本机会话。常用的 `http://localhost:<listen 端口>` 是另一个 origin，浏览器存储各自独立，已在那里加入的身份不受影响。
 
 本机会话可使用本机业务、配置本机 Agent 和项目目录，并通过正常授权路由发送任务；不能签署成员授权、登录其他 Node 或替代网络管理客户端。已有签名管理身份继续保留管理权限。
 
 可在网页的设备设置关闭本机自动访问，也可在本机执行 `vibeface access --disable`。`vibeface access --enable` 重新开启并输出本机入口。命令经同一用户才能访问的维护 socket 交给运行中的 Node，立即生效，无需改配置或重启；Node 未运行时只写入配置，启动后生效。初始化时加 `--no-local-auto-access` 可直接关闭。关闭会撤销已有本机会话和待兑换 token；普通配对身份仍可使用。重新开启不恢复旧凭据。
 
-本机会话兑换使用固定回环端口 `local_listen`（默认 `127.0.0.1:4791`），重启后本机 origin 和浏览器存储不变；端口被占用时 `init` 先报错并提示用 `--local-listen` 更换，不写数据目录。固定 localhost 网页只有通过实际 loopback 来源、字面 Host、精确 Origin 且不含转发头的设置请求，才能取得短期启动材料。一般公开请求仅伪造 `Host: localhost` 或代理头不能取得本机访问权。自动访问关闭时仍使用签名成员邀请或恢复包。反向代理应只转发公开 listener。
+本机会话兑换使用固定回环端口 `local_listen`（默认 `127.0.0.1:4791`），重启后本机 origin 和浏览器存储不变；端口被占用时 `init` 先报错并提示用 `--local-listen` 更换，不写数据目录。设置请求须来自实际 loopback、带字面 Host 和精确 Origin、不含转发头，并带数据目录 `local-access.json` 里的所有者凭据，才能取得一次性初始化邀请或短期启动材料；匿名本机网页只得到状态，回环连接本身不证明 OS 账户。一般公开请求仅伪造 `Host: localhost` 或代理头不能取得本机访问权。自动访问关闭时仍使用签名成员邀请或恢复包。反向代理应只转发公开 listener。
 
 ## 配置管理 Agent
 
@@ -137,14 +137,14 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 `vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。Codex 默认写入 `<data-dir>/providers/codex/hooks.json`，Claude 默认写入 `<data-dir>/providers/claude/settings.json`；pi 和 opencode 的扩展仍写入本机用户目录。给 `--home <目录>` 时，这四种产品的文件全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
-| 产品 | 写入 | Bot 能回答 |
+| 产品 | 写入 | 协调 Agent 能回答 |
 |---|---|---|
-| Codex | `<Codex 目录>/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
+| Codex | `<Codex 目录>/hooks.json` | 只上报 `Stop` 和 `PermissionRequest`，不挂起；App Server 上的请求由 Node 挂起，协调 Agent 用 `vibeface respond` 回答，需要本人决定时提问，答案经私有回答控制递交 |
 | Claude Code | `.claude/settings.json` 的 hooks | 权限请求和提问 |
 | pi | `.pi/agent/extensions/vibeface.ts` | 一轮结束后替本人发下一条消息；本人已接着输入时丢弃 |
 | opencode | `.config/opencode/plugins/vibeface.ts` | 权限请求和提问 |
 
-Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端处理。
+hook 挂起的请求由协调 Agent 经 `vibeface requests` 和 `vibeface respond` 处理；30 秒内既没回答也没提问时，请求交回原程序，由本人在终端处理。
 
 ### 转发到外部聊天
 
@@ -305,7 +305,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    }
    ```
 
-   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数和 `/api/decision` 的预算，忽略 `Forwarded` 和 `X-Forwarded-For`。decision 预算是每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429；经反代而没设 `--trusted-proxy` 时，所有 decision 都记在回环这一个来源上。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上初始化 Node 时经它入网，然后启动：
 
@@ -428,7 +428,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `mesh.allow_private` | 采用私网和回环地址上的 relay 与网关，默认关闭 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 
-浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
+浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准；`/api/decision` 的预算（同时 16 个、每分钟 256 个来源、每来源 12 次）按同一地址认定。
 
 `--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名或 IP 生成自签占位证书 `tls-cert.pem` 和私钥 `tls-key.pem`；浏览器直连时把它们换成 CA 签发的证书链和私钥（例如 acme.sh `--install-cert`，见 [`deploy/README.md`](../../deploy/README.md)）。Node 在文件变化后的下一个连接重新加载，不需要重启；证书和私钥不配对或无法解析时继续用上一对，5 秒后再试。
 
@@ -549,7 +549,7 @@ Node 从表里选开放 relay：逐个验证，按延迟和历史成功率取最
 
 普通查询可以直接回答，本机工作使用 SDK 的宿主工具，远端工作通过 Agent 任务消息委派。日常操作不需要创建任务单、打开执行会话或选择调度器。进展、补充输入和结果都回到原机器人的聊天。
 
-会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`）。调度设备离线而当前连接的设备能运行管理 Agent 时，聊天里出现“X 离线了，这个对话在等它”，点**交给这台设备处理**即可换过来，排队的消息在新设备上继续回复。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。旧调度设备看到更换后会停下正在进行的回复，并拒绝它之后的工具调用。每个定时时刻由当时的调度设备在共享记录里领取，本机已有有效领取记录的时刻不再排队；错过太久而跳过的时刻也会领取。新设备不领取早于或等于换负责人记录时间的时刻，并等待 5 分钟接管宽限期，让旧设备同步领取记录。schedule 定义、启停和接管时间使用事件首次在本机落库的 `seen_at_ms`，不受写入方时钟偏差影响。旧设备断网超过宽限期且尚未得知负责人变更时，新旧设备仍可能执行同一时刻。详见 [Schedule](design/agent-capabilities.md#1-schedule)。
+会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`）。调度设备离线而当前连接的设备能运行管理 Agent 时，聊天里出现“X 离线了，这个对话在等它”，点**交给这台设备处理**即可换过来，排队的消息在新设备上继续回复。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。旧调度设备看到更换后会停下正在进行的回复，并拒绝它之后的工具调用。每个定时时刻由当时的调度设备在共享记录里领取，本机已有有效领取记录的时刻不再排队；错过太久而跳过的时刻也会领取。每个定时任务只看最新到期的时刻：同一时刻只领一次；上一次运行还在排队时不领新时刻，错过的中间时刻并入最新到期的那个；晚于 10 分钟的时刻只记领取并跳过；会话队列满 256 项时也不领。上一次运行已经开始则不等待，所以 Parallel 的 Provider 在 `machine_slots` 允许时，同一定时任务的不同时刻可以重叠运行；Serial 的 Provider 仍串行。新设备不领取早于或等于换负责人记录时间的时刻，并等待 5 分钟接管宽限期，让旧设备同步领取记录。schedule 定义、启停和接管时间使用事件首次在本机落库的 `seen_at_ms`，不受写入方时钟偏差影响。旧设备断网超过宽限期且尚未得知负责人变更时，新旧设备仍可能执行同一时刻。详见 [Schedule](design/agent-capabilities.md#1-schedule)。
 
 发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
 
@@ -564,13 +564,13 @@ Codex、Claude Code、pi 和 OpenCode 的活动输入走各自原生补充路径
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
-协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。Node 发送前读取并规范化线程的真实目录，核对它位于本机 `roots` 内。给出 `cwd` 时还须与真实目录一致。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
+协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。Node 发送前读取并规范化线程的真实目录，核对它位于本机 `roots` 内。给出 `cwd` 时还须与真实目录一致。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks`、`/api/triage` 相同：回环来源、无 `Origin`、无转发头，并带数据目录 `local-access.json` 里的所有者 bearer，命令按该文件记录的 origin 发请求；同一 OS 账户的完整 Shell 本就能读这个文件，所以这不是进程沙箱隔离）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
 Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答。本人答案沿独立私有控制队列回到原执行设备，不等待被挂起 Task 的 scheduler 槽位。基础审批只按原请求动作递交，文字题由捕获配置的新协调会话按原题型整理。普通问题仍在原 Task 或 Main 排后续轮，未知结果只查询。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
 Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺少的程序路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议显式 App Server socket、会话扫描目录或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。整个 `providers.codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。spawn 时 Node 托管自己的 `codex app-server`，使用 `<data-dir>/providers/codex` 和私有的 `/tmp/vibeface-<identity>/` socket；不会扫描用户 control socket、sessions 或 hooks。`system` 只连接明确配置的 socket，不启动或结束外部服务。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。连接系统 App Server 时，同时设置 `providers.codex_app_server.mode` 为 `system` 和显式的绝对 `socket`；`init --codex-socket` 会同时保存两者。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
-App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
+App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令。读不到原 turn 的工作标为“待核对”，由本人附证据结清。目标设备在线但已没有原工作记录时也一样：缺少记录不等于没执行，Node 不重新派发，只接受本人签名的一次结清。
 
 普通执行的终态结果自动送回原聊天，协调 Agent 以完整权限汇报，可以继续派发工作。
 

@@ -20,7 +20,7 @@ import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
 
-type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'erasing' | 'erase_failed' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => Promise<void>; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
@@ -114,12 +114,12 @@ const UNSAVED_KEY = 'vibeface.unsaved-recovery'
 function tabStorage(): Storage | null { try { return globalThis.sessionStorage ?? null } catch { return null } }
 const toBase64 = (bytes: Uint8Array) => { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary) }
 const fromBase64 = (text: string) => Uint8Array.from(atob(text), char => char.charCodeAt(0))
-function loadKept(): KeptRecovery | null {
+function loadKept(platform: Platform): KeptRecovery | null {
   try {
-    const value: unknown = JSON.parse(tabStorage()?.getItem(UNSAVED_KEY) ?? 'null')
+    const value: unknown = JSON.parse((platform.recoveryStorage ? platform.recoveryStorage.read() : tabStorage()?.getItem(UNSAVED_KEY)) ?? 'null')
     if (!value || typeof value !== 'object') return null
-    const { name, code, attempted, data } = value as Record<string, unknown>
-    return typeof name === 'string' && typeof code === 'string' && typeof data === 'string' ? { name, code, attempted: attempted === true, bytes: fromBase64(data) } : null
+    const { name, code, attempted, data } = record(value)
+    return typeof name === 'string' && !/[\\/]/.test(name) && typeof code === 'string' && /^[A-F0-9]{8}$/.test(code) && name.startsWith(`vibeface-recovery-${code}`) && typeof data === 'string' ? { name, code, attempted: attempted === true, bytes: fromBase64(data) } : null
   } catch { return null }
 }
 class AuthenticationError extends Error {}
@@ -233,7 +233,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [recovered, setRecovered] = useState(load('recovered') === true)
   const kept = useRef<KeptRecovery | null>(null)
   const [unsavedRecovery, setUnsavedRecovery] = useState<UnsavedRecovery | null>(() => {
-    kept.current = loadKept()
+    kept.current = loadKept(platform)
     return kept.current && { name: kept.current.name, code: kept.current.code, attempted: kept.current.attempted }
   })
   const [, setDismissals] = useState(0)
@@ -270,6 +270,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [entrances, setEntrances] = useState<OpenEntrance[]>([])
   const seen = useRef<Vector>({})
   const switching = useRef(false)
+  const pendingEntrance = useRef<Reconnect | null>(null)
   /** Nodes advertising on the app's LAN right now. */
   const lanSightings = useRef<LanSighting[]>([])
   /** The direct channel `goDirect` is trying; leaving the network or erasing the phone stops it before it signs. */
@@ -294,6 +295,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }, [])
   const resetConnection = useCallback(() => {
     reconnect.current = null
+    pendingEntrance.current = null
     resumeQueue.current = []
     if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
     reconnectTimer.current = null
@@ -371,6 +373,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     store('last-authenticated', { entry: entryJson(active.entry), networkId: principal.network_id })
     store('pending-join', null); store('stay-disconnected', null)
     active.networkId = principal.network_id
+    pendingEntrance.current = null
     reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, principal, info: active.info,
@@ -415,6 +418,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       step({ type: 'connect' })
       let done: boolean | 'next' = false
       try { done = await reconnectThrough(target) } finally { switching.current = false }
+      const pending = pendingEntrance.current
+      pendingEntrance.current = null
+      if (pending && reconnect.current === pending && !session.current?.networkId) { scheduleReconnect(true); return }
       if (done === 'next') { scheduleReconnect(true); return }
       if (done || reconnect.current !== target) return
       step({ type: 'lost', reason: target.entry.kind === 'local' ? unreachableText : '所有访问地址都连不上。' })
@@ -497,6 +503,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
         return true
       } catch (cause) {
+        if (active && session.current === active && !active.networkId) { generation.current += 1; session.current = null; active.channel.close() }
         if (reconnect.current !== target) return true
         // Only a definite answer about this browser's identity ends the resume; a Node error, timeout or drop is retried.
         if (own && cause instanceof AuthenticationError) {
@@ -524,6 +531,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
+    let opened: DeviceChannel | null = null
     setQueued(null)
     try {
       const channel = await connectDevice(parsed, {
@@ -549,6 +557,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
           }
         },
       }).finally(() => { if (version === generation.current) setQueued(null) })
+      opened = channel
       if (version !== generation.current) { channel.close(); throw changed() }
       const infoValue = await channel.request('info')
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -567,6 +576,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
           setPhase('reconnecting'); scheduleReconnect()
         } else { resetConnection(); setError(messageOf(cause)) }
       }
+      opened?.close()
       throw cause
     }
   }
@@ -788,10 +798,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function factoryReset() {
     const { erase } = platform
     if (!erase || !restart) throw new Error(`${self}不能恢复出厂设置。`)
+    store('erase-pending', true)
     if (ready?.isCurrent()) await leave().catch(() => {})
     disconnect()
-    await erase()
-    restart()
+    setPhase('erasing'); setError('')
+    try { await erase(); restart() }
+    catch (cause) { setPhase('erase_failed'); setError(messageOf(cause)); throw cause }
   }
   async function setManage(deviceId: string, manage: boolean) {
     const connection = managing(), request = scoped()
@@ -1078,9 +1090,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     page.open(url.href)
   }
   function setKept(next: KeptRecovery | null) {
+    const serialized = next && JSON.stringify({ name: next.name, code: next.code, attempted: next.attempted, data: toBase64(next.bytes) })
+    if (platform.recoveryStorage) platform.recoveryStorage.write(serialized)
+    else { const storage = tabStorage(); if (serialized) storage?.setItem(UNSAVED_KEY, serialized); else storage?.removeItem(UNSAVED_KEY) }
     if (kept.current && kept.current.bytes !== next?.bytes) kept.current.bytes.fill(0)
     kept.current = next
-    try { if (next) tabStorage()?.setItem(UNSAVED_KEY, JSON.stringify({ name: next.name, code: next.code, attempted: next.attempted, data: toBase64(next.bytes) })); else tabStorage()?.removeItem(UNSAVED_KEY) } catch {}
     setUnsavedRecovery(next && { name: next.name, code: next.code, attempted: next.attempted })
   }
   /**
@@ -1089,7 +1103,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
    */
   async function keepRecoveryFile(bytes: Uint8Array, code: string) {
     const file: KeptRecovery = { name: recoveryFileName(code), code, attempted: false, bytes: bytes.slice() }
-    setKept(file)
+    try { setKept(file) } catch (cause) { file.bytes.fill(0); throw cause }
     try { await platform.saveRecovery(file.bytes, file.name); if (kept.current === file) setKept({ ...file, attempted: true }) } catch {}
   }
   async function downloadUnsavedRecovery() {
@@ -1172,10 +1186,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
               const checkpoints = [...chain, checkpoint]
               const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints, events }, next, password)
               try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
+              if (released || session.current !== active || active.generation !== generation.current) throw changed()
               prepared = { checkpoints, checkpoint }
             } finally { next.free(); verified?.free() }
             password = ''
           }
+          if (released || session.current !== active || active.generation !== generation.current) throw changed()
           const wait: WaitRecord = { entry: active.entry, networkId: opened.networkId, genesis, rootKey: view.recovery_key, checkpoint: prepared.checkpoint }
           store('recovery-wait', { ...wait, entry: entryJson(wait.entry) })
           let auth: Record<string, unknown>
@@ -1272,6 +1288,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints, events: array(state.events) }, next, password)
         try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
+      if (!connection.isCurrent()) throw changed()
       await connection.request('recover', { genesis: state.genesis, checkpoints, events: state.events })
       await refreshDirectory()
     } finally { opened.release(); verified?.free() }
@@ -1290,6 +1307,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     let mounted = true
     let version = generation.current
     const setupController = new AbortController()
+    if (load('erase-pending') === true) { setPhase('erase_failed'); setError('应用内数据尚未清除完成，请继续清除。'); return }
     setEntries(savedEntries())
     const { invitation, localLaunch } = page?.takeLaunch() ?? { invitation: '', localLaunch: null }
     if (invitation) setInitialInvitation(invitation)
@@ -1371,9 +1389,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       message(message) {
         for (const listener of tabListeners.current) listener(message)
         const target = reconnect.current
-        if (message.type !== 'entrance' || !target || session.current || target.networkId !== message.networkId) return
+        if (message.type !== 'entrance' || !target || session.current?.networkId || target.networkId !== message.networkId) return
         if (reconnectTimer.current !== null) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null }
         reconnect.current = { ...target, entry: message.entry }
+        pendingEntrance.current = switching.current ? reconnect.current : null
         scheduleReconnect(true)
       },
     })

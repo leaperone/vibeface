@@ -503,10 +503,7 @@ impl MemoryBase {
         );
         if let Some(version) = &self.version {
             for hash in [&version.revision, &version.source_event_hash] {
-                anyhow::ensure!(
-                    hex::decode(hash).is_ok_and(|value| value.len() == 32),
-                    "invalid memory version"
-                );
+                vibeface_secure::membership::validate_hash(hash)?;
             }
         }
         Ok(())
@@ -1045,8 +1042,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    /// Written by the target. The user settles an `unverified` result through any entry Node,
-    /// signed; the owner records `unverified` after the target is removed.
+    /// Written by the target, including `unverified`. The user settles an unknown result through
+    /// any entry Node, signed; the causal owner may also record it as `unverified`.
     WorkFinished {
         work_id: String,
         outcome: WorkOutcome,

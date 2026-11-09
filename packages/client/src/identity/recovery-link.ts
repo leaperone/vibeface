@@ -20,7 +20,8 @@ export function recoveryTarget(value: string): ConnectionEntry | null {
   try {
     const url = new URL(value.trim())
     const device_id = url.searchParams.get('recover')
-    if (url.protocol !== 'vibeface:' || url.host !== 'join' || !device_id || url.searchParams.has('link')) return null
+    if (url.protocol !== 'vibeface:' || url.host !== 'join' || url.pathname || url.hash || url.username || url.password || !device_id || url.searchParams.has('link') || url.searchParams.getAll('recover').length !== 1 || url.searchParams.getAll('address').length > 1) return null
+    if ([...url.searchParams.keys()].some(key => !['recover', 'address', 'lan'].includes(key)) || url.searchParams.has('address') && url.searchParams.has('lan')) return null
     const address = url.searchParams.get('address')
     return parseEntry(address ? { device_id, address } : { device_id, addrs: url.searchParams.getAll('lan') })
   } catch { return null }

@@ -775,7 +775,9 @@ mod tests {
             bind: Some("127.0.0.1:0".parse()?),
             ..Default::default()
         };
-        let secret = crate::crypto::LocalIdentity::generate().secret_key_hex;
+        let secret = crate::crypto::LocalIdentity::generate()
+            .secret_key_hex
+            .clone();
         let net = Net::bind(&secret, &config, 0, vec![]).await?;
         let mesh_config = mesh::MeshConfig {
             enabled: true,
@@ -924,7 +926,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let secret = crate::crypto::LocalIdentity::generate().secret_key_hex;
+        let secret = crate::crypto::LocalIdentity::generate()
+            .secret_key_hex
+            .clone();
         let net = Net::bind(&secret, &config, 0, vec![]).await?;
         let url = |port: u16| format!("http://127.0.0.1:{}/", 10 + port);
         let device = crate::crypto::LocalIdentity::generate().device_id()?;

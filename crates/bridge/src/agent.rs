@@ -212,18 +212,13 @@ fn process_start(process: u32) -> Result<String> {
     Ok(value)
 }
 impl Processes {
+    /// Writes this run's processes plus any earlier record whose tree is not confirmed gone, so
+    /// a tree an earlier start could not end is still there to try again after the next start.
     fn save(&self, running: &BTreeMap<String, Tracked>) -> Result<()> {
         let Some(path) = &self.pidfile else {
             return Ok(());
         };
-        if running.is_empty() {
-            return match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            };
-        }
-        let records: Vec<_> = running
+        let mut records: Vec<_> = running
             .iter()
             .map(|(token, tracked)| ProcessRecord {
                 token: token.clone(),
@@ -231,6 +226,21 @@ impl Processes {
                 identity: tracked.identity.clone(),
             })
             .collect();
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(earlier) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes)
+        {
+            records.extend(earlier.into_iter().filter(|record| {
+                !running.contains_key(&record.token)
+                    && !matches!(platform::tree::Leftover::find(&record.token), Ok(None))
+            }));
+        }
+        if records.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
         platform::privatefs::write_atomic(path, &serde_json::to_vec(&records)?)
     }
     fn track(&self, token: String, tracked: Tracked) -> Result<()> {
@@ -374,15 +384,16 @@ impl CursorAgent {
         let Ok(records) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes) else {
             return;
         };
+        let mut unconfirmed = Vec::new();
         for record in records {
-            let same = match record.identity {
+            let same = match &record.identity {
                 #[cfg(unix)]
                 ProcessIdentity::UnixStart(expected) => record
                     .token
                     .parse()
                     .ok()
                     .and_then(|pid| process_start(pid).ok())
-                    .is_some_and(|current| current == expected),
+                    .is_some_and(|current| current == *expected),
                 #[cfg(windows)]
                 ProcessIdentity::WindowsJob => true,
                 ProcessIdentity::Exited => false,
@@ -397,8 +408,18 @@ impl CursorAgent {
                 let accepted = |_: &str| true;
                 let _ = platform::tree::stop_recorded(&record.token, accepted);
             }
+            // A tree that cannot be confirmed gone stays on record for the next start.
+            if same && !matches!(platform::tree::Leftover::find(&record.token), Ok(None)) {
+                unconfirmed.push(record);
+            }
         }
-        let _ = std::fs::remove_file(pidfile);
+        if unconfirmed.is_empty() {
+            let _ = std::fs::remove_file(pidfile);
+        } else if let Ok(bytes) = serde_json::to_vec(&unconfirmed)
+            && let Err(error) = platform::privatefs::write_atomic(pidfile, &bytes)
+        {
+            tracing::warn!(%error, "could not preserve the unconfirmed process journal");
+        }
     }
     pub async fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
@@ -745,9 +766,10 @@ impl CursorAgent {
         let mut observed = false;
         let secrets: Vec<&str> = turn
             .env
-            .values()
-            .chain(self.env.values())
-            .map(String::as_str)
+            .iter()
+            .chain(self.env.iter())
+            .filter(|(name, value)| credential_value(name, value))
+            .map(|(_, value)| value.as_str())
             .chain(turn.callback_token.as_deref())
             .collect();
         let operation = async {
@@ -1340,19 +1362,42 @@ fn validate_origin(origin: &str) -> Result<()> {
     Ok(())
 }
 
-/// Existing line-based journals used by the Claude process owner.
+/// Existing line-based journals used by the Claude and pi process owners. A record stays until
+/// its tree is confirmed gone, so an unanswerable or still-running tree is never forgotten.
 pub fn kill_recorded_programs(pidfile: &Path) {
     let Ok(recorded) = std::fs::read_to_string(pidfile) else {
         return;
     };
+    let mut unconfirmed = String::new();
     for line in recorded.lines() {
-        if let Some((token, executable)) = line.split_once(' ')
-            && !executable.is_empty()
+        // A journal record never contains a space, so the rest of the line is the whole
+        // program path even when a directory in it has one.
+        let Some((token, executable)) = line.split_once(' ') else {
+            unconfirmed.push_str(&format!("{line}\n"));
+            continue;
+        };
+        if executable.is_empty() {
+            unconfirmed.push_str(&format!("{line}\n"));
+            continue;
+        }
+        if let Err(error) =
+            platform::tree::stop_recorded(token, |member| member.contains(executable))
         {
-            let _ = platform::tree::stop_recorded(token, |member| member.contains(executable));
+            tracing::debug!(
+                event = "agent.leftover_left_alone",
+                %error,
+                "a recorded program was not ended"
+            );
+        }
+        if !matches!(platform::tree::Leftover::find(token), Ok(None)) {
+            unconfirmed.push_str(&format!("{line}\n"));
         }
     }
-    let _ = std::fs::remove_file(pidfile);
+    if unconfirmed.is_empty() {
+        let _ = std::fs::remove_file(pidfile);
+    } else if let Err(error) = platform::privatefs::write_atomic(pidfile, unconfirmed.as_bytes()) {
+        tracing::warn!(%error, "could not preserve the unconfirmed process journal");
+    }
 }
 
 pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
@@ -1397,6 +1442,84 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+/// Whether an environment value is a credential worth hiding in shared records. Ordinary values
+/// such as `DEBUG=1` or a workspace path must not be replaced, or every "1" in a reply vanishes.
+fn credential_value(name: &str, value: &str) -> bool {
+    if value.len() < 8 {
+        return false;
+    }
+    if ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if [
+        "-----begin",
+        "bearer ",
+        "password=",
+        "password:",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    value
+        .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .any(|word| {
+            let lower = word.to_ascii_lowercase();
+            url_with_password(word)
+                || (word.len() >= 20
+                    && [
+                        "sk-",
+                        "sk_",
+                        "ghp_",
+                        "gho_",
+                        "ghs_",
+                        "ghu_",
+                        "github_pat_",
+                        "xoxb-",
+                        "xoxp-",
+                        "xapp-",
+                        "akia",
+                        "aiza",
+                        "glpat-",
+                        "hf_",
+                        "npm_",
+                    ]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix)))
+                || (word.len() >= 32
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && word.chars().any(|c| c.is_ascii_uppercase())
+                    && word.chars().any(|c| c.is_ascii_lowercase()))
+        })
+}
+
+/// A connection string such as `postgres://user:pass@host/db` carries its password in the
+/// authority, so the whole value is a credential whatever its variable is called.
+fn url_with_password(word: &str) -> bool {
+    let Some((_, rest)) = word.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit_once('@').is_some_and(|(userinfo, _)| {
+        userinfo
+            .split_once(':')
+            .is_some_and(|(_, pass)| !pass.is_empty())
+    })
 }
 
 fn redact_text(mut text: String, secrets: &[&str]) -> String {
@@ -1482,4 +1605,28 @@ pub(crate) async fn bounded_line(
         "line exceeds the configured size limit"
     );
     Ok(line)
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::credential_value;
+
+    #[test]
+    fn credential_values_are_selected_by_name_or_shape_only() {
+        assert!(credential_value("CURSOR_API_KEY", "k!secret1"));
+        assert!(!credential_value("FOO_TOKEN", "1"));
+        assert!(credential_value(
+            "DATABASE_URL",
+            "postgres://app:s3cret@db.internal/app"
+        ));
+        assert!(credential_value(
+            "X",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        ));
+        assert!(!credential_value("DEBUG", "1"));
+        assert!(!credential_value("NODE_ENV", "production"));
+        assert!(!credential_value("HOME", "/Users/me/project"));
+        assert!(!credential_value("API_BASE", "http://host:8080/path"));
+        assert!(!credential_value("ORIGIN", "user@example.com"));
+    }
 }

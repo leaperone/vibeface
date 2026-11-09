@@ -44,7 +44,7 @@ jobs:
         run: |
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
-          cargo install cargo-ndk --locked
+          cargo install cargo-ndk --version 4.1.2 --locked
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
       - run: pnpm install --frozen-lockfile
       - run: scripts/build-mobile-secure.sh android

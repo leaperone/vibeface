@@ -92,7 +92,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_func_ticket_decode(text: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_ticket_encode(entry: Uint8Array, secretHex: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_verify(deviceId: Uint8Array, domain: Uint8Array, payload: Uint8Array, signature: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
-    ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership(stateJson: Uint8Array, expectedNetwork: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
+    ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership(stateJson: Uint8Array, expectedNetwork: Uint8Array, now: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_channel_open_record(uniffiSelf: bigint, record: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_channel_seal_message(uniffiSelf: bigint, payload: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_constructor_handshake_new(initiator: number, expectedDeviceId: Uint8Array, context: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;

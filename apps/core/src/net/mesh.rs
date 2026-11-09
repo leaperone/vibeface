@@ -1302,7 +1302,11 @@ mod tests {
             .join(format!("mesh-loopback-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let secrets: Vec<String> = (0..4)
-            .map(|_| crate::crypto::LocalIdentity::generate().secret_key_hex)
+            .map(|_| {
+                crate::crypto::LocalIdentity::generate()
+                    .secret_key_hex
+                    .clone()
+            })
             .collect();
         let mut nodes = Vec::new();
         let result = async {
