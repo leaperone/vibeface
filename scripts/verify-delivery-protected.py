@@ -99,6 +99,13 @@ def diagnostic_events(events):
             need(role == phase.removesuffix("_spawn"), "invalid_diagnostic_spawn_worker")
         elif phase == "worker_wait":
             need(role in ("generator", "prover") and edge != "begin", "invalid_diagnostic_wait_worker")
+            need(event["errno"] is None and (
+                edge == "ok" and event["exit_code"] == 0 and event["signal"] is None and event["failure_class"] is None
+                or edge == "error" and (
+                    event["exit_code"] is not None and event["exit_code"] != 0 and event["signal"] is None
+                    and event["failure_class"] == "worker_exit"
+                    or event["exit_code"] is None and event["signal"] is not None and event["failure_class"] == "worker_signal")),
+                "invalid_diagnostic_wait_termination")
         else:
             need(role is None and not event["cleanup_requested"], "unexpected_diagnostic_worker")
         need(edge == "error" or event["failure_class"] is None and event["signal"] is None and event["errno"] is None
@@ -1170,6 +1177,43 @@ def self_test_diagnostics():
         value = registration_diagnostics(encode(failed), source, artifacts, {**cli, "exit_code": 1})
         need(value["availability"] == "partial" and value["first_observed_failure"]["signal"] == signal_number
              and value["first_observed_failure"]["exit_code"] == exit_code, "worker_signal_not_inferred_from_137")
+    partial = value
+    cleanup = copy.deepcopy(failed)
+    cleanup.append({**records[boundary + 1], "edge": "error", "exit_code": None, "signal": 15,
+                    "failure_class": "worker_signal", "cleanup_requested": True})
+    value = registration_diagnostics(encode(cleanup), source, artifacts, partial["cli"])
+    need(value["availability"] == "partial" and value["first_observed_failure"] == partial["first_observed_failure"]
+         and value["events"][-1]["cleanup_requested"], "cleanup_failure_preserves_first_worker_failure")
+    invalid_waits = []
+    for change in ({"exit_code": 0}, {"failure_class": "worker_signal"},
+                   {"exit_code": None, "signal": 9, "failure_class": "worker_exit"}, {"errno": 5},
+                   {"signal": 9}, {"exit_code": None},
+                   {"edge": "ok", "exit_code": 1, "failure_class": None},
+                   {"edge": "ok", "exit_code": None, "failure_class": None}):
+        raw = copy.deepcopy(failed); raw[-1].update(change)
+        public = copy.deepcopy(partial); public["events"][-1].update(change)
+        public["first_observed_failure"] = diagnostic_first_failure(public["events"])
+        public["first_observed_failed_phase"] = diagnostic_phase(next((event for event in public["events"] if event["edge"] == "error"), None))
+        invalid_waits.append((raw, public))
+    raw, public = copy.deepcopy(records), copy.deepcopy(positive)
+    for event in [*raw, *public["events"]]:
+        if event["phase"] == "worker_wait": event["exit_code"] = None
+    invalid_waits.append((raw, public))
+    for raw, public in invalid_waits:
+        value = registration_diagnostics(encode(raw), source, artifacts, public["cli"])
+        need(value["availability"] == "unavailable" and not value["events"] and not value["resource_deltas"]
+             and all(value[key] is None for key in ("first_observed_failure", "last_observed_phase", "first_observed_failed_phase")),
+             "contradictory_worker_wait_raw_is_unavailable")
+        try: project_registration_diagnostics(public, source, artifacts)
+        except CheckFailure: pass
+        else: raise AssertionError("contradictory worker_wait public projection accepted")
+    core_end = next(index for index, event in enumerate(records) if event["writer"] == "core" and event["phase"] == "proof_prove" and event["edge"] == "ok")
+    for failure_class in ("result_decode", "receipt_check"):
+        core_failed = copy.deepcopy(records[:core_end + 1])
+        core_failed[-1].update(edge="error", failure_class=failure_class)
+        value = registration_diagnostics(encode(core_failed), source, artifacts, {**cli, "exit_code": 1})
+        need(value["availability"] == "partial" and value["events"][-1]["exit_code"] == 0
+             and value["events"][-1]["failure_class"] == failure_class, "core_validation_can_fail_after_successful_subprocess")
     print(f"Registration diagnostic self-tests passed; full synthetic path {len(records)} events/8 resource groups; no processes or proofs")
 
 

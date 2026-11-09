@@ -3320,6 +3320,23 @@ def self_test_registration_export(expected):
         assert passed
         projected=json.loads((output/"registration-diagnostics.json").read_bytes())
         assert projected==diagnostic and len(projected["events"])==len(records) and len(projected["resource_deltas"])==8
+        boundary=next(index for index,event in enumerate(records) if event["phase"]=="worker_wait")
+        failed=deepcopy(records[:boundary+1])
+        failed[-1].update(edge="error",exit_code=137,failure_class="worker_exit")
+        partial=driver["registration_diagnostics"](b"".join((json.dumps(record,separators=(",",":"))+"\n").encode() for record in failed),
+            expected,artifacts,{"exit_code":1,"signal":None,"spawn_errno":None})
+        assert partial["availability"]=="partial" and partial["first_observed_failure"]["exit_code"]==137
+        output,passed=export(partial,1)
+        assert not passed and json.loads((output/"registration-diagnostics.json").read_bytes())==partial
+        invalid_exit=deepcopy(partial)
+        invalid_exit["events"][-1]["exit_code"]=0
+        invalid_exit["first_observed_failure"]["exit_code"]=0
+        missing_wait_status=deepcopy(diagnostic)
+        for event in missing_wait_status["events"]:
+            if event["phase"]=="worker_wait": event["exit_code"]=None
+        for invalid in (invalid_exit,missing_wait_status):
+            output,passed=export(invalid)
+            assert not passed and not (output/"registration-diagnostics.json").exists()
         sentinel="UNAPPROVED_PRIVATE_SENTINEL"
         changes=[lambda value:value.update(private=sentinel),lambda value:value.update(source_commit="0"*40),
             lambda value:value["artifact_sha256"].update(prover="0"*64),lambda value:value["events"][0].update(private=sentinel),
