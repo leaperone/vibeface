@@ -1339,17 +1339,14 @@ pub(super) fn event_in_session_scope_from(
         } => SessionScope::Routine {
             trigger: schedule_trigger(schedule_id, *slot_ms),
         },
-        EventBody::QuestionAsked {
-            target: Some(target),
-            ..
-        } => target_scope(target),
-        EventBody::QuestionAsked { about, .. } => {
-            let scope:Option<String> = connection.query_row(
-                "SELECT scope FROM scheduler_sessions WHERE conversation_id=? AND native_id=? LIMIT 1",
-                params![conversation, about.session_id], |row| row.get(0),
-            ).optional()?;
-            match scope {
-                Some(scope) => SessionScope::from_storage_key(&scope)?,
+        EventBody::QuestionAsked { question_id, .. } => {
+            match super::scope_projection::question_input_target_from(
+                connection,
+                network,
+                conversation,
+                question_id,
+            )? {
+                Some(target) => target_scope(&target),
                 None => return Ok(false),
             }
         }

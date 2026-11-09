@@ -2302,7 +2302,15 @@ impl Runtime {
                     Some(event.turn_id.clone())
                 };
                 *target = if let Some(native_turn) = native_turn {
-                    store.native_input_target(network, &owner, &event.session_id, &native_turn)?
+                    match store.native_input_target(
+                        network,
+                        &owner,
+                        &event.session_id,
+                        &native_turn,
+                    )? {
+                        Some(target) => Some(target),
+                        None => store.attributed_session_input_target(network, &owner, about)?,
+                    }
                 } else {
                     None
                 };
