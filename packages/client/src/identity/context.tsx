@@ -920,11 +920,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: the access address.
-   * The device key is the check.
+   * Straight to where the ticket's entry Node listens, for one not reachable from the internet, then any Gateway that
+   * forwards to it: the access address. The device key is the check either way.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    return [{ kind: 'gateway', address: currentGateway(), device_id: link.entryId }]
+    const gateway: ConnectionEntry = { kind: 'gateway', address: currentGateway(), device_id: link.entryId }
+    return link.entryAddrs.length ? [{ kind: 'lan', addrs: link.entryAddrs, device_id: link.entryId }, gateway] : [gateway]
   }
   /**
    * One question on a channel of its own, so the screen's connection stays as it is. The secret goes only to the

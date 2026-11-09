@@ -53,7 +53,7 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '', entryAddrs = [] as string[] } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -107,7 +107,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
-    parseJoinLink: async () => ({ entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
+    parseJoinLink: async () => ({ entryId: target, entryAddrs, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
@@ -673,6 +673,21 @@ test('opening a used link says so before 加入, on its own channel, and sends n
     app.inviteState.value = 'open'
     await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.equal(app.render().joining?.status, 'pending', 'an open link still goes through the approval')
+  } finally { app.close() }
+})
+
+test('a link whose entry Node listens at addresses is checked and joined straight there first', async () => {
+  const app = deviceHarness({ entryAddrs: ['192.168.1.4:7001'] })
+  try {
+    app.render(); await settle()
+    const before = app.sockets.length
+    assert.equal(await app.render().checkInvite('vibeface://join/vibeface1ticket'), 'open')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    assert.deepEqual(plain(app.sockets.slice(before).map(socket => socket.entry)), [
+      { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: target },
+      { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: target },
+    ])
+    assert.equal(app.render().joining?.status, 'pending')
   } finally { app.close() }
 })
 
