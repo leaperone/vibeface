@@ -38,14 +38,18 @@ export function listTime(at: number, now: number): string {
   return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`
 }
 
-/** On a phone every page but the list goes back one level; null on the list itself. */
+/** The phone's bottom tabs; each is a root with no way back. */
+export const tabs = ["/", "/tasks", "/inbox", "/settings"]
+
+/** On a phone every page below a tab goes back one level; null on a tab. */
 export function backTo(pathname: string, bot?: string): string | null {
-  if (pathname === "/") return null
+  if (tabs.includes(pathname)) return null
   // A device page opened from a chat goes back to that chat.
   if (bot && pathname.startsWith("/devices")) return `/b/${encodeURIComponent(bot)}`
   const work = /^(\/b\/[^/]+)\/work\//.exec(pathname)
   if (work) return work[1]
   if (/^\/devices\/[^/]+/.test(pathname)) return "/devices"
+  if (pathname.startsWith("/devices")) return "/settings"
   if (pathname.startsWith("/settings/lab/")) return "/settings/lab"
   if (pathname.startsWith("/settings/")) return "/settings"
   return "/"

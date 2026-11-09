@@ -1,6 +1,6 @@
 import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ArrowDown, Bot, BrainCircuit, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
@@ -229,7 +229,7 @@ export default function ChatScreen() {
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <Link href={`/b/${bot.bot_id}/context`} asChild><Button variant="ghost" size="icon" accessibilityLabel="上下文和历史"><Icon as={BrainCircuit} /></Button></Link>,
+      headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" size="icon" accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,

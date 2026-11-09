@@ -2096,9 +2096,11 @@ test('composers save each pending draft once and let edited drafts save independ
       first.resolve(new Uint8Array([1, 2, 3]).buffer); await saves[0]; await settleComponent()
       assert.equal(composer().value, '第二份草稿')
       assert.equal(composer().files, laterFiles, 'the earlier save cannot remove the new attachments')
-      const intent = render().find(({ type, props }) => example.native ? typeof type === 'function' && type.name === 'InputOptions' || type === 'InputOptions' : type === 'NativeSelect' && props['aria-label'] === '发送方式')?.props
+      // Native and the web's main chat pick the intent by value; the web's scoped composers keep a native select.
+      const byValue = example.native || example.name === 'web Main'
+      const intent = render().find(({ type, props }) => example.native ? typeof type === 'function' && type.name === 'InputOptions' || type === 'InputOptions' : byValue ? typeof type === 'function' && type.name === 'IntentMenu' : type === 'NativeSelect' && props['aria-label'] === '发送方式')?.props
       const changeIntent = intent?.[example.native ? 'onIntent' : 'onChange']; assert.ok(typeof changeIntent === 'function')
-      changeIntent(example.native ? 'defer' : { currentTarget: { value: 'defer' } }); submit(); submit(); await settleComponent()
+      changeIntent(byValue ? 'defer' : { currentTarget: { value: 'defer' } }); submit(); submit(); await settleComponent()
       assert.equal(attempts.length, 3, 'a changed send intent is a separate draft without blocking it globally')
       later.resolve(new Uint8Array([4, 5, 6]).buffer); await Promise.all(saves); await settleComponent()
       assert.equal(composer().value, '')
@@ -2124,10 +2126,10 @@ test('composers save each pending draft once and let edited drafts save independ
       if (!example.name.endsWith('Scoped')) for (const change of ['text', 'intent', 'unchanged']) {
         const before = navigations.length, taskId: string = `created-task-${attempts.length + 1}`, name = `navigate-${change}.txt`
         const held = pendingResult(); reads.set(name, held)
-        changeIntent(example.native ? 'new_task' : { currentTarget: { value: 'new_task' } })
+        changeIntent(byValue ? 'new_task' : { currentTarget: { value: 'new_task' } })
         composer().onChange?.(`新任务 ${change}`); attach(name); submit()
         if (change === 'text') composer().onChange?.('当前正在编辑的正文')
-        if (change === 'intent') changeIntent(example.native ? 'continue' : { currentTarget: { value: 'continue' } })
+        if (change === 'intent') changeIntent(byValue ? 'continue' : { currentTarget: { value: 'continue' } })
         render()
         held.resolve(new Uint8Array([10, 11, 12]).buffer); await saves.at(-1); await settleComponent()
         assert.equal(navigations.length, before + (change === 'unchanged' ? 1 : 0), 'only the unchanged submitted draft can navigate after local acceptance')

@@ -29,6 +29,7 @@ type Props = {
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
+  /** A small control beside the send button, inside the box. */
   target?: ReactNode
   sendLabel?: string
   label?: string
@@ -121,14 +122,13 @@ export function Composer({ chrome, value, onChange, files, onFiles, attachmentSc
       </View>)}
     </ScrollView> : null}
     {ios ? <View className="min-h-13 flex-row items-end p-1">
-      {input}<View className="flex-row gap-1">{controls}</View>
+      {input}<View className="flex-row gap-1">{target}{controls}</View>
     </View> : <>
       {input}
-      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">{attach}{controls}</View>
+      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5"><View className="flex-row items-center">{attach}{target}</View>{controls}</View>
     </>}
   </>
   return <View pointerEvents={ios ? 'box-none' : undefined} className={ios ? 'gap-2 px-4 pb-2' : 'gap-2 bg-background px-4 pb-3'}>
-    {target ? <View className="w-full max-w-3xl self-center">{target}</View> : null}
     {ios ? <View pointerEvents="box-none" className="w-full max-w-3xl flex-row items-end gap-2 self-center">
       <ChatMaterial chrome={chrome} className="size-13">{attach}</ChatMaterial>
       <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>
