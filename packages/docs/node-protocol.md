@@ -442,7 +442,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### 地址簿
 
-每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在启用网页时取 `public_url`。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
+每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url, relay? }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在启用网页时取 `public_url`。`relay` 只在本 Node 运行 relay 时出现，取 `relay_url`。成员把记录里的 `relay` 加入自己的 relay 候选；`endpoint` 里的 relay 只用于拨号，不加入候选，因为对方的 home relay 未必接纳本 Node。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
 
 ### 附件
 
