@@ -6901,6 +6901,17 @@ fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<(
             },
         )?;
         origin.append_event(&net.a, &net.network, "c", input, vec![], 5)?;
+        let mut unscoped = question(
+            &origin,
+            &net,
+            "c",
+            "q-native-unscoped",
+            "exact-native-thread",
+        )?;
+        if let EventBody::QuestionAsked { target, about, .. } = &mut unscoped {
+            *target = None;
+            origin.claim_session(&net.a, &net.network, "c", about, 5)?;
+        }
         super::scheduler::admit_from(
             &origin.connection,
             &net.network,
@@ -7042,6 +7053,34 @@ fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<(
                 assert!(in_scope.is_err(), "{case}: invalid bindings stay rejected");
             }
         }
+        origin.ask(&net.a, &net.network, "c", unscoped, 8)?;
+        let mut replica = store(&net)?;
+        all_accepted(&mut replica, &net, &origin)?;
+        for node in [&mut origin, &mut replica] {
+            assert!(
+                node.question(&net.network, "q-native-unscoped")?
+                    .context("unscoped native question")?["target"]
+                    .is_null(),
+                "{case}: shared native Work bindings cannot become Main through attribution"
+            );
+            assert!(
+                node.accept_answer(
+                    &net.a,
+                    &net.network,
+                    "q-native-unscoped",
+                    "continue",
+                    Some(answer_signature(
+                        &net,
+                        "c",
+                        "q-native-unscoped",
+                        "continue"
+                    )?),
+                    9,
+                )
+                .is_err(),
+                "{case}: an unknown native target stays rejected on every device"
+            );
+        }
     }
     Ok(())
 }
@@ -7152,6 +7191,254 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
                 .count(),
             1
         );
+    }
+    let rejected = origin
+        .accept_answer(
+            &net.a,
+            &net.network,
+            "q-unknown-scope",
+            "continue",
+            Some(answer_signature(&net, "c", "q-unknown-scope", "continue")?),
+            8,
+        )
+        .err()
+        .context("an unowned session cannot borrow Main")?;
+    assert!(rejected.to_string().contains("trigger target is unknown"));
+    assert!(
+        origin
+            .message(&net.network, "c", "a-q-unknown-scope")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn colliding_question_events_keep_their_own_scope_in_history_and_notifications() -> Result<()> {
+    use crate::workspace::InputTarget;
+    for target in [
+        Some(InputTarget::Task {
+            task_id: "private-task".into(),
+        }),
+        Some(InputTarget::Work {
+            work_id: "private-work".into(),
+        }),
+        None,
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        isolated_task(&mut origin, &net, "private-work")?;
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "task",
+            workspace_task_command("private-task", None),
+            5,
+        )?;
+        let main = question(&origin, &net, "c", "q-collision", "public-thread")?;
+        origin.append_event(&net.a, &net.network, "c", main, vec![], 6)?;
+        let mut private = question(&origin, &net, "c", "q-collision", "private-thread")?;
+        if let EventBody::QuestionAsked {
+            target: destination,
+            text,
+            ..
+        } = &mut private
+        {
+            *destination = target.clone();
+            *text = "private question must stay outside Main".into();
+        }
+        origin.append_event(&net.a, &net.network, "c", private, vec![], 7)?;
+        origin.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            "after-collision",
+            "public input",
+            vec![],
+            true,
+            signature(&net, "after-collision", "public input")?,
+            8,
+        )?;
+        let job = origin
+            .scheduler_job("c", "message:after-collision")?
+            .context("Main job")?;
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        for node in [&origin, &replica] {
+            let events = node.context(&net.network, "c", None)?.events;
+            let questions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.event.body,
+                        EventBody::QuestionAsked { question_id, .. } if question_id == "q-collision"
+                    )
+                })
+                .collect();
+            assert_eq!(questions.len(), 2, "both signed events remain effective");
+            assert!(node.main_event_allowed(&net.network, "c", questions[0])?);
+            assert!(
+                !node.main_event_allowed(&net.network, "c", questions[1])?,
+                "{target:?}: a losing event cannot borrow the winner's Main target"
+            );
+            assert_eq!(
+                node.question(&net.network, "q-collision")?
+                    .context("winning card")?["text"],
+                "要继续吗？"
+            );
+            let history = node.turn_history(&net.network, "c", &job, None)?;
+            assert!(!history.recent.events.iter().any(|event| matches!(
+                &event.event.body,
+                EventBody::QuestionAsked { text, .. } if text == "private question must stay outside Main"
+            )), "{target:?}: Main never sees the losing event's private text");
+            let notes = node.pending_notifications(&net.network, "web")?;
+            let private = notes
+                .iter()
+                .find(|note| note.text == "private question must stay outside Main")
+                .context("private question notification")?;
+            assert_eq!(
+                private.target, target,
+                "a notification's target must describe its own text"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn targetless_questions_require_current_matching_session_attributions() -> Result<()> {
+    for case in [
+        "attributed",
+        "node",
+        "provider",
+        "session",
+        "conversation",
+        "muted",
+        "deleted",
+        "handed-over",
+        "late-attribution",
+        "other-node-work",
+        "other-provider-work",
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        second_bot(&mut origin, &net, "Other")?;
+        let mut card = question(&origin, &net, "c", "q-attributed", "external-thread")?;
+        let EventBody::QuestionAsked { target, about, .. } = &mut card else {
+            unreachable!()
+        };
+        *target = None;
+        let mut attribution = about.clone();
+        match case {
+            "node" => attribution.node = net.b.device_id()?,
+            "provider" => attribution.agent = Some(Provider::Claude),
+            "session" => attribution.session_id = "another-session".into(),
+            _ => {}
+        }
+        if case != "late-attribution" {
+            origin.claim_session(
+                if case == "node" { &net.b } else { &net.a },
+                &net.network,
+                if case == "conversation" { "d" } else { "c" },
+                &attribution,
+                4,
+            )?;
+        }
+        if matches!(case, "other-node-work" | "other-provider-work") {
+            let identity = if case == "other-node-work" {
+                &net.b
+            } else {
+                &net.a
+            };
+            let provider = if case == "other-provider-work" {
+                Provider::Claude
+            } else {
+                Provider::Codex
+            };
+            origin.accept_work_fixture(
+                identity,
+                &net.network,
+                WorkSpec {
+                    work_id: "unrelated-native-work".into(),
+                    conversation: "d".into(),
+                    trigger: "message:unrelated".into(),
+                    target: identity.device_id()?,
+                    dispatcher: identity.device_id()?,
+                    call_ref: "unrelated".into(),
+                    kind: WorkKind::Agent(provider),
+                    model: None,
+                    resolved: ResolvedModel {
+                        provider,
+                        model: None,
+                    },
+                    cwd: "/w".into(),
+                    title: "unrelated".into(),
+                    prompt: "unrelated".into(),
+                    continues: None,
+                    parent: None,
+                    thread: Some("external-thread".into()),
+                },
+                5,
+            )?;
+        }
+        origin.ask(&net.a, &net.network, "c", card, 6)?;
+        match case {
+            "muted" | "handed-over" => {
+                let version = session_version(&origin, &net, "external-thread")?;
+                origin.hand_over_session(
+                    &net.a,
+                    &net.network,
+                    "c",
+                    "external-thread",
+                    &version,
+                    (case == "handed-over").then_some("d"),
+                    7,
+                )?;
+            }
+            "deleted" => {
+                let deleted = net.a.fixture_admin().attest(
+                    &net.network,
+                    "c",
+                    EventBody::BotDeleted {
+                        cause: None,
+                        attestation: None,
+                    },
+                )?;
+                origin.append_event(&net.a, &net.network, "c", deleted, vec![], 7)?;
+            }
+            "late-attribution" => {
+                origin.claim_session(&net.a, &net.network, "c", &attribution, 7)?;
+            }
+            _ => {}
+        }
+        let expected = matches!(
+            case,
+            "attributed" | "other-node-work" | "other-provider-work"
+        )
+        .then(|| crate::workspace::InputTarget::BotMain {
+            bot_id: "bot".into(),
+        });
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        for node in [&mut origin, &mut replica] {
+            assert_eq!(
+                node.question(&net.network, "q-attributed")?
+                    .context("attributed question")?["target"],
+                json!(expected),
+                "{case}: only this question's current signed attribution proves Main"
+            );
+            let answered = node.accept_answer(
+                &net.a,
+                &net.network,
+                "q-attributed",
+                "continue",
+                Some(answer_signature(&net, "c", "q-attributed", "continue")?),
+                8,
+            );
+            assert_eq!(answered.is_ok(), expected.is_some(), "{case}");
+            if expected.is_none() {
+                assert!(node.message(&net.network, "c", "a-q-attributed")?.is_none());
+            }
+        }
     }
     Ok(())
 }
@@ -7508,13 +7795,12 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
         let mut store = Store::open(&path)?;
         store.install_trust_bundle(&net.network, &net.state)?;
         question_conversation(&mut store, &net)?;
-        store.ask(
-            &net.a,
-            &net.network,
-            "c",
-            question(&store, &net, "c", "q-1", "t1")?,
-            2,
-        )?;
+        let mut card = question(&store, &net, "c", "q-1", "t1")?;
+        if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+            *target = None;
+            store.claim_session(&net.a, &net.network, "c", about, 2)?;
+        }
+        store.ask(&net.a, &net.network, "c", card, 2)?;
         let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
         let first = store.accept_answer(&net.a, &net.network, "q-1", "允许", signed.clone(), 3)?;
         assert!(!first.already_answered && first.receipt.is_some());
@@ -7522,6 +7808,62 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
         assert!(!retry.already_answered && retry.message == first.message);
         let webhook = store.accept_answer(&net.a, &net.network, "q-1", "拒绝", None, 5)?;
         assert!(webhook.already_answered && webhook.message.text == "允许");
+        let trigger = message_trigger(&questions::answer_id("q-1"));
+        store.accept_work_fixture(
+            &net.a,
+            &net.network,
+            WorkSpec {
+                work_id: "answered-external-session".into(),
+                conversation: "c".into(),
+                trigger: trigger.clone(),
+                target: net.a.device_id()?,
+                dispatcher: net.a.device_id()?,
+                call_ref: "answer".into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: ResolvedModel {
+                    provider: Provider::Codex,
+                    model: None,
+                },
+                cwd: "/w".into(),
+                title: "answer".into(),
+                prompt: "continue".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t1".into()),
+            },
+            6,
+        )?;
+        let job = store.scheduler_job("c", &trigger)?.context("answer job")?;
+        assert_eq!(job.scope, SessionScope::Main);
+        let history = store.turn_history(&net.network, "c", &job, None)?;
+        assert!(
+            history.recent.events.iter().any(|event| matches!(
+                &event.event.body,
+                EventBody::QuestionAsked { question_id, text, target: None, .. }
+                    if question_id == "q-1" && text == "要继续吗？"
+            )),
+            "the original question remains in Main after its answer starts Work"
+        );
+        let expected = crate::workspace::InputTarget::BotMain {
+            bot_id: "bot".into(),
+        };
+        assert_eq!(
+            store
+                .question(&net.network, "q-1")?
+                .context("projected question")?["target"],
+            json!(expected)
+        );
+        assert_eq!(
+            store.trigger_input_target(&net.network, "c", &trigger)?,
+            Some(expected.clone())
+        );
+        assert!(
+            store
+                .pending_notifications(&net.network, "web")?
+                .iter()
+                .any(|note| note.kind == "question" && note.target.as_ref() == Some(&expected))
+        );
         drop(store);
         let mut store = Store::open(&path)?;
         let trigger = message_trigger(&questions::answer_id("q-1"));
@@ -7607,13 +7949,12 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
     let (mut a, mut b) = (store(&net)?, store(&net)?);
     question_conversation(&mut a, &net)?;
-    a.ask(
-        &net.a,
-        &net.network,
-        "c",
-        question(&a, &net, "c", "q-1", "t1")?,
-        2,
-    )?;
+    let mut card = question(&a, &net, "c", "q-1", "t1")?;
+    if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+        *target = None;
+        a.claim_session(&net.a, &net.network, "c", about, 2)?;
+    }
+    a.ask(&net.a, &net.network, "c", card, 2)?;
     sync(&a, &mut b, &net)?;
     assert_eq!(unanswered(&b, &net)?, vec!["q-1".to_owned()]);
     let signed = answer_signature(&net, "c", "q-1", "继续")?;

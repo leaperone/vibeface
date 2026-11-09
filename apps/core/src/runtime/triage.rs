@@ -2364,7 +2364,15 @@ impl Runtime {
                     Some(event.turn_id.clone())
                 };
                 *target = if let Some(native_turn) = native_turn {
-                    store.native_input_target(network, &owner, &event.session_id, &native_turn)?
+                    match store.native_input_target(
+                        network,
+                        &owner,
+                        &event.session_id,
+                        &native_turn,
+                    )? {
+                        Some(target) => Some(target),
+                        None => store.attributed_session_input_target(network, &owner, about)?,
+                    }
                 } else {
                     None
                 };
@@ -5761,7 +5769,13 @@ pub(super) mod tests {
 
                 let accepted = node.ingest_agent_event(turn("s1", "t5", "/w")).await?;
                 let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
-                assert_eq!(node.triage_command(raise).await?["conversation_id"], "d");
+                let raised = node.triage_command(raise).await?;
+                assert_eq!(raised["conversation_id"], "d");
+                let question = node.store.lock().await.question(
+                    &network,
+                    raised["question_id"].as_str().context("handed-over question")?,
+                )?.context("saved handed-over question")?;
+                assert_eq!(question["target"], json!({"kind":"bot_main","bot_id":"d"}));
                 Ok::<_, anyhow::Error>(())
             }
             .await;
