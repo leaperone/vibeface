@@ -1,7 +1,7 @@
 //! Read-model destinations follow signed inputs and verified execution bindings.
 use super::{Store, bots::bot_for_conversation_from, log, reduce, work, workspace};
 use crate::{
-    model::{EventBody, Role, Subject},
+    model::{Event, EventBody, Role, Subject},
     scheduling::{SessionScope, parse_schedule_trigger},
     workspace::InputTarget,
 };
@@ -358,6 +358,36 @@ pub(crate) fn question_input_target_from(
     .target())
 }
 
+pub(crate) fn question_event_input_target_from(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<Option<InputTarget>> {
+    let EventBody::QuestionAsked {
+        question_id,
+        target,
+        ..
+    } = &event.body
+    else {
+        return Ok(None);
+    };
+    if let Some(target) = target {
+        return Ok(Some(target.clone()));
+    }
+    if !super::event_about_from(
+        connection,
+        network,
+        &event.scope_id,
+        "question_asked",
+        question_id,
+    )?
+    .is_some_and(|question| question.event == *event)
+    {
+        return Ok(None);
+    }
+    question_input_target_from(connection, network, &event.scope_id, question_id)
+}
+
 pub(crate) fn trigger_is_main_from(
     connection: &Connection,
     network: &str,
@@ -413,8 +443,8 @@ pub(crate) fn notification_target_from(
         EventBody::WorkFinished { work_id, .. } => {
             Ok(target_from(connection, network, &event.scope_id, Source::Work(work_id))?.target())
         }
-        EventBody::QuestionAsked { question_id, .. } => {
-            question_input_target_from(connection, network, &event.scope_id, &question_id)
+        EventBody::QuestionAsked { .. } => {
+            question_event_input_target_from(connection, network, &event)
         }
         EventBody::SessionAttributed { .. } => {
             Ok(main_target_from(connection, network, &event.scope_id)?.target())

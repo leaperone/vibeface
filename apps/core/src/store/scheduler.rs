@@ -1339,12 +1339,9 @@ pub(super) fn event_in_session_scope_from(
         } => SessionScope::Routine {
             trigger: schedule_trigger(schedule_id, *slot_ms),
         },
-        EventBody::QuestionAsked { question_id, .. } => {
-            match super::scope_projection::question_input_target_from(
-                connection,
-                network,
-                conversation,
-                question_id,
+        EventBody::QuestionAsked { .. } => {
+            match super::scope_projection::question_event_input_target_from(
+                connection, network, event,
             )? {
                 Some(target) => target_scope(&target),
                 None => return Ok(false),
