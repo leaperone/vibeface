@@ -10,7 +10,7 @@
 
 仍找不到程序且没有保存 bin/PATH 时，仅查询操作系统登记登录 shell 的 PATH。Codex 的声明认证变量也沿用既有补缺流程。只读取验证过的固定名称，不导出整个环境或执行任意命令。shell 使用随机 NUL 帧、输出与时限限制，结束时回收进程树；用户启动脚本可能有自身副作用。
 
-保存的显式认证优先，其次是 Node 真实继承的命名认证环境，最后才复用本机 CLI 登录。Cursor 不从登录 shell 自动捕获 API key。`null` 只删除私有环境覆盖，不禁止进程继承或后续补缺。认证值不回读，不进入共享事件、工作记录或日志。
+除 Cursor 外，保存的显式认证优先，其次是 Node 真实继承的命名认证环境，最后才复用本机 CLI 登录。`null` 只删除私有环境覆盖，不禁止进程继承或后续补缺。认证值不回读，不进入共享事件、工作记录或日志。
 
 ## Codex 与 Claude Code
 
@@ -30,9 +30,9 @@ Claude 在检查或每次必要启动前，先用不含借用令牌的官方 `au
 
 ## Cursor
 
-Cursor 通过官方 `agent acp` 接入，直接复用 CLI 登录。缺少 API key 时自然使用订阅；保存或继承的 CURSOR_API_KEY/CURSOR_AUTH_TOKEN 仍可显式使用。显式认证在官方 memory credential store 中运行，避免改变个人 CLI 的凭据存储。缺认证时给出 `agent login` 命令，不自动打开浏览器。
+Cursor 只通过官方 `agent` 或 `cursor-agent` 的 ACP 接入，复用本机 CLI 的订阅登录。Node 和网页不请求、导入、传递或使用 CURSOR_API_KEY、CURSOR_AUTH_TOKEN，也不覆盖官方 credential store。缺认证时提供所选官方 CLI 的 `login` 命令，不自动打开浏览器。旧 SDK Bridge 不是可运行入口，也不生成其登录命令。
 
-订阅检查运行 `agent status --format json`，只保留状态枚举和认证布尔值，丢弃身份及消息。未登录也可能退出 0，退出码不能作为已认证证据。只有完整本地登录才继续 ACP 初始化，显式 key/token 则独立检查会话初始化结果。默认检查和执行从不调用会触发浏览器登录的 ACP authenticate。
+订阅检查运行 `agent status --format json`，只保留状态枚举和认证布尔值，丢弃身份及消息。未登录也可能退出 0，退出码不能作为已认证证据。只有完整本地登录才继续 ACP 初始化。默认检查和执行从不调用会触发浏览器登录的 ACP authenticate。
 
 ACP 会话使用每个 Node owner 的私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供官方 CLI 读取认证。该目录行为由 Cursor `2026.11.05-86047df` 官方发行源码确认；ACP 历史实际在 config 根的 `acp-sessions` 下，不能仅设置数据根。Node 只新建或加载自己持久记录归属的会话，不扫描个人历史。官方 CLI 仍可读取用户及项目的 MCP、规则或 hooks，私有根不代表禁用这些 CLI 资源。
 
