@@ -156,8 +156,9 @@ table "pending_events" {
     type = text
   }
   column "author" {
-    null = false
-    type = text
+    null    = false
+    type    = text
+    default = ""
   }
   column "missing" {
     null = false
@@ -232,9 +233,8 @@ table "messages" {
     type = text
   }
   column "author" {
-    null    = false
-    type    = text
-    default = ""
+    null = false
+    type = text
   }
   column "role" {
     null = false

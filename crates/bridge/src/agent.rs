@@ -212,18 +212,13 @@ fn process_start(process: u32) -> Result<String> {
     Ok(value)
 }
 impl Processes {
+    /// Writes this run's processes plus any earlier record whose tree is not confirmed gone, so
+    /// a tree an earlier start could not end is still there to try again after the next start.
     fn save(&self, running: &BTreeMap<String, Tracked>) -> Result<()> {
         let Some(path) = &self.pidfile else {
             return Ok(());
         };
-        if running.is_empty() {
-            return match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            };
-        }
-        let records: Vec<_> = running
+        let mut records: Vec<_> = running
             .iter()
             .map(|(token, tracked)| ProcessRecord {
                 token: token.clone(),
@@ -231,6 +226,21 @@ impl Processes {
                 identity: tracked.identity.clone(),
             })
             .collect();
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(earlier) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes)
+        {
+            records.extend(earlier.into_iter().filter(|record| {
+                !running.contains_key(&record.token)
+                    && !matches!(platform::tree::Leftover::find(&record.token), Ok(None))
+            }));
+        }
+        if records.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
         platform::privatefs::write_atomic(path, &serde_json::to_vec(&records)?)
     }
     fn track(&self, token: String, tracked: Tracked) -> Result<()> {
@@ -1437,6 +1447,9 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
 /// Whether an environment value is a credential worth hiding in shared records. Ordinary values
 /// such as `DEBUG=1` or a workspace path must not be replaced, or every "1" in a reply vanishes.
 fn credential_value(name: &str, value: &str) -> bool {
+    if value.len() < 8 {
+        return false;
+    }
     if ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
@@ -1600,7 +1613,8 @@ mod credential_tests {
 
     #[test]
     fn credential_values_are_selected_by_name_or_shape_only() {
-        assert!(credential_value("CURSOR_API_KEY", "k!"));
+        assert!(credential_value("CURSOR_API_KEY", "k!secret1"));
+        assert!(!credential_value("FOO_TOKEN", "1"));
         assert!(credential_value(
             "DATABASE_URL",
             "postgres://app:s3cret@db.internal/app"
