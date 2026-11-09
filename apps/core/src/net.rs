@@ -21,12 +21,9 @@ use std::{
     time::Duration,
 };
 
-pub mod bootstrap;
-mod discovery;
 mod lan;
-pub mod pkarr;
+pub mod mesh;
 
-pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
@@ -35,8 +32,7 @@ pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";
 pub const SERVICE: &[u8] = b"vibeface/service/1";
-/// Every Node answers discovery probes; registrations and lookups only with `serve_discovery`.
-pub const ALPNS: [&[u8]; 8] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE, DISCOVERY];
+pub const ALPNS: [&[u8]; 7] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
@@ -68,23 +64,12 @@ impl std::error::Error for Unanswered {}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    #[serde(default)]
-    pub pkarr: pkarr::PkarrConfig,
     /// UDP address of the iroh endpoint; defaults to all interfaces on the `listen` port.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
     /// Extra iroh relays besides the ones the personal network's Nodes run.
     #[serde(default)]
     pub relays: Vec<Relay>,
-    /// Also use n0's public relays.
-    #[serde(default)]
-    pub n0_relays: bool,
-    /// Infrastructure this Node uses for address discovery and simultaneous direct probes.
-    #[serde(default)]
-    pub discovery: Vec<String>,
-    /// Answer other devices' discovery registrations and lookups on this Node's UDP endpoint.
-    #[serde(default)]
-    pub serve_discovery: bool,
     /// Run an iroh relay on this address.
     #[serde(default)]
     pub relay_listen: Option<SocketAddr>,
@@ -110,10 +95,8 @@ pub struct NetworkConfig {
     /// Device IDs the relay refuses.
     #[serde(default)]
     pub relay_blocked: Vec<String>,
-    /// How this Node finds public infrastructure. Off in `default()`, so fixtures stay offline;
-    /// initialization turns the public service on for ordinary Nodes.
     #[serde(default)]
-    pub bootstrap: bootstrap::Bootstrap,
+    pub mesh: mesh::MeshConfig,
 }
 
 /// A relay this Node uses, with the token it requires of devices outside its personal network.
@@ -158,13 +141,8 @@ pub fn same_token(a: &str, b: &str) -> bool {
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
-        self.pkarr.validate()?;
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
-        ensure!(self.discovery.len() <= 4, "too many discovery servers");
-        for server in &self.discovery {
-            discovery::validate_server(server)?;
-        }
-        self.bootstrap.validate()?;
+        self.mesh.validate()?;
         let mut urls = HashSet::new();
         for relay in &self.relays {
             ensure!(
@@ -218,18 +196,6 @@ impl NetworkConfig {
             (None, Some(listen)) => relay_url(&format!("http://{listen}")).map(Some),
             (None, None) => Ok(None),
         }
-    }
-
-    /// Every discovery service this Node registers with: the configured ones and the bootstrap
-    /// one, once each.
-    pub fn discovery_servers(&self) -> Result<Vec<String>> {
-        let mut servers = self.discovery.clone();
-        if let Some(discovery) = self.bootstrap.discovery()?
-            && !servers.contains(&discovery)
-        {
-            servers.push(discovery);
-        }
-        Ok(servers)
     }
 }
 
@@ -328,8 +294,8 @@ impl SignedAddress {
 pub struct Net {
     pub endpoint: Endpoint,
     lookup: MemoryLookup,
-    discovery: discovery::Discovery,
     lan: OnceLock<lan::Lan>,
+    mesh: OnceLock<Arc<mesh::Mesh>>,
     relays: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
 }
@@ -357,8 +323,8 @@ fn merge_relays(relays: Vec<(RelayUrl, Option<String>)>) -> Vec<(RelayUrl, Optio
 }
 
 impl Net {
-    /// Binds the endpoint. Addresses stay in tickets and the personal network unless the
-    /// operator configures a discovery service or public bootstrap is on.
+    /// Binds the endpoint. Addresses stay in tickets and the personal network until the mesh
+    /// starts.
     pub async fn bind(
         secret_key_hex: &str,
         config: &NetworkConfig,
@@ -376,14 +342,6 @@ impl Net {
         if let Some(own) = config.own_relay()? {
             urls.push((own, None));
         }
-        if config.n0_relays {
-            urls.extend(
-                iroh::defaults::prod::default_relay_map()
-                    .urls::<Vec<_>>()
-                    .into_iter()
-                    .map(|url| (url, None)),
-            );
-        }
         let mut known = HashSet::new();
         for (url, token) in merge_relays(urls) {
             known.insert(url.clone());
@@ -396,21 +354,6 @@ impl Net {
             .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
-        for url in &config.pkarr.urls {
-            let url = reqwest::Url::parse(url)?;
-            if config.pkarr.publish {
-                let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone());
-                let publisher = if config.pkarr.publish_direct {
-                    publisher.addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
-                } else {
-                    publisher
-                };
-                builder = builder.address_lookup(publisher);
-            }
-            if config.pkarr.resolve {
-                builder = builder.address_lookup(pkarr::FreshResolver::new(url)?);
-            }
-        }
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
@@ -434,27 +377,11 @@ impl Net {
             .bind()
             .await
             .context("QUIC endpoint failed to start")?;
-        // Registrants may make an open relay their home relay; any other is for those it admits.
-        let offered = if config.relay_open {
-            config.own_relay()?
-        } else {
-            None
-        };
-        // Registration runs in the background: the local API, maintenance and LAN start
-        // whether or not the public infrastructure answers.
-        let discovery = discovery::Discovery::new(
-            &endpoint,
-            &config.discovery_servers()?,
-            config.serve_discovery,
-            offered,
-            config.own_relay()?,
-            known.clone(),
-        )?;
         Ok(Self {
             endpoint,
             lookup,
-            discovery,
             lan: OnceLock::new(),
+            mesh: OnceLock::new(),
             relays: known,
             connections: Mutex::new(HashMap::new()),
         })
@@ -498,6 +425,22 @@ impl Net {
         self.endpoint
             .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
             .await;
+    }
+
+    pub async fn remove_relay(&self, url: &RelayUrl) {
+        self.relays.lock().await.remove(url);
+        self.endpoint.remove_relay(url).await;
+    }
+
+    /// Joins the mesh `config` names, keeping its records in `db`.
+    pub async fn start_mesh(&self, config: &mesh::MeshConfig, db: &std::path::Path) -> Result<()> {
+        let started = mesh::Mesh::start(self, config, db).await?;
+        ensure!(self.mesh.set(started).is_ok(), "the mesh already started");
+        Ok(())
+    }
+
+    pub fn mesh(&self) -> Option<Arc<mesh::Mesh>> {
+        self.mesh.get().cloned()
     }
 
     /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
@@ -595,18 +538,11 @@ impl Net {
             return Ok(connection.clone());
         }
         let connection = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let hint = self.discovery.resolve(id, Duration::from_secs(1)).await;
             let mut addresses = self
                 .lookup
                 .get_endpoint_info(id)
                 .map(|info| info.addrs().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            // Dialed as given, not added to the relay map: a relay there could become this
-            // Node's home relay and refuse it.
-            if let Some(found) = hint {
-                addresses.push(iroh::TransportAddr::Ip(found.address));
-                addresses.extend(found.relays.into_iter().map(iroh::TransportAddr::Relay));
-            }
             let lan = self.lan.get().map(|lan| lan.hints(device_id));
             addresses.extend(lan.into_iter().flatten().map(iroh::TransportAddr::Ip));
             self.endpoint
@@ -621,27 +557,6 @@ impl Net {
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
         Ok(connection)
-    }
-
-    /// The relays Discovery has registered for `device_id`, waiting up to `wait` for this
-    /// endpoint's registration sessions to come up.
-    pub async fn discovered_relays(
-        &self,
-        device_id: &str,
-        wait: Duration,
-    ) -> Result<Vec<RelayUrl>> {
-        let found = self.discovery.resolve(endpoint_id(device_id)?, wait).await;
-        Ok(found.map(|found| found.relays).unwrap_or_default())
-    }
-
-    pub(crate) fn discovery_router(self: &Arc<Self>) -> iroh::protocol::Router {
-        iroh::protocol::Router::builder(self.endpoint.clone())
-            .accept(DISCOVERY, discovery::Handler(Arc::downgrade(self)))
-            .spawn()
-    }
-
-    pub async fn serve_discovery(&self, connection: Connection) -> Result<()> {
-        self.discovery.serve(connection).await
     }
 
     pub fn path_kind(&self, device_id: &str) -> Option<PathKind> {
@@ -697,6 +612,9 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        if let Some(mesh) = self.mesh.get() {
+            mesh.close().await;
+        }
         self.endpoint.close().await;
     }
 }
@@ -1099,25 +1017,10 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_settings_are_validated() -> Result<()> {
-        let mut config = NetworkConfig {
-            bootstrap: bootstrap::Bootstrap::Public,
-            ..Default::default()
-        };
-        config.validate()?;
-        let servers = config.discovery_servers()?;
-        assert_eq!(servers.len(), 1);
-        assert!(servers[0].starts_with("vibeface://"));
-        config.discovery = servers.clone();
-        assert_eq!(
-            config.discovery_servers()?.len(),
-            1,
-            "the bootstrap Discovery is not registered twice"
-        );
-        assert!(NetworkConfig::default().discovery_servers()?.is_empty());
-        // The public node: Discovery and an open relay on one Node.
+    fn the_public_node_settings_are_valid() -> Result<()> {
+        // The default bootstrap node with an open relay.
         let public = NetworkConfig {
-            serve_discovery: true,
+            mesh: mesh::MeshConfig::public()?,
             relay_listen: Some("0.0.0.0:3340".parse()?),
             relay_url: Some("http://203.0.113.7:3340".into()),
             relay_open: true,

@@ -46,15 +46,23 @@ const WEBHOOK_KEY: &str = "triage-webhook.key";
 const DECISION_TOKENS: &str = "decision-tokens.json";
 pub const SPOOL_DIR: &str = "hook-spool";
 
-/// Where a webhook's reader answers. Without a public HTTPS URL, a Node on the public bootstrap
-/// is answered through the official public node, which hands each decision to it by device ID.
-fn decision_url(config: &config::Config) -> Result<String> {
-    let base = if config.public_url.starts_with("https://")
-        || config.network.bootstrap != net::bootstrap::Bootstrap::Public
-    {
-        config.public_url.clone()
-    } else {
-        net::bootstrap::PublicDefaults::load()?.gateway_url
+fn public_https(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| url.scheme() == "https" && net::mesh::public_host(&url))
+}
+
+/// Where a webhook's reader answers: `public_url` when it is public HTTPS, else one of the
+/// mesh's verified `gateways`, the default bootstrap node's first, which hands each decision to
+/// this Node by device ID.
+fn decision_url(public_url: &str, gateways: &[(String, String)]) -> Result<String> {
+    let anchor = net::mesh::default_bootstrap_id()?;
+    let gateway = gateways
+        .iter()
+        .find(|(device, _)| *device == anchor)
+        .or(gateways.first());
+    let base = match gateway {
+        Some((_, url)) if !public_https(public_url) => url,
+        _ => public_url,
     };
     Ok(format!("{}/api/decision", base.trim_end_matches('/')))
 }
@@ -2339,6 +2347,14 @@ impl Runtime {
         )
     }
 
+    async fn decision_url(&self) -> Result<String> {
+        let gateways = match self.net().ok().and_then(|net| net.mesh()) {
+            Some(mesh) if !public_https(&self.config.public_url) => mesh.gateways(&[]).await,
+            _ => vec![],
+        };
+        decision_url(&self.config.public_url, &gateways)
+    }
+
     /// Queues a new question for the webhook when its project's outlet says so.
     async fn send_question(&self, question: &Value, cwd: &str) -> Result<bool> {
         let config = self.triage.config();
@@ -2357,7 +2373,7 @@ impl Runtime {
             "schema_version":triage::SCHEMA_VERSION, "type":"question", "event_id":question_id,
             "question_id":question_id, "severity":question["severity"], "text":question["text"],
             "choices":choices, "about":question["about"], "bot":question["bot"],
-            "answer":{"url":decision_url(&self.config)?, "device_id":self.identity.device_id()?,
+            "answer":{"url":self.decision_url().await?, "device_id":self.identity.device_id()?,
                 "question_id":question_id},
         });
         self.queue_webhook(question_id, &body).await?;
@@ -2605,7 +2621,7 @@ impl Runtime {
             "webhook_url":config.webhook_url, "scan_codex_sessions":config.scan_codex_sessions,
             "codex_sessions":config.codex_sessions,
             "webhook_secret_set":self.webhook_secret()?.is_some(),
-            "decision_url":decision_url(&self.config)?, "device_id":self.identity.device_id()?,
+            "decision_url":self.decision_url().await?, "device_id":self.identity.device_id()?,
             "decision_tokens":tokens, "outbox":outbox, "status":self.triage_status().await?,
         }))
     }
@@ -2970,16 +2986,35 @@ pub(super) mod tests {
     use vibeface_bridge::failure::FailureKind;
 
     #[test]
-    fn decisions_reach_a_node_without_public_https_through_the_public_node() -> Result<()> {
-        let mut config = Config::local("127.0.0.1:4792".parse().unwrap(), vec![], false);
-        assert_eq!(decision_url(&config)?, "http://127.0.0.1:4792/api/decision");
-        config.network.bootstrap = net::bootstrap::Bootstrap::Public;
+    fn decisions_reach_a_node_without_public_https_through_a_mesh_gateway() -> Result<()> {
+        let local = "http://127.0.0.1:4792";
         assert_eq!(
-            decision_url(&config)?,
-            "https://node.vibeface.dev:4792/api/decision"
+            decision_url(local, &[])?,
+            "http://127.0.0.1:4792/api/decision"
         );
-        config.public_url = "https://node.example/".into();
-        assert_eq!(decision_url(&config)?, "https://node.example/api/decision");
+        let other = ("ab".repeat(32), "https://other.example".to_owned());
+        let anchor = (
+            net::mesh::default_bootstrap_id()?,
+            "https://node.vibeface.dev:4792".to_owned(),
+        );
+        assert_eq!(
+            decision_url(local, std::slice::from_ref(&other))?,
+            "https://other.example/api/decision"
+        );
+        assert_eq!(
+            decision_url(local, &[other.clone(), anchor])?,
+            "https://node.vibeface.dev:4792/api/decision",
+            "the default bootstrap node's gateway goes first"
+        );
+        assert_eq!(
+            decision_url("https://192.168.1.2", std::slice::from_ref(&other))?,
+            "https://other.example/api/decision",
+            "a private HTTPS URL is no public answer"
+        );
+        assert_eq!(
+            decision_url("https://node.example/", &[other])?,
+            "https://node.example/api/decision"
+        );
         Ok(())
     }
 
@@ -7702,7 +7737,7 @@ pub(super) mod tests {
             assert_eq!(headers["x-vibeface-signature"].to_str()?, triage::signature(secret.as_bytes(), timestamp, body));
             let body: Value = serde_json::from_str(body)?;
             assert_eq!((body["type"].clone(), body["choices"][1].clone()), (json!("question"), json!({"index":1,"label":"不修"})));
-            assert_eq!(body["answer"], json!({"url":decision_url(&node.config)?,"device_id":node.identity.device_id()?,"question_id":question}));
+            assert_eq!(body["answer"], json!({"url":node.decision_url().await?,"device_id":node.identity.device_id()?,"question_id":question}));
             let answered: Value = serde_json::from_str(&received[1].1)?;
             let network = node.network_id().await?;
             let hash = node.store.lock().await.message(&network, "c", &format!("a-{question}"))?.context("answer")?.event_hash;

@@ -417,6 +417,67 @@ impl Delivery {
         );
         Ok(())
     }
+    /// The service this Node offers on the mesh: the paid terms its `Announce` gives when it can
+    /// quote, else charity without an offer.
+    pub(crate) fn mesh_role(&self) -> Option<crate::net::mesh::record::Role> {
+        use crate::net::mesh::record::{Offer, Role, ServiceKind};
+        let config = self.config();
+        let quotable = config.paid_enabled
+            && Amount::from_decimal_str(&config.provider_gas_cap)
+                .is_ok_and(|cap| cap != Amount::ZERO);
+        let offer = match (
+            &config.chain,
+            deployment(&config, Mode::Paid),
+            self.identity.device_id(),
+        ) {
+            (Some(chain), Ok((_, escrow)), Ok(device)) if quotable => Some(Offer {
+                asset: chain.asset.clone(),
+                price: config.delivery_fee_per_window.clone(),
+                escrow: format!("0x{}", hex::encode(escrow)),
+                // ponytail: names the service only; grants come with settlement.
+                grant_endpoint: format!("vibeface://{device}/service/1"),
+            }),
+            _ => None,
+        };
+        (config.enabled && (offer.is_some() || config.charity_enabled)).then_some(Role::Service {
+            service: ServiceKind::Delivery,
+            offer,
+        })
+    }
+    /// Delivery services other Nodes offer on the mesh, most recently seen first.
+    fn providers(&self, node: &Runtime) -> Result<Value> {
+        use crate::net::mesh::record::{Role, ServiceKind};
+        let own = self.identity.device_id()?;
+        let mut providers: Vec<(u64, Value)> = match node.net().ok().and_then(|net| net.mesh()) {
+            Some(mesh) => mesh
+                .table()
+                .online(crate::runtime::now_ms() as u64)
+                .filter(|entry| entry.record.device_id != own)
+                .filter_map(|entry| {
+                    entry.record.roles.iter().find_map(|role| match role {
+                        Role::Service {
+                            service: ServiceKind::Delivery,
+                            offer,
+                        } => Some((
+                            entry.last_seen_ms,
+                            json!({"device_id":entry.record.device_id,"paid":offer.is_some(),
+                                "offer":offer,"last_seen_ms":entry.last_seen_ms}),
+                        )),
+                        _ => None,
+                    })
+                })
+                .collect(),
+            None => vec![],
+        };
+        providers.sort_by_key(|(seen, _)| std::cmp::Reverse(*seen));
+        // ponytail: the 256 most recent; paging if a picker ever needs more.
+        let providers: Vec<Value> = providers
+            .into_iter()
+            .take(256)
+            .map(|(_, provider)| provider)
+            .collect();
+        Ok(json!({"providers":providers}))
+    }
     async fn chain(&self) -> Result<chain::Chain> {
         chain::Chain::connect(
             self.config()
@@ -445,6 +506,7 @@ impl Delivery {
             .context("delivery operation is required")?;
         match op {
             "status" => self.status(),
+            "providers" => self.providers(node),
             "find_intent" => {
                 let intent = text(&params, "intent_id")?;
                 uuid::Uuid::parse_str(intent)?;

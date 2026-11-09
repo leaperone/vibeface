@@ -182,6 +182,16 @@ pub struct Health {
     pub write_state: Option<crate::store::WriteState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerHealth>,
+    /// Present while the mesh runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshHealth>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHealth {
+    /// Records that have not expired, this Node's own included.
+    pub records: usize,
+    pub neighbors: usize,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +228,11 @@ enum Command {
         action: crate::delivery::KeyAction,
         intent_id: String,
         gas_cap: String,
+    },
+    /// Edit the mesh bootstrap nodes in config.json and the running mesh.
+    MeshBootstrap {
+        add: Vec<String>,
+        remove: Vec<String>,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -430,6 +445,16 @@ pub async fn join(data_dir: &Path, link: &str, name: &str) -> Result<crate::clie
     response.join.context("node did not report its join")
 }
 
+/// Hands `vibeface mesh bootstrap` to the running Node, which saves the list and joins through it.
+pub async fn mesh_bootstrap(data_dir: &Path, add: Vec<String>, remove: Vec<String>) -> Result<()> {
+    let (_, response) = request(data_dir, Command::MeshBootstrap { add, remove }).await?;
+    ensure!(
+        response.status == Status::Healthy,
+        "node did not apply the bootstrap nodes"
+    );
+    Ok(())
+}
+
 pub async fn delivery_wallet(
     data_dir: &Path,
     command: crate::delivery::wallet::WalletCommand,
@@ -503,6 +528,10 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
         web_enabled: runtime.config.web_enabled,
         write_state: Some(write_state),
         peers: runtime.peer_health().await,
+        mesh: runtime.net().ok().and_then(|net| net.mesh()).map(|mesh| {
+            let (records, neighbors) = mesh.counts();
+            MeshHealth { records, neighbors }
+        }),
     };
     let mut response = Response {
         protocol: PROTOCOL,
@@ -587,6 +616,13 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     };
                     response.error = Some(error.to_string());
                 }
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::MeshBootstrap { add, remove } => {
+            if let Err(error) = runtime.edit_mesh_bootstrap(&add, &remove).await {
+                response.status = Status::Error;
+                response.error = Some(error.to_string());
             }
             write_packet(&mut stream, &response).await?;
         }

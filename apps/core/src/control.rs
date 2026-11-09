@@ -6,7 +6,10 @@ use crate::{
     discovery,
     local_access::Launcher,
     maintenance,
-    net::{self, NetworkConfig},
+    net::{
+        self, NetworkConfig,
+        mesh::{self, MeshConfig},
+    },
     providers::{AppServer, AppServerMode, Provider, ProviderEnv},
     store::Store,
 };
@@ -52,10 +55,6 @@ struct InitOptions {
     /// `(relay URL, token file)`: the token this Node presents to one of `relays`.
     #[serde(default)]
     relay_tokens: Vec<(String, PathBuf)>,
-    #[serde(default)]
-    discovery: Vec<String>,
-    #[serde(default)]
-    serve_discovery: bool,
     relay_listen: Option<SocketAddr>,
     relay_url: Option<String>,
     /// File with the token this Node's relay asks of devices outside its personal network.
@@ -79,32 +78,35 @@ struct InitOptions {
     #[serde(default)]
     bins: Vec<(Provider, PathBuf)>,
     codex_socket: Option<PathBuf>,
-    /// `off`, `public`, or the `vibeface://` URL of a self-hosted Discovery. A fresh Node that
-    /// does not serve discovery itself defaults to `public`.
-    bootstrap: Option<String>,
+    #[serde(default)]
+    no_mesh: bool,
+    mesh_network: Option<String>,
+    /// Replaces the default bootstrap node.
+    #[serde(default)]
+    bootstrap: Vec<String>,
 }
 
 fn default_listen() -> SocketAddr {
     DEFAULT_LISTEN
 }
 
-/// The bootstrap a fresh Node gets: an explicit choice, else public unless this Node serves
-/// discovery itself.
-fn resolve_bootstrap(
-    choice: Option<&str>,
-    infrastructure: bool,
-) -> Result<net::bootstrap::Bootstrap> {
-    use net::bootstrap::Bootstrap;
-    let bootstrap = match choice.map(str::trim) {
-        None if infrastructure => Bootstrap::Off,
-        None | Some("public") => Bootstrap::Public,
-        Some("off") => Bootstrap::Off,
-        Some(discovery) => Bootstrap::Custom {
-            discovery: discovery.to_owned(),
-        },
+/// The mesh a fresh Node joins. The default bootstrap node is on the default network only.
+fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> Result<MeshConfig> {
+    let mut mesh = MeshConfig {
+        enabled: !no_mesh,
+        ..MeshConfig::public()?
     };
-    bootstrap.validate()?;
-    Ok(bootstrap)
+    if let Some(network) = network {
+        if network != mesh.network {
+            mesh.bootstrap.clear();
+        }
+        mesh.network = network;
+    }
+    if !bootstrap.is_empty() {
+        mesh.bootstrap = bootstrap;
+    }
+    mesh.validate()?;
+    Ok(mesh)
 }
 fn default_local_listen() -> SocketAddr {
     config::DEFAULT_LOCAL_LISTEN
@@ -137,6 +139,99 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
             data_dir,
             operation,
         } => wallet(&data_dir, operation),
+        vibeface_control::ControlRequest::Mesh {
+            data_dir,
+            operation,
+        } => mesh_control(&data_dir, operation).await,
+    }
+}
+
+/// The socket is missing or refuses: the Node is not running.
+fn stopped(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    })
+}
+
+/// `vibeface mesh`: reads the records in `mesh.sqlite3`, which the running Node keeps written
+/// through, and edits the bootstrap nodes in the running Node or, stopped, in config.json.
+async fn mesh_control(data_dir: &Path, operation: Value) -> Result<Value> {
+    validate_data_dir(data_dir)?;
+    let data_dir = fs::canonicalize(data_dir)
+        .context("initialized data directory is required; run vibeface init first")?;
+    let config = Config::load(&data_dir)?.network.mesh;
+    let entries = || mesh::table::read(&data_dir.join("mesh.sqlite3"), &config.network);
+    let now = crate::runtime::now_ms() as u64;
+    match operation["op"].as_str() {
+        Some("status") => {
+            let own = config::identity(&data_dir)?.device_id()?;
+            let entries = entries()?;
+            let neighbors = maintenance::probe(&data_dir)
+                .await
+                .ok()
+                .and_then(|health| health.mesh)
+                .map(|mesh| mesh.neighbors);
+            Ok(json!({
+                "enabled": config.enabled,
+                "network": config.network,
+                "bootstrap": config.bootstrap,
+                "records": entries.iter().filter(|entry| entry.online(now)).count(),
+                "neighbors": neighbors,
+                "own": entries.iter().find(|entry| entry.record.device_id == own).map(|entry| &entry.record),
+            }))
+        }
+        Some("records") => {
+            let role = operation["role"].as_str();
+            let mut entries = entries()?;
+            entries.retain(|entry| {
+                role.is_none_or(|role| {
+                    entry.record.roles.iter().any(|held| {
+                        serde_json::to_value(held).is_ok_and(|held| held["kind"] == role)
+                    })
+                })
+            });
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen_ms));
+            // The answer must fit a control packet.
+            let limit = operation["limit"].as_u64().unwrap_or(200).min(500) as usize;
+            let records: Vec<Value> = entries
+                .iter()
+                .take(limit)
+                .map(|entry| {
+                    json!({"online":entry.online(now),"last_seen_ms":entry.last_seen_ms,
+                        "record":entry.record})
+                })
+                .collect();
+            Ok(json!({"records":records,"total":entries.len()}))
+        }
+        Some("bootstrap") => {
+            let list = |key: &str| -> Result<Vec<String>> {
+                match &operation[key] {
+                    Value::Null => Ok(vec![]),
+                    value => {
+                        serde_json::from_value(value.clone()).context("invalid bootstrap list")
+                    }
+                }
+            };
+            let (add, remove) = (list("add")?, list("remove")?);
+            let running =
+                match maintenance::mesh_bootstrap(&data_dir, add.clone(), remove.clone()).await {
+                    Ok(()) => true,
+                    Err(error) if stopped(&error) => {
+                        let mut configuration = Config::load(&data_dir)?;
+                        configuration.network.mesh.edit_bootstrap(&add, &remove)?;
+                        configuration.save(&data_dir)?;
+                        false
+                    }
+                    Err(error) => return Err(error),
+                };
+            Ok(
+                json!({"bootstrap":Config::load(&data_dir)?.network.mesh.bootstrap,"running":running}),
+            )
+        }
+        _ => bail!("unknown mesh operation"),
     }
 }
 
@@ -189,18 +284,10 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
     });
     let status = match &health {
         Ok(_) => "running",
-        Err(error)
-            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                )
-            }) =>
-        {
-            "stopped"
-        }
+        Err(error) if stopped(error) => "stopped",
         Err(_) => "unavailable",
     };
+    let running_mesh = health.as_ref().ok().and_then(|health| health.mesh.as_ref());
     let error = health.as_ref().err().map(|error| format!("{error:#}"));
     Ok(json!({
         "status": status,
@@ -213,7 +300,12 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
         "version": health.as_ref().ok().map(|health| &health.version),
         "write_state": health.as_ref().ok().and_then(|health| health.write_state),
-        "bootstrap": configuration.network.bootstrap.label(),
+        "mesh": {
+            "enabled": configuration.network.mesh.enabled,
+            "network": configuration.network.mesh.network,
+            "records": running_mesh.map(|mesh| mesh.records),
+            "neighbors": running_mesh.map(|mesh| mesh.neighbors),
+        },
         "peers": health.as_ref().ok().map(|health| &health.peers),
         "core_version": authoritative_core_version(health.as_ref().ok()),
         "error": error,
@@ -348,14 +440,7 @@ async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<bool> {
     validate_data_dir(data_dir)?;
     match maintenance::set_local_access(data_dir, enabled).await {
         Ok(()) => Ok(true),
-        Err(error)
-            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                )
-            }) =>
-        {
+        Err(error) if stopped(&error) => {
             let mut configuration = Config::load(data_dir)?;
             configuration.local_auto_access = enabled;
             configuration.save(data_dir)?;
@@ -410,7 +495,7 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
     };
     if empty {
         let mut configuration = Config::local(DEFAULT_LISTEN, vec![], false);
-        configuration.network.bootstrap = net::bootstrap::Bootstrap::Public;
+        configuration.network.mesh = MeshConfig::public()?;
         initialize(dir, configuration)?;
     }
     Ok(())
@@ -465,8 +550,6 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     }
     configuration.network = NetworkConfig {
         relays,
-        discovery: options.discovery,
-        serve_discovery: options.serve_discovery,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
         relay_operator_token: options
@@ -478,7 +561,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         relay_rate: options.relay_rate,
         relay_max_clients: options.relay_max_clients,
         relay_max_clients_per_ip: options.relay_max_clients_per_ip,
-        bootstrap: resolve_bootstrap(options.bootstrap.as_deref(), options.serve_discovery)?,
+        mesh: init_mesh(options.no_mesh, options.mesh_network, options.bootstrap)?,
         ..NetworkConfig::default()
     };
     let forwarding = &mut configuration.forwarding;
@@ -511,7 +594,8 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         &discovery::Host::current(),
     )?;
     let web_enabled = configuration.web_enabled;
-    let bootstrap = configuration.network.bootstrap.label();
+    let mesh = &configuration.network.mesh;
+    let mesh = json!({"enabled":mesh.enabled,"network":mesh.network,"bootstrap":mesh.bootstrap});
     let open =
         if configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified() {
             format!("http://localhost:{}", configuration.listen.port())
@@ -528,7 +612,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         "data_dir": data_dir,
         "web_enabled": web_enabled,
         "open": web_enabled.then_some(open),
-        "bootstrap": bootstrap,
+        "mesh": mesh,
         "device_id": device_id,
     }))
 }
@@ -660,6 +744,7 @@ mod tests {
             web_enabled: true,
             write_state: None,
             peers: vec![],
+            mesh: None,
         };
         assert_eq!(
             super::authoritative_core_version(Some(&health)),
@@ -708,7 +793,7 @@ mod tests {
             "listen": "127.0.0.1:0",
             "local_listen": "127.0.0.1:0",
             "no_web": true,
-            "bootstrap": "off",
+            "no_mesh": true,
         }))
         .unwrap();
         assert!(initialize_from_options(options).is_err());
@@ -731,31 +816,25 @@ mod tests {
     }
 
     #[test]
-    fn fresh_nodes_bootstrap_publicly_unless_told_otherwise() {
-        use net::bootstrap::Bootstrap;
-        let custom = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
-        assert_eq!(resolve_bootstrap(None, false).unwrap(), Bootstrap::Public);
+    fn fresh_nodes_join_the_public_mesh_unless_told_otherwise() {
+        let public = MeshConfig::public().unwrap();
+        assert!(public.enabled && public.network == mesh::DEFAULT_NETWORK);
+        assert_eq!(public.bootstrap, [mesh::default_bootstrap().unwrap()]);
+        assert_eq!(init_mesh(false, None, vec![]).unwrap(), public);
+        assert!(!init_mesh(true, None, vec![]).unwrap().enabled);
+        let own = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
         assert_eq!(
-            resolve_bootstrap(None, true).unwrap(),
-            Bootstrap::Off,
-            "a Node serving discovery is the infrastructure"
+            init_mesh(false, None, vec![own.into()]).unwrap().bootstrap,
+            [own]
         );
-        assert_eq!(
-            resolve_bootstrap(Some("off"), false).unwrap(),
-            Bootstrap::Off
+        let lab = init_mesh(false, Some("lab".into()), vec![]).unwrap();
+        assert!(
+            lab.bootstrap.is_empty(),
+            "the default bootstrap node is on the default network only"
         );
-        assert_eq!(
-            resolve_bootstrap(Some("public"), true).unwrap(),
-            Bootstrap::Public
-        );
-        assert_eq!(
-            resolve_bootstrap(Some(custom), false).unwrap(),
-            Bootstrap::Custom {
-                discovery: custom.into(),
-            }
-        );
-        assert!(resolve_bootstrap(Some("https://not-a-discovery"), false).is_err());
-        let dir = temp_dir("bootstrap-default");
+        assert!(init_mesh(false, Some("Lab".into()), vec![]).is_err());
+        assert!(init_mesh(false, None, vec!["https://not-a-node".into()]).is_err());
+        let dir = temp_dir("mesh-default");
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
             "no_web": true,
@@ -764,16 +843,58 @@ mod tests {
         }))
         .unwrap();
         let result = initialize_from_options(options).unwrap();
-        assert_eq!(result["bootstrap"], "public");
-        assert_eq!(
-            Config::load(&dir).unwrap().network.bootstrap,
-            Bootstrap::Public
-        );
+        assert_eq!(result["mesh"]["enabled"], true);
+        assert_eq!(Config::load(&dir).unwrap().network.mesh, public);
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `vibeface mesh` on a stopped Node: bootstrap edits land in config.json, checked as
+    /// `init` checks them, and the empty table reads back.
+    #[tokio::test]
+    async fn mesh_bootstrap_edits_reach_the_config_of_a_stopped_node() -> Result<()> {
+        let dir = temp_dir("mesh-control");
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "no_web": true,
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+        }))?;
+        initialize_from_options(options)?;
+        let device = "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235";
+        let added = format!("vibeface://{device}@127.0.0.1:4792");
+        let edit = |add: Vec<&str>, remove: Vec<&str>| {
+            mesh_control(&dir, json!({"op":"bootstrap","add":add,"remove":remove}))
+        };
+        let result = edit(vec![&added], vec![]).await?;
+        assert_eq!(result["running"], false);
+        let default = mesh::default_bootstrap()?;
+        assert_eq!(result["bootstrap"], json!([default, added]));
+        assert!(
+            edit(vec!["vibeface://zz@127.0.0.1:1"], vec![])
+                .await
+                .is_err()
+        );
+        assert!(
+            edit(vec![], vec![&"ab".repeat(32)]).await.is_err(),
+            "not listed"
+        );
+        let result = edit(vec![], vec![&mesh::default_bootstrap_id()?]).await?;
+        assert_eq!(result["bootstrap"], json!([added]));
+        assert_eq!(Config::load(&dir)?.network.mesh.bootstrap, [added]);
+        let status = mesh_control(&dir, json!({"op":"status"})).await?;
+        assert_eq!(
+            (&status["records"], &status["neighbors"], &status["own"]),
+            (&json!(0), &Value::Null, &Value::Null)
+        );
+        let records = mesh_control(&dir, json!({"op":"records","role":"gateway"})).await?;
+        assert_eq!(records["records"], json!([]));
+        assert!(mesh_control(&dir, json!({"op":"other"})).await.is_err());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
-    fn a_public_node_serves_discovery_and_an_open_paced_relay_and_forwards_to_anyone() {
+    fn a_public_node_runs_an_open_paced_relay_and_forwards_to_anyone() {
         let dir = temp_dir("public-node");
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
@@ -781,7 +902,6 @@ mod tests {
             "local_listen": free_addr(),
             "public_url": "https://app.example",
             "tls": true,
-            "serve_discovery": true,
             "relay_listen": "127.0.0.1:0",
             "relay_open": true,
             "relay_rate": 65536,
@@ -795,13 +915,9 @@ mod tests {
             "trusted_proxies": ["203.0.113.1"],
         }))
         .unwrap();
-        let result = initialize_from_options(options).unwrap();
-        assert_eq!(
-            result["bootstrap"], "off",
-            "a Node serving discovery is the infrastructure"
-        );
+        initialize_from_options(options).unwrap();
         let saved = Config::load(&dir).unwrap();
-        assert!(saved.network.serve_discovery && saved.network.relay_open);
+        assert!(saved.network.mesh.enabled && saved.network.relay_open);
         assert_eq!(saved.network.relay_rate.map(NonZeroU32::get), Some(65536));
         assert_eq!(
             saved.network.relay_max_clients.map(NonZeroUsize::get),
@@ -862,7 +978,7 @@ mod tests {
                 "no_web": true,
                 "listen": free_addr(),
                 "local_listen": free_addr(),
-                "bootstrap": "off",
+                "no_mesh": true,
                 "relays": ["https://relay.example", "https://other.example"],
                 "relay_tokens": relay_tokens,
             }))
@@ -901,7 +1017,7 @@ mod tests {
                 "local_listen": local_listen,
                 "no_web": true,
                 "codex_socket": socket,
-                "bootstrap": "off",
+                "no_mesh": true,
             }))
             .unwrap();
             initialize_from_options(options).unwrap();
@@ -947,7 +1063,7 @@ mod tests {
             "local_listen": "127.0.0.1:0",
             "no_web": true,
             "relays": ["https://relay.test/?token=secret"],
-            "bootstrap": "off",
+            "no_mesh": true,
         }))
         .unwrap();
         let error = initialize_from_options(options).unwrap_err().to_string();
@@ -971,9 +1087,9 @@ mod tests {
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
             assert_eq!(
-                Config::load(&dir).unwrap().network.bootstrap,
-                net::bootstrap::Bootstrap::Public,
-                "a fresh direct start bootstraps from the public infrastructure"
+                Config::load(&dir).unwrap().network.mesh,
+                MeshConfig::public().unwrap(),
+                "a fresh direct start joins the public mesh"
             );
             let runtime = crate::runtime::Runtime::open(&dir).await.unwrap();
             drop(runtime);

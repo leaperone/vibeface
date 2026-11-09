@@ -213,6 +213,14 @@ impl Runtime {
             .await?,
         );
         ensure!(self.net.set(net.clone()).is_ok(), "network already started");
+        let mesh = &self.config.network.mesh;
+        if mesh.enabled
+            && let Err(error) = net
+                .start_mesh(mesh, &self.data_dir.join("mesh.sqlite3"))
+                .await
+        {
+            tracing::warn!(event = "mesh.off", %error, "the mesh is off");
+        }
         let weak = Arc::downgrade(self);
         let mut router = Router::builder(net.endpoint.clone());
         for alpn in net::ALPNS {
@@ -223,6 +231,9 @@ impl Runtime {
                     alpn,
                 },
             );
+        }
+        if let Some(mesh) = net.mesh() {
+            router = mesh.accept(router);
         }
         *self.router.lock().await = Some(router.spawn());
         if let Some(listen) = self.config.network.relay_listen {
@@ -277,6 +288,9 @@ impl Runtime {
     pub(super) async fn stop_network(&self) {
         if let Ok(net) = self.net() {
             net.stop_lan().await;
+            if let Some(mesh) = net.mesh() {
+                mesh.close().await;
+            }
         }
         if let Some(router) = self.router.lock().await.take() {
             let _ = router.shutdown().await;
@@ -357,9 +371,6 @@ impl Runtime {
         alpn: &'static [u8],
         connection: Connection,
     ) -> Result<()> {
-        if alpn == net::DISCOVERY {
-            return self.net()?.serve_discovery(connection).await;
-        }
         let remote = net::device_id(&connection.remote_id());
         if alpn == net::SERVICE {
             return self.delivery.serve(self.clone(), connection).await;
@@ -755,10 +766,14 @@ impl Runtime {
 
     async fn sync_loop(self: Arc<Self>) {
         let Ok(net) = self.net().cloned() else { return };
+        let mut joined = Vec::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                 _ = self.sync_wakeup.notified() => {},
+            }
+            if let Some(mesh) = net.mesh() {
+                mesh.set_roles(self.mesh_roles());
             }
             let Ok(state) = self.membership_state().await else {
                 continue;
@@ -789,6 +804,12 @@ impl Runtime {
                 .collect();
             // The loop also rolls the LAN tag over each hour.
             net.refresh_lan(Some(&network), &peers);
+            if let Some(mesh) = net.mesh()
+                && joined != peers
+            {
+                mesh.join_peers(&peers).await;
+                joined.clone_from(&peers);
+            }
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");
@@ -1566,6 +1587,43 @@ impl Runtime {
             .then(|| self.config.public_url.clone())
     }
 
+    /// What this Node offers on the mesh: a gateway when its web app is at a public HTTPS origin
+    /// and forwards for any device, and its delivery service.
+    pub(crate) fn mesh_roles(&self) -> Vec<net::mesh::record::Role> {
+        let url = &self.config.public_url;
+        let reachable = reqwest::Url::parse(url).is_ok_and(|parsed| {
+            self.config.network.mesh.allow_private || net::mesh::public_host(&parsed)
+        });
+        let gateway = (self.config.web_enabled
+            && self.config.forwarding.any
+            && reachable
+            && net::mesh::record::gateway_url(url).is_ok())
+        .then(|| net::mesh::record::Role::Gateway { url: url.clone() });
+        gateway
+            .into_iter()
+            .chain(self.delivery.mesh_role())
+            .collect()
+    }
+
+    /// Saves the bootstrap nodes `vibeface mesh bootstrap` changed and joins through them.
+    pub(crate) async fn edit_mesh_bootstrap(
+        &self,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        let bootstrap = {
+            let _save = self.config_save.lock().await;
+            let mut config = crate::config::Config::load(&self.data_dir)?;
+            config.network.mesh.edit_bootstrap(add, remove)?;
+            config.save(&self.data_dir)?;
+            config.network.mesh.bootstrap
+        };
+        if let Some(mesh) = self.net().ok().and_then(|net| net.mesh()) {
+            mesh.set_bootstrap(bootstrap).await;
+        }
+        Ok(())
+    }
+
     /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
     async fn refresh_own_address(&self, network: &str) -> Result<bool> {
         let net = self.net()?;
@@ -1670,6 +1728,28 @@ impl Runtime {
                     .open(network)
                     .is_ok_and(|record| view.node(&record.device_id).is_ok())
             })
+            .collect())
+    }
+
+    /// Verified public gateways on the mesh outside the personal network, at most 16.
+    pub(crate) async fn mesh_gateways(&self) -> Result<Vec<Value>> {
+        let Some(mesh) = self.net().ok().and_then(|net| net.mesh()) else {
+            return Ok(vec![]);
+        };
+        let members: Vec<String> = match self.membership_state().await {
+            Ok(state) => state
+                .project()?
+                .members
+                .into_iter()
+                .map(|member| member.device_id)
+                .collect(),
+            Err(_) => vec![],
+        };
+        Ok(mesh
+            .gateways(&members)
+            .await
+            .into_iter()
+            .map(|(device_id, url)| json!({"device_id":device_id,"url":url}))
             .collect())
     }
 

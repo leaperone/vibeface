@@ -833,7 +833,7 @@ async fn dispatch(
             let principal = principal(node, session).await?;
             let read_only = matches!(
                 params["op"].as_str(),
-                Some("status" | "list" | "get" | "find_intent" | "read")
+                Some("status" | "list" | "get" | "find_intent" | "read" | "providers")
             );
             ensure!(
                 read_only || (principal.source == "membership" && principal.can_manage),
@@ -986,7 +986,10 @@ async fn dispatch(
         }
         "entrances" => {
             let principal = principal(node, session).await?;
-            Ok(json!({"entrances":node.entrances(&principal.network_id).await?}))
+            Ok(
+                json!({"entrances":node.entrances(&principal.network_id).await?,
+                "gateways":node.mesh_gateways().await?}),
+            )
         }
         "join_check" => {
             let state = node
@@ -1634,84 +1637,86 @@ struct PendingJoin {
 struct JoinLink {
     net: Arc<Net>,
     entry: String,
-    _router: iroh::protocol::Router,
 }
 impl JoinLink {
+    /// A link to the ticket's entry Node, found on the mesh or through the configured relays.
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
+        let network = &node.config.network;
         let config = NetworkConfig {
-            discovery: node.config.network.discovery_servers()?,
-            bind: node
-                .config
-                .network
-                .bind
-                .map(|address| SocketAddr::new(address.ip(), 0)),
+            bind: network.bind.map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
-        // A relay configured with a token keeps it. Without Discovery the entry Node may run
-        // any other configured relay; with it, only the relays the entry registered get the
-        // invite token, so the others never see it.
-        let discovery = !config.discovery.is_empty();
-        let mut relays = node
-            .config
-            .network
+        // iroh reads a relay's token only when it first connects, and it connects to a relay in
+        // its map on its own once bound, so the relays go in once their tokens are known.
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, vec![]).await?);
+        let db = node.data_dir.join("mesh.sqlite3");
+        let (record, open) = match node.net().ok().and_then(|net| net.mesh()) {
+            Some(mesh) => {
+                let record = mesh.find(&entry).await;
+                let home = record.as_ref().and_then(|record| record.relay_url.clone());
+                let open = home
+                    .and_then(|url| net::relay_url(&url).ok())
+                    .is_some_and(|url| net::mesh::open_relay(mesh.table().entries(), &url));
+                (record, open)
+            }
+            None if network.mesh.enabled => {
+                let record = net::mesh::find_through(&link, &network.mesh, &db, &entry).await;
+                let home = record.as_ref().and_then(|record| record.relay_url.clone());
+                let open = home
+                    .and_then(|url| net::relay_url(&url).ok())
+                    .is_some_and(|url| {
+                        net::mesh::table::read(&db, &network.mesh.network)
+                            .is_ok_and(|entries| net::mesh::open_relay(&entries, &url))
+                    });
+                (record, open)
+            }
+            None => (None, false),
+        };
+        let entry_addr = record
+            .as_ref()
+            .map(|record| net::mesh::record_addr(record, network.mesh.allow_private))
+            .transpose()?;
+        // A relay configured with a token keeps it. Found on the mesh, only the entry's home relay
+        // gets the invite token, unless it admits anyone; not found, the entry may run any
+        // configured relay.
+        let mut relays = network
             .relays
             .iter()
             .map(|relay| {
                 let credential = relay
                     .token
                     .clone()
-                    .or_else(|| (!discovery).then(|| token.clone()));
+                    .or_else(|| record.is_none().then(|| token.clone()));
                 Ok((net::relay_url(&relay.url)?, credential))
             })
             .collect::<Result<Vec<_>>>()?;
-        let n0 = if node.config.network.n0_relays {
-            iroh::defaults::prod::default_relay_map().urls::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        relays.extend(n0.iter().map(|url| (url.clone(), None)));
-        ensure!(
-            !relays.is_empty() || discovery,
-            "no relay or discovery server is configured to find the invite's entry Node"
-        );
-        // iroh reads a relay's token only when it first connects, and it connects to a relay
-        // in its map on its own once bound. With Discovery the endpoint binds without relays
-        // and they go in, with their tokens, once the entry's registered relays are known.
-        let initial = if discovery {
-            Vec::new()
-        } else {
-            relays.clone()
-        };
-        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, initial).await?);
-        if discovery {
-            for url in link.discovered_relays(&entry, net::DIAL_TIMEOUT).await? {
-                if n0.contains(&url) {
-                    continue;
-                }
-                match relays.iter_mut().find(|(known, _)| *known == url) {
-                    Some((_, credential @ None)) => *credential = Some(token.clone()),
-                    Some(_) => {}
-                    None => relays.push((url, Some(token.clone()))),
-                }
-            }
-            for (url, credential) in &relays {
-                link.insert_relay(url.clone(), credential.clone()).await;
+        if let Some(home) = entry_addr
+            .as_ref()
+            .and_then(|addr| addr.relay_urls().next())
+        {
+            let credential = (!open).then(|| token.clone());
+            match relays.iter_mut().find(|(known, _)| known == home) {
+                Some((_, slot @ None)) => *slot = credential,
+                Some(_) => {}
+                None => relays.push((home.clone(), credential)),
             }
         }
-        let addrs: Vec<TransportAddr> = relays
-            .into_iter()
-            .map(|(url, _)| TransportAddr::Relay(url))
-            .collect();
-        let router = link.discovery_router();
+        ensure!(
+            record.is_some() || !relays.is_empty(),
+            "the invite's entry Node is not on the mesh and no relay is configured to reach it"
+        );
+        for (url, credential) in &relays {
+            link.insert_relay(url.clone(), credential.clone()).await;
+        }
+        let mut addrs: Vec<TransportAddr> = entry_addr
+            .map(|addr| addr.addrs.into_iter().collect())
+            .unwrap_or_default();
+        addrs.extend(relays.into_iter().map(|(url, _)| TransportAddr::Relay(url)));
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
-        Ok(Self {
-            net: link,
-            entry,
-            _router: router,
-        })
+        Ok(Self { net: link, entry })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -2188,7 +2193,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn node_joins_reuse_the_configured_private_relay() -> Result<()> {
+    async fn node_joins_reach_the_entry_through_the_mesh_or_the_configured_relays() -> Result<()> {
         use crate::config::{self, Config};
         use iroh::protocol::{AcceptError, ProtocolHandler, Router};
         use iroh_relay::server::{Access, AccessControl, ClientRequest};
@@ -2311,31 +2316,41 @@ mod tests {
         let access = Arc::new(PrivateRelay::default());
         let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None, None).await?;
         let relay_url = format!("http://{}", relay.addr);
+        let mesh = |bootstrap: Vec<String>| net::mesh::MeshConfig {
+            enabled: true,
+            network: "join-test".into(),
+            bootstrap,
+            allow_private: true,
+        };
+        // An ordinary Node the others join the mesh through.
         let service = Arc::new(
             Net::bind(
                 &LocalIdentity::generate().secret_key_hex,
-                &NetworkConfig {
-                    serve_discovery: true,
-                    ..Default::default()
-                },
+                &NetworkConfig::default(),
                 0,
                 vec![],
             )
             .await?,
         );
-        let service_router = service.discovery_router();
-        let discovery = |v4: bool| -> Result<String> {
+        service
+            .start_mesh(&mesh(vec![]), &dir.join("service-mesh.sqlite3"))
+            .await?;
+        let service_mesh = service.mesh().context("the service mesh")?;
+        let service_router = service_mesh
+            .accept(Router::builder(service.endpoint.clone()))
+            .spawn();
+        let bootstrap = |v4: bool| -> Result<String> {
             let port = service
                 .endpoint
                 .bound_sockets()
                 .into_iter()
                 .find(|address| address.is_ipv4() == v4)
-                .context("discovery socket missing")?
+                .context("mesh socket missing")?
                 .port();
             let host = if v4 { "127.0.0.1" } else { "[::1]" };
             Ok(format!(
                 "vibeface://{}@{host}:{port}",
-                service.endpoint.id()
+                net::device_id(&service.endpoint.id())
             ))
         };
         let listed = |url: &str, token: Option<&str>| net::Relay {
@@ -2383,17 +2398,25 @@ mod tests {
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,
-                &NetworkConfig {
-                    discovery: vec![discovery(false)?],
-                    ..target.config.network.clone()
-                },
+                &target.config.network,
                 0,
                 vec![],
             )
             .await?,
         );
-        let router = Router::builder(target_net.endpoint.clone())
-            .accept(net::JOIN, JoinServer(target.clone()))
+        target_net
+            .start_mesh(
+                &mesh(vec![bootstrap(false)?]),
+                &dir.join("target-mesh.sqlite3"),
+            )
+            .await?;
+        let router = target_net
+            .mesh()
+            .context("the target mesh")?
+            .accept(
+                Router::builder(target_net.endpoint.clone())
+                    .accept(net::JOIN, JoinServer(target.clone())),
+            )
             .spawn();
         let result = async {
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -2406,33 +2429,24 @@ mod tests {
             check(&joining, &ticket, &access, Some(OPERATOR_TOKEN)).await?;
             let stale_relay = "http://127.0.0.1:9";
             let invite_token = net::relay_token(&ticket.invite_hash());
-            let watcher = Net::bind(
-                &LocalIdentity::generate().secret_key_hex,
-                &NetworkConfig {
-                    bind: Some("127.0.0.1:0".parse()?),
-                    discovery: vec![discovery(true)?],
-                    ..Default::default()
-                },
-                0,
-                vec![],
-            )
-            .await?;
+            let home = net::relay_url(&relay_url)?;
             tokio::time::timeout(Duration::from_secs(15), async {
-                while watcher
-                    .discovered_relays(&target_id, Duration::from_secs(1))
-                    .await?
-                    != [net::relay_url(&relay_url)?]
-                {
+                while !service_mesh.records().iter().any(|entry| {
+                    entry.record.device_id == target_id
+                        && entry
+                            .record
+                            .relay_url
+                            .as_deref()
+                            .is_some_and(|url| net::relay_url(url).is_ok_and(|url| url == home))
+                }) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                anyhow::Ok(())
             })
             .await
-            .context("Discovery did not learn the target's home relay")??;
-            watcher.close().await;
-            for (name, discovered, relays, expected_token) in [
+            .context("the mesh did not learn the target's home relay")?;
+            for (name, on_mesh, relays, expected_token) in [
                 (
-                    "discovered-relay",
+                    "home-relay-from-the-mesh",
                     true,
                     vec![
                         listed(stale_relay, Some(WRONG_TOKEN)),
@@ -2441,7 +2455,7 @@ mod tests {
                     Some(invite_token.as_str()),
                 ),
                 (
-                    "configured-token-over-discovered",
+                    "configured-token-over-the-mesh",
                     true,
                     vec![listed(&relay_url, Some(OPERATOR_TOKEN))],
                     Some(OPERATOR_TOKEN),
@@ -2456,10 +2470,10 @@ mod tests {
                 let configuration = NetworkConfig {
                     bind: Some("127.0.0.1:0".parse()?),
                     relays,
-                    discovery: if discovered {
-                        vec![discovery(true)?]
+                    mesh: if on_mesh {
+                        mesh(vec![bootstrap(true)?])
                     } else {
-                        vec![]
+                        Default::default()
                     },
                     ..Default::default()
                 };
@@ -2497,6 +2511,7 @@ mod tests {
         router.shutdown().await?;
         target_net.close().await;
         service_router.shutdown().await?;
+        service.close().await;
         relay.shutdown().await;
         drop((target, joining));
         std::fs::remove_dir_all(dir)?;

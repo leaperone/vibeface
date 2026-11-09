@@ -95,6 +95,11 @@ pub enum MaintenanceCommand {
         intent_id: String,
         gas_cap: String,
     },
+    /// Edit the mesh bootstrap nodes in config.json and the running mesh.
+    MeshBootstrap {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

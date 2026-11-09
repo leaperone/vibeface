@@ -57,6 +57,10 @@ pub enum ControlRequest {
         data_dir: PathBuf,
         operation: Value,
     },
+    Mesh {
+        data_dir: PathBuf,
+        operation: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
