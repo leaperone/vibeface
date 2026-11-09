@@ -137,7 +137,7 @@ struct Serve {
 }
 
 impl Serve {
-    /// Asks the tree to stop, then the drop ends what is left after a grace period.
+    /// Ends the managed tree, retaining its record if cleanup is unconfirmed.
     async fn stop(mut self) {
         self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
     }
@@ -146,7 +146,7 @@ impl Serve {
 impl Drop for Serve {
     /// The tools the serve started belong to its tree and end with it.
     fn drop(&mut self) {
-        if !self.reaped {
+        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
             self.tree.kill();
         }
         if matches!(tree::Leftover::find(self.tree.token()), Ok(None)) {
@@ -389,10 +389,7 @@ impl Opencode {
         }
         if let Some(running) = serve.as_mut()
             && (running.launch == launch || self.users.load(SeqCst) > 0)
-            && running
-                .child
-                .try_wait()
-                .is_ok_and(|status| status.is_none())
+            && tree::try_observe_exit(&mut running.child).is_ok_and(|status| status.is_none())
         {
             self.users.fetch_add(1, SeqCst);
             return Ok((running.conn.clone(), Use(self.users.clone())));
@@ -409,7 +406,7 @@ impl Opencode {
     async fn running(&self) -> Option<Conn> {
         let mut serve = self.serve.lock().await;
         let running = serve.as_mut()?;
-        (running.child.try_wait())
+        tree::try_observe_exit(&mut running.child)
             .is_ok_and(|status| status.is_none())
             .then(|| running.conn.clone())
     }
@@ -983,7 +980,7 @@ impl Opencode {
             let Some(serve) = serve.as_mut() else {
                 return Some(false);
             };
-            match serve.child.try_wait() {
+            match tree::try_observe_exit(&mut serve.child) {
                 Ok(None) => serve.conn.clone(),
                 Ok(Some(_)) => return Some(false),
                 Err(_) => return None,

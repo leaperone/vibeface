@@ -349,6 +349,39 @@ pathlib.Path(sys.argv[2]).write_text('completed')
 
 #[cfg(unix)]
 #[tokio::test]
+async fn observing_exit_preserves_the_owned_root_and_its_status() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt as _;
+    for killed in [false, true] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", if killed { "exec sleep 120" } else { "exit 7" }]);
+        let (mut spawned, mut child) = tree::Tree::spawn(command, "platform-observe", true)?;
+        let root = child.id();
+        if killed {
+            assert!(tree::try_observe_exit(&mut child)?.is_none());
+            child.start_kill()?;
+        }
+        let status =
+            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut child)).await??;
+        assert_eq!(tree::try_observe_exit(&mut child)?, Some(status));
+        assert_eq!(
+            child.id(),
+            root,
+            "observing exit does not release the owned root"
+        );
+        if killed {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        } else {
+            assert_eq!(status.code(), Some(7));
+        }
+        assert!(vibeface_bridge::agent::terminate_process_tree(&mut child, &mut spawned).await);
+        assert_eq!(child.wait().await?, status);
+        assert!(child.id().is_none());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_reaped_root_does_not_authorize_more_group_signals() -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;

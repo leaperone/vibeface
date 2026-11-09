@@ -15,6 +15,69 @@ use std::{path::Path, time::Duration};
 /// How long a tree gets to exit after being asked, before it is ended outright.
 pub(crate) const GRACE: Duration = Duration::from_secs(3);
 
+/// Observes exit without releasing an owned Unix child's PID. Windows retains its Job identity.
+pub fn try_observe_exit(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        let Some(pid) = child.id() else {
+            return child.try_wait();
+        };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        if info.si_signo == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        let raw = match info.si_code {
+            libc::CLD_EXITED => status << 8,
+            libc::CLD_KILLED => status,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected child exit observation",
+                ));
+            }
+        };
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    }
+    #[cfg(windows)]
+    {
+        child.try_wait()
+    }
+}
+
+/// Waits for exit while preserving the Unix PID until managed-tree signalling is finished.
+pub async fn observe_exit(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = try_observe_exit(child)? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A started process tree, kept for as long as the Node manages it.
 pub struct Tree {
     /// The record a journal stores so a later run can find the same tree.

@@ -524,7 +524,7 @@ impl CursorAgent {
         let identity = match process_start(group) {
             Ok(start) => ProcessIdentity::UnixStart(start),
             Err(error) => {
-                if child.try_wait()?.is_some() {
+                if platform::tree::try_observe_exit(&mut child)?.is_some() {
                     ProcessIdentity::Exited
                 } else {
                     tree.kill();
@@ -610,7 +610,7 @@ impl CursorAgent {
                     }
                 }
             }
-            let _ = terminate_process_tree(&mut child, &mut tree).await;
+            let cleared = terminate_process_tree(&mut child, &mut tree).await;
             stdout_task.abort();
             stderr_task.abort();
             if !stdout_joined {
@@ -620,7 +620,9 @@ impl CursorAgent {
             drop(stdin);
             drop(child);
             drop(tree);
-            processes.forget(&token);
+            if cleared {
+                processes.forget(&token);
+            }
             let _ = exit.send(true);
         });
         Ok(Rpc {
