@@ -109,16 +109,18 @@ def guard(info):
             and network.get('relay_open') is True and network.get('relay_operator_token') is None
             and network.get('relay_rate') and network.get('relay_max_clients')
             and network.get('relay_max_clients_per_ip') and forwarding['any'] is True and forwarding.get('rate')
-            and forwarding.get('per_ip') and forwarding.get('trusted_proxies'),
+            and forwarding.get('per_ip'),
             'the official node needs discovery, an open relay and browser forwarding, each within limits')
-    # The App reaches the browser API only through TLS that pins this Node's certificate.
-    require(config['web_enabled'] is True and config.get('tls') is True and config['public_url'] == APP_ORIGIN
+    # Browsers connect straight to this Node, so every limit counts the real peer address.
+    require(not forwarding.get('trusted_proxies'), 'the official node has no proxy in front to trust')
+    anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
+    # Browsers on the App page reach this Node at the address the image pins, over its own TLS certificate.
+    require(config['web_enabled'] is True and config.get('tls') is True and config['public_url'] == anchor['gateway_url']
             and APP_ORIGIN in config.get('allowed_origins', []),
-            'browser access needs TLS and the App origin as public_url and in allowed_origins')
+            'browser access needs TLS, the pinned gateway_url as public_url and the App origin in allowed_origins')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
-    anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
     require(result['device_id'] == expected['VIBEFACE_EXPECTED_DEVICE']
             and result['core_version'] == info['version'], 'existing Node identity or binary version differs')
     require(result['device_id'] == anchor['issuer'], 'the Node is not the issuer this image pins')
@@ -178,16 +180,17 @@ def self_test():
                 'files': {'vibeface-core': hashlib.sha256(b'fixture').hexdigest()}}
         (directory / 'COMPONENT-INFO.json').write_text(json.dumps(info))
         assert component_info(directory) == info
-        anchor = {'issuer': 'b' * 64, 'udp_host': '203.0.113.7', 'udp_port': 4792}
+        anchor = {'issuer': 'b' * 64, 'udp_host': '203.0.113.7', 'udp_port': 4792,
+                  'gateway_url': 'https://203.0.113.7:4792'}
         (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
         data = directory / 'data'; data.mkdir(mode=0o700)
         for name in ('identity.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
             (data / name).write_text('fixture')
         (data / 'data-epoch.json').write_text('{"data_epoch":1}')
-        config = {'listen': '0.0.0.0:4792', 'public_url': APP_ORIGIN, 'allowed_origins': [APP_ORIGIN],
+        config = {'listen': '0.0.0.0:4792', 'public_url': anchor['gateway_url'], 'allowed_origins': [APP_ORIGIN],
                   'web_enabled': True, 'tls': True, 'roots': [], 'manager': None,
                   'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
-                                 'trusted_proxies': ['203.0.113.1']},
+                                 'trusted_proxies': []},
                   'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_open': True,
                               'relay_operator_token': None, 'relay_rate': 65536, 'relay_max_clients': 512,
                               'relay_max_clients_per_ip': 16}}
@@ -236,9 +239,10 @@ def self_test():
             (data / 'identity.json').write_text('fixture')
             network, forwarding = config['network'], config['forwarding']
             for change in ({'allowed_origins': []}, {'public_url': 'https://other.example.invalid'},
+                           {'public_url': APP_ORIGIN},
                            {'web_enabled': False}, {'tls': False}, {'forwarding': dict(forwarding, any=False)},
                            {'forwarding': dict(forwarding, rate=None)}, {'forwarding': dict(forwarding, per_ip=None)},
-                           {'forwarding': dict(forwarding, trusted_proxies=[])},
+                           {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
                            {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
                            {'network': dict(network, relay_open=False)},
                            {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},

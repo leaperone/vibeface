@@ -6,10 +6,6 @@
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-/// The official App, whose `/api/decision` reaches the public node, which hands each decision
-/// to its Node by device ID.
-pub const APP_ORIGIN: &str = "https://app.vibeface.dev";
-
 const PUBLIC_DEFAULTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../config/public-bootstrap.json"
@@ -22,6 +18,9 @@ pub struct PublicDefaults {
     pub issuer: String,
     pub udp_host: String,
     pub udp_port: u16,
+    /// The public node's own HTTPS origin, its `public_url`: browsers and webhook readers reach
+    /// it there, and it forwards to any Node by device ID.
+    pub gateway_url: String,
 }
 
 impl PublicDefaults {
@@ -32,6 +31,12 @@ impl PublicDefaults {
         ensure!(
             defaults.udp_port != 0 && !defaults.udp_host.is_empty(),
             "invalid public discovery address"
+        );
+        let gateway = crate::config::http_origin(&defaults.gateway_url)?;
+        ensure!(
+            gateway.scheme() == "https"
+                && gateway.origin().ascii_serialization() == defaults.gateway_url,
+            "the public gateway must be an HTTPS origin"
         );
         Ok(defaults)
     }
@@ -109,6 +114,7 @@ mod tests {
         assert_eq!(device_id(&server.id), defaults.issuer);
         assert_eq!(server.host, file["udp_host"].as_str().unwrap());
         assert_eq!(u64::from(server.port), file["udp_port"].as_u64().unwrap());
+        assert_eq!(defaults.gateway_url, file["gateway_url"].as_str().unwrap());
         assert!(Bootstrap::Off.discovery()?.is_none());
         assert_eq!(
             serde_json::to_value(Bootstrap::default())?,

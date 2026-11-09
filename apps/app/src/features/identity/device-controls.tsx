@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Check, Copy, Wifi, WifiOff, X } from 'lucide-react'
+import { Check, Copy, RotateCcw, Wifi, WifiOff, X } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { Details, InlineError, SettingsDisclosure } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -24,6 +24,30 @@ export function CopyDiagnostics({ lines, label = '复制诊断信息' }: { lines
 }
 
 /**
+ * Where join links and a last resort reconnect reach a Node by device ID, kept on this device. The Node there only carries
+ * end-to-end encrypted frames to the device the link names, which proves its key.
+ */
+export function GatewayForm() {
+  const device = useDevice()
+  const [error, setError] = useState<unknown>(null)
+  const [saved, setSaved] = useState(false)
+  const choose = (address: string | null) => { try { device.setGateway(address); setError(null); setSaved(true) } catch (cause) { setSaved(false); setError(cause) } }
+  return <Details label="接入地址">
+    <form key={device.gateway} className="grid gap-2" noValidate onSubmit={(event) => {
+      event.preventDefault()
+      choose((event.currentTarget.elements.namedItem('gateway') as HTMLInputElement).value.trim())
+    }}>
+      <Input type="url" name="gateway" aria-label="接入地址" defaultValue={device.gateway} onChange={() => setSaved(false)} autoComplete="off" spellCheck={false} />
+      <div className="flex flex-wrap gap-2">
+        <Button type="submit" variant="outline" className="w-fit">{saved ? <Check aria-hidden="true" className="text-success" /> : null}<span role={saved ? 'status' : undefined}>{saved ? '已保存' : '保存'}</span></Button>
+        {device.gateway !== device.defaultGateway ? <Button type="button" variant="ghost" className="w-fit" onClick={() => choose(null)}><RotateCcw aria-hidden="true" />恢复默认</Button> : null}
+      </div>
+    </form>
+    {error ? <InlineError error={error} /> : null}
+  </Details>
+}
+
+/**
  * Settings → 高级 → 连接: where this browser connects, named once; the sidebar already shows it and whether it is online.
  * Folded under it, the saved addresses to drop (switching lives in the sidebar), the ids support asks for, and adding an
  * address by hand.
@@ -44,6 +68,7 @@ export function ConnectionSettings() {
       <Button type="button" variant="ghost" size="icon" aria-label="从列表删掉这个地址" title="从列表删掉这个地址" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
     <CopyDiagnostics lines={[['个人网络', directory?.network_id || ready.principal.network_id], ['授权版本', directory?.epoch], ['这个浏览器', identity?.deviceId], ['当前连接', ready.entry.device_id]]} />
+    <GatewayForm />
     <Details label="手动添加地址">
       <form className="grid gap-2" noValidate onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget

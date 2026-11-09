@@ -144,8 +144,9 @@ struct Init {
     /// Public browser entry URL.
     #[arg(long)]
     public_url: Option<String>,
-    /// Serve --listen over TLS only, with a self-signed certificate for --public-url's host
-    /// that the reverse proxy in front pins.
+    /// Serve --listen over TLS only, from tls-cert.pem and tls-key.pem in the data directory,
+    /// first a self-signed pair for --public-url's host; replaced files are served without a
+    /// restart.
     #[arg(long, requires = "public_url")]
     tls: bool,
     /// Disable the browser interface.

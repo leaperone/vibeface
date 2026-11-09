@@ -52,7 +52,7 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now } = {}) {
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -74,7 +74,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   // As the Node sends it.
   const sessionEntry = { address: 'https://node.example', device_id: target, local: true }
   const localState: { enabled: boolean; setup?: unknown } = { enabled: true }
-  const pageOrigin = local ? localEntry.address : entry.address
+  const pageOrigin = origin || (local ? localEntry.address : entry.address)
   const hash = invitation ? `#${invitation}` : fragment, pathname = invitation ? '/join' : '/'
   const location = { hash, pathname, href: `${pageOrigin}${pathname}${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
   const hashListeners = new Set<() => void>()
@@ -183,7 +183,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
   function load(filename: string): Record<string, unknown> {
-    if (extname(filename) === '.json') return { default: JSON.parse(readFileSync(filename, 'utf8')) }
+    if (extname(filename) === '.json') return { __esModule: true, default: JSON.parse(readFileSync(filename, 'utf8')) }
     const cached = modules.get(filename)
     if (cached) return cached.exports
     const module = { exports: {} }; modules.set(filename, module)
@@ -574,6 +574,28 @@ test('a join asks this page\'s Gateway to forward to the entry Node by its devic
     await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.deepEqual(plain(app.sockets.map(socket => socket.entry)), [{ kind: 'gateway', address: entry.address, device_id: target }])
     assert.ok(app.requests.some(request => request.method === 'join'))
+  } finally { app.close() }
+})
+
+test('the official page joins through the public node, or the access address this browser keeps instead', async () => {
+  const publicNode = JSON.parse(readFileSync(new URL('../../../../../config/public-bootstrap.json', import.meta.url), 'utf8')).gateway_url
+  const storage = new Map<string, string>()
+  const app = deviceHarness({ origin: 'https://app.vibeface.dev', storage })
+  try {
+    app.render(); await settle()
+    assert.equal(publicNode, 'https://8.217.72.118:4792')
+    assert.equal(app.render().gateway, publicNode)
+    assert.equal(app.render().defaultGateway, publicNode)
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    app.render().cancelJoin()
+    app.render().setGateway('https://mine.example')
+    assert.equal(app.render().gateway, 'https://mine.example')
+    assert.equal(storage.get('vibeface.gateway'), '"https://mine.example"')
+    await app.render().join('vibeface://join/vibeface1other', 'browser')
+    assert.deepEqual(plain(app.sockets.map(socket => 'address' in socket.entry ? socket.entry.address : '')).filter((address: string, i: number, all: string[]) => all.indexOf(address) === i), [publicNode, 'https://mine.example'])
+    app.render().setGateway(null)
+    assert.equal(app.render().gateway, publicNode)
+    assert.equal(storage.get('vibeface.gateway'), 'null')
   } finally { app.close() }
 })
 

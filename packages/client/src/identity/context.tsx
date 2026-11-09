@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { joinLink, joinTicket, unreachableText, validTarget } from '../lib/transport.ts'
+import { joinLink, joinTicket, unreachableText, validEndpoint, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
@@ -15,7 +15,7 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { APP_ORIGIN, candidates, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import { candidates, defaultGateway, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
@@ -101,6 +101,10 @@ type DeviceContextValue = {
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
   /** This connection's place in line at a busy Gateway, 1 next; null when it is not waiting. */
   queued: number | null
+  /** Where join links and a last-resort reconnect reach a Node by device ID; `defaultGateway` unless the person chose another. */
+  gateway: string; defaultGateway: string
+  /** Keeps `address` as the access address on this device; null goes back to the default. */
+  setGateway(address: string | null): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 export type UnsavedRecovery = { name: string; code: string; attempted: boolean }
@@ -245,6 +249,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [rejoined, setRejoined] = useState(false)
   const [nodeJoining, setNodeJoining] = useState<NodeJoining | null>(null)
   const [localAutoAccess, setLocalAutoAccessState] = useState<boolean | null>(null)
+  const fallbackGateway = defaultGateway(page?.origin)
+  /** Read at each use, so a choice made in another tab of this origin applies too. */
+  const currentGateway = () => storedGateway(load('gateway')) ?? fallbackGateway
+  const [gateway, setGatewayState] = useState(currentGateway)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
@@ -464,9 +472,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const list = target.entry.kind === 'local'
       ? [target.entry]
       : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]))
-    // The official Gateway is the way left when the Node's own are gone; a page of another origin it refuses.
-    const official: ConnectionEntry = { kind: 'gateway', address: APP_ORIGIN, device_id: target.entry.device_id }
-    if (target.entry.kind !== 'local' && (!page || page.origin === APP_ORIGIN) && !list.some(way => entryKey(way) === entryKey(official))) list.push(official)
+    // The access address is the way left when the Node's own are gone.
+    const access: ConnectionEntry = { kind: 'gateway', address: currentGateway(), device_id: target.entry.device_id }
+    if (target.entry.kind !== 'local' && !list.some(way => entryKey(way) === entryKey(access))) list.push(access)
     for (const candidate of list) {
       let active: Session | null = null
       // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
@@ -893,11 +901,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory().catch(() => {})
   }
   /**
-   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: this page's own,
-   * or for an app the official one. The device key is the check.
+   * The ticket names the entry Node only by device ID, so any Gateway that forwards to it will do: the access address.
+   * The device key is the check.
    */
   function joinWays(link: JoinLink): ConnectionEntry[] {
-    return [{ kind: 'gateway', address: page ? page.origin : APP_ORIGIN, device_id: link.entryId }]
+    return [{ kind: 'gateway', address: currentGateway(), device_id: link.entryId }]
   }
   /**
    * One question on a channel of its own, so the screen's connection stays as it is. The secret goes only to the
@@ -1422,6 +1430,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效。重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效。重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive, queued,
+    gateway, defaultGateway: fallbackGateway,
+    setGateway(address) {
+      const chosen = address === null ? null : validEndpoint(address)
+      store('gateway', chosen === fallbackGateway ? null : chosen)
+      setGatewayState(chosen ?? fallbackGateway)
+    },
     pendingRecovery, vetoRecovery, approveRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },

@@ -84,7 +84,7 @@ The official public node is an ordinary Node outside every personal network. It 
 vibeface://<issuer>@8.217.72.118:4792
 ```
 
-New personal Nodes register with it by default, and use its open relay when no direct path works. `https://app.vibeface.dev` reaches your Node through it by device ID, and LAN connections remain preferred. It forwards only ciphertext. Use `--bootstrap off` during first initialization to disable public bootstrap, or point a Node at a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
+New personal Nodes register with it by default, and use its open relay when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url`, and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards only ciphertext. Use `--bootstrap off` during first initialization to disable public bootstrap, or point a Node at a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 

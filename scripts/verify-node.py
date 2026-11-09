@@ -800,7 +800,7 @@ class Node:
 
 
 def pinned_info(node, certificate=None):
-    """`/api/info` from a `--tls` Node as a reverse proxy trusting only `certificate`, by default the Node's own."""
+    """`/api/info` from a `--tls` Node, as a client trusting only `certificate`, by default the Node's own."""
     host = urllib.parse.urlsplit(json.loads((node.directory / "config.json").read_text())["public_url"]).hostname
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.load_verify_locations(certificate or node.directory / "tls-cert.pem")
@@ -5547,8 +5547,8 @@ def public_node_acceptance(options):
                 "P stores no attachments")
         passed("public-node-stores-nothing", **rows)
 
-        # The official node's browser API speaks only TLS, verified as the App host pins it: its own
-        # certificate for the App's name.
+        # The official node's browser API speaks only TLS, under the certificate the host installs into its data
+        # directory and renews there while the Node runs.
         t, t2 = (Node(run, name, binary, workspace, helper, init_args=["--tls", "--public-url", "https://app.example.invalid"])
                  for name in ("T", "T2"))
         nodes += [t, t2]
@@ -5565,6 +5565,10 @@ def public_node_acceptance(options):
             raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
             answer = raw.recv(64)
         require(not answer.startswith(b"HTTP/"), "T answers no plain HTTP")
+        for name in ("tls-key.pem", "tls-cert.pem"):
+            shutil.copyfile(t2.directory / name, t.directory / name)
+        wait_for("T serves a renewed certificate without a restart",
+                 lambda: pinned_info(t, t2.directory / "tls-cert.pem")["device_id"] == t.device_id, timeout=30)
         passed("tls-only-node-answers-its-pinned-certificate")
         report["status"] = "passed"
     except BaseException as error:

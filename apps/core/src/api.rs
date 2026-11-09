@@ -31,6 +31,8 @@ const HOOKS: &str = "/api/hooks";
 const HOOKS_WAIT: &str = "/api/hooks/wait";
 const TRIAGE: &str = "/api/triage";
 const LOG: &str = "/api/log";
+/// What a page of another allowed origin may read: the Noise socket and this Node's device ID.
+const CROSS_ORIGIN: [&str; 2] = ["/api/client", "/api/info"];
 const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -143,8 +145,11 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
     let tls = node
         .config
         .tls
-        .then(|| tls_acceptor(&node.data_dir))
+        .then(|| TlsFiles::load(&node.data_dir))
         .transpose()?;
+    if let Some(files) = &tls {
+        tracing::info!(event = "tls.loaded", sha256 = %files.leaf, "serving the TLS certificate");
+    }
     let listener = if node.config.web_enabled {
         Some(TcpListener::bind(node.config.listen).await?)
     } else {
@@ -193,11 +198,11 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
             let service = browser_router_with_assets(node.clone(), sites, false, assets.clone())
                 .into_make_service_with_connect_info::<SocketAddr>();
             match (listener, tls) {
-                (Some(tcp), Some(acceptor)) => {
+                (Some(tcp), Some(files)) => {
                     use axum::serve::ListenerExt as _;
                     let listener = TlsListener {
                         tcp,
-                        acceptor,
+                        files,
                         handshakes: Default::default(),
                     };
                     // `tap_io` is how axum hands a custom listener's peer address to ConnectInfo.
@@ -225,29 +230,103 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The acceptor for `config::TLS_CERT`, the certificate the reverse proxy in front pins.
-fn tls_acceptor(dir: &Path) -> Result<tokio_rustls::TlsAcceptor> {
+/// `config::TLS_CERT`, a full chain, and `config::TLS_KEY`, as `init --tls` makes them or a
+/// certificate client on the host installs and renews them. A change to either file is seen at
+/// the next connection, so a renewed certificate is served without a restart.
+struct TlsFiles {
+    dir: PathBuf,
+    loaded: Stamp,
+    acceptor: tokio_rustls::TlsAcceptor,
+    /// SHA-256 of the leaf certificate served.
+    leaf: String,
+    /// The files as they were when they last failed to load, and when that was.
+    failed: Option<(Stamp, std::time::Instant)>,
+}
+
+/// Each file's modification time and length.
+type Stamp = [(std::time::SystemTime, u64); 2];
+/// An unchanged pair that failed is tried again this often: a new owner or mode, which a
+/// renewal may set after writing, changes neither field of its stamp.
+const TLS_RETRY: Duration = Duration::from_secs(5);
+
+impl TlsFiles {
+    fn load(dir: &Path) -> Result<Self> {
+        let loaded = tls_stamp(dir)?;
+        let (acceptor, leaf) = tls_acceptor(dir)?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            loaded,
+            acceptor,
+            leaf,
+            failed: None,
+        })
+    }
+
+    /// The acceptor for the files as they are now. A pair that does not load, such as one caught
+    /// between its certificate and its key being replaced, leaves the last good one in place.
+    fn current(&mut self) -> tokio_rustls::TlsAcceptor {
+        let Ok(now) = tls_stamp(&self.dir) else {
+            return self.acceptor.clone();
+        };
+        let due = self
+            .failed
+            .is_none_or(|(stamp, at)| stamp != now || at.elapsed() >= TLS_RETRY);
+        if now != self.loaded && due {
+            match tls_acceptor(&self.dir) {
+                Ok((acceptor, leaf)) => {
+                    tracing::info!(event = "tls.reloaded", sha256 = %leaf, "serving a new TLS certificate");
+                    (self.acceptor, self.leaf, self.loaded, self.failed) =
+                        (acceptor, leaf, now, None);
+                }
+                Err(error) => {
+                    if self.failed.is_none_or(|(stamp, _)| stamp != now) {
+                        tracing::warn!(event = "tls.reload_failed", %error, "keeping the previous TLS certificate");
+                    }
+                    self.failed = Some((now, std::time::Instant::now()));
+                }
+            }
+        }
+        self.acceptor.clone()
+    }
+}
+
+fn tls_stamp(dir: &Path) -> std::io::Result<Stamp> {
+    let stamp = |name| {
+        let file = std::fs::metadata(dir.join(name))?;
+        Ok::<_, std::io::Error>((file.modified()?, file.len()))
+    };
+    Ok([
+        stamp(crate::config::TLS_CERT)?,
+        stamp(crate::config::TLS_KEY)?,
+    ])
+}
+
+fn tls_acceptor(dir: &Path) -> Result<(tokio_rustls::TlsAcceptor, String)> {
+    use sha2::{Digest as _, Sha256};
     use tokio_rustls::rustls::{
         self,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
     };
-    let cert = CertificateDer::from_pem_file(dir.join(crate::config::TLS_CERT))
+    let chain = CertificateDer::pem_file_iter(dir.join(crate::config::TLS_CERT))
+        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
         .context("invalid TLS certificate")?;
+    let leaf = hex::encode(Sha256::digest(chain.first().context("no TLS certificate")?));
     let key = PrivateKeyDer::from_pem_file(dir.join(crate::config::TLS_KEY))
         .context("invalid TLS key")?;
+    // Refuses a key that is not the leaf certificate's.
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()?
     .with_no_client_auth()
-    .with_single_cert(vec![cert], key)?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    .with_single_cert(chain, key)?;
+    Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), leaf))
 }
 
 /// The public listener under `tls`. Handshakes run apart, so a slow client holds up no other.
 struct TlsListener {
     tcp: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    files: TlsFiles,
     handshakes: tokio::task::JoinSet<Option<(TlsStream, SocketAddr)>>,
 }
 
@@ -267,7 +346,7 @@ impl axum::serve::Listener for TlsListener {
                 }
                 accepted = self.tcp.accept() => match accepted {
                     Ok((stream, peer)) => {
-                        let acceptor = self.acceptor.clone();
+                        let acceptor = self.files.current();
                         self.handshakes.spawn(async move {
                             let accepting = acceptor.accept(stream);
                             let stream = tokio::time::timeout(TLS_HANDSHAKE, accepting).await;
@@ -429,9 +508,10 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = if path == "/api/client" && *method == Method::GET {
+    let site = if CROSS_ORIGIN.contains(&path) && *method == Method::GET {
         // Cross-origin by design: this Node's browser origins and those of the personal
-        // network's other Gateways, as their signed address records state them.
+        // network's other Gateways, as their signed address records state them. A page such as
+        // the official App, served elsewhere, reaches its access Node this way.
         let site = host_site(&app.sites, headers)?;
         if let Some(origin) = headers.get(header::ORIGIN) {
             let origin = one_header(headers, header::ORIGIN.as_str())
@@ -549,8 +629,15 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty() && token.trim() == token).then_some(token)
 }
 
-async fn info(State(app): State<App>) -> Json<Value> {
-    Json(app.node.info())
+/// The boundary already refused an `Origin` this Node does not allow, so any left may read it.
+async fn info(State(app): State<App>, headers: HeaderMap) -> Response {
+    let mut response = Json(app.node.info()).into_response();
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let headers = response.headers_mut();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(header::VARY, HeaderValue::from_static("origin"));
+    }
+    response
 }
 
 async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -1081,6 +1168,49 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renewed_certificate_is_served_without_a_restart() -> Result<()> {
+        use crate::config::{TLS_CERT, TLS_KEY};
+        let dir = std::env::temp_dir().join(format!("vibeface-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let issue = |host: &str| {
+            let made = rcgen::generate_simple_self_signed(vec![host.into()]).unwrap();
+            (made.cert.pem(), made.signing_key.serialize_pem())
+        };
+        let write = |(cert, key): &(String, String)| {
+            std::fs::write(dir.join(TLS_CERT), cert)?;
+            std::fs::write(dir.join(TLS_KEY), key)
+        };
+        let fingerprint = |pem: &str| {
+            use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                CertificateDer::from_pem_slice(pem.as_bytes()).unwrap(),
+            ))
+        };
+        let first = issue("203.0.113.7");
+        write(&first)?;
+        let mut files = TlsFiles::load(&dir)?;
+        assert_eq!(files.leaf, fingerprint(&first.0));
+        // A chain: the leaf, then what signed it, as a certificate client installs a full chain.
+        let renewed = issue("203.0.113.7");
+        let chained = (format!("{}{}", renewed.0, first.0), renewed.1.clone());
+        write(&chained)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&renewed.0));
+        // Caught between the certificate and its key: the last good pair stays.
+        let next = issue("203.0.113.7");
+        std::fs::write(dir.join(TLS_CERT), &next.0)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&renewed.0));
+        assert!(files.failed.is_some());
+        std::fs::write(dir.join(TLS_KEY), &next.1)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&next.0));
+        assert!(files.failed.is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn only_a_trusted_proxy_names_the_client_address() {

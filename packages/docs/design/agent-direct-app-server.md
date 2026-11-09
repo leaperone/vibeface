@@ -208,7 +208,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，或用 `vibeface respond <请求> '<json>' --node <设备>` 应答挂起的请求，重试只回读。
 
-Grok Bot 用 HTTPS 调 webhook 正文里的 `answer.url`（即 `triage_settings` 的 `decision_url`）：`POST <answer.url>`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。公共节点不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备已向它的发现服务登记）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的转给目标。`answer.url` 是 `<public_url>/api/decision`；`public_url` 不是 HTTPS 而 `bootstrap` 为 `public` 时改用官方页面的 `https://app.vibeface.dev/api/decision`，由它反代到官方公共节点。令牌错误返回 401。
+Grok Bot 用 HTTPS 调 webhook 正文里的 `answer.url`（即 `triage_settings` 的 `decision_url`）：`POST <answer.url>`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。公共节点不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备已向它的发现服务登记）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的转给目标。`answer.url` 是 `<public_url>/api/decision`；`public_url` 不是 HTTPS 而 `bootstrap` 为 `public` 时改用官方公共节点 `config/public-bootstrap.json` 里 `gateway_url` 的 `/api/decision`（`https://8.217.72.118:4792/api/decision`）。令牌错误返回 401。
 
 ## 6. 安装 hook
 

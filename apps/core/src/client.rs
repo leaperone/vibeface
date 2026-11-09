@@ -4398,6 +4398,13 @@ mod tests {
             let http = reqwest::Client::builder().no_proxy().build()?;
             let other = http.post(format!("{origin}/api/local/setup")).header("origin", "https://app.example").json(&json!({})).send().await?;
             assert_eq!(other.status(), 403);
+            // A page of an allowed origin served elsewhere reads which device answers here; any other page cannot.
+            let info = http.get(format!("{origin}/api/info")).header("origin", "https://app.example").send().await?;
+            assert_eq!(info.headers().get("access-control-allow-origin").map(|v| v.as_bytes()), Some(&b"https://app.example"[..]));
+            assert_eq!(info.json::<Value>().await?["device_id"], node_id);
+            assert_eq!(http.get(format!("{origin}/api/info")).header("origin", "https://evil.example").send().await?.status(), 403);
+            let own = http.get(format!("{origin}/api/info")).send().await?;
+            assert!(own.status().is_success() && own.headers().get("access-control-allow-origin").is_none());
             Ok(())
         }
         .await;

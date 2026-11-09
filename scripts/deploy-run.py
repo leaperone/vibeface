@@ -89,13 +89,12 @@ def core_smoke(identity, info, output):
     base = ['--platform', 'linux/amd64', '--network', 'none', '-v', volume + ':/data']
     try:
         # The official node's shape, offline; the runtime guard refuses anything less bounded.
-        origin = 'https://app.vibeface.dev'
-        options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': origin, 'tls': True,
-                   'allowed_origins': [origin], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
+        gateway = 'https://127.0.0.1:4793'
+        options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': gateway, 'tls': True,
+                   'allowed_origins': ['https://app.vibeface.dev'], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
                    'relay_open': True, 'relay_rate': 65536, 'relay_max_clients': 512,
                    'relay_max_clients_per_ip': 16, 'forward_any': True, 'forward_sessions': 32,
-                   'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
-                   'trusted_proxies': ['203.0.113.1'], 'bootstrap': 'off'}
+                   'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8, 'bootstrap': 'off'}
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
@@ -116,7 +115,8 @@ def core_smoke(identity, info, output):
                                   identity, 'guard'], capture_output=True, timeout=60)
         release.require(refused.returncode != 0, 'the guard accepted a Node other than the pinned issuer')
         anchor = output / 'fixture-bootstrap.json'
-        anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4793}))
+        anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4793,
+                                      'gateway_url': gateway}))
         base += ['-v', f'{anchor}:/opt/vibeface/public-bootstrap.json:ro']
         container = docker('run', '-d', *base, '--init', '--read-only', '--user', '1001:1001',
                            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',

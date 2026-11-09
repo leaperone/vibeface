@@ -1,8 +1,25 @@
 import type { ConnectionEntry, MembershipView } from './node.ts'
-import { lanAddrs } from './transport.ts'
+import { lanAddrs, validEndpoint } from './transport.ts'
+import publicBootstrap from '../../../../config/public-bootstrap.json' with { type: 'json' }
 
-/** The official page. Its Gateway forwards to any Node by device ID and takes no page of another origin. */
+/** The official page: static, with no Node behind it. */
 export const APP_ORIGIN = 'https://app.vibeface.dev'
+/** The official public node, which forwards to any Node by device ID and takes the official page's origin. */
+export const PUBLIC_GATEWAY: string = publicBootstrap.gateway_url
+
+/**
+ * Where this device reaches a Node by device ID, as a join link names one: the Node that served this page, which
+ * takes its own origin; the official public node for the official page and the apps, which have none; or the
+ * address the person chose instead.
+ */
+export function defaultGateway(pageOrigin: string | undefined): string {
+  return pageOrigin && pageOrigin !== APP_ORIGIN ? pageOrigin : PUBLIC_GATEWAY
+}
+
+/** A chosen access address as stored, or null when there is none or it no longer validates. */
+export function storedGateway(value: unknown): string | null {
+  try { return typeof value === 'string' ? validEndpoint(value) : null } catch { return null }
+}
 
 /**
  * A member Node from its latest signed address record. `seq` is the highest record accepted, kept

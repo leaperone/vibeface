@@ -25,7 +25,8 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
 
 pub const UNNAMED_NODE: &str = "Node";
 
-/// The certificate and key `init --tls` makes for `public_url`'s host.
+/// The certificate chain and key `listen` serves under `tls`: at first the self-signed pair
+/// `init --tls` makes for `public_url`'s host, then whatever the host installs over them.
 pub const TLS_CERT: &str = "tls-cert.pem";
 pub const TLS_KEY: &str = "tls-key.pem";
 
@@ -151,7 +152,7 @@ pub struct Config {
     /// Loopback-only local session listener; fixed so its origin and browser storage persist.
     pub local_listen: SocketAddr,
     pub public_url: String,
-    /// `listen` speaks only TLS, with the `TLS_CERT` a reverse proxy pins.
+    /// `listen` speaks only TLS, with `TLS_CERT` and `TLS_KEY`, read again once they change.
     #[serde(default)]
     pub tls: bool,
     pub web_enabled: bool,

@@ -562,7 +562,8 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &serde_json::to_vec(&store.bootstrap_capability()?)?,
     )?;
     if configuration.tls {
-        // Self-signed for the reverse proxy in front, which pins this very certificate.
+        // A self-signed placeholder for first start and tests; a CA-issued pair the host installs
+        // over these files is served from the next connection on.
         let url = reqwest::Url::parse(&configuration.public_url)?;
         let host = url.host_str().context("public_url has no host")?;
         let made = rcgen::generate_simple_self_signed(vec![host.trim_matches(['[', ']']).into()])?;

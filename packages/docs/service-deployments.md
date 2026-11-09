@@ -24,7 +24,7 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 | --- | --- |
 | `all` | 官方公共节点和 App，不含官网 |
 | `node` | 香港官方公共节点的 Core 容器：发现服务、开放 relay 和浏览器接入，各有限额，不含前端文件 |
-| `app` | 独立网页静态容器，外层 Nginx 把 `/api/client`、`/api/info`、`/api/decision` 反代到公共节点 |
+| `app` | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
 | `www` | 独立官网静态容器，使用精确 `www-v<version>` Tag |
 
 产品目标接受精确 Stable、RC、Nightly `v<version>`，官网只接受对应 `www-v<version>`。不自动跟随渠道。所有目标使用同一个 `deploy-services.yml`。部署命令以 `apply=true` 启动流水线；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。
@@ -55,8 +55,8 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 ## 保留身份并核对上线
 
-公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。首轮容器切换需要现有服务进入维护并正常退出，保存备份后再激活。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
+公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。替换现有 systemd 服务时，它先进入维护并正常退出，保存备份后再激活；全新安装没有旧服务，校验已初始化的数据目录并备份后直接启动容器，失败时只停新容器。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
 
-公共节点没有域名，也不提供网页文件。App 主机的 Nginx 经 TLS 把浏览器接入接口反代到公共节点，钉住公共节点 `init --tls` 生成的证书，并透传 `Host: app.vibeface.dev`。部署前必须在阿里云安全组里让公共节点的网页 TCP 端口只放行 App 主机的 IP，脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点 IP 上的 relay 和 UDP 发现服务，不经过 App。
+公共节点没有域名，也不提供网页文件。浏览器直接连接它的 `https://8.217.72.118:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的 IP 证书，安装到数据目录后 Core 不重启即换用。部署前必须在阿里云安全组对公网开放 TCP 4792、UDP 4792 和 TCP 3340（acme.sh 验证另需 TCP 80），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点 IP 上的网页接入、relay 和 UDP 发现服务，都不经过 App 主机。
 
 部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表发现服务公网 UDP、relay 连接、浏览器排队接入、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。

@@ -8,7 +8,7 @@
 
 `--bootstrap off` 关闭公共引导。自建服务用 `--bootstrap 'vibeface://<设备编号>@<主机>:<UDP 端口>'` 指定，自建配置不在失败时切到官方服务。
 
-公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次（`issuer`、`udp_host`、`udp_port`），Core 用 `include_str!` 编入。网页和手机客户端不读取它，只认官方页面 `https://app.vibeface.dev`。
+公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次（`issuer`、`udp_host`、`udp_port`、`gateway_url`），Core 用 `include_str!` 编入。网页和手机客户端在构建时导入同一文件，取 `gateway_url` 作为默认接入地址；用户可在设置里改成自己的 Gateway，存在本设备上。
 
 ## 发现与 Relay
 
@@ -18,7 +18,7 @@ Relay 默认只接纳自己、本网络的 Node 和持邀请令牌的加入者�
 
 ## 浏览器接入
 
-`app.vibeface.dev` 是静态网页。它的 Nginx 经 TLS 把 `/api/client`、`/api/info` 和 `/api/decision` 反代给公共节点，钉住公共节点的自签证书，并透传 `Host: app.vibeface.dev` 和取自 Cloudflare 的浏览器地址 `X-Real-IP`，公共节点的网页端口只对 App 主机开放；公共节点以这个 origin 为 `public_url` 检查 Host 和 Origin。浏览器在 `connect` 帧里指定设备编号，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
+`app.vibeface.dev` 是静态网页，不转发任何接口。浏览器直接连公共节点的 `gateway_url`（`https://8.217.72.118:4792`）：`/api/client`、`/api/info` 和 `/api/decision` 都在这个地址上。公共节点以它为 `public_url` 检查 Host，`allowed_origins` 包含 `https://app.vibeface.dev`，所以官方页面的跨源 WebSocket 和 `/api/info` 被接受。这个端口的证书是 Let's Encrypt 签给该 IP 的短期证书，宿主 acme.sh 续期后写进数据目录，Core 不重启就换用；限额按浏览器的真实 TCP 地址计。网页 CSP 的 `connect-src` 为 `'self' https: ws: wss:`，因为接入地址可由用户改成任意 Gateway，不能在静态头里列举主机。浏览器在 `connect` 帧里指定设备编号，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
 转发名额用完时，新会话排队并收到 `{"type":"queued","position":n}`，页面显示“排队中，第 n 位”；队列也满时回 `gateway_busy`。同一浏览器地址的连接超出份额时，在升级前直接拒绝。每个会话的速率也受限。Node 默认不限速、不排队，只有官方公共节点在部署配置里设上限，见 [`deploy/README.md`](../../../deploy/README.md)。
 

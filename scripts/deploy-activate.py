@@ -4,7 +4,6 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -23,8 +22,6 @@ import uuid
 
 CORE_ROLES = ('node',)
 ROLES = (*CORE_ROLES, 'app', 'www')
-# The App's browser API belongs to the official node; the App host forwards these routes there.
-NODE_ROUTES = ('/api/info', '/api/client', '/api/decision')
 IMAGE = r'sha256:[0-9a-f]{64}'
 VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-nightly\.[0-9]{8}\.[1-9][0-9]*)?'
 DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
@@ -48,14 +45,15 @@ def canonical_path(value):
 def validate_config(config):
     common = {'project', 'role', 'deploy_dir', 'listen'}
     require(isinstance(config, dict) and config.get('role') in ROLES, 'invalid service role')
-    required = common | ({'data_dir', 'device_id', 'uid', 'gid', 'legacy_service', 'maintenance_socket'}
-                         if config['role'] in CORE_ROLES else {'nginx_config', 'server_name'})
-    if config['role'] == 'app':
-        required |= {'node_url', 'node_certificate'}
-    require(required <= config.keys() and config.keys() <= required | {'public_url'},
+    core = config['role'] in CORE_ROLES
+    required = common | ({'data_dir', 'device_id', 'uid', 'gid'} if core else {'nginx_config', 'server_name'})
+    # A Node that replaces a host service names it and its maintenance socket; a fresh install names neither.
+    legacy = {'legacy_service', 'maintenance_socket'} if core else set()
+    require(required <= config.keys() and config.keys() <= required | legacy | {'public_url'}
+            and (legacy <= config.keys() or not legacy & config.keys()),
             'unsupported or missing deployment configuration fields')
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', config['project']), 'invalid Compose project')
-    # The official node takes the App host's forwarded routes; a static container only its own host's.
+    # Browsers and devices reach the official node directly; a static container only its own host's nginx.
     host = '0.0.0.0' if config['role'] in CORE_ROLES else '127.0.0.1'
     require(re.fullmatch(re.escape(host) + r':[1-9][0-9]{0,4}', config['listen'])
             and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit port on ' + host)
@@ -65,22 +63,14 @@ def validate_config(config):
     if config['role'] in CORE_ROLES:
         require(re.fullmatch(r'[0-9a-f]{64}', config['device_id'])
                 and all(type(config[n]) is int and 0 < config[n] <= 2**31 - 1 for n in ('uid', 'gid'))
-                and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service']),
+                and ('legacy_service' not in config
+                     or re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service'])),
                 'invalid existing service identity')
         data, deploy = Path(config['data_dir']), Path(config['deploy_dir'])
         require(data != deploy and data not in deploy.parents and deploy not in data.parents,
                 'deployment files and Node data must be separate')
     if 'nginx_config' in config:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', config['server_name']), 'invalid nginx server name')
-    if 'node_url' in config:
-        require(re.fullmatch(r'https://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{0,4}', config['node_url']),
-                'node_url must be the official node\'s HTTPS IPv4 address and port')
-    if 'node_certificate' in config:
-        # The official node's own `tls-cert.pem`, which the App host pins.
-        require(isinstance(config['node_certificate'], str) and len(config['node_certificate']) <= 16384
-                and re.fullmatch(r'-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----\n?',
-                                 config['node_certificate']),
-                'node_certificate must be one PEM certificate')
     if 'public_url' in config:
         require(re.fullmatch(r'https://[a-zA-Z0-9][a-zA-Z0-9.:-]*(?::[0-9]+)?', config['public_url']),
                 'public_url must be an HTTPS origin without credentials')
@@ -258,7 +248,7 @@ def image_preflight(config, image, tag, source, version):
         require(data.is_dir() and stat.S_IMODE(metadata.st_mode) == 0o700
                 and metadata.st_uid == config['uid'] and metadata.st_gid == config['gid'],
                 'existing data ownership or permissions differ')
-        for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock'):
+        for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
             checked_path(data / name)
             require((data / name).is_file(), 'initialized Node files are required')
         epoch = read_json(data / 'data-epoch.json')
@@ -305,45 +295,17 @@ def nginx_nodes(text):
     return parse(0, False)[0]
 
 
-def every_address(value):
-    try:
-        return ipaddress.ip_network(value, strict=False).prefixlen == 0
-    except ValueError:
-        return False
-
-
-def transform_nginx(text, config, certificate=None):
+def transform_nginx(text, config):
     servers = [node for node in nginx_nodes(text) if node['words'] == ['server'] and node['children']]
     targets = [server for server in servers
                if any(n['words'][0] == 'server_name' and config['server_name'] in n['words'][1:] for n in server['children'])
                and any(n['words'][0] == 'listen' and 'ssl' in n['words'][1:] for n in server['children'])]
     require(len(targets) == 1, 'nginx config must contain one matching TLS server')
-    if config['role'] == 'app':
-        require(re.fullmatch(r'/[A-Za-z0-9/._-]+', str(certificate)), 'the App needs the pinned node certificate')
-        # The official node limits each browser by the address in X-Real-IP; behind Cloudflare,
-        # `$remote_addr` is that address only once realip takes it from Cloudflare's header.
-        directives = [n['words'] for n in targets[0]['children']]
-        trusted = [value.strip('"\'') for words in directives if words[0] == 'set_real_ip_from' for value in words[1:]]
-        require(trusted and ['real_ip_header', 'CF-Connecting-IP'] in directives,
-                'the App server must set set_real_ip_from and real_ip_header CF-Connecting-IP')
-        # Trusting every address lets any client name its own X-Real-IP.
-        require(not any(every_address(value) for value in trusted), 'set_real_ip_from must not trust every address')
     def indent(start):
         return text[text.rfind('\n', 0, start) + 1:start]
     def location(selector, body, start):
         return 'location ' + selector + ' {\n' + indent(start) + '    ' + body + '\n' + indent(start) + '}'
-    def node_route(route):
-        # The official node serves only the App's Host, over TLS with the certificate pinned here, and
-        # the browser socket outlives nginx's default timeout.
-        body = ('proxy_pass ' + config['node_url'] + ';\n        proxy_set_header Host ' + config['server_name'] + ';'
-                '\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_ssl_verify on;'
-                '\n        proxy_ssl_trusted_certificate ' + str(certificate) + ';'
-                '\n        proxy_ssl_name ' + config['server_name'] + ';')
-        if route == '/api/client':
-            body += ('\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;'
-                     '\n        proxy_set_header Connection "upgrade";\n        proxy_read_timeout 1h;')
-        return body
-    edits, routes, catchall = [], set(), []
+    edits, catchall = [], []
     for node in targets[0]['children']:
         words = node['words']
         if words[0] != 'location':
@@ -368,19 +330,13 @@ def transform_nginx(text, config, certificate=None):
             body = ('proxy_pass http://' + config['listen'] + ';\n'
                     '        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n'
                     '        proxy_set_header Connection "";\n        proxy_intercept_errors off;\n        proxy_cache off;')
-        elif config['role'] == 'app' and len(words) == 3 and words[1] == '=' and words[2] in NODE_ROUTES:
-            routes.add(words[2])
-            body = node_route(words[2])
         else:
+            # Browsers call the official node directly, so the page host answers no API or relay route.
             require(bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children']),
-                    'unrecognized static or node nginx location')
+                    'unrecognized static nginx location; API and relay routes must only return 404')
             continue
         edits.append((node['start'], node['end'], location(selector, body, node['start'])))
     require(len(catchall) == 1, 'expected nginx routes are missing')
-    if config['role'] == 'app':
-        edits.append((catchall[0], catchall[0], ''.join(
-            location('= ' + route, node_route(route), catchall[0]) + '\n' + indent(catchall[0])
-            for route in NODE_ROUTES if route not in routes)))
     for start, end, replacement in sorted(edits, reverse=True):
         text = text[:start] + replacement + text[end:]
     nginx_nodes(text)
@@ -405,9 +361,11 @@ def lease(config, previous):
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
-    else:
+    elif 'legacy_service' in config:
         with legacy_channel(config, 'acquire') as health:
             yield health
+    else:
+        yield None
 
 
 @contextmanager
@@ -507,7 +465,7 @@ def rollback(journal, journal_path):
     previous = journal['previous']
     restored = restored_previous(previous)
     legacy_restored = False
-    if not previous and config['role'] in CORE_ROLES:
+    if not previous and 'legacy_service' in config:
         if command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode == 0:
             with legacy_channel(config, 'probe') as health:
                 require(health['version'] == journal['legacy_version'], 'legacy running version differs')
@@ -525,7 +483,7 @@ def rollback(journal, journal_path):
         if previous:
             compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
             wait_healthy(previous)
-        else:
+        elif 'legacy_service' in config:
             command('systemctl', 'start', config['legacy_service'])
             if journal['legacy_enabled']:
                 command('systemctl', 'enable', config['legacy_service'])
@@ -600,29 +558,29 @@ def activate(config, image, tag, source, version):
             require(nginx.is_file() and nginx.stat().st_size <= 1024 * 1024, 'invalid nginx configuration file')
             command('nginx', '-t')
             old_nginx = nginx.read_bytes()
-            certificate = None
-            if config['role'] == 'app':
-                certificate = release / 'node.pem'
-                atomic_write(certificate, config['node_certificate'].rstrip('\n').encode() + b'\n')
-            nginx_data = transform_nginx(old_nginx.decode(), config, certificate).encode()
+            nginx_data = transform_nginx(old_nginx.decode(), config).encode()
             target['nginx_sha256'] = hashlib.sha256(nginx_data).hexdigest()
             atomic_write(release / 'nginx.before', old_nginx)
             journal['nginx_backup'] = str(release / 'nginx.before')
         if config['role'] in CORE_ROLES:
             journal['identity_sha256'] = hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
-            if not current:
+            if not current and 'legacy_service' in config:
                 command('systemctl', 'is-active', '--quiet', config['legacy_service'])
                 journal['legacy_enabled'] = command('systemctl', 'is-enabled', config['legacy_service'], check=False).stdout.strip() == 'enabled'
+            elif not current:
+                # A fresh install: no service of this project may already run on this data.
+                stopped(target)
         write_json(journal_path, journal)
         try:
             if config['role'] in CORE_ROLES:
                 with lease(config, current) as health:
-                    if not current:
+                    if health:
                         journal['legacy_version'] = health['version']
-                    journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
+                    if current or health:
+                        journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
                     if current:
                         stop(current)
-                    else:
+                    elif health:
                         command('systemctl', 'stop', config['legacy_service'])
                         require(command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode != 0,
                                 'legacy service did not stop')
@@ -686,21 +644,18 @@ def self_test():
               'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'device_id': 'a' * 64,
               'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
               'maintenance_socket': '/tmp/private-node/maintenance.sock'}
-    certificate = '-----BEGIN CERTIFICATE-----\nMIIBfixture+/=\nMIIB\n-----END CERTIFICATE-----\n'
     app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
            'listen': '127.0.0.1:8088', 'nginx_config': '/etc/nginx/conf.d/app.conf',
-           'server_name': 'app.example.invalid', 'node_url': 'https://203.0.113.7:4792',
-           'node_certificate': certificate}
-    validate_config(config); validate_config(app)
+           'server_name': 'app.example.invalid'}
+    fresh = {key: item for key, item in config.items() if key not in ('legacy_service', 'maintenance_socket')}
+    validate_config(config); validate_config(app); validate_config(fresh)
     for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
                                (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
-                               (config, 'legacy_service', '--help'), (config, 'node_url', app['node_url']),
-                               (config, 'node_certificate', certificate),
-                               (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://node.example.invalid'),
-                               (app, 'node_url', 'http://203.0.113.7:4792'), (app, 'node_url', None),
-                               (app, 'node_certificate', None), (app, 'node_certificate', 'not a certificate'),
-                               (app, 'node_certificate', certificate + certificate),
-                               (app, 'node_certificate', certificate + 'proxy_pass http://evil;\n')):
+                               (config, 'legacy_service', '--help'), (config, 'legacy_service', None),
+                               (config, 'maintenance_socket', None),
+                               (config, 'node_url', 'https://203.0.113.7:4792'),
+                               (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://203.0.113.7:4792'),
+                               (app, 'legacy_service', 'official-node.service')):
         bad = {key: item for key, item in dict(base, **{field: value}).items() if item is not None}
         try:
             validate_config(bad)
@@ -717,12 +672,10 @@ def self_test():
 server {
     listen 443 ssl;
     server_name app.example.invalid;
-    set_real_ip_from 173.245.48.0/20;
-    real_ip_header CF-Connecting-IP;
     root /srv/static-old;
     add_header Content-Security-Policy "old policy" always;
     add_header X-Vibeface-Source old;
-    location = /api/client { proxy_pass http://127.0.0.1:4900; }
+    location = /api/client { return 404; }
     location = /api/info { return 404; }
     location = /sdk.v1.js { return 404; }
     location = /manifest.webmanifest { types {} default_type application/manifest+json; try_files $uri =404; }
@@ -731,49 +684,28 @@ server {
     location / { try_files $uri $uri/ /_shell.html; }
 }
 '''
-    pem = Path('/srv/service-control/app/release-1/node.pem')
-    updated = transform_nginx(nginx, app, pem)
+    updated = transform_nginx(nginx, app)
     assert 'old policy' not in updated and 'X-Vibeface-Source old' not in updated and 'try_files' not in updated
-    assert '127.0.0.1:4900' not in updated and 'location = /sdk.v1.js { return 404; }' in updated
-    for route in NODE_ROUTES:
-        block = updated.split('location = ' + route + ' {', 1)[1].split('}', 1)[0]
-        assert 'proxy_pass https://203.0.113.7:4792;' in block and 'proxy_set_header Host app.example.invalid;' in block
-        assert all(line in block for line in ('proxy_ssl_verify on;', f'proxy_ssl_trusted_certificate {pem};',
-                                              'proxy_ssl_name app.example.invalid;',
-                                              'proxy_set_header X-Real-IP $remote_addr;'))
-        assert ('Upgrade $http_upgrade' in block) == (route == '/api/client')
-    assert updated.index('location = /api/decision') < updated.index('location / {')
-    assert transform_nginx(updated, app, pem) == updated
-    try:
-        transform_nginx(nginx, app)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('the App forwarded to an unpinned node')
-    try:
-        transform_nginx(nginx, dict(app, role='www'))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('WWW forwarded the node routes')
+    assert 'location = /sdk.v1.js { return 404; }' in updated and 'location = /api/client { return 404; }' in updated
+    assert 'proxy_pass https://' not in updated and '/api/decision' not in updated
+    assert transform_nginx(updated, app) == updated == transform_nginx(nginx, dict(app, role='www'))
     for selector in ('location = /favicon.ico { alias /old/icon.ico; }',
                      'location /old/ { include /old/static.conf; }', 'location /old/ {}',
+                     'location = /api/decision { proxy_pass https://203.0.113.7:4792; }',
                      'location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }',
                      'location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }'):
         try:
-            transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app, pem)
+            transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
         except ValueError:
             pass
         else:
             raise AssertionError('unknown static route accepted')
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
                 nginx.replace('location / {', 'include /old/routes.conf; location / {', 1),
-                nginx.replace('    real_ip_header CF-Connecting-IP;\n', '', 1),
-                nginx.replace('    set_real_ip_from 173.245.48.0/20;\n', '', 1),
-                nginx.replace('173.245.48.0/20', '0.0.0.0/0', 1), nginx.replace('173.245.48.0/20', '::/0', 1),
-                nginx.replace('173.245.48.0/20', '"0::0/0"', 1)):
+                nginx.replace('location = /api/client { return 404; }',
+                              'location = /api/client { proxy_pass http://127.0.0.1:4900; }', 1)):
         try:
-            transform_nginx(bad, app, pem)
+            transform_nginx(bad, app)
         except ValueError:
             pass
         else:
@@ -847,6 +779,19 @@ server {
         with patch(__name__ + '.stop', side_effect=lambda target: events.append('unsafe-stop')):
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
+        events.clear()
+        with lease(fresh, None) as health:
+            assert health is None
+        fresh_data = directory / 'fresh'; fresh_data.mkdir()
+        (fresh_data / 'identity.json').write_text('fresh'); (fresh_data / 'node.lock').touch()
+        fresh_state = dict(state, previous=None, legacy_enabled=False, config=dict(fresh, data_dir=str(fresh_data)),
+                           identity_sha256=hashlib.sha256(b'fresh').hexdigest())
+        with patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
+                patch(__name__ + '.command', side_effect=lambda *a, **k: events.append('unsafe-systemctl')), \
+                patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-start')):
+            rollback(fresh_state, directory / 'activation.json')
+        assert events == ['stop-new'] and not (directory / 'current.json').exists()
+        assert read_json(directory / 'activation.json')['phase'] == 'rolled_back'
         events.clear()
         with patch(__name__ + '.restored_previous', return_value=False), \
                 patch(__name__ + '.previous_stopped', return_value=False), \

@@ -19,9 +19,9 @@ import { webPlatform } from '@/lib/platform'
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
 import { PasswordStrength, RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
-import { CopyDiagnostics } from './device-controls'
+import { CopyDiagnostics, GatewayForm } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
-import { APP_ORIGIN } from '@vibeface/client/lib/entrances.ts'
+import { APP_ORIGIN, PUBLIC_GATEWAY } from '@vibeface/client/lib/entrances.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -122,23 +122,24 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /**
- * The device ID of the computer that served this page: it fills in a manual address that is this page's own, which the
- * page already trusts by running its code.
+ * The device ID of the Node at the access address: it fills in a manual address that is that Node's own. The page or
+ * the person chose that Node, unless it is the official public node, which is nobody's device.
  */
-function usePageNode() {
+function useGatewayNode(gateway: string) {
   const [deviceId, setDeviceId] = useState('')
   useEffect(() => {
     let live = true
-    if (typeof fetch === 'function') fetch('/api/info', { cache: 'no-store', credentials: 'omit' })
+    setDeviceId('')
+    if (gateway !== PUBLIC_GATEWAY && typeof fetch === 'function') fetch(new URL('/api/info', gateway), { cache: 'no-store', credentials: 'omit' })
       .then(response => response.ok ? response.json() : null)
       .then(info => { if (live) setDeviceId(typeof info?.device_id === 'string' ? info.device_id : '') })
       .catch(() => {})
     return () => { live = false }
-  }, [])
+  }, [gateway])
   return deviceId
 }
 
-const sameOrigin = (address: string) => { try { return new URL(address).origin === location.origin } catch { return false } }
+const sameOrigin = (address: string, origin: string) => { try { return new URL(address).origin === origin } catch { return false } }
 
 /** Opened from the Home Screen: iOS keeps such an app's storage apart from Safari's. */
 const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true)
@@ -146,8 +147,8 @@ const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('
 /** `lane`: the way in to show first, as the join page does. */
 export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const device = useDevice()
-  const pageNode = usePageNode()
-  // The official page's Node forwards to people's own devices and is none of them, so that page only opens join links.
+  const gatewayNode = useGatewayNode(device.gateway)
+  // The official page has no Node of its own, and the public node it reaches is nobody's device, so it only opens join links.
   const official = globalThis.location?.origin === APP_ORIGIN
   const generation = device.connectionGeneration()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
@@ -337,17 +338,18 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         <form className="grid gap-3" noValidate onSubmit={(event) => {
           event.preventDefault()
           const form = event.currentTarget, address = value(form, 'address')
-          const deviceId = value(form, 'device_id').trim() || (!official && sameOrigin(address) ? pageNode : '')
+          const deviceId = value(form, 'device_id').trim() || (sameOrigin(address, device.gateway) ? gatewayNode : '')
           void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
-            <Field label="访问地址"><Input type="url" name="address" defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={official ? undefined : manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Field label="访问地址"><Input key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={gatewayNode ? manualCopy.optional : undefined} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <p className="-mt-1 text-muted-foreground">{manualCopy.where}</p>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>
         </form>
       </Details> : null}
+      {usable ? <GatewayForm /> : null}
     </Details> : null}
   </AuthPage>
 }

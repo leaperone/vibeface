@@ -231,7 +231,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 - **发现服务**：UDP `8.217.72.118:4792`。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
 - **开放 relay**：`http://8.217.72.118:3340`，显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一来源地址（IPv6 按 /56 计）最多 16 个。
-- **浏览器接入**：`https://app.vibeface.dev` 的 `/api/client`、`/api/info` 和 `/api/decision` 由网页服务器的 nginx 经 TLS 反代给它。它的网页端口只接受 TLS，证书是 `init --tls` 生成的自签证书，nginx 钉住这张证书；这个 TCP 端口只对 App 主机开放。nginx 用 Cloudflare 给出的浏览器地址覆盖 `X-Real-IP`，公共节点只认 App 主机发来的这个头。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
+- **浏览器接入**：`https://8.217.72.118:4792`，即 `config/public-bootstrap.json` 的 `gateway_url`。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。这个端口只接受 TLS，证书是 Let's Encrypt 签给这个 IP 的短期证书，由宿主续期后写进数据目录，Node 不重启就换用新证书。浏览器直连，限额按 TCP 对端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
 `vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台向官方发现服务登记自己的地址和 relay，本机网页、维护接口和局域网发现不等待它。登记应答附上公共节点的开放 relay，Node 把它加为候选 relay，所以直连不通的设备之间也能经它连通。浏览器在官方页面按设备编号连接，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
@@ -379,7 +379,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 
 浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
 
-`--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名生成自签证书 `tls-cert.pem` 和私钥 `tls-key.pem`，由前面的反代钉住这张证书。
+`--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名或 IP 生成自签占位证书 `tls-cert.pem` 和私钥 `tls-key.pem`；浏览器直连时把它们换成 CA 签发的证书链和私钥（例如 acme.sh `--install-cert`，见 [`deploy/README.md`](../../deploy/README.md)）。Node 在文件变化后的下一个连接重新加载，不需要重启；证书和私钥不配对或无法解析时继续用上一对，5 秒后再试。
 
 公网 Node 承担 relay 角色。例如在服务器上用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
@@ -495,6 +495,8 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 ## 多个访问地址
 
 每台启用 Gateway 的 Node 都是同一个人网络的一个访问地址。浏览器连上任意一台后，会经它连到目标 Node：Noise 握手仍在浏览器和目标之间完成，中间的 Gateway 只转发密文；目标不是本网络成员时，Gateway 回“目标不在我的设备里”。
+
+加入链接和最后的重连都按设备编号经“接入地址”找到目标。官方页面和手机 App 默认用官方公共节点的 `gateway_url`，Node 自己提供的页面默认用本页的 origin；在连接页或设置 → 高级 → 连接 → 接入地址可以改成自己的 Gateway，地址只存在这台设备上，“恢复默认”清除它。
 
 左下角的连接状态显示在线、切换中或离线，点开可看到当前访问地址和其他可切换的地址，每个地址标明“公网”或“仅本机或局域网”。只有带公网 HTTPS `gateway_url` 的地址算公网，邀请的二维码只用公网地址。
 

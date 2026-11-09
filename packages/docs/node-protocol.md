@@ -25,14 +25,14 @@
 | `listen` | HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡；iroh 默认在同一端口号上监听 UDP |
 | `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`，让本机 origin 和浏览器存储跨重启不变 |
 | `public_url` | 本 Node 的网页 origin，公网为 HTTPS；网页开启时作为地址记录的 `gateway_url` |
-| `tls` | 默认 `false`；`true` 时 `listen` 只接受 TLS，使用 `init --tls` 为 `public_url` 主机名生成的自签证书 `tls-cert.pem` 和私钥 `tls-key.pem`，供前面的反代钉住；要求 HTTPS 的 `public_url` |
+| `tls` | 默认 `false`；`true` 时 `listen` 只接受 TLS，使用数据目录里的证书链 `tls-cert.pem` 和私钥 `tls-key.pem`，`init --tls` 先为 `public_url` 的主机名或 IP 写一对自签占位，部署方可换成 CA 签发的一对，文件变化后不重启即重新加载；要求 HTTPS 的 `public_url` |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
 | `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和发现服务设置，见下表 |
-| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是反代地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`） |
+| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是自建反代的地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`），浏览器直连的 Node（如官方公共节点）不设 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
 | `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
@@ -120,14 +120,14 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 允许的浏览器入口由 `public_url`、`allowed_origins`、本机 HTTP 别名，以及地址簿中未撤销成员 Node 的 `gateway_url` 组成。本机别名为 `127.0.0.1`、`localhost`、`0.0.0.0`，端口使用 `listen` 的端口。允许入口不会改变监听网卡或开放防火墙。
 
-显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口；只有 `/api/client` 接受跨源连接。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
+显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口；只有 `/api/client` 和 `GET /api/info` 接受任一允许入口的跨源请求，`/api/info` 对带 Origin 的请求回 `Access-Control-Allow-Origin`，所以官方页面能读取公共节点的设备编号。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
 | `/`、`/assets/*` | GET | App 静态网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/vibeface_secure.js`、`/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
-| `/api/info` | GET | `device_id` 和 `version` |
+| `/api/info` | GET | `device_id` 和 `version`；允许入口可跨源读取 |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；`forwarding.any` 的公共节点回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的回环工具端口上提供；`vibeface tool` 发 `{toolName, args, agentId}`，回 `{result}`；按当前 attempt bearer 授权，`agentId` 不授予权限 |
