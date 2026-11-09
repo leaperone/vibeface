@@ -1067,11 +1067,11 @@ mod tests {
         let locator_path = reply_locator_path(&node.data_dir.join("cursor"), "bot-attempt")?;
         let locator_bytes = std::fs::read(&locator_path)?;
         let saved = std::str::from_utf8(&locator_bytes)?;
-        assert!(!saved.contains("fixture-api-key") && !saved.contains("CURSOR_API_KEY"));
+        assert!(!saved.contains("fixture-api-key") && !saved.contains("FIXTURE_CURSOR_KEY"));
         let launches = std::fs::read_to_string(dir.join("bridge-starts.log"))?;
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("rotated-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("rotated-key".into()))]),
         )?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
@@ -1084,7 +1084,7 @@ mod tests {
         );
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into()))]),
         )?;
         config::private_write(&locator_path, b"not json")?;
         assert_eq!(
@@ -1094,7 +1094,7 @@ mod tests {
         config::private_write(&locator_path, &locator_bytes)?;
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), None)]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), None)]),
         )?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
@@ -1106,7 +1106,7 @@ mod tests {
         );
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into()))]),
         )?;
         let blocked = reply_locator_path(&node.data_dir.join("cursor"), "blocked-attempt")?;
         config::private_dir(&blocked)?;
@@ -1180,7 +1180,7 @@ mod tests {
             local.env.apply(
                 Provider::Cursor,
                 BTreeMap::from([
-                    ("CURSOR_API_KEY".into(), Some("fixture-api-key".into())),
+                    ("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into())),
                     (
                         "FAKE_BRIDGE_SEND_LOG".into(),
                         Some(send_log.display().to_string()),

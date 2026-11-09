@@ -66,6 +66,6 @@ Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的
 
 备用策略保存在 Node 本地，默认关闭。开启后按顺序选择一个不同候选，最多追加一次尝试。跨服务候选须在本机启用执行角色，使用该设备配置的账户。只有原回合明确未启动、没有工具调用和待确认记录时才切换。已接纳的远端 Task 不自动切换备用，始终保留冻结的 Provider 和模型。记录保留原选项、实际提交选项和切换原因。
 
-私有 Codex、Claude Code 和 OpenCode 根可能需要重新认证。`ProviderStatus.setup` 返回非敏感目录和可复制登录命令，Web 与 Mobile 提供复制和重新检查入口。Node 不自动登录，不读取个人 OAuth、钥匙串或 GUI 令牌。Codex/Cursor 启动已启用用途、开启用途及 `configure_provider {connect_local:true}` 共用本机补缺：已有私有环境优先，只将当前服务声明且本次未显式编辑的缺失变量从 Node 环境、受限交互登录 shell 补入 `ProviderEnv`。程序、路径、模型和用途保持原选择。完整契约见[本机 AI 服务接入](local-provider-onboarding.md)。未确认的认证仍显示未知，已确认缺少登录时显示需要设置。
+私有 Codex、Claude Code 和 OpenCode 根可能需要重新认证。`ProviderStatus.setup` 返回非敏感目录和可复制登录命令，Web 与 Mobile 提供复制和重新检查入口。Node 不自动登录，不读取个人 OAuth、钥匙串或 GUI 令牌。Codex、Claude Code、Cursor 启动已启用用途、开启用途及 `configure_provider {connect_local:true}` 共用本机补缺。Cursor 只复用官方 CLI 订阅登录，不接受认证环境覆盖；其他服务仅把声明且本次未显式编辑的缺失变量从 Node 环境、受限交互登录 shell 补入 `ProviderEnv`，已有私有环境优先。有效程序选择、模型和用途保持不变。完整契约见[本机 AI 服务接入](local-provider-onboarding.md)。未确认的认证仍显示未知，已确认缺少登录时显示需要设置。
 
 存储使用 epoch 1 最终结构与事件协议 1。同一网络要求所有 Node 使用本轮最终格式，不能混用旧开发快照；本机 epoch 校验不是 peer 握手。旧形状会拒绝新增字段。程序不会迁移或清空旧数据。受控协议、真实账户、模型理解质量和手机验收分别记录证据。

@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
-use vibeface_bridge::agent::CustomToolConfig;
+use vibeface_bridge::agent::{CURSOR_AUTH_OVERRIDES, CustomToolConfig, is_cursor_sdk_bridge};
 
 mod login;
 pub use login::AuthenticationSource;
@@ -1028,11 +1028,14 @@ static NO_VARIABLES: BTreeMap<String, String> = BTreeMap::new();
 
 impl ProviderEnv {
     pub fn load(dir: &Path) -> Result<Self> {
-        let env: Self = match std::fs::read(dir.join(ENV_FILE)) {
+        let mut env: Self = match std::fs::read(dir.join(ENV_FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("invalid provider environment")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(error) => return Err(error.into()),
         };
+        if let Some(cursor) = env.0.get_mut(&Provider::Cursor) {
+            cursor.retain(|name, _| !CURSOR_AUTH_OVERRIDES.contains(&name.as_str()));
+        }
         for (provider, variables) in &env.0 {
             for (name, value) in variables {
                 validate(*provider, name, value)?;
@@ -1106,6 +1109,10 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
 
 fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     validate_env_name(name)?;
+    ensure!(
+        provider != Provider::Cursor || !CURSOR_AUTH_OVERRIDES.contains(&name),
+        "Cursor uses the official CLI subscription login; authentication overrides are unsupported"
+    );
     ensure!(
         !name.starts_with("VIBEFACE_")
             && !provider
@@ -1313,6 +1320,7 @@ impl Local {
     pub fn bin(&self, provider: Provider) -> PathBuf {
         self.bins
             .get(&provider)
+            .filter(|bin| provider != Provider::Cursor || !is_cursor_sdk_bridge(bin))
             .cloned()
             .unwrap_or_else(|| provider.default_bin().into())
     }
@@ -1329,25 +1337,8 @@ impl Local {
         host: &crate::discovery::Host,
     ) -> BTreeMap<String, String> {
         let mut env = self.env.get(provider).clone();
-        if provider == Provider::Cursor && !cfg!(test) {
-            if !["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
-                .iter()
-                .any(|name| env.contains_key(*name))
-            {
-                for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
-                    if let Ok(value) = std::env::var(name)
-                        && !value.is_empty()
-                    {
-                        env.insert(name.into(), value);
-                    }
-                }
-            }
-            if !env.contains_key("AGENT_CLI_CREDENTIAL_STORE")
-                && let Ok(value) = std::env::var("AGENT_CLI_CREDENTIAL_STORE")
-                && !value.is_empty()
-            {
-                env.insert("AGENT_CLI_CREDENTIAL_STORE".into(), value);
-            }
+        if provider == Provider::Cursor {
+            env.retain(|name, _| !CURSOR_AUTH_OVERRIDES.contains(&name.as_str()));
         }
         let path = env
             .get("PATH")
@@ -1704,12 +1695,18 @@ mod tests {
         )?;
         env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-cursor-value".into()))]),
+            BTreeMap::from([(
+                "FIXTURE_CURSOR_KEY".into(),
+                Some("fixture-cursor-value".into()),
+            )]),
         )?;
         for (provider, name) in [
             (Provider::Codex, "VIBEFACE_DATA_DIR"),
             (Provider::Cursor, "CURSOR_CONFIG_DIR"),
             (Provider::Cursor, "CURSOR_DATA_DIR"),
+            (Provider::Cursor, "CURSOR_API_KEY"),
+            (Provider::Cursor, "CURSOR_AUTH_TOKEN"),
+            (Provider::Cursor, "AGENT_CLI_CREDENTIAL_STORE"),
             (Provider::Codex, "1KEY"),
             (Provider::Codex, "A-B"),
         ] {
@@ -1730,9 +1727,13 @@ mod tests {
         )?;
         let loaded = ProviderEnv::load(&dir)?;
         assert!(!loaded.get(Provider::Cursor).contains_key("CPA_API_KEY"));
-        assert!(!loaded.get(Provider::Codex).contains_key("CURSOR_API_KEY"));
+        assert!(
+            !loaded
+                .get(Provider::Codex)
+                .contains_key("FIXTURE_CURSOR_KEY")
+        );
         assert_eq!(
-            loaded.get(Provider::Cursor)["CURSOR_API_KEY"],
+            loaded.get(Provider::Cursor)["FIXTURE_CURSOR_KEY"],
             "fixture-cursor-value"
         );
         let mut removed = loaded.clone();
@@ -1741,6 +1742,25 @@ mod tests {
             BTreeMap::from([("CPA_API_KEY".into(), None)]),
         )?;
         assert!(removed.get(Provider::Codex).is_empty());
+        let mut historical = serde_json::to_value(&loaded)?;
+        for name in CURSOR_AUTH_OVERRIDES {
+            historical["cursor"][name] = json!("synthetic-unused-auth");
+        }
+        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(&historical)?)?;
+        let loaded = ProviderEnv::load(&dir)?;
+        let local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::new(),
+            env: loaded,
+        };
+        assert_eq!(
+            ProviderRoots::new(&dir).authentication_source(Provider::Cursor, &local),
+            AuthenticationSource::LocalCliLogin
+        );
+        for name in CURSOR_AUTH_OVERRIDES {
+            assert!(!local.env.get(Provider::Cursor).contains_key(name));
+            assert!(!local.launch_env(Provider::Cursor).contains_key(name));
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

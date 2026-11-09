@@ -1577,6 +1577,59 @@ test('native chat glass follows accessibility events without replacing its input
   } finally { app.close() }
 })
 
+test('opening AI settings connects only Cursor and checks CLI login again on focus', async (t) => {
+  for (const unknownWrite of [false, true]) await t.test(`unknown write=${unknownWrite}`, async () => {
+    const provider: ProviderStatus = {
+      provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
+      execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } },
+      probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [provider], display_paths: {}, suggested_roots: [] }
+    const signedOut: NodeSettingsResponse = { ...initial, providers: [{ ...provider, bin: '/fixture/agent', installed: true,
+      setup: { directory: null, command: "'/fixture/agent' login" }, probe: { ...provider.probe, checked_at_ms: 1, authentication: 'sign_in_required' } }] }
+    const signedIn: NodeSettingsResponse = { ...signedOut, providers: signedOut.providers.map((item) => ({ ...item, probe: { ...item.probe, checked_at_ms: 2, authentication: 'authenticated' } })) }
+    const first = pendingResult(), second = pendingResult(), calls: { method: string; params: unknown }[] = []
+    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => {
+      calls.push({ method, params })
+      if (method === 'node_settings') return calls.length === 1 ? initial : signedOut
+      return calls.filter((call) => call.method === 'configure_provider').length === 1 ? first.promise : second.promise
+    } }
+    let focused = () => {}
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener(_event: string, callback: () => void) { focused = callback }, removeEventListener() { focused = () => {} } } })
+    const render = () => app.render('AiSettings', { compact: true })
+    try {
+      render(); await settleComponent(); render(); render()
+      const writes = () => calls.filter((call) => call.method === 'configure_provider')
+      assert.equal(writes().length, 1, 'entering settings discovers Cursor once without clicking automatic connection')
+      focused(); focused()
+      assert.equal(writes().length, 1, 'focus cannot duplicate an in-flight connection write')
+      if (unknownWrite) first.reject(new Error('client response timed out; outcome may be unknown'))
+      else first.resolve(signedOut)
+      await settleComponent(); render()
+      if (unknownWrite) assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown connection write is read back before any retry')
+      assert.equal(writes().length, 1, 'a readback does not resend the connection write')
+      focused(); focused(); render()
+      assert.equal(writes().length, 2, 'returning from CLI login rechecks authentication once')
+      second.resolve(signedIn)
+      await settleComponent()
+      const card = render().find(({ props }) => props.item !== undefined)
+      const status = nodeSettings.parseProvider(card?.props.item)
+      assert.equal(status.probe.authentication, 'authenticated')
+      assert.deepEqual(status.roles, [])
+      assert.ok(writes().every((call) => JSON.stringify(call.params) === JSON.stringify({ provider: 'cursor', connect_local: true })), 'automatic connection never changes roles or other providers')
+    } finally { app.close() }
+  })
+})
+
 test("automatic connection checks the three local services without changing uses and reads back unknown writes", async (t) => {
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {

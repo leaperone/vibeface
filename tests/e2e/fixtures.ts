@@ -59,6 +59,28 @@ export const test = base.extend<{ node: NodeInfo }>({
     } finally { await call({ op: 'stop' }); }
   },
 });
+export const cursorTest = base.extend<{ cursor: {
+  node: NodeInfo;
+  login(): Promise<void>;
+  inspect(): Promise<{ selected_official: boolean; bot_enabled: boolean; execution: string[]; prompts: number }>;
+} }>({
+  cursor: async ({ app }, use) => {
+    const call = await control(app.baseUrl);
+    try {
+      const value = nodes(await call({ op: 'reset', kind: 'cursor' }));
+      await use({ node: node(value.source),
+        async login() { assert.equal(record(await call({ op: 'cursor_login' })).signed_in, true); },
+        async inspect() {
+          const value = record(await call({ op: 'cursor_inspect' }));
+          assert(typeof value.selected_official === 'boolean' && typeof value.bot_enabled === 'boolean');
+          assert(Array.isArray(value.execution) && value.execution.every((item): item is string => typeof item === 'string'));
+          assert(typeof value.prompts === 'number' && Number.isSafeInteger(value.prompts) && value.prompts >= 0);
+          return { selected_official: value.selected_official, bot_enabled: value.bot_enabled, execution: value.execution, prompts: value.prompts };
+        },
+      });
+    } finally { await call({ op: 'stop' }); }
+  },
+});
 export type DeliveryFixture = {
   source: NodeInfo; receiver: NodeInfo; provider: NodeInfo;
   restart(role: Role, crash?: boolean): Promise<void>;

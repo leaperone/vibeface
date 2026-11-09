@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availability, parseNodeSettings, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
+import { availability, canSetProviderEnvironment, parseNodeSettings, probeIssueText, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
 import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type WorkCard, type WorkRecord } from './types.ts'
@@ -170,14 +170,26 @@ test('a provider shows whether it can be used before any use is picked', () => {
   const provider = (extra: Partial<Status>): Status => ({ app_server: null, state: 'off', installed: true, env: [], ...extra })
   assert.equal(availability(provider({})), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'unverified')
+  assert.equal(availability(provider({ env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
+  assert.equal(availability(provider({ env: [{ name: 'FIXTURE_KEY', set: false, inherited: true, required: true }] })), 'unverified')
   assert.equal(availability(provider({ state: 'starting' })), 'starting')
   for (const installed of [false, true]) {
     const system = provider({ installed, app_server: { mode: 'system', socket: '/fixture/codex.sock', link: { state: 'off' } }, env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }] })
     assert.equal(availability(system), 'unverified', 'an unused system service does not need local launch prerequisites')
     assert.equal(availability({ ...system, state: 'unverified' }), 'unverified')
   }
+})
+
+test('Cursor settings accept only the official CLI subscription authentication', () => {
+  for (const name of ['CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']) {
+    assert.equal(canSetProviderEnvironment('cursor', name), false)
+    assert.equal(canSetProviderEnvironment('codex', name), true, 'other providers keep their environment rules')
+  }
+  assert.equal(canSetProviderEnvironment('cursor', 'PATH'), true)
+  const issue = { stage: 'authentication', code: 'sign_in_required' } as const
+  assert.match(probeIssueText('cursor', issue), /CLI 订阅登录/)
+  assert.ok(!probeIssueText('cursor', issue).includes('API'))
+  assert.match(probeIssueText('codex', issue), /API 密钥/)
 })
 
 test('provider observations preserve unknown prerequisites and discard private fields', () => {

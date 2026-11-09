@@ -781,7 +781,6 @@ mod tests {
         variables.apply(
             Provider::Cursor,
             env.into_iter()
-                .chain([("CURSOR_API_KEY".into(), "fixture-api-key".into())])
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
@@ -822,7 +821,7 @@ mod tests {
         )]))
         .await?;
         let probe = node.probe_provider(Provider::Cursor).await;
-        assert!(matches!(probe.launch, LaunchCheck::Failed { .. }));
+        assert_ne!(probe.launch, LaunchCheck::Launchable);
         assert_eq!(probe.authentication, Authentication::Unverified);
         assert_eq!(probe.catalog, ModelCatalog::default());
         node.cursor.get().unwrap().stop().await;
@@ -841,7 +840,7 @@ mod tests {
         original.env.apply(
             provider,
             BTreeMap::from([
-                ("FAKE_BRIDGE_ME".into(), Some("401".into())),
+                ("FAKE_BRIDGE_ME".into(), Some("200".into())),
                 (
                     "FAKE_BRIDGE_ME_READY".into(),
                     Some(ready.display().to_string()),
@@ -868,7 +867,7 @@ mod tests {
                 |target| {
                     target.local.env.apply(
                         provider,
-                        BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
+                        BTreeMap::from([("FAKE_CONFIG_ID".into(), Some(key.into()))]),
                     )
                 },
                 None,

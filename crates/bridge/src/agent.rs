@@ -33,6 +33,18 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
 static NEXT_PROCESS: AtomicU64 = AtomicU64::new(0);
 
+pub const CURSOR_AUTH_OVERRIDES: [&str; 3] = [
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "AGENT_CLI_CREDENTIAL_STORE",
+];
+
+pub fn is_cursor_sdk_bridge(executable: &Path) -> bool {
+    executable
+        .file_stem()
+        .is_some_and(|name| name == "cursor-sdk-bridge")
+}
+
 #[derive(Clone, Copy)]
 enum CursorCommand {
     Acp,
@@ -434,6 +446,10 @@ impl CursorAgent {
             "Cursor agent is stopped"
         );
         ensure!(
+            !is_cursor_sdk_bridge(executable),
+            "Cursor requires the official agent or cursor-agent CLI"
+        );
+        ensure!(
             workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
             "Cursor needs an existing absolute workspace and private store"
         );
@@ -461,8 +477,8 @@ impl CursorAgent {
             .envs(&self.env)
             .env("CURSOR_CONFIG_DIR", root.join("config"))
             .env("CURSOR_DATA_DIR", root.join("data"));
-        if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
-            command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
+        for name in CURSOR_AUTH_OVERRIDES {
+            command.env_remove(name);
         }
         if !model.is_empty() {
             command.args(["--model", model]);
@@ -674,18 +690,15 @@ impl CursorAgent {
         root: &Path,
         env: &BTreeMap<String, String>,
     ) -> Result<CursorObservation> {
-        let mut authentication = CursorAuthentication::Unknown;
-        if !env.contains_key("CURSOR_API_KEY") && !env.contains_key("CURSOR_AUTH_TOKEN") {
-            authentication = self
-                .subscription_authentication(executable, workspace, root, env)
-                .await?;
-            if authentication != CursorAuthentication::Authenticated {
-                return Ok(CursorObservation {
-                    launchable: false,
-                    authentication,
-                    catalog: CursorCatalog::Unavailable,
-                });
-            }
+        let authentication = self
+            .subscription_authentication(executable, workspace, root, env)
+            .await?;
+        if authentication != CursorAuthentication::Authenticated {
+            return Ok(CursorObservation {
+                launchable: false,
+                authentication,
+                catalog: CursorCatalog::Unavailable,
+            });
         }
         let mut rpc = self
             .spawn(executable, workspace, root, env, "", CursorCommand::Acp)
@@ -791,22 +804,18 @@ impl CursorAgent {
             if *cancel.borrow() {
                 bail!("Cursor cancelled before prompt submission");
             }
-            if !turn.env.contains_key("CURSOR_API_KEY")
-                && !turn.env.contains_key("CURSOR_AUTH_TOKEN")
-            {
-                stage = ProviderStage::Authentication;
-                ensure!(
-                    self.subscription_authentication(
-                        &turn.executable,
-                        &turn.workspace,
-                        &turn.local_store_root,
-                        &turn.env
-                    )
-                    .await?
-                        == CursorAuthentication::Authenticated,
-                    "Cursor CLI login is missing or unverified; run agent login explicitly"
-                );
-            }
+            stage = ProviderStage::Authentication;
+            ensure!(
+                self.subscription_authentication(
+                    &turn.executable,
+                    &turn.workspace,
+                    &turn.local_store_root,
+                    &turn.env
+                )
+                .await?
+                    == CursorAuthentication::Authenticated,
+                "Cursor CLI login is missing or unverified; run agent login explicitly"
+            );
             stage = ProviderStage::Launch;
             let mut rpc = self
                 .spawn(

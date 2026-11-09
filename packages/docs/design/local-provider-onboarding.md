@@ -4,9 +4,9 @@
 
 ## 程序与设置
 
-启动为已有用途补缺，设备页的 `configure_provider {provider, connect_local:true}` 可以单独准备服务。Web 按 Codex、Claude Code、Cursor 顺序处理，一项失败仍继续其余服务；写入结果未知时先读完整设置对账。手机开启相应用途走同一接入路径。
+启动为已有用途补缺，设备页的 `configure_provider {provider, connect_local:true}` 可以单独准备服务。Web 进入 AI 设置及返回页面时只自动接入并检查 Cursor，登录变化会重新观察，不复用旧检查结果。手动点**自动接入**时按 Codex、Claude Code、Cursor 顺序处理，一项失败仍继续其余服务；写入结果未知时先读完整设置对账。手机开启相应用途走同一接入路径。
 
-程序先使用保存的选择和 PATH，再查进程 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。Cursor 支持官方 `agent`、`cursor-agent` 入口；Windows 使用 PATHEXT。NVM 按有效 Node 版本降序选择。npm wrapper 启动时补齐 sibling Node 或其他已发现的 Node 目录；仅能从登录 shell 找到所需 Node 时，保存受限 PATH 快照。已选择的绝对程序路径即使失效也不覆盖。
+程序先使用保存的选择和 PATH，再查进程 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。Cursor 支持官方 `agent`、`cursor-agent` 入口；Windows 使用 PATHEXT。NVM 按有效 Node 版本降序选择。npm wrapper 启动时补齐 sibling Node 或其他已发现的 Node 目录；仅能从登录 shell 找到所需 Node 时，保存受限 PATH 快照。已选择的绝对程序路径即使失效也不覆盖，Cursor 的旧 SDK Bridge 选择除外，自动接入会重新发现并保存官方 CLI 的绝对路径。有效自定义 CLI 选择保持不变。
 
 仍找不到程序且没有保存 bin/PATH 时，仅查询操作系统登记登录 shell 的 PATH。Codex 的声明认证变量也沿用既有补缺流程。只读取验证过的固定名称，不导出整个环境或执行任意命令。shell 使用随机 NUL 帧、输出与时限限制，结束时回收进程树；用户启动脚本可能有自身副作用。
 
@@ -30,7 +30,7 @@ Claude 在检查或每次必要启动前，先用不含借用令牌的官方 `au
 
 ## Cursor
 
-Cursor 只通过官方 `agent` 或 `cursor-agent` 的 ACP 接入，复用本机 CLI 的订阅登录。Node 和网页不请求、导入、传递或使用 CURSOR_API_KEY、CURSOR_AUTH_TOKEN，也不覆盖官方 credential store。缺认证时提供所选官方 CLI 的 `login` 命令，不自动打开浏览器。旧 SDK Bridge 不是可运行入口，也不生成其登录命令。
+Cursor 只通过官方 `agent` 或 `cursor-agent` 的 ACP 接入，复用本机 CLI 的订阅登录。Node 和网页不请求、导入、传递或使用 CURSOR_API_KEY、CURSOR_AUTH_TOKEN，也不覆盖官方 credential store。已有私有文件中的这些认证覆盖不会参与运行，新设置会被拒绝，且不会阻止 Node 加载。缺认证时提供所选官方 CLI 的 `login` 命令，命令会清除继承的认证覆盖，不自动打开浏览器。旧 SDK Bridge 不是可运行入口，也不生成其登录命令。
 
 订阅检查运行 `agent status --format json`，只保留状态枚举和认证布尔值，丢弃身份及消息。未登录也可能退出 0，退出码不能作为已认证证据。只有完整本地登录才继续 ACP 初始化。默认检查和执行从不调用会触发浏览器登录的 ACP authenticate。
 
