@@ -72,7 +72,16 @@ pub(crate) async fn complete_local(
             .is_none_or(|bin| vibeface_bridge::agent::is_cursor_sdk_bridge(bin))
     {
         next.bins.remove(&Provider::Cursor);
-        if let Some(bin) = host.program(Provider::Cursor.default_bin()) {
+        let provider_host = Host {
+            path: next
+                .env
+                .get(Provider::Cursor)
+                .get("PATH")
+                .map(OsString::from)
+                .or(host.path.clone()),
+            ..host.clone()
+        };
+        if let Some(bin) = provider_host.program(Provider::Cursor.default_bin()) {
             next.bins.insert(Provider::Cursor, bin);
         }
     }
@@ -1146,6 +1155,36 @@ exec /bin/sh -c "$2"
             custom,
             "a custom CLI remains selected"
         );
+        let saved = root.join("saved-path/agent");
+        let inherited = root.join("process-path/agent");
+        program(&saved);
+        program(&inherited);
+        let priority_host = Host {
+            path: Some(inherited.parent().unwrap().as_os_str().to_owned()),
+            ..host.clone()
+        };
+        assert_eq!(priority_host.program("agent"), Some(inherited));
+        for sdk_selected in [false, true] {
+            local.bins.remove(&Provider::Cursor);
+            if sdk_selected {
+                local
+                    .bins
+                    .insert(Provider::Cursor, root.join(".local/bin/cursor-sdk-bridge"));
+            }
+            local.env.apply(
+                Provider::Cursor,
+                BTreeMap::from([(
+                    "PATH".into(),
+                    Some(saved.parent().unwrap().to_string_lossy().into_owned()),
+                )]),
+            )?;
+            assert!(complete_local(&mut local, &connect, None, &priority_host).await?);
+            assert_eq!(
+                local.bins.get(&Provider::Cursor),
+                Some(&saved),
+                "the saved Cursor PATH wins with sdk_selected={sdk_selected}"
+            );
+        }
         assert_eq!(host.display(&root.join(".codex")), "~/.codex");
         assert_eq!(
             host.display(Path::new("/opt/tools/bin/codex")),
