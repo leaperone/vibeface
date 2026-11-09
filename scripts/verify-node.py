@@ -405,8 +405,8 @@ class Client:
         require(0 < _wait_timeout <= 30, "client command wait stays within its original deadline")
         if self.process is None:
             self.process = subprocess.Popen(
-                ["node", str(self.helper), *([str(self.identity_file)] if self.identity_file else [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                ["node", "--v8-pool-size=1", str(self.helper), *([str(self.identity_file)] if self.identity_file else [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1, env={**os.environ, "UV_THREADPOOL_SIZE": "1"})
         self.process.stdin.write(json.dumps({"op": op, **arguments}) + "\n")
         self.process.stdin.flush()
         require(select.select([self.process.stdout], [], [], _wait_timeout)[0], "WASM client command completed before timeout")
