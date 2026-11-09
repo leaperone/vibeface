@@ -258,11 +258,138 @@ async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
     );
     assert!(spawned.is_running());
 
-    spawned.stop();
-    let _ = child.start_kill();
-    child.wait().await?;
+    assert!(vibeface_bridge::agent::terminate_process_tree(&mut child, &mut spawned).await);
     eventually("the tree to be cleared", || !spawned.is_running());
     assert!(!tree::token_is_running(spawned.token()));
+
+    #[cfg(unix)]
+    for graceful in [true, false] {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+        let directory = scratch("group-grace");
+        let release = directory.join("release");
+        let completed = directory.join("completed");
+        let lost_anchor = directory.join("lost-anchor");
+        let mut root = Command::new("python3");
+        root.args(["-c", "import time; time.sleep(120)"])
+            .stdout(Stdio::piped());
+        let (mut spawned, mut child) = tree::Tree::spawn(root, "platform-grace", true)?;
+        let token = spawned.token().to_owned();
+        let mut root_stdout = child.stdout.take().unwrap();
+        let mut member = Command::new("python3");
+        member
+            .args([
+                "-c",
+                r#"
+import os, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print('ready', flush=True)
+while True:
+    try:
+        os.kill(int(sys.argv[3]), 0)
+    except ProcessLookupError:
+        pathlib.Path(sys.argv[4]).write_text('reaped')
+    if pathlib.Path(sys.argv[1]).exists():
+        break
+    time.sleep(0.01)
+pathlib.Path(sys.argv[2]).write_text('completed')
+"#,
+            ])
+            .arg(&release)
+            .arg(&completed)
+            .arg(spawned.root().to_string())
+            .arg(&lost_anchor)
+            .stdout(Stdio::piped())
+            .process_group(spawned.root() as i32);
+        let mut member = tokio::process::Command::from(member)
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(member.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .await?;
+        assert_eq!(ready, "ready\n");
+        let started = Instant::now();
+        let (cleared, status) = tokio::join!(
+            biased;
+            vibeface_bridge::agent::terminate_process_tree(&mut child, &mut spawned),
+            async {
+                root_stdout.read_to_end(&mut Vec::new()).await?;
+                if graceful { std::fs::write(&release, b"released")?; }
+                member.wait().await
+            }
+        );
+        let status = status?;
+        assert!(
+            !lost_anchor.exists(),
+            "the owned leader stays unreaped until group signalling is finished"
+        );
+        assert!(
+            cleared && !tree::token_is_running(&token),
+            "the whole group is reaped before completion"
+        );
+        if graceful {
+            assert!(
+                status.success() && completed.exists(),
+                "cooperative group members can finish during the grace period"
+            );
+        } else {
+            assert!(
+                started.elapsed() >= Duration::from_secs(3),
+                "a running member keeps the full grace period after its root exits"
+            );
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert!(!completed.exists());
+        }
+        std::fs::remove_dir_all(directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reaped_root_does_not_authorize_more_group_signals() -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let directory = scratch("reaped-group");
+    let signalled = directory.join("signalled");
+    let mut root = Command::new("python3");
+    root.args(["-c", "import time; time.sleep(120)"]);
+    let (mut spawned, mut child) = tree::Tree::spawn(root, "platform-reaped", true)?;
+    let mut member = Command::new("python3");
+    member
+        .args([
+            "-c",
+            "import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: pathlib.Path(sys.argv[1]).write_text('term')); print('ready', flush=True); time.sleep(120)",
+        ])
+        .arg(&signalled)
+        .stdout(Stdio::piped())
+        .process_group(spawned.root() as i32);
+    let mut member = tokio::process::Command::from(member)
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut ready = String::new();
+    BufReader::new(member.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .await?;
+    assert_eq!(ready, "ready\n");
+    child.start_kill()?;
+    child.wait().await?;
+    assert!(child.id().is_none());
+
+    let cleared = vibeface_bridge::agent::terminate_process_tree(&mut child, &mut spawned).await;
+    let remained = member.try_wait()?.is_none();
+    let received_term = signalled.exists();
+    let _ = member.start_kill();
+    member.wait().await?;
+    std::fs::remove_dir_all(directory)?;
+    assert!(!cleared, "an unowned group remains unconfirmed");
+    assert!(
+        remained && !received_term,
+        "a reaped root cannot authorize TERM or KILL to its numeric group"
+    );
     Ok(())
 }
 

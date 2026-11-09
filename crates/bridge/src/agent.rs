@@ -1422,20 +1422,28 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
 
 /// Reaps this bridge's own process tree only; already accepted external work is unaffected.
 ///
-/// `true` means nothing of the tree is left. A `false` answer keeps the tree recorded so a
-/// later attempt, or the next run of the Node, ends it rather than losing track of it.
+/// `true` means nothing of the tree is left. A `false` answer leaves cleanup unconfirmed.
+/// Callers retain the record for later reconciliation.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
-    let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    if !matches!(reaped, Ok(Ok(_))) {
-        tree.kill();
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            return false;
+    if cfg!(windows) || child.id() == Some(tree.root()) {
+        tree.ask_to_stop();
+        let stopped = tokio::time::timeout(platform::tree::GRACE, async {
+            // Keep the Unix leader unreaped until the last possible group signal.
+            while tree.has_live_members().await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            tree.kill();
         }
+    }
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
     }
     for _ in 0..20 {
         // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
@@ -1447,6 +1455,7 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
                 tracing::warn!(%error, "could not confirm Cursor process-tree exit");
             }
         }
+        #[cfg(windows)]
         tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

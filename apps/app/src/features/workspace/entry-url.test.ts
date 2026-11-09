@@ -1580,8 +1580,8 @@ test('native chat glass follows accessibility events without replacing its input
   } finally { app.close() }
 })
 
-test('opening AI settings connects only Cursor and checks CLI login again on focus', async (t) => {
-  for (const unknownWrite of [false, true]) await t.test(`unknown write=${unknownWrite}`, async () => {
+test('opening AI settings connects only Cursor and retains focus until it can recheck CLI login', async (t) => {
+  for (const outcome of ['returned', 'read-back', 'unreadable', 'connection-changed', 'recheck-failed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {
       provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
       execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
@@ -1593,16 +1593,23 @@ test('opening AI settings connects only Cursor and checks CLI login again on foc
     const signedOut: NodeSettingsResponse = { ...initial, providers: [{ ...provider, bin: '/fixture/agent', installed: true,
       setup: { directory: null, command: "'/fixture/agent' login" }, probe: { ...provider.probe, checked_at_ms: 1, authentication: 'sign_in_required' } }] }
     const signedIn: NodeSettingsResponse = { ...signedOut, providers: signedOut.providers.map((item) => ({ ...item, probe: { ...item.probe, checked_at_ms: 2, authentication: 'authenticated' } })) }
-    const first = pendingResult(), second = pendingResult(), calls: { method: string; params: unknown }[] = []
-    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => {
+    const first = pendingResult(), second = pendingResult(), readback = pendingResult(), calls: { method: string; params: unknown }[] = []
+    let current = true, reads = 0
+    const connection = { isCurrent: () => current, request: async (method: string, params?: unknown) => {
       calls.push({ method, params })
-      if (method === 'node_settings') return calls.length === 1 ? initial : signedOut
+      if (method === 'node_settings') return ++reads === 2 && outcome === 'unreadable' ? readback.promise : signedOut
       return calls.filter((call) => call.method === 'configure_provider').length === 1 ? first.promise : second.promise
     } }
+    const replacementCalls: { method: string; params: unknown }[] = []
+    const replacement = { isCurrent: () => !current, request: async (method: string, params?: unknown) => {
+      replacementCalls.push({ method, params })
+      return signedIn
+    } }
+    let ready = connection
     let focused = () => {}
     const app = componentHarness('../devices/ai-settings.tsx', {
       '@vibeface/client/lib/node.ts': nodeSettings,
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready }) },
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
       '@vibeface/client/identity/copy.ts': { deviceCopy },
       '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
@@ -1613,21 +1620,57 @@ test('opening AI settings connects only Cursor and checks CLI login again on foc
       render(); await settleComponent(); render(); render()
       const writes = () => calls.filter((call) => call.method === 'configure_provider')
       assert.equal(writes().length, 1, 'entering settings discovers Cursor once without clicking automatic connection')
+      const cached = render().find(({ props }) => props.item !== undefined)
+      assert.equal(cached?.props.busy, 'connect_local')
+      assert.equal(nodeSettings.parseProvider(cached?.props.item).probe.authentication, 'sign_in_required', 'the CLI login command is already available during the old probe')
       focused(); focused()
       assert.equal(writes().length, 1, 'focus cannot duplicate an in-flight connection write')
-      if (unknownWrite) first.reject(new Error('client response timed out; outcome may be unknown'))
+      if (outcome === 'connection-changed') {
+        current = false; ready = replacement
+        render(); await settleComponent(); render(); render()
+        first.resolve(signedOut)
+        for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+        assert.equal(writes().length, 1, 'an old connection never consumes its pending focus')
+        assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [
+          { method: 'node_settings' }, { method: 'configure_provider', params: { provider: 'cursor', connect_local: true } },
+        ], 'the new connection gets only its own automatic check')
+        assert.equal(nodeSettings.parseProvider(render().find(({ props }) => props.item !== undefined)?.props.item).probe.authentication, 'authenticated')
+        return
+      }
+      if (outcome === 'read-back' || outcome === 'unreadable') first.reject(new Error('client response timed out; outcome may be unknown'))
       else first.resolve(signedOut)
       await settleComponent(); render()
-      if (unknownWrite) assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown connection write is read back before any retry')
-      assert.equal(writes().length, 1, 'a readback does not resend the connection write')
-      focused(); focused(); render()
-      assert.equal(writes().length, 2, 'returning from CLI login rechecks authentication once')
-      second.resolve(signedIn)
-      await settleComponent()
+      if (outcome === 'unreadable') {
+        assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown connection write is read back before any retry')
+        readback.reject(new Error('device read failed'))
+        await settleComponent(); render()
+        focused(); focused()
+        for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+        assert.equal(writes().length, 1, 'focus cannot resend an unknown write before it is reconciled')
+        const elements = render()
+        assert.equal(elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')?.props.disabled, true)
+        const retry: unknown = elements.find(({ type }) => type === 'InlineError')?.props.action
+        assert.ok(retry && typeof retry === 'object' && 'label' in retry && retry.label === '重新读取' && 'onClick' in retry && typeof retry.onClick === 'function')
+        retry.onClick()
+      }
+      for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+      assert.equal(writes().length, 2, 'the merged busy focus is consumed once after the connection is safe')
+      assert.deepEqual(calls.map((call) => call.method), outcome === 'returned' || outcome === 'recheck-failed'
+        ? ['node_settings', 'configure_provider', 'configure_provider']
+        : outcome === 'read-back' ? ['node_settings', 'configure_provider', 'node_settings', 'configure_provider']
+          : ['node_settings', 'configure_provider', 'node_settings', 'node_settings', 'configure_provider'], 'unknown writes are read before the queued check starts')
+      if (outcome === 'recheck-failed') second.reject(new Error('client response timed out; outcome may be unknown'))
+      else second.resolve(signedIn)
+      for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
       const card = render().find(({ props }) => props.item !== undefined)
       const status = nodeSettings.parseProvider(card?.props.item)
-      assert.equal(status.probe.authentication, 'authenticated')
+      assert.equal(status.probe.authentication, outcome === 'recheck-failed' ? 'sign_in_required' : 'authenticated')
       assert.deepEqual(status.roles, [])
+      assert.equal(writes().length, 2, 'no further focus means no additional automatic attempt')
+      if (outcome === 'recheck-failed') {
+        assert.deepEqual(calls.map((call) => call.method), ['node_settings', 'configure_provider', 'configure_provider', 'node_settings'])
+        assert.ok(render().some(({ type }) => type === 'InlineError'), 'a failed queued check remains visible instead of retrying itself')
+      }
       assert.ok(writes().every((call) => JSON.stringify(call.params) === JSON.stringify({ provider: 'cursor', connect_local: true })), 'automatic connection never changes roles or other providers')
     } finally { app.close() }
   })

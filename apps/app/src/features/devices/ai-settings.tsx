@@ -179,6 +179,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   const sequence = useRef(0)
   const connecting = useRef<typeof ready>(null)
   const automaticallyConnected = useRef<typeof ready>(null)
+  const pendingFocus = useRef<typeof ready>(null)
   const [localResult, setLocalResult] = useState("")
   const [needsRead, setNeedsRead] = useState(false)
 
@@ -213,7 +214,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     } catch { /* the shown error already says what failed */ }
     return false
   }
-  useEffect(() => { setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
+  useEffect(() => { pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
   useEffect(() => {
     if (!ready || busy || !response?.providers.some((item) => item.provider === "cursor") || automaticallyConnected.current === ready) return
     automaticallyConnected.current = ready
@@ -221,10 +222,11 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   }, [ready, response, busy])
   // CLI installation and login can change outside this page; read them again on return.
   useEffect(() => {
-    const back = () => { if (!busy) void connectLocal(["cursor"]) }
+    if (ready && pendingFocus.current === ready) void connectLocal(["cursor"])
+    const back = () => { pendingFocus.current = ready; void connectLocal(["cursor"]) }
     window.addEventListener("focus", back)
     return () => window.removeEventListener("focus", back)
-  }, [ready, busy])
+  }, [ready, busy, needsRead])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
     try {
@@ -253,6 +255,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   async function connectLocal(providers: readonly ProviderId[] = localProviderIds) {
     if (!ready?.isCurrent() || busy || connecting.current === ready || needsRead) return
     const connection = ready, owner = ++sequence.current
+    if (pendingFocus.current === connection) pendingFocus.current = null
     connecting.current = connection
     setBusy("connect_local"); setError(null); setLocalResult("")
     const failures: string[] = []
