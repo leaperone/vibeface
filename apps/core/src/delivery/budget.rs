@@ -1539,10 +1539,9 @@ impl Delivery {
             })?;
             if matches!(observed.phase.as_str(), "confirmed" | "reverted")
                 && observed.block_hash.is_some()
+                && let Some(number) = observed.block_number
             {
-                if let Some(number) = observed.block_number {
-                    terminal_blocks.push(number);
-                }
+                terminal_blocks.push(number);
             }
             if observed.phase != "reverted" {
                 last = Some((transaction, observed));
@@ -2428,14 +2427,13 @@ mod tests {
             }
             let before = fixture.original_transactions()?;
             for claim in &mut fixture.claims {
-                if case == "chain_immature" {
-                    if let ClaimState::DisclosedOutstanding {
+                if case == "chain_immature"
+                    && let ClaimState::DisclosedOutstanding {
                         settlement_candidate: Some(candidate),
                         ..
                     } = &mut claim.state
-                    {
-                        candidate.anchor.timestamp = fixture.now - 6;
-                    }
+                {
+                    candidate.anchor.timestamp = fixture.now - 6;
                 }
                 if case == "timeout_final" {
                     let evidence = claim.state.take_settlement_candidate().unwrap();
