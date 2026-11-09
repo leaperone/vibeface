@@ -51,15 +51,13 @@ fn public_https(url: &str) -> bool {
         .is_ok_and(|url| url.scheme() == "https" && net::mesh::public_host(&url))
 }
 
-/// Where a webhook's reader answers: `public_url` when it is public HTTPS, else one of the
-/// mesh's verified `gateways`, the default bootstrap node's first, which hands each decision to
-/// this Node by device ID.
+/// Where a webhook's reader answers: `public_url` when it is public HTTPS, else the default
+/// bootstrap node's gateway among the mesh's verified `gateways`, which hands each decision to
+/// this Node by device ID. The answer carries the decision token, so no other mesh gateway,
+/// which anyone may announce, ever receives it.
 fn decision_url(public_url: &str, gateways: &[(String, String)]) -> Result<String> {
     let anchor = net::mesh::default_bootstrap_id()?;
-    let gateway = gateways
-        .iter()
-        .find(|(device, _)| *device == anchor)
-        .or(gateways.first());
+    let gateway = gateways.iter().find(|(device, _)| *device == anchor);
     let base = match gateway {
         Some((_, url)) if !public_https(public_url) => url,
         _ => public_url,
@@ -2419,7 +2417,11 @@ impl Runtime {
 
     async fn decision_url(&self) -> Result<String> {
         let gateways = match self.net().ok().and_then(|net| net.mesh()) {
-            Some(mesh) if !public_https(&self.config.public_url) => mesh.gateways(&[]).await,
+            Some(mesh) if !public_https(&self.config.public_url) => {
+                let anchor = net::mesh::default_bootstrap_id()?;
+                let url = mesh.gateway_of(&anchor).await;
+                url.map(|url| (anchor, url)).into_iter().collect()
+            }
             _ => vec![],
         };
         decision_url(&self.config.public_url, &gateways)
@@ -3077,7 +3079,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn decisions_reach_a_node_without_public_https_through_a_mesh_gateway() -> Result<()> {
+    fn decisions_reach_a_node_without_public_https_only_through_the_default_gateway() -> Result<()>
+    {
         let local = "http://127.0.0.1:4792";
         assert_eq!(
             decision_url(local, &[])?,
@@ -3090,16 +3093,16 @@ pub(super) mod tests {
         );
         assert_eq!(
             decision_url(local, std::slice::from_ref(&other))?,
-            "https://other.example/api/decision"
+            "http://127.0.0.1:4792/api/decision",
+            "another device's gateway never receives the decision token"
         );
         assert_eq!(
-            decision_url(local, &[other.clone(), anchor])?,
+            decision_url(local, &[other.clone(), anchor.clone()])?,
+            "https://node.vibeface.dev:4792/api/decision"
+        );
+        assert_eq!(
+            decision_url("https://192.168.1.2", &[other.clone(), anchor])?,
             "https://node.vibeface.dev:4792/api/decision",
-            "the default bootstrap node's gateway goes first"
-        );
-        assert_eq!(
-            decision_url("https://192.168.1.2", std::slice::from_ref(&other))?,
-            "https://other.example/api/decision",
             "a private HTTPS URL is no public answer"
         );
         assert_eq!(

@@ -750,13 +750,39 @@ where
     F: Fn(Value) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Value>> + Send,
 {
+    serve_streams_within(connection, None, handle).await
+}
+
+/// Bounds a protocol anyone may call: at most the semaphore's permits of streams are answered
+/// at once across every connection sharing it, each within the duration; a stream past either
+/// is closed unanswered.
+pub type StreamLimit = (Arc<tokio::sync::Semaphore>, Duration);
+
+/// [`serve_streams`] under `limit`.
+pub async fn serve_streams_within<F, Fut>(
+    connection: Connection,
+    limit: Option<StreamLimit>,
+    handle: F,
+) where
+    F: Fn(Value) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Value>> + Send,
+{
     let mut replies = FuturesUnordered::new();
     loop {
         tokio::select! {
             stream = connection.accept_bi() => {
                 let Ok((mut send, mut recv)) = stream else { break };
+                let (permit, within) = match &limit {
+                    Some((open, within)) => match open.clone().try_acquire_owned() {
+                        Ok(permit) => (Some(permit), Some(*within)),
+                        Err(_) => continue,
+                    },
+                    None => (None, None),
+                };
                 let handle = handle.clone();
                 replies.push(std::panic::AssertUnwindSafe(async move {
+                    let _permit = permit;
+                    let reply = async move {
                     let response = match read_frame(&mut recv).await {
                         Ok(Some(request)) => handle(request)
                             .await
@@ -767,6 +793,13 @@ where
                     if write_frame(&mut send, &response).await.is_ok() {
                         send.finish().ok();
                         let _ = send.stopped().await;
+                    }
+                    };
+                    match within {
+                        Some(within) => {
+                            let _ = tokio::time::timeout(within, reply).await;
+                        }
+                        None => reply.await,
                     }
                 }).catch_unwind());
             }

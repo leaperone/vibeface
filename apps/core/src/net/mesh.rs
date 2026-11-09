@@ -4,7 +4,7 @@
 pub mod record;
 pub mod table;
 
-use super::{MemoryLookup, Net, call, device_id, endpoint_id, serve_streams};
+use super::{MemoryLookup, Net, call, device_id, endpoint_id, serve_streams_within};
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{StreamExt as _, stream::BoxStream, stream::FuturesUnordered};
 use iroh::{
@@ -49,6 +49,7 @@ const JOIN_RETRY_MAX: Duration = Duration::from_secs(300);
 const PAGE_RECORDS: usize = 2000;
 const PAGE_BYTES: usize = 4 << 20;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const ANSWERING: usize = 16;
 const LOOKUP_BUDGET: Duration = Duration::from_secs(8);
 const LOOKUP_NEIGHBORS: usize = 3;
 /// Remembered Nodes tried when joining again, besides the bootstrap nodes.
@@ -336,6 +337,9 @@ pub struct Mesh {
     /// Asks the announcer to check this Node's record.
     wake: Notify,
     limits: Mutex<HashMap<EndpointId, Limit>>,
+    /// Exchange requests answered at once from every device together, each within 30 s, so
+    /// pages nobody reads hold at most these permits' worth of memory.
+    answering: Arc<tokio::sync::Semaphore>,
     gateway_checks: Mutex<HashMap<(String, String), (bool, Instant)>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -376,6 +380,7 @@ impl Mesh {
             neighbors: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             limits: Mutex::new(HashMap::new()),
+            answering: Arc::new(tokio::sync::Semaphore::new(ANSWERING)),
             gateway_checks: Mutex::new(HashMap::new()),
             tasks: Mutex::new(vec![]),
         });
@@ -557,6 +562,23 @@ impl Mesh {
             .map(|((_, device, url), _)| (device, url))
             .take(GATEWAYS)
             .collect()
+    }
+
+    /// `device`'s gateway, when its online record names one that answers as it.
+    pub async fn gateway_of(&self, device: &str) -> Option<String> {
+        let url = self
+            .table
+            .lock()
+            .expect("mesh table")
+            .online(now_ms())
+            .filter(|entry| entry.record.device_id == device)
+            .find_map(|entry| {
+                entry.record.roles.iter().find_map(|role| match role {
+                    Role::Gateway { url } => Some(url.clone()),
+                    _ => None,
+                })
+            })?;
+        self.gateway_ok(device, &url).await.then_some(url)
     }
 
     async fn gateway_ok(&self, device: &str, url: &str) -> bool {
@@ -898,9 +920,10 @@ impl Mesh {
 
     async fn serve(self: Arc<Self>, connection: Connection) {
         let remote = connection.remote_id();
+        let limit = (self.answering.clone(), EXCHANGE_TIMEOUT);
         let mesh = Arc::downgrade(&self);
         drop(self);
-        serve_streams(connection, move |request: Value| {
+        serve_streams_within(connection, Some(limit), move |request: Value| {
             let mesh = mesh.clone();
             async move {
                 mesh.upgrade()
