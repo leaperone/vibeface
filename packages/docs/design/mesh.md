@@ -31,7 +31,7 @@
 
 主题 ID 由 `SHA-256("vibeface:mesh:v1:" ‖ network)` 派生，gossip 与交换各用一条带网络名的 ALPN：`vibeface/mesh-gossip/<network>/1`、`vibeface/mesh/<network>/1`。测试用随机网络名，不会进入真实网络。
 
-入网候选依次是：本地旧表里最近见过且公网可达的 8 台、本个人网络的成员 Node、`mesh.seeds`。任一连上就加入主题。全部失败时退避重试，个人网络内的功能不受影响。
+入网候选依次是：本地旧表里最近见过且公网可达的 8 台、本个人网络的成员 Node、`mesh.bootstrap`。任一连上就加入主题。全部失败时退避重试，个人网络内的功能不受影响。
 
 gossip 只送新消息。两台 Node 成为邻居时，各自把 `(device_id, seq)` 摘要发给对方，再只取回自己缺少或更旧的记录。同一条流也回答按设备编号的查询，作为表里没有目标时的兜底。
 
@@ -65,7 +65,7 @@ relay 前置代理按 endpoint 累计双向字节，写入 `mesh.sqlite3` 的 `r
 "mesh": {"enabled": true, "network": "vibeface", "seeds": ["vibeface://<设备编号>@<主机>:<UDP 端口>?relay=<relay URL>"], "allow_private": false}
 ```
 
-`init` 默认开启并写入官方种子。`--no-mesh` 关闭，`--mesh-network` 改网络名，`--mesh-seed` 指定种子（可重复）。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
+`init` 默认开启并写入官方种子。`--no-mesh` 关闭，`--mesh-network` 改网络名，`--bootstrap` 指定种子（可重复）。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
 
 ## 信任边界
 
