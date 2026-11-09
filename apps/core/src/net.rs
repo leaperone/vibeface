@@ -280,6 +280,9 @@ pub struct AddressRecord {
     pub seq: u64,
     pub endpoint: EndpointAddr,
     pub gateway_url: Option<String>,
+    /// The relay this Node runs, which members may make their home relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 /// `payload` is the record's JSON text exactly as signed, so browsers verify the same bytes.
@@ -461,20 +464,31 @@ impl Net {
         self.endpoint.addr()
     }
 
-    /// Remembers where a peer is and adds relays it uses that this Node does not know yet.
+    /// Remembers where a peer is. Its relays are dialed as given, not added to the relay map:
+    /// a peer's home relay may be one that refuses this Node, and it could become home here.
     pub async fn learn(&self, addr: &EndpointAddr) {
-        if addr.id == self.endpoint.id() {
+        if addr.id != self.endpoint.id() {
+            self.lookup.set_endpoint_info(addr.clone());
+        }
+    }
+
+    /// Learns a member Node's record and adds the relay it runs, which admits members.
+    pub async fn learn_member(&self, record: &AddressRecord) {
+        self.learn(&record.endpoint).await;
+        let Some(url) = record.relay.as_deref().and_then(|url| relay_url(url).ok()) else {
             return;
+        };
+        let mut relays = self.relays.lock().await;
+        if relays.insert(url.clone()) {
+            self.endpoint
+                .insert_relay(url.clone(), Arc::new(relay_config(url, None)))
+                .await;
         }
-        self.lookup.set_endpoint_info(addr.clone());
-        for url in addr.relay_urls() {
-            let mut relays = self.relays.lock().await;
-            if relays.insert(url.clone()) {
-                self.endpoint
-                    .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
-                    .await;
-            }
-        }
+    }
+
+    #[cfg(test)]
+    pub async fn knows_relay(&self, url: &RelayUrl) -> bool {
+        self.relays.lock().await.contains(url)
     }
 
     /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
