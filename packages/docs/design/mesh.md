@@ -25,13 +25,26 @@
 - `gateway {url}`：对任何设备转发 `/api/client` 的 HTTPS 入口。
 - `service {service: delivery, offer?}`：实验室文件传输的中转设备。
 
-`offer {asset, price, escrow, grant_endpoint}` 是付费字段，本版本只定义不收费。
+`offer {settlement: {chain_id, escrow, asset}, price}` 是付费字段，本版本只定义不收费。`settlement` 与实验室付费传输的 `chain` 配置同名同值，`price` 是资产最小单位的十进制整数；由谁签发凭证看记录的 `device_id`，不另写地址。
+
+## 两种链接
+
+两种链接都用 `vibeface://`，用途不同，互不接受。
+
+| 链接 | 形式 | 用途 |
+|---|---|---|
+| 节点链接 | `vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>&relay=<URL>` | 说明一台 Node 是谁、在哪里。可当 bootstrap，公开无妨 |
+| 加入链接 | `vibeface://join/vibeface1…` | 加入一个个人网络，含一次性 secret，只交给自己的设备 |
+
+节点链接最多 4 个 `addr`、1 个 `relay`，`addr` 的主机是 IP 或小写域名，`relay` 是不含 `&#?%` 的 http(s) URL。地址和 relay 只是拨号提示，QUIC 握手证明对端就是这台设备。`share_link` 返回本机当前的节点链接：公网地址在前，再是局域网和回环地址，去掉 IPv6 链路本地地址，加上当前 home relay。
+
+加入链接的票据是 postcard 编码再小写 base32，内容是版本、入口 Node 的节点链接和 32 字节 secret，最长 2400 个字符。入口 Node 在 `invite` 应答里给出自己的节点链接，管理设备把它和 secret 一起编进票据。新设备先把票据里的地址和 relay 放进地址簿，入口的 relay 同时拿到邀请凭证；再查全网和配置的 relay。新设备关闭全网、用别的网络名，或 bootstrap 节点连不上时，照样能连到入口。
 
 ## 入网与交换
 
 主题 ID 由 `SHA-256("vibeface:mesh:v1:" ‖ network)` 派生，gossip 与交换各用一条带网络名的 ALPN：`vibeface/mesh-gossip/<network>/1`、`vibeface/mesh/<network>/1`。测试用随机网络名，不会进入真实网络。
 
-入网候选依次是：本地旧表里最近见过且公网可达的 8 台、本个人网络的成员 Node、`mesh.bootstrap`。任一连上就加入主题。全部失败时退避重试，个人网络内的功能不受影响。
+入网候选依次是：本地旧表里最近见过且公网可达的 8 台、本个人网络的成员 Node、`mesh.bootstrap`。任一连上就加入主题。`mesh.bootstrap` 的每一项是节点链接，至少带一个 `addr` 或 `relay`，可以是你认识的任何一台 Node：在那台 Node 上运行 `vibeface mesh share`，或在网页设备页的「节点链接」复制。全部失败时退避重试，个人网络内的功能不受影响。
 
 gossip 只送新消息。两台 Node 成为邻居时，各自把 `(device_id, seq)` 摘要发给对方，再只取回自己缺少或更旧的记录。同一条流也回答按设备编号的查询，作为表里没有目标时的兜底。
 
@@ -57,15 +70,17 @@ Node 在网页设备页打开「公共转发」或运行 `vibeface relay volunte
 
 ## 付费地基
 
-relay 前置代理按 endpoint 累计双向字节，写入 `mesh.sqlite3` 的 `relay_usage`。relay 接受运营者签发的凭证：绑定被授予的设备编号和到期时间，可限字节数。本版本不签发凭证，也不收费。收费要等预付预算与结算上线。
+relay 前置代理按 endpoint 累计双向字节，写入 `mesh.sqlite3` 的 `relay_usage`。relay 接受运营者签发的凭证：绑定被授予的设备编号和到期时间，可限字节数。本版本不签发凭证，也不收费。
+
+计划的购买流程：买方从表里选一条 `access: paid` 的 relay 记录，按其 `offer.settlement` 在实验室付费传输已用的同一 escrow、同一资产上锁定 `price`，不另建合约或钱包。买方按设备编号连到该记录的设备，交出锁定交易，运营方确认链上锁定后签发 `RelayGrant`，写明买方设备、到期时间和字节上限。买方把凭证当 relay token 使用，relay 按 `relay_usage` 计量，到期或用满即拒绝。结算沿用 escrow 的领取与退款期限，未用完的预算按同一规则退回。
 
 ## 配置
 
 ```json
-"mesh": {"enabled": true, "network": "vibeface", "bootstrap": ["vibeface://<设备编号>@<主机>:<UDP 端口>?relay=<relay URL>"], "allow_private": false}
+"mesh": {"enabled": true, "network": "vibeface", "bootstrap": ["vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>&relay=<relay URL>"], "allow_private": false}
 ```
 
-`init` 默认开启并写入官方 bootstrap 节点。`--no-mesh` 关闭，`--mesh-network` 改网络名（不再带官方 bootstrap 节点），`--bootstrap` 指定 bootstrap 节点（可重复，最多 16 个）。`vibeface mesh bootstrap add|remove` 修改列表，Node 运行时立即生效；`vibeface mesh status` 和 `vibeface mesh records [--role relay|gateway|service]` 查看全网。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
+`init` 默认开启并写入官方 bootstrap 节点。`--no-mesh` 关闭，`--mesh-network` 改网络名（不再带官方 bootstrap 节点），`--bootstrap` 指定你认识的第一台 Node，取它的节点链接（可重复，最多 16 个）。`vibeface mesh share` 打印本机运行中的节点链接，`vibeface mesh bootstrap add|remove` 修改列表，Node 运行时立即生效；`vibeface mesh status` 和 `vibeface mesh records [--role relay|gateway|service]` 查看全网。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
 
 ## 信任边界
 
