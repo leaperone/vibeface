@@ -6071,7 +6071,8 @@ def auto_route_acceptance(options):
         require(upgrade_status(target, "/api/client", "https://elsewhere.example") == 403,
                 "other origins cannot open /api/client")
         require(upgrade_status(target, "/api/local/ws", allowed) == 403, "other paths stay same-origin")
-        target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=403)
+        target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=200)
+        target.client.request("/api/local/info", headers={"Origin": allowed}, origin=False, status=403)
         cross = fresh(target.url)
         cross.connect(target.device_id, origin=allowed)
         require(cross.call("info")["device_id"] == target.device_id, "a cross-origin page completes Noise to the target")
