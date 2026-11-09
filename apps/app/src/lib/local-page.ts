@@ -7,7 +7,8 @@ const invitationIn = () => location.pathname === '/join' && location.hash.starts
 
 /** Only a page on localhost may set up, launch or join the computer serving it. */
 export const localPage: LocalPage = {
-  get origin() { return location.origin },
+  // Prerendering has no location; the page then counts as the official one until it runs in a browser.
+  get origin() { return globalThis.location?.origin ?? '' },
   takeLaunch() {
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = invitationIn()

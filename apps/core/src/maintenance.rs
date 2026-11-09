@@ -180,9 +180,6 @@ pub struct Health {
     pub web_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_state: Option<crate::store::WriteState>,
-    /// Standing with the public infrastructure; absent when bootstrap is off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap: Option<crate::net::bootstrap::BootstrapState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerHealth>,
 }
@@ -500,12 +497,12 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
         request.protocol == PROTOCOL,
         "unsupported maintenance protocol"
     );
+    let write_state = *runtime.write_state.borrow();
     let health = Health {
         device_id: runtime.identity.device_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
         web_enabled: runtime.config.web_enabled,
-        write_state: (!runtime.config.public_entry).then(|| *runtime.write_state.borrow()),
-        bootstrap: runtime.bootstrap_state(),
+        write_state: Some(write_state),
         peers: runtime.peer_health().await,
     };
     let mut response = Response {
@@ -994,7 +991,10 @@ mod tests {
         )?;
         let mut configuration = Config::local("127.0.0.1:4794".parse()?, vec![], false);
         // A relay nobody answers on keeps each join waiting.
-        configuration.network.relays = vec!["http://127.0.0.1:9".into()];
+        configuration.network.relays = vec![crate::net::Relay {
+            url: "http://127.0.0.1:9".into(),
+            token: None,
+        }];
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("identity.json"),

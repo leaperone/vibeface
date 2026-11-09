@@ -3087,7 +3087,40 @@ def self_test_protected(original):
             assert environment["RISC0_SERVER_PATH"] == "/opt/vdp/bin/r0vm" and environment["TOKIO_WORKER_THREADS"] == "2"
             assert not any(name.startswith(("RISC0_DEV","RISC0_SKIP")) for name in environment)
     driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
-    assert "BootstrapSite" in driver and "BootstrapSite" in driver["e2e_fixture"].__code__.co_names
+    with tempfile.TemporaryDirectory(prefix="protected-public-node-selftest-", dir=ARTIFACTS) as temporary:
+        directory = Path(temporary)
+        binary = directory / "vibeface"; binary.touch(mode=0o600)
+        options = argparse.Namespace(binary=binary, artifacts=directory / "fixtures",
+            crypto_module=directory / "vibeface_secure.js", fixture_kind="bootstrap", fixture_port=27100)
+        class FixtureConstructed(BaseException): pass
+        public = Mock(device_id="public-selfcheck-peer", quic_port=27102)
+        member = Mock()
+        public.start.side_effect = FixtureConstructed
+        constructor = Mock(side_effect=[public, member])
+        cleanup = Mock()
+        relay_args = ["--relay-listen", "127.0.0.1:27101", "--relay-url", "http://127.0.0.1:27101",
+            "--relay-open", "--relay-rate", "1048576", "--relay-max-clients", "64", "--relay-max-clients-per-ip", "64"]
+        with patch.dict(driver["e2e_fixture"].__globals__, Node=constructor, available_port=lambda: 27101,
+                        stop_fixture_processes=cleanup), patch("signal.signal"), \
+             patch("subprocess.Popen", forbidden), patch("subprocess.run", forbidden), patch("socket.socket", forbidden):
+            assert driver["public_node_args"]() == relay_args
+            try: driver["e2e_fixture"](options)
+            except FixtureConstructed: pass
+            else: raise AssertionError("public Node fixture selfcheck must stop before process startup")
+        assert len(constructor.call_args_list) == 2
+        public_call, member_call = constructor.call_args_list
+        run = public_call.args[0]
+        assert public_call.args[1] == "public" and member_call.args[1] == "member"
+        assert public_call.kwargs == {"port": options.fixture_port,
+            "init_args": ["--serve-discovery", "--forward-any", *relay_args]}
+        assert member_call.kwargs == {"init_args": ["--root", str(run / "workspace"), "--bootstrap",
+            "vibeface://public-selfcheck-peer@127.0.0.1:27102"]}
+        public.start.assert_called_once_with()
+        member.start.assert_not_called()
+        for node in (public, member):
+            node.client.close.assert_called_once_with()
+            node.stop.assert_called_once_with()
+        cleanup.assert_called_once_with(run)
     def forbidden(*_args, **_kwargs): raise AssertionError("retired UI selfcheck started work")
     with patch("subprocess.Popen", forbidden), patch("subprocess.run", forbidden), patch("socket.socket", forbidden):
         try: driver["delivery_ui_selfcheck"](argparse.Namespace())

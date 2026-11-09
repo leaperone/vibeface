@@ -3,7 +3,7 @@ import test from 'node:test'
 import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { passphrase, passwordStrength } from '@vibeface/client/lib/secure.ts'
@@ -91,6 +91,12 @@ test('only entrance records signed by a current member Node of this network surv
   ]
   const found = verifiedEntrances(records, view, signedBySelf)
   assert.deepEqual(found.map(item => [item.device_id[0], item.gateway_url, item.public]), [['a', 'https://a.example.com', true], ['b', 'http://192.168.1.4:4790', false]])
+})
+
+test('a page a Node served reaches Nodes through that Node; the official page and the apps through the public node', () => {
+  assert.equal(defaultGateway('https://node.example:4790'), 'https://node.example:4790')
+  assert.equal(defaultGateway('http://127.0.0.1:4790'), 'http://127.0.0.1:4790')
+  for (const origin of [APP_ORIGIN, 'vibeface-app://app', 'capacitor://localhost', 'null', undefined]) assert.equal(defaultGateway(origin), PUBLIC_GATEWAY, String(origin))
 })
 
 test('switching tries the entry that dropped, then entrances by last success; revoked ones leave the list', () => {

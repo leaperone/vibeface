@@ -29,17 +29,13 @@ export type Inspect = {
   localListen: string
   listen: string
   webEnabled: boolean
-  publicEntry: boolean
   coreVersion: string
   /** Core's own description of why a probe failed; never contains credentials. */
   error: string | null
 }
 
-export type Access =
-  /** A node that publishes a public entry: the URL is already the one to open. */
-  | { kind: 'public_entry'; url: string; deviceId: string }
-  /** A local node: the URL carries a single-use `#local=` or `#bootstrap=` fragment. */
-  | { kind: 'local'; url: string; deviceId: string }
+/** A local node: the URL carries a single-use `#local=` or `#bootstrap=` fragment. */
+export type Access = { kind: 'local'; url: string; deviceId: string }
 
 function record(value: unknown, what: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -89,7 +85,6 @@ export function parseInspect(value: unknown): Inspect {
     localListen: text(source, 'local_listen', 'core inspect result'),
     listen: text(source, 'listen', 'core inspect result'),
     webEnabled: flag(source, 'web_enabled', 'core inspect result'),
-    publicEntry: flag(source, 'public_entry', 'core inspect result'),
     coreVersion: text(source, 'core_version', 'core inspect result'),
     error: optionalText(source, 'error'),
   }
@@ -99,6 +94,5 @@ export function parseAccess(value: unknown): Access {
   const source = record(value, 'core access result')
   const url = text(source, 'url', 'core access result')
   const deviceId = text(source, 'device_id', 'core access result')
-  if (source['public_entry'] === true) return { kind: 'public_entry', url, deviceId }
   return { kind: 'local', url, deviceId }
 }

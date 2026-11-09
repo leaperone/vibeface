@@ -73,7 +73,7 @@ LOCAL_PROCESS_RULES = (
     ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
     ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
     ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
-    ("public-entry", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
+    ("public-node", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
     ("discovery", ("config/public-bootstrap.json", "apps/core/src/discovery.rs", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
     ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
     ("delivery-charity", PATH_RULES[0][1]),
@@ -437,7 +437,7 @@ def self_test():
         assert "delivery-charity" in selected["local_process_modes"]
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
-    assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-entry", "discovery"]
+    assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "discovery"]
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]
@@ -461,20 +461,20 @@ def self_test():
         ("apps/core/src/store/reduce.rs", ["memory-sync", "phase1", "phase5"]),
         ("apps/core/src/store/log.rs", ["memory-sync", "default", "phase1", "phase5"]),
         ("apps/core/src/store/sync.rs", ["memory-sync", "default", "phase4", "phase5"]),
-        ("apps/core/src/identity.rs", ["memory-sync", "auto-route", "default", "phase4", "public-entry", "phase5"]),
-        ("apps/core/src/net.rs", ["auto-route", "default", "phase4", "public-entry", "discovery", "delivery-charity"]),
-        ("apps/core/src/runtime/peers.rs", ["default", "phase4", "public-entry", "discovery", "delivery-charity"]),
+        ("apps/core/src/identity.rs", ["memory-sync", "auto-route", "default", "phase4", "public-node", "phase5"]),
+        ("apps/core/src/net.rs", ["auto-route", "default", "phase4", "public-node", "discovery", "delivery-charity"]),
+        ("apps/core/src/runtime/peers.rs", ["default", "phase4", "public-node", "discovery", "delivery-charity"]),
         ("apps/core/src/runtime/codex_server.rs", ["chat-agent"]),
         ("crates/secure/src/recovery.rs", ["memory-sync", "auto-route", "default", "phase5"]),
         ("crates/bridge/src/codex.rs", ["chat-agent", "phase4"]),
-        ("crates/control/src/lib.rs", ["auto-route", "chat-agent", "phase4", "public-entry", "phase5"]),
+        ("crates/control/src/lib.rs", ["auto-route", "chat-agent", "phase4", "public-node", "phase5"]),
     ):
         assert make_plan([path])["local_process_modes"] == modes, path
     combined = make_plan(["apps/core/src/store/bot_settings.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bot_settings.rs"])
     assert combined["local_process_modes"] == ["memory-sync", "default", "phase1", "chat-agent", "phase4", "phase5"]
     for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs", "crates/protocol/src/lib.rs"):
-        assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5"]
-    assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5", "delivery-charity"]
+        assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5"]
+    assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5", "delivery-charity"]
     assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
     expected = {
         "node": ["vibeface-core"],
@@ -626,7 +626,7 @@ def self_test():
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
         assert set(paths) == {"README.md", "README.zh-CN.md", "apps/core/src/old.rs", "apps/app/old.rs"}
         assert make_plan(paths)["rust_packages"] == ["vibeface-core"]
-        assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5"]
+        assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         git("checkout", "--quiet", "--detach", base, cwd=directory)
         upstream = Path(directory) / "docs/upstream.md"

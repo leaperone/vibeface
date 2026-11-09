@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import release
 
-SERVICES = ('all', 'discovery', 'relay', 'relay-cn', 'app', 'www')
+SERVICES = ('all', 'node', 'app', 'www')
 REPOSITORY = 'leaperone/vibeface'
 
 
@@ -88,7 +88,7 @@ def plan(tag):
 def selection(service, tag):
     kind, _, _ = release.parse_tag(tag)
     release.require((service == 'www') == (kind == 'www'), 'website deployments require a www tag; other services require a product tag')
-    return ['discovery', 'relay', 'relay-cn', 'app'] if service == 'all' else [service]
+    return ['node', 'app'] if service == 'all' else [service]
 
 
 def execute(action, service, tag):
@@ -119,7 +119,7 @@ def prepare(service, tag, output):
     expected = {'tag': tag, 'version': info['version'], 'source_commit': info['source_sha'],
                 'channel': info['channel']}
     components = {'www'} if service == 'www' else set()
-    if any(t in ('discovery', 'relay', 'relay-cn') for t in info['targets']):
+    if 'node' in info['targets']:
         components.add('core')
     if 'app' in info['targets']:
         components.add('app')
@@ -226,7 +226,7 @@ def self_test():
         execute('release', 'app', tag)
         command.assert_called_once_with('workflow', 'run', 'deploy-services.yml', '--repo', REPOSITORY,
                                         '--ref', 'main', '-f', 'service=app', '-f', f'tag={tag}', '-f', 'apply=true')
-    assert selection('all', tag) == ['discovery', 'relay', 'relay-cn', 'app']
+    assert selection('all', tag) == ['node', 'app']
     assert selection('www', 'www-v0.0.1') == ['www']
     for service, wrong_tag in (('www', tag), ('app', 'www-v0.0.1'), ('all', 'www-v0.0.1')):
         try:

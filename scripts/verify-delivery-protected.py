@@ -520,7 +520,7 @@ class Experiment:
         self.funder = accounts[0]
         default_checks = []
         for name in ("S", "R", "P"):
-            args = self.helpers["delivery_entry_args"]() if name == "P" else []
+            args = self.helpers["public_node_args"]() if name == "P" else []
             node = self.helpers["Node"](self.run, name, self.paths["binary"], workspace, client, init_args=args)
             self.nodes.append(node)
             self.helpers["isolate_delivery_node"](node)

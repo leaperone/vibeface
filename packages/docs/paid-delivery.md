@@ -10,6 +10,8 @@
 
 在 S、P 的本机维护命令中创建并解锁独立钱包，备份保管方式沿用钱包命令。密码只通过受保护 FD 传递。R 先用现有 `register-key` 操作完成真实接收密钥注册，再准备订单；历史接收密钥仍保留给已分配订单。
 
+S 和 R 各自管理个人网络，可以属于不同网络。P 是普通公共 Node，可以不加入二者的个人网络。服务通道认证 PeerID，个人网络通道另外验证成员资格；服务 PeerID 不授予个人网络成员权限。
+
 ```sh
 node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output "$VDP_RUN/deployment.json"
 vibeface wallet --data-dir "$VDP_SOURCE" budget open \

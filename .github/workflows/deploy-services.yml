@@ -7,7 +7,7 @@ on:
       service:
         description: Official service to deploy
         type: choice
-        options: [all, discovery, relay, relay-cn, app, www]
+        options: [all, node, app, www]
         required: true
       tag:
         description: Exact published product tag, or website tag for www

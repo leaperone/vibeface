@@ -12,7 +12,6 @@ const inspect = (overrides: Partial<Inspect> = {}): Inspect => ({
   localListen: '127.0.0.1:4791',
   listen: '127.0.0.1:4790',
   webEnabled: true,
-  publicEntry: false,
   coreVersion: '0.0.1',
   error: null,
   ...overrides,
@@ -88,20 +87,6 @@ describe('businessUrl', () => {
   it('rejects an access URL that is not loopback', () => {
     expect(() => businessUrl(access('http://198.51.100.7:4790/'), inspect())).toThrow(/loopback/)
   })
-
-  it('passes a public entry through without rewriting it', () => {
-    const url = businessUrl(
-      { kind: 'public_entry', url: 'https://vb.example.com/', deviceId: DEVICE },
-      inspect({ publicEntry: true })
-    )
-    expect(url).toBe('https://vb.example.com/')
-  })
-
-  it('refuses a public entry published over plain http', () => {
-    expect(() =>
-      businessUrl({ kind: 'public_entry', url: 'http://vb.example.com/', deviceId: DEVICE }, inspect({ publicEntry: true }))
-    ).toThrow(/HTTPS/)
-  })
 })
 
 describe('businessNavigation', () => {
@@ -111,11 +96,6 @@ describe('businessNavigation', () => {
     expect(businessNavigation(access(), inspect(), invite)).toEqual({
       kind: 'business',
       url: 'http://127.0.0.1:4791/join#vibeface1qq2ww3ee4',
-    })
-    const publicAccess: Access = { kind: 'public_entry', url: 'https://vb.example.com/', deviceId: DEVICE }
-    expect(businessNavigation(publicAccess, inspect({ publicEntry: true }), invite)).toEqual({
-      kind: 'business',
-      url: 'https://vb.example.com/join#vibeface1qq2ww3ee4',
     })
   })
 })

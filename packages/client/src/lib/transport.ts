@@ -28,7 +28,7 @@ export type LanStream = {
 export type LanDial = (deviceId: string, addrs: string[], timeoutMs: number) => Promise<LanStream>
 /** Explicit native-only transport for the inspected local Node; browser local-origin checks stay in place. */
 export type NativeLocalCarrier = (entry: Extract<ConnectionEntry, { kind: 'local' }>, timeoutMs: number) => Promise<LanStream>
-/** Selected local Node's ordinary Gateway/bootstrap channel; remote Gateway entries remain browser WebSockets. */
+/** Selected local Node's ordinary Gateway channel; remote Gateway entries remain browser WebSockets. */
 export type NativeLocalGatewayCarrier = (entry: Extract<ConnectionEntry, { kind: 'gateway' }>, target: string, timeoutMs: number) => Promise<LanStream | null>
 type ConnectOptions = {
   onEvent?: (event: unknown) => void
@@ -36,12 +36,14 @@ type ConnectOptions = {
   signal?: AbortSignal
   /** Connect and handshake must finish within this; entrance switching uses less. */
   timeoutMs?: number
+  /** A busy Gateway holds the connection in line: `position` 1 goes next, 0 is let through. */
+  onQueued?: (position: number) => void
 }
 /** A computer that does not answer at its address: off, or on another network. */
 export const unreachableText = '连不上这个节点。确认它正在运行，并且和这里网络互通。'
 
 export type Transport = ReturnType<typeof createTransport>
-/** What the Noise session runs over: binary frames each way; a text frame from the far side is a refusal. */
+/** What the Noise session runs over: binary frames each way; a text frame from the far side is a place in line or a refusal. */
 type Carrier = {
   send(frame: Uint8Array): void
   receive(): Promise<Uint8Array>
@@ -91,13 +93,14 @@ export function joinTicket(value: string): string | null {
 export const joinLink = (ticket: string) => `${JOIN_LINK}${ticket}`
 
 /** Frames not yet read, the connect timer and the one close of a carrier; `shut` drops what carries them. */
-function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (error: Error) => void, shut: () => void) {
+function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (error: Error) => void, shut: () => void, onQueued?: (position: number) => void) {
   const incoming: Uint8Array[] = [], waiting: { resolve(value: Uint8Array): void; reject(error: Error): void }[] = []
   let failure: Error | undefined, fail: (error: Error) => void = () => {}
   /** Rejects once the carrier closed, for racing what it waits on. */
   const failed = new Promise<never>((_, reject) => { fail = reject })
   failed.catch(() => {})
-  const timer = setTimeout(() => close(new Error('连接超时。')), timeoutMs)
+  const expire = () => close(new Error('连接超时。'))
+  let timer = setTimeout(expire, timeoutMs)
   function close(error = new Error('无法接通指定设备。')) {
     if (failure) return
     failure = error
@@ -123,10 +126,22 @@ function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (err
       else if (incoming.length < 512) incoming.push(data)
       else close(new Error('对方发送的数据过多，已关闭连接。'))
     },
-    /** The Gateway or Node refuses in English for logs; `code` is what the page translates. */
-    refuse(text: string) {
+    /**
+     * A busy Gateway's place in line, sent while it waits and so its sign of life: the connect timeout starts over.
+     * Anything else refuses, in English for logs; `code` is what the page translates.
+     */
+    text(text: string) {
       const refusal = Object.assign(new Error('访问地址拒绝了这次连接。'), { code: undefined as unknown })
-      try { const value = JSON.parse(text); refusal.message = String(value.error || refusal.message); refusal.code = value.code } catch {}
+      try {
+        const value = JSON.parse(text)
+        if (value?.type === 'queued' && Number.isSafeInteger(value.position)) {
+          if (failure) return
+          clearTimeout(timer); timer = setTimeout(expire, timeoutMs)
+          onQueued?.(value.position)
+          return
+        }
+        refusal.message = String(value.error || refusal.message); refusal.code = value.code
+      } catch {}
       close(refusal)
     },
     receive(): Promise<Uint8Array> {
@@ -139,12 +154,12 @@ function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (err
 }
 
 /** A WebSocket to a Gateway, which forwards to the Node `connect` names, or to the local page's own Node. */
-async function socketCarrier(url: string, connect: string | null, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+async function socketCarrier(url: string, connect: string | null, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
   const socket = new WebSocket(url)
   socket.binaryType = 'arraybuffer'
-  const frames = inbox(signal, timeoutMs, onClose, () => socket.close())
+  const frames = inbox(signal, timeoutMs, onClose, () => socket.close(), onQueued)
   socket.addEventListener('message', (event: MessageEvent) => {
-    if (typeof event.data === 'string') frames.refuse(event.data)
+    if (typeof event.data === 'string') frames.text(event.data)
     else frames.push(new Uint8Array(event.data as ArrayBuffer))
   })
   socket.addEventListener('close', () => frames.close())
@@ -155,9 +170,9 @@ async function socketCarrier(url: string, connect: string | null, signal: AbortS
 }
 
 /** A QUIC stream straight to the Node: no Gateway in between, so no connect frame. */
-async function streamCarrier(openStream: () => Promise<LanStream>, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+async function streamCarrier(openStream: () => Promise<LanStream>, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
   let stream: LanStream | undefined
-  const frames = inbox(signal, timeoutMs, onClose, () => stream?.close())
+  const frames = inbox(signal, timeoutMs, onClose, () => stream?.close(), onQueued)
   const dialing = openStream().then(opened => {
     stream = opened
     if (frames.closed()) opened.close()
@@ -168,9 +183,9 @@ async function streamCarrier(openStream: () => Promise<LanStream>, signal: Abort
   catch (error) { frames.close(error as Error); throw error }
   void (async () => {
     try {
-      for (let next = await opened.recv(); next; next = await opened.recv()) {
-        if (next.text) { frames.refuse(new TextDecoder().decode(next.data)); return }
-        frames.push(next.data)
+      for (let next = await opened.recv(); next && !frames.closed(); next = await opened.recv()) {
+        if (next.text) frames.text(new TextDecoder().decode(next.data))
+        else frames.push(next.data)
       }
     } catch {}
     frames.close()
@@ -233,7 +248,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     return { entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret }
   }
 
-  async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {
+  async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
     if (entry.kind === 'lan') {
       if (!dialLan) throw new Error('这里不能在局域网里直连设备。')
       return lanCarrier(dialLan, target, entry.addrs, signal, onClose, timeoutMs)
@@ -245,18 +260,18 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     if (entry.kind === 'local' && endpoint !== page()?.origin) throw new Error('本机会话只能连接这个节点。')
     if (entry.kind === 'gateway' && nativeLocalGateway) {
       const stream = await nativeLocalGateway(entry, target, timeoutMs)
-      if (stream) return streamCarrier(() => Promise.resolve(stream), signal, onClose, timeoutMs)
+      if (stream) return streamCarrier(() => Promise.resolve(stream), signal, onClose, timeoutMs, onQueued)
     }
     const url = new URL(entry.kind === 'local' ? '/api/local/ws' : '/api/client', endpoint)
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-    return socketCarrier(url.href, entry.kind === 'local' ? null : JSON.stringify({ type: 'connect', target }), signal, onClose, timeoutMs)
+    return socketCarrier(url.href, entry.kind === 'local' ? null : JSON.stringify({ type: 'connect', target }), signal, onClose, timeoutMs, onQueued)
   }
 
   /**
    * Opens a Noise channel to `entry.device_id` over the way `entry` names.
    * The Node must prove that device key; any other key closes the connection.
    */
-  async function connectDevice(entry: ConnectionEntry, { onEvent, onClose, signal, timeoutMs = 10000 }: ConnectOptions = {}): Promise<DeviceChannel> {
+  async function connectDevice(entry: ConnectionEntry, { onEvent, onClose, signal, timeoutMs = 10000, onQueued }: ConnectOptions = {}): Promise<DeviceChannel> {
     if (signal?.aborted) throw new Error('设备连接已取消。')
     const me = await initClient()
     const target = validTarget(entry.device_id)
@@ -272,7 +287,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     }
     let carrier: Carrier | undefined, handshake: SecureHandshake | undefined
     try {
-      carrier = await carry(entry, target, signal, closing, timeoutMs)
+      carrier = await carry(entry, target, signal, closing, timeoutMs, onQueued)
       if (signal?.aborted) throw new Error('设备连接已取消。')
       handshake = new secure.Handshake(true, target, prologue)
       handshake.setProof(me.deviceId, await sign(handshake.signingBytes()))
