@@ -268,6 +268,12 @@ export type RelaySettings = {
   volunteer: boolean; url: string | null; listen: string | null; rate: number; max_clients: number; max_clients_per_ip: number
   status: typeof relayStates[number]; error: string | null
 }
+/** `share_link`: this Node's node link, `vibeface://node/<device-id>?addr=…&relay=…`, which another Node takes as its bootstrap. */
+export function parseShareLink(value: unknown): string {
+  const link = text(record(value, '节点链接').link)
+  if (!/^vibeface:\/\/node\/[0-9a-f]{64}(\?\S*)?$/.test(link)) throw new Error('节点链接格式无效。')
+  return link
+}
 /** The limits `configure_relay` applies when turned on without them: bytes per second per connection, connections, connections per IP. */
 export const relayDefaults = { rate: 16384, max_clients: 128, max_clients_per_ip: 8 } as const
 export function parseRelaySettings(value: unknown): RelaySettings {

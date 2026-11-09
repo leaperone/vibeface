@@ -4,7 +4,7 @@ import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
 import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, gatewaysOf, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { entryAddress, parseRelaySettings } from '@vibeface/client/lib/node.ts'
+import { entryAddress, parseRelaySettings, parseShareLink } from '@vibeface/client/lib/node.ts'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { passphrase, passwordStrength } from '@vibeface/client/lib/secure.ts'
 import { failureKinds, failureText, humanError, outcomeUnknown, rawError, spentInvite, spentInviteText, workFailure } from '@vibeface/client/lib/errors.ts'
@@ -165,6 +165,16 @@ test('relay settings read as the Node reports them and refuse an unknown state',
   assert.deepEqual(parseRelaySettings(off), off)
   assert.throws(() => parseRelaySettings({ ...on, status: 'pending' }))
   assert.throws(() => parseRelaySettings({ ...on, rate: -1 }))
+})
+
+test('a share link reads only as a node link', () => {
+  const link = `vibeface://node/${'ab'.repeat(32)}?addr=203.0.113.5:4790&relay=https://relay.example`
+  assert.equal(parseShareLink({ link }), link)
+  assert.equal(parseShareLink({ link: `vibeface://node/${'ab'.repeat(32)}` }), `vibeface://node/${'ab'.repeat(32)}`)
+  for (const bad of [`vibeface://join/vibeface1abc`, `vibeface://${'ab'.repeat(32)}@203.0.113.5:4790`, `vibeface://node/${'AB'.repeat(32)}`, `vibeface://node/${'ab'.repeat(32)}?addr=a b`, '']) {
+    assert.throws(() => parseShareLink({ link: bad }), bad)
+  }
+  assert.throws(() => parseShareLink(null))
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {

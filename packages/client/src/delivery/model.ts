@@ -193,9 +193,9 @@ export const receiverChoices = (members: readonly Member[], self: string): Membe
 export function parseProviders(value: unknown): DeliveryProvider[] {
   return array(record(value).providers).flatMap((item): DeliveryProvider[] => {
     try {
-      const v = record(item), offer = v.offer === null ? null : record(v.offer)
+      const v = record(item), offer = v.offer === null ? null : record(v.offer), settlement = offer && record(offer.settlement)
       return [{ device_id: peer(v.device_id), paid: boolean(v.paid), last_seen_ms: integer(v.last_seen_ms),
-        offer: offer && { asset: text(offer.asset), price: amount(offer.price), escrow: text(offer.escrow), grant_endpoint: text(offer.grant_endpoint) } }]
+        offer: offer && settlement && { settlement: { chain_id: integer(settlement.chain_id), escrow: text(settlement.escrow), asset: text(settlement.asset) }, price: amount(offer.price) } }]
     } catch { return [] }
   })
 }

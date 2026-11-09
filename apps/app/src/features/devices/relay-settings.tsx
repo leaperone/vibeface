@@ -1,13 +1,40 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, LoaderCircle, RadioTower, SlidersHorizontal, TriangleAlert } from "lucide-react"
+import { Check, CircleCheck, Copy, LoaderCircle, RadioTower, Share2, SlidersHorizontal, TriangleAlert } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { parseRelaySettings, relayDefaults, type RelaySettings as Settings } from "@vibeface/client/lib/node.ts"
+import { parseRelaySettings, parseShareLink, relayDefaults, type RelaySettings as Settings } from "@vibeface/client/lib/node.ts"
 
 export const relayLabel = "公共转发"
+const shareLabel = "节点链接"
+
+/** The connected Node's node link, which another Node takes as `--bootstrap`. */
+export function ShareLink() {
+  const { ready } = useDevice()
+  const [link, setLink] = useState("")
+  const [copied, setCopied] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+  useEffect(() => {
+    if (!ready?.isCurrent()) return
+    const connection = ready
+    let live = true
+    setLink(""); setError(null); setCopied(false)
+    connection.request("share_link").then((raw) => { if (live && connection.isCurrent()) setLink(parseShareLink(raw)) }, (cause) => { if (live) setError(cause) })
+    return () => { live = false }
+  }, [ready])
+  const copy = () => void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {})
+  return <SettingsGroup>
+    <SettingsRow icon={Share2} label={shareLabel}>
+      {link ? <Button type="button" variant="ghost" size="icon-sm" aria-label={copied ? "已复制" : "复制"} title={copied ? "已复制" : "复制"} onClick={copy}>
+        {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      </Button> : error ? null : <Skeleton className="h-6 w-11" />}
+    </SettingsRow>
+    {link ? <div className="px-4 py-3"><code className="block select-all break-all font-mono text-meta text-muted-foreground">{link}</code></div> : null}
+    {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
+  </SettingsGroup>
+}
 const fieldLabel = "-mb-1 text-meta font-medium text-muted-foreground"
 /** Off shows the switch alone; the other states an icon, their words only on hover and for screen readers. */
 const states = {

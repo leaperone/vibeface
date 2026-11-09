@@ -688,10 +688,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const record_ = { network_id: connection.principal.network_id, invite_hash: inviteHash, issuer: own().deviceId, expires_at_ms: expiresAt, signature: '' }
     record_.signature = await signClient('identity-invite', inviteSigningPayload(JSON.stringify(record_)))
     const result = record(await request('invite', { record: record_ }))
-    const entryId = validTarget(result.entry_id)
-    if (entryId !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
-    const ticket = ticketEncode(entryId, hex(secret))
+    // The ticket carries the entry's node link, so a new device reaches it at its addresses and relay.
+    const ticket = ticketEncode(String(result.entry), hex(secret))
     secret.fill(0)
+    if (validTarget(JSON.parse(platform.secure.ticketDecode(ticket)).entry_id) !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
     return { link: joinLink(ticket), expiresAt }
   }
   async function startApproval(joinId: string) {

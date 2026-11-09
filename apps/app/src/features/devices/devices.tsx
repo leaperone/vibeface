@@ -14,7 +14,7 @@ import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
 import { entryAddress, throughEntry, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings } from "./ai-settings"
-import { RelaySettings, relayLabel } from "./relay-settings"
+import { RelaySettings, ShareLink, relayLabel } from "./relay-settings"
 import { JoinRequests } from "./join"
 import { localCopy } from "@/features/workspace/local-session"
 
@@ -245,6 +245,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
+    {row.entry && row.kind === "node" && (canManage || localSession) ? <ShareLink /> : null}
     {row.entry && row.kind === "node" ? canManage || localSession ? <RelaySettings /> : <SettingsGroup>
       <SettingsRow icon={RadioTower} label={relayLabel}>{editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</SettingsRow>
     </SettingsGroup> : null}

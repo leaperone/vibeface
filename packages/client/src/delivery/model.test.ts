@@ -251,7 +251,7 @@ test('a file goes to my other computers without pasting, never to this one or a 
 })
 
 test('the provider field offers announced devices: paid delivery those that quote a price, free delivery all', async () => {
-  const offer = { asset: `0x${'55'.repeat(20)}`, price: '9007199254740993', escrow: `0x${'66'.repeat(20)}`, grant_endpoint: 'service/1' }
+  const offer = { settlement: { chain_id: 31337, escrow: `0x${'66'.repeat(20)}`, asset: `0x${'55'.repeat(20)}` }, price: '9007199254740993' }
   const asked: unknown[] = []
   const client = createDeliveryClient(connection(async (method, params) => {
     asked.push([method, params])
