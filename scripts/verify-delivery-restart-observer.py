@@ -173,7 +173,13 @@ def watch(ready_fd, done_fd):
             missing_before = summary['prewindow_rpc_snapshot_missing']['count']
             if not summary['window_started'] and now >= next_stats:
                 try:
-                    candidate = {'value':rpc_stats(),'read_completed_monotonic':time.monotonic()}
+                    metadata = rpc_statistics_file.lstat()
+                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                            or stat.S_IMODE(metadata.st_mode) != 0o600
+                            or not native.is_dir() or not public.is_dir()):
+                        raise ObservationIncomplete('unsafe prewindow RPC statistics file')
+                    if baseline is not None or metadata.st_size != 0:
+                        candidate = {'value':rpc_stats(),'read_completed_monotonic':time.monotonic()}
                 except FileNotFoundError as error:
                     if (error.errno != errno.ENOENT or error.filename != str(rpc_statistics_file)
                             or not native.is_dir() or not public.is_dir()):
