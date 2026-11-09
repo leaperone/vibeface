@@ -3522,7 +3522,7 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","connect_local":true,"env":{"CURSOR_API_KEY":cursor_key}}),
+            json!({"provider":"cursor","connect_local":true,"env":{"FIXTURE_CURSOR_KEY":cursor_key}}),
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
@@ -3603,8 +3603,8 @@ mod tests {
         let codex_env = node.provider_env(Provider::Codex);
         let cursor_env = node.provider_env(Provider::Cursor);
         assert_eq!(codex_env["FIXTURE_CODEX_KEY"], codex_key);
-        assert!(!codex_env.contains_key("CURSOR_API_KEY"));
-        assert_eq!(cursor_env["CURSOR_API_KEY"], cursor_key);
+        assert!(!codex_env.contains_key("FIXTURE_CURSOR_KEY"));
+        assert_eq!(cursor_env["FIXTURE_CURSOR_KEY"], cursor_key);
         assert!(!cursor_env.contains_key("FIXTURE_CODEX_KEY"));
 
         crate::logging::write(&crate::logging::Record {
@@ -3685,6 +3685,10 @@ mod tests {
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
+            json!({"provider":"cursor","env":{"CURSOR_API_KEY":"synthetic-rejected-key"}}),
+            json!({"provider":"cursor","env":{"CURSOR_AUTH_TOKEN":"synthetic-rejected-token"}}),
+            json!({"provider":"cursor","env":{"AGENT_CLI_CREDENTIAL_STORE":"memory"}}),
+            json!({"provider":"cursor","bin":"/fixture/cursor-sdk-bridge"}),
         ] {
             assert!(
                 dispatch(&node, &mut owner, "configure_provider", invalid)
@@ -3823,7 +3827,7 @@ mod tests {
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(
-            reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
+            reopened.provider_env(Provider::Cursor)["FIXTURE_CURSOR_KEY"],
             cursor_key
         );
         reopened.shutdown().await;

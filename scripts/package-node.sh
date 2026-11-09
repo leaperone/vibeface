@@ -127,7 +127,7 @@ cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 The archive contains the CLI, Core, and static browser application. Install the provider tools separately before enabling the bot.
 
 - Codex bots and native App Server access need the `codex` CLI and its authenticated account.
-- Cursor uses the official local Agent CLI (`agent` or `cursor-agent`) and its CLI subscription login; an explicitly configured API key/token is also supported.
+- Cursor uses only the official local Agent CLI (`agent` or `cursor-agent`) and its CLI subscription login. API keys and auth tokens are not required or used, and the official credential store is never overridden.
 
 The device page's automatic connection finds common program installations and completes missing declared authentication variables from the Node environment or a bounded interactive login shell. Existing private settings and enabled uses are preserved. You can still choose an absolute program path in advanced settings.
 

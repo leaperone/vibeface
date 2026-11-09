@@ -33,6 +33,18 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
 static NEXT_PROCESS: AtomicU64 = AtomicU64::new(0);
 
+pub const CURSOR_AUTH_OVERRIDES: [&str; 3] = [
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "AGENT_CLI_CREDENTIAL_STORE",
+];
+
+pub fn is_cursor_sdk_bridge(executable: &Path) -> bool {
+    executable
+        .file_stem()
+        .is_some_and(|name| name == "cursor-sdk-bridge")
+}
+
 #[derive(Clone, Copy)]
 enum CursorCommand {
     Acp,
@@ -455,6 +467,10 @@ impl CursorAgent {
             "Cursor agent is stopped"
         );
         ensure!(
+            !is_cursor_sdk_bridge(executable),
+            "Cursor requires the official agent or cursor-agent CLI"
+        );
+        ensure!(
             workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
             "Cursor needs an existing absolute workspace and private store"
         );
@@ -482,8 +498,8 @@ impl CursorAgent {
             .envs(&self.env)
             .env("CURSOR_CONFIG_DIR", root.join("config"))
             .env("CURSOR_DATA_DIR", root.join("data"));
-        if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
-            command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
+        for name in CURSOR_AUTH_OVERRIDES {
+            command.env_remove(name);
         }
         if !model.is_empty() {
             command.args(["--model", model]);
@@ -508,7 +524,7 @@ impl CursorAgent {
         let identity = match process_start(group) {
             Ok(start) => ProcessIdentity::UnixStart(start),
             Err(error) => {
-                if child.try_wait()?.is_some() {
+                if platform::tree::try_observe_exit(&mut child)?.is_some() {
                     ProcessIdentity::Exited
                 } else {
                     tree.kill();
@@ -594,7 +610,7 @@ impl CursorAgent {
                     }
                 }
             }
-            let _ = terminate_process_tree(&mut child, &mut tree).await;
+            let cleared = terminate_process_tree(&mut child, &mut tree).await;
             stdout_task.abort();
             stderr_task.abort();
             if !stdout_joined {
@@ -604,7 +620,9 @@ impl CursorAgent {
             drop(stdin);
             drop(child);
             drop(tree);
-            processes.forget(&token);
+            if cleared {
+                processes.forget(&token);
+            }
             let _ = exit.send(true);
         });
         Ok(Rpc {
@@ -695,18 +713,15 @@ impl CursorAgent {
         root: &Path,
         env: &BTreeMap<String, String>,
     ) -> Result<CursorObservation> {
-        let mut authentication = CursorAuthentication::Unknown;
-        if !env.contains_key("CURSOR_API_KEY") && !env.contains_key("CURSOR_AUTH_TOKEN") {
-            authentication = self
-                .subscription_authentication(executable, workspace, root, env)
-                .await?;
-            if authentication != CursorAuthentication::Authenticated {
-                return Ok(CursorObservation {
-                    launchable: false,
-                    authentication,
-                    catalog: CursorCatalog::Unavailable,
-                });
-            }
+        let authentication = self
+            .subscription_authentication(executable, workspace, root, env)
+            .await?;
+        if authentication != CursorAuthentication::Authenticated {
+            return Ok(CursorObservation {
+                launchable: false,
+                authentication,
+                catalog: CursorCatalog::Unavailable,
+            });
         }
         let mut rpc = self
             .spawn(executable, workspace, root, env, "", CursorCommand::Acp)
@@ -813,22 +828,18 @@ impl CursorAgent {
             if *cancel.borrow() {
                 bail!("Cursor cancelled before prompt submission");
             }
-            if !turn.env.contains_key("CURSOR_API_KEY")
-                && !turn.env.contains_key("CURSOR_AUTH_TOKEN")
-            {
-                stage = ProviderStage::Authentication;
-                ensure!(
-                    self.subscription_authentication(
-                        &turn.executable,
-                        &turn.workspace,
-                        &turn.local_store_root,
-                        &turn.env
-                    )
-                    .await?
-                        == CursorAuthentication::Authenticated,
-                    "Cursor CLI login is missing or unverified; run agent login explicitly"
-                );
-            }
+            stage = ProviderStage::Authentication;
+            ensure!(
+                self.subscription_authentication(
+                    &turn.executable,
+                    &turn.workspace,
+                    &turn.local_store_root,
+                    &turn.env
+                )
+                .await?
+                    == CursorAuthentication::Authenticated,
+                "Cursor CLI login is missing or unverified; run agent login explicitly"
+            );
             stage = ProviderStage::Launch;
             let mut rpc = self
                 .spawn(
@@ -1413,20 +1424,28 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
 
 /// Reaps this bridge's own process tree only; already accepted external work is unaffected.
 ///
-/// `true` means nothing of the tree is left. A `false` answer keeps the tree recorded so a
-/// later attempt, or the next run of the Node, ends it rather than losing track of it.
+/// `true` means nothing of the tree is left. A `false` answer leaves cleanup unconfirmed.
+/// Callers retain the record for later reconciliation.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
-    let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    if !matches!(reaped, Ok(Ok(_))) {
-        tree.kill();
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            return false;
+    if cfg!(windows) || child.id() == Some(tree.root()) {
+        tree.ask_to_stop();
+        let stopped = tokio::time::timeout(platform::tree::GRACE, async {
+            // Keep the Unix leader unreaped until the last possible group signal.
+            while tree.has_live_members().await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            tree.kill();
         }
+    }
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
     }
     for _ in 0..20 {
         // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
@@ -1438,6 +1457,7 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
                 tracing::warn!(%error, "could not confirm Cursor process-tree exit");
             }
         }
+        #[cfg(windows)]
         tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

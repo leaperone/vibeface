@@ -220,7 +220,8 @@ impl Config {
     }
     pub fn load(dir: &Path) -> Result<Self> {
         let bytes = Zeroizing::new(std::fs::read(dir.join("config.json"))?);
-        let config: Self = serde_json::from_slice(&bytes)?;
+        let mut config: Self = serde_json::from_slice(&bytes)?;
+        config.provider_env.remove_cursor_auth_overrides();
         config.register_private_paths(dir);
         config.validate()?;
         Ok(config)

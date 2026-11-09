@@ -104,7 +104,7 @@ Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `code
 
 pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
 
-Cursor 使用官方 Agent CLI 的已有订阅登录，缺认证时提供 `agent login`，不要求 API key，也不自动打开浏览器。保存或继承的 API key/token 仍优先。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
+Cursor 只使用官方 Agent CLI 的已有订阅登录，缺认证时提供所选 CLI 的 `login` 命令，不自动打开浏览器。网页进入 AI 设置或返回页面时自动接入并重新检查 Cursor，不开启用途。Node 忽略已有私有文件中的 Cursor API key/token 和 credential-store 覆盖，拒绝新设置，并在子进程边界清除这些覆盖。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
 
 ## 配置会话扫描和 hooks
 

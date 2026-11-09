@@ -1,9 +1,44 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { stat } from 'node:fs/promises';
-import { test } from './fixtures';
+import { readFile, stat } from 'node:fs/promises';
+import { test, cursorTest } from './fixtures';
 import { expect, secrets } from 'e2e';
+
+cursorTest('automatically connects Cursor using only the official CLI subscription login', async ({ app, cursor, screen, browser }) => {
+  await app.open(cursor.node.entry);
+  await screen.getByRole('button', '新建我的网络').click();
+  await screen.getByLabel('这个节点叫什么？').fill('Cursor subscription fixture');
+  await screen.getByRole('button', '下一步').click();
+  await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
+  await screen.getByRole('button', '下一步').click();
+  await browser.waitForDownload(() => screen.getByRole('button', '下载恢复文件').click());
+  await screen.getByRole('checkbox', '已把文件和密码分开保存').check();
+  await screen.getByRole('button', '完成创建').click();
+  await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
+  const card = screen.getByRole('listitem').filter({ has: screen.getByText('Cursor', { exact: true }) });
+  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toBeVisible();
+  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveValue(/\/agent' login$/);
+  await expect(card.getByRole('textbox', /密钥|令牌/)).toHaveCount(0);
+  await expect(card.getByRole('link', /获取/)).toHaveCount(0);
+  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
+  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
+  await app.screenshot('cursor-cli-sign-in-required');
+  await cursor.login();
+  await browser.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await expect(card.getByText('未验证，可尝试', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 尚未确认这个模型，可发送消息或先检查可用性', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toHaveCount(0);
+  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveCount(0);
+  const requests = (await readFile(join(cursor.node.directory, '..', 'cursor-requests.jsonl'), 'utf8')).trim().split('\n').map((line): unknown => JSON.parse(line));
+  assert(requests.includes('initialize') && requests.includes('session/new'), 'the signed-in CLI returned its controlled model catalog');
+  assert(!requests.includes('session/prompt'), 'catalog observation sends no model prompt');
+  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
+  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
+  await app.screenshot('cursor-cli-authenticated-model-unverified');
+});
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
   await app.open(node.entry);

@@ -1580,6 +1580,124 @@ test('native chat glass follows accessibility events without replacing its input
   } finally { app.close() }
 })
 
+test('opening AI settings connects only Cursor and retains focus until it can recheck CLI login', async (t) => {
+  for (const outcome of ['returned', 'read-back', 'unreadable', 'connection-changed', 'recheck-failed', 'same-device-reconnected']) await t.test(outcome, async () => {
+    const unreadable = outcome === 'unreadable' || outcome === 'same-device-reconnected'
+    const provider: ProviderStatus = {
+      provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
+      execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } },
+      probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const otherProvider: ProviderStatus = { ...provider, provider: 'codex', authentication_source: 'private_login', roles: ['execution'], probe: { ...provider.probe, provider: 'codex' } }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [provider, otherProvider], display_paths: {}, suggested_roots: [] }
+    const signedOut: NodeSettingsResponse = { ...initial, providers: [{ ...provider, bin: '/fixture/agent', installed: true,
+      setup: { directory: null, command: "'/fixture/agent' login" }, probe: { ...provider.probe, checked_at_ms: 1, authentication: 'sign_in_required' } }, otherProvider] }
+    const signedIn: NodeSettingsResponse = { ...signedOut, providers: signedOut.providers.map((item) => item.provider === 'cursor' ? { ...item, probe: { ...item.probe, checked_at_ms: 2, authentication: 'authenticated' } } : item) }
+    const first = pendingResult(), second = pendingResult(), readback = pendingResult(), replacementRead = pendingResult(), calls: { method: string; params: unknown }[] = []
+    let current = true, reads = 0
+    const connection = { entry: { device_id: 'fixture-node' }, isCurrent: () => current, request: async (method: string, params?: unknown) => {
+      calls.push({ method, params })
+      if (method === 'node_settings') return ++reads === 2 && unreadable ? readback.promise : signedOut
+      return calls.filter((call) => call.method === 'configure_provider').length === 1 ? first.promise : second.promise
+    } }
+    const replacementCalls: { method: string; params: unknown }[] = []
+    const replacement = { entry: connection.entry, isCurrent: () => !current, request: async (method: string, params?: unknown) => {
+      replacementCalls.push({ method, params })
+      if (method === 'node_settings' && outcome === 'same-device-reconnected') return replacementRead.promise
+      return signedIn
+    } }
+    let ready = connection
+    let focused = () => {}
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener(_event: string, callback: () => void) { focused = callback }, removeEventListener() { focused = () => {} } } })
+    const render = () => app.render('AiSettings', { compact: true })
+    try {
+      render(); await settleComponent(); render(); render()
+      const writes = () => calls.filter((call) => call.method === 'configure_provider')
+      assert.equal(writes().length, 1, 'entering settings discovers Cursor once without clicking automatic connection')
+      const cached = render().find(({ props }) => props.item !== undefined)
+      assert.equal(cached?.props.busy, 'connect_local')
+      assert.equal(nodeSettings.parseProvider(cached?.props.item).probe.authentication, 'sign_in_required', 'the CLI login command is already available during the old probe')
+      focused(); focused()
+      assert.equal(writes().length, 1, 'focus cannot duplicate an in-flight connection write')
+      if (outcome === 'connection-changed') {
+        current = false; ready = replacement
+        render(); await settleComponent(); render(); render()
+        first.resolve(signedOut)
+        for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+        assert.equal(writes().length, 1, 'an old connection never consumes its pending focus')
+        assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [
+          { method: 'node_settings' }, { method: 'configure_provider', params: { provider: 'cursor', connect_local: true } },
+        ], 'the new connection gets only its own automatic check')
+        assert.equal(nodeSettings.parseProvider(render().find(({ props }) => props.item !== undefined)?.props.item).probe.authentication, 'authenticated')
+        return
+      }
+      if (outcome === 'read-back' || unreadable) first.reject(new Error('client response timed out; outcome may be unknown'))
+      else first.resolve(signedOut)
+      await settleComponent(); render()
+      if (unreadable) {
+        assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown connection write is read back before any retry')
+        readback.reject(new Error('device read failed'))
+        await settleComponent(); render()
+        focused(); focused()
+        for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+        assert.equal(writes().length, 1, 'focus cannot resend an unknown write before it is reconciled')
+        const elements = render()
+        assert.equal(elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')?.props.disabled, true)
+        if (outcome === 'same-device-reconnected') {
+          const oldCalls = JSON.parse(JSON.stringify(calls))
+          current = false; ready = replacement
+          assert.equal(ready.entry.device_id, connection.entry.device_id, 'the component stays mounted for the same device')
+          render(); await settleComponent(); render()
+          assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [{ method: 'node_settings' }], 'the new connection waits for its own settings read')
+          replacementRead.resolve(signedOut)
+          for (let turn = 0; turn < 4; turn++) { await settleComponent(); render() }
+          assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [
+            { method: 'node_settings' }, { method: 'configure_provider', params: { provider: 'cursor', connect_local: true } },
+          ], 'a successful read on the new connection automatically connects Cursor exactly once')
+          assert.deepEqual(JSON.parse(JSON.stringify(calls)), oldCalls, 'reconnection never replays the unknown write on the old connection')
+          const statuses = render().filter(({ props }) => props.item !== undefined).map(({ props }) => nodeSettings.parseProvider(props.item))
+          assert.equal(statuses.find((item) => item.provider === 'cursor')?.probe.authentication, 'authenticated')
+          assert.deepEqual(statuses.map((item) => ({ provider: item.provider, roles: item.roles })), [
+            { provider: 'cursor', roles: [] }, { provider: 'codex', roles: ['execution'] },
+          ], 'reconnection preserves provider roles')
+          return
+        }
+        const retry: unknown = elements.find(({ type }) => type === 'InlineError')?.props.action
+        assert.ok(retry && typeof retry === 'object' && 'label' in retry && retry.label === '重新读取' && 'onClick' in retry && typeof retry.onClick === 'function')
+        retry.onClick()
+      }
+      for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+      assert.equal(writes().length, 2, 'the merged busy focus is consumed once after the connection is safe')
+      assert.deepEqual(calls.map((call) => call.method), outcome === 'returned' || outcome === 'recheck-failed'
+        ? ['node_settings', 'configure_provider', 'configure_provider']
+        : outcome === 'read-back' ? ['node_settings', 'configure_provider', 'node_settings', 'configure_provider']
+          : ['node_settings', 'configure_provider', 'node_settings', 'node_settings', 'configure_provider'], 'unknown writes are read before the queued check starts')
+      if (outcome === 'recheck-failed') second.reject(new Error('client response timed out; outcome may be unknown'))
+      else second.resolve(signedIn)
+      for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() }
+      const card = render().find(({ props }) => props.item !== undefined)
+      const status = nodeSettings.parseProvider(card?.props.item)
+      assert.equal(status.probe.authentication, outcome === 'recheck-failed' ? 'sign_in_required' : 'authenticated')
+      assert.deepEqual(status.roles, [])
+      assert.equal(writes().length, 2, 'no further focus means no additional automatic attempt')
+      if (outcome === 'recheck-failed') {
+        assert.deepEqual(calls.map((call) => call.method), ['node_settings', 'configure_provider', 'configure_provider', 'node_settings'])
+        assert.ok(render().some(({ type }) => type === 'InlineError'), 'a failed queued check remains visible instead of retrying itself')
+      }
+      assert.ok(writes().every((call) => JSON.stringify(call.params) === JSON.stringify({ provider: 'cursor', connect_local: true })), 'automatic connection never changes roles or other providers')
+    } finally { app.close() }
+  })
+})
+
 test("automatic connection checks the three local services without changing uses and reads back unknown writes", async (t) => {
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {

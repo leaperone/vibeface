@@ -8825,6 +8825,31 @@ def e2e_fixture(options):
         if options.fixture_kind == "workspace" else None
     mesh_invitation = None
     mesh_kind = options.fixture_kind == "mesh"
+    cursor_bin = run / "cursor-cli"
+    cursor_bin.mkdir(mode=0o700)
+    cursor_program = cursor_bin / "agent"
+    cursor_login = run / "cursor-signed-in"
+    cursor_requests = run / "cursor-requests.jsonl"
+    cursor_prompts = run / "cursor-prompts.jsonl"
+    cursor_protocol = Path(__file__).resolve().parents[1] / "crates/bridge/tests/fixtures/fake-cursor-agent"
+    cursor_program.write_text(f'''#!{sys.executable}
+import os, pathlib, sys
+login = pathlib.Path({str(cursor_login)!r})
+if sys.argv[1:] == ['login']:
+    login.touch(mode=0o600)
+    sys.exit(0)
+if not login.exists():
+    os.environ['FAKE_STATUS_SIGNED_OUT'] = '1'
+os.environ['FAKE_BRIDGE_REQUEST_LOG'] = {str(cursor_requests)!r}
+os.environ['FAKE_BRIDGE_SEND_LOG'] = {str(cursor_prompts)!r}
+os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:]])
+''')
+    cursor_program.chmod(0o700)
+
+    def configure_cursor(node):
+        bins = json.loads((node.directory / "config.json").read_text()).get("bins", {})
+        bins["cursor"] = str(cursor_bin / "cursor-sdk-bridge" if options.fixture_kind == "cursor" else cursor_program)
+        node.configure(bins=bins)
 
     def details():
         # A browser lives on the origin of the owner's access link; a Node without one names its listener.
@@ -8851,6 +8876,8 @@ def e2e_fixture(options):
                 "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", public.mesh_address])
             nodes["member"] = member
             node_cli(member, "config", "set", "mesh.allow_private", "true")
+            configure_cursor(public)
+            configure_cursor(member)
             public.start()
             member.start()
             member.bootstrap()
@@ -8880,7 +8907,11 @@ def e2e_fixture(options):
                 node.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(run, workspace),
                                bins={"codex": str(fixture_wrapper(run, "workspace-codex", "--fixture-codex"))},
                                app_server=SPAWN_APP_SERVER)
-            node.start()
+            configure_cursor(node)
+            environment = node.environment()
+            if options.fixture_kind == "cursor":
+                environment["PATH"] = str(cursor_bin) + os.pathsep + os.defpath
+            node.start(env=environment)
         print(json.dumps({"ready": details()}), flush=True)
         for line in sys.stdin:
             request = json.loads(line)
@@ -8893,6 +8924,23 @@ def e2e_fixture(options):
                     node.stop(crash=bool(request.get("crash")))
                     node.start()
                     result = details()
+                elif op == "cursor_login":
+                    require(set(request) == {"op"} and options.fixture_kind == "cursor",
+                            "Cursor login belongs only to this controlled fixture")
+                    env = nodes["source"].environment()
+                    for name in ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN", "AGENT_CLI_CREDENTIAL_STORE"):
+                        env.pop(name, None)
+                    result = subprocess.run([str(cursor_program), "login"], env=env, capture_output=True, timeout=5)
+                    require(result.returncode == 0 and cursor_login.exists(), "the controlled CLI login completes")
+                    result = {"signed_in": True}
+                elif op == "cursor_inspect":
+                    require(set(request) == {"op"} and options.fixture_kind == "cursor",
+                            "Cursor inspection belongs only to this controlled fixture")
+                    configuration = json.loads((nodes["source"].directory / "config.json").read_text())
+                    result = {"selected_official": configuration["bins"].get("cursor") == str(cursor_program),
+                              "bot_enabled": configuration["manager"] is not None,
+                              "execution": configuration["providers"]["execution"],
+                              "prompts": len(cursor_prompts.read_text().splitlines()) if cursor_prompts.exists() else 0}
                 elif op == "inspect":
                     result = {"wallet_files": sum((node.directory / "delivery-wallet.json").exists()
                                                   for node in nodes.values()),
@@ -9175,7 +9223,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "mesh"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "mesh", "cursor"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()

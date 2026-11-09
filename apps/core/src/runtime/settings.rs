@@ -27,8 +27,11 @@ fn provider_setup(
 ) -> Option<Value> {
     let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
     if provider == Provider::Cursor {
+        let unset = vibeface_bridge::agent::CURSOR_AUTH_OVERRIDES
+            .map(|name| format!("-u {name}"))
+            .join(" ");
         return Some(
-            json!({"directory":null,"command":format!("{} login",quote(&local.bin(provider).to_string_lossy()))}),
+            json!({"directory":null,"command":format!("env {unset} {} login",quote(&local.bin(provider).to_string_lossy()))}),
         );
     }
     let directory = match provider {
@@ -180,6 +183,11 @@ impl ProviderChange {
                 target.local.bins.remove(&provider);
             } else {
                 providers::validate_bin(provider, &trimmed)?;
+                ensure!(
+                    provider != Provider::Cursor
+                        || !vibeface_bridge::agent::is_cursor_sdk_bridge(&trimmed),
+                    "Cursor requires the official agent or cursor-agent CLI"
+                );
                 target.local.bins.insert(provider, trimmed);
             }
         }
@@ -1768,7 +1776,7 @@ mod tests {
             &bin,
             r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
-names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME']
+names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME', 'CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']
 pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args': sys.argv[1:], 'env': {name: os.environ.get(name) for name in names}, 'auth': os.environ.get('FAKE_LOGIN_AUTH')}))
 "#,
         )?;
@@ -1785,6 +1793,7 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
         for (provider, args) in [
             (Provider::Codex, vec!["login"]),
             (Provider::Claude, vec!["auth", "login"]),
+            (Provider::Cursor, vec!["login"]),
             (Provider::Opencode, vec!["--standalone", "auth", "login"]),
         ] {
             let setup = provider_setup(provider, &local, &roots).context("private setup")?;
@@ -1804,6 +1813,9 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
                 "XDG_CONFIG_HOME",
                 "XDG_STATE_HOME",
                 "XDG_CACHE_HOME",
+                "CURSOR_API_KEY",
+                "CURSOR_AUTH_TOKEN",
+                "AGENT_CLI_CREDENTIAL_STORE",
             ] {
                 command.env(name, "/external/user");
             }
@@ -1812,6 +1824,23 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
                 serde_json::from_slice(&std::fs::read(dir.join("observed.json"))?)?;
             assert_eq!(observed["args"], json!(args));
             assert_eq!(observed["auth"], "fixture-auth");
+            if provider == Provider::Cursor {
+                for name in vibeface_bridge::agent::CURSOR_AUTH_OVERRIDES {
+                    assert_eq!(observed["env"][name], Value::Null);
+                }
+                let mut unsupported = local.clone();
+                unsupported
+                    .bins
+                    .insert(Provider::Cursor, dir.join("cursor-sdk-bridge"));
+                let setup = provider_setup(Provider::Cursor, &unsupported, &roots)
+                    .context("official setup")?;
+                assert!(
+                    !setup["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cursor-sdk-bridge")
+                );
+            }
             for (name, value) in roots.env(provider) {
                 if observed["env"].get(&name).is_some() {
                     assert_eq!(observed["env"][name], value);

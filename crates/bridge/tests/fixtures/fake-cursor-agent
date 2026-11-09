@@ -8,6 +8,9 @@ import sys
 import time
 import uuid
 
+for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN", "AGENT_CLI_CREDENTIAL_STORE"]:
+    assert name not in os.environ, "Cursor must use the official subscription login"
+
 root = pathlib.Path(os.environ["CURSOR_CONFIG_DIR"])
 data = pathlib.Path(os.environ["CURSOR_DATA_DIR"])
 assert root.is_absolute() and data.is_absolute() and root != data
@@ -60,8 +63,6 @@ if sys.argv[1:4] == ["status", "--format", "json"]:
     print(json.dumps(status, indent=2), flush=True)
     sys.exit(0)
 
-if os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_AUTH_TOKEN"):
-    assert os.environ.get("AGENT_CLI_CREDENTIAL_STORE") == "memory"
 log("FAKE_BRIDGE_LOG", {"pid": os.getpid(), "config": str(root), "data": str(data)})
 if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
     sys.exit(2)

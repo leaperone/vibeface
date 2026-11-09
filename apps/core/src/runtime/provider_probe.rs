@@ -786,7 +786,6 @@ mod tests {
         variables.apply(
             Provider::Cursor,
             env.into_iter()
-                .chain([("CURSOR_API_KEY".into(), "fixture-api-key".into())])
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
@@ -829,7 +828,7 @@ mod tests {
         )]))
         .await?;
         let probe = node.probe_provider(Provider::Cursor).await;
-        assert!(matches!(probe.launch, LaunchCheck::Failed { .. }));
+        assert_ne!(probe.launch, LaunchCheck::Launchable);
         assert_eq!(probe.authentication, Authentication::Unverified);
         assert_eq!(probe.catalog, ModelCatalog::default());
         node.cursor.get().unwrap().stop().await;
@@ -848,7 +847,7 @@ mod tests {
         original.env.apply(
             provider,
             BTreeMap::from([
-                ("FAKE_BRIDGE_ME".into(), Some("401".into())),
+                ("FAKE_BRIDGE_ME".into(), Some("200".into())),
                 (
                     "FAKE_BRIDGE_ME_READY".into(),
                     Some(ready.display().to_string()),
@@ -861,33 +860,40 @@ mod tests {
         )?;
         *node.providers.lock().unwrap() = original.clone();
         let first = node.provider_probe_snapshot(provider).await;
-        let running = node.clone();
-        let pending = tokio::spawn(async move { running.probe_provider(provider).await });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let result = async {
+            let pending = node.probe_provider(provider);
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = async {
+                    while !ready.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {},
+                early = &mut pending => anyhow::bail!("Cursor probe completed before the fixture barrier: {early:?}"),
             }
-        })
-        .await?;
-        let save = node.config_save.lock().await;
-        for key in ["fixture-new-key", "fixture-api-key"] {
-            node.write_providers(
-                |target| {
-                    target.local.env.apply(
-                        provider,
-                        BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
-                    )
-                },
-                None,
-            )
-            .await?;
+            let save = node.config_save.lock().await;
+            for key in ["fixture-new-key", "fixture-api-key"] {
+                node.write_providers(
+                    |target| {
+                        target.local.env.apply(
+                            provider,
+                            BTreeMap::from([("FAKE_CONFIG_ID".into(), Some(key.into()))]),
+                        )
+                    },
+                    None,
+                )
+                .await?;
+            }
+            drop(save);
+            let current = node.provider_probe_snapshot(provider).await;
+            std::fs::write(release, b"ready")?;
+            let returned = pending.await;
+            Ok::<_, anyhow::Error>((current, returned))
         }
-        drop(save);
-        let current = node.provider_probe_snapshot(provider).await;
-        std::fs::write(release, b"ready")?;
-        let returned = pending.await?;
+        .await;
         node.cursor.get().unwrap().stop().await;
         drop(node);
+        let (current, returned) = result?;
         std::fs::remove_dir_all(dir)?;
         assert_ne!(first.config_id, current.config_id);
         assert_eq!(returned, current);
