@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import runpy
 import re
+import select
 import signal
 import sqlite3
 import stat
@@ -30,6 +31,7 @@ CAP = "100000000000000000"
 POLICY = {"watchdog_seconds": 60, "inclusion_seconds": 60, "finality_seconds": 10,
           "clock_skew_seconds": 5, "max_fee_per_gas": "3000000000", "priority_fee_per_gas": "1000000000"}
 PROFILE_FIELDS = ("crypto_suite", "max_windows", "max_window_bytes", "max_total_bytes", "max_guest_cycles", "max_prover_memory_bytes")
+OBSERVER_READY_FD = "VIBEFACE_PROTECTED_OBSERVER_READY_FD"
 NOT_CHECKED = ["old fee5 failure remains its original baseline", "same bytes or maximum size as old fee5 case",
                "strict or Open relations", "Web or Android rendered UI", "public network or real assets",
                "absolute finality or real-world economics", "cross-container chain/order resume",
@@ -44,6 +46,20 @@ class CheckFailure(RuntimeError):
 def need(value, code):
     if not value:
         raise CheckFailure(code)
+
+
+def wait_observer_ready():
+    descriptor = os.environ.pop(OBSERVER_READY_FD, None)
+    if descriptor is None:
+        return
+    need(descriptor.isdecimal() and int(descriptor) >= 3, "invalid_observer_ready_descriptor")
+    descriptor = int(descriptor)
+    try:
+        os.set_inheritable(descriptor, False)
+        ready, _, _ = select.select([descriptor], [], [], 120)
+        need(ready and os.read(descriptor, 1) == b"R", "restart_observer_not_ready_before_business")
+    finally:
+        os.close(descriptor)
 
 
 def exact(value, fields, code):
@@ -434,13 +450,14 @@ class Experiment:
             message = str(value["error"]).lower()
             self.summary["failure_order_id"] = order_id
             code = "actual_paid_order_executor_failed_private_log_retained"
-            if re.search(r"proof|prover", message) and re.search(r"timeout|timed out", message):
-                code = "actual_product_proof_timeout_with_original_7200_second_cap"
+            if re.search(r"proof|prover", message) and re.search(r"timeout|timed out|exceeded its execution deadline", message):
+                code = "actual_product_proof_execution_deadline_exceeded"
             raise CheckFailure(code)
         need(value["deadlines"] == self.orders[order_id]["deadlines"], "original_order_deadlines_must_not_change")
         return value
 
     def start(self):
+        wait_observer_ready()
         need(sys.platform.startswith("linux") and platform.machine() in ("x86_64", "amd64"), "linux_amd64_required")
         need(not any(name.startswith(("RISC0_DEV", "RISC0_SKIP")) for name in os.environ), "no_dev_or_skip_verifier_environment")
         git_env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
@@ -616,6 +633,7 @@ class Experiment:
         def uploaded():
             for order_id in self.orders:
                 self.get(source, order_id)
+            for order_id in self.orders:
                 records = self.rows(provider, "SELECT idx,kind,committed,complete FROM objects WHERE order_id=? ORDER BY idx,kind", (order_id,))
                 if len(records) != 2 or any(index != 0 or not complete or committed <= 0 for index, _, committed, complete in records):
                     return None
@@ -899,6 +917,76 @@ def self_test():
                 else: raise AssertionError("the settings selfcheck must stop before real Node startup")
                 need(node.start.call_count == (0 if preconfigured else 1), "only_absent_delivery_settings_reach_fresh_startup")
                 need(json.loads((directory / "config.json").read_bytes()) == {"network": {}}, "main_config_must_not_gain_delivery_fields")
+        for response in (b"R", b"X", b"", None):
+            reader, writer = os.pipe()
+            if response is not None:
+                os.write(writer, response)
+            os.close(writer)
+            with patch.dict(os.environ, {OBSERVER_READY_FD: str(reader)}), \
+                 patch("select.select", return_value=([] if response is None else [reader], [], [])):
+                try: wait_observer_ready()
+                except CheckFailure as error:
+                    need(response != b"R" and str(error) == "restart_observer_not_ready_before_business", "observer_not_ready_is_fail_closed")
+                else: need(response == b"R", "only_actual_ready_byte_releases_business")
+                need(OBSERVER_READY_FD not in os.environ, "ready_descriptor_not_inherited_by_business")
+            try: os.fstat(reader)
+            except OSError: pass
+            else: raise AssertionError("the native readiness reader remained open")
+        with tempfile.TemporaryDirectory(prefix="protected-ready-selftest-", dir=ARTIFACTS) as temporary:
+            startup = Experiment(sample, {}, Path(temporary) / "native")
+            def ready_before_processes():
+                need(startup.public.is_dir() and not startup.nodes and startup.deployment is None,
+                     "fresh_directories_exist_before_observer_gate")
+                raise CheckFailure("synthetic_stop_at_readiness_gate")
+            with patch.dict(globals(), wait_observer_ready=ready_before_processes):
+                try: startup.start()
+                except CheckFailure as error: need(str(error) == "synthetic_stop_at_readiness_gate", "ready_precedes_original_start")
+                else: raise AssertionError("startup bypassed the readiness gate")
+        class PredicateObserved(Exception):
+            pass
+        complete_objects = [(0, "ciphertext", 1, True), (0, "capsule", 1, True)]
+        cases = [("a-pending", "a", None, 2, ["a", "b"], None),
+                 ("b-pending", "b", None, 2, ["a", "b"], None),
+                 ("one-source", None, None, 1, ["a", "b"], None),
+                 ("missing-offer", None, None, 2, ["a"], None),
+                 ("ready", None, None, 2, ["a", "b"], True)]
+        for message in ("proof task exceeded its execution deadline", "proof timeout", "prover timed out",
+                        "executor refused work", "RPC exceeded its execution deadline"):
+            cases.append((message, "a", message, 2, ["a", "b"], None))
+        with tempfile.TemporaryDirectory(prefix="protected-source-predicate-selftest-", dir=ARTIFACTS) as temporary:
+            for name, missing, error_message, count, offers, expected_ready in cases:
+                source, receiver, provider = object(), object(), object()
+                experiment = object.__new__(Experiment)
+                experiment.nodes = [source, receiver, provider]
+                experiment.orders = {key: {"deadlines": {"key_deadline": 123}} for key in ("a", "b")}
+                experiment.summary = {}; experiment.run = Path(temporary)
+                experiment.proofs = {key: {"entry": {"relation": 2}} for key in ("a", "b")[:count]}
+                def result(node, operation, **params):
+                    if operation == "list":
+                        need(node is receiver, "offers_come_from_receiver")
+                        return {"orders": [{"order_id": key} for key in offers]}
+                    need(node is source and operation == "get", "source_state_checked_before_readiness")
+                    if params["order_id"] == "b" and error_message:
+                        return {"error": error_message}
+                    return {"deadlines": {"key_deadline": 123}}
+                experiment.call = Mock(side_effect=result)
+                experiment.rows = Mock(side_effect=lambda _node, _query, params: [] if params[0] == missing else complete_objects)
+                observed = []
+                def wait(label, predicate, *, timeout):
+                    need(timeout == 16000, "original_source_stage_bound_unchanged")
+                    observed.append(predicate())
+                    raise PredicateObserved()
+                experiment.wait = wait
+                try: experiment.wait_allocations_and_stop_source()
+                except PredicateObserved: need(not error_message and observed == [expected_ready], "actual_source_predicate_result")
+                except CheckFailure as error:
+                    code = "actual_product_proof_execution_deadline_exceeded" if error_message and error_message.startswith(("proof", "prover")) else "actual_paid_order_executor_failed_private_log_retained"
+                    need(error_message and str(error) == code and experiment.summary["failure_order_id"] == "b", "actual_get_failure_classification")
+                    need(json.loads((experiment.run / "order-failure-b.json").read_bytes()) == {"error": error_message}, "actual_order_error_retained_privately")
+                    experiment.rows.assert_not_called()
+                else: raise AssertionError("the predicate selfcheck reached business operations")
+                need([call.kwargs["order_id"] for call in experiment.call.call_args_list if call.args[1] == "get"] == ["a", "b"],
+                     "all_source_errors_checked_before_pending_objects")
         experiment = object.__new__(Experiment)
         experiment.progress = Mock(); experiment.scan_receipts = Mock(); experiment.checkpoint = Mock()
         experiment.processes = SimpleNamespace(capture=Mock())

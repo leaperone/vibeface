@@ -2270,6 +2270,7 @@ def self_test():
                 raise AssertionError("A different crypto artifact must fail")
     assert len(PROOFS) == len(set(PROOFS)) == 7
     self_test_protected(original)
+    protected_selfcheck()
     print("Live artifact and protected dispatch/export self-tests passed; no Node, Android, UI, container or proof ran")
 
 
@@ -2296,8 +2297,400 @@ def protected_public_failure(run, expected, returncode):
     output = Path(tempfile.mkdtemp(prefix="public-export-", dir=run)); output.chmod(0o755)
     replace_public(output / "summary.json", {"schemaVersion":1,"status":"FAIL","sourceCommit":expected,
         "scope":"fresh-two-order-protected-native-only","genuineReceipts":0,"nativeStatus":"UNVERIFIED",
+        "restartObserverStatus":"UNVERIFIED","nativeExitCode":None,"observerExitCode":None,
         "containerExitCode":returncode,"failureCodes":["public_export_unavailable"]})
     return output, False
+
+
+OBSERVER_SCRIPT = "scripts/verify-delivery-restart-observer.py"
+OBSERVER_READY_FD = "VIBEFACE_PROTECTED_OBSERVER_READY_FD"
+NATIVE_DONE_FD = "VIBEFACE_PROTECTED_NATIVE_DONE_FD"
+OBSERVER_CHECKS = ("counterReadyToStopped", "otherMethodsZero", "counterNondecreasing", "writeRpcZero",
+                   "proverIdentityUnchanged", "inotifyIntact", "accountSnapshotsAgree", "noncesSettled",
+                   "nativePass", "receiverHistoryRead")
+OBSERVER_COUNTS = ("calibrationOpens", "proverOpensInWindow", "proofsGeneratedByObserver", "rawTransactionsBefore",
+                   "rawTransactionsAfter", "chainSamples", "chainSampleErrors", "prewindowSnapshotMissing")
+OBSERVER_BINDINGS = ("sourceCommit", "runBindingSha256", "configurationSha256", "scriptSha256", "proverSha256", "nativeResultSha256")
+OBSERVER_FAILURES = ("none", "observer_result_unavailable", "observer_binding_invalid", "observer_exit_nonzero",
+                     "native_exit_nonzero", "observer_conditions_failed")
+
+
+def observer_bindings(run, expected):
+    configuration = regular(run / "configuration.json", 16384)
+    config = json.loads(configuration)
+    if config["source_commit"] != expected:
+        raise ValueError("Observer configuration source differs")
+    observer = runpy.run_path(str(ROOT / OBSERVER_SCRIPT))
+    native = run / "native/public/native-result.json"
+    return {"sourceCommit":expected,"runBindingSha256":observer["run_binding"](run, configuration, ROOT),
+        "configurationSha256":hashlib.sha256(configuration).hexdigest(),"scriptSha256":digest(ROOT / OBSERVER_SCRIPT),
+        "proverSha256":config["sha256"]["prover"],"nativeResultSha256":hashlib.sha256(regular(native,131072)).hexdigest() if native.is_file() and not native.is_symlink() else None}
+
+
+def project_observer_summary(value, bindings):
+    fields = {*OBSERVER_BINDINGS, *OBSERVER_CHECKS, *OBSERVER_COUNTS,
+              "schemaVersion", "scope", "status", "failureCode", "nativeExitCode", "observerExitCode",
+              "calibrationExitCode", "windowStarted", "windowEnded"}
+    if not isinstance(value,dict) or set(value) != fields or type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1 or value["scope"] != "original-settlement-to-native-cleanup":
+        raise ValueError("Invalid observer summary schema")
+    if any(value[name] != bindings[name] for name in OBSERVER_BINDINGS):
+        raise ValueError("Observer summary binding differs")
+    if any(not isinstance(value[name],str) or not re.fullmatch(r"[0-9a-f]{64}",value[name]) for name in OBSERVER_BINDINGS if name not in ("sourceCommit","nativeResultSha256")):
+        raise ValueError("Invalid observer digest")
+    if value["nativeResultSha256"] is not None and not re.fullmatch(r"[0-9a-f]{64}",value["nativeResultSha256"]):
+        raise ValueError("Invalid native result digest")
+    if value["status"] not in ("PASS","INCONCLUSIVE") or value["failureCode"] not in OBSERVER_FAILURES:
+        raise ValueError("Invalid observer result enum")
+    if any(type(value[name]) is not bool for name in (*OBSERVER_CHECKS,"windowStarted","windowEnded")):
+        raise ValueError("Invalid observer condition")
+    if any(value[name] is not None and (type(value[name]) is not int or not 0 <= value[name] <= 2**63-1) for name in OBSERVER_COUNTS):
+        raise ValueError("Invalid observer counter")
+    if any(value[name] is not None and (type(value[name]) is not int or not -128 <= value[name] <= 255) for name in ("nativeExitCode","observerExitCode","calibrationExitCode")):
+        raise ValueError("Invalid observer exit code")
+    passed = (value["failureCode"] == "none" and value["nativeResultSha256"] is not None
+        and all(value[name] for name in (*OBSERVER_CHECKS,"windowStarted","windowEnded"))
+        and value["nativeExitCode"] == value["observerExitCode"] == value["calibrationExitCode"] == 0
+        and value["proofsGeneratedByObserver"] == value["proverOpensInWindow"] == 0
+        and value["calibrationOpens"] is not None and value["calibrationOpens"] > 0
+        and value["rawTransactionsBefore"] is not None and value["rawTransactionsBefore"] >= 7
+        and value["rawTransactionsAfter"] is not None and value["rawTransactionsAfter"] >= 7
+        and value["chainSamples"] is not None and value["chainSamples"] >= 2)
+    if (value["status"] == "PASS") != passed:
+        raise ValueError("Observer status contradicts its certified conditions")
+    return {name:value[name] for name in sorted(fields)}, passed
+
+
+def write_observer_summary(run, expected, native_exit, observer_exit):
+    bindings = observer_bindings(run, expected)
+    value = {**bindings,"schemaVersion":1,"scope":"original-settlement-to-native-cleanup","status":"INCONCLUSIVE",
+        "failureCode":"observer_result_unavailable","nativeExitCode":native_exit,"observerExitCode":observer_exit,
+        "calibrationExitCode":None,"windowStarted":False,"windowEnded":False,
+        **{name:False for name in OBSERVER_CHECKS}, **{name:None for name in OBSERVER_COUNTS}}
+    try:
+        raw = json.loads(regular(run / "restart-observer/result.json",131072))
+        pairs = {"sourceCommit":"source_commit","runBindingSha256":"run_binding_sha256",
+            "configurationSha256":"configuration_sha256","scriptSha256":"script_sha256",
+            "proverSha256":"prover_sha256","nativeResultSha256":"native_result_sha256"}
+        if any(raw.get(field) != bindings[name] for name,field in pairs.items()):
+            value["failureCode"] = "observer_binding_invalid"
+        else:
+            start,end = raw.get("window_start",{}),raw.get("window_end",{})
+            before,after = start.get("rpc_baseline",{}),end.get("rpc_final",{})
+            first,last = raw.get("first_anchored_snapshot_in_window") or {},raw.get("last_anchored_snapshot_in_window") or {}
+            counts_before,counts_after = before.get("rpc_counts",{}),after.get("rpc_counts",{})
+            counters = set(counts_before) | set(counts_after)
+            accounts = first.get("accounts",{})
+            calibration = raw.get("calibration",{})
+            delta = raw.get("write_rpc_delta")
+            native = json.loads(regular(run / "native/public/native-result.json",131072))
+            value.update(windowStarted=raw.get("window_started") is True,windowEnded=raw.get("window_ended") is True,
+                calibrationExitCode=calibration.get("exit_code"),calibrationOpens=calibration.get("observed_inode_open_events"),
+                proverOpensInWindow=raw.get("prover_opens_in_window"),proofsGeneratedByObserver=raw.get("proofs_generated_by_observer"),
+                rawTransactionsBefore=counts_before.get("eth_sendRawTransaction"),rawTransactionsAfter=counts_after.get("eth_sendRawTransaction"),
+                chainSamples=raw.get("chain_samples"),chainSampleErrors=raw.get("chain_sample_errors"),
+                prewindowSnapshotMissing=raw.get("prewindow_rpc_snapshot_missing",{}).get("count"),
+                counterReadyToStopped=before.get("state")=="ready" and after.get("state")=="stopped",
+                otherMethodsZero=before.get("other_logged_methods")==after.get("other_logged_methods")==0,
+                counterNondecreasing=bool(counters) and all(type(counts_before.get(key,0)) is int and type(counts_after.get(key,0)) is int
+                    and counts_after.get(key,0)>=counts_before.get(key,0)>=0 for key in counters),
+                writeRpcZero=isinstance(delta,dict) and "eth_sendRawTransaction" in delta and all(type(item) is int and item==0 for item in delta.values()),
+                proverIdentityUnchanged=raw.get("prover_inode_and_identity_unchanged") is True,
+                inotifyIntact=raw.get("flags")==[] and calibration.get("status")=="PASS",
+                accountSnapshotsAgree=bool(accounts) and accounts==last.get("accounts"),
+                noncesSettled=bool(accounts) and all(item["nonce"]==item["pending_nonce"] for item in accounts.values()),
+                nativePass=raw.get("native_status")==native.get("status")=="PASS",
+                receiverHistoryRead=(raw.get("native_real_process_restart") or {}).get("receiver_history_read") is True
+                    and (native.get("real_process_restart") or {}).get("receiver_history_read") is True)
+            value["failureCode"] = ("observer_exit_nonzero" if observer_exit != 0 else "native_exit_nonzero" if native_exit != 0
+                else "none" if raw.get("status")=="PASS" else "observer_conditions_failed")
+            candidate = {**value,"status":"PASS"}
+            try: project_observer_summary(candidate,bindings)
+            except (ValueError,TypeError):
+                if value["failureCode"] == "none": value["failureCode"] = "observer_conditions_failed"
+            else: value = candidate
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):
+        value.update(status="INCONCLUSIVE",failureCode="observer_result_unavailable")
+        for name in OBSERVER_COUNTS: value[name] = None
+        value["calibrationExitCode"] = None
+    for name in (*OBSERVER_COUNTS,"calibrationExitCode"):
+        item = value[name]
+        maximum = 255 if name == "calibrationExitCode" else 2**63-1
+        minimum = -128 if name == "calibrationExitCode" else 0
+        if item is not None and (type(item) is not int or not minimum <= item <= maximum):
+            value[name] = None
+            value.update(status="INCONCLUSIVE",failureCode="observer_conditions_failed")
+    value, passed = project_observer_summary(value,bindings)
+    path = run / "restart-observer-summary.json"
+    write_private(path,value)
+    return {"summary":"restart-observer-summary.json","sha256":digest(path),
+        "nativeExitCode":native_exit,"observerExitCode":observer_exit}, passed
+
+
+def supervise_protected(configuration, run, environment, log):
+    ready_reader,ready_writer = os.pipe()
+    try: done_reader,done_writer = os.pipe()
+    except BaseException:
+        os.close(ready_reader); os.close(ready_writer)
+        raise
+    owned = {ready_reader,ready_writer,done_reader,done_writer}
+    native = observer = None
+    native_exit = observer_exit = None
+    interrupted = False
+    pending_signal = None
+    failed = False
+    previous = {action:signal.getsignal(action) for action in (signal.SIGINT,signal.SIGTERM)}
+    def close(descriptor):
+        if descriptor in owned:
+            owned.remove(descriptor); os.close(descriptor)
+    def interrupt(signum,_frame):
+        nonlocal interrupted,pending_signal
+        interrupted = True
+        if native is not None and native.poll() is None:
+            native.send_signal(signum)
+        elif native is None:
+            pending_signal = signum
+    for action in previous: signal.signal(action,interrupt)
+    try:
+        with log.open("ab") as output:
+            child_env = {key:value for key,value in environment.items() if key not in (OBSERVER_READY_FD,NATIVE_DONE_FD)}
+            observer = subprocess.Popen([sys.executable,str(ROOT / OBSERVER_SCRIPT),"--configuration",str(configuration),"--run-dir",str(run)],
+                stdin=subprocess.DEVNULL,stdout=output,stderr=output,start_new_session=True,
+                env={**child_env,OBSERVER_READY_FD:str(ready_writer),NATIVE_DONE_FD:str(done_reader)},pass_fds=(ready_writer,done_reader))
+            close(ready_writer); close(done_reader)
+            if interrupted: raise KeyboardInterrupt()
+            native = subprocess.Popen([sys.executable,str(ROOT / "scripts/run-delivery-live.py"),"--protected-config",str(configuration),
+                "--protected-run-dir",str(run / "native")],stdin=subprocess.DEVNULL,start_new_session=True,
+                env={**child_env,OBSERVER_READY_FD:str(ready_reader)},pass_fds=(ready_reader,))
+            close(ready_reader)
+            if pending_signal is not None and native.poll() is None:
+                native.send_signal(pending_signal)
+            while native_exit is None or observer_exit is None:
+                if native_exit is None and native.poll() is not None:
+                    native_exit = native.wait(); close(done_writer)
+                if observer_exit is None and observer.poll() is not None:
+                    observer_exit = observer.wait()
+                    if native_exit is None and (observer_exit != 0 or not (run / "native/public/native-result.json").is_file()):
+                        native.send_signal(signal.SIGTERM)
+                if native_exit is None or observer_exit is None: time.sleep(0.02)
+    except BaseException:
+        failed = True
+    finally:
+        try:
+            if native is not None and native_exit is None:
+                if native.poll() is None: native.send_signal(signal.SIGTERM)
+                native_exit = native.wait()
+            close(done_writer)
+            for descriptor in tuple(owned): close(descriptor)
+            if observer is not None and observer_exit is None: observer_exit = observer.wait()
+        finally:
+            for action,handler in previous.items(): signal.signal(action,handler)
+    record,passed = write_observer_summary(run,json.loads(regular(configuration,16384))["source_commit"],native_exit,observer_exit)
+    return record, passed and not interrupted and not failed
+
+
+def self_test_observer_fixture(run, expected):
+    configuration = run / "configuration.json"
+    write_private(configuration,{"source_commit":expected,"sha256":{"prover":"b"*64}})
+    terminal = run / "native/public/native-result.json"
+    terminal.parent.mkdir(parents=True,exist_ok=True)
+    terminal.write_text(json.dumps({"status":"PASS","real_process_restart":{"receiver_history_read":True}}))
+    bindings = observer_bindings(run,expected)
+    statistics = {"rpc_counts":{"eth_sendRawTransaction":7},"other_logged_methods":0}
+    accounts = {name:{"nonce":"0x1","pending_nonce":"0x1","private":"UNAPPROVED_PRIVATE_SENTINEL"} for name in ("S","R","P")}
+    raw = {"source_commit":expected,"run_binding_sha256":bindings["runBindingSha256"],
+        "configuration_sha256":bindings["configurationSha256"],"script_sha256":bindings["scriptSha256"],
+        "prover_sha256":bindings["proverSha256"],"native_result_sha256":bindings["nativeResultSha256"],
+        "status":"PASS","window_started":True,"window_ended":True,"prover_opens_in_window":0,"proofs_generated_by_observer":0,
+        "calibration":{"status":"PASS","exit_code":0,"observed_inode_open_events":1},"flags":[],
+        "window_start":{"rpc_baseline":{**statistics,"state":"ready"}},"window_end":{"rpc_final":{**statistics,"state":"stopped"}},
+        "write_rpc_delta":{"eth_sendRawTransaction":0},"prover_inode_and_identity_unchanged":True,
+        "first_anchored_snapshot_in_window":{"accounts":accounts},"last_anchored_snapshot_in_window":{"accounts":accounts},
+        "chain_samples":2,"chain_sample_errors":0,"prewindow_rpc_snapshot_missing":{"count":0},
+        "native_status":"PASS","native_real_process_restart":{"receiver_history_read":True}}
+    (run / "restart-observer").mkdir()
+    write_private(run / "restart-observer/result.json",raw)
+    return configuration
+
+
+def self_test_supervision():
+    from unittest.mock import patch
+    expected = "1"*40
+    def forbidden(*_args,**_kwargs): raise AssertionError("supervisor self-test started business work")
+    scenes = ("native-first","observer-first","observer-exit1","native-exit1","early-observer-zero",
+              "observer-spawn-failure","native-spawn-failure","interrupt","interrupt-during-native-spawn","native-marker-exit1")
+    for scene in scenes:
+        with tempfile.TemporaryDirectory(prefix="protected-supervisor-selftest-",dir=ARTIFACTS) as directory:
+            run = Path(directory); configuration = self_test_observer_fixture(run,expected)
+            terminal = run / "native/public/native-result.json"
+            marker = terminal.read_bytes()
+            if scene == "early-observer-zero": terminal.unlink()
+            tick,children,timeline = [0],{},[]
+            handlers = {action:signal.getsignal(action) for action in (signal.SIGINT,signal.SIGTERM)}
+            class Child:
+                def __init__(self,kind,options):
+                    self.kind=kind; self.copies={fd:os.dup(fd) for fd in options["pass_fds"]}; self.forced=False; self.reaped=False
+                    self.environment=options["env"]
+                    assert all(not os.get_inheritable(fd) for fd in self.copies.values())
+                def poll(self):
+                    if self.kind=="native":
+                        if self.forced or tick[0]>= (3 if scene in ("observer-first","observer-exit1","early-observer-zero","interrupt","interrupt-during-native-spawn") else 1):
+                            if not terminal.exists(): terminal.write_bytes(marker)
+                            return 1 if self.forced or scene in ("native-exit1","native-marker-exit1") else 0
+                    else:
+                        done=self.copies[int(self.environment[NATIVE_DONE_FD])]
+                        import select
+                        eof=bool(select.select([done],[],[],0)[0])
+                        if eof: timeline.append(("done-eof",tick[0]))
+                        if tick[0]>= (1 if scene in ("observer-first","observer-exit1","early-observer-zero") else 3) or eof and "native" not in children:
+                            return 1 if scene=="observer-exit1" or "native" not in children else 0
+                    return None
+                def wait(self):
+                    code=self.poll()
+                    assert code is not None, (scene,self.kind,"reaped before actual exit")
+                    timeline.append(("wait",self.kind,tick[0])); self.reaped=True
+                    for fd in self.copies.values(): os.close(fd)
+                    self.copies.clear()
+                    return code
+                def send_signal(self,signum):
+                    assert self.kind=="native", "observer was signalled before its final save"
+                    timeline.append(("signal",signum)); self.forced=True
+            def spawn(arguments,**options):
+                kind="observer" if OBSERVER_SCRIPT in arguments[1] else "native"
+                if scene==kind+"-spawn-failure": raise OSError("synthetic spawn failure")
+                assert not any("--delivery"==part for part in arguments)
+                if kind=="observer":
+                    assert set(options["pass_fds"])=={int(options["env"][OBSERVER_READY_FD]),int(options["env"][NATIVE_DONE_FD])}
+                else:
+                    assert "--protected-config" in arguments and NATIVE_DONE_FD not in options["env"]
+                    assert options["pass_fds"]==(int(options["env"][OBSERVER_READY_FD]),)
+                    if scene=="interrupt-during-native-spawn": signal.getsignal(signal.SIGINT)(signal.SIGINT,None)
+                children[kind]=Child(kind,options); return children[kind]
+            def sleep(_duration):
+                tick[0]+=1
+                assert tick[0]<12, "supervisor did not converge after child exits"
+                if scene=="interrupt" and tick[0]==1:
+                    signal.getsignal(signal.SIGINT)(signal.SIGINT,None)
+            actual_write=write_observer_summary
+            def write(*args):
+                assert all(child.reaped for child in children.values()), "summary certified a process still running"
+                timeline.append(("summary",tick[0])); return actual_write(*args)
+            with patch.object(subprocess,"Popen",side_effect=spawn), patch.object(subprocess,"run",forbidden), \
+                 patch.object(socket,"socket",forbidden), patch.object(time,"sleep",side_effect=sleep), \
+                 patch.dict(globals(),write_observer_summary=write):
+                record,passed=supervise_protected(configuration,run,{"TOKIO_WORKER_THREADS":"2"},run / "private.log")
+            assert passed == (scene in ("native-first","observer-first")), (scene,record,passed)
+            assert all(signal.getsignal(action)==handler for action,handler in handlers.items())
+            assert all(child.reaped for child in children.values())
+            if scene=="native-first":
+                assert record["nativeExitCode"]==record["observerExitCode"]==0
+                assert next(item[2] for item in timeline if item[:2]==("wait","native")) < next(item[2] for item in timeline if item[:2]==("wait","observer"))
+                assert any(item[0]=="done-eof" for item in timeline)
+            if scene in ("observer-exit1","early-observer-zero","interrupt","interrupt-during-native-spawn"):
+                assert any(item[0]=="signal" for item in timeline), (scene,timeline)
+    print("Protected supervisor self-tests passed; child processes and sockets were mocked")
+
+
+def protected_selfcheck():
+    driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
+    driver["delivery_protected_selfcheck"]()
+    runpy.run_path(str(ROOT / OBSERVER_SCRIPT))["self_test"]()
+    self_test_supervision()
+    self_test_observer_summary()
+
+
+def self_test_observer_summary():
+    from copy import deepcopy
+    expected = "1"*40
+    with tempfile.TemporaryDirectory(prefix="protected-observer-summary-selftest-",dir=ARTIFACTS) as directory:
+        run=Path(directory); self_test_observer_fixture(run,expected)
+        manifest,passed=write_observer_summary(run,expected,0,0)
+        assert passed
+        target=run / manifest["summary"]; positive=json.loads(target.read_bytes()); bindings=observer_bindings(run,expected)
+        assert b"UNAPPROVED_PRIVATE_SENTINEL" not in target.read_bytes()
+        changes = [{"unapproved":"UNAPPROVED_PRIVATE_SENTINEL"},{"status":"UNKNOWN"},{"failureCode":"UNAPPROVED_PRIVATE_SENTINEL"},
+                   {"schemaVersion":True},{"rawTransactionsBefore":True},{"nativeExitCode":1},{"observerExitCode":1},
+                   {"chainSamples":1},{"calibrationOpens":0},{"proverOpensInWindow":1},{"counterReadyToStopped":False}]
+        changes += [{name:"0"*64} for name in OBSERVER_BINDINGS]
+        for change in changes:
+            invalid={**deepcopy(positive),**change}
+            try: project_observer_summary(invalid,bindings)
+            except (ValueError,TypeError): pass
+            else: raise AssertionError("an invalid observer summary was certified")
+        for native_exit,observer_exit in ((1,0),(0,1),(None,None)):
+            target.unlink()
+            manifest,passed=write_observer_summary(run,expected,native_exit,observer_exit)
+            assert not passed and json.loads(target.read_bytes())["status"]=="INCONCLUSIVE"
+        raw_path=run / "restart-observer/result.json"; raw=json.loads(raw_path.read_bytes())
+        for change in ({"script_sha256":"0"*64},{"window_started":False},{"calibration":{"exit_code":"UNAPPROVED_PRIVATE_SENTINEL"}},
+                       {"write_rpc_delta":{"eth_sendRawTransaction":1}}, {"status":"INCONCLUSIVE"}):
+            raw_path.write_text(json.dumps({**raw,**change})); target.unlink()
+            _,passed=write_observer_summary(run,expected,0,0)
+            assert not passed and b"UNAPPROVED_PRIVATE_SENTINEL" not in target.read_bytes()
+        sentinel = "UNAPPROVED_PRIVATE_SENTINEL"
+        projected = project_wrapper_summary("artifact-provenance.json", {"status":"FAIL","sourceCommit":expected,"raw":sentinel,
+            "failureCode":sentinel,"runtimeIdentity":{"uid":123,"raw":sentinel},"guestInfo":{"imageId":"a"*64,"raw":sentinel},
+            "restartObserver":{"raw":sentinel}})
+        assert sentinel not in json.dumps(projected) and projected["failureCode"]=="OtherFailure"
+        projected = project_wrapper_summary("resources.json", {"status":"FAIL","initial":{"memory.current":"1","raw":sentinel},"raw":sentinel})
+        assert sentinel not in json.dumps(projected)
+    print("Protected observer projection self-tests passed; raw diagnostics were not exported")
+
+
+def project_wrapper_summary(name, value):
+    if name == "resources.json":
+        result = {key:value[key] for key in ("status","initial","final","oomDelta","scope") if key in value}
+        for key in ("initial","final"):
+            if key in result:
+                result[key] = {field:item for field,item in result[key].items() if field in
+                    ("memory.max","memory.swap.max","memory.current","memory.events","pids.max","pids.current","memory.peak","pids.peak")}
+                if any(not isinstance(item,str) or not re.fullmatch(r"[a-z_0-9 \n]+",item) for item in result[key].values()):
+                    raise ValueError("Invalid resource counter")
+        if "oomDelta" in result:
+            result["oomDelta"] = {key:item for key,item in result["oomDelta"].items() if key in ("oom","oom_kill","oom_group_kill")}
+            if any(type(item) is not int or item < 0 for item in result["oomDelta"].values()):
+                raise ValueError("Invalid OOM delta")
+        if "scope" in result and result["scope"] != "entire protected sandbox including artifact preparation":
+            raise ValueError("Invalid resource scope")
+        return result
+    result = {key:value[key] for key in ("schemaVersion","sourceCommit","status","runtimeIdentity","package",
+        "packageRuntime","testedBinaryOrigin","testedArtifactSha256","guestInfo","failureCode") if key in value}
+    if "schemaVersion" in result and (type(result["schemaVersion"]) is not int or result["schemaVersion"] != 1):
+        raise ValueError("Invalid provenance schema")
+    if "failureCode" in result and result["failureCode"] not in ("RuntimeError","ValueError","KeyboardInterrupt","SystemExit",
+            "OSError","FileNotFoundError","PermissionError","CalledProcessError","TimeoutExpired","JSONDecodeError"):
+        result["failureCode"] = "OtherFailure"
+    if "runtimeIdentity" in result:
+        integers = ("uid","gid","runDirectoryUid")
+        booleans = ("rustupReadable","rustupWritable")
+        result["runtimeIdentity"] = {key:item for key,item in result["runtimeIdentity"].items() if key in (*integers,*booleans)}
+        if any(type(item) is not int or item < 0 for key,item in result["runtimeIdentity"].items() if key in integers) or any(
+                type(item) is not bool for key,item in result["runtimeIdentity"].items() if key in booleans):
+            raise ValueError("Invalid runtime identity")
+    if "package" in result:
+        package = result["package"]
+        result["package"] = {key:package[key] for key in ("buildInfo","binarySha256","coreSha256","cryptoSha256","wasmSha256") if key in package}
+        if "buildInfo" in package:
+            verify_build_info(package["buildInfo"])
+            result["package"]["buildInfo"] = {key:package["buildInfo"][key] for key in ("version","target","source_commit","update_protocol",
+                "data_epoch","core_version","core_source_commit","app_version","app_source_commit") if key in package["buildInfo"]}
+        if any(not isinstance(item,str) or not re.fullmatch(r"[0-9a-f]{64}",item) for key,item in result["package"].items() if key != "buildInfo"):
+            raise ValueError("Invalid package digest")
+    if "testedArtifactSha256" in result:
+        result["testedArtifactSha256"] = {key:item for key,item in result["testedArtifactSha256"].items() if key in
+            ("binary","core_binary","crypto_module","prover","r0vm","crypto_wasm","profile")}
+        if any(not isinstance(item,str) or not re.fullmatch(r"[0-9a-f]{64}",item) for item in result["testedArtifactSha256"].values()):
+            raise ValueError("Invalid tested artifact digest")
+    if "guestInfo" in result:
+        result["guestInfo"] = {key:item for key,item in result["guestInfo"].items() if key in ("imageId","schemaHash","elfSha256","statementBytes")}
+        if any(not isinstance(item,str) or not re.fullmatch(r"[0-9a-f]{64}",item) for key,item in result["guestInfo"].items() if key != "statementBytes"):
+            raise ValueError("Invalid guest identity")
+        if "statementBytes" in result["guestInfo"] and result["guestInfo"]["statementBytes"] != 1504:
+            raise ValueError("Invalid guest statement size")
+    if "packageRuntime" in result and result["packageRuntime"] not in ("PASS","GLIBC_INCOMPATIBLE"):
+        raise ValueError("Invalid package runtime")
+    if "testedBinaryOrigin" in result and result["testedBinaryOrigin"] not in ("exact-head Linux package", "clean exact-head source rebuild after measured package GLIBC incompatibility"):
+        raise ValueError("Invalid binary origin")
+    return result
 
 
 def protected_public(run, expected, returncode):
@@ -2381,16 +2774,40 @@ def protected_public(run, expected, returncode):
             failures.add("unapproved_public_material")
     except Exception:
         failures.add("public_source_unavailable")
-    states = {}
+    states, wrappers = {}, {}
     for name in ("artifact-provenance.json","resources.json"):
         try:
             data = regular(run / name,131072); value = json.loads(data)
             if not isinstance(value,dict) or value.get("status") not in ("PASS","FAIL","UNVERIFIED") or name == "artifact-provenance.json" and value.get("sourceCommit") != expected:
                 raise ValueError("invalid wrapper report")
-            (output / name).write_bytes(data); (output / name).chmod(0o644)
+            if name == "artifact-provenance.json":
+                public_wrapper = project_wrapper_summary(name,value)
+                replace_public(output / name,public_wrapper)
+            else:
+                replace_public(output / name,project_wrapper_summary(name,value))
             states[name] = value["status"]
+            wrappers[name] = value
         except Exception:
             failures.add("wrapper_report_unavailable")
+    observer_summary = None
+    try:
+        manifest = wrappers["artifact-provenance.json"]["restartObserver"]
+        if set(manifest) != {"summary","sha256","nativeExitCode","observerExitCode"} or manifest["summary"] != "restart-observer-summary.json":
+            raise ValueError("Invalid observer manifest")
+        data = regular(run / "restart-observer-summary.json",16384)
+        if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+            raise ValueError("Changed observer summary")
+        candidate,observer_passed = project_observer_summary(json.loads(data),observer_bindings(run,expected))
+        if any(candidate[name] != manifest[name] for name in ("nativeExitCode","observerExitCode")):
+            raise ValueError("Observer exit authentication differs")
+        observer_summary = candidate
+        replace_public(output / "restart-observer-summary.json",observer_summary)
+        public_wrapper["restartObserver"] = {"summary":"restart-observer-summary.json","sha256":digest(output / "restart-observer-summary.json"),
+            "nativeExitCode":observer_summary["nativeExitCode"],"observerExitCode":observer_summary["observerExitCode"]}
+        replace_public(output / "artifact-provenance.json",public_wrapper)
+        if not observer_passed: failures.add("restart_observer_not_passed")
+    except Exception:
+        failures.add("restart_observer_unavailable")
     sources = {fact["orderId"] for fact in qualified if fact["relation"] == 2}
     holds = {fact["orderId"] for fact in qualified if fact["relation"] == 3}
     complete = len(qualified) == 5 and sum(fact["relation"] == 1 for fact in qualified) == 1 and len(sources) == 2 and sources == holds
@@ -2405,6 +2822,9 @@ def protected_public(run, expected, returncode):
             "status":"PASS" if passed else "FAIL","genuine_receipts":qualified,"public_files":public_files,"native_status":native_status})
     replace_public(output / "summary.json", {"schemaVersion":1,"status":"PASS" if passed else "FAIL","sourceCommit":expected,
         "scope":"fresh-two-order-protected-native-only","genuineReceipts":len(qualified),"nativeStatus":native_status,"containerExitCode":returncode,
+        "restartObserverStatus":observer_summary["status"] if observer_summary else "UNVERIFIED",
+        "nativeExitCode":observer_summary["nativeExitCode"] if observer_summary else None,
+        "observerExitCode":observer_summary["observerExitCode"] if observer_summary else None,
         "failureCodes":sorted(failures),
         "notChecked":["rendered Web or Android UI","old fee5 identical bytes or maximum capacity","forced reorg/nonce-revert/near-cutoff/token faults","public chain or real assets"]})
     return output, passed
@@ -2518,7 +2938,10 @@ def protected_package_inside(package, expected, run):
         write_private(configuration_path, configuration)
         provenance.update(testedArtifactSha256=hashes,guestInfo=compiled)
         os.environ["VIBEFACE_APP_DIR"] = str(package / "web")
-        protected_dispatch(configuration_path, run / "native")
+        observer_record,observer_passed = supervise_protected(configuration_path,run,environment,log)
+        provenance["restartObserver"] = observer_record
+        if not observer_passed:
+            raise RuntimeError("Native acceptance or its complete restart observation failed")
         source_commit(expected)
         provenance["status"] = "PASS"
     except BaseException as error:
@@ -2623,10 +3046,13 @@ def self_test_protected(original):
                 "official_host_verified":True,"wrong_journal_receipt_comparison_rejected":True}
             if order: fact.update(orderId="0x"+order,windowIndex=0)
             facts.append(fact)
-        terminal = public / "native-result.json"; terminal.write_text(json.dumps({"marker":"synthetic exporter selfcheck only"}))
+        self_test_observer_fixture(run,expected)
+        observer_record,observer_passed = write_observer_summary(run,expected,0,0)
+        assert observer_passed
+        terminal = public / "native-result.json"
         base = {"source_commit":expected,"scope":"fresh-two-order-protected-native-only","status":"PASS","genuine_receipts":facts,
             "public_files":{"native-result.json":digest(terminal)}}
-        (run / "artifact-provenance.json").write_text(json.dumps({"sourceCommit":expected,"status":"PASS"}))
+        (run / "artifact-provenance.json").write_text(json.dumps({"sourceCommit":expected,"status":"PASS","restartObserver":observer_record}))
         (run / "resources.json").write_text(json.dumps({"status":"PASS"}))
         def export(manifest, returncode=0):
             (public / "progress.json").write_text(json.dumps(manifest))
@@ -2640,6 +3066,36 @@ def self_test_protected(original):
         output, passed, summary = export(base)
         assert passed and summary["genuineReceipts"] == 5
         assert (output / "key-binding.receipt").stat().st_mode & 0o777 == 0o644
+        assert json.loads((output / "artifact-provenance.json").read_bytes())["restartObserver"]["sha256"] == digest(output / "restart-observer-summary.json")
+        observer_path = run / "restart-observer-summary.json"
+        provenance_path = run / "artifact-provenance.json"
+        observer_bytes,provenance_bytes = observer_path.read_bytes(),provenance_path.read_bytes()
+        observer_value = json.loads(observer_bytes)
+        for change in ({"raw_diagnostic":"UNAPPROVED_PRIVATE_SENTINEL"},{"status":"UNKNOWN"},{"observerExitCode":1},
+                       {"nativeExitCode":1},{"windowStarted":False},{"calibrationOpens":0},
+                       *({name:"0"*64} for name in OBSERVER_BINDINGS)):
+            observer_path.write_text(json.dumps({**observer_value,**change}))
+            provenance = json.loads(provenance_bytes)
+            provenance["restartObserver"]["sha256"] = digest(observer_path)
+            provenance_path.write_text(json.dumps(provenance))
+            rejected,passed,details = export(base)
+            assert not passed and details["genuineReceipts"]==5 and details["restartObserverStatus"]=="UNVERIFIED"
+            assert not (rejected / "restart-observer-summary.json").exists()
+            assert all(b"UNAPPROVED_PRIVATE_SENTINEL" not in path.read_bytes() for path in rejected.iterdir())
+        observer_path.write_bytes(observer_bytes); provenance_path.write_bytes(provenance_bytes)
+        for mode in ("missing","changed","unapproved_manifest","exit_mismatch"):
+            provenance = json.loads(provenance_bytes)
+            if mode=="missing": observer_path.unlink()
+            elif mode=="changed": observer_path.write_bytes(observer_bytes+b" ")
+            elif mode=="unapproved_manifest": provenance["restartObserver"]["private"]="UNAPPROVED_PRIVATE_SENTINEL"
+            else: provenance["restartObserver"]["observerExitCode"]=1
+            provenance_path.write_text(json.dumps(provenance))
+            rejected,passed,details = export(base)
+            assert not passed and details["genuineReceipts"]==5 and details["restartObserverStatus"]=="UNVERIFIED"
+            assert all(b"UNAPPROVED_PRIVATE_SENTINEL" not in path.read_bytes() for path in rejected.iterdir())
+            observer_path.write_bytes(observer_bytes); provenance_path.write_bytes(provenance_bytes)
+        _,passed,_ = export(base)
+        assert passed, "observer rejection tests need a restored positive control"
         output, passed, summary = export(base,1)
         assert not passed and summary["genuineReceipts"] == 5
         (public / facts[-1]["public"]).unlink()
@@ -2738,7 +3194,8 @@ if __name__ == "__main__":
         if historical_action or bool(args.protected_config) == args.protected_selfcheck or (args.protected_run_dir and not args.protected_config):
             parser.error("Provide --protected-config with optional --protected-run-dir, or --protected-selfcheck")
         if args.protected_selfcheck:
-            runpy.run_path(str(ROOT / "scripts/verify-node.py"))["delivery_protected_selfcheck"]()
+            ARTIFACTS.mkdir(parents=True,exist_ok=True)
+            protected_selfcheck()
         else:
             protected_dispatch(args.protected_config, args.protected_run_dir)
     elif args.verify_source_commit is not None:

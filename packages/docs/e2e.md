@@ -91,15 +91,21 @@ python3 scripts/run-delivery-live.py \
 
 该入口复用 `check-delivery.py` 的 canonical sandbox 构建配方，固定 Linux amd64、11GiB、zero swap、64 PIDs 和两个 Tokio workers。源码与任务缓存仍在本 worktree 的 `.artifacts/`；linked worktree 的 common Git metadata 和 `.git` 只读挂载，显式设置 `GIT_DIR`、`GIT_WORK_TREE` 和 `GIT_OPTIONAL_LOCKS=0`，始终核对 clean exact HEAD。容器以宿主 UID/GID 运行，配置在容器内以 `0600` 创建；不会改变既有缓存权限或复制工具链。
 
+canonical 入口监督 native 与 tracked restart observer 两个同级子进程，observer 不属于 native 的后代清理树。native 只先创建 fresh native/public，再在原 start 的任何进程前等待匿名 ready FD；observer 安装同一 inotify FD 的 host inode/目录 watch，并实际完成 official info exit0、ELF 匹配及同 inode open 正控后才放行。原120秒准备门不进入 KeyBinding 或订单期限。observer 失败会阻止或中断本任务 native，原 native 中断状态如实保留。
+
+独立 E1 窗口始终是原 `settlement-observation.json` 到 cleanup 后 `native-result.json`。要求同 inode host opens=0、无 inotify 队列/身份缺口、累计 RPC ready→stopped、前后 raw 广播数均至少7且所有写方法增量0，以及窗口内至少两份已完成的锚定账户样本相等、nonce 已结清。只容忍精确 stats 文件的预窗口 ENOENT 且不推进 baseline，终态缺失或坏数据仍失败。native 被 reap 后关闭 done FD，observer 先排空原事件队列，再对缺窗作 INCONCLUSIVE 判定。PID1 等 observer 保存并真实退出后才结束，不延长业务窗口或 key gate 凑样本。
+
 本机入口按原生驱动既有阶段和业务期限等待，不再套用旧 Strict/UI 的 20700 秒整轮截止。KeyBinding 观察上限仍为 7400 秒，Source、Hold 各为 16000 秒；每次证明的 7200 秒硬界、原 UUID、报价/持有/密钥截止、费用与 W/I/F/S 均不变。每份完成的证明仍立即独立验真并保存。同一个运行容器可以跨宿主工具轮次继续等待；停止容器后不支持恢复原链/订单，不能把已保存分项称为已支持跨容器续跑。
 
 `prepare`、`confirm_batch`、`accept_batch` 只有在结构化响应明确返回提交前的固定错误 `another delivery operation is in progress` 时，才沿既有 120 秒阶段上限等待重试，原 UUID 和参数不变。超时、网络异常、未知结果及其他拒绝直接失败，不自动重发。
 
-GitHub Actions job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表单项失败或完整实验通过。需要继续同一合法原生运行时，应保留本机的原容器、原链和原业务期限；不得靠新 UUID、延长期限或重部署链绕过原边界。
+GitHub Actions `delivery-live` 使用 `ubuntu-24.04` 原生 x86 runner，核对宿主 Linux/x86_64，消费同 run 同 SHA 的 Linux/crypto/web 制品。job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表具体 prove 耗尽或完整实验通过。不能凭容器目标架构证明没有 emulation，也不能把已停止 CI 的链称为可恢复。健康的同一运行只能在原容器、原链与原业务期限内继续等待；停止后若重新验收，必须创建完整新链、钱包、预算、订单和五份新 proof，保留旧 FAIL，不通过新 UUID 或期限掩盖原失败。
 
-容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置并调用现有 `verify-node.py --delivery-protected`。Web 资源进程检查不代表渲染验收。
+容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置，再由 native 子进程经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper。Web 资源进程检查不代表渲染验收。
 
 输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指安全目录，实际路径为本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+
+observer 只导出固定字段投影 `restart-observer-summary.json`，包含受控状态、计数、条件布尔、相对 run/配置内容绑定与 script/prover/native-result 摘要，以及 supervisor 实际 wait 得到的两个退出码。原 native 全通过、observer 完整窗口全通过、两者真实 exit0 才能整体 PASS。result 自称 PASS、observer 尚未退出、缺窗或 INCONCLUSIVE 均不够。账户原始快照、RPC payload、私有 observer result/诊断不能导出。原生 get 的 proof deadline 诊断保持中性，同一句 Core 错误也可能来自 info30秒或 verify120秒；`node_proof_timeout_seconds=7200` 是 prove 配置，不单独证明具体耗时。
 
 未登记、临时、私密或损坏材料不导出，也不妨碍其他已验真分项导出；整体仍为 FAIL，并写出安全摘要和 `public-directory`。任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能上传整个 run 或 `native/public/`。
 
@@ -144,7 +150,7 @@ python3 scripts/run-delivery-live.py \
   --protected-run-dir "$PWD/.artifacts/protected/run"
 ```
 
-每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。低层驱动在其 run 的 `public/` 保留逐份验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`，但它本身不核验 bare binary 的构建来源；调用方必须先完成上文的制品来源检查。
+每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。低层驱动在其 run 的 `public/` 保留逐份验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`，但它本身不核验 bare binary 构建来源，也不启动独立 observer 或认证 E1；完整验收使用 canonical `--protected-package`。`--protected-selfcheck` 检查真实 predicate、合成 observer 事件、FD 监督和安全投影，不产生实际 proof 或完整 E1 窗口证据。
 
 该运行只证明新的 4096 字节双单场景。它核对 S 离线后 nonce 不增、P 自动累计提款、R 实际读取，以及 S/R/P 真正重启、locked/off 后拒写与历史读取；不覆盖 UI 渲染、旧 fee5 同字节或最大容量、强制 reorg、nonce-consuming revert、临近截止和异常代币矩阵。这些仍需独立证据。
 
