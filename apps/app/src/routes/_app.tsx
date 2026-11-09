@@ -14,7 +14,7 @@ export const Route = createFileRoute('/_app')({ component: AppLayout })
 
 /** Workspace pages need a member connection; a browser with saved credentials waits here while it reconnects. */
 function AppLayout() {
-  const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect, retryNow } = useDevice()
+  const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect, retryNow, queued } = useDevice()
   const navigate = useNavigate()
   const onboarding = useOnboarding()
   // Onboarding ends on a pressed button that leaves with it; the workspace that follows takes the focus on its title.
@@ -27,8 +27,8 @@ function AppLayout() {
     if (returnTo === null) return null
     return <Navigate to="/connect" search={returnTo === '/' ? {} : { redirect: returnTo }} replace />
   }
-  if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
-  if (!ready) return <ShellSkeleton home={home} />
+  if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} queued={queued} />
+  if (!ready) return <ShellSkeleton home={home} queued={queued} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
   return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id, target?: InputTarget) => {
     if (target?.kind === 'task' || target?.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: target.task_id } })

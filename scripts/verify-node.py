@@ -39,6 +39,7 @@ import signal
 import select
 import shlex
 import socket
+import ssl
 import struct
 import stat
 import sqlite3
@@ -195,7 +196,7 @@ async function connect(input) {
   // Node's WebSocket can send the Origin a page on another client origin would send.
   const socket = new WebSocket(url, Object.keys(headers).length ? { headers } : undefined);
   socket.binaryType = 'arraybuffer';
-  const queue = [], waiting = [], pending = new Map(), events = [];
+  const queue = [], waiting = [], pending = new Map(), events = [], queued = [];
   let channel, closed = false, failure, sequence = 0;
   function close(error = new Error('channel closed')) {
     if (closed) return;
@@ -206,12 +207,27 @@ async function connect(input) {
   }
   const receive = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.reject(failure) : new Promise((resolve, reject) => waiting.push({ resolve, reject }));
   socket.addEventListener('message', event => {
-    if (typeof event.data === 'string') { let reason = 'gateway refused'; try { const value = JSON.parse(event.data); reason = `${value.code}: ${value.error}`; } catch {} close(new Error(reason)); return; }
+    if (typeof event.data === 'string') {
+      let reason = 'gateway refused';
+      try {
+        const value = JSON.parse(event.data);
+        // A busy Gateway holds the session in line and lets it through at position 0; `release` names
+        // this client's connection that gives up its slot once this one waits.
+        if (value.type === 'queued' && Number.isSafeInteger(value.position) && !channel) {
+          queued.push(value.position); clearTimeout(timer); timer = setTimeout(expire, 15000);
+          if (input.release && queued.length === 1) { connections.get(input.release)?.close(); connections.delete(input.release); }
+          return;
+        }
+        reason = `${value.code}: ${value.error}`;
+      } catch {}
+      close(new Error(reason)); return;
+    }
     const waiter = waiting.shift(); if (waiter) waiter.resolve(event.data); else if (queue.length < 512) queue.push(event.data); else close(new Error('bounded receive queue'));
   });
   socket.addEventListener('close', () => close());
   socket.addEventListener('error', () => close(new Error('WebSocket transport failed')));
-  const timer = setTimeout(() => close(new Error('handshake timeout')), 15000);
+  const expire = () => close(new Error('handshake timeout'));
+  let timer = setTimeout(expire, 15000);
   let handshake;
   try {
     await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('close', () => reject(failure), { once: true }); });
@@ -240,7 +256,7 @@ async function connect(input) {
   })();
   const send = (id, method, params) => { for (const record of channel.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) socket.send(record); };
   return {
-    events, close,
+    events, close, queued,
     request(method, params) {
       if (closed) return Promise.resolve({ error: String(failure) });
       const id = String(++sequence);
@@ -260,7 +276,12 @@ for await (const line of createInterface({ input: process.stdin })) {
     let result;
     switch (input.op) {
       case 'identity': result = { device_id: client.deviceId }; break;
-      case 'connect': { connections.get(input.connection || 'main')?.close(); connections.set(input.connection || 'main', await connect(input)); result = { connected: true }; break; }
+      case 'connect': {
+        connections.get(input.connection || 'main')?.close();
+        const connection = await connect(input);
+        connections.set(input.connection || 'main', connection);
+        result = { connected: true, queued: connection.queued }; break;
+      }
       case 'genesis': {
         roots.get('root')?.free();
         const key = Identity.generate(); roots.set('root', key);
@@ -397,10 +418,12 @@ class Client:
         require(value.get("ok"), f"client {op} failed: {value.get('error', 'unknown error')}")
         return value.get("result")
 
-    def connect(self, device_id=None, *, connection="main", check=True, origin=None, local_cookie=None, authorization=None):
+    def connect(self, device_id=None, *, connection="main", check=True, origin=None, local_cookie=None, authorization=None,
+                release=None):
         self.device_id = device_id or self.device_id
         return self.command("connect", url=self.url, device_id=self.device_id, connection=connection, check=check,
                             **({"origin": origin} if origin else {}),
+                            **({"release": release} if release else {}),
                             **({"local_cookie": local_cookie} if local_cookie is not None else {}),
                             **({"authorization": authorization} if authorization is not None else {}))
 
@@ -634,8 +657,7 @@ class Node:
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
-        if json.loads((self.directory / "config.json").read_text())["network"]["relay_mode"] != "discovery-only":
-            self.configure_network(bind=f"127.0.0.1:{self.quic_port}")
+        self.configure_network(bind=f"127.0.0.1:{self.quic_port}")
         self.device_id = self.client.device_id = node_status(self)["device_id"]
         require(self.device_id, "the initialized data directory pins the Node identity")
         # The owner's access material exists only while the Node runs; `start` reads it once the listener publishes it.
@@ -696,38 +718,37 @@ class Node:
             def listener():
                 if self.process.poll() is not None:
                     raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
-                return self.client.request("/api/info")
+                return pinned_info(self) if configuration.get("tls") else self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)
             require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
-        if not configuration["public_entry"]:
-            def published():
-                if self.process.poll() is not None:
-                    raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
-                return local_owner(self) if credential.read_bytes() != stale else None
-            # Every start publishes a fresh owner credential for the local listener; the last run's file does not count.
-            launcher = wait_for(f"{self.name} publishes its local owner credential", published)
-            require(launcher["origin"] == f"http://127.0.0.1:{self.local_port}" and launcher["node_id"] == self.device_id
-                    and credential.stat().st_mode & 0o077 == 0,
-                    f"{self.name}: the owner credential is private and names this Node's exact local origin")
-        if web and self.access is None:
+        def published():
+            if self.process.poll() is not None:
+                raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
+            return local_owner(self) if credential.read_bytes() != stale else None
+        # Every start publishes a fresh owner credential for the local listener; the last run's file does not count.
+        launcher = wait_for(f"{self.name} publishes its local owner credential", published)
+        require(launcher["origin"] == f"http://127.0.0.1:{self.local_port}" and launcher["node_id"] == self.device_id
+                and credential.stat().st_mode & 0o077 == 0,
+                f"{self.name}: the owner credential is private and names this Node's exact local origin")
+        # A public node forwards browsers to any device and answers no local setup, so it has no owner link to check.
+        if web and self.access is None and not configuration["forwarding"]["any"]:
             result = subprocess.run([str(self.binary), "access", "--json", "--data-dir", str(self.directory)],
                                     capture_output=True, timeout=15)
             require(result.returncode == 0, f"{self.name}: local access material is available: {result.stderr.decode(errors='replace')[-300:]}")
             self.access = json.loads(result.stdout)
             require(self.access["device_id"] == self.device_id, "local access pins the Node identity")
-            if not configuration["public_entry"]:
-                setup = self.client.request("/api/local/setup", {})
-                require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
-                        and not {"invitation", "local_launch", "capability"} & set(setup),
-                        "an anonymous local setup on the public listener reports only the Node's state")
-                if self.access.get("capability"):
-                    link = subprocess.run([str(self.binary), "access", "--data-dir", str(self.directory)],
-                                          capture_output=True, text=True, timeout=15)
-                    require(self.access["url"] == launcher["origin"] and link.returncode == 0
-                            and bootstrap_entry(link.stdout.strip()) == {"url": launcher["origin"], "device_id": self.device_id,
-                                                                         "capability": self.access["capability"]},
-                            "the owner's access link carries the bootstrap entry a browser consumes")
-                    self.entry = link.stdout.strip()
+            setup = self.client.request("/api/local/setup", {})
+            require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
+                    and not {"invitation", "local_launch", "capability"} & set(setup),
+                    "an anonymous local setup on the public listener reports only the Node's state")
+            if self.access.get("capability"):
+                link = subprocess.run([str(self.binary), "access", "--data-dir", str(self.directory)],
+                                      capture_output=True, text=True, timeout=15)
+                require(self.access["url"] == launcher["origin"] and link.returncode == 0
+                        and bootstrap_entry(link.stdout.strip()) == {"url": launcher["origin"], "device_id": self.device_id,
+                                                                     "capability": self.access["capability"]},
+                        "the owner's access link carries the bootstrap entry a browser consumes")
+                self.entry = link.stdout.strip()
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -807,15 +828,26 @@ class Node:
         return self.client.network_id
 
 
+def pinned_info(node, certificate=None):
+    """`/api/info` from a `--tls` Node, as a client trusting only `certificate`, by default the Node's own."""
+    host = urllib.parse.urlsplit(json.loads((node.directory / "config.json").read_text())["public_url"]).hostname
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(certificate or node.directory / "tls-cert.pem")
+    with socket.create_connection(("127.0.0.1", node.port), timeout=5) as raw, \
+            context.wrap_socket(raw, server_hostname=host) as stream:
+        stream.sendall(f"GET /api/info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+        response = b"".join(iter(lambda: stream.recv(65536), b""))
+    head, _, body = response.partition(b"\r\n\r\n")
+    require(head.startswith(b"HTTP/1.1 200 "), f"{node.name}: /api/info answers over pinned TLS")
+    return json.loads(body)
+
+
 def local_discovery(run, binary, workspace, helper, cleanup, name="DISCOVERY"):
-    """A started discovery-only Node on loopback. Invites carry only the entry's device ID, so a CLI join
-    finds its entry here; give `discovery_address` to the joiner and the entry before they start."""
-    port = available_port()
-    node = Node(run, name, binary, workspace, helper, init_args=[
-        "--public-entry", "--relay-mode", "discovery-only", "--relay-listen", f"0.0.0.0:{port}"])
+    """A started Node serving discovery on loopback, with no relay. Invites carry only the entry's device ID,
+    so a CLI join finds its entry here; give `discovery_address` to the joiner and the entry before they start."""
+    node = Node(run, name, binary, workspace, helper, init_args=["--serve-discovery"])
     cleanup.append(node)
-    node.discovery_port = port
-    node.discovery_address = f"vibeface://{node.device_id}@localhost:{port}"
+    node.discovery_address = f"vibeface://{node.device_id}@localhost:{node.quic_port}"
     node.start()
     return node
 
@@ -4590,14 +4622,16 @@ def acceptance(options):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
         discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        for node in (a, p, b, c):
+        # B cannot reach the IPv4-only Discovery, so its join hands the invite token to P's relay,
+        # which admits only members and those P invited.
+        for node in (a, p, c):
             node.configure_network(discovery=[discovery])
         a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
-        a.configure_network(relays=[relay_url])
-        c.configure_network(relays=[relay_url])
-        b.configure_network(relays=[relay_url], bind=f"[::1]:{b.port}")
+        a.configure_network(relays=[{"url": relay_url}])
+        c.configure_network(relays=[{"url": relay_url}])
+        b.configure_network(relays=[{"url": relay_url}], bind=f"[::1]:{b.port}")
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -4619,7 +4653,7 @@ def acceptance(options):
         require(all(scheduler_records(node, network) == [] for node in (p, b, c)),
                 "syncing history creates no scheduler job on replicas")
         b_config = json.loads((b.directory / "config.json").read_text())["network"]
-        require(b_config["bind"] == f"[::1]:{b.port}" and b_config["relays"] == [relay_url], "B has no IP family in common with the IPv4-only peers")
+        require(b_config["bind"] == f"[::1]:{b.port}" and b_config["relays"] == [{"url": relay_url}], "B has no IP family in common with the IPv4-only peers")
         require(wait_for("B actually selects a relay data path", lambda: any(
             row.get("path") == "relay" for row in node_status(b).get("peers", []))), "B uses a real relay path")
         passed("join-and-sync-over-iroh", heads=synced, events=dags, relay=relay_url)
@@ -4920,7 +4954,7 @@ def phase4_acceptance(options):
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))},
                            app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
-            node.configure_network(relays=[relay_url], discovery=[discovery])
+            node.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
         a.start()
         network = a.bootstrap()
@@ -5336,12 +5370,15 @@ def phase4_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
-def public_entry_acceptance(options):
-    """A public entry P that is no member: web, relay and forwarding only. M is the only member Node and
-    is reachable only through P's relay; a browser opens P's origin, joins M and chats with it."""
+def public_node_acceptance(options):
+    """A public node P in no personal network: an ordinary Node that serves discovery, runs an open relay and
+    forwards browsers to any device, with one forwarding slot and one place in line. M is the only member Node
+    and configures nothing but P's discovery; a browser opens P's origin, joins M and chats with it. A private
+    relay R with an operator token then carries A's traffic to an IPv6-only X while X holds the token, and
+    nothing once it holds a wrong one."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
     options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("public-entry-" + uuid.uuid4().hex[:10])
+    run = options.artifacts.resolve() / ("public-node-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
@@ -5350,96 +5387,90 @@ def public_entry_acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "public entry P (not a member) with its relay; member M on IPv6-only transport; "
-                          "Node X holding a wrong relay token; WASM browser client on P's origin",
-              "not_checked": ["real NAT and TLS reverse proxy (loopback ports stand in for nginx paths)",
+              "coverage": "public node P (not a member) serving discovery, an open relay limited per address and "
+                          "browser forwarding with one slot and one place in line; member M configured only with "
+                          "P's discovery; private relay R with an operator token between A and an IPv6-only X; "
+                          "TLS-only T as a reverse proxy pinning its certificate sees it; WASM browser client on P's origin",
+              "not_checked": ["real NAT and the nginx reverse proxy (loopback ports stand in for nginx paths)",
                               "rendered browser UI (see the browser screenshots)"]}
 
     def passed(name, **evidence):
         report["cases"][name] = evidence
         print("PASS " + name, flush=True)
 
-    def entry_rows(path):
+    def node_rows(path):
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
             return {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                     for table in ("networks", "events", "conversations", "log_heads")}
 
+    def peer(node, target):
+        return next((row for row in node_status(node).get("peers", []) if row["device_id"] == target.device_id), {})
+
+    def stop(*members):
+        for node in members:
+            node.client.close()
+            node.stop()
+
+    def start(network, *members):
+        for node in members:
+            node.start()
+        members[0].client.connect(members[0].device_id)
+        members[0].client.authenticate(network)
+        wait_for("the management Node is aligned and writable",
+                 lambda: node_status(members[0]).get("write_state") == "writable", timeout=60)
+
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        p = Node(run, "P", binary, workspace, helper,
-                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
+        p = Node(run, "P", binary, workspace, helper, init_args=[
+            "--serve-discovery", "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
+            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
         nodes.append(p)
-        token = p.directory / "entry-token"
-        require(token.stat().st_mode & 0o077 == 0 and len(token.read_text().strip()) == 64,
-                "the public entry keeps a private operator token")
-        require(not (p.directory / "bootstrap.json").exists(), "a public entry has no network setup capability")
-        wrong = run / "wrong-token"
-        wrong.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
-        wrong.chmod(0o600)
+        discovery = f"vibeface://{p.device_id}@127.0.0.1:{p.quic_port}"
         fixture = run / "fixture-M"
         fixture.mkdir(mode=0o700)
-        m = Node(run, "M", binary, workspace, helper, init_args=[
-            "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(token)])
-        x = Node(run, "X", binary, workspace, helper, init_args=[
-            "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(wrong)])
-        nodes += [m, x]
-        for node in (m, x):
-            node.configure_network(bind=f"[::1]:{node.port}")
+        m = Node(run, "M", binary, workspace, helper, init_args=["--root", str(workspace), "--bootstrap", discovery])
+        nodes.append(m)
+        configured = json.loads((m.directory / "config.json").read_text())["network"]
+        require(configured["bootstrap"] == {"mode": "custom", "discovery": discovery}
+                and configured["relays"] == [] and configured["discovery"] == [],
+                "M configures nothing but P's discovery")
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
                     bins={"codex": str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
         for node in nodes:
             node.start()
-        info = p.client.request("/api/info")
-        require(info["public_entry"] is True, "the entry says it is a public entry")
+        require(p.client.request("/api/info")["device_id"] == p.device_id, "P serves its own identity")
         p.client.request("/api/local/setup", {}, status=404)
-        passed("public-entry-starts-without-a-network", device=p.device_id, relay=relay_url)
+        passed("public-node-starts-without-a-network", device=p.device_id, relay=relay_url)
 
         network = m.bootstrap()
-        x.bootstrap()
-        m.client.call("subscribe")
-        listed = wait_for("M advertises the public entry as its Gateway", lambda: next(
-            (row for row in m.client.call("entrances")["entrances"]
-             if json.loads(row["payload"])["device_id"] == m.device_id
-             and json.loads(row["payload"]).get("gateway_url") == p.url), None), timeout=60)
-        require(listed, "M's signed address names P")
-        passed("member-names-the-public-entry", gateway_url=p.url)
-
         phone = Client(p.url, helper, identity_file=run / "phone-identity.json")
         clients.append(phone)
         started = time.monotonic()
+        wait_for("M registers with P's discovery", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
         phone.join(m.client, "phone", via=p.url)
         require(phone.url == p.url, "the phone joined through P's origin")
-        passed("browser-joins-the-member-through-the-public-entry", elapsed_ms=round((time.monotonic() - started) * 1000))
+        passed("browser-joins-the-member-through-the-public-node", elapsed_ms=round((time.monotonic() - started) * 1000))
 
-        conversation = "public-entry-chat"
-        phone.rpc("create_bot", bot_id="public-entry-bot", conversation_id=conversation, name="经公共入口",
+        conversation = "public-node-chat"
+        phone.rpc("create_bot", bot_id="public-node-bot", conversation_id=conversation, name="经公共节点",
                   instructions="", scheduler_node=m.device_id,
                   project={"target_node": m.device_id, "cwd": str(workspace)})
         phone.rpc("message", conversation_id=conversation, message_id="pe-1", text="你好")
         wait_for("M answers the phone", lambda: any(row["role"] == "assistant" for row in
                  phone.rpc("conversation", conversation_id=conversation)["messages"]), timeout=60)
-        passed("browser-chats-through-the-public-entry")
+        passed("browser-chats-through-the-public-node")
 
         phone.close()
         p.stop()
         p.start()
-        wait_for("the phone reconnects through the restarted entry", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
+        wait_for("the phone reconnects through the restarted public node", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
         phone.authenticate(network)
         phone.rpc("message", conversation_id=conversation, message_id="pe-2", text="又来了")
         wait_for("M answers after the reconnect", lambda: sum(row["role"] == "assistant" for row in
                  phone.rpc("conversation", conversation_id=conversation)["messages"]) >= 2, timeout=60)
-        passed("browser-reconnects-after-the-entry-restarts")
-
-        refused = Client(p.url, helper, identity_file=run / "outsider-identity.json")
-        clients.append(refused)
-        outcome = refused.connect(x.device_id, check=False)
-        require(not outcome.get("ok"), "P cannot reach a Node whose relay token is wrong")
-        direct = Client(x.url, helper, identity_file=run / "outsider-identity.json")
-        clients.append(direct)
-        require(direct.connect(x.device_id, check=False).get("ok"), "X itself is running")
-        passed("relay-refuses-a-wrong-token", error=str(outcome.get("error", ""))[:200])
+        passed("browser-reconnects-after-the-public-node-restarts")
 
         wait_for("M's Main scheduler settles before the hook producer", lambda:
                  not scheduler_sessions(m, conversation).get("main", {}).get("active") and all(
@@ -5450,7 +5481,7 @@ def public_entry_acceptance(options):
         (work_dir / "release").touch()
         phone.rpc("message", conversation_id=conversation, message_id="pe-3", text=json.dumps({"label": "pe-3", "dispatch": {
             "label": "pe-work", "cwd": str(work_dir), "native": {"gate": str(work_dir / "release")}}}))
-        dispatch = wait_for("M records the public-entry source Work", lambda: next(
+        dispatch = wait_for("M records the public-node source Work", lambda: next(
             (row for row in fixture_records(fixture, "manager-native-work.jsonl")
              if row["label"] == "pe-work" and row["trigger"] == "message:pe-3"), None), timeout=60)
         source = wait_for("M's exact Work records its Codex thread and turn", lambda: next(
@@ -5459,7 +5490,7 @@ def public_entry_acceptance(options):
              and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
         require(source["trigger"] == "message:pe-3" and source["target_node"] == m.device_id
                 and source["cwd"] == str(work_dir) and source["kind"] == "codex" and source["outcome"] == "completed",
-                "the public-entry hook keeps its original Work's native identity")
+                "the public-node hook keeps its original Work's native identity")
         wait_for("M's source Human turn completes before the answer", lambda:
                  (scheduler_record(m, network, "message:pe-3") or {}).get("state") == "completed", timeout=60)
         wait_for("M's source WorkResult turn completes before the answer", lambda:
@@ -5474,7 +5505,7 @@ def public_entry_acceptance(options):
         require(question.get("target") == {"kind": "work", "work_id": source["work_id"]},
                 "the repeated hook's question keeps the actual Work scope")
         token = m.client.call("create_decision_token", {"label": "grok"})["token"]
-        decision = {"device_id": m.device_id, "question_id": question_id, "text": "经入口送达的回答"}
+        decision = {"device_id": m.device_id, "question_id": question_id, "text": "经公共节点送达的回答"}
         sent = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
         again = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
         p.client.request("/api/decision", decision, origin=False,
@@ -5486,7 +5517,7 @@ def public_entry_acceptance(options):
                  and row["message"]["params"].get("clientUserMessageId") == answer_work
                  and acted[0]["replies"][1]["work_id"] == answer_work]
         require(sent == again == {"question_id": question_id, "answer_id": "a-" + question_id, "status": "answered",
-                                  "text": "经入口送达的回答"} and question["conversation_id"] == conversation
+                                  "text": "经公共节点送达的回答"} and question["conversation_id"] == conversation
                 and len(acted) == 1 and len(sends) == 1,
                 "a decision token's POST through P answers M's question once and the answer reaches the thread once; a wrong token gets 401")
         before_unknown = len([row for row in fixture_records(fixture, "codex-rpc.jsonl")
@@ -5507,13 +5538,89 @@ def public_entry_acceptance(options):
                                if row["message"].get("method") in ("turn/start", "turn/steer")
                                and row["message"]["params"].get("threadId") == thread_id]) == before_unknown)
         require(token not in (p.directory / "process.log").read_text(errors="replace"), "P does not log the token")
-        passed("decision-through-the-public-entry", question=question_id, thread=thread_id[:24])
+        passed("decision-through-the-public-node", question=question_id, thread=thread_id[:24])
 
-        rows = entry_rows(p.directory / "node.sqlite3")
+        # The phone holds P's one forwarding slot, so a second session takes the one place in line and goes
+        # through once the phone leaves.
+        second = phone.connect(m.device_id, connection="second", release="main")
+        require(second["queued"][:1] == [1] and second["queued"][-1] == 0,
+                "the waiting session hears its place in line, then position 0 as it goes through")
+        principal = phone.call("authenticate", {"network_id": network}, connection="second")["principal"]
+        require(principal["network_id"] == network, "the session that waited reaches M")
+        passed("browser-waits-in-line-when-the-public-node-is-busy", positions=second["queued"])
+
+        token_file, wrong = run / "relay-token", run / "wrong-relay-token"
+        for path in (token_file, wrong):
+            path.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
+            path.chmod(0o600)
+        private_port = available_port()
+        private_url = f"http://127.0.0.1:{private_port}"
+        r = Node(run, "R", binary, workspace, helper, init_args=[
+            "--relay-listen", f"127.0.0.1:{private_port}", "--relay-url", private_url,
+            "--relay-operator-token", str(token_file)])
+        nodes.append(r)
+        # D offers no relay, so R is the only one A and X can use.
+        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
+        a, x = (Node(run, name, binary, workspace, helper, init_args=[
+            "--root", str(workspace), "--discovery", d.discovery_address,
+            "--relay", private_url, "--relay-token", f"{private_url}={token_file}"]) for name in ("A", "X"))
+        nodes += [a, x]
+        r.start(no_web=True)
+        a.start()
+        private = a.bootstrap()
+        x.pair(a)
+        x.start()
+        wait_for("A and X publish the private relay path", lambda: {
+            json.loads(row["payload"])["device_id"] for row in a.client.call("entrances")["entrances"]
+            if any("Relay" in item for item in json.loads(row["payload"])["endpoint"]["addrs"])} >= {a.device_id, x.device_id},
+            timeout=60)
+        a.client.rpc("create_conversation", conversation_id="before-ipv6", title="Before IPv6")
+        wait_for("A and X align before X loses IPv4", lambda: converged((a, x), private), timeout=60)
+        stop(a, x)
+        x.configure_network(bind=f"[::1]:{x.port}")
+        start(private, a, x)
+        wait_for("A reaches the IPv6-only X through the private relay", lambda: peer(a, x).get("path") == "relay", timeout=60)
+        a.client.rpc("create_conversation", conversation_id="private-relay", title="Private relay")
+        wait_for("the private relay carries A's event to X", lambda: converged((a, x), private), timeout=60)
+        passed("private-relay-admits-its-token-holders", path=peer(a, x)["path"])
+        stop(a, x)
+        x.configure_network(relays=[{"url": private_url, "token": wrong.read_text().strip()}])
+        start(private, a, x)
+        wait_for("X, holding a wrong token, is unreachable", lambda: peer(a, x).get("reachable") is False, timeout=45)
+        a.client.rpc("create_conversation", conversation_id="wrong-relay-token", title="Wrong relay token")
+        require_quiet("the private relay carries nothing for X", lambda: heads(x, private) != heads(a, private))
+        require(peer(a, x).get("path") is None, "no path reaches X without its relay")
+        passed("private-relay-refuses-a-wrong-token")
+
+        rows = node_rows(p.directory / "node.sqlite3")
         require(all(count == 0 for count in rows.values()), "P stores no events, conversations or logs")
         require(not any((p.directory / "blobs").rglob("*")) if (p.directory / "blobs").exists() else True,
                 "P stores no attachments")
-        passed("public-entry-stores-nothing", **rows)
+        passed("public-node-stores-nothing", **rows)
+
+        # The official node's browser API speaks only TLS, under the certificate the host installs into its data
+        # directory and renews there while the Node runs.
+        t, t2 = (Node(run, name, binary, workspace, helper, init_args=["--tls", "--public-url", "https://app.example.invalid"])
+                 for name in ("T", "T2"))
+        nodes += [t, t2]
+        t.start()
+        require(pinned_info(t)["device_id"] == t.device_id, "T answers over TLS pinned to its own certificate")
+        try:
+            pinned_info(t, t2.directory / "tls-cert.pem")
+        except ssl.SSLCertVerificationError:
+            pass
+        else:
+            raise AssertionError("another Node's certificate verifies T")
+        answer = b""
+        with socket.create_connection(("127.0.0.1", t.port), timeout=5) as raw, contextlib.suppress(ConnectionResetError):
+            raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
+            answer = raw.recv(64)
+        require(not answer.startswith(b"HTTP/"), "T answers no plain HTTP")
+        for name in ("tls-key.pem", "tls-cert.pem"):
+            shutil.copyfile(t2.directory / name, t.directory / name)
+        wait_for("T serves a renewed certificate without a restart",
+                 lambda: pinned_info(t, t2.directory / "tls-cert.pem")["device_id"] == t.device_id, timeout=30)
+        passed("tls-only-node-answers-its-pinned-certificate")
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"
@@ -5583,17 +5690,11 @@ def discovery_acceptance(options):
 
     try:
         d = local_discovery(run, binary, workspace, helper, nodes, name="D")
-        discovery_port = d.discovery_port
-        require(not (d.directory / "entry-token").exists(), "discovery has no data-relay operator token")
+        served = json.loads((d.directory / "config.json").read_text())["network"]
+        require(served["serve_discovery"] and served["relay_listen"] is None,
+                "discovery is a capability of an ordinary Node and brings no relay")
         require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
-        for path in ("/api/client", "/api/decision", "/api/local/setup"):
-            d.client.request(path, status=404)
-        try:
-            with socket.create_connection(("127.0.0.1", discovery_port), timeout=1):
-                raise AssertionError("discovery must not run the TCP business relay")
-        except ConnectionRefusedError:
-            pass
-        passed("discovery-has-no-business-relay-or-http-proxy")
+        passed("discovery-runs-on-an-ordinary-node-without-a-relay")
         address = d.discovery_address
         a, b = [Node(run, name, binary, workspace, helper) for name in ("A", "B")]
         nodes += [a, b]
@@ -5651,7 +5752,7 @@ def discovery_acceptance(options):
         for node in (a, b):
             node.client.close()
             node.stop()
-            node.configure_network(relays=[relay_url])
+            node.configure_network(relays=[{"url": relay_url}])
             node.start()
         reconnect(a, network)
         wait_for("members publish normal relay paths", lambda: all(
@@ -5765,7 +5866,7 @@ def phase5_acceptance(options):
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
         discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
         b.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
-        a.configure_network(relays=[relay_url], discovery=[discovery])
+        a.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
         a.start()
         network = a.bootstrap()
         b.pair(a)
@@ -6235,9 +6336,13 @@ def delivery_rows(node, query, parameters=()):
         return connection.execute(query, parameters).fetchall()
 
 
-def delivery_entry_args():
+# A relay that admits any device is bounded; loopback fixtures share one address.
+OPEN_RELAY = ["--relay-open", "--relay-rate", "1048576", "--relay-max-clients", "64", "--relay-max-clients-per-ip", "64"]
+
+
+def public_node_args():
     address = f"127.0.0.1:{available_port()}"
-    return ["--public-entry", "--relay-listen", address, "--relay-url", "http://" + address]
+    return ["--relay-listen", address, "--relay-url", "http://" + address, *OPEN_RELAY]
 
 
 def delivery_free_state(nodes, spy):
@@ -6268,7 +6373,7 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     source = options.delivery_source_root.resolve(strict=True)
     value = {"actor_peer": actor.device_id, "identity_file": str(actor.directory / "identity.json"),
              "targets": [{"peer": node.device_id, "address": f"127.0.0.1:{node.quic_port}",
-                          "public_entry": node is targets[-1] and node.name == "P"} for node in targets],
+                          "public_node": node is targets[-1] and node.name == "P"} for node in targets],
              "order_id": order_id}
     if action is not None:
         value["action"] = action
@@ -6345,7 +6450,7 @@ def delivery_charity_acceptance(options):
 
     try:
         for name in ("S", "R", "P", "X"):
-            args = delivery_entry_args() if name == "P" else []
+            args = public_node_args() if name == "P" else []
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
@@ -8150,7 +8255,7 @@ def delivery_paid_run(options, configuration, deployment):
         funder = accounts[0]
         require(int(rpc("eth_chainId", []), 16) == 31337, "the running local chain has the pinned identity")
         for name in ("S", "R", "P"):
-            args = delivery_entry_args() if name == "P" else []
+            args = public_node_args() if name == "P" else []
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
@@ -8689,59 +8794,6 @@ def delivery_paid_run(options, configuration, deployment):
     return report
 
 
-class BootstrapSite:
-    """Serves the entry UI and Discovery on one origin, with its own client socket unavailable."""
-    def __init__(self, port, entry, discovery):
-        site = self
-        self.catalog_reads = 0
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                path = urllib.parse.urlsplit(self.path).path
-                if path == "/api/client":
-                    self.send_error(503, "fixture direct gateway is unavailable")
-                    return
-                if path.startswith("/bootstrap/"):
-                    upstream = discovery.url
-                    if path == "/bootstrap/catalog":
-                        site.catalog_reads += 1
-                else:
-                    upstream = entry.url
-                try:
-                    try:
-                        response = opener.open(upstream + self.path, timeout=15)
-                    except urllib.error.HTTPError as error:
-                        response = error
-                    with response:
-                        body = response.read(4 * 1024 * 1024 + 1)
-                        require(len(body) <= 4 * 1024 * 1024, "fixture proxy response is bounded")
-                        self.send_response(response.status)
-                        for name in ("Content-Type", "Content-Security-Policy", "Cache-Control", "X-Vibeface-Source"):
-                            value = response.headers.get(name)
-                            if value:
-                                self.send_header(name, value)
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-                except (OSError, ValueError):
-                    self.send_error(502)
-
-            def log_message(self, *_):
-                pass
-
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-        require(not self.thread.is_alive(), "bootstrap site stops its own thread")
-
-
 def e2e_fixture(options):
     program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
     require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
@@ -8764,13 +8816,12 @@ def e2e_fixture(options):
     native_queue = None
     workspace_gates = {name: run / ("workspace-release-" + name) for name in ("taskA", "taskB", "main", "channel")} \
         if options.fixture_kind == "workspace" else None
-    bootstrap_site = None
     bootstrap_invitation = None
-    bootstrap_kind = options.fixture_kind in ("bootstrap", "bootstrap-http")
+    bootstrap_kind = options.fixture_kind == "bootstrap"
 
     def details():
         # A browser lives on the origin of the owner's access link; a Node without one names its listener.
-        return {"run": str(run), "site": bootstrap_site.url if bootstrap_site else None, "nodes": {
+        return {"run": str(run), "nodes": {
             role: {"url": node.access["url"] if node.entry else node.url, "entry": node.entry,
                    "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
@@ -8783,45 +8834,30 @@ def e2e_fixture(options):
     signal.signal(signal.SIGINT, stop)
     try:
         if bootstrap_kind:
-            site_url = f"http://127.0.0.1:{options.fixture_port}"
-            relay_port, entry_port, discovery_port = available_port(), available_port(), available_port()
-            gateway_url = f"http://127.0.0.1:{entry_port}"
+            # The page's own Node is a public node; the member configures nothing but its discovery.
+            relay_port = available_port()
             relay_url = f"http://127.0.0.1:{relay_port}"
-            discovery = Node(run, "discovery", binary, workspace, helper, init_args=[
-                "--public-entry", "--relay-mode", "discovery-only",
-                "--relay-listen", f"127.0.0.1:{discovery_port}",
-                "--catalog-gateway", gateway_url, "--catalog-relay", relay_url])
-            nodes["discovery"] = discovery
-            entry = Node(run, "entry", binary, workspace, helper, port=entry_port, init_args=[
-                "--public-entry", "--public-url", gateway_url,
-                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url,
-                "--relay-admission", "grants", "--grant-issuer", discovery.device_id,
-                "--allowed-origin", site_url])
-            nodes["entry"] = entry
-            udp_port = available_port() if options.fixture_kind == "bootstrap-http" else discovery_port
+            public = Node(run, "public", binary, workspace, helper, port=options.fixture_port, init_args=[
+                "--serve-discovery", "--forward-any",
+                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
+            nodes["public"] = public
             member = Node(run, "member", binary, workspace, helper, init_args=[
-                "--root", str(workspace), "--bootstrap", f"vibeface://{discovery.device_id}@127.0.0.1:{udp_port}",
-                "--bootstrap-https", discovery.url + "/bootstrap"])
+                "--root", str(workspace), "--bootstrap", f"vibeface://{public.device_id}@127.0.0.1:{public.quic_port}"])
             nodes["member"] = member
-            require(not (member.directory / "entry-token").exists(), "public bootstrap member has no operator credential")
-            discovery.start(no_web=True)
-            entry.start()
+            public.start()
             member.start()
-            def admitted():
-                status = (node_status(member).get("bootstrap") or {}).get("status") or {}
-                return status if status.get("state") == "admitted" else None
-            state = wait_for("fresh member registers a public Relay lease", admitted)
-            require(state["gateway_url"] == gateway_url and state["relay_url"] == relay_url,
-                    "bootstrap selects the paired gateway and Relay")
-            if options.fixture_kind == "bootstrap-http":
-                require(state["via"] == "https", "UDP-unreachable fixture admits over HTTP")
             member.bootstrap()
+            probe = Client(public.url, helper, identity_file=run / "probe-identity.json")
+            try:
+                wait_for("the member registers with the page Node's discovery",
+                         lambda: probe.connect(member.device_id, check=False).get("ok"), timeout=60)
+            finally:
+                probe.close()
             member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
                               name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
             bootstrap_invitation = member.client.invite().removeprefix("vibeface://join/")
-            bootstrap_site = BootstrapSite(options.fixture_port, entry, discovery)
         for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
-            args = delivery_entry_args() if role == "provider" else []
+            args = public_node_args() if role == "provider" else []
             # The e2e runner's port is the browser's origin: the source Node's local listener, where its owner link opens.
             node = Node(run, role, binary, workspace, helper, init_args=args,
                         local_port=options.fixture_port if role == "source" else None)
@@ -8903,11 +8939,9 @@ def e2e_fixture(options):
                     result = details()
                 elif op == "bootstrap_info":
                     require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
-                    result = {**details(), "invitation": bootstrap_invitation,
-                              "issuer": nodes["discovery"].device_id,
-                              "bootstrap": node_status(nodes["member"])["bootstrap"]["status"],
-                              "member_has_operator_token": (nodes["member"].directory / "entry-token").exists(),
-                              "catalog_reads": bootstrap_site.catalog_reads}
+                    network = json.loads((nodes["member"].directory / "config.json").read_text())["network"]
+                    result = {**details(), "invitation": bootstrap_invitation, "bootstrap": network["bootstrap"],
+                              "relays": network["relays"], "discovery": network["discovery"]}
                 elif op == "bootstrap_pairing":
                     require(bootstrap_kind, "bootstrap pairing belongs to its controlled fixture")
                     owner = nodes["member"].client
@@ -9084,8 +9118,7 @@ def e2e_fixture(options):
         raise SystemExit(1) from None
     finally:
         cleanup_failed = False
-        actions = ([bootstrap_site.close] if bootstrap_site else [])
-        actions += [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
+        actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
         actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
         for action in actions:
             try:
@@ -9116,8 +9149,8 @@ if __name__ == "__main__":
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
-        modes.add_argument("--discovery", action="store_true", help="check discovery-only connection assistance, automatic normal-relay fallback, and headless Nodes")
-        modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
+        modes.add_argument("--discovery", action="store_true", help="check discovery connection assistance, automatic normal-relay fallback, and headless Nodes")
+        modes.add_argument("--public-node", action="store_true", help="check a public node that serves discovery, an open relay and queued browser forwarding to a member Node, and a private relay's token")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
@@ -9131,7 +9164,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "bootstrap", "bootstrap-http"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "bootstrap"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
@@ -9176,8 +9209,8 @@ if __name__ == "__main__":
                 discovery_acceptance(arguments)
             elif arguments.phase5:
                 phase5_acceptance(arguments)
-            elif arguments.public_entry:
-                public_entry_acceptance(arguments)
+            elif arguments.public_node:
+                public_node_acceptance(arguments)
             elif arguments.phase4:
                 phase4_acceptance(arguments)
             elif arguments.auto_route:

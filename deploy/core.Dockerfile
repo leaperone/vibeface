@@ -5,6 +5,7 @@ RUN apt-get update \
 WORKDIR /opt/vibeface
 COPY component/ ./
 COPY runtime.py ./runtime.py
+COPY public-bootstrap.json ./public-bootstrap.json
 RUN python3 runtime.py info > /dev/null
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=15s --start-period=20s --retries=3 \

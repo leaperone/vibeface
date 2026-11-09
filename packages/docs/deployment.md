@@ -1,6 +1,6 @@
 ---
 title: 配置并部署 Node
-description: 配置数据目录、网络边界与公共入口。
+description: 配置数据目录、网络边界与公共节点。
 ---
 
 # 配置并部署 Node
@@ -30,7 +30,7 @@ Core 默认只接受配置允许的网页来源。独立 App 的 HTTPS origin �
 
 本地完整发行包把静态文件放在两个二进制文件旁边的 `web/`。Core 直接读取该目录；源码运行时可用 `VIBEFACE_APP_DIR` 指定同提交生成的 `apps/app/dist/client`。这只是选择文件位置，App 仍不包含或启动 Core。
 
-公共发现服务是另一种 Core 配置，它只帮助发现与连接，不提供用户的执行环境，也不转发业务数据，见[只做发现的服务](node.md#运行不转发业务数据的公共发现服务)。`www.vibeface.dev` 的门户部署不等于独立 App 或发现服务已经部署。
+公共节点是不加入个人网络的 Core 配置，按配置提供发现服务、relay 和浏览器转发，不提供用户的执行环境，见[从外网访问](node.md#从外网访问)和[运行公共发现服务](node.md#运行公共发现服务)。`www.vibeface.dev` 的门户部署不等于独立 App 或公共节点已经部署。
 
 ## 指定数据目录
 
@@ -133,9 +133,9 @@ vibeface hooks status [--home '<同一个目录>']
 
 网页 HTTP 入口的默认回环监听适用于本机浏览器。需要其他设备访问网页入口时，明确配置监听地址和外部访问 URL。非回环监听必须提供 `--public-url`。运行 relay 时必须同时提供 `--relay-listen` 和 `--relay-url`。Node 间的 iroh UDP 传输默认绑定全接口，不能把网页回环监听当作它的网络边界。
 
-公网部署使用 HTTPS 反向代理，将网页和 WebSocket 请求转发到配置的回环监听地址。域名、证书、防火墙和 relay 地址都属于部署配置。具体角色配置见 [Node 使用](node.md#配置公共入口)。
+公网部署使用 HTTPS 反向代理，将网页和 WebSocket 请求转发到配置的回环监听地址。域名、证书、防火墙和 relay 地址都属于部署配置。具体角色配置见 [从外网访问](node.md#从外网访问)。
 
-官方公共服务按职责分域部署：`app.vibeface.dev` 提供静态网页，`discovery.vibeface.dev` 提供 UDP 发现及 HTTPS 目录和许可接口，`relay.vibeface.dev` 由同一个公共 Node 提供 Gateway 和 Relay。官方默认地址统一来自 `config/public-bootstrap.json`，Core、网页和手机客户端不各自维护一份副本。自建发现服务和私人入口使用各自明确配置的地址与身份；私人入口不进入官方公共目录。
+官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，不转发接口；公共节点 `node.vibeface.dev` 是指向 `8.217.72.118` 的 DNS-only A 记录，不经代理，提供 UDP 发现服务、开放 Relay 和浏览器接入 `https://node.vibeface.dev:4792`，网页的 `/api/client`、`/api/info` 和 `/api/decision` 直接连它，证书是宿主 acme.sh 续期的 Let's Encrypt 域名证书。自建节点可以不用域名，按纯 IP `https://<IP>:4792` 直连，配 Let's Encrypt 短期 IP 证书。公共节点的设备编号、地址和 `gateway_url` 只在 `config/public-bootstrap.json` 定义一次，Core 编入同一文件，网页和 App 构建时导入它：官方页面与手机、桌面 App 以 `gateway_url` 为默认接入地址，由 Node 提供的页面用该页面自己的 origin，用户可在设置里改。自建发现服务和公共节点使用各自明确配置的地址与身份。
 
 
 ## 安装程序和后台服务

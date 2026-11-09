@@ -14,8 +14,12 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
 };
 use tokio::net::TcpListener;
 
@@ -24,7 +28,7 @@ use static_assets::{DEFAULT_CONTENT_SECURITY_POLICY, StaticAssets};
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The scoped CLI posts tool calls to this private path.
 pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
-const MAX_CLIENT_SOCKETS: usize = 256;
+pub(crate) const MAX_CLIENT_SOCKETS: usize = 256;
 const MAX_DECISIONS: usize = 16;
 const DECISIONS_PER_MINUTE: u32 = 12;
 const MAX_DECISION_SOURCES: usize = 256;
@@ -33,12 +37,9 @@ const HOOKS: &str = "/api/hooks";
 const HOOKS_WAIT: &str = "/api/hooks/wait";
 const TRIAGE: &str = "/api/triage";
 const LOG: &str = "/api/log";
-/// A discovery entry's signed service catalogue, fetched by Nodes and clients.
-pub const BOOTSTRAP_CATALOG: &str = "/bootstrap/catalog";
-/// A discovery entry issues a relay grant for a device-signed request.
-pub const BOOTSTRAP_GRANT: &str = "/bootstrap/grant";
-/// A public entry's relay learns a renewed grant for an endpoint it already admits.
-pub const RELAY_GRANT: &str = "/api/relay/grant";
+/// What a page of another allowed origin may read: the Noise socket and this Node's device ID.
+const CROSS_ORIGIN: [&str; 2] = ["/api/client", "/api/info"];
+const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct App {
@@ -46,6 +47,8 @@ struct App {
     sites: Vec<Site>,
     clients: Arc<tokio::sync::Semaphore>,
     decisions: Arc<DecisionLimit>,
+    /// The `/api/client` connections each browser address holds, counted on `listen` alone.
+    addresses: Option<crate::net::Shares>,
     assets: Option<Arc<StaticAssets>>,
     local: bool,
 }
@@ -57,6 +60,7 @@ impl App {
             sites,
             clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
             decisions: Arc::new(DecisionLimit::default()),
+            addresses: None,
             assets,
             local: false,
         }
@@ -189,23 +193,19 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         site.secure || node.config.listen.ip().is_loopback() || node.config.allow_insecure_lan,
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
-    let listener = if node.config.web_enabled || node.serves_bootstrap_http() {
+    let tls = node
+        .config
+        .tls
+        .then(|| TlsFiles::load(&node.data_dir))
+        .transpose()?;
+    if let Some(files) = &tls {
+        tracing::info!(event = "tls.loaded", sha256 = %files.leaf, "serving the TLS certificate");
+    }
+    let listener = if node.config.web_enabled {
         Some(TcpListener::bind(node.config.listen).await?)
     } else {
         None
     };
-    if node.config.public_entry {
-        return match listener {
-            Some(listener) => axum::serve(
-                listener,
-                browser_router_with_assets(node.clone(), sites, false, assets.clone())
-                    .into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .map_err(Into::into),
-            None => std::future::pending().await,
-        };
-    }
     let local_listen = node.config.local_listen;
     let local_listener = TcpListener::bind(local_listen).await.with_context(|| {
         format!(
@@ -244,15 +244,9 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
     node.tools_ready(tool_url)?;
     tokio::try_join!(
         async {
+            let router = browser_router_with_assets(node.clone(), sites, false, assets.clone());
             match listener {
-                Some(listener) => {
-                    axum::serve(
-                        listener,
-                        browser_router_with_assets(node.clone(), sites, false, assets.clone())
-                            .into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await
-                }
+                Some(tcp) => serve_public(tcp, tls, router, PUBLIC).await,
                 None => std::future::pending().await,
             }
         },
@@ -272,6 +266,238 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         }
     )?;
     Ok(())
+}
+
+/// `config::TLS_CERT`, a full chain, and `config::TLS_KEY`, as `init --tls` makes them or a
+/// certificate client on the host installs and renews them. A change to either file is seen at
+/// the next connection, so a renewed certificate is served without a restart.
+struct TlsFiles {
+    dir: PathBuf,
+    loaded: Stamp,
+    acceptor: tokio_rustls::TlsAcceptor,
+    /// SHA-256 of the leaf certificate served.
+    leaf: String,
+    /// The files as they were when they last failed to load, and when that was.
+    failed: Option<(Stamp, std::time::Instant)>,
+}
+
+/// Each file's modification time and length.
+type Stamp = [(std::time::SystemTime, u64); 2];
+/// An unchanged pair that failed is tried again this often: a new owner or mode, which a
+/// renewal may set after writing, changes neither field of its stamp.
+const TLS_RETRY: Duration = Duration::from_secs(5);
+
+impl TlsFiles {
+    fn load(dir: &Path) -> Result<Self> {
+        let loaded = tls_stamp(dir)?;
+        let (acceptor, leaf) = tls_acceptor(dir)?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            loaded,
+            acceptor,
+            leaf,
+            failed: None,
+        })
+    }
+
+    /// The acceptor for the files as they are now. A pair that does not load, such as one caught
+    /// between its certificate and its key being replaced, leaves the last good one in place.
+    fn current(&mut self) -> tokio_rustls::TlsAcceptor {
+        let Ok(now) = tls_stamp(&self.dir) else {
+            return self.acceptor.clone();
+        };
+        let due = self
+            .failed
+            .is_none_or(|(stamp, at)| stamp != now || at.elapsed() >= TLS_RETRY);
+        if now != self.loaded && due {
+            match tls_acceptor(&self.dir) {
+                Ok((acceptor, leaf)) => {
+                    tracing::info!(event = "tls.reloaded", sha256 = %leaf, "serving a new TLS certificate");
+                    (self.acceptor, self.leaf, self.loaded, self.failed) =
+                        (acceptor, leaf, now, None);
+                }
+                Err(error) => {
+                    if self.failed.is_none_or(|(stamp, _)| stamp != now) {
+                        tracing::warn!(event = "tls.reload_failed", %error, "keeping the previous TLS certificate");
+                    }
+                    self.failed = Some((now, std::time::Instant::now()));
+                }
+            }
+        }
+        self.acceptor.clone()
+    }
+}
+
+fn tls_stamp(dir: &Path) -> std::io::Result<Stamp> {
+    let stamp = |name| {
+        let file = std::fs::metadata(dir.join(name))?;
+        Ok::<_, std::io::Error>((file.modified()?, file.len()))
+    };
+    Ok([
+        stamp(crate::config::TLS_CERT)?,
+        stamp(crate::config::TLS_KEY)?,
+    ])
+}
+
+fn tls_acceptor(dir: &Path) -> Result<(tokio_rustls::TlsAcceptor, String)> {
+    use sha2::{Digest as _, Sha256};
+    use tokio_rustls::rustls::{
+        self,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+    let chain = CertificateDer::pem_file_iter(dir.join(crate::config::TLS_CERT))
+        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
+        .context("invalid TLS certificate")?;
+    let leaf = hex::encode(Sha256::digest(chain.first().context("no TLS certificate")?));
+    let key = PrivateKeyDer::from_pem_file(dir.join(crate::config::TLS_KEY))
+        .context("invalid TLS key")?;
+    // Refuses a key that is not the leaf certificate's.
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(chain, key)?;
+    Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), leaf))
+}
+
+/// What `listen` admits. Anyone may reach it, so each connection holds a place until it closes,
+/// or until the WebSocket it became does.
+#[derive(Clone, Copy)]
+struct Admission {
+    connections: usize,
+    /// Per client address, an IPv4 address or IPv6 /56 as the relay counts them.
+    per_address: NonZeroUsize,
+    /// How long a connection may take to send a request head, just connected or idle after its
+    /// last response.
+    request_head: Duration,
+}
+
+/// Room for the official forwarding limits (32 sessions, 192 queued, 8 per address) and a
+/// browser's own HTTP connections, far below the descriptors the relay and discovery service in
+/// this process also need.
+const PUBLIC: Admission = Admission {
+    connections: 1024,
+    per_address: NonZeroUsize::new(32).unwrap(),
+    request_head: Duration::from_secs(20),
+};
+
+/// Serves `listen`, over TLS when `tls` is set. A connection past either limit is closed unread.
+async fn serve_public(
+    tcp: TcpListener,
+    mut tls: Option<TlsFiles>,
+    router: Router,
+    admission: Admission,
+) -> std::io::Result<()> {
+    let places = Arc::new(tokio::sync::Semaphore::new(admission.connections));
+    let addresses = crate::net::Shares::default();
+    loop {
+        let (stream, peer) = match tcp.accept().await {
+            Ok(accepted) => accepted,
+            // Out of descriptors, say; retrying at once would spin.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(place) = places.clone().try_acquire_owned() else {
+            continue;
+        };
+        let Some(share) = addresses.take(peer.ip(), admission.per_address) else {
+            continue;
+        };
+        let held = (place, share);
+        let acceptor = tls.as_mut().map(TlsFiles::current);
+        let router = router.clone();
+        // Handshakes run apart, so a slow client holds up no other.
+        tokio::spawn(async move {
+            let Some(acceptor) = acceptor else {
+                return serve_connection(stream, held, peer, router, admission).await;
+            };
+            let accepting = tokio::time::timeout(TLS_HANDSHAKE, acceptor.accept(stream));
+            if let Ok(Ok(stream)) = accepting.await {
+                serve_connection(stream, held, peer, router, admission).await;
+            }
+        });
+    }
+}
+
+async fn serve_connection<I>(
+    io: I,
+    held: (tokio::sync::OwnedSemaphorePermit, crate::net::Share),
+    peer: SocketAddr,
+    router: Router,
+    admission: Admission,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |mut request: Request<hyper::body::Incoming>| {
+        request.extensions_mut().insert(ConnectInfo(peer));
+        tower_service::Service::call(&mut router.clone(), request)
+    });
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(admission.request_head);
+    let _ = http
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(Admitted { io, _held: held }),
+            service,
+        )
+        .with_upgrades()
+        .await;
+}
+
+/// A connection and its admission, given back when the connection, or the WebSocket it became,
+/// closes.
+struct Admitted<I> {
+    io: I,
+    _held: (tokio::sync::OwnedSemaphorePermit, crate::net::Share),
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Admitted<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Admitted<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
@@ -317,33 +543,18 @@ fn browser_router_with_assets(
 ) -> Router {
     let mut app = App::new(node, sites, assets);
     app.local = local;
-    let mut routes = Router::new();
-    if app.node.serves_bootstrap_http() {
-        // Bootstrap bodies are small by contract; the limit is enforced per request below too.
-        let mut bootstrap = Router::new();
-        if app.node.config.network.catalog.is_some() {
-            bootstrap = bootstrap
-                .route(BOOTSTRAP_CATALOG, get(bootstrap_catalog))
-                .route(BOOTSTRAP_GRANT, post(bootstrap_grant));
-        }
-        if app.node.config.network.relay_admission.is_grants() {
-            bootstrap = bootstrap.route(RELAY_GRANT, post(relay_grant));
-        }
-        routes = routes.merge(bootstrap.layer(DefaultBodyLimit::max(
-            crate::net::bootstrap::MAX_GRANT_BYTES * 2,
-        )));
-        if !app.node.config.web_enabled {
-            routes = routes.route("/api/info", get(info));
-        }
+    // Anyone may reach `listen`; every connection to the local listener is this computer's.
+    if !local {
+        app.addresses = Some(Default::default());
     }
+    let mut routes = Router::new();
     if app.node.config.web_enabled {
-        routes = routes.route("/api/info", get(info)).fallback(frontend);
-        if app.node.config.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly {
-            routes = routes
-                .route("/api/local/setup", post(local_setup))
-                .route("/api/client", get(client_gateway))
-                .route("/api/decision", post(decision));
-        }
+        routes = routes
+            .route("/api/info", get(info))
+            .fallback(frontend)
+            .route("/api/local/setup", post(local_setup))
+            .route("/api/client", get(client_gateway))
+            .route("/api/decision", post(decision));
         if local {
             routes = routes
                 .route("/api/local/info", get(local_info))
@@ -383,7 +594,14 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         // Admission comes before maintenance or any discovery and dial work.
         if request.uri().path() == "/api/decision" && *request.method() == Method::POST {
             app.decisions
-                .enter(client_ip(&request), crate::runtime::now_ms())
+                .enter(
+                    client_ip(
+                        ip,
+                        request.headers(),
+                        &app.node.config.forwarding.trusted_proxies,
+                    ),
+                    crate::runtime::now_ms(),
+                )
                 .map(Some)
         } else {
             Ok(None)
@@ -442,15 +660,10 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    // Bootstrap resources carry their own signatures and are public by design: any origin may
-    // read the catalogue, and grants are requested and registered by Nodes, not browsers.
-    let bootstrap_path =
-        path == BOOTSTRAP_CATALOG || path == BOOTSTRAP_GRANT || path == RELAY_GRANT;
-    let site = if bootstrap_path {
-        host_site(&app.sites, headers)?
-    } else if path == "/api/client" && *method == Method::GET {
+    let site = if CROSS_ORIGIN.contains(&path) && *method == Method::GET {
         // Cross-origin by design: this Node's browser origins and those of the personal
-        // network's other Gateways, as their signed address records state them.
+        // network's other Gateways, as their signed address records state them. A page such as
+        // the official App, served elsewhere, reaches its access Node this way.
         let site = host_site(&app.sites, headers)?;
         if let Some(origin) = headers.get(header::ORIGIN) {
             let origin = one_header(headers, header::ORIGIN.as_str())
@@ -501,8 +714,7 @@ async fn check_boundary(
             || path == HOOKS
             || path == HOOKS_WAIT
             || path == TRIAGE
-            || path == LOG
-            || bootstrap_path;
+            || path == LOG;
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
@@ -573,100 +785,15 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty() && token.trim() == token).then_some(token)
 }
 
-async fn info(State(app): State<App>) -> Json<Value> {
-    Json(app.node.info())
-}
-
-fn unavailable(error: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
-}
-
-/// When the TCP peer is loopback, optional single `X-Real-IP` set by a trusted local reverse proxy;
-/// otherwise the connecting peer IP. Never trusts `X-Forwarded-For` or `Forwarded`.
-fn client_ip(request: &Request) -> IpAddr {
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|peer| peer.0.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    if !peer.is_loopback() {
-        return peer;
+/// The boundary already refused an `Origin` this Node does not allow, so any left may read it.
+async fn info(State(app): State<App>, headers: HeaderMap) -> Response {
+    let mut response = Json(app.node.info()).into_response();
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let headers = response.headers_mut();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(header::VARY, HeaderValue::from_static("origin"));
     }
-    let headers = request.headers();
-    one_header(headers, "x-real-ip")
-        .and_then(|ip| ip.trim().parse().ok())
-        .unwrap_or(peer)
-}
-
-/// Reads a bootstrap body within the contract's size limit.
-async fn small_json<T: serde::de::DeserializeOwned>(
-    request: Request,
-    limit: usize,
-) -> ApiResult<T> {
-    let bytes = axum::body::to_bytes(request.into_body(), limit)
-        .await
-        .map_err(|_| ApiError::bad("request body exceeds the bootstrap limit"))?;
-    serde_json::from_slice(&bytes).map_err(ApiError::bad)
-}
-
-/// `GET /bootstrap/catalog`: the discovery entry's signed catalogue. Any origin may read it;
-/// its signature, not the transport, is what clients and Nodes trust.
-async fn bootstrap_catalog(State(app): State<App>) -> ApiResult<Response> {
-    let catalog = app
-        .node
-        .net()
-        .ok()
-        .and_then(|net| net.issuer().cloned())
-        .ok_or_else(|| unavailable("the catalogue is not being published yet"))?
-        .catalog(crate::runtime::now_ms())
-        .map_err(unavailable)?;
-    let mut response = Json(catalog).into_response();
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    Ok(response)
-}
-
-/// `POST /bootstrap/grant`: a device-signed request for a relay grant.
-async fn bootstrap_grant(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
-    let issuer = app
-        .node
-        .net()
-        .ok()
-        .and_then(|net| net.issuer().cloned())
-        .ok_or_else(|| unavailable("grants are not being issued yet"))?;
-    let ip = client_ip(&request);
-    let signed: crate::net::bootstrap::SignedRequest =
-        small_json(request, crate::net::bootstrap::MAX_REQUEST_BYTES).await?;
-    let grant = issuer
-        .grant_signed(&signed, ip, crate::runtime::now_ms())
-        .map_err(|error| ApiError(StatusCode::FORBIDDEN, error.to_string()))?;
-    Ok(Json(json!({"grant": grant.as_str()})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GrantRegistration {
-    grant: String,
-}
-
-/// `POST /api/relay/grant`: a Node registers its renewed grant with the public entry's relay.
-async fn relay_grant(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
-    let admission = app
-        .node
-        .net()
-        .ok()
-        .and_then(|net| net.grant_admission().cloned())
-        .ok_or_else(|| unavailable("the relay is not admitting by grants yet"))?;
-    let registration: GrantRegistration =
-        small_json(request, crate::net::bootstrap::MAX_GRANT_BYTES + 32).await?;
-    let grant = admission
-        .register(&registration.grant, crate::runtime::now_ms())
-        .map_err(|error| ApiError(StatusCode::FORBIDDEN, error.to_string()))?;
-    Ok(Json(
-        json!({"device_id": grant.device_id, "expires_at_ms": grant.expires_at_ms}),
-    ))
+    response
 }
 
 async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -837,10 +964,12 @@ async fn local_setup(
     headers: HeaderMap,
     Json(_): Json<LocalSetupRequest>,
 ) -> ApiResult<Json<LocalSetup>> {
-    if app.node.config.public_entry {
+    // A public node's page opens other people's join links; its operator sets it up from
+    // its access URL instead.
+    if app.node.config.forwarding.any {
         return Err(ApiError(
             StatusCode::NOT_FOUND,
-            "a public entry has no local setup".into(),
+            "a public node has no local setup".into(),
         ));
     }
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
@@ -1094,7 +1223,28 @@ async fn decision(
         })
 }
 
-async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+async fn client_gateway(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let forwarding = &app.node.config.forwarding;
+    // Taken before the shared sockets, so one address cannot hold them all.
+    let share = match (&app.addresses, forwarding.per_ip) {
+        (Some(addresses), Some(limit)) => {
+            let client = client_ip(peer.ip(), &headers, &forwarding.trusted_proxies);
+            let Some(share) = addresses.take(client, limit) else {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "this address holds too many client connections",
+                )
+                    .into_response();
+            };
+            Some(share)
+        }
+        _ => None,
+    };
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1110,8 +1260,19 @@ async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> 
             if let Err(error) = crate::client::serve_gateway(app.node, socket).await {
                 tracing::debug!(%error, "client connection closed");
             }
-            drop(permit);
+            drop((permit, share));
         })
+}
+
+/// The browser's address: what a trusted proxy's single `X-Real-IP` names, or else the peer.
+fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|proxy| proxy.to_canonical() == peer) {
+        return peer;
+    }
+    one_header(headers, "x-real-ip")
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) -> Response {
@@ -1173,6 +1334,175 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renewed_certificate_is_served_without_a_restart() -> Result<()> {
+        use crate::config::{TLS_CERT, TLS_KEY};
+        let dir = std::env::temp_dir().join(format!("vibeface-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let issue = |host: &str| {
+            let made = rcgen::generate_simple_self_signed(vec![host.into()]).unwrap();
+            (made.cert.pem(), made.signing_key.serialize_pem())
+        };
+        let write = |(cert, key): &(String, String)| {
+            std::fs::write(dir.join(TLS_CERT), cert)?;
+            std::fs::write(dir.join(TLS_KEY), key)
+        };
+        let fingerprint = |pem: &str| {
+            use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                CertificateDer::from_pem_slice(pem.as_bytes()).unwrap(),
+            ))
+        };
+        let first = issue("203.0.113.7");
+        write(&first)?;
+        let mut files = TlsFiles::load(&dir)?;
+        assert_eq!(files.leaf, fingerprint(&first.0));
+        // A chain: the leaf, then what signed it, as a certificate client installs a full chain.
+        let renewed = issue("203.0.113.7");
+        let chained = (format!("{}{}", renewed.0, first.0), renewed.1.clone());
+        write(&chained)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&renewed.0));
+        // Caught between the certificate and its key: the last good pair stays.
+        let next = issue("203.0.113.7");
+        std::fs::write(dir.join(TLS_CERT), &next.0)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&renewed.0));
+        assert!(files.failed.is_some());
+        std::fs::write(dir.join(TLS_KEY), &next.1)?;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&next.0));
+        assert!(files.failed.is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// `listen` closes a connection past its address's share unread, and one that sends no
+    /// request head in time, just connected or idle after a response; a WebSocket stays open.
+    #[tokio::test]
+    async fn the_public_listener_bounds_each_address_and_silent_connections() -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            net::TcpStream,
+        };
+        use tokio_tungstenite::tungstenite::Message;
+        let router =
+            Router::new()
+                .route(
+                    "/",
+                    get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                        peer.ip().to_string()
+                    }),
+                )
+                .route(
+                    "/ws",
+                    get(|upgrade: WebSocketUpgrade| async move {
+                        upgrade.on_upgrade(|mut socket| async move {
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if socket.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                    }),
+                );
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = tcp.local_addr()?;
+        let head = Duration::from_millis(300);
+        let admission = Admission {
+            connections: 16,
+            per_address: NonZeroUsize::new(2).unwrap(),
+            request_head: head,
+        };
+        let server = tokio::spawn(serve_public(tcp, None, router, admission));
+        // What the connection sends until it closes, or None while it stays open.
+        let until_closed = async |stream: &mut TcpStream| {
+            let (mut sent, mut buf) = (Vec::new(), [0; 1024]);
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                    Ok(Ok(0) | Err(_)) => return Some(sent),
+                    Ok(Ok(n)) => sent.extend_from_slice(&buf[..n]),
+                    Err(_) => return None,
+                }
+            }
+        };
+        let request = b"GET / HTTP/1.1\r\nHost: node\r\n\r\n";
+
+        let (mut socket, _) = tokio_tungstenite::client_async(
+            format!("ws://{addr}/ws"),
+            TcpStream::connect(addr).await?,
+        )
+        .await?;
+        let mut silent = TcpStream::connect(addr).await?;
+        let mut third = TcpStream::connect(addr).await?;
+        let _ = third.write_all(request).await;
+        assert_eq!(
+            until_closed(&mut third).await,
+            Some(vec![]),
+            "a third connection from one address is closed unread"
+        );
+        let started = std::time::Instant::now();
+        assert!(until_closed(&mut silent).await.is_some());
+        assert!(
+            started.elapsed() < head * 4,
+            "a silent connection is closed"
+        );
+
+        tokio::time::sleep(head * 2).await;
+        socket.send(Message::text("still here")).await?;
+        assert_eq!(
+            socket.next().await.context("echo")??,
+            Message::text("still here"),
+            "a WebSocket outlives the request head timeout"
+        );
+
+        let mut idle = TcpStream::connect(addr).await?;
+        idle.write_all(request).await?;
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"127.0.0.1") {
+            let mut buf = [0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut buf)).await??;
+            ensure!(n > 0, "closed before answering");
+            answer.extend_from_slice(&buf[..n]);
+        }
+        assert!(answer.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(
+            until_closed(&mut idle).await,
+            Some(vec![]),
+            "a kept-alive connection that asks nothing more is closed"
+        );
+        drop(socket);
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_trusted_proxy_names_the_client_address() {
+        let headers = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("x-real-ip", value.parse().unwrap());
+            }
+            headers
+        };
+        let proxy: IpAddr = "198.51.100.1".parse().unwrap();
+        let named = headers(&["203.0.113.9"]);
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip(proxy, &named, &[proxy]), ip("203.0.113.9"));
+        assert_eq!(
+            client_ip(ip("::ffff:198.51.100.1"), &named, &[proxy]),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(ip("192.0.2.4"), &named, &[proxy]),
+            ip("192.0.2.4")
+        );
+        let doubled = headers(&["203.0.113.9", "203.0.113.10"]);
+        assert_eq!(client_ip(proxy, &doubled, &[proxy]), proxy);
+        assert_eq!(client_ip(proxy, &headers(&["nonsense"]), &[proxy]), proxy);
+    }
 
     #[tokio::test]
     async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {
@@ -1725,55 +2055,5 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
-    }
-
-    fn request_from_peer(peer: IpAddr, build: impl FnOnce(&mut HeaderMap)) -> Request {
-        let mut headers = HeaderMap::new();
-        build(&mut headers);
-        let mut request = Request::builder()
-            .uri("/bootstrap/grant")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        *request.headers_mut() = headers;
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(peer, 40_000)));
-        request
-    }
-
-    #[test]
-    fn client_ip_loopback_accepts_only_a_single_valid_x_real_ip() {
-        let peer: IpAddr = "127.0.0.1".parse().unwrap();
-        let from_header: IpAddr = "203.0.113.55".parse().unwrap();
-        let r = request_from_peer(peer, |headers| {
-            headers.insert("x-real-ip", "203.0.113.55".parse().unwrap());
-        });
-        assert_eq!(client_ip(&r), from_header);
-        let r = request_from_peer(peer, |headers| {
-            headers.append("x-real-ip", "203.0.113.1".parse().unwrap());
-            headers.append("x-real-ip", "203.0.113.2".parse().unwrap());
-        });
-        assert_eq!(client_ip(&r), peer);
-        let r = request_from_peer(peer, |headers| {
-            headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
-        });
-        assert_eq!(client_ip(&r), peer);
-    }
-
-    #[test]
-    fn client_ip_ignores_forwarded_headers_and_non_loopback_spoofing() {
-        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
-        let r = request_from_peer(loopback, |headers| {
-            headers.insert(
-                "x-forwarded-for",
-                "203.0.113.1, 198.51.100.2".parse().unwrap(),
-            );
-        });
-        assert_eq!(client_ip(&r), loopback);
-        let public: IpAddr = "198.51.100.9".parse().unwrap();
-        let r = request_from_peer(public, |headers| {
-            headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
-        });
-        assert_eq!(client_ip(&r), public);
     }
 }

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createHash, createPublicKey, verify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,8 +10,6 @@ import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
-import { setPublicBootstrapMode, type PublicBootstrapMode } from '@vibeface/client/lib/bootstrap.ts'
-import bootstrapFixture from '../../../../../tests/fixtures/bootstrap-catalog.json' with { type: 'json' }
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -56,16 +53,10 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function verifyCatalogSignature(deviceId: string, domain: string, payload: Uint8Array, signature: string) {
-  const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(deviceId, 'hex')]), format: 'der', type: 'spki' })
-  const digest = createHash('sha256').update(payload).digest('hex')
-  assert.ok(verify(null, Buffer.from(`vibeface:message:v1:${domain}:${digest}`), key, Buffer.from(signature, 'hex')), 'invalid catalogue signature')
-}
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now } = {}) {
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
-  if (!stored.has('vibeface.bootstrap-public-mode')) stored.set('vibeface.bootstrap-public-mode', 'off')
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
@@ -84,7 +75,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   // As the Node sends it.
   const sessionEntry = { address: 'https://node.example', device_id: target, local: true }
   const localState: { enabled: boolean; setup?: unknown } = { enabled: true }
-  const pageOrigin = local ? localEntry.address : entry.address
+  const pageOrigin = origin || (local ? localEntry.address : entry.address)
   const hash = invitation ? `#${invitation}` : fragment, pathname = invitation ? '/join' : '/'
   const location = { hash, pathname, href: `${pageOrigin}${pathname}${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
   const hashListeners = new Set<() => void>()
@@ -173,7 +164,6 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
     history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, btoa, atob, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
-      if (path.endsWith('/catalog')) { calls.push(`catalog:${path}`); return { ok: false, status: 503 } }
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
         ? { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, device_id: subject, network_id: network, entry: sessionEntry }) }
@@ -195,7 +185,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
   function load(filename: string): Record<string, unknown> {
-    if (extname(filename) === '.json') return { default: JSON.parse(readFileSync(filename, 'utf8')) }
+    if (extname(filename) === '.json') return { __esModule: true, default: JSON.parse(readFileSync(filename, 'utf8')) }
     const cached = modules.get(filename)
     if (cached) return cached.exports
     const module = { exports: {} }; modules.set(filename, module)
@@ -212,7 +202,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     return module.exports
   }
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
-  const platform = { secure: { verify: verifyCatalogSignature }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
   const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
   let restarts = 0
@@ -606,6 +596,39 @@ test('a join asks this page\'s Gateway to forward to the entry Node by its devic
     await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.deepEqual(plain(app.sockets.map(socket => socket.entry)), [{ kind: 'gateway', address: entry.address, device_id: target }])
     assert.ok(app.requests.some(request => request.method === 'join'))
+  } finally { app.close() }
+})
+
+test('the desktop app, whose page is its own bundle, joins through the public node', async () => {
+  const publicNode = JSON.parse(readFileSync(new URL('../../../../../config/public-bootstrap.json', import.meta.url), 'utf8')).gateway_url
+  const app = deviceHarness({ origin: 'vibeface-app://app' })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().defaultGateway, publicNode)
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    assert.deepEqual(plain(app.sockets.map(socket => socket.entry)), [{ kind: 'gateway', address: publicNode, device_id: target }])
+  } finally { app.close() }
+})
+
+test('the official page joins through the public node, or the access address this browser keeps instead', async () => {
+  const publicNode = JSON.parse(readFileSync(new URL('../../../../../config/public-bootstrap.json', import.meta.url), 'utf8')).gateway_url
+  const storage = new Map<string, string>()
+  const app = deviceHarness({ origin: 'https://app.vibeface.dev', storage })
+  try {
+    app.render(); await settle()
+    assert.equal(publicNode, 'https://node.vibeface.dev:4792')
+    assert.equal(app.render().gateway, publicNode)
+    assert.equal(app.render().defaultGateway, publicNode)
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    app.render().cancelJoin()
+    app.render().setGateway('https://mine.example')
+    assert.equal(app.render().gateway, 'https://mine.example')
+    assert.equal(storage.get('vibeface.gateway'), '"https://mine.example"')
+    await app.render().join('vibeface://join/vibeface1other', 'browser')
+    assert.deepEqual(plain(app.sockets.map(socket => 'address' in socket.entry ? socket.entry.address : '')).filter((address: string, i: number, all: string[]) => all.indexOf(address) === i), [publicNode, 'https://mine.example'])
+    app.render().setGateway(null)
+    assert.equal(app.render().gateway, publicNode)
+    assert.equal(storage.get('vibeface.gateway'), 'null')
   } finally { app.close() }
 })
 
@@ -1220,51 +1243,6 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.equal(app.verifications(), 2)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
-  } finally { app.close() }
-})
-
-for (const change of ['off', 'custom', 'unchanged']) test(`an existing channel reconnects with ${change} public bootstrap settings`, async () => {
-  const source = { kind: 'custom', issuer: bootstrapFixture.issuer, https_base: 'https://catalog-a.fixture.test' } satisfies PublicBootstrapMode
-  const cache = JSON.stringify({ v: 2, source_key: `${source.issuer}:${source.https_base}`, issuer: source.issuer, https_base: source.https_base, fetched_at_ms: bootstrapFixture.now_ms, ...bootstrapFixture.catalog })
-  const storage = new Map([
-    ['vibeface.stay-disconnected', 'true'],
-    [`vibeface.network-for.${target}`, JSON.stringify(network)],
-    ['vibeface.bootstrap-catalog-cache-v1', cache],
-  ])
-  setPublicBootstrapMode({ getItem: key => storage.get(key) ?? null, setItem: (key, value) => { storage.set(key, value) } }, source)
-  const app = deviceHarness({ saved: true, storage, now: () => bootstrapFixture.now_ms })
-  const entrance = { ...entry, address: 'https://entrance.fixture.test' }
-  const fallback = { ...entry, address: 'https://gateway.fixture.test' }
-  try {
-    app.render(); await settle(); await app.render().connect(entry)
-    assert.equal(app.render().ready?.isCurrent(), true)
-    assert.deepEqual(plain(app.sockets[0].entry), entry)
-    const selected: PublicBootstrapMode = change === 'off' ? { kind: 'off' } : change === 'custom' ? { ...source, https_base: 'https://catalog-b.fixture.test' } : source
-    app.render().setPublicBootstrapMode(selected); app.render(); await settle()
-    assert.deepEqual(plain(app.render().publicBootstrap), selected)
-    assert.equal(app.stored.get('vibeface.bootstrap-catalog-cache-v1'), cache)
-    app.stored.set(`vibeface.entrances.${network}`, JSON.stringify([{ device_id: target, seq: 1, gateway_url: entrance.address, public: true, direct: [], last_ok_ms: 0 }]))
-    const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('address unavailable'))
-    app.holds.set(`open:${entry.address}`, unavailable); app.holds.set(`open:${entrance.address}`, unavailable)
-    app.sockets[0].drop()
-    assert.equal(app.timers.size, 1)
-    const [id, retry] = [...app.timers.entries()][0]
-    app.timers.delete(id); retry(); await settle()
-    assert.deepEqual(app.sockets.slice(1).map(socket => plain(socket.entry)), change === 'unchanged' ? [entry, entrance, fallback] : [entry, entrance])
-    if (change === 'unchanged') {
-      assert.deepEqual(plain(app.render().ready?.entry), fallback)
-      assert.equal(app.render().ready?.isCurrent(), true)
-      assert.equal(app.timers.size, 0)
-    } else {
-      assert.equal(app.render().phase, 'reconnecting')
-      assert.equal(app.render().ready?.isCurrent(), false)
-      app.holds.delete(`open:${entrance.address}`)
-      const [next, again] = [...app.timers.entries()][0]
-      app.timers.delete(next); again(); await settle()
-      assert.deepEqual(plain(app.render().ready?.entry), entrance)
-      assert.equal(app.render().ready?.isCurrent(), true, 'saved entrances remain usable with public bootstrap disabled or changed')
-      assert.equal(app.timers.size, 0)
-    }
   } finally { app.close() }
 })
 

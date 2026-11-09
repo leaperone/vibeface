@@ -24,7 +24,7 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web instal
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
-示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和公共入口 Node，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
+示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。
 
@@ -32,7 +32,7 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 
 `workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
-公共发现使用同一文件导出的 `bootstrapTest` 和 `httpBootstrapTest`。每项测试运行独立 Discovery、公共入口和新节点，不配置运营者口令。网页自身的连接接口返回 503，浏览器必须验证目录签名并使用目录里的另一处入口，完成真实安全码配对后读取助手列表。HTTP 专项还会把节点的 UDP 发现地址设为不可达，确认节点通过 HTTPS 获取接入许可。普通夹具关闭公共发现，并阻止请求默认公共服务。
+公共引导使用同一文件导出的 `bootstrapTest`。测试页面由一台公共节点提供，它运行发现服务、开放 relay 和面向任何设备的浏览器转发；成员 Node 只配置这台公共节点的发现服务，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取助手列表，刷新后仍能连上。普通夹具的 Node 关闭公共引导，本机页面不连接官方服务。
 
 ```sh
 pnpm exec e2e run --config tests/e2e/e2e.config.ts bootstrap.e2e.ts
@@ -63,7 +63,7 @@ python3 scripts/verify-node.py --delivery-charity \
   --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe
 ```
 
-该模式运行四个全新 Node，验证免费签名目录、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品发现代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共入口 Node，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
+该模式运行四个全新 Node，验证免费签名目录、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品发现代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共节点，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
 
 构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌发现代码的 SHA-256，拒绝使用其他源码的旧 probe。
 

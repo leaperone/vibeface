@@ -7,6 +7,7 @@ use std::{
     fs,
     io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -143,6 +144,11 @@ struct Init {
     /// Public browser entry URL.
     #[arg(long)]
     public_url: Option<String>,
+    /// Serve --listen over TLS only, from tls-cert.pem and tls-key.pem in the data directory,
+    /// first a self-signed pair for --public-url's host; replaced files are served without a
+    /// restart.
+    #[arg(long, requires = "public_url")]
+    tls: bool,
     /// Disable the browser interface.
     #[arg(long)]
     no_web: bool,
@@ -176,75 +182,59 @@ struct Init {
     /// Relay URL. Repeat for multiple relays.
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
+    /// File with the token a listed --relay asks of this Node. Repeat for each such relay.
+    #[arg(long = "relay-token", value_name = "URL=FILE", value_parser = relay_token)]
+    relay_tokens: Vec<(String, PathBuf)>,
     /// Discovery URL. Repeat for multiple entries.
     #[arg(long = "discovery", value_name = "URL")]
     discovery: Vec<String>,
-    /// Relay service role.
-    #[arg(long, value_enum, default_value = "forward")]
-    relay_mode: RelayServiceMode,
+    /// Answer other devices' discovery registrations and lookups on this Node's UDP port.
+    #[arg(long)]
+    serve_discovery: bool,
     /// Address for an embedded relay.
     #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
     /// Public URL for the embedded relay.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
-    /// Run a public entry without local workspace execution.
-    #[arg(long, requires = "relay_listen", conflicts_with_all = ["manager", "roots", "entry"])]
-    public_entry: bool,
-    /// Public entry URL for this Node.
-    #[arg(long, value_name = "URL", requires = "relay_token_file")]
-    entry: Option<String>,
-    /// Relay URL for the public entry.
-    #[arg(long, value_name = "URL", requires = "entry")]
-    entry_relay: Option<String>,
-    /// File containing the relay credential.
-    #[arg(long, value_name = "PATH", requires = "entry")]
-    relay_token_file: Option<PathBuf>,
-    /// Public bootstrap: `public` (default for a fresh Node), `off`, or a self-hosted
-    /// `vibeface://` discovery URL.
+    /// File with a token that admits devices outside this personal network to the embedded
+    /// relay; without it or --relay-open, only this network and its invitees.
+    #[arg(long, value_name = "FILE", requires = "relay_listen")]
+    relay_operator_token: Option<PathBuf>,
+    /// Admit any device to the embedded relay; needs --relay-rate and --relay-max-clients.
+    #[arg(long, requires = "relay_listen")]
+    relay_open: bool,
+    /// Bytes a second the embedded relay reads from each connection.
+    #[arg(long, value_name = "BYTES", requires = "relay_listen")]
+    relay_rate: Option<NonZeroU32>,
+    /// Connections from outside this network the embedded relay holds at once.
+    #[arg(long, value_name = "N", requires = "relay_listen")]
+    relay_max_clients: Option<NonZeroUsize>,
+    /// Connections the embedded relay takes from one client address.
+    #[arg(long, value_name = "N", requires = "relay_listen")]
+    relay_max_clients_per_ip: Option<NonZeroUsize>,
+    /// Forward browser sessions to any device, not only this network's Nodes.
+    #[arg(long)]
+    forward_any: bool,
+    /// Browser sessions forwarded at once (default 256).
+    #[arg(long, value_name = "N")]
+    forward_sessions: Option<usize>,
+    /// Browser sessions waiting for a forwarding slot (default 0).
+    #[arg(long, value_name = "N")]
+    forward_queue: Option<usize>,
+    /// Bytes a second each forwarded browser session carries.
+    #[arg(long, value_name = "BYTES")]
+    forward_rate: Option<NonZeroU32>,
+    /// Browser connections one client address holds at once, whatever their target.
+    #[arg(long, value_name = "N")]
+    forward_per_ip: Option<NonZeroUsize>,
+    /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
+    #[arg(long = "trusted-proxy", value_name = "IP")]
+    trusted_proxies: Vec<IpAddr>,
+    /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
+    /// a self-hosted `vibeface://` discovery URL.
     #[arg(long, value_name = "MODE|URL")]
     bootstrap: Option<String>,
-    /// HTTPS bootstrap base of a self-hosted discovery service.
-    #[arg(long, value_name = "URL", requires = "bootstrap")]
-    bootstrap_https: Option<String>,
-    /// Gateway URL a discovery-only entry lists; pair each with --catalog-relay.
-    #[arg(
-        long = "catalog-gateway",
-        value_name = "URL",
-        requires = "public_entry"
-    )]
-    catalog_gateways: Vec<String>,
-    /// Relay URL paired with the --catalog-gateway given in the same position.
-    #[arg(
-        long = "catalog-relay",
-        value_name = "URL",
-        requires = "catalog_gateways"
-    )]
-    catalog_relays: Vec<String>,
-    /// Lifetime of the relay grants a discovery entry issues.
-    #[arg(long, value_name = "MINUTES", requires = "catalog_gateways")]
-    grant_ttl_minutes: Option<i64>,
-    /// How a public entry's relay admits Nodes.
-    #[arg(long, value_enum, requires = "public_entry")]
-    relay_admission: Option<RelayAdmission>,
-    /// Device ID of the discovery entry whose grants the relay admits.
-    #[arg(long, value_name = "DEVICE-ID", requires = "relay_admission")]
-    grant_issuer: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum RelayServiceMode {
-    #[default]
-    Forward,
-    DiscoveryOnly,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum RelayAdmission {
-    OperatorToken,
-    Grants,
 }
 
 #[derive(Args)]
@@ -653,19 +643,15 @@ async fn main() -> Result<()> {
             if let Some(open) = result["open"].as_str() {
                 println!("打开 {open}");
             }
-            if result["discovery_only"] == true {
-                if let Some(device_id) = result["device_id"].as_str() {
-                    println!("Discovery device ID: {device_id}");
-                }
-            } else if result["public_entry"] == true
-                && let Some(path) = result["relay_token_file"].as_str()
+            if options.serve_discovery
+                && let Some(device_id) = result["device_id"].as_str()
             {
-                println!("Relay token: {path} (copy it to your Node and pass --relay-token-file)");
+                println!("Discovery device ID: {device_id}");
             }
             match result["bootstrap"].as_str() {
                 Some("public") => println!("公共接入: 启用（--bootstrap off 可关闭）"),
                 Some("custom") => println!("公共接入: 自建 Discovery"),
-                Some("off") if result["public_entry"] != true => println!("公共接入: 关闭"),
+                Some("off") if !options.serve_discovery => println!("公共接入: 关闭"),
                 _ => {}
             }
             Ok(())
@@ -798,10 +784,8 @@ async fn status(options: Access) -> Result<()> {
         if let Some(write_state) = result["write_state"].as_str() {
             println!("Writes: {write_state}");
         }
-        if let Ok(bootstrap) =
-            serde_json::from_value::<terminal::BootstrapStatus>(result["bootstrap"].clone())
-        {
-            println!("Bootstrap: {}", bootstrap.summary());
+        if let Some(bootstrap) = result["bootstrap"].as_str() {
+            println!("Bootstrap: {bootstrap}");
         }
         if let Some(peers) = result["peers"].as_array() {
             let now = now_ms();
@@ -869,9 +853,7 @@ async fn access(options: LocalEntry) -> Result<()> {
             "url": result["url"],
             "device_id": result["device_id"],
         });
-        if result["public_entry"] == true {
-            output["public_entry"] = Value::Bool(true);
-        } else if result["local"] == true {
+        if result["local"] == true {
             output["local"] = Value::Bool(true);
         } else {
             if let Some(capability) = result["capability"].as_str() {
@@ -2137,6 +2119,11 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
         );
     }
     privatefs::write_atomic(path, bytes)
+}
+
+fn relay_token(value: &str) -> Result<(String, PathBuf), String> {
+    let (url, path) = value.split_once('=').ok_or("use URL=FILE")?;
+    Ok((url.into(), path.into()))
 }
 
 fn provider_bin(value: &str) -> Result<(triage::Provider, PathBuf), String> {

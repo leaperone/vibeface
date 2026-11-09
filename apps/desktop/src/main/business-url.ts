@@ -57,20 +57,14 @@ function checkLocalFragment(fragment: string, deviceId: string): void {
 }
 
 /**
- * Resolve the URL the business window may load. A public-entry node is opened as published;
- * a local node is pinned to its own private origin and must match the inspected device.
+ * Resolve the URL the business window may load: the node's page, pinned to its own private
+ * origin, which must match the inspected device.
  */
 export function businessUrl(access: Access, inspect: Inspect): string {
   if (access.deviceId !== inspect.deviceId) {
     throw new Error('core access and inspect report different nodes')
   }
   const url = new URL(access.url)
-  if (access.kind === 'public_entry') {
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback(url.hostname))) {
-      throw new Error('a public entry must publish an HTTPS origin')
-    }
-    return url.toString()
-  }
   if (url.protocol !== 'http:' || !loopback(url.hostname)) {
     throw new Error('core access did not return a loopback URL')
   }

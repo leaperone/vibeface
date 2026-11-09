@@ -44,7 +44,7 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在四个目标的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在四个目标的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共节点的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |

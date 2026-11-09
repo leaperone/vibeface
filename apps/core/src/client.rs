@@ -23,10 +23,14 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
+    num::NonZeroU32,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::mpsc, time::Instant};
@@ -44,8 +48,10 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
 /// Under the browser's 10-second connect timeout, so the refusal reaches it first.
 const FORWARD_DIAL_TIMEOUT: Duration = Duration::from_secs(7);
-/// Anyone can open `/api/client`, so a Gateway relays a bounded number of sessions at once.
-static FORWARDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+/// How often a waiting browser hears its place in line; each notice restarts its connect timeout.
+const QUEUE_NOTICE: Duration = Duration::from_secs(2);
+/// What a waiting browser may send before its turn: its first handshake message.
+const QUEUED_FRAMES: usize = 4;
 /// Sessions from devices that are not members yet (joining, recovering) share a few slots and
 /// close after `GUEST_LIFETIME`, longer than an invite lives.
 static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
@@ -292,8 +298,44 @@ impl Client {
     }
 }
 
+/// Browser sessions this Gateway forwards to other devices. Anyone can open `/api/client`, so
+/// `forwarding.sessions` go at once and up to `forwarding.queue` wait, served in arrival order.
+pub(crate) struct Forwards {
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Tickets of the waiting sessions, oldest first: a ticket's index is its place in line.
+    waiting: std::sync::Mutex<VecDeque<u64>>,
+    tickets: AtomicU64,
+}
+
+impl Forwards {
+    pub(crate) fn new(forwarding: &crate::config::Forwarding) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(forwarding.sessions)),
+            waiting: Default::default(),
+            tickets: AtomicU64::new(0),
+        }
+    }
+
+    fn position(&self, ticket: u64) -> usize {
+        let waiting = self.waiting.lock().expect("forwarding queue");
+        waiting
+            .iter()
+            .position(|held| *held == ticket)
+            .map_or(0, |index| index + 1)
+    }
+}
+
+/// A waiting session's place in line, given up however its wait ends.
+struct InLine<'a>(&'a Forwards, u64);
+impl Drop for InLine<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.waiting.lock().expect("forwarding queue");
+        waiting.retain(|held| *held != self.1);
+    }
+}
+
 /// `/api/client`: read the connect frame, then end Noise here when the target is this Node,
-/// or relay the ciphertext to the target member Node over `vibeface/client/1`.
+/// or relay the ciphertext to the target over `vibeface/client/1`.
 pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Result<()> {
     let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
         .await
@@ -304,53 +346,94 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     };
     let Connect::Connect { target } =
         serde_json::from_str(&text).context("invalid connect frame")?;
-    if target == node.identity.device_id()? && !node.config.public_entry {
+    if target == node.identity.device_id()? {
         return serve_session(node, socket, None).await;
     }
-    let Ok(_slot) = FORWARDS.try_acquire() else {
-        let refusal = json!({"type":"error","code":"gateway_busy","error":"this Gateway relays too many sessions"});
-        let _ = socket.send(Message::Text(refusal.to_string().into())).await;
-        bail!("gateway forwarding budget exhausted");
-    };
-    let forwarded = match open_forward(&node, &target).await {
-        Ok(forwarded) => forwarded,
-        Err((code, error)) => {
-            let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
-            let _ = socket.send(Message::Text(refusal.to_string().into())).await;
-            return Err(error.context("client target refused"));
-        }
-    };
-    relay_frames(socket, forwarded).await
-}
-
-/// A public entry holds no address book. Its own relay is one place the target may be; dialing
-/// also asks Discovery for the target's relays and address.
-pub(crate) async fn reach_through_entry(node: &Runtime, target: &str) -> Result<()> {
-    let relay = node
-        .config
-        .network
-        .own_relay()?
-        .context("a public entry runs a relay")?;
-    let addr = EndpointAddr::from_parts(net::endpoint_id(target)?, [TransportAddr::Relay(relay)]);
-    node.net()?.learn(&addr).await;
-    Ok(())
-}
-
-async fn open_forward(
-    node: &Runtime,
-    target: &str,
-) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
-    if node.config.public_entry {
-        reach_through_entry(node, target)
-            .await
-            .map_err(|error| ("target_unreachable", error))?;
-    } else {
+    // A public node forwards to any device it can reach; other Nodes only to their own
+    // network's Nodes, checked before the session would wait in line.
+    if !node.config.forwarding.any {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
-            node.store.lock().await.authorize_node(&network, target)
+            node.store.lock().await.authorize_node(&network, &target)
         };
-        member.await.map_err(|error| ("target_not_member", error))?;
+        if let Err(error) = member.await {
+            return refuse(&mut socket, "target_not_member", error).await;
+        }
     }
+    let (_slot, early) = forward_slot(&node, &mut socket).await?;
+    let mut forwarded = match open_forward(&node, &target).await {
+        Ok(forwarded) => forwarded,
+        Err(error) => return refuse(&mut socket, "target_unreachable", error).await,
+    };
+    for frame in early {
+        forwarded.send(frame).await?;
+    }
+    relay_frames(socket, forwarded, node.config.forwarding.rate).await
+}
+
+/// Tells the browser why the Gateway ends its session.
+async fn refuse<T>(socket: &mut ClientSocket, code: &str, error: anyhow::Error) -> Result<T> {
+    let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
+    let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+    Err(error.context("client target refused"))
+}
+
+/// A forwarding slot, after waiting in line while all are taken. A waiting browser hears
+/// `{"type":"queued","position":n}` every `QUEUE_NOTICE` and position 0 when its turn comes;
+/// what it sends meanwhile is kept for the target.
+async fn forward_slot(
+    node: &Runtime,
+    socket: &mut ClientSocket,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, Vec<Message>)> {
+    let forwards = &node.forwards;
+    if let Ok(slot) = forwards.slots.clone().try_acquire_owned() {
+        return Ok((slot, Vec::new()));
+    }
+    let ticket = forwards.tickets.fetch_add(1, Ordering::Relaxed);
+    let joined = {
+        let mut waiting = forwards.waiting.lock().expect("forwarding queue");
+        let room = waiting.len() < node.config.forwarding.queue;
+        if room {
+            waiting.push_back(ticket);
+        }
+        room
+    };
+    if !joined {
+        let error = anyhow!("this Gateway relays too many sessions");
+        return refuse(socket, "gateway_busy", error).await;
+    }
+    let _line = InLine(forwards, ticket);
+    let queued = |position: usize| {
+        Message::Text(
+            json!({"type":"queued","position":position})
+                .to_string()
+                .into(),
+        )
+    };
+    let slot = forwards.slots.clone().acquire_owned();
+    tokio::pin!(slot);
+    let mut notice = tokio::time::interval(QUEUE_NOTICE);
+    let mut early = Vec::new();
+    loop {
+        tokio::select! {
+            slot = &mut slot => {
+                let slot = slot?;
+                socket.send(queued(0)).await?;
+                return Ok((slot, early));
+            }
+            _ = notice.tick() => socket.send(queued(forwards.position(ticket))).await?,
+            frame = socket.next() => match frame {
+                Some(Ok(Message::Close(_))) | None => bail!("the client left the queue"),
+                Some(frame) => {
+                    early.push(frame?);
+                    ensure!(early.len() <= QUEUED_FRAMES, "the client sent too much while queued");
+                }
+            },
+        }
+    }
+}
+
+async fn open_forward(node: &Runtime, target: &str) -> Result<ClientSocket> {
     let opened = async {
         let connection = node.net()?.connect(target, net::CLIENT).await?;
         let (send, recv) = connection
@@ -361,11 +444,8 @@ async fn open_forward(
     };
     match tokio::time::timeout(FORWARD_DIAL_TIMEOUT, opened).await {
         Ok(Ok(forwarded)) => Ok(forwarded),
-        Ok(Err(error)) => Err(("target_unreachable", unreachable(error))),
-        Err(_) => Err((
-            "target_unreachable",
-            unreachable(anyhow!("peer did not answer in time")),
-        )),
+        Ok(Err(error)) => Err(unreachable(error)),
+        Err(_) => Err(unreachable(anyhow!("peer did not answer in time"))),
     }
 }
 
@@ -373,19 +453,68 @@ fn unreachable(error: anyhow::Error) -> anyhow::Error {
     error.context("the target device is unreachable: no relay in common and no direct path")
 }
 
-/// Copies frames both ways without reading them; the Noise session ends at the target.
-async fn relay_frames(mut client: ClientSocket, mut target: ClientSocket) -> Result<()> {
+/// Copies frames both ways without reading them; the Noise session ends at the target. With a
+/// `rate`, the session's frames together move at most that many bytes a second.
+async fn relay_frames(
+    mut client: ClientSocket,
+    mut target: ClientSocket,
+    rate: Option<NonZeroU32>,
+) -> Result<()> {
+    let mut pace = rate.map(|rate| Pace::new(rate, Instant::now()));
     loop {
-        tokio::select! {
+        let (frame, to_target) = tokio::select! {
             frame = client.next() => match frame {
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
-                Some(frame) => target.send(frame?).await?,
+                Some(frame) => (frame?, true),
             },
             frame = target.next() => match frame {
                 None => return Ok(()),
-                Some(frame) => client.send(frame?).await?,
+                Some(frame) => (frame?, false),
             },
+        };
+        if let Some(pace) = &mut pace {
+            let bytes = match &frame {
+                Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+                Message::Text(text) => text.as_str().len(),
+                Message::Close(_) => 0,
+            };
+            let wait = pace.delay(bytes, Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
         }
+        if to_target {
+            target.send(frame).await?;
+        } else {
+            client.send(frame).await?;
+        }
+    }
+}
+
+/// A forwarded session's byte budget. It refills at the rate and holds at most a second's
+/// worth, so a session bursts briefly and then moves at the rate.
+struct Pace {
+    rate: f64,
+    credit: f64,
+    at: Instant,
+}
+
+impl Pace {
+    fn new(rate: NonZeroU32, now: Instant) -> Self {
+        let rate = f64::from(rate.get());
+        Self {
+            rate,
+            credit: rate,
+            at: now,
+        }
+    }
+
+    /// How long to hold the next `bytes` back.
+    fn delay(&mut self, bytes: usize, now: Instant) -> Duration {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * self.rate;
+        self.credit = (self.credit + refill).min(self.rate) - bytes as f64;
+        self.at = now;
+        Duration::from_secs_f64((-self.credit / self.rate).max(0.0))
     }
 }
 
@@ -626,8 +755,7 @@ async fn dispatch(
             let device_id = node.identity.device_id()?;
             let initialized = node.has_membership().await?;
             let mut info = json!({"initialized":initialized,"network_id":null,"device_id":device_id,
-                "name":crate::config::UNNAMED_NODE,"public_entry":node.config.public_entry,
-                "version":env!("CARGO_PKG_VERSION")});
+                "name":crate::config::UNNAMED_NODE,"version":env!("CARGO_PKG_VERSION")});
             if initialized && principal(node, session).await.is_ok() {
                 let state = node.membership_state().await?;
                 if let Some(member) = state
@@ -855,9 +983,7 @@ async fn dispatch(
                 .lock()
                 .await
                 .register_invite(&record, &session.device_id)?;
-            Ok(
-                json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"gateway_url":node.gateway_url()}),
-            )
+            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?}))
         }
         "entrances" => {
             let principal = principal(node, session).await?;
@@ -1545,15 +1671,22 @@ impl JoinLink {
                 .map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
-        // Without Discovery the entry Node may run any configured relay. With it, only the
-        // relays the entry registered get the invite token, so the others never see it.
+        // A relay configured with a token keeps it. Without Discovery the entry Node may run
+        // any other configured relay; with it, only the relays the entry registered get the
+        // invite token, so the others never see it.
         let discovery = !config.discovery.is_empty();
         let mut relays = node
             .config
             .network
             .relays
             .iter()
-            .map(|url| Ok((net::relay_url(url)?, (!discovery).then(|| token.clone()))))
+            .map(|relay| {
+                let credential = relay
+                    .token
+                    .clone()
+                    .or_else(|| (!discovery).then(|| token.clone()));
+                Ok((net::relay_url(&relay.url)?, credential))
+            })
             .collect::<Result<Vec<_>>>()?;
         let n0 = if node.config.network.n0_relays {
             iroh::defaults::prod::default_relay_map().urls::<Vec<_>>()
@@ -1561,16 +1694,6 @@ impl JoinLink {
             Vec::new()
         };
         relays.extend(n0.iter().map(|url| (url.clone(), None)));
-        if let (Some(entry), Some(token)) = (&node.config.network.entry, &node.entry_token) {
-            let url = net::relay_url(&entry.relay)?;
-            relays.retain(|(known, _)| *known != url);
-            relays.push((url, Some(token.clone())));
-        }
-        // The public relay admits this device by its Discovery grant, not by an invite token.
-        if let Some((url, grant)) = node.public_relay_credential().await {
-            relays.retain(|(known, _)| *known != url);
-            relays.push((url, Some(grant)));
-        }
         ensure!(
             !relays.is_empty() || discovery,
             "no relay or discovery server is configured to find the invite's entry Node"
@@ -2035,6 +2158,9 @@ async fn next_binary(socket: &mut ClientSocket) -> Result<Vec<u8>> {
                 ensure!(bytes.len() <= 65_535, "client frame too large");
                 return Ok(bytes.to_vec());
             }
+            // A Gateway tells a client waiting for a forwarding slot its place in line.
+            Message::Text(text)
+                if serde_json::from_str::<Value>(&text).is_ok_and(|v| v["type"] == "queued") => {}
             Message::Text(text) => bail!("Gateway refused the connection: {text}"),
             Message::Ping(_) | Message::Pong(_) => {}
             _ => bail!("client channel accepts only encrypted binary frames"),
@@ -2289,7 +2415,7 @@ mod tests {
             }
         }
 
-        async fn node(dir: &Path, network: NetworkConfig, token: &str) -> Result<Arc<Runtime>> {
+        async fn node(dir: &Path, network: NetworkConfig) -> Result<Arc<Runtime>> {
             config::private_dir(dir)?;
             let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
             configuration.network = network;
@@ -2300,7 +2426,6 @@ mod tests {
                 &dir.join("identity.json"),
                 &serde_json::to_vec(&LocalIdentity::generate())?,
             )?;
-            config::private_write(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
             Ok(Arc::new(Runtime::open(dir).await?))
         }
 
@@ -2354,17 +2479,13 @@ mod tests {
             .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let access = Arc::new(PrivateRelay::default());
-        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone()).await?;
-        let relay_url = format!(
-            "http://{}",
-            relay.http_addr().context("relay listener missing")?
-        );
+        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None, None).await?;
+        let relay_url = format!("http://{}", relay.addr);
         let service = Arc::new(
             Net::bind(
                 &LocalIdentity::generate().secret_key_hex,
                 &NetworkConfig {
-                    relay_mode: net::RelayServiceMode::DiscoveryOnly,
-                    relay_listen: Some("0.0.0.0:0".parse()?),
+                    serve_discovery: true,
                     ..Default::default()
                 },
                 0,
@@ -2387,24 +2508,23 @@ mod tests {
                 service.endpoint.id()
             ))
         };
-        let network = |bind| NetworkConfig {
+        let listed = |url: &str, token: Option<&str>| net::Relay {
+            url: url.into(),
+            token: token.map(Into::into),
+        };
+        let network = |bind, token| NetworkConfig {
             bind: Some(bind),
-            entry: Some(net::PublicEntry {
-                url: relay_url.clone(),
-                relay: relay_url.clone(),
-            }),
+            relays: vec![listed(&relay_url, Some(token))],
             ..Default::default()
         };
         let target = node(
             &dir.join("target"),
-            network("[::1]:0".parse()?),
-            OPERATOR_TOKEN,
+            network("[::1]:0".parse()?, OPERATOR_TOKEN),
         )
         .await?;
         let joining = node(
             &dir.join("joining"),
-            network("127.0.0.1:0".parse()?),
-            OPERATOR_TOKEN,
+            network("127.0.0.1:0".parse()?, OPERATOR_TOKEN),
         )
         .await?;
         let target_id = target.identity.device_id()?;
@@ -2438,7 +2558,7 @@ mod tests {
                     ..target.config.network.clone()
                 },
                 0,
-                vec![(net::relay_url(&relay_url)?, Some(OPERATOR_TOKEN.into()))],
+                vec![],
             )
             .await?,
         );
@@ -2480,52 +2600,47 @@ mod tests {
             .await
             .context("Discovery did not learn the target's home relay")??;
             watcher.close().await;
-            for (name, discovered, entry_relay, token, expected_token) in [
+            for (name, discovered, relays, expected_token) in [
                 (
                     "discovered-relay",
                     true,
-                    Some(stale_relay),
-                    WRONG_TOKEN,
+                    vec![
+                        listed(stale_relay, Some(WRONG_TOKEN)),
+                        listed(&relay_url, None),
+                    ],
                     Some(invite_token.as_str()),
                 ),
                 (
-                    "entry-over-discovered",
+                    "configured-token-over-discovered",
                     true,
-                    Some(relay_url.as_str()),
-                    OPERATOR_TOKEN,
+                    vec![listed(&relay_url, Some(OPERATOR_TOKEN))],
                     Some(OPERATOR_TOKEN),
                 ),
                 (
                     "configured-relay",
                     false,
-                    None,
-                    OPERATOR_TOKEN,
+                    vec![listed(&relay_url, None)],
                     Some(invite_token.as_str()),
                 ),
             ] {
                 let configuration = NetworkConfig {
                     bind: Some("127.0.0.1:0".parse()?),
-                    relays: vec![relay_url.clone()],
+                    relays,
                     discovery: if discovered {
                         vec![discovery(true)?]
                     } else {
                         vec![]
                     },
-                    entry: entry_relay.map(|relay| net::PublicEntry {
-                        url: relay.into(),
-                        relay: relay.into(),
-                    }),
                     ..Default::default()
                 };
-                let joining = node(&dir.join(name), configuration, token).await?;
+                let joining = node(&dir.join(name), configuration).await?;
                 check(&joining, &ticket, &access, expected_token)
                     .await
                     .with_context(|| format!("relay case {name}"))?;
             }
             let denied = node(
                 &dir.join("wrong-operator-token"),
-                network("127.0.0.1:0".parse()?),
-                WRONG_TOKEN,
+                network("127.0.0.1:0".parse()?, WRONG_TOKEN),
             )
             .await?;
             let link = JoinLink::open(&denied, &ticket).await?;
@@ -2552,7 +2667,7 @@ mod tests {
         router.shutdown().await?;
         target_net.close().await;
         service_router.shutdown().await?;
-        relay.shutdown().await?;
+        relay.shutdown().await;
         drop((target, joining));
         std::fs::remove_dir_all(dir)?;
         result
@@ -2910,7 +3025,10 @@ mod tests {
         config::private_dir(&project)?;
         assert!(!workspace.exists());
         let mut latest = Config::load(&dir)?;
-        latest.network.relays.push("https://relay.example/".into());
+        latest.network.relays.push(net::Relay {
+            url: "https://relay.example/".into(),
+            token: None,
+        });
         latest.daily_decision_limit = 11;
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
@@ -3604,7 +3722,10 @@ mod tests {
         let mut configuration =
             crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false);
         // A relay nobody answers on keeps the join waiting.
-        configuration.network.relays = vec!["http://127.0.0.1:9".into()];
+        configuration.network.relays = vec![net::Relay {
+            url: "http://127.0.0.1:9".into(),
+            token: None,
+        }];
         configuration.save(&dir)?;
         crate::config::private_write(
             &dir.join("data-epoch.json"),
@@ -4432,9 +4553,24 @@ mod tests {
             let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
+            // A target outside the network is refused before it would wait for a slot.
+            let full = node.forwards.slots.clone().try_acquire_many_owned(u32::try_from(node.config.forwarding.sessions)?)?;
+            let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
+            let mut socket = ClientSocket::Client(Box::new(socket));
+            socket.send(Message::Text(json!({"type":"connect","target":LocalIdentity::generate().device_id()?}).to_string().into())).await?;
+            let Some(Ok(Message::Text(refusal))) = socket.next().await else { bail!("the Gateway closed without a refusal") };
+            assert_eq!(serde_json::from_str::<Value>(&refusal)?["code"], "target_not_member");
+            drop(full);
             let http = reqwest::Client::builder().no_proxy().build()?;
             let other = http.post(format!("{origin}/api/local/setup")).header("origin", "https://app.example").json(&json!({})).send().await?;
             assert_eq!(other.status(), 403);
+            // A page of an allowed origin served elsewhere reads which device answers here; any other page cannot.
+            let info = http.get(format!("{origin}/api/info")).header("origin", "https://app.example").send().await?;
+            assert_eq!(info.headers().get("access-control-allow-origin").map(|v| v.as_bytes()), Some(&b"https://app.example"[..]));
+            assert_eq!(info.json::<Value>().await?["device_id"], node_id);
+            assert_eq!(http.get(format!("{origin}/api/info")).header("origin", "https://evil.example").send().await?.status(), 403);
+            let own = http.get(format!("{origin}/api/info")).send().await?;
+            assert!(own.status().is_success() && own.headers().get("access-control-allow-origin").is_none());
             Ok(())
         }
         .await;
@@ -4444,6 +4580,133 @@ mod tests {
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_gateway_queues_browsers_in_order_and_refuses_past_its_queue() -> Result<()> {
+        async fn text(socket: &mut ClientSocket) -> Result<Value> {
+            match tokio::time::timeout(Duration::from_secs(5), socket.next()).await? {
+                Some(Ok(Message::Text(text))) => Ok(serde_json::from_str(&text)?),
+                other => bail!("expected a text frame, got {other:?}"),
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("vibeface-queue-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let public = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut config = crate::config::Config::local(public.local_addr()?, vec![], false);
+        config.local_listen = local.local_addr()?;
+        config.forwarding.sessions = 1;
+        config.forwarding.queue = 1;
+        config.forwarding.any = true;
+        config.forwarding.per_ip = std::num::NonZeroUsize::new(1);
+        config.forwarding.trusted_proxies = vec!["127.0.0.1".parse()?];
+        drop((public, local));
+        config.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let origin = node.config.public_url.clone();
+        let server = tokio::spawn(crate::api::serve(node.clone(), None));
+        let result: Result<()> = async {
+            use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+            let origin = &origin;
+            // The trusted proxy on loopback names each browser's address.
+            let request = |address: &'static str| -> Result<_> {
+                let mut request = client_url(origin)?.into_client_request()?;
+                request.headers_mut().insert("x-real-ip", address.parse()?);
+                Ok(request)
+            };
+            let open = |address: &'static str| async move {
+                for _ in 0..100 {
+                    if let Ok((socket, _)) =
+                        tokio_tungstenite::connect_async(request(address)?).await
+                    {
+                        let mut socket = ClientSocket::Client(Box::new(socket));
+                        let target = LocalIdentity::generate().device_id()?;
+                        let connect = json!({"type":"connect","target":target});
+                        socket
+                            .send(Message::Text(connect.to_string().into()))
+                            .await?;
+                        return Ok(socket);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                bail!("the Gateway did not open")
+            };
+            let held = node.forwards.slots.clone().try_acquire_owned()?;
+            let mut first = open("203.0.113.1").await?;
+            assert_eq!(
+                text(&mut first).await?,
+                json!({"type":"queued","position":1})
+            );
+            // Refused before the upgrade, whatever its target, so it takes no shared socket.
+            match tokio_tungstenite::connect_async(request("203.0.113.1")?).await {
+                Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 429),
+                other => bail!("an address holds one connection: {:?}", other.map(|_| ())),
+            }
+            let mut second = open("203.0.113.2").await?;
+            assert_eq!(
+                text(&mut second).await?["code"],
+                "gateway_busy",
+                "the queue holds one"
+            );
+            drop(held);
+            let mut turn = text(&mut first).await?;
+            while turn == json!({"type":"queued","position":1}) {
+                turn = text(&mut first).await?;
+            }
+            assert_eq!(turn, json!({"type":"queued","position":0}));
+            assert_eq!(
+                text(&mut first).await?["code"],
+                "target_unreachable",
+                "the waiting session went on to its target"
+            );
+            assert!(
+                node.forwards
+                    .waiting
+                    .lock()
+                    .expect("forwarding queue")
+                    .is_empty()
+            );
+            drop(first);
+            open("203.0.113.1")
+                .await
+                .context("the ended connection kept its address's share")?;
+            Ok(())
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[test]
+    fn a_paced_session_moves_its_rate_after_a_one_second_burst() {
+        let start = Instant::now();
+        let mut pace = Pace::new(NonZeroU32::new(1000).unwrap(), start);
+        assert_eq!(pace.delay(1000, start), Duration::ZERO);
+        assert_eq!(pace.delay(500, start), Duration::from_millis(500));
+        assert_eq!(
+            pace.delay(0, start + Duration::from_millis(500)),
+            Duration::ZERO,
+            "waiting pays the debt"
+        );
+        assert_eq!(
+            pace.delay(2000, start + Duration::from_secs(10)),
+            Duration::from_secs(1),
+            "idle time saves at most a second's worth"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ import time
 import uuid
 
 
-CORE_ROLES = ('discovery', 'entry', 'relay')
+CORE_ROLES = ('node',)
 ROLES = (*CORE_ROLES, 'app', 'www')
 IMAGE = r'sha256:[0-9a-f]{64}'
 VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-nightly\.[0-9]{8}\.[1-9][0-9]*)?'
@@ -28,6 +28,10 @@ DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
 HEADER_NAMES = {'content-security-policy', 'x-content-type-options', 'x-frame-options',
                 'referrer-policy', 'cache-control', 'x-vibeface-source', 'x-vibeface-version'}
 STATIC_REGEX = r'\.(?:js|wasm|css|woff2?|svg|png|ico|json|webmanifest)$'
+# Mounted one by one over the Node's own copies, so a certificate client must rewrite them in place.
+TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
+UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/usr/local/lib/systemd/system',
+             '/usr/lib/systemd/system', '/lib/systemd/system')
 
 
 def require(condition, message):
@@ -45,26 +49,30 @@ def canonical_path(value):
 def validate_config(config):
     common = {'project', 'role', 'deploy_dir', 'listen'}
     require(isinstance(config, dict) and config.get('role') in ROLES, 'invalid service role')
-    required = common | ({'data_dir', 'device_id', 'uid', 'gid', 'legacy_service', 'maintenance_socket'}
-                         if config['role'] in CORE_ROLES else {'nginx_config', 'server_name'})
-    if config['role'] == 'relay':
-        required |= {'nginx_config', 'server_name'}
-    require(required <= config.keys() and config.keys() <= required | {'public_url'},
+    core = config['role'] in CORE_ROLES
+    required = common | ({'data_dir', 'tls_dir', 'device_id', 'uid', 'gid'} if core else {'nginx_config', 'server_name'})
+    # A Node that replaces a host service names it and its maintenance socket; a fresh install names neither.
+    legacy = {'legacy_service', 'maintenance_socket'} if core else set()
+    require(required <= config.keys() and config.keys() <= required | legacy | {'public_url'}
+            and (legacy <= config.keys() or not legacy & config.keys()),
             'unsupported or missing deployment configuration fields')
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', config['project']), 'invalid Compose project')
-    require(re.fullmatch(r'127\.0\.0\.1:[1-9][0-9]{0,4}', config['listen'])
-            and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit IPv4 loopback port')
-    for name in ('deploy_dir', 'data_dir', 'nginx_config', 'maintenance_socket'):
+    # Browsers and devices reach the official node directly; a static container only its own host's nginx.
+    host = '0.0.0.0' if config['role'] in CORE_ROLES else '127.0.0.1'
+    require(re.fullmatch(re.escape(host) + r':[1-9][0-9]{0,4}', config['listen'])
+            and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit port on ' + host)
+    for name in ('deploy_dir', 'data_dir', 'tls_dir', 'nginx_config', 'maintenance_socket'):
         if name in config:
             canonical_path(config[name])
     if config['role'] in CORE_ROLES:
         require(re.fullmatch(r'[0-9a-f]{64}', config['device_id'])
                 and all(type(config[n]) is int and 0 < config[n] <= 2**31 - 1 for n in ('uid', 'gid'))
-                and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service']),
+                and ('legacy_service' not in config
+                     or re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service'])),
                 'invalid existing service identity')
-        data, deploy = Path(config['data_dir']), Path(config['deploy_dir'])
-        require(data != deploy and data not in deploy.parents and deploy not in data.parents,
-                'deployment files and Node data must be separate')
+        paths = [Path(config[name]) for name in ('data_dir', 'deploy_dir', 'tls_dir')]
+        require(all(a != b and a not in b.parents for a in paths for b in paths if a is not b),
+                'deployment files, Node data and TLS files must be separate')
     if 'nginx_config' in config:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', config['server_name']), 'invalid nginx server name')
     if 'public_url' in config:
@@ -220,11 +228,29 @@ def compose_runtime(config, image, version, source, fingerprint):
         service.update(network_mode='host', user=f'{config["uid"]}:{config["gid"]}',
                        environment=core_environment(config, version, source),
                        volumes=[{'type': 'bind', 'source': config['data_dir'], 'target': '/data',
-                                 'bind': {'create_host_path': False}}])
+                                 'bind': {'create_host_path': False}},
+                                *({'type': 'bind', 'source': config['tls_dir'] + '/' + name, 'target': '/data/' + name,
+                                   'read_only': True, 'bind': {'create_host_path': False}} for name in TLS_FILES)],
+                       # Each relay or browser connection takes descriptors; containers often start
+                       # with a soft limit of 1024.
+                       ulimits={'nofile': {'soft': 65536, 'hard': 65536}})
     else:
         service.update(user='101:101', ports=[{'target': 8080, 'published': config['listen'].split(':')[1],
                                              'host_ip': '127.0.0.1', 'protocol': 'tcp'}])
     return {'services': {'service': service}}
+
+
+def tls_directory(config, owner=0):
+    """The root directory the host's certificate client writes, which the Node may read but not change."""
+    tls = checked_path(Path(config['tls_dir']))
+    metadata = tls.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == config['gid']
+            and stat.S_IMODE(metadata.st_mode) == 0o750, 'TLS directory must be root:gid with mode 0750')
+    for name, group, mode in (('tls-cert.pem', None, 0o644), ('tls-key.pem', config['gid'], 0o640)):
+        metadata = checked_path(tls / name).lstat()
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and stat.S_IMODE(metadata.st_mode) == mode
+                and group in (None, metadata.st_gid), 'TLS certificate must be root 0644 and its key root:gid 0640')
+    return tls
 
 
 def image_preflight(config, image, tag, source, version):
@@ -241,14 +267,17 @@ def image_preflight(config, image, tag, source, version):
         require(data.is_dir() and stat.S_IMODE(metadata.st_mode) == 0o700
                 and metadata.st_uid == config['uid'] and metadata.st_gid == config['gid'],
                 'existing data ownership or permissions differ')
-        for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock'):
+        for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
             checked_path(data / name)
             require((data / name).is_file(), 'initialized Node files are required')
         epoch = read_json(data / 'data-epoch.json')
         require(epoch == {'data_epoch': component['data_epoch']} and type(epoch['data_epoch']) is int,
                 'data epoch differs; migration is not allowed')
+        tls = tls_directory(config)
         options = ['--user', f'{config["uid"]}:{config["gid"]}', '--tmpfs', '/tmp:rw,nosuid,noexec,mode=1777',
                    '--mount', f'type=bind,src={data},dst=/data,readonly']
+        for name in TLS_FILES:
+            options.extend(('--mount', f'type=bind,src={tls / name},dst=/data/{name},readonly'))
         for key, value in core_environment(config, version, source).items():
             options.extend(('--env', key + '=' + value))
         docker('run', '--rm', '--network', 'none', '--read-only', *options, image, 'guard')
@@ -294,53 +323,42 @@ def transform_nginx(text, config):
                if any(n['words'][0] == 'server_name' and config['server_name'] in n['words'][1:] for n in server['children'])
                and any(n['words'][0] == 'listen' and 'ssl' in n['words'][1:] for n in server['children'])]
     require(len(targets) == 1, 'nginx config must contain one matching TLS server')
-    edits = []
-    catchall = 0
-    relay_routes = 0
+    def indent(start):
+        return text[text.rfind('\n', 0, start) + 1:start]
+    def location(selector, body, start):
+        return 'location ' + selector + ' {\n' + indent(start) + '    ' + body + '\n' + indent(start) + '}'
+    edits, catchall = [], []
     for node in targets[0]['children']:
         words = node['words']
         if words[0] != 'location':
             require(words[0] != 'include', 'target nginx server must not include unverified routes')
-            if words[0] in ('root', 'index') or config['role'] in ('app', 'www') and (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
+            if words[0] in ('root', 'index') or (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
                 edits.append((node['start'], node['end'], ''))
             continue
         selector = ' '.join(words[1:])
-        relay_routes += int(words[-1].strip('"\'') == '^/(relay|ping|generate_204)$')
         is_catchall = words == ['location', '/']
-        catchall += int(is_catchall)
-        if config['role'] == 'relay':
-            require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                    or len(words) == 3 and words[1] == '=' and words[2] in ('/api/info', '/api/client'),
-                    'Relay refuses frontend and non-browser API routes')
-            if not is_catchall:
-                continue
-            body = 'return 404;'
-        else:
-            is_static = is_catchall or (len(words) == 3 and words[1] in ('=', '^~') and words[2] in (
-                '/assets/', '/generated/', '/manifest.webmanifest', '/vibeface_secure_bg.wasm',
-                '/vibeface_secure.js', '/_shell.html', '/index.html', '/icon.svg', '/sw.js')) \
-                or len(words) == 3 and words[1] in ('~', '~*') and words[2] == STATIC_REGEX
-            directives = {n['words'][0] for n in node['children'] or []}
-            require('try_files' not in directives or is_static, 'unrecognized static nginx location')
-            if not is_static:
-                infra = (len(words) == 3 and words[1] == '=' and words[2] in
-                         ('/api/info', '/api/client', '/api/relay/grant', '/api/decision')) \
-                        or words == ['location', '^~', '/bootstrap/'] \
-                        or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                denied = bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children'])
-                require((infra and not directives & {'try_files', 'alias', 'root', 'index', 'include'}) or denied,
-                        'unrecognized static or gateway nginx location')
-                continue
+        if is_catchall:
+            catchall.append(node['start'])
+        is_static = is_catchall or (len(words) == 3 and words[1] in ('=', '^~') and words[2] in (
+            '/assets/', '/generated/', '/manifest.webmanifest', '/vibeface_secure_bg.wasm',
+            '/vibeface_secure.js', '/_shell.html', '/index.html', '/icon.svg', '/sw.js')) \
+            or len(words) == 3 and words[1] in ('~', '~*') and words[2] == STATIC_REGEX
+        directives = {n['words'][0] for n in node['children'] or []}
+        require('try_files' not in directives or is_static, 'unrecognized static nginx location')
+        if is_static:
             require(directives <= {'try_files', 'types', 'default_type', 'add_header', 'expires', 'access_log',
                                    'root', 'index', 'proxy_pass', 'proxy_set_header', 'proxy_http_version',
                                    'proxy_intercept_errors', 'proxy_cache'}, 'unsupported static nginx directives')
             body = ('proxy_pass http://' + config['listen'] + ';\n'
                     '        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n'
                     '        proxy_set_header Connection "";\n        proxy_intercept_errors off;\n        proxy_cache off;')
-        indent = text[text.rfind('\n', 0, node['start']) + 1:node['start']]
-        replacement = 'location ' + selector + ' {\n' + indent + '    ' + body + '\n' + indent + '}'
-        edits.append((node['start'], node['end'], replacement))
-    require(catchall == 1 and (config['role'] != 'relay' or relay_routes == 1), 'expected nginx routes are missing')
+        else:
+            # Browsers call the official node directly, so the page host answers no API or relay route.
+            require(bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children']),
+                    'unrecognized static nginx location; API and relay routes must only return 404')
+            continue
+        edits.append((node['start'], node['end'], location(selector, body, node['start'])))
+    require(len(catchall) == 1, 'expected nginx routes are missing')
     for start, end, replacement in sorted(edits, reverse=True):
         text = text[:start] + replacement + text[end:]
     nginx_nodes(text)
@@ -365,9 +383,11 @@ def lease(config, previous):
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
-    else:
+    elif 'legacy_service' in config:
         with legacy_channel(config, 'acquire') as health:
             yield health
+    else:
+        yield None
 
 
 @contextmanager
@@ -399,6 +419,23 @@ def legacy_channel(config, request):
         yield value['health']
     finally:
         stream.close()
+
+def units_using(path, roots=UNIT_DIRS):
+    """Unit files and drop-ins naming `path` or a path under it in any field, read as text for systemd 219."""
+    pattern = re.compile(re.escape(path) + r'(?![\w.-])')
+    found = set()
+    for root in roots:
+        for directory, _, names in os.walk(root):
+            for name in names:
+                unit = Path(directory) / name
+                try:
+                    if unit.is_file() and unit.stat().st_size <= 1024 * 1024 \
+                            and pattern.search(unit.read_text(errors='replace')):
+                        found.add(str(unit))
+                except OSError:
+                    continue
+    return sorted(found)
+
 
 @contextmanager
 def node_lock(config):
@@ -467,7 +504,7 @@ def rollback(journal, journal_path):
     previous = journal['previous']
     restored = restored_previous(previous)
     legacy_restored = False
-    if not previous and config['role'] in CORE_ROLES:
+    if not previous and 'legacy_service' in config:
         if command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode == 0:
             with legacy_channel(config, 'probe') as health:
                 require(health['version'] == journal['legacy_version'], 'legacy running version differs')
@@ -485,7 +522,7 @@ def rollback(journal, journal_path):
         if previous:
             compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
             wait_healthy(previous)
-        else:
+        elif 'legacy_service' in config:
             command('systemctl', 'start', config['legacy_service'])
             if journal['legacy_enabled']:
                 command('systemctl', 'enable', config['legacy_service'])
@@ -566,19 +603,27 @@ def activate(config, image, tag, source, version):
             journal['nginx_backup'] = str(release / 'nginx.before')
         if config['role'] in CORE_ROLES:
             journal['identity_sha256'] = hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
-            if not current:
+            if not current and 'legacy_service' in config:
                 command('systemctl', 'is-active', '--quiet', config['legacy_service'])
                 journal['legacy_enabled'] = command('systemctl', 'is-enabled', config['legacy_service'], check=False).stdout.strip() == 'enabled'
+            elif not current:
+                # A fresh install: no service of this project may already run on this data, and no host
+                # service may own it either; one that does is replaced only as `legacy_service`.
+                units = units_using(config['data_dir'])
+                require(not units, 'systemd units use the data directory; configure legacy_service to replace '
+                        + ', '.join(units))
+                stopped(target)
         write_json(journal_path, journal)
         try:
             if config['role'] in CORE_ROLES:
                 with lease(config, current) as health:
-                    if not current:
+                    if health:
                         journal['legacy_version'] = health['version']
-                    journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
+                    if current or health:
+                        journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
                     if current:
                         stop(current)
-                    else:
+                    elif health:
                         command('systemctl', 'stop', config['legacy_service'])
                         require(command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode != 0,
                                 'legacy service did not stop')
@@ -605,9 +650,21 @@ def activate(config, image, tag, source, version):
         except BaseException:
             rollback(journal, journal_path)
             raise
+        prune(directory, release, current, image)
         return {'status': 'activated', 'image': image, 'source_sha': source, 'version': version}
     finally:
         os.close(descriptor)
+
+
+def prune(directory, release, previous, image):
+    # The backups and the old release only serve a rollback; once confirmed, the host keeps the new one.
+    for name in ('nginx.before', 'data.before.tar.gz'):
+        (release / name).unlink(missing_ok=True)
+    for old in directory.glob('release-*'):
+        if old != release:
+            shutil.rmtree(old)
+    if previous and previous['image'] != image:
+        docker('image', 'rm', previous['image'], check=False)
 
 
 def self_test():
@@ -638,14 +695,26 @@ def self_test():
                     pass
                 else:
                     raise AssertionError('accepted an ambiguous imported image')
-    config = {'project': 'official-entry', 'role': 'entry', 'deploy_dir': '/srv/service-control/entry',
-              'listen': '127.0.0.1:4900', 'data_dir': '/var/lib/official-entry', 'device_id': 'a' * 64,
-              'uid': 1001, 'gid': 1001, 'legacy_service': 'official-entry.service',
+    config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
+              'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'tls_dir': '/etc/official-node/tls',
+              'device_id': 'a' * 64,
+              'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
               'maintenance_socket': '/tmp/private-node/maintenance.sock'}
-    validate_config(config)
-    for field, value in (('data_dir', '/var/lib/../other'), ('uid', 0), ('listen', '0.0.0.0:80'),
-                         ('device_id', 'wrong'), ('legacy_service', '--help')):
-        bad = dict(config, **{field: value})
+    app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
+           'listen': '127.0.0.1:8088', 'nginx_config': '/etc/nginx/conf.d/app.conf',
+           'server_name': 'app.example.invalid'}
+    fresh = {key: item for key, item in config.items() if key not in ('legacy_service', 'maintenance_socket')}
+    validate_config(config); validate_config(app); validate_config(fresh)
+    for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
+                               (config, 'tls_dir', None), (config, 'tls_dir', '/var/lib/official-node/tls'),
+                               (config, 'tls_dir', '/srv/service-control/node'),
+                               (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
+                               (config, 'legacy_service', '--help'), (config, 'legacy_service', None),
+                               (config, 'maintenance_socket', None),
+                               (config, 'node_url', 'https://203.0.113.7:4792'),
+                               (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://203.0.113.7:4792'),
+                               (app, 'legacy_service', 'official-node.service')):
+        bad = {key: item for key, item in dict(base, **{field: value}).items() if item is not None}
         try:
             validate_config(bad)
         except ValueError:
@@ -655,7 +724,11 @@ def self_test():
     runtime = compose_runtime(config, 'sha256:' + 'b' * 64, '1.0.0', 'c' * 40, 'd' * 64)['services']['service']
     assert runtime['network_mode'] == 'host' and runtime['user'] == '1001:1001'
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
-    assert runtime['environment']['VIBEFACE_ROLE'] == 'entry'
+    assert runtime['environment']['VIBEFACE_ROLE'] == 'node'
+    assert runtime['ulimits'] == {'nofile': {'soft': 65536, 'hard': 65536}}
+    assert [(v['source'], v['target'], v.get('read_only')) for v in runtime['volumes'][1:]] == [
+        ('/etc/official-node/tls/tls-cert.pem', '/data/tls-cert.pem', True),
+        ('/etc/official-node/tls/tls-key.pem', '/data/tls-key.pem', True)]
     nginx = '''server { listen 80; server_name app.example.invalid; return 301 https://$host$request_uri; }
 server {
     listen 443 ssl;
@@ -663,40 +736,25 @@ server {
     root /srv/static-old;
     add_header Content-Security-Policy "old policy" always;
     add_header X-Vibeface-Source old;
-    location = /api/client { proxy_pass http://127.0.0.1:4900; }
-    location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }
-    location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3900; }
+    location = /api/client { return 404; }
+    location = /api/info { return 404; }
+    location = /sdk.v1.js { return 404; }
     location = /manifest.webmanifest { types {} default_type application/manifest+json; try_files $uri =404; }
     location ^~ /assets/ { try_files $uri =404; }
     location ~* \\.(?:js|wasm|css|woff2?|svg|png|ico|json|webmanifest)$ { try_files $uri =404; }
     location / { try_files $uri $uri/ /_shell.html; }
 }
 '''
-    app = {'role': 'app', 'server_name': 'app.example.invalid', 'listen': '127.0.0.1:8088'}
     updated = transform_nginx(nginx, app)
     assert 'old policy' not in updated and 'X-Vibeface-Source old' not in updated and 'try_files' not in updated
-    for node in nginx_nodes(nginx)[1]['children']:
-        if node['words'][0] == 'location' and any(token in ' '.join(node['words']) for token in ('api/client', 'bootstrap', 'relay|')):
-            assert nginx[node['start']:node['end']] in updated
-    assert transform_nginx(updated, app) == updated
-    relay_source = '''server { listen 443 ssl; server_name app.example.invalid; root /old;
-    location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }
-    location = /api/client { proxy_pass http://127.0.0.1:4900; }
-    location / { proxy_pass http://127.0.0.1:4900; }
-}'''
-    relay = transform_nginx(relay_source, dict(app, role='relay'))
-    assert 'location / {\n        return 404;' in relay and 'location ~ ^/(relay|ping|generate_204)$' in relay
-    assert 'location = /api/client { proxy_pass http://127.0.0.1:4900; }' in relay
-    for selector in ('location = /index.html { try_files $uri =404; }',
-                     'location ^~ /assets/ { alias /old/; }'):
-        try:
-            transform_nginx(relay_source.replace('root /old;', 'root /old; ' + selector), dict(app, role='relay'))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('Relay kept a frontend route')
+    assert 'location = /sdk.v1.js { return 404; }' in updated and 'location = /api/client { return 404; }' in updated
+    assert 'proxy_pass https://' not in updated and '/api/decision' not in updated
+    assert transform_nginx(updated, app) == updated == transform_nginx(nginx, dict(app, role='www'))
     for selector in ('location = /favicon.ico { alias /old/icon.ico; }',
-                     'location /old/ { include /old/static.conf; }', 'location /old/ {}'):
+                     'location /old/ { include /old/static.conf; }', 'location /old/ {}',
+                     'location = /api/decision { proxy_pass https://203.0.113.7:4792; }',
+                     'location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }',
+                     'location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }'):
         try:
             transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
         except ValueError:
@@ -704,7 +762,9 @@ server {
         else:
             raise AssertionError('unknown static route accepted')
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
-                nginx.replace('location / {', 'include /old/routes.conf; location / {', 1)):
+                nginx.replace('location / {', 'include /old/routes.conf; location / {', 1),
+                nginx.replace('location = /api/client { return 404; }',
+                              'location = /api/client { proxy_pass http://127.0.0.1:4900; }', 1)):
         try:
             transform_nginx(bad, app)
         except ValueError:
@@ -769,7 +829,7 @@ server {
         def restored_legacy(*args):
             yield {'version': '1.0.0'}
         legacy_state = dict(state, previous=None, legacy_version='1.0.0', legacy_enabled=False,
-                            config={'role': 'entry', 'legacy_service': 'fixture.service'})
+                            config={'role': 'node', 'legacy_service': 'fixture.service'})
         with patch(__name__ + '.legacy_channel', side_effect=restored_legacy), \
                 patch(__name__ + '.command', return_value=subprocess.CompletedProcess([], 0, '', '')), \
                 patch(__name__ + '.stopped', side_effect=lambda *a: events.append('verify-target-stopped')), \
@@ -781,6 +841,19 @@ server {
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
         events.clear()
+        with lease(fresh, None) as health:
+            assert health is None
+        fresh_data = directory / 'fresh'; fresh_data.mkdir()
+        (fresh_data / 'identity.json').write_text('fresh'); (fresh_data / 'node.lock').touch()
+        fresh_state = dict(state, previous=None, legacy_enabled=False, config=dict(fresh, data_dir=str(fresh_data)),
+                           identity_sha256=hashlib.sha256(b'fresh').hexdigest())
+        with patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
+                patch(__name__ + '.command', side_effect=lambda *a, **k: events.append('unsafe-systemctl')), \
+                patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-start')):
+            rollback(fresh_state, directory / 'activation.json')
+        assert events == ['stop-new'] and not (directory / 'current.json').exists()
+        assert read_json(directory / 'activation.json')['phase'] == 'rolled_back'
+        events.clear()
         with patch(__name__ + '.restored_previous', return_value=False), \
                 patch(__name__ + '.previous_stopped', return_value=False), \
                 patch(__name__ + '.stop', side_effect=ValueError('new process still running')), \
@@ -790,6 +863,34 @@ server {
             except ValueError:
                 pass
         assert not events
+        tls = directory / 'tls'; tls.mkdir(); tls.chmod(0o750)
+        (tls / 'tls-cert.pem').write_text('cert'); (tls / 'tls-cert.pem').chmod(0o644)
+        (tls / 'tls-key.pem').write_text('key'); (tls / 'tls-key.pem').chmod(0o640)
+        owned = dict(config, tls_dir=str(tls), gid=os.getegid())
+        assert tls_directory(owned, owner=os.geteuid()) == tls
+        for unsafe in (lambda: (tls / 'tls-key.pem').chmod(0o660), lambda: (tls / 'tls-key.pem').chmod(0o644),
+                       lambda: tls.chmod(0o770), lambda: owned.update(gid=os.getegid() + 1)):
+            unsafe()
+            try:
+                tls_directory(owned, owner=os.geteuid())
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('TLS files the Node could change or not read accepted')
+            tls.chmod(0o750); (tls / 'tls-key.pem').chmod(0o640); owned['gid'] = os.getegid()
+        try:
+            tls_directory(owned)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('TLS files not owned by root accepted')
+        units = directory / 'units'; (units / 'old.service.d').mkdir(parents=True)
+        (units / 'other.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir /var/lib/official-node2\n')
+        assert units_using('/var/lib/official-node', [str(units)]) == []
+        (units / 'old.service.d' / 'data.conf').write_text('[Service]\nWorkingDirectory=/var/lib/official-node\n')
+        (units / 'old.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir=/var/lib/official-node/\n')
+        assert units_using('/var/lib/official-node', [str(units)]) == [
+            str(units / 'old.service'), str(units / 'old.service.d' / 'data.conf')]
         data = directory / 'data'; data.mkdir(); (data / 'identity.json').write_text('keep')
         (data / 'escape').symlink_to(directory)
         try:
@@ -799,6 +900,18 @@ server {
         else:
             raise AssertionError('backup followed a symbolic link')
         assert (data / 'identity.json').read_text() == 'keep'
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        old, new = directory / 'release-old', directory / 'release-new'
+        for release in (old, new):
+            release.mkdir()
+            for name in ('compose.yaml', 'nginx.before', 'data.before.tar.gz'):
+                (release / name).write_text(name)
+        with patch(__name__ + '.docker') as remove:
+            prune(directory, new, {'image': 'sha256:old'}, 'sha256:new')
+        assert sorted(path.name for path in directory.iterdir()) == ['release-new']
+        assert [path.name for path in new.iterdir()] == ['compose.yaml'], 'confirmed release keeps no backups'
+        remove.assert_called_once_with('image', 'rm', 'sha256:old', check=False)
     print('deployment activation self-test passed')
 
 

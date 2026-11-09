@@ -65,7 +65,7 @@ function inspected(origin: string): { inspect: Inspect; access: { kind: 'local';
   return {
     inspect: {
       status: 'running', deviceId: nodeId, dataDir: '/fixture/node', localListen: `127.0.0.1:${port}`, listen: '127.0.0.1:4790',
-      webEnabled: true, publicEntry: false, coreVersion: 'fixture', error: null,
+      webEnabled: true, coreVersion: 'fixture', error: null,
     },
     access: { kind: 'local', url: origin, deviceId: nodeId },
   }

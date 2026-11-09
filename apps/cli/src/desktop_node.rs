@@ -1535,10 +1535,9 @@ mod tests {
             "listen": "127.0.0.1:4790",
             "local_listen": "127.0.0.1:4791",
             "public_url": null,
-            "public_entry": false,
             "web_enabled": true,
             "write_state": null,
-            "bootstrap": { "mode": "default", "status": null },
+            "bootstrap": "public",
             "peers": [],
             "error": null
         });

@@ -2,11 +2,11 @@
 
 use crate::{
     config::{self, Config, ManagerSettings},
-    crypto::{self, LocalIdentity},
+    crypto::LocalIdentity,
     discovery,
     local_access::Launcher,
     maintenance,
-    net::{self, NetworkConfig, RelayServiceMode},
+    net::{self, NetworkConfig},
     providers::{AppServer, AppServerMode, Provider, ProviderEnv},
     store::Store,
 };
@@ -18,6 +18,7 @@ use std::{
     fs,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -35,6 +36,8 @@ struct InitOptions {
     local_listen: SocketAddr,
     public_url: Option<String>,
     #[serde(default)]
+    tls: bool,
+    #[serde(default)]
     no_web: bool,
     #[serde(default)]
     allowed_origins: Vec<String>,
@@ -46,74 +49,60 @@ struct InitOptions {
     allow_insecure_lan: bool,
     #[serde(default)]
     relays: Vec<String>,
+    /// `(relay URL, token file)`: the token this Node presents to one of `relays`.
+    #[serde(default)]
+    relay_tokens: Vec<(String, PathBuf)>,
     #[serde(default)]
     discovery: Vec<String>,
     #[serde(default)]
-    relay_mode: Option<RelayServiceMode>,
+    serve_discovery: bool,
     relay_listen: Option<SocketAddr>,
     relay_url: Option<String>,
+    /// File with the token this Node's relay asks of devices outside its personal network.
+    relay_operator_token: Option<PathBuf>,
     #[serde(default)]
-    public_entry: bool,
-    entry: Option<String>,
-    entry_relay: Option<String>,
-    relay_token_file: Option<PathBuf>,
+    relay_open: bool,
+    relay_rate: Option<NonZeroU32>,
+    relay_max_clients: Option<NonZeroUsize>,
+    relay_max_clients_per_ip: Option<NonZeroUsize>,
+    #[serde(default)]
+    forward_any: bool,
+    forward_sessions: Option<usize>,
+    forward_queue: Option<usize>,
+    forward_rate: Option<NonZeroU32>,
+    forward_per_ip: Option<NonZeroUsize>,
+    #[serde(default)]
+    trusted_proxies: Vec<IpAddr>,
     manager: Option<Provider>,
     workspace: Option<PathBuf>,
     model: Option<String>,
     #[serde(default)]
     bins: Vec<(Provider, PathBuf)>,
     codex_socket: Option<PathBuf>,
-    /// `off`, `public`, or a `vibeface://` discovery URL of a private bootstrap source. A fresh
-    /// Node without a private entry defaults to `public`.
+    /// `off`, `public`, or the `vibeface://` URL of a self-hosted Discovery. A fresh Node that
+    /// does not serve discovery itself defaults to `public`.
     bootstrap: Option<String>,
-    /// HTTPS base of a private bootstrap source, for Nodes whose UDP is blocked.
-    bootstrap_https: Option<String>,
-    /// Paired with `catalog_relays`: the catalogue a discovery-only entry publishes.
-    #[serde(default)]
-    catalog_gateways: Vec<String>,
-    #[serde(default)]
-    catalog_relays: Vec<String>,
-    /// Grant lifetime the catalogue's issuer hands out, in minutes.
-    grant_ttl_minutes: Option<i64>,
-    /// How a public entry's relay admits Nodes.
-    relay_admission: Option<RelayAdmissionMode>,
-    /// The discovery entry whose grants a `grants` relay admits.
-    grant_issuer: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum RelayAdmissionMode {
-    OperatorToken,
-    Grants,
 }
 
 fn default_listen() -> SocketAddr {
     DEFAULT_LISTEN
 }
 
-/// The bootstrap a fresh Node gets: an explicit choice, else public unless this Node is
-/// infrastructure itself or already has a private entry.
+/// The bootstrap a fresh Node gets: an explicit choice, else public unless this Node serves
+/// discovery itself.
 fn resolve_bootstrap(
     choice: Option<&str>,
-    https: Option<&str>,
     infrastructure: bool,
-    private_entry: bool,
 ) -> Result<net::bootstrap::Bootstrap> {
     use net::bootstrap::Bootstrap;
     let bootstrap = match choice.map(str::trim) {
-        None if infrastructure || private_entry => Bootstrap::Off,
+        None if infrastructure => Bootstrap::Off,
         None | Some("public") => Bootstrap::Public,
         Some("off") => Bootstrap::Off,
         Some(discovery) => Bootstrap::Custom {
             discovery: discovery.to_owned(),
-            https: https.map(str::to_owned),
         },
     };
-    ensure!(
-        https.is_none() || matches!(bootstrap, Bootstrap::Custom { .. }),
-        "--bootstrap-https belongs to a custom --bootstrap discovery URL"
-    );
     bootstrap.validate()?;
     Ok(bootstrap)
 }
@@ -222,15 +211,11 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         "listen": configuration.listen,
         "local_listen": configuration.local_listen,
         "public_url": configuration.public_url,
-        "public_entry": configuration.public_entry,
         "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
         "http_enabled": health.as_ref().is_ok_and(|health| health.http_enabled),
         "version": health.as_ref().ok().map(|health| &health.version),
         "write_state": health.as_ref().ok().and_then(|health| health.write_state),
-        "bootstrap": {
-            "mode": configuration.network.bootstrap.label(),
-            "status": health.as_ref().ok().and_then(|health| health.bootstrap.as_ref()),
-        },
+        "bootstrap": configuration.network.bootstrap.label(),
         "peers": health.as_ref().ok().map(|health| &health.peers),
         "core_version": authoritative_core_version(health.as_ref().ok()),
         "error": error,
@@ -255,11 +240,6 @@ async fn access(data_dir: &Path) -> Result<Value> {
     );
     let identity = config::identity(data_dir)?;
     let device_id = identity.device_id()?;
-    if configuration.public_entry {
-        return Ok(
-            json!({"url":configuration.public_url,"device_id":device_id,"public_entry":true}),
-        );
-    }
     let store = Store::open_readonly(data_dir.join("node.sqlite3"))?;
     let initialized = store.has_network()?;
     let capability = if initialized {
@@ -347,7 +327,7 @@ async fn access(data_dir: &Path) -> Result<Value> {
 async fn local_setup(data_dir: &Path) -> Result<Value> {
     let info = inspect(data_dir).await?;
     ensure!(
-        info["web_enabled"] == true && info["public_entry"] == false,
+        info["web_enabled"] == true && !Config::load(data_dir)?.forwarding.any,
         "this Node has no local browser setup"
     );
     let launcher = Launcher::read(data_dir)?;
@@ -467,21 +447,13 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
     if empty {
         let mut configuration = Config::local(DEFAULT_LISTEN, vec![], false);
         configuration.network.bootstrap = net::bootstrap::Bootstrap::Public;
-        initialize(dir, configuration, None)?;
+        initialize(dir, configuration)?;
     }
     Ok(())
 }
 
 fn initialize_from_options(options: InitOptions) -> Result<Value> {
     validate_data_dir(&options.data_dir)?;
-    ensure!(
-        options.entry.is_none() || options.relay_token_file.is_some(),
-        "--entry requires --relay-token-file"
-    );
-    ensure!(
-        options.entry_relay.is_none() || options.entry.is_some(),
-        "--entry-relay requires --entry"
-    );
     let roots: Vec<_> = options
         .roots
         .iter()
@@ -489,6 +461,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
     configuration.local_listen = options.local_listen;
+    configuration.tls = options.tls;
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
     configuration.allowed_origins = options.allowed_origins;
@@ -513,83 +486,44 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
             backup: Default::default(),
         });
     }
-    let relay_mode = options.relay_mode.unwrap_or_default();
-    ensure!(
-        options.catalog_gateways.len() == options.catalog_relays.len(),
-        "--catalog-gateway and --catalog-relay are given in pairs"
-    );
-    ensure!(
-        options.catalog_gateways.is_empty()
-            || (options.public_entry && relay_mode == RelayServiceMode::DiscoveryOnly),
-        "a catalogue is published by a discovery-only public entry"
-    );
-    let catalog = (!options.catalog_gateways.is_empty()).then(|| net::bootstrap::CatalogConfig {
-        entries: options
-            .catalog_gateways
-            .iter()
-            .zip(&options.catalog_relays)
-            .map(|(gateway_url, relay_url)| net::bootstrap::CatalogEntry {
-                gateway_url: gateway_url.clone(),
-                relay_url: relay_url.clone(),
-            })
-            .collect(),
-        grant_ttl_ms: options
-            .grant_ttl_minutes
-            .map_or(net::bootstrap::DEFAULT_GRANT_TTL_MS, |minutes| {
-                minutes.saturating_mul(60_000)
-            }),
-    });
-    ensure!(
-        options.grant_ttl_minutes.is_none() || catalog.is_some(),
-        "--grant-ttl-minutes belongs to a published catalogue"
-    );
-    let relay_admission = match options
-        .relay_admission
-        .unwrap_or(RelayAdmissionMode::OperatorToken)
-    {
-        RelayAdmissionMode::OperatorToken => {
-            ensure!(
-                options.grant_issuer.is_none(),
-                "--grant-issuer belongs to --relay-admission grants"
-            );
-            net::RelayAdmission::OperatorToken
-        }
-        RelayAdmissionMode::Grants => net::RelayAdmission::Grants {
-            issuer: options
-                .grant_issuer
-                .clone()
-                .context("--relay-admission grants requires --grant-issuer")?,
-        },
-    };
-    let bootstrap = resolve_bootstrap(
-        options.bootstrap.as_deref(),
-        options.bootstrap_https.as_deref(),
-        options.public_entry,
-        options.entry.is_some(),
-    )?;
-    let mut discovery = options.discovery;
-    // A private entry's Node still registers with the official Discovery, so others find it by
-    // device ID. Bootstrap stays off: an official relay grant could become its home relay in
-    // place of the entry's.
-    if options.entry.is_some()
-        && !options.public_entry
-        && options.bootstrap.is_none()
-        && discovery.is_empty()
-    {
-        discovery.push(net::bootstrap::PublicDefaults::load()?.discovery_url());
+    let mut relays: Vec<net::Relay> = options
+        .relays
+        .into_iter()
+        .map(|url| net::Relay { url, token: None })
+        .collect();
+    for (url, file) in &options.relay_tokens {
+        let named = net::relay_url(url)?;
+        let relay = relays
+            .iter_mut()
+            .find(|relay| net::relay_url(&relay.url).is_ok_and(|url| url == named))
+            .context("--relay-token names a relay missing from --relay")?;
+        relay.token = Some(net::read_token_file(file)?);
     }
     configuration.network = NetworkConfig {
-        relays: options.relays,
-        discovery,
-        relay_mode,
+        relays,
+        discovery: options.discovery,
+        serve_discovery: options.serve_discovery,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
-        bootstrap,
-        relay_admission,
-        catalog,
+        relay_operator_token: options
+            .relay_operator_token
+            .as_deref()
+            .map(net::read_token_file)
+            .transpose()?,
+        relay_open: options.relay_open,
+        relay_rate: options.relay_rate,
+        relay_max_clients: options.relay_max_clients,
+        relay_max_clients_per_ip: options.relay_max_clients_per_ip,
+        bootstrap: resolve_bootstrap(options.bootstrap.as_deref(), options.serve_discovery)?,
         ..NetworkConfig::default()
     };
-    configuration.public_entry = options.public_entry;
+    let forwarding = &mut configuration.forwarding;
+    forwarding.any = options.forward_any;
+    forwarding.sessions = options.forward_sessions.unwrap_or(forwarding.sessions);
+    forwarding.queue = options.forward_queue.unwrap_or(forwarding.queue);
+    forwarding.rate = options.forward_rate;
+    forwarding.per_ip = options.forward_per_ip;
+    forwarding.trusted_proxies = options.trusted_proxies;
     if let Some(url) = options.public_url {
         configuration.public_url = config::http_origin(&url)?
             .to_string()
@@ -601,69 +535,39 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
             "set --public-url when listening beyond loopback"
         );
     }
-    if let Some(entry) = options.entry {
-        let url = config::http_origin(&entry)?
-            .to_string()
-            .trim_end_matches('/')
-            .to_owned();
-        configuration.network.entry = Some(crate::net::PublicEntry {
-            relay: options.entry_relay.unwrap_or_else(|| url.clone()),
-            url,
-        });
-    }
-    let bootstrap_http = configuration.public_entry
-        && match relay_mode {
-            RelayServiceMode::DiscoveryOnly => configuration.network.catalog.is_some(),
-            RelayServiceMode::Forward => configuration.network.relay_admission.is_grants(),
-        };
     check_ports(
         configuration.listen,
         configuration.local_listen,
-        configuration.web_enabled || bootstrap_http,
-        configuration.public_entry,
+        configuration.web_enabled,
     )?;
-    // A relay admitting by grants holds no operator token for anyone to copy.
-    let operator_relay = configuration.public_entry
-        && relay_mode == RelayServiceMode::Forward
-        && !configuration.network.relay_admission.is_grants();
-    let entry_token = match options.relay_token_file {
-        Some(path) => Some(net::read_token_file(&path)?),
-        None => operator_relay.then(|| crypto::random_hex(32)),
-    };
     let mut provider_env = ProviderEnv::default();
     discovery::complete(
         &mut configuration,
         &mut provider_env,
         &discovery::Host::current(),
     )?;
-    let public_entry = configuration.public_entry;
-    let discovery_only = configuration.network.relay_mode == RelayServiceMode::DiscoveryOnly;
     let web_enabled = configuration.web_enabled;
     let bootstrap = configuration.network.bootstrap.label();
-    let open = if !public_entry
-        && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified())
-    {
-        format!("http://localhost:{}", configuration.listen.port())
-    } else {
-        configuration.public_url.clone()
-    };
+    let open =
+        if configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified() {
+            format!("http://localhost:{}", configuration.listen.port())
+        } else {
+            configuration.public_url.clone()
+        };
     configuration.provider_env = provider_env;
-    initialize(&options.data_dir, configuration, entry_token)?;
+    initialize(&options.data_dir, configuration)?;
     let data_dir = fs::canonicalize(&options.data_dir)?;
     let device_id = config::identity(&data_dir)?.device_id()?;
     Ok(json!({
         "data_dir": data_dir,
         "web_enabled": web_enabled,
         "open": web_enabled.then_some(open),
-        "discovery_only": discovery_only,
-        "public_entry": public_entry,
         "bootstrap": bootstrap,
         "device_id": device_id,
-        "relay_token_file": operator_relay.then(|| options.data_dir.join(net::ENTRY_TOKEN_FILE)),
     }))
 }
 
-fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
+fn initialize(dir: &Path, configuration: Config) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -685,28 +589,30 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
         &serde_json::to_vec_pretty(&configuration)?,
     )?;
     let store = Store::open(dir.join("node.sqlite3"))?;
-    if !configuration.public_entry {
+    create_private(
+        &dir.join("bootstrap.json"),
+        &serde_json::to_vec(&store.bootstrap_capability()?)?,
+    )?;
+    if configuration.tls {
+        // A self-signed placeholder for first start and tests; a CA-issued pair the host installs
+        // over these files is served from the next connection on.
+        let url = reqwest::Url::parse(&configuration.public_url)?;
+        let host = url.host_str().context("public_url has no host")?;
+        let made = rcgen::generate_simple_self_signed(vec![host.trim_matches(['[', ']']).into()])?;
+        create_private(&dir.join(config::TLS_CERT), made.cert.pem().as_bytes())?;
         create_private(
-            &dir.join("bootstrap.json"),
-            &serde_json::to_vec(&store.bootstrap_capability()?)?,
+            &dir.join(config::TLS_KEY),
+            made.signing_key.serialize_pem().as_bytes(),
         )?;
-    }
-    if let Some(token) = entry_token {
-        create_private(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
     }
     create_private(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
     Ok(())
 }
 
-fn check_ports(
-    listen: SocketAddr,
-    local_listen: SocketAddr,
-    web_enabled: bool,
-    public_entry: bool,
-) -> Result<()> {
+fn check_ports(listen: SocketAddr, local_listen: SocketAddr, web_enabled: bool) -> Result<()> {
     for (address, flag) in [
         web_enabled.then_some((listen, "--listen")),
-        (!public_entry).then_some((local_listen, "--local-listen")),
+        Some((local_listen, "--local-listen")),
     ]
     .into_iter()
     .flatten()
@@ -744,12 +650,6 @@ pub fn restart_fresh(dir: &Path) -> Result<()> {
 
 fn start_over(dir: &Path) -> Result<PathBuf> {
     let configuration = Config::load(dir)?;
-    let entry_token = configuration
-        .network
-        .entry
-        .is_some()
-        .then(|| net::read_token_file(&dir.join(net::ENTRY_TOKEN_FILE)))
-        .transpose()?;
     let name = dir
         .file_name()
         .context("data directory has no name")?
@@ -762,7 +662,7 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         "{} already exists",
         archive.display()
     );
-    if let Err(error) = initialize(&fresh, configuration, entry_token) {
+    if let Err(error) = initialize(&fresh, configuration) {
         let _ = fs::remove_dir_all(&fresh);
         return Err(error);
     }
@@ -792,7 +692,6 @@ mod tests {
             web_enabled: true,
             http_enabled: true,
             write_state: None,
-            bootstrap: None,
             peers: vec![],
         };
         assert_eq!(
@@ -814,7 +713,7 @@ mod tests {
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
         config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = crypto::LocalIdentity::generate();
+        let identity = LocalIdentity::generate();
         Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false).save(&dir)?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let inspected = inspect(&dir).await?;
@@ -837,38 +736,14 @@ mod tests {
         let dir = temp_dir("existing");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("existing-data"), b"original").unwrap();
-        let options = InitOptions {
-            data_dir: dir.clone(),
-            listen: "127.0.0.1:0".parse().unwrap(),
-            local_listen: "127.0.0.1:0".parse().unwrap(),
-            public_url: None,
-            no_web: true,
-            allowed_origins: vec![],
-            roots: vec![],
-            no_local_auto_access: false,
-            allow_insecure_lan: false,
-            relays: vec![],
-            discovery: vec![],
-            relay_mode: None,
-            relay_listen: None,
-            relay_url: None,
-            public_entry: false,
-            entry: None,
-            entry_relay: None,
-            relay_token_file: None,
-            manager: None,
-            workspace: None,
-            model: None,
-            bins: vec![],
-            codex_socket: None,
-            bootstrap: Some("off".into()),
-            bootstrap_https: None,
-            catalog_gateways: vec![],
-            catalog_relays: vec![],
-            grant_ttl_minutes: None,
-            relay_admission: None,
-            grant_issuer: None,
-        };
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "listen": "127.0.0.1:0",
+            "local_listen": "127.0.0.1:0",
+            "no_web": true,
+            "bootstrap": "off",
+        }))
+        .unwrap();
         assert!(initialize_from_options(options).is_err());
         assert_eq!(fs::read(dir.join("existing-data")).unwrap(), b"original");
         assert!(!dir.join("identity.json").exists());
@@ -892,45 +767,27 @@ mod tests {
     fn fresh_nodes_bootstrap_publicly_unless_told_otherwise() {
         use net::bootstrap::Bootstrap;
         let custom = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
+        assert_eq!(resolve_bootstrap(None, false).unwrap(), Bootstrap::Public);
         assert_eq!(
-            resolve_bootstrap(None, None, false, false).unwrap(),
-            Bootstrap::Public
-        );
-        assert_eq!(
-            resolve_bootstrap(None, None, true, false).unwrap(),
+            resolve_bootstrap(None, true).unwrap(),
             Bootstrap::Off,
-            "public entries are the infrastructure"
+            "a Node serving discovery is the infrastructure"
         );
         assert_eq!(
-            resolve_bootstrap(None, None, false, true).unwrap(),
-            Bootstrap::Off,
-            "a private entry is not silently paired with the public one"
-        );
-        assert_eq!(
-            resolve_bootstrap(Some("off"), None, false, false).unwrap(),
+            resolve_bootstrap(Some("off"), false).unwrap(),
             Bootstrap::Off
         );
         assert_eq!(
-            resolve_bootstrap(Some("public"), None, false, true).unwrap(),
+            resolve_bootstrap(Some("public"), true).unwrap(),
             Bootstrap::Public
         );
         assert_eq!(
-            resolve_bootstrap(
-                Some(custom),
-                Some("http://127.0.0.1:4800/bootstrap"),
-                false,
-                false
-            )
-            .unwrap(),
+            resolve_bootstrap(Some(custom), false).unwrap(),
             Bootstrap::Custom {
                 discovery: custom.into(),
-                https: Some("http://127.0.0.1:4800/bootstrap".into())
             }
         );
-        assert!(
-            resolve_bootstrap(Some("public"), Some("https://x.example"), false, false).is_err()
-        );
-        assert!(resolve_bootstrap(Some("https://not-a-discovery"), None, false, false).is_err());
+        assert!(resolve_bootstrap(Some("https://not-a-discovery"), false).is_err());
         let dir = temp_dir("bootstrap-default");
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
@@ -949,98 +806,112 @@ mod tests {
     }
 
     #[test]
-    fn grant_admitting_entries_hold_no_operator_token() {
-        let dir = temp_dir("grants-entry");
-        let listen = free_addr();
-        let relay_listen = loop {
-            let candidate = free_addr();
-            if candidate != listen {
-                break candidate;
-            }
-        };
+    fn a_public_node_serves_discovery_and_an_open_paced_relay_and_forwards_to_anyone() {
+        let dir = temp_dir("public-node");
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
-            "no_web": true,
-            "listen": listen,
-            "public_url": "https://entry.example",
-            "public_entry": true,
-            "relay_listen": relay_listen,
-            "relay_url": "https://entry.example",
-            "relay_admission": "grants",
-            "grant_issuer": "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235",
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+            "public_url": "https://app.example",
+            "tls": true,
+            "serve_discovery": true,
+            "relay_listen": "127.0.0.1:0",
+            "relay_open": true,
+            "relay_rate": 65536,
+            "relay_max_clients": 512,
+            "relay_max_clients_per_ip": 16,
+            "forward_any": true,
+            "forward_sessions": 32,
+            "forward_queue": 192,
+            "forward_rate": 262144,
+            "forward_per_ip": 8,
+            "trusted_proxies": ["203.0.113.1"],
         }))
         .unwrap();
         let result = initialize_from_options(options).unwrap();
-        assert_eq!(result["bootstrap"], "off");
-        assert!(result["relay_token_file"].is_null());
-        assert!(!dir.join(net::ENTRY_TOKEN_FILE).exists());
-        let saved = Config::load(&dir).unwrap();
-        assert!(saved.network.relay_admission.is_grants());
-        assert!(saved.network.bootstrap.is_off());
-        fs::remove_dir_all(dir).unwrap();
-        let missing: InitOptions = serde_json::from_value(json!({
-            "data_dir": temp_dir("grants-missing"),
-            "public_url": "https://entry.example",
-            "public_entry": true,
-            "relay_listen": "127.0.0.1:0",
-            "relay_admission": "grants",
-        }))
-        .unwrap();
-        assert!(
-            initialize_from_options(missing)
-                .unwrap_err()
-                .to_string()
-                .contains("grant-issuer")
+        assert_eq!(
+            result["bootstrap"], "off",
+            "a Node serving discovery is the infrastructure"
         );
-    }
-
-    #[test]
-    fn initialization_rejects_an_entry_without_an_explicit_relay_token_file() {
-        let dir = temp_dir("entry-token");
-        let options: InitOptions = serde_json::from_value(json!({
-            "data_dir": dir,
-            "entry": "https://entry.example"
+        let saved = Config::load(&dir).unwrap();
+        assert!(saved.network.serve_discovery && saved.network.relay_open);
+        assert_eq!(saved.network.relay_rate.map(NonZeroU32::get), Some(65536));
+        assert_eq!(
+            saved.network.relay_max_clients.map(NonZeroUsize::get),
+            Some(512)
+        );
+        assert_eq!(
+            saved
+                .network
+                .relay_max_clients_per_ip
+                .map(NonZeroUsize::get),
+            Some(16)
+        );
+        let forwarding = saved.forwarding;
+        assert!(forwarding.any && forwarding.sessions == 32 && forwarding.queue == 192);
+        assert_eq!(forwarding.rate.map(NonZeroU32::get), Some(262144));
+        assert_eq!(forwarding.per_ip.map(NonZeroUsize::get), Some(8));
+        assert_eq!(
+            forwarding.trusted_proxies,
+            ["203.0.113.1".parse::<IpAddr>().unwrap()]
+        );
+        assert!(saved.tls);
+        let certificate = fs::read_to_string(dir.join(config::TLS_CERT)).unwrap();
+        assert!(certificate.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(dir.join(config::TLS_KEY).is_file());
+        fs::remove_dir_all(dir).unwrap();
+        let open: InitOptions = serde_json::from_value(json!({
+            "data_dir": temp_dir("open-relay"),
+            "no_web": true,
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+            "relay_listen": "127.0.0.1:0",
+            "relay_open": true,
         }))
         .unwrap();
-        let error = initialize_from_options(options).unwrap_err().to_string();
-        assert!(error.contains("relay-token-file"), "{error}");
+        let error = initialize_from_options(open).unwrap_err().to_string();
+        assert!(error.contains("open relay"), "{error}");
+        let crowded: InitOptions = serde_json::from_value(json!({
+            "data_dir": temp_dir("crowded"),
+            "no_web": true,
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+            "forward_sessions": 32,
+            "forward_queue": 256,
+        }))
+        .unwrap();
+        let error = initialize_from_options(crowded).unwrap_err().to_string();
+        assert!(error.contains("browser sockets"), "{error}");
     }
 
     #[test]
-    fn a_private_entry_node_registers_with_the_official_discovery_without_its_bootstrap() {
-        let official = net::bootstrap::PublicDefaults::load()
-            .unwrap()
-            .discovery_url();
-        let own = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
-        for (extra, discovery, bootstrap) in [
-            (json!({}), vec![official.clone()], "off"),
-            (json!({"discovery": [own]}), vec![own.to_owned()], "off"),
-            (json!({"bootstrap": "off"}), vec![], "off"),
-            (json!({"bootstrap": "public"}), vec![], "public"),
-        ] {
-            let dir = temp_dir("private-entry");
-            let token = dir.with_extension("token");
-            fs::write(&token, "ab".repeat(32)).unwrap();
-            let mut options = json!({
+    fn relay_tokens_come_from_files_and_name_a_listed_relay() {
+        let dir = temp_dir("relay-token");
+        let token = dir.with_extension("token");
+        fs::write(&token, "ab".repeat(32)).unwrap();
+        let options = |relay_tokens: Value| -> InitOptions {
+            serde_json::from_value(json!({
                 "data_dir": dir,
                 "no_web": true,
                 "listen": free_addr(),
                 "local_listen": free_addr(),
-                "entry": "https://entry.example",
-                "relay_token_file": token,
-            });
-            options
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            let result = initialize_from_options(serde_json::from_value(options).unwrap()).unwrap();
-            assert_eq!(result["bootstrap"], bootstrap, "{extra}");
-            let saved = Config::load(&dir).unwrap();
-            assert_eq!(saved.network.discovery, discovery, "{extra}");
-            assert_eq!(saved.network.bootstrap.label(), bootstrap, "{extra}");
-            fs::remove_dir_all(dir).unwrap();
-            fs::remove_file(token).unwrap();
-        }
+                "bootstrap": "off",
+                "relays": ["https://relay.example", "https://other.example"],
+                "relay_tokens": relay_tokens,
+            }))
+            .unwrap()
+        };
+        let error = initialize_from_options(options(json!([["https://missing.example", token]])))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--relay-token"), "{error}");
+        assert!(!dir.exists());
+        initialize_from_options(options(json!([["https://relay.example/", token]]))).unwrap();
+        let relays = Config::load(&dir).unwrap().network.relays;
+        assert_eq!(relays[0].token.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(relays[1].token, None);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(token).unwrap();
     }
 
     #[test]
@@ -1057,38 +928,15 @@ mod tests {
                     break candidate;
                 }
             };
-            let options = InitOptions {
-                data_dir: dir.clone(),
-                listen,
-                local_listen,
-                public_url: None,
-                no_web: true,
-                allowed_origins: vec![],
-                roots: vec![],
-                no_local_auto_access: false,
-                allow_insecure_lan: false,
-                relays: vec![],
-                discovery: vec![],
-                relay_mode: None,
-                relay_listen: None,
-                relay_url: None,
-                public_entry: false,
-                entry: None,
-                entry_relay: None,
-                relay_token_file: None,
-                manager: None,
-                workspace: None,
-                model: None,
-                bins: vec![],
-                codex_socket: socket.clone(),
-                bootstrap: Some("off".into()),
-                bootstrap_https: None,
-                catalog_gateways: vec![],
-                catalog_relays: vec![],
-                grant_ttl_minutes: None,
-                relay_admission: None,
-                grant_issuer: None,
-            };
+            let options: InitOptions = serde_json::from_value(json!({
+                "data_dir": dir,
+                "listen": listen,
+                "local_listen": local_listen,
+                "no_web": true,
+                "codex_socket": socket,
+                "bootstrap": "off",
+            }))
+            .unwrap();
             initialize_from_options(options).unwrap();
             let saved = Config::load(&dir).unwrap().providers.codex_app_server;
             assert_eq!(
@@ -1126,38 +974,15 @@ mod tests {
     #[test]
     fn relay_validation_happens_before_any_data_file_is_created() {
         let dir = temp_dir("bad-relay");
-        let options = InitOptions {
-            data_dir: dir.clone(),
-            listen: "127.0.0.1:0".parse().unwrap(),
-            local_listen: "127.0.0.1:0".parse().unwrap(),
-            public_url: None,
-            no_web: true,
-            allowed_origins: vec![],
-            roots: vec![],
-            no_local_auto_access: false,
-            allow_insecure_lan: false,
-            relays: vec!["https://relay.test/?token=secret".into()],
-            discovery: vec![],
-            relay_mode: None,
-            relay_listen: None,
-            relay_url: None,
-            public_entry: false,
-            entry: None,
-            entry_relay: None,
-            relay_token_file: None,
-            manager: None,
-            workspace: None,
-            model: None,
-            bins: vec![],
-            codex_socket: None,
-            bootstrap: Some("off".into()),
-            bootstrap_https: None,
-            catalog_gateways: vec![],
-            catalog_relays: vec![],
-            grant_ttl_minutes: None,
-            relay_admission: None,
-            grant_issuer: None,
-        };
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "listen": "127.0.0.1:0",
+            "local_listen": "127.0.0.1:0",
+            "no_web": true,
+            "relays": ["https://relay.test/?token=secret"],
+            "bootstrap": "off",
+        }))
+        .unwrap();
         let error = initialize_from_options(options).unwrap_err().to_string();
         assert!(!error.contains("secret"));
         assert!(!dir.exists());

@@ -312,7 +312,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
 
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
 /** `home`: the conversation list loads on a phone, the last conversation on a wide screen. */
-export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: { retry?: number | null; onRetry?: () => void; onLeave?: () => void; home?: boolean } = {}) {
+export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false, queued = null }: { retry?: number | null; onRetry?: () => void; onLeave?: () => void; home?: boolean; queued?: number | null } = {}) {
   // A tap on reconnect holds the offline view with a turning icon until the attempt ends: connected, or a new countdown.
   const [retrying, setRetrying] = useState(false)
   useEffect(() => { if (retry !== null) setRetrying(false) }, [retry])
@@ -320,7 +320,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
   if (retry !== null) shown.current = retry
   const offline = retry !== null || retrying
   // Offline, the page says it once in the middle; the corner status is only for a connection still in progress.
-  const status = offline ? null : <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
+  const status = offline ? null : <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{queued ? `排队中，第 ${queued} 位` : '连接中'}</>
   return <div className="flex h-dvh" aria-busy={!offline}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <Wordmark />

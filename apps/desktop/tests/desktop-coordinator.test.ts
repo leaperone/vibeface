@@ -10,7 +10,7 @@ import type { ControlRequest, Inspect } from '../src/main/control-types.js'
 const deviceId = 'a'.repeat(64)
 const inspect = (dataDir: string, id = deviceId, status: Inspect['status'] = 'running'): Inspect => ({
   status, deviceId: id, dataDir, localListen: '127.0.0.1:4791', listen: '0.0.0.0:4790',
-  webEnabled: true, publicEntry: false, coreVersion: '0.0.1-nightly.20261107.1', error: null,
+  webEnabled: true, coreVersion: '0.0.1-nightly.20261107.1', error: null,
 })
 const local = (dataDir: string, id = deviceId, status = 'running') => ({ status, data_dir: dataDir, device_id: id,
   local_listen: '127.0.0.1:4791', listen: '0.0.0.0:4790', web_enabled: true,
@@ -207,7 +207,7 @@ describe('Desktop coordinator', () => {
       const value = inspect(dataDir, deviceId, 'stopped')
       return { status: value.status, device_id: value.deviceId, data_dir: await realpath(value.dataDir),
         local_listen: value.localListen, listen: value.listen, web_enabled: value.webEnabled,
-        public_entry: value.publicEntry, core_version: value.coreVersion, error: null }
+        core_version: value.coreVersion, error: null }
     })
     const prepared = await prepareAppProfileNode(profile, { command: '/fixed/core', args: ['--control'] }, control as never)
     expect(prepared).toMatchObject({ dataDir: await realpath(dataDir), deviceId, status: 'stopped' })

@@ -1,19 +1,16 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { BellRing, Bot, ChevronUp, Crown, FileKey, FlaskConical, Globe, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { BellRing, Bot, ChevronUp, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { parseCustomHttpsBaseInput, publicBootstrapDefaults } from '@vibeface/client/lib/bootstrap.ts'
 import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { OfflineBar } from '@/components/connection-pill'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { Icon } from '@/components/ui/icon'
 import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
@@ -70,7 +67,6 @@ export default function Settings() {
     </SettingsGroup>
     <SettingsGroup title="高级">
       <SettingsRow href="/lab" icon={FlaskConical} label="实验室" />
-      <PublicBootstrapSettings />
     </SettingsGroup>
     <View className="gap-3">
       <SettingsGroup>
@@ -106,89 +102,6 @@ export default function Settings() {
       </View> : null}
     </View>
   </ScrollView>
-}
-
-const issuerHexPattern = /^[a-f0-9]{64}$/
-
-function PublicBootstrapSettings() {
-  const device = useDevice()
-  if (!device.ready) return null
-  return <PublicBootstrapSettingsForm />
-}
-
-function PublicBootstrapSettingsForm() {
-  const device = useDevice()
-  const { publicBootstrap, setPublicBootstrapMode } = device
-  const [baseDraft, setBaseDraft] = useState(() => (publicBootstrap.kind === 'custom' ? publicBootstrap.https_base : ''))
-  const [issuerDraft, setIssuerDraft] = useState(() => (publicBootstrap.kind === 'custom' ? publicBootstrap.issuer : ''))
-  const [applyError, setApplyError] = useState<string | null>(null)
-  useEffect(() => {
-    if (publicBootstrap.kind === 'custom') {
-      setBaseDraft(publicBootstrap.https_base)
-      setIssuerDraft(publicBootstrap.issuer)
-    } else if (publicBootstrap.kind === 'default') {
-      setBaseDraft('')
-      setIssuerDraft('')
-    }
-    if (publicBootstrap.kind !== 'custom') setApplyError(null)
-  }, [publicBootstrap])
-  const enabled = publicBootstrap.kind !== 'off'
-  return <>
-    <SettingsRow
-      icon={Globe}
-      label="公共发现"
-      description="优先通过局域网连接。连不上时，自动向默认或自定义服务查找其他连接方式。"
-    >
-      <Switch accessibilityLabel="公共发现" value={enabled} onValueChange={(on) => { setApplyError(null); setPublicBootstrapMode(on ? { kind: 'default' } : { kind: 'off' }) }} />
-    </SettingsRow>
-    {enabled ? <View className="gap-2 px-4 py-2 ps-11">
-      <Text className="text-meta text-muted-foreground">
-        可选：填写签发者编号与发现服务根地址以使用自建来源；留空两项并点应用则恢复默认目录。
-      </Text>
-      <Input
-        className="font-mono"
-        value={issuerDraft}
-        onChangeText={(t) => setIssuerDraft(t.trim().toLowerCase())}
-        placeholder="服务校验码，64 位字母或数字"
-        accessibilityLabel="公共发现签发者编号"
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
-      <Input
-        value={baseDraft}
-        onChangeText={setBaseDraft}
-        placeholder={publicBootstrapDefaults.https_base}
-        accessibilityLabel="公共发现服务根地址"
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
-      {applyError ? <Text className="text-meta text-destructive">{applyError}</Text> : null}
-      <Button
-        variant="outline"
-        className="self-start"
-        onPress={() => {
-          const issuer = issuerDraft.trim().toLowerCase()
-          const base = baseDraft.trim()
-          if (!issuer && !base) {
-            setApplyError(null)
-            setPublicBootstrapMode({ kind: 'default' })
-            return
-          }
-          if (!issuerHexPattern.test(issuer)) {
-            setApplyError('请填写服务提供的 64 位校验码，只能包含 0–9 和 a–f')
-            return
-          }
-          const https_base = parseCustomHttpsBaseInput(base)
-          if (!https_base) {
-            setApplyError('请填写有效的 HTTPS 根地址（本地夹具可用 http://127.0.0.1）')
-            return
-          }
-          setApplyError(null)
-          setPublicBootstrapMode({ kind: 'custom', issuer, https_base })
-        }}
-      ><Text>应用</Text></Button>
-    </View> : null}
-  </>
 }
 
 function CurrentRecoveryFile() {

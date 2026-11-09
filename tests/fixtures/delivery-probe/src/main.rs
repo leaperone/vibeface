@@ -121,7 +121,7 @@ fn rejection(value: &Value, expected: &str) -> Result<()> {
 struct Target {
     peer: String,
     address: SocketAddr,
-    public_entry: bool,
+    public_node: bool,
 }
 impl Target {
     fn addr(&self) -> Result<EndpointAddr> {
@@ -225,13 +225,8 @@ async fn private_rejected(endpoint: &Endpoint, target: &Target, alpn: &[u8]) -> 
         Ok(connection) => connection.closed().await.to_string(),
         Err(error) => error.to_string(),
     };
-    let expected = if target.public_entry {
-        "a public entry accepts no connections"
-    } else {
-        "not a member Node of this personal network"
-    };
     ensure!(
-        closed.contains(expected),
+        closed.contains("not a member Node of this personal network"),
         "private ALPN did not return the membership boundary rejection"
     );
     Ok(())
@@ -358,7 +353,7 @@ async fn main() -> Result<()> {
     if let Action::PaidSecurity { scenario } = &input.action {
         let target = input.targets.last().context("paid provider missing")?;
         ensure!(
-            target.public_entry,
+            target.public_node,
             "paid security requires its actual public provider"
         );
         let call = async {
@@ -506,8 +501,8 @@ async fn main() -> Result<()> {
                 PaidSecurity::Outsider { receiver_grant } => {
                     ensure!(
                         input.targets.len() == 3
-                            && !input.targets[0].public_entry
-                            && !input.targets[1].public_entry,
+                            && !input.targets[0].public_node
+                            && !input.targets[1].public_node,
                         "the outsider checks exactly the real independent Source, Receiver and public Provider"
                     );
                     rejection(
@@ -561,7 +556,7 @@ async fn main() -> Result<()> {
     }
     if matches!(&input.action, Action::PaidOrder) {
         ensure!(
-            input.targets.len() == 1 && input.targets[0].public_entry,
+            input.targets.len() == 1 && input.targets[0].public_node,
             "paid order observation requires its controlled public provider"
         );
         let observed = tokio::time::timeout(
@@ -588,7 +583,7 @@ async fn main() -> Result<()> {
     } = &input.action
     {
         ensure!(
-            input.targets.len() == 1 && input.targets[0].public_entry,
+            input.targets.len() == 1 && input.targets[0].public_node,
             "paid resume uses its actual public provider"
         );
         let target = &input.targets[0];
@@ -643,7 +638,7 @@ async fn main() -> Result<()> {
     } = &input.action
     {
         ensure!(
-            input.targets.len() == 1 && input.targets[0].public_entry,
+            input.targets.len() == 1 && input.targets[0].public_node,
             "paid upload probe requires its controlled public provider"
         );
         let target = &input.targets[0];
@@ -787,8 +782,8 @@ async fn main() -> Result<()> {
     } = &input.action
     {
         ensure!(
-            input.targets.len() == 1 && input.targets[0].public_entry,
-            "prefix probe requires its controlled public entry"
+            input.targets.len() == 1 && input.targets[0].public_node,
+            "prefix probe requires its controlled public node"
         );
         let target = &input.targets[0];
         ensure!(
@@ -876,7 +871,7 @@ async fn main() -> Result<()> {
             )
             .await??;
         }
-        if target.public_entry {
+        if target.public_node {
             for (request, expected) in [
                 (
                     json!({"op":"order","order_id":input.order_id}),
@@ -910,7 +905,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        cases.push(json!({"peer":target.peer,"positiveService":true,"singleRequestClosed":true,"stalledHandshakeReleased":true,"privateAlpnsRejected":3,"foreignObjectsRejected":target.public_entry}));
+        cases.push(json!({"peer":target.peer,"positiveService":true,"singleRequestClosed":true,"stalledHandshakeReleased":true,"privateAlpnsRejected":3,"foreignObjectsRejected":target.public_node}));
     }
     let discovery = discovery_checks(&key).await?;
     endpoint.close().await;
