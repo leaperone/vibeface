@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { test, cursorTest } from './fixtures';
 import { expect, secrets } from 'e2e';
 
@@ -27,10 +27,17 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
   await app.screenshot('cursor-cli-sign-in-required');
   await cursor.login();
   await browser.evaluate(() => window.dispatchEvent(new Event('focus')));
-  await expect(card.getByText('可用', { exact: true })).toBeVisible();
+  await expect(card.getByText('未验证，可尝试', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 尚未确认这个模型，可发送消息或先检查可用性', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toHaveCount(0);
   await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveCount(0);
+  const requests = (await readFile(join(cursor.node.directory, '..', 'cursor-requests.jsonl'), 'utf8')).trim().split('\n').map((line): unknown => JSON.parse(line));
+  assert(requests.includes('initialize') && requests.includes('session/new'), 'the signed-in CLI returned its controlled model catalog');
+  assert(!requests.includes('session/prompt'), 'catalog observation sends no model prompt');
+  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
+  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
   assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
-  await app.screenshot('cursor-cli-subscription-ready');
+  await app.screenshot('cursor-cli-authenticated-model-unverified');
 });
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
