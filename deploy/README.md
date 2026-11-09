@@ -60,10 +60,10 @@ chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibefac
 
 `config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP 和上面的端口，`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
 
-`init --tls` 写的是自签占位证书，浏览器不信任它。公共节点没有域名，由宿主的 acme.sh 向 Let's Encrypt 申请 IP 证书（`shortlived` profile，约 6 天有效，acme.sh 按 ARI 大约每 3 天续期），HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot：
+`init --tls` 写的是自签占位证书，浏览器不信任它。公共节点没有域名，由宿主 root 的 acme.sh（要写 0700 的数据目录并改属主） 向 Let's Encrypt 申请 IP 证书（`shortlived` profile，约 6 天有效，acme.sh 按 ARI 大约每 3 天续期），HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot：
 
 ```sh
-acme.sh --issue --server letsencrypt -d 8.217.72.118 --cert-profile shortlived -w /var/www/acme
+acme.sh --issue --server letsencrypt -d 8.217.72.118 --certificate-profile shortlived -w /var/www/acme
 acme.sh --install-cert -d 8.217.72.118 \
   --fullchain-file /opt/apps/vibeface-node/state/tls-cert.pem \
   --key-file /opt/apps/vibeface-node/state/tls-key.pem \
