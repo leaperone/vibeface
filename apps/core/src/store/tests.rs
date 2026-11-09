@@ -7073,11 +7073,16 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
         let mut store = Store::open(&path)?;
         store.install_trust_bundle(&net.network, &net.state)?;
         question_conversation(&mut store, &net)?;
+        let mut card = question(&store, &net, "c", "q-1", "t1")?;
+        if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+            *target = None;
+            store.claim_session(&net.a, &net.network, "c", about, 2)?;
+        }
         store.ask(
             &net.a,
             &net.network,
             "c",
-            question(&store, &net, "c", "q-1", "t1")?,
+            card,
             2,
         )?;
         let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
@@ -7172,11 +7177,16 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
     let (mut a, mut b) = (store(&net)?, store(&net)?);
     question_conversation(&mut a, &net)?;
+    let mut card = question(&a, &net, "c", "q-1", "t1")?;
+    if let EventBody::QuestionAsked { target, about, .. } = &mut card {
+        *target = None;
+        a.claim_session(&net.a, &net.network, "c", about, 2)?;
+    }
     a.ask(
         &net.a,
         &net.network,
         "c",
-        question(&a, &net, "c", "q-1", "t1")?,
+        card,
         2,
     )?;
     sync(&a, &mut b, &net)?;
