@@ -5,7 +5,7 @@
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::memory::MemoryLookup,
     endpoint::{
         BindOpts, Connection, PortmapperConfig, ReadExactError, RecvStream, SendStream, presets,
@@ -20,6 +20,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
+
+use vibeface_secure::link::{Host, NodeLink};
 
 mod lan;
 pub mod mesh;
@@ -237,6 +239,28 @@ pub fn device_id(id: &EndpointId) -> String {
     hex::encode(id.as_bytes())
 }
 
+/// Where `link` says its Node is, its DNS names resolved now; a name that does not resolve is
+/// left out.
+pub async fn link_addr(link: &NodeLink) -> Result<EndpointAddr> {
+    let mut addrs = Vec::new();
+    for addr in &link.addrs {
+        match &addr.host {
+            Host::Ip(ip) => addrs.push(TransportAddr::Ip(SocketAddr::new(*ip, addr.port))),
+            Host::Name(name) => match tokio::net::lookup_host((name.as_str(), addr.port)).await {
+                Ok(found) => addrs.extend(found.take(8).map(TransportAddr::Ip)),
+                Err(error) => tracing::debug!(event = "net.link_unresolved", %name, %error),
+            },
+        }
+    }
+    if let Some(relay) = &link.relay {
+        addrs.push(TransportAddr::Relay(relay_url(relay)?));
+    }
+    Ok(EndpointAddr::from_parts(
+        endpoint_id(&link.device_id())?,
+        addrs,
+    ))
+}
+
 /// A Node's signed statement of where it can be reached, exchanged only inside the network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -394,6 +418,29 @@ impl Net {
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// This Node's node link: public addresses first, then local and loopback ones, at most
+    /// four, and its home relay.
+    pub fn share_link(&self) -> Result<NodeLink> {
+        let addr = self.endpoint.addr();
+        let mut addrs: Vec<SocketAddr> = addr
+            .ip_addrs()
+            .copied()
+            .filter(|address| !matches!(address.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local()))
+            .collect();
+        addrs.sort_by_key(|address| {
+            (
+                address.ip().is_loopback(),
+                !crate::fetch::public(address.ip()),
+            )
+        });
+        addrs.truncate(vibeface_secure::link::MAX_ADDRS);
+        Ok(NodeLink::new(
+            &device_id(&self.endpoint.id()),
+            addrs.into_iter().map(Into::into).collect(),
+            addr.relay_urls().next().map(ToString::to_string),
+        )?)
     }
 
     /// Remembers where a peer is. Its relays are dialed as given, not added to the relay map:

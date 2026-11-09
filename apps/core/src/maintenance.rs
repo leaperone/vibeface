@@ -1087,7 +1087,12 @@ mod tests {
         let node = Arc::new(Runtime::open(&dir).await?);
         let server = tokio::spawn(serve(node.clone(), dir.clone()));
         let link = |secret: u8| -> Result<String> {
-            Ok(Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?.encode()?)
+            let entry = vibeface_secure::link::NodeLink::new(
+                &LocalIdentity::generate().device_id()?,
+                vec![],
+                None,
+            )?;
+            Ok(Ticket::new(entry, [secret; 32])?.encode()?)
         };
         let nonce = || -> Result<(String, String)> {
             let pending: serde_json::Value =

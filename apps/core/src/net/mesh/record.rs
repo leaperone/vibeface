@@ -1,5 +1,6 @@
 // A Node's signed public record on the mesh. The delivery probe includes this file and pins its
 // SHA-256, so it uses only anyhow, serde, serde_json, vibeface_secure and std.
+use crate::delivery::chain::Settlement;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv6Addr, SocketAddr};
@@ -79,13 +80,22 @@ pub enum ServiceKind {
     Delivery,
 }
 
+/// Paid terms: `price`, a decimal amount in the asset's smallest unit, settled through the
+/// delivery escrow. The offering device answers for it by its device ID.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Offer {
-    pub asset: String,
+    pub settlement: Settlement,
     pub price: String,
-    pub escrow: String,
-    pub grant_endpoint: String,
+}
+
+impl Offer {
+    pub fn check(&self) -> Result<()> {
+        self.settlement.validate()?;
+        vibeface_delivery::Amount::from_decimal_str(&self.price)
+            .map_err(|error| anyhow::anyhow!("invalid offer price: {error}"))?;
+        Ok(())
+    }
 }
 
 impl SignedMeshRecord {
@@ -149,9 +159,14 @@ impl MeshRecord {
         }
         for role in &self.roles {
             match role {
-                Role::Relay { url, .. } => relay_url(url)?,
+                Role::Relay { url, offer, .. } => {
+                    relay_url(url)?;
+                    offer.as_ref().map(Offer::check).transpose()?;
+                }
                 Role::Gateway { url } => gateway_url(url)?,
-                Role::Service { .. } => {}
+                Role::Service { offer, .. } => {
+                    offer.as_ref().map(Offer::check).transpose()?;
+                }
             }
         }
         Ok(())
@@ -308,6 +323,73 @@ mod tests {
                 .to_string()
                 .contains("another network")
         );
+    }
+
+    #[test]
+    fn relay_and_delivery_offers_settle_through_the_delivery_chain() {
+        let chain: crate::delivery::chain::ChainConfig =
+            serde_json::from_value(serde_json::json!({
+                "rpc_url": "http://127.0.0.1:8545/",
+                "chain_id": 31337,
+                "escrow": format!("0x{}", "11".repeat(20)),
+                "asset": format!("0x{}", "22".repeat(20)),
+                "profile": serde_json::from_str::<serde_json::Value>(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../crates/delivery/proof/profile.json"
+                )))
+                .unwrap(),
+                "confirmations": 1,
+            }))
+            .unwrap();
+        chain.validate().unwrap();
+        let offer = Offer {
+            settlement: chain.settlement(),
+            price: "2500".into(),
+        };
+        let identity = vibeface_secure::Identity::generate().unwrap();
+        let mut paid = record(&identity, NOW);
+        paid.roles = vec![
+            Role::Relay {
+                url: "https://relay.example/".into(),
+                access: Access::Paid,
+                rate: 1,
+                max_clients: 1,
+                offer: Some(offer.clone()),
+            },
+            Role::Service {
+                service: ServiceKind::Delivery,
+                offer: Some(offer.clone()),
+            },
+        ];
+        let opened = signed(&identity, &paid).open("vibeface", NOW).unwrap();
+        assert_eq!(opened, paid);
+        for broken in [
+            Offer {
+                price: "1.5".into(),
+                ..offer.clone()
+            },
+            Offer {
+                settlement: Settlement {
+                    asset: offer.settlement.escrow.clone(),
+                    ..offer.settlement.clone()
+                },
+                ..offer.clone()
+            },
+            Offer {
+                settlement: Settlement {
+                    escrow: "0xABC".into(),
+                    ..offer.settlement.clone()
+                },
+                ..offer.clone()
+            },
+        ] {
+            let mut bad = record(&identity, NOW);
+            bad.roles = vec![Role::Service {
+                service: ServiceKind::Delivery,
+                offer: Some(broken),
+            }];
+            assert!(SignedMeshRecord::sign(&bad, |_| Ok(String::new())).is_err());
+        }
     }
 
     #[test]

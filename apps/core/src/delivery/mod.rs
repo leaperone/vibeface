@@ -425,20 +425,15 @@ impl Delivery {
         let quotable = config.paid_enabled
             && Amount::from_decimal_str(&config.provider_gas_cap)
                 .is_ok_and(|cap| cap != Amount::ZERO);
-        let offer = match (
-            &config.chain,
-            deployment(&config, Mode::Paid),
-            self.identity.device_id(),
-        ) {
-            (Some(chain), Ok((_, escrow)), Ok(device)) if quotable => Some(Offer {
-                asset: chain.asset.clone(),
+        let offer = config
+            .chain
+            .as_ref()
+            .filter(|_| quotable)
+            .map(|chain| Offer {
+                settlement: chain.settlement(),
                 price: config.delivery_fee_per_window.clone(),
-                escrow: format!("0x{}", hex::encode(escrow)),
-                // ponytail: names the service only; grants come with settlement.
-                grant_endpoint: format!("vibeface://{device}/service/1"),
-            }),
-            _ => None,
-        };
+            })
+            .filter(|offer| offer.check().is_ok());
         (config.enabled && (offer.is_some() || config.charity_enabled)).then_some(Role::Service {
             service: ServiceKind::Delivery,
             offer,

@@ -519,7 +519,7 @@ mod tests {
         };
         let (a, dir_a) = node(config(mesh.clone())).await?;
         let a_bootstrap = format!(
-            "vibeface://{}@127.0.0.1:{}",
+            "vibeface://node/{}?addr=127.0.0.1:{}",
             a.identity.device_id()?,
             a.net()?.endpoint.bound_sockets()[0].port()
         );

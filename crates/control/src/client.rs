@@ -24,6 +24,7 @@ use vibeface_secure::{
         ATTESTATION_DOMAIN, INVITE_DOMAIN, InviteRecord, Ticket, attestation_payload, invite_hash,
         invite_id, join_commit, short_code,
     },
+    link::NodeLink,
     membership::{
         AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, Member, NetworkState,
         Revocation, RootCheckpoint,
@@ -432,13 +433,12 @@ impl Session<'_> {
         };
         record.signature = self.key.sign(INVITE_DOMAIN, &record.signing_payload()?)?;
         let registered = self.call("invite", json!({"record":record})).await?;
-        let entry = registered["entry_id"]
-            .as_str()
-            .context("entry_id is missing")?;
-        Ok(format!(
-            "vibeface://join/{}",
-            Ticket::new(entry, secret)?.encode()?
-        ))
+        let entry = NodeLink::parse(registered["entry"].as_str().context("entry is missing")?)?;
+        ensure!(
+            self.entry.node_id == entry.device_id(),
+            "the invite names another Node than the one this client reached"
+        );
+        Ok(Ticket::new(entry, secret)?.link()?)
     }
 
     /// The joins waiting for a manager, with the short code of each this client pinned and
@@ -635,7 +635,7 @@ pub enum Progress {
 impl<'a> Enrollment<'a> {
     /// Sends `join` for `link` through `origin`, whose Gateway reaches the invite's Node.
     pub async fn start(key: &'a ClientKey, origin: &str, link: &str, name: &str) -> Result<Self> {
-        let ticket = Ticket::decode(link.trim().trim_start_matches("vibeface://join/"))?;
+        let ticket = Ticket::from_link(link)?;
         let entry = Entry {
             origin: origin.to_owned(),
             node_id: ticket.entry_id(),

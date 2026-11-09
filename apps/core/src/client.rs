@@ -750,7 +750,7 @@ async fn dispatch(
     } else {
         Some(node.maintenance.enter()?)
     };
-    if !GUEST_METHODS.contains(&method) {
+    if !GUEST_METHODS.contains(&method) && !local_owner_outside_a_network(node, session).await? {
         principal(node, session).await?;
     }
     match method {
@@ -903,6 +903,10 @@ async fn dispatch(
             node_operator(node, session).await?;
             node.relay_settings()
         }
+        "share_link" => {
+            node_operator(node, session).await?;
+            Ok(json!({"link":node.share_link()?.to_string()}))
+        }
         "configure_relay" => {
             node_operator(node, session).await?;
             node.configure_relay(params).await
@@ -994,7 +998,7 @@ async fn dispatch(
                 .lock()
                 .await
                 .register_invite(&record, &session.device_id)?;
-            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?}))
+            Ok(json!({"join_id":join_id,"entry":node.share_link()?.to_string()}))
         }
         "entrances" => {
             let principal = principal(node, session).await?;
@@ -1563,7 +1567,17 @@ pub(crate) async fn operator_call(
     dispatch(node, &mut session, method, params).await
 }
 
+async fn local_owner_outside_a_network(node: &Runtime, session: &Session) -> Result<bool> {
+    Ok(session.operator && !node.has_membership().await?)
+}
+
+/// A management client, the local page, or the owner at this computer; the owner runs the Node
+/// also before it belongs to a personal network, as a public or bootstrap Node does. Methods
+/// that act inside a network still ask for its principal.
 async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
+    if local_owner_outside_a_network(node, session).await? {
+        return Ok(());
+    }
     let principal = principal(node, session).await?;
     ensure!(
         principal.can_manage || matches!(principal.source, "local_session" | "local_operator"),
@@ -1677,13 +1691,7 @@ fn client_url(origin: &str) -> Result<String> {
 
 /// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
-    let link = link.trim();
-    let ticket = link.strip_prefix("vibeface://join/").unwrap_or(link);
-    ensure!(
-        ticket.starts_with("vibeface1"),
-        "invite link must look like vibeface://join/vibeface1…"
-    );
-    Ok(Ticket::decode(ticket)?)
+    Ok(Ticket::from_link(link)?)
 }
 
 /// Saved so an interrupted join, from the terminal or the local page, resumes with the same
@@ -1704,7 +1712,8 @@ struct JoinLink {
     entry: String,
 }
 impl JoinLink {
-    /// A link to the ticket's entry Node, found on the mesh or through the configured relays.
+    /// A link to the ticket's entry Node, dialed at the addresses and relay the ticket carries
+    /// and where the mesh or the configured relays find it.
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
@@ -1717,35 +1726,45 @@ impl JoinLink {
         // its map on its own once bound, so the relays go in once their tokens are known.
         let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, vec![]).await?);
         let db = node.data_dir.join("mesh.sqlite3");
+        let hints = net::link_addr(&ticket.entry).await?;
+        // The entry's home relays: where the mesh says it is, and where the ticket says it was.
+        let homes = |record: &Option<net::mesh::record::MeshRecord>| -> Vec<iroh::RelayUrl> {
+            record
+                .as_ref()
+                .and_then(|record| record.relay_url.as_deref())
+                .and_then(|url| net::relay_url(url).ok())
+                .into_iter()
+                .chain(hints.relay_urls().cloned())
+                .collect()
+        };
         let (record, open) = match node.net().ok().and_then(|net| net.mesh()) {
             Some(mesh) => {
                 let record = mesh.find(&entry).await;
-                let home = record.as_ref().and_then(|record| record.relay_url.clone());
-                let open = home
-                    .and_then(|url| net::relay_url(&url).ok())
-                    .is_some_and(|url| net::mesh::open_relay(mesh.table().entries(), &url));
+                let open: Vec<_> = homes(&record)
+                    .into_iter()
+                    .filter(|url| net::mesh::open_relay(mesh.table().entries(), url))
+                    .collect();
                 (record, open)
             }
             None if network.mesh.enabled => {
                 let record = net::mesh::find_through(&link, &network.mesh, &db, &entry).await;
-                let home = record.as_ref().and_then(|record| record.relay_url.clone());
-                let open = home
-                    .and_then(|url| net::relay_url(&url).ok())
-                    .is_some_and(|url| {
-                        net::mesh::table::read(&db, &network.mesh.network)
-                            .is_ok_and(|entries| net::mesh::open_relay(&entries, &url))
-                    });
+                let entries =
+                    net::mesh::table::read(&db, &network.mesh.network).unwrap_or_default();
+                let open: Vec<_> = homes(&record)
+                    .into_iter()
+                    .filter(|url| net::mesh::open_relay(&entries, url))
+                    .collect();
                 (record, open)
             }
-            None => (None, false),
+            None => (None, vec![]),
         };
         let entry_addr = record
             .as_ref()
             .map(|record| net::mesh::record_addr(record, network.mesh.allow_private))
             .transpose()?;
-        // A relay configured with a token keeps it. Found on the mesh, only the entry's home relay
-        // gets the invite token, unless it admits anyone; not found, the entry may run any
-        // configured relay.
+        // A relay configured with a token keeps it. The entry's home relays, found on the mesh or
+        // named by the ticket, get the invite token unless they admit anyone; not found on the
+        // mesh, the entry may run any configured relay.
         let mut relays = network
             .relays
             .iter()
@@ -1757,11 +1776,9 @@ impl JoinLink {
                 Ok((net::relay_url(&relay.url)?, credential))
             })
             .collect::<Result<Vec<_>>>()?;
-        if let Some(home) = entry_addr
-            .as_ref()
-            .and_then(|addr| addr.relay_urls().next())
-        {
-            let credential = (!open).then(|| token.clone());
+        let mesh_home = entry_addr.iter().flat_map(|addr| addr.relay_urls()).take(1);
+        for home in mesh_home.chain(hints.relay_urls()) {
+            let credential = (!open.contains(home)).then(|| token.clone());
             match relays.iter_mut().find(|(known, _)| known == home) {
                 Some((_, slot @ None)) => *slot = credential,
                 Some(_) => {}
@@ -1769,8 +1786,8 @@ impl JoinLink {
             }
         }
         ensure!(
-            record.is_some() || !relays.is_empty(),
-            "the invite's entry Node is not on the mesh and no relay is configured to reach it"
+            record.is_some() || !relays.is_empty() || hints.ip_addrs().next().is_some(),
+            "the invite carries no address of its entry Node, which is not on the mesh, and no relay is configured to reach it"
         );
         for (url, credential) in &relays {
             link.insert_relay(url.clone(), credential.clone()).await;
@@ -1778,6 +1795,7 @@ impl JoinLink {
         let mut addrs: Vec<TransportAddr> = entry_addr
             .map(|addr| addr.addrs.into_iter().collect())
             .unwrap_or_default();
+        addrs.extend(hints.ip_addrs().copied().map(TransportAddr::Ip));
         addrs.extend(relays.into_iter().map(|(url, _)| TransportAddr::Relay(url)));
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
@@ -2240,9 +2258,18 @@ mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
 
+    /// A ticket entry known only by device ID, found on the mesh or through relays.
+    fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
+        vibeface_secure::link::NodeLink::new(device_id, vec![], None).unwrap()
+    }
+
     #[test]
     fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
-        let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
+        let ticket = Ticket::new(
+            entry_only(&LocalIdentity::generate().device_id().unwrap()),
+            [7; 32],
+        )
+        .unwrap();
         let text = ticket.encode().unwrap();
         for link in [format!("vibeface://join/{text}"), format!(" {text} ")] {
             assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
@@ -2255,6 +2282,51 @@ mod tests {
         ] {
             assert!(parse_join_link(&link).is_err(), "{link}");
         }
+    }
+
+    /// A public or bootstrap Node never joins a personal network; its owner still runs its relay
+    /// and shares its link, while network methods say why they cannot answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_owner_operates_a_node_outside_any_personal_network() -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("operator-no-network-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+        configuration.save(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            assert!(!node.has_membership().await?);
+            let settings = operator_call(&node, "relay_settings", json!({})).await?;
+            assert_eq!(settings["volunteer"], false);
+            let closed =
+                operator_call(&node, "configure_relay", json!({"volunteer":false})).await?;
+            assert_eq!(closed["volunteer"], false);
+            let shared = operator_call(&node, "share_link", json!({})).await?;
+            let link = vibeface_secure::link::NodeLink::parse(
+                shared["link"].as_str().context("share link")?,
+            )?;
+            assert_eq!(link.device_id(), node.identity.device_id()?);
+            let refused = operator_call(&node, "confirm_writable", json!({}))
+                .await
+                .expect_err("writes need a personal network");
+            assert!(
+                format!("{refused:#}").contains("personal network is not installed"),
+                "{refused:#}"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2421,7 +2493,7 @@ mod tests {
                 .port();
             let host = if v4 { "127.0.0.1" } else { "[::1]" };
             Ok(format!(
-                "vibeface://{}@{host}:{port}",
+                "vibeface://node/{}?addr={host}:{port}",
                 net::device_id(&service.endpoint.id())
             ))
         };
@@ -2453,7 +2525,7 @@ mod tests {
             )
             .await?;
         let admin = target.identity.fixture_admin();
-        let ticket = Ticket::new(&target_id, [7; 32])?;
+        let ticket = Ticket::new(entry_only(&target_id), [7; 32])?;
         let mut record = InviteRecord {
             network_id: target.identity.fixture_network_id()?,
             invite_hash: ticket.invite_hash(),
@@ -2554,6 +2626,49 @@ mod tests {
                     .await
                     .with_context(|| format!("relay case {name}"))?;
             }
+            // Off the mesh and without a configured relay, the ticket's own hints reach the
+            // entry: its home relay, given the invite token, or its direct address.
+            let shared = target_net.share_link()?;
+            assert_eq!(
+                shared.relay.as_deref().map(net::relay_url).transpose()?,
+                Some(home.clone())
+            );
+            let off_mesh = |bind: &str| -> Result<NetworkConfig> {
+                Ok(NetworkConfig {
+                    bind: Some(bind.parse()?),
+                    ..Default::default()
+                })
+            };
+            let relay_hint = vibeface_secure::link::NodeLink {
+                addrs: vec![],
+                ..shared.clone()
+            };
+            let joining = node(&dir.join("ticket-relay"), off_mesh("127.0.0.1:0")?).await?;
+            check(
+                &joining,
+                &Ticket::new(relay_hint, [7; 32])?,
+                &access,
+                Some(invite_token.as_str()),
+            )
+            .await
+            .context("ticket relay hint")?;
+            let direct_hint = vibeface_secure::link::NodeLink {
+                relay: None,
+                ..shared
+            };
+            ensure!(
+                !direct_hint.addrs.is_empty(),
+                "the target shares no address"
+            );
+            let joining = node(&dir.join("ticket-addrs"), off_mesh("[::1]:0")?).await?;
+            let link = JoinLink::open(&joining, &Ticket::new(direct_hint, [7; 32])?).await?;
+            let reply = link
+                .call("join_check", json!({"secret":hex::encode([7; 32])}))
+                .await;
+            let path = link.net.path_kind(&target_id);
+            link.net.close().await;
+            assert_eq!(reply?, json!({"invite":"open"}));
+            assert_eq!(path, Some(net::PathKind::Direct));
             let denied = node(
                 &dir.join("wrong-operator-token"),
                 network("127.0.0.1:0".parse()?, WRONG_TOKEN),
@@ -3666,7 +3781,7 @@ mod tests {
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
-            let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
+            let ticket = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?;
             let params = json!({
                 "capability": capability.capability,
                 "link": format!("vibeface://join/{}", ticket.encode()?),
@@ -3784,7 +3899,7 @@ mod tests {
         let result = async {
             // No address and no discovery: the join fails after it committed, before reaching anyone.
             let link = |secret: u8| -> Result<String> {
-                let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+                let ticket = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [secret; 32])?;
                 Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});

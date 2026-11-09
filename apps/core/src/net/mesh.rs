@@ -31,6 +31,7 @@ use std::{
 };
 use table::{Entry, Table};
 use tokio::sync::{Notify, watch};
+use vibeface_secure::link::{Addr, NodeLink};
 
 pub const DEFAULT_NETWORK: &str = "vibeface";
 const MAX_BOOTSTRAP: usize = 16;
@@ -74,8 +75,9 @@ pub struct MeshConfig {
     pub enabled: bool,
     #[serde(default = "default_network")]
     pub network: String,
-    /// The Nodes this one joins through first, as `vibeface://<device_id>@<host>:<udp_port>`
-    /// or `vibeface://<device_id>?relay=<url>`, either with an optional `relay` hint.
+    /// The Nodes this one joins through first, each a node link
+    /// `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>` naming an address, a
+    /// relay or both.
     #[serde(default)]
     pub bootstrap: Vec<String>,
     /// Use gateways and relays on private and loopback addresses, as a LAN group or test does.
@@ -108,7 +110,7 @@ impl MeshConfig {
         let mut seen = HashSet::new();
         for value in &self.bootstrap {
             ensure!(
-                seen.insert(BootstrapNode::parse(value)?.id),
+                seen.insert(bootstrap_link(value)?.id),
                 "a bootstrap node is listed once"
             );
         }
@@ -124,24 +126,24 @@ impl MeshConfig {
         })
     }
 
-    /// Takes out `remove`, each a bootstrap URL or a device ID, and adds `add` in place of any
+    /// Takes out `remove`, each a node link or a device ID, and adds `add` in place of any
     /// listed node of the same device; the result is checked as `init` checks it.
     pub fn edit_bootstrap(&mut self, add: &[String], remove: &[String]) -> Result<()> {
-        let listed = |list: &[String], id: EndpointId| {
+        let listed = |list: &[String], id: [u8; 32]| {
             list.iter()
-                .position(|value| BootstrapNode::parse(value).is_ok_and(|node| node.id == id))
+                .position(|value| bootstrap_link(value).is_ok_and(|node| node.id == id))
         };
         for value in remove {
             let id = match value.starts_with("vibeface://") {
-                true => BootstrapNode::parse(value)?.id,
-                false => endpoint_id(value)?,
+                true => bootstrap_link(value)?.id,
+                false => *endpoint_id(value)?.as_bytes(),
             };
             let at = listed(&self.bootstrap, id)
                 .with_context(|| format!("{value} is not a bootstrap node"))?;
             self.bootstrap.remove(at);
         }
         for value in add {
-            let id = BootstrapNode::parse(value)?.id;
+            let id = bootstrap_link(value)?.id;
             if let Some(at) = listed(&self.bootstrap, id) {
                 self.bootstrap.remove(at);
             }
@@ -173,15 +175,14 @@ pub fn default_bootstrap() -> Result<String> {
         Ok(_) => format!("[{}]", anchor.udp_host),
         Err(_) => anchor.udp_host,
     };
-    let mut url = reqwest::Url::parse(&format!(
-        "vibeface://{}@{host}:{}",
-        anchor.issuer, anchor.udp_port
-    ))?;
-    url.query_pairs_mut()
-        .append_pair("relay", &anchor.relay_url);
-    let value = url.to_string();
-    BootstrapNode::parse(&value).context("invalid config/public-bootstrap.json")?;
-    Ok(value)
+    let link = NodeLink::new(
+        &anchor.issuer,
+        vec![Addr::parse(&format!("{host}:{}", anchor.udp_port))?],
+        Some(anchor.relay_url),
+    )?
+    .to_string();
+    bootstrap_link(&link).context("invalid config/public-bootstrap.json")?;
+    Ok(link)
 }
 
 /// The default bootstrap node's device ID.
@@ -189,62 +190,18 @@ pub fn default_bootstrap_id() -> Result<String> {
     Ok(anchor()?.issuer)
 }
 
-/// Where to dial a bootstrap node. Its relay is a hint for reaching it, never put in the relay map.
-#[derive(Debug, PartialEq, Eq)]
-pub struct BootstrapNode {
-    pub id: EndpointId,
-    address: Option<(String, u16)>,
-    relay: Option<RelayUrl>,
-}
-
-impl BootstrapNode {
-    pub fn parse(value: &str) -> Result<Self> {
-        const FORMAT: &str = "a bootstrap node is vibeface://<device-id>@<host>:<UDP-port> or vibeface://<device-id>?relay=<URL>";
-        let url = reqwest::Url::parse(value).context(FORMAT)?;
-        ensure!(
-            url.scheme() == "vibeface"
-                && url.password().is_none()
-                && url.fragment().is_none()
-                && matches!(url.path(), "" | "/"),
-            FORMAT
-        );
-        let (device, address) = if url.username().is_empty() {
-            ensure!(url.port().is_none(), FORMAT);
-            (url.host_str().unwrap_or_default().to_owned(), None)
-        } else {
-            let host = url.host_str().context(FORMAT)?;
-            let port = url.port().filter(|port| *port != 0).context(FORMAT)?;
-            (
-                url.username().to_owned(),
-                Some((host.trim_matches(['[', ']']).to_owned(), port)),
-            )
-        };
-        let mut relay = None;
-        for (key, value) in url.query_pairs() {
-            ensure!(key == "relay" && relay.is_none(), FORMAT);
-            relay = Some(super::relay_url(&value)?);
-        }
-        ensure!(address.is_some() || relay.is_some(), FORMAT);
-        Ok(Self {
-            id: endpoint_id(&device)?,
-            address,
-            relay,
-        })
+/// A bootstrap node: a node link naming where to dial it. Its relay is a hint for reaching it,
+/// never put in the relay map.
+pub fn bootstrap_link(value: &str) -> Result<NodeLink> {
+    let link = NodeLink::parse(value)?;
+    ensure!(
+        link.has_hints(),
+        "a bootstrap node link needs an addr or a relay"
+    );
+    if let Some(relay) = &link.relay {
+        super::relay_url(relay)?;
     }
-
-    async fn addr(&self) -> EndpointAddr {
-        let mut addrs = Vec::new();
-        if let Some((host, port)) = &self.address {
-            match tokio::net::lookup_host((host.as_str(), *port)).await {
-                Ok(found) => addrs.extend(found.take(8).map(TransportAddr::Ip)),
-                Err(error) => {
-                    tracing::debug!(event = "mesh.bootstrap_unresolved", %host, %error)
-                }
-            }
-        }
-        addrs.extend(self.relay.clone().map(TransportAddr::Relay));
-        EndpointAddr::from_parts(self.id, addrs)
-    }
+    Ok(link)
 }
 
 pub fn gossip_alpn(network: &str) -> Vec<u8> {
@@ -663,14 +620,17 @@ impl Mesh {
         };
         let bootstrap = self.bootstrap.lock().expect("mesh bootstrap").clone();
         for value in bootstrap {
-            let Ok(node) = BootstrapNode::parse(&value) else {
+            let Ok(link) = bootstrap_link(&value) else {
                 continue;
             };
-            if node.id == self.endpoint.id() || peers.contains(&node.id) {
+            let Ok(addr) = super::link_addr(&link).await else {
+                continue;
+            };
+            if addr.id == self.endpoint.id() || peers.contains(&addr.id) {
                 continue;
             }
-            self.lookup.add_endpoint_info(node.addr().await);
-            peers.push(node.id);
+            peers.push(addr.id);
+            self.lookup.add_endpoint_info(addr);
         }
         peers
     }
@@ -1085,8 +1045,10 @@ pub async fn find_through(
         Err(error) => tracing::debug!(event = "mesh.table_unavailable", %error),
     }
     for value in &config.bootstrap {
-        if let Ok(node) = BootstrapNode::parse(value) {
-            candidates.push(node.addr().await);
+        if let Ok(link) = bootstrap_link(value)
+            && let Ok(addr) = super::link_addr(&link).await
+        {
+            candidates.push(addr);
         }
     }
     let alpn = exchange_alpn(&config.network);
@@ -1219,35 +1181,41 @@ impl AddressLookup for Lookup {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bootstrap_nodes_name_a_device_and_where_to_reach_it() {
+    #[tokio::test]
+    async fn bootstrap_nodes_are_node_links_that_say_where_to_reach_them() {
         let id = "eb963306d731fa49648858f7a5489bd45aa1b96be18adb30e9909b9f8dd4b2dc";
-        let full = BootstrapNode::parse(&format!(
-            "vibeface://{id}@node.example:4792?relay=http%3A%2F%2Fnode.example%3A3340"
+        let full = bootstrap_link(&format!(
+            "vibeface://node/{id}?addr=127.0.0.1:4792&relay=http://node.example:3340"
         ))
         .unwrap();
-        assert_eq!(device_id(&full.id), id);
-        assert_eq!(full.address, Some(("node.example".into(), 4792)));
-        assert_eq!(full.relay.unwrap().to_string(), "http://node.example:3340/");
-        let relay_only = BootstrapNode::parse(&format!(
-            "vibeface://{id}?relay=https%3A%2F%2Frelay.example"
-        ))
-        .unwrap();
-        assert_eq!(relay_only.address, None);
+        assert_eq!(full.device_id(), id);
+        let addr = super::super::link_addr(&full).await.unwrap();
+        assert_eq!(device_id(&addr.id), id);
+        assert_eq!(
+            addr.ip_addrs().copied().collect::<Vec<_>>(),
+            ["127.0.0.1:4792".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            addr.relay_urls().next().unwrap().to_string(),
+            "http://node.example:3340/"
+        );
+        let relay_only =
+            bootstrap_link(&format!("vibeface://node/{id}?relay=https://relay.example")).unwrap();
+        assert!(relay_only.addrs.is_empty());
         for bad in [
-            format!("vibeface://{id}"),
-            format!("vibeface://{id}@node.example"),
-            format!("https://{id}@node.example:4792"),
-            format!("vibeface://{id}@node.example:4792?relay=ftp%3A%2F%2Fx"),
-            format!("vibeface://{id}@node.example:4792?other=1"),
-            "vibeface://zz@node.example:4792".into(),
+            format!("vibeface://node/{id}"),
+            format!("vibeface://{id}@node.example:4792"),
+            format!("https://node/{id}?addr=node.example:4792"),
+            format!("vibeface://node/{id}?addr=node.example:4792&relay=http://user@x"),
+            format!("vibeface://node/{id}?addr=node.example:4792&other=1"),
+            "vibeface://node/zz?addr=node.example:4792".into(),
         ] {
-            assert!(BootstrapNode::parse(&bad).is_err(), "{bad}");
+            assert!(bootstrap_link(&bad).is_err(), "{bad}");
         }
         let public = MeshConfig::public().unwrap();
         assert!(public.enabled && public.network == DEFAULT_NETWORK);
         assert_eq!(
-            device_id(&BootstrapNode::parse(&public.bootstrap[0]).unwrap().id),
+            bootstrap_link(&public.bootstrap[0]).unwrap().device_id(),
             default_bootstrap_id().unwrap()
         );
         assert!(
@@ -1294,7 +1262,10 @@ mod tests {
 
         fn bootstrap(&self) -> String {
             let port = self.net.endpoint.bound_sockets()[0].port();
-            format!("vibeface://{}@127.0.0.1:{port}", self.mesh.device_id)
+            format!(
+                "vibeface://node/{}?addr=127.0.0.1:{port}",
+                self.mesh.device_id
+            )
         }
 
         /// Waits until this Node holds `count` records that name an address.

@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(public.bootstrap, [mesh::default_bootstrap().unwrap()]);
         assert_eq!(init_mesh(false, None, vec![]).unwrap(), public);
         assert!(!init_mesh(true, None, vec![]).unwrap().enabled);
-        let own = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
+        let own = "vibeface://node/82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235?addr=127.0.0.1:4792";
         assert_eq!(
             init_mesh(false, None, vec![own.into()]).unwrap().bootstrap,
             [own]
@@ -883,7 +883,7 @@ mod tests {
         }))?;
         initialize_from_options(options)?;
         let device = "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235";
-        let added = format!("vibeface://{device}@127.0.0.1:4792");
+        let added = format!("vibeface://node/{device}?addr=127.0.0.1:4792");
         let edit = |add: Vec<&str>, remove: Vec<&str>| {
             mesh_control(&dir, json!({"op":"bootstrap","add":add,"remove":remove}))
         };
@@ -892,7 +892,7 @@ mod tests {
         let default = mesh::default_bootstrap()?;
         assert_eq!(result["bootstrap"], json!([default, added]));
         assert!(
-            edit(vec!["vibeface://zz@127.0.0.1:1"], vec![])
+            edit(vec!["vibeface://node/zz?addr=127.0.0.1:1"], vec![])
                 .await
                 .is_err()
         );

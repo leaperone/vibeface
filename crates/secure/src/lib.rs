@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 pub mod join;
 pub mod lan;
+pub mod link;
 pub mod membership;
 
 mod recovery;

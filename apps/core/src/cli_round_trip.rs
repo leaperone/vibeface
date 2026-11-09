@@ -89,6 +89,19 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let phone_id = phone.device_id().to_owned();
         let mut session = admin.connect(None).await?;
         let link = session.invite().await?;
+        // The invite carries the Node's own node link, the one it shares.
+        let shared = crate::client::operator_call(&node, "share_link", json!({})).await?;
+        let shared = shared["link"].as_str().context("share link")?;
+        assert_eq!(
+            vibeface_secure::link::NodeLink::parse(shared)?.device_id(),
+            entry.node_id
+        );
+        assert_eq!(
+            vibeface_secure::join::Ticket::from_link(&link)?
+                .entry
+                .to_string(),
+            shared
+        );
         let mut enrollment = Enrollment::start(&phone, &entry.origin, &link, "phone").await?;
         assert!(matches!(enrollment.poll().await?, Progress::Waiting));
         let join_id = enrollment.join_id.clone();

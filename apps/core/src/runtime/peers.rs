@@ -217,6 +217,19 @@ impl Runtime {
         self.net.get().context("the Node network has not started")
     }
 
+    /// This Node's node link, which bootstraps other Nodes and goes into its invites; only its
+    /// device ID until the network starts.
+    pub(crate) fn share_link(&self) -> Result<vibeface_secure::link::NodeLink> {
+        match self.net() {
+            Ok(net) => net.share_link(),
+            Err(_) => Ok(vibeface_secure::link::NodeLink::new(
+                &self.identity.device_id()?,
+                vec![],
+                None,
+            )?),
+        }
+    }
+
     pub(super) async fn start_network(self: &Arc<Self>) -> Result<()> {
         let net = Arc::new(
             Net::bind(

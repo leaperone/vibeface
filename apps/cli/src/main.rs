@@ -250,10 +250,10 @@ struct Init {
     /// Mesh to join instead of the public one; it starts without the default bootstrap node.
     #[arg(long, value_name = "NAME")]
     mesh_network: Option<String>,
-    /// A Node to join the mesh through first, itself an ordinary Node:
-    /// vibeface://<device-id>@<host>:<UDP-port>[?relay=<URL>]. Repeat for more; replaces the
-    /// default bootstrap node.
-    #[arg(long = "bootstrap", value_name = "URL")]
+    /// The first Node you know, as its node link from `vibeface mesh share`:
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>. Repeat for more; replaces
+    /// the default bootstrap node.
+    #[arg(long = "bootstrap", value_name = "LINK")]
     bootstrap: Vec<String>,
 }
 
@@ -413,18 +413,21 @@ enum MeshAction {
         #[command(subcommand)]
         command: BootstrapAction,
     },
+    /// Print this running Node's node link, for another Node's --bootstrap.
+    Share,
 }
 
 #[derive(Subcommand)]
 enum BootstrapAction {
-    /// Add bootstrap nodes: vibeface://<device-id>@<host>:<UDP-port>[?relay=<URL>].
+    /// Add bootstrap nodes, each a node link
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>.
     Add {
-        #[arg(required = true, value_name = "URL")]
+        #[arg(required = true, value_name = "LINK")]
         nodes: Vec<String>,
     },
-    /// Remove bootstrap nodes by URL or device ID.
+    /// Remove bootstrap nodes by node link or device ID.
     Remove {
-        #[arg(required = true, value_name = "URL|DEVICE_ID")]
+        #[arg(required = true, value_name = "LINK|DEVICE_ID")]
         nodes: Vec<String>,
     },
 }
@@ -948,6 +951,11 @@ async fn status(options: Access) -> Result<()> {
 
 async fn mesh(options: MeshOptions) -> Result<()> {
     let operation = match &options.command {
+        MeshAction::Share => {
+            let shared = manage::operator(&options.data_dir, "share_link", json!({})).await?;
+            println!("{}", shared["link"].as_str().unwrap_or_default());
+            return Ok(());
+        }
         MeshAction::Status { .. } => json!({"op":"status"}),
         MeshAction::Records { role, limit, .. } => {
             json!({"op":"records","role":role,"limit":limit})
@@ -1019,6 +1027,7 @@ async fn mesh(options: MeshOptions) -> Result<()> {
                 );
             }
         }
+        MeshAction::Share => unreachable!("answered by the running Node above"),
         MeshAction::Bootstrap { .. } => {
             for node in result["bootstrap"].as_array().into_iter().flatten() {
                 println!("{}", node.as_str().unwrap_or_default());
@@ -2732,6 +2741,31 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["vibeface", "--data-dir", "relative"]).is_err());
+    }
+
+    #[test]
+    fn mesh_share_and_bootstrap_take_node_links() {
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "--data-dir", TEST_DATA_NODE, "share"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Share,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["vibeface", "mesh", "share", "extra"]).is_err());
+        let link = "vibeface://node/82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235?addr=203.0.113.5:4790";
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "bootstrap", "add", link]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Bootstrap {
+                    command: BootstrapAction::Add { nodes }
+                },
+                ..
+            })) if nodes == [link]
+        ));
     }
 
     #[test]

@@ -336,7 +336,7 @@ extern "C" {
         RustCallStatus *uniffi_out_err
     );
     RustBuffer uniffi_vibeface_secure_ffi_fn_func_ticket_encode(
-        RustBuffer entry_id, 
+        RustBuffer entry, 
         RustBuffer secret_hex, 
         RustCallStatus *uniffi_out_err
     );
