@@ -1220,12 +1220,48 @@ def self_test_diagnostics():
 def self_test():
     from unittest.mock import Mock, patch
     from types import SimpleNamespace
+    import io
     import socket
     import tempfile
     def forbidden(*_args, **_kwargs):
         raise AssertionError("no-process self-test attempted an external process or network")
     with patch.object(subprocess, "Popen", forbidden), patch.object(subprocess, "run", forbidden), patch.object(socket, "socket", forbidden):
         self_test_diagnostics()
+        Client = runpy.run_path(str(REPOSITORY / "scripts/verify-node.py"))["Client"]
+        for identity in (None, Path("/artifact/client-identity.json")):
+            stdin = io.StringIO()
+            stdout = io.StringIO('{"ok":true,"result":{"device_id":"synthetic-client"}}\n'
+                                 '{"ok":true,"result":{"status":"ready"}}\n')
+            process = SimpleNamespace(stdin=stdin, stdout=stdout, wait=Mock(return_value=0), kill=Mock())
+            with patch.dict(os.environ, {"UV_THREADPOOL_SIZE": "7", "VIBEFACE_HELPER_SELFTEST_SENTINEL": "unchanged"}):
+                parent_environment = dict(os.environ)
+                with patch.object(subprocess, "Popen", return_value=process) as spawn, \
+                     patch.object(select, "select", return_value=([stdout], [], [])) as ready:
+                    client = Client("http://127.0.0.1:1", Path("/artifact/client.mjs"), identity_file=identity)
+                    for timeout in (0, 31):
+                        try: client.command("identity", _wait_timeout=timeout)
+                        except AssertionError as error:
+                            need(str(error) == "client command wait stays within its original deadline", "client_wait_bound_rejects_before_spawn")
+                        else: raise AssertionError("client command accepted an invalid wait bound")
+                    need(spawn.call_count == 0, "client_invalid_wait_never_spawns")
+                    need(client.command("identity") == {"device_id": "synthetic-client"}, "client_first_json_response")
+                    need(client.command("request", method="status", params={}, _wait_timeout=7) == {"status": "ready"}, "client_second_json_response")
+                    need([json.loads(line) for line in stdin.getvalue().splitlines()] == [
+                        {"op": "identity"}, {"op": "request", "method": "status", "params": {}}], "client_original_json_requests")
+                    client.close()
+                    need(spawn.call_count == 1, "client_reuses_its_helper_process")
+                    need(spawn.call_args.args == (["node", "--v8-pool-size=1", "/artifact/client.mjs", *([str(identity)] if identity else [])],),
+                         "client_helper_v8_pool_is_fixed")
+                    need(spawn.call_args.kwargs == {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL,
+                         "text": True, "bufsize": 1, "env": {**parent_environment, "UV_THREADPOOL_SIZE": "1"}}, "client_helper_child_pool_and_stdio_preserved")
+                    need(dict(os.environ) == parent_environment, "client_helper_does_not_mutate_parent_environment")
+                    need([call.args for call in ready.call_args_list] == [([stdout], [], [], 30), ([stdout], [], [], 7)], "client_original_wait_bounds")
+                    need(stdin.closed and client.process is None, "client_close_sends_eof_and_releases_process")
+                    need(process.wait.call_count == 1 and process.wait.call_args.args == ()
+                         and process.wait.call_args.kwargs == {"timeout": 5}, "client_close_original_wait_bound")
+                    need(process.kill.call_count == 0, "client_normal_close_does_not_kill")
+            stdout.close()
+        need(subprocess.Popen is forbidden and subprocess.run is forbidden and socket.socket is forbidden, "client_mock_preserves_outer_process_and_network_gate")
         sample = {"schema_version": 1, "source_commit": "1" * 40,
             "paths": {"repository": str(REPOSITORY), "binary": "/artifact/vibeface", "core_binary": "/artifact/vibeface-core", "crypto_module": "/artifact/vibeface_secure.js", "prover": "/artifact/vibeface-delivery-prover", "r0vm": "/artifact/r0vm"},
             "sha256": {name: "a" * 64 for name in ("binary", "core_binary", "crypto_module", "crypto_wasm", "prover", "r0vm", "profile")},
