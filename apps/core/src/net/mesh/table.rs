@@ -142,7 +142,7 @@ impl Table {
 
     /// Takes `records` from other devices; returns those accepted, each valid and dated at least
     /// 30 s after the one held, and the writes that store them. A device not held yet is taken
-    /// only when `admit` agrees.
+    /// only when it is protected or `admit` agrees.
     pub fn insert(
         &mut self,
         records: Vec<SignedMeshRecord>,
@@ -162,7 +162,9 @@ impl Table {
                 Some(entry) if record.seq < entry.record.seq.saturating_add(MIN_INTERVAL_MS) => {
                     continue;
                 }
-                None if !admit(&record) => continue,
+                None if !self.protected.contains(&record.device_id) && !admit(&record) => {
+                    continue;
+                }
                 _ => {}
             }
             if self.put(signed, record.clone(), now_ms, &mut writes) {
@@ -199,26 +201,39 @@ impl Table {
             .filter(move |entry| entry.online(now_ms))
     }
 
-    /// The record a full table drops for a new device: the expired one seen longest ago, else
-    /// the one first seen most recently, so records known for long outlast a flood of new ones.
-    /// This Node's own record and protected ones are never dropped.
-    fn victim(&self, now_ms: u64) -> Option<String> {
-        // ponytail: a scan of the full table per new device once full; an ordered index if it
-        // shows.
-        let droppable = || {
-            self.entries.values().filter(|entry| {
+    /// The records a full table drops for new devices, one 64th of it in one scan: the expired
+    /// ones seen longest ago first, then the ones first seen most recently, so records known for
+    /// long outlast a flood of new ones. This Node's own record and protected ones are never
+    /// dropped.
+    fn victims(&self, now_ms: u64) -> Vec<String> {
+        let mut droppable: Vec<((bool, u64), &str)> = self
+            .entries
+            .values()
+            .filter(|entry| {
                 entry.record.device_id != self.own
                     && !self.protected.contains(&entry.record.device_id)
             })
-        };
-        droppable()
-            .filter(|entry| !entry.online(now_ms))
-            .min_by_key(|entry| entry.last_seen_ms)
-            .or_else(|| droppable().max_by_key(|entry| entry.first_seen_ms))
-            .map(|entry| entry.record.device_id.clone())
+            .map(|entry| {
+                let key = if entry.online(now_ms) {
+                    (true, u64::MAX - entry.first_seen_ms)
+                } else {
+                    (false, entry.last_seen_ms)
+                };
+                (key, entry.record.device_id.as_str())
+            })
+            .collect();
+        let count = (self.capacity / 64).clamp(1, droppable.len().max(1));
+        if droppable.len() > count {
+            droppable.select_nth_unstable(count);
+            droppable.truncate(count);
+        }
+        droppable
+            .into_iter()
+            .map(|(_, device)| device.to_owned())
+            .collect()
     }
 
-    /// Holds `record`, dropping another when the table is full; returns false when the table is
+    /// Holds `record`, dropping others when the table is full; returns false when the table is
     /// full of records that stay and `record` is neither this Node's nor protected.
     fn put(
         &mut self,
@@ -230,14 +245,16 @@ impl Table {
         let held = self.entries.get(&record.device_id);
         let first_seen_ms = held.map_or(now_ms, |entry| entry.first_seen_ms);
         if held.is_none() && self.entries.len() >= self.capacity {
-            match self.victim(now_ms) {
-                Some(victim) => {
-                    self.entries.remove(&victim);
-                    writes.push(Write::Delete(victim));
-                }
-                None if record.device_id == self.own
-                    || self.protected.contains(&record.device_id) => {}
-                None => return false,
+            let victims = self.victims(now_ms);
+            if victims.is_empty()
+                && record.device_id != self.own
+                && !self.protected.contains(&record.device_id)
+            {
+                return false;
+            }
+            for victim in victims {
+                self.entries.remove(&victim);
+                writes.push(Write::Delete(victim));
             }
         }
         let entry = Entry {

@@ -71,7 +71,9 @@ const PROBE_EVERY: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 /// Records of devices not held yet that one neighbor's deliveries may add, per second and at
-/// once. The personal network's Nodes and the bootstrap nodes are not limited.
+/// once, and all gossip together too: gossip forwards records before any Node checks them, so
+/// who delivers one says nothing of who made it. Records of the personal network's Nodes and
+/// the bootstrap nodes, and pages pulled from them, are not limited.
 const NEW_RECORDS_PER_SECOND: f64 = 20.0;
 const NEW_RECORDS_BURST: f64 = 200.0;
 /// Changes to the table are written to `mesh.sqlite3` together, this long after the first.
@@ -416,6 +418,17 @@ struct Limit {
     probe_at: Option<Instant>,
 }
 
+/// Where records came from.
+#[derive(Clone, Copy)]
+enum Delivery {
+    /// The answer to a lookup this Node made.
+    Asked,
+    /// A page this Node pulled from the peer.
+    Pulled(EndpointId),
+    /// Gossip the neighbor forwarded, whoever made it.
+    Gossip(EndpointId),
+}
+
 /// How many records of devices not held yet one neighbor may still deliver.
 struct Bucket {
     tokens: f64,
@@ -470,6 +483,8 @@ pub struct Mesh {
     members: Mutex<Vec<String>>,
     neighbors: Mutex<HashSet<EndpointId>>,
     buckets: Mutex<HashMap<EndpointId, Bucket>>,
+    /// New records all gossip together may still add.
+    gossip_bucket: Mutex<Bucket>,
     /// Asks the announcer to check this Node's record.
     wake: Notify,
     limits: Mutex<HashMap<EndpointId, Limit>>,
@@ -519,6 +534,7 @@ impl Mesh {
             members: Mutex::new(vec![]),
             neighbors: Mutex::new(HashSet::new()),
             buckets: Mutex::new(HashMap::new()),
+            gossip_bucket: Mutex::new(Bucket::new()),
             wake: Notify::new(),
             limits: Mutex::new(HashMap::new()),
             answering: Arc::new(tokio::sync::Semaphore::new(ANSWERING)),
@@ -850,26 +866,34 @@ impl Mesh {
         ok
     }
 
-    /// Takes `records` that `from` delivered, or that this Node asked for when `None`. A
-    /// neighbor outside the personal network and the bootstrap nodes adds records of devices
-    /// not held yet at most 20 a second, 200 at once; returns the records accepted and whether
+    /// Takes `records` as `delivery` brought them. Records of devices not held yet, other than
+    /// the personal network's Nodes and the bootstrap nodes, come in at most 20 a second, 200 at
+    /// once, from each neighbor and from all gossip together; a lookup's answer and a page pulled
+    /// from a member or bootstrap node are not limited. Returns the records accepted and whether
     /// any were dropped for that.
     fn accept_records(
         &self,
         records: Vec<SignedMeshRecord>,
-        from: Option<EndpointId>,
+        delivery: Delivery,
     ) -> (Vec<MeshRecord>, bool) {
         let mut limited = false;
         let (accepted, writes) = {
             let mut table = self.table.lock().expect("mesh table");
-            let from = from.filter(|peer| !table.is_protected(&device_id(peer)));
+            let from = match delivery {
+                Delivery::Asked => None,
+                Delivery::Pulled(peer) if table.is_protected(&device_id(&peer)) => None,
+                Delivery::Pulled(peer) | Delivery::Gossip(peer) => Some(peer),
+            };
             let mut buckets = self.buckets.lock().expect("mesh buckets");
             if buckets.len() >= 4096 {
                 buckets.retain(|_, bucket| bucket.at.elapsed() < Duration::from_secs(60));
             }
+            let mut gossip = matches!(delivery, Delivery::Gossip(_))
+                .then(|| self.gossip_bucket.lock().expect("mesh gossip bucket"));
             let mut bucket = from.map(|peer| buckets.entry(peer).or_insert_with(Bucket::new));
             let admit = |_: &MeshRecord| {
-                let admitted = bucket.as_mut().is_none_or(|bucket| bucket.take());
+                let admitted = bucket.as_mut().is_none_or(|bucket| bucket.take())
+                    && gossip.as_mut().is_none_or(|bucket| bucket.take());
                 limited |= !admitted;
                 admitted
             };
@@ -951,7 +975,7 @@ impl Mesh {
                 }
                 Ok(Event::Received(message)) => {
                     if let Ok(signed) = serde_json::from_slice(&message.content) {
-                        self.accept_records(vec![signed], Some(message.delivered_from));
+                        self.accept_records(vec![signed], Delivery::Gossip(message.delivered_from));
                     }
                 }
                 Ok(Event::Lagged) => {
@@ -1011,7 +1035,7 @@ impl Mesh {
                 let record = MeshRecord::parse(&signed.payload).ok()?;
                 Some((record.device_id, record.seq))
             }));
-            let (_, limited) = self.accept_records(records, Some(peer));
+            let (_, limited) = self.accept_records(records, Delivery::Pulled(peer));
             if limited || reply["more"] != true {
                 break;
             }
@@ -1186,7 +1210,7 @@ impl Mesh {
         .ok()
         .flatten()?;
         let record = MeshRecord::parse(&signed.payload).ok();
-        self.accept_records(vec![signed], None);
+        self.accept_records(vec![signed], Delivery::Asked);
         record
     }
 
@@ -1622,7 +1646,8 @@ mod tests {
 
     /// A neighbor delivers ten thousand records of new devices into a table that holds at
     /// most 100. It adds about 200 of them, no more than its limit lets through, and none of
-    /// the 50 records known before is dropped; a member's deliveries are not limited.
+    /// the 50 records known before is dropped. Strangers' records a member forwards are limited
+    /// too; a member's own record and pages pulled from a member are not.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_flood_of_new_records_neither_passes_the_limit_nor_drops_known_ones() -> Result<()> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1640,7 +1665,7 @@ mod tests {
                 .collect();
             let (accepted, _) = node
                 .mesh
-                .accept_records(known.iter().map(signed_record).collect(), None);
+                .accept_records(known.iter().map(signed_record).collect(), Delivery::Asked);
             assert_eq!(accepted.len(), 50);
 
             let flood: Vec<SignedMeshRecord> = (0..10_000)
@@ -1651,7 +1676,9 @@ mod tests {
             let mut added = 0;
             let mut limited = false;
             for signed in flood {
-                let (accepted, dropped) = node.mesh.accept_records(vec![signed], Some(neighbor));
+                let (accepted, dropped) = node
+                    .mesh
+                    .accept_records(vec![signed], Delivery::Gossip(neighbor));
                 added += accepted.len();
                 limited |= dropped;
             }
@@ -1671,13 +1698,28 @@ mod tests {
 
             let member = vibeface_secure::Identity::generate()?;
             node.mesh.join_peers(&[member.device_id()]).await;
-            let from_member: Vec<SignedMeshRecord> = (0..300)
+            let member_id = endpoint_id(&member.device_id())?;
+            let forwarded: Vec<SignedMeshRecord> = (0..300)
+                .map(|_| signed_record(&vibeface_secure::Identity::generate().unwrap()))
+                .collect();
+            let (accepted, limited) = node
+                .mesh
+                .accept_records(forwarded, Delivery::Gossip(member_id));
+            assert!(
+                limited && accepted.len() < 300,
+                "strangers' records a member forwards are limited"
+            );
+            let (accepted, _) = node
+                .mesh
+                .accept_records(vec![signed_record(&member)], Delivery::Gossip(neighbor));
+            assert_eq!(accepted.len(), 1, "a member's own record is not limited");
+            let pulled: Vec<SignedMeshRecord> = (0..300)
                 .map(|_| signed_record(&vibeface_secure::Identity::generate().unwrap()))
                 .collect();
             let (_, limited) = node
                 .mesh
-                .accept_records(from_member, Some(endpoint_id(&member.device_id())?));
-            assert!(!limited, "a member's deliveries are not limited");
+                .accept_records(pulled, Delivery::Pulled(member_id));
+            assert!(!limited, "a page pulled from a member is not limited");
             Ok::<_, anyhow::Error>(())
         }
         .await;
