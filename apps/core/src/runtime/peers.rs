@@ -258,7 +258,7 @@ impl Runtime {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
                 {
-                    net.learn(&record.endpoint).await;
+                    net.learn_member(&record).await;
                 }
             }
         }
@@ -1572,16 +1572,18 @@ impl Runtime {
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
         let gateway_url = self.gateway_url();
+        let relay = self.config.network.own_relay()?.map(|url| url.to_string());
         let mut store = self.store.lock().await;
         let previous = store
             .address_book()?
             .into_iter()
             .filter_map(|signed| signed.open(network).ok())
             .find(|record| record.device_id == device_id);
-        if previous
-            .as_ref()
-            .is_some_and(|record| record.endpoint == endpoint && record.gateway_url == gateway_url)
-        {
+        if previous.as_ref().is_some_and(|record| {
+            record.endpoint == endpoint
+                && record.gateway_url == gateway_url
+                && record.relay == relay
+        }) {
             return Ok(false);
         }
         let record = AddressRecord {
@@ -1594,6 +1596,7 @@ impl Runtime {
                 .max(now_ms() as u64),
             endpoint,
             gateway_url,
+            relay,
         };
         let payload = serde_json::to_string(&record)?;
         let signed = SignedAddress {
@@ -1643,7 +1646,7 @@ impl Runtime {
                 .await
                 .save_address(network, &record, &signed)?;
             if changed && let Ok(net) = self.net() {
-                net.learn(&record.endpoint).await;
+                net.learn_member(&record).await;
             }
             learned |= changed;
         }
@@ -2375,6 +2378,51 @@ mod tests {
         )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test]
+    async fn only_the_relay_a_member_runs_joins_the_relay_map() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+            a.install_membership(state).await?;
+            a.start_network().await?;
+            let net = a.net()?;
+            let peer = net::endpoint_id(&ib.device_id()?)?;
+            let home = net::relay_url("https://home.example.invalid")?;
+            let runs = net::relay_url("https://runs.example.invalid")?;
+            let endpoint =
+                iroh::EndpointAddr::from_parts(peer, [iroh::TransportAddr::Relay(home.clone())]);
+            net.learn(&endpoint).await;
+            ensure!(
+                !net.knows_relay(&home).await,
+                "a peer's home relay stays out"
+            );
+            net.learn_member(&AddressRecord {
+                version: 1,
+                network_id: ia.fixture_network_id()?,
+                device_id: ib.device_id()?,
+                seq: 1,
+                endpoint,
+                gateway_url: None,
+                relay: Some(runs.to_string()),
+            })
+            .await;
+            ensure!(
+                !net.knows_relay(&home).await,
+                "the member's home relay stays out"
+            );
+            ensure!(
+                net.knows_relay(&runs).await,
+                "the relay the member runs joins"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        a.stop_network().await;
+        std::fs::remove_dir_all(&dir)?;
+        result
     }
 
     #[tokio::test]
