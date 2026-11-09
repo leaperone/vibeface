@@ -15,7 +15,8 @@ import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingC
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
-import { joinDestination, openedJoinLink } from '@vibeface/client/identity/switch-network.ts'
+import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
@@ -1579,10 +1580,10 @@ test('native chat glass follows accessibility events without replacing its input
   } finally { app.close() }
 })
 
-test("automatic connection checks both services without changing uses and reads back unknown writes", async (t) => {
+test("automatic connection checks the three local services without changing uses and reads back unknown writes", async (t) => {
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {
-      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
+      provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
       execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
       state: 'starting', issues: [], readiness: { state: 'starting' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'starting' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
@@ -1617,7 +1618,7 @@ test("automatic connection checks both services without changing uses and reads 
     try {
       render(); await settleComponent()
       let elements = render()
-      assert.ok(elements.some((element) => elementText(element).includes('在「远端工作机」上检测 Codex 和 Cursor')))
+      assert.ok(elements.some((element) => elementText(element).includes('在「远端工作机」上检测 Codex、Claude Code 和 Cursor')))
       const connect = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
       assert.ok(connect?.props.onClick)
       connect.props.onClick(); connect.props.onClick()
@@ -1646,7 +1647,7 @@ test("automatic connection checks both services without changing uses and reads 
       }
       await settleComponent(); await settleComponent()
       const writes = calls.filter((call) => call.method === 'configure_provider').map((call) => JSON.parse(JSON.stringify(call.params)))
-      assert.deepEqual(writes, [{ provider: 'codex', connect_local: true }, { provider: 'cursor', connect_local: true }])
+      assert.deepEqual(writes, [{ provider: 'codex', connect_local: true }, { provider: 'claude', connect_local: true }, { provider: 'cursor', connect_local: true }])
       elements = render()
       const button = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
       assert.equal(button?.props.disabled, outcome === 'unreadable', 'a failed read blocks another attempt until the settings can be read')
@@ -1660,7 +1661,7 @@ test("automatic connection checks both services without changing uses and reads 
 test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
   for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
     const item: ProviderStatus = {
-      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
+      provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
       app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
       execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
       env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
@@ -1714,7 +1715,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
   const kit = { toneText: { neutral: 'neutral', success: 'success', warning: 'warning' }, providerIcons: { codex: 'CodexIcon' }, Details: 'Details', FolderPath: 'FolderPath', CopyableId: 'CopyableId', BusyIcon: 'BusyIcon' }
   for (const platform of ['web', 'mobile']) for (const example of cases) await t.test(`${platform} ${example.name}`, () => {
     const item: ProviderStatus = {
-      provider: 'codex', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
+      provider: 'codex', authentication_source: 'private_login', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
       execution_model: 'saved-model', execution_readiness: example.execution_readiness,
       setup: { directory: '/private/provider', command: 'codex --home /private/provider login' }, installed: true,
       home: null, sessions: null, env: [], state: example.readiness.state, issues: [], readiness: example.readiness,
@@ -4228,7 +4229,7 @@ test('unknown task detail reads its exact work without starting a Main request a
 
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
-  const invitation = { link: 'https://node.example/join#vibeface1test', qr: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
+  const invitation = { link: 'vibeface://join/vibeface1test', expiresAt: Date.now() + 600_000 }
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
@@ -4254,10 +4255,10 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   } finally { app.close() }
 })
 
-test("a link a phone's browser cannot open still gets a QR code, for the app", async () => {
-  const shown = async (link: string, qr: string, publicEntry: boolean) => {
+test("the invitation's QR code is its link, for the app", async () => {
+  const shown = async (link: string) => {
     const encoded: string[] = []
-    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, qr, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
       '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
       '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData(value: string) { encoded.push(value) }, make() {}, createDataURL: () => 'data:qr' }),
@@ -4267,14 +4268,10 @@ test("a link a phone's browser cannot open still gets a QR code, for the app", a
       return { tree: app.render('AddDevice'), encoded }
     } finally { app.close() }
   }
-  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', 'vibeface://join?link=vibeface1test', false)
-  assert.deepEqual(local.encoded, ['vibeface://join?link=vibeface1test'])
+  const local = await shown('vibeface://join/vibeface1test')
+  assert.deepEqual(local.encoded, ['vibeface://join/vibeface1test'])
   assert.equal(local.tree.find(({ type }) => type === 'img')?.props.alt, '用手机 App 扫码')
   assert.ok(local.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')))
-  const open = await shown('https://node.example/join#vibeface1test', 'https://node.example/join#vibeface1test', true)
-  assert.deepEqual(open.encoded, ['https://node.example/join#vibeface1test'])
-  assert.equal(open.tree.find(({ type }) => type === 'img')?.props.alt, '用手机相机扫码打开')
-  assert.equal(open.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')), false)
 })
 
 test("an entry is stored in the one form Nodes send it in, and a LAN entry as its device id and addresses", () => {
@@ -4467,33 +4464,32 @@ test('native notification callbacks replace tags, open once, stay bounded and cl
 })
 
 test('the native switch confirmation fixes the decoded entry and never erases for a changed link or cancellation', async () => {
-  const entryId = 'a'.repeat(64), link = 'https://entry.example/join#vibeface1fixture'
-  let url = `vibeface://join?link=${encodeURIComponent(link)}`, erased = 0, canceled = 0
+  const entryId = 'a'.repeat(64), link = 'vibeface://join/vibeface1fixture'
+  let url = link, erased = 0, canceled = 0
   const kept: (string | null)[] = [], failures: unknown[] = []
   const app = componentHarness('../../../../../apps/mobile/app/switch-network.tsx', {
-    'expo-router': { router: { back: () => { canceled++ } }, useLocalSearchParams: () => ({ link, entryId, address: 'https://entry.example' }) },
+    'expo-router': { router: { back: () => { canceled++ } }, useLocalSearchParams: () => ({ link }) },
     'expo-linking': { useLinkingURL: () => url },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: { members: [] }, linkTarget: () => 'other' }) },
     '@vibeface/client/identity/copy.ts': { soleManager: () => false, switchCopy: { title: '换到新的网络？', erase: () => '清除应用内数据', confirm: '换网络' } },
     '@vibeface/client/identity/switch-network.ts': { joinDestination },
     '@/platform': { mobilePlatform: { secure: { ticketDecode: () => JSON.stringify({ entry_id: entryId }) } }, self: '这台手机' },
-    '@/lib/join-link': { openedLink: openedJoinLink, keepSwitchedLink: (value: string | null) => kept.push(value) },
+    '@/lib/join-link': { openedLink: (value: string | null) => value?.startsWith('vibeface://join/') && joinTicket(value) ? value : null, keepSwitchedLink: (value: string | null) => kept.push(value) },
     '@/lib/factory-reset': { factoryReset: async () => { erased++ } },
     '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_name: string, action: () => Promise<void>) => { try { await action() } catch (cause) { failures.push(cause) } } }) },
   })
   try {
     app.render('default')
     assert.match(componentText(app.output), new RegExp(entryId))
-    assert.match(componentText(app.output), /https:\/\/entry\.example/)
     const cancel = app.render('default').find(({ props }) => props.variant === 'ghost')?.props.onPress
     assert.ok(typeof cancel === 'function'); cancel()
     assert.equal(canceled, 1); assert.equal(erased, 0)
-    url = 'vibeface://join?link=vibeface1different'
+    url = 'vibeface://join/vibeface1different'
     const changed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
     assert.equal(changed?.disabled, true)
     assert.ok(typeof changed?.onPress === 'function'); changed.onPress(); await settleComponent()
     assert.equal(erased, 0); assert.equal(failures.length, 1)
-    url = `vibeface://join?link=${encodeURIComponent(link)}`
+    url = link
     const confirmed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
     assert.equal(confirmed?.disabled, false)
     assert.ok(typeof confirmed?.onPress === 'function'); confirmed.onPress(); await settleComponent()

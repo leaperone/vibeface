@@ -100,7 +100,7 @@ sequenceDiagram
 - `turn/start` 带 `clientUserMessageId=work_id`。回合里的 `userMessage.clientId` 证明这次发送，对账靠它，不靠“最后一个回合”。
 - `model` 在接纳时解析并持久化为 `resolved`，后续 `turn/start` 使用冻结值。`effort` 和 `images`（本机图片路径或 URL）按 Provider 能力传递。
 - `target_node` 是另一台设备时，Node 把任务作为签名的 `WorkDispatched`（`kind=task`）交给那台设备的协调 Agent，由它在本机直连派发。目标设备必须启用协调 Agent。
-- Cursor SDK 没有 Shell CLI 路径，它的 `dispatch_work` 回调在 Node 进程里执行同一个 `agent_cli::dispatch`。
+- Cursor CLI 的 Node 工具通过作用域 MCP 接入，`dispatch_work` 在 Node 进程里执行同一个 `agent_cli::dispatch`。
 
 ### 2.4 状态机
 

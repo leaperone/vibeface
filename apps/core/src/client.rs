@@ -42,6 +42,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
+/// Under the browser's 10-second connect timeout, so the refusal reaches it first.
+const FORWARD_DIAL_TIMEOUT: Duration = Duration::from_secs(7);
 /// Anyone can open `/api/client`, so a Gateway relays a bounded number of sessions at once.
 static FORWARDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
 /// Sessions from devices that are not members yet (joining, recovering) share a few slots and
@@ -321,8 +323,8 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     relay_frames(socket, forwarded).await
 }
 
-/// A public entry holds no address book: the target must be on this entry's relay, which only
-/// token holders reach.
+/// A public entry holds no address book. Its own relay is one place the target may be; dialing
+/// also asks Discovery for the target's relays and address.
 pub(crate) async fn reach_through_entry(node: &Runtime, target: &str) -> Result<()> {
     let relay = node
         .config
@@ -357,7 +359,18 @@ async fn open_forward(
             .map_err(|error| anyhow!("target connection closed: {error}"))?;
         Ok::<_, anyhow::Error>(ClientSocket::forwarded(send, recv))
     };
-    opened.await.map_err(|error| ("target_unreachable", error))
+    match tokio::time::timeout(FORWARD_DIAL_TIMEOUT, opened).await {
+        Ok(Ok(forwarded)) => Ok(forwarded),
+        Ok(Err(error)) => Err(("target_unreachable", unreachable(error))),
+        Err(_) => Err((
+            "target_unreachable",
+            unreachable(anyhow!("peer did not answer in time")),
+        )),
+    }
+}
+
+fn unreachable(error: anyhow::Error) -> anyhow::Error {
+    error.context("the target device is unreachable: no relay in common and no direct path")
 }
 
 /// Copies frames both ways without reading them; the Noise session ends at the target.
@@ -842,15 +855,8 @@ async fn dispatch(
                 .lock()
                 .await
                 .register_invite(&record, &session.device_id)?;
-            // Only this Node's own relay knows the invite, so only it admits the joiner's token.
-            let own_relay = node.config.network.own_relay().ok().flatten();
-            let entry = node.net().ok().map(|net| {
-                let addr = net.addr();
-                json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
-                    "direct_addrs":invite_addrs(addr.ip_addrs().copied())})
-            });
             Ok(
-                json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry,"gateway_url":node.gateway_url()}),
+                json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"gateway_url":node.gateway_url()}),
             )
         }
         "entrances" => {
@@ -1497,53 +1503,15 @@ fn client_url(origin: &str) -> Result<String> {
     Ok(url.into())
 }
 
-/// The ticket holds at most 8 addresses; a phone on the LAN needs the private IPv4 ones, which a
-/// computer with many interfaces could otherwise push out. Link-local IPv6 cannot be dialed without
-/// its interface; loopback goes last, for Nodes on one machine.
-fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
-    let mut addrs: Vec<_> = addrs
-        .filter(|addr| !matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
-        .collect();
-    // Home LANs are mostly 192.168/16; container bridges and VPNs take 172.16/12 and 10/8.
-    addrs.sort_by_key(|addr| match addr.ip() {
-        ip if ip.is_loopback() => 5,
-        std::net::IpAddr::V4(ip) if ip.octets()[..2] == [192, 168] => 0,
-        std::net::IpAddr::V4(ip) if ip.octets()[0] == 10 => 1,
-        std::net::IpAddr::V4(ip) if ip.is_private() => 2,
-        std::net::IpAddr::V4(_) => 3,
-        std::net::IpAddr::V6(_) => 4,
-    });
-    addrs.truncate(8);
-    addrs
-}
-
-/// The ticket in an invite: `https://origin/join#vibeface1…`, the app's
-/// `vibeface://join?link=…` around either form, or `vibeface1…` alone. A Node joins over iroh,
-/// so the Gateway origin is not needed.
+/// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
-    parse_join_link_within(link.trim(), true)
-}
-
-fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
-    const SHAPE: &str = "invite link must look like https://host/join#vibeface1…";
-    if link.starts_with("vibeface1") {
-        return Ok(Ticket::decode(link)?);
-    }
-    let url = reqwest::Url::parse(link).context(SHAPE)?;
-    if nest && url.scheme() == "vibeface" && url.host_str() == Some("join") {
-        let (_, inner) = url
-            .query_pairs()
-            .find(|(key, _)| key == "link")
-            .context(SHAPE)?;
-        return parse_join_link_within(&inner, false);
-    }
+    let link = link.trim();
+    let ticket = link.strip_prefix("vibeface://join/").unwrap_or(link);
     ensure!(
-        matches!(url.scheme(), "http" | "https") && url.path() == "/join",
-        SHAPE
+        ticket.starts_with("vibeface1"),
+        "invite link must look like vibeface://join/vibeface1…"
     );
-    Ok(Ticket::decode(
-        url.fragment().context("invite link has no ticket")?,
-    )?)
+    Ok(Ticket::decode(ticket)?)
 }
 
 /// Saved so an interrupted join, from the terminal or the local page, resumes with the same
@@ -1568,26 +1536,31 @@ impl JoinLink {
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
+        let config = NetworkConfig {
+            discovery: node.config.network.discovery_servers()?,
+            bind: node
+                .config
+                .network
+                .bind
+                .map(|address| SocketAddr::new(address.ip(), 0)),
+            ..NetworkConfig::default()
+        };
+        // Without Discovery the entry Node may run any configured relay. With it, only the
+        // relays the entry registered get the invite token, so the others never see it.
+        let discovery = !config.discovery.is_empty();
         let mut relays = node
             .config
             .network
             .relays
             .iter()
-            .map(|url| Ok((net::relay_url(url)?, None)))
+            .map(|url| Ok((net::relay_url(url)?, (!discovery).then(|| token.clone()))))
             .collect::<Result<Vec<_>>>()?;
-        if node.config.network.n0_relays {
-            relays.extend(
-                iroh::defaults::prod::default_relay_map()
-                    .urls::<Vec<_>>()
-                    .into_iter()
-                    .map(|url| (url, None)),
-            );
-        }
-        if let Some(url) = &ticket.entry.relay_url {
-            let url = net::relay_url(url)?;
-            relays.retain(|(known, _)| *known != url);
-            relays.push((url, Some(token)));
-        }
+        let n0 = if node.config.network.n0_relays {
+            iroh::defaults::prod::default_relay_map().urls::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        relays.extend(n0.iter().map(|url| (url.clone(), None)));
         if let (Some(entry), Some(token)) = (&node.config.network.entry, &node.entry_token) {
             let url = net::relay_url(&entry.relay)?;
             relays.retain(|(known, _)| *known != url);
@@ -1598,33 +1571,38 @@ impl JoinLink {
             relays.retain(|(known, _)| *known != url);
             relays.push((url, Some(grant)));
         }
-        let mut addrs: Vec<TransportAddr> = relays
-            .iter()
-            .map(|(url, _)| TransportAddr::Relay(url.clone()))
-            .collect();
-        addrs.extend(
-            ticket
-                .entry
-                .direct_addrs
-                .iter()
-                .copied()
-                .map(TransportAddr::Ip),
-        );
-        let discovery = node.config.network.discovery_servers()?;
         ensure!(
-            !addrs.is_empty() || !discovery.is_empty(),
-            "this invite carries no address and no discovery server is configured"
+            !relays.is_empty() || discovery,
+            "no relay or discovery server is configured to find the invite's entry Node"
         );
-        let config = NetworkConfig {
-            discovery,
-            bind: node
-                .config
-                .network
-                .bind
-                .map(|address| SocketAddr::new(address.ip(), 0)),
-            ..NetworkConfig::default()
+        // iroh reads a relay's token only when it first connects, and it connects to a relay
+        // in its map on its own once bound. With Discovery the endpoint binds without relays
+        // and they go in, with their tokens, once the entry's registered relays are known.
+        let initial = if discovery {
+            Vec::new()
+        } else {
+            relays.clone()
         };
-        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?);
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, initial).await?);
+        if discovery {
+            for url in link.discovered_relays(&entry, net::DIAL_TIMEOUT).await? {
+                if n0.contains(&url) {
+                    continue;
+                }
+                match relays.iter_mut().find(|(known, _)| *known == url) {
+                    Some((_, credential @ None)) => *credential = Some(token.clone()),
+                    Some(_) => {}
+                    None => relays.push((url, Some(token.clone()))),
+                }
+            }
+            for (url, credential) in &relays {
+                link.insert_relay(url.clone(), credential.clone()).await;
+            }
+        }
+        let addrs: Vec<TransportAddr> = relays
+            .into_iter()
+            .map(|(url, _)| TransportAddr::Relay(url))
+            .collect();
         let router = link.discovery_router();
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
@@ -2240,44 +2218,20 @@ mod tests {
     fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
         let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
         let text = ticket.encode().unwrap();
-        let web = format!("http://192.168.1.10:4790/join#{text}");
-        let app = |link: &str| {
-            reqwest::Url::parse_with_params("vibeface://join", [("link", link)])
-                .unwrap()
-                .to_string()
-        };
-        for link in [web.clone(), text.clone(), app(&text), app(&web)] {
+        for link in [format!("vibeface://join/{text}"), format!(" {text} ")] {
             assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
         }
-        assert!(parse_join_link(&app(&app(&text))).is_err());
-        assert!(parse_join_link(&format!("http://h/other#{text}")).is_err());
+        for link in [
+            format!("http://192.168.1.10:4790/join#{text}"),
+            format!("vibeface://join?link={text}"),
+            format!("vibeface://join/{text}?x=1"),
+            format!("vibeface://other/{text}"),
+        ] {
+            assert!(parse_join_link(&link).is_err(), "{link}");
+        }
     }
 
-    #[test]
-    fn invites_keep_private_ipv4_within_the_ticket_limit() {
-        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
-        let mut many: Vec<_> = (0..8)
-            .map(|i| addr(&format!("[2001:db8::{i}]:4790")))
-            .collect();
-        many.extend([addr("[fe80::1]:4790"), addr("127.0.0.1:4790")]);
-        many.extend((17..27).map(|i| addr(&format!("172.{i}.0.1:4790"))));
-        many.push(addr("192.168.1.10:4790"));
-        let kept = invite_addrs(many.into_iter());
-        assert_eq!(kept.len(), 8);
-        assert_eq!(
-            kept[0],
-            addr("192.168.1.10:4790"),
-            "container bridges do not crowd out the home LAN"
-        );
-        assert!(!kept.contains(&addr("[fe80::1]:4790")));
-        assert_eq!(
-            invite_addrs([addr("127.0.0.1:9")].into_iter()),
-            [addr("127.0.0.1:9")],
-            "Nodes on one machine still join over loopback"
-        );
-    }
-
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn node_joins_reuse_the_configured_private_relay() -> Result<()> {
         use crate::config::{self, Config};
         use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -2292,7 +2246,6 @@ mod tests {
         #[derive(Default)]
         struct PrivateRelay {
             attempts: std::sync::Mutex<Vec<(iroh::EndpointId, Option<String>)>>,
-            without_token: std::sync::Mutex<Option<iroh::EndpointId>>,
         }
         impl std::fmt::Debug for PrivateRelay {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2307,16 +2260,10 @@ mod tests {
                     .expect("relay attempts")
                     .push((request.endpoint_id(), token.clone()));
                 let invite_token = net::relay_token(&vibeface_secure::join::invite_hash(&[7; 32]));
-                let allowed = match token {
-                    Some(token) => {
-                        net::same_token(&token, OPERATOR_TOKEN)
-                            || net::same_token(&token, &invite_token)
-                    }
-                    None => {
-                        *self.without_token.lock().expect("relay allowance")
-                            == Some(request.endpoint_id())
-                    }
-                };
+                let allowed = token.is_some_and(|token| {
+                    net::same_token(&token, OPERATOR_TOKEN)
+                        || net::same_token(&token, &invite_token)
+                });
                 if allowed {
                     Access::Allow
                 } else {
@@ -2412,6 +2359,34 @@ mod tests {
             "http://{}",
             relay.http_addr().context("relay listener missing")?
         );
+        let service = Arc::new(
+            Net::bind(
+                &LocalIdentity::generate().secret_key_hex,
+                &NetworkConfig {
+                    relay_mode: net::RelayServiceMode::DiscoveryOnly,
+                    relay_listen: Some("0.0.0.0:0".parse()?),
+                    ..Default::default()
+                },
+                0,
+                vec![],
+            )
+            .await?,
+        );
+        let service_router = service.discovery_router();
+        let discovery = |v4: bool| -> Result<String> {
+            let port = service
+                .endpoint
+                .bound_sockets()
+                .into_iter()
+                .find(|address| address.is_ipv4() == v4)
+                .context("discovery socket missing")?
+                .port();
+            let host = if v4 { "127.0.0.1" } else { "[::1]" };
+            Ok(format!(
+                "vibeface://{}@{host}:{port}",
+                service.endpoint.id()
+            ))
+        };
         let network = |bind| NetworkConfig {
             bind: Some(bind),
             entry: Some(net::PublicEntry {
@@ -2458,7 +2433,10 @@ mod tests {
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,
-                &target.config.network,
+                &NetworkConfig {
+                    discovery: vec![discovery(false)?],
+                    ..target.config.network.clone()
+                },
                 0,
                 vec![(net::relay_url(&relay_url)?, Some(OPERATOR_TOKEN.into()))],
             )
@@ -2478,33 +2456,61 @@ mod tests {
             check(&joining, &ticket, &access, Some(OPERATOR_TOKEN)).await?;
             let stale_relay = "http://127.0.0.1:9";
             let invite_token = net::relay_token(&ticket.invite_hash());
-            for (name, ticket_relay, entry_relay, token, expected_token) in [
+            let watcher = Net::bind(
+                &LocalIdentity::generate().secret_key_hex,
+                &NetworkConfig {
+                    bind: Some("127.0.0.1:0".parse()?),
+                    discovery: vec![discovery(true)?],
+                    ..Default::default()
+                },
+                0,
+                vec![],
+            )
+            .await?;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while watcher
+                    .discovered_relays(&target_id, Duration::from_secs(1))
+                    .await?
+                    != [net::relay_url(&relay_url)?]
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("Discovery did not learn the target's home relay")??;
+            watcher.close().await;
+            for (name, discovered, entry_relay, token, expected_token) in [
                 (
-                    "stale-ticket",
-                    Some(stale_relay),
-                    Some(relay_url.as_str()),
-                    OPERATOR_TOKEN,
-                    Some(OPERATOR_TOKEN),
-                ),
-                (
-                    "matching-relays",
-                    Some(relay_url.as_str()),
-                    Some(relay_url.as_str()),
-                    OPERATOR_TOKEN,
-                    Some(OPERATOR_TOKEN),
-                ),
-                (
-                    "unrelated-entry",
-                    Some(relay_url.as_str()),
+                    "discovered-relay",
+                    true,
                     Some(stale_relay),
                     WRONG_TOKEN,
                     Some(invite_token.as_str()),
                 ),
-                ("configured-relay", None, None, OPERATOR_TOKEN, None),
+                (
+                    "entry-over-discovered",
+                    true,
+                    Some(relay_url.as_str()),
+                    OPERATOR_TOKEN,
+                    Some(OPERATOR_TOKEN),
+                ),
+                (
+                    "configured-relay",
+                    false,
+                    None,
+                    OPERATOR_TOKEN,
+                    Some(invite_token.as_str()),
+                ),
             ] {
                 let configuration = NetworkConfig {
                     bind: Some("127.0.0.1:0".parse()?),
                     relays: vec![relay_url.clone()],
+                    discovery: if discovered {
+                        vec![discovery(true)?]
+                    } else {
+                        vec![]
+                    },
                     entry: entry_relay.map(|relay| net::PublicEntry {
                         url: relay.into(),
                         relay: relay.into(),
@@ -2512,13 +2518,7 @@ mod tests {
                     ..Default::default()
                 };
                 let joining = node(&dir.join(name), configuration, token).await?;
-                if entry_relay.is_none() {
-                    *access.without_token.lock().expect("relay allowance") =
-                        Some(net::endpoint_id(&joining.identity.device_id()?)?);
-                }
-                let mut routed = ticket.clone();
-                routed.entry.relay_url = ticket_relay.map(str::to_owned);
-                check(&joining, &routed, &access, expected_token)
+                check(&joining, &ticket, &access, expected_token)
                     .await
                     .with_context(|| format!("relay case {name}"))?;
             }
@@ -2551,6 +2551,7 @@ mod tests {
         .await;
         router.shutdown().await?;
         target_net.close().await;
+        service_router.shutdown().await?;
         relay.shutdown().await?;
         drop((target, joining));
         std::fs::remove_dir_all(dir)?;
@@ -3600,7 +3601,11 @@ mod tests {
             .join("../../.artifacts")
             .join(format!("node-join-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false).save(&dir)?;
+        let mut configuration =
+            crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false);
+        // A relay nobody answers on keeps the join waiting.
+        configuration.network.relays = vec!["http://127.0.0.1:9".into()];
+        configuration.save(&dir)?;
         crate::config::private_write(
             &dir.join("data-epoch.json"),
             &crate::config::data_epoch_marker(),
@@ -3613,11 +3618,10 @@ mod tests {
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
-            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
-            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
+            let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
             let params = json!({
                 "capability": capability.capability,
-                "link": format!("http://127.0.0.1:4793/join#{}", ticket.encode()?),
+                "link": format!("vibeface://join/{}", ticket.encode()?),
                 "name": "工作室 Mac",
             });
             let mut page = Session {
@@ -3732,7 +3736,7 @@ mod tests {
             // No address and no discovery: the join fails after it committed, before reaching anyone.
             let link = |secret: u8| -> Result<String> {
                 let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
-                Ok(format!("http://127.0.0.1:4795/join#{}", ticket.encode()?))
+                Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
             let mut page = Session {

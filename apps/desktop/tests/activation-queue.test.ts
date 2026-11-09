@@ -20,8 +20,8 @@ describe('ActivationQueue', () => {
       return readyForLocalJoin ? 'handled' : 'defer'
     })
 
-    expect(queue.enqueue({ kind: 'join', ticket, origin: null })).toBe(true)
-    expect(queue.enqueue({ kind: 'join', ticket, origin: null })).toBe(true)
+    expect(queue.enqueue({ kind: 'join', ticket })).toBe(true)
+    expect(queue.enqueue({ kind: 'join', ticket })).toBe(true)
     expect(queue.enqueue({ kind: 'ignored' })).toBe(false)
     expect(queue.pending()).toBe(1)
 
@@ -48,7 +48,7 @@ describe('ActivationQueue', () => {
     })
     queue.setReady()
 
-    expect(queue.enqueue({ kind: 'join', ticket, origin: 'http://127.0.0.1:4790' })).toBe(true)
+    expect(queue.enqueue({ kind: 'join', ticket })).toBe(true)
     await waitFor(() => handled.length === 1)
     expect(handled).toEqual([ticket])
     expect(queue.pending()).toBe(0)
@@ -56,9 +56,9 @@ describe('ActivationQueue', () => {
 
   it('bounds in-memory pending invites', () => {
     const queue = new ActivationQueue(async () => 'defer', 2)
-    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1a', origin: null })).toBe(true)
-    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1b', origin: null })).toBe(true)
-    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1c', origin: null })).toBe(false)
+    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1a' })).toBe(true)
+    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1b' })).toBe(true)
+    expect(queue.enqueue({ kind: 'join', ticket: 'vibeface1c' })).toBe(false)
     expect(queue.pending()).toBe(2)
   })
 })

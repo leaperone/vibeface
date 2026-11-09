@@ -5,6 +5,7 @@ import { DeviceProvider } from '@vibeface/client/identity/context.tsx'
 import { ViewportHeight } from '@/components/viewport-height'
 import { registerShell } from '@/lib/offline'
 import { installErrorReporting } from '@/lib/error-reporting'
+import { installDesktopNavigation } from '@/lib/desktop-nav'
 import { webPlatform } from '@/lib/platform'
 import { installValidityMessages } from '@/lib/validity'
 import { themeScript } from '@/lib/theme'
@@ -48,6 +49,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
   useEffect(registerShell, [])
   useEffect(installErrorReporting, [])
   useEffect(installValidityMessages, [])
+  useEffect(installDesktopNavigation, [])
   return (
     <html lang="zh-CN">
       <head>

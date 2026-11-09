@@ -188,32 +188,42 @@ async function waitForExit(process, timeoutMs) {
   });
 }
 
-async function launcherPage() {
-  const pages = await devtools('/json/list');
-  return pages.find(page => page.type === 'page' && page.url.startsWith('vibeface-launcher://app/'));
+const CLIENT_ORIGIN = 'vibeface-app://app';
+
+function isClientPage(page) {
+  try {
+    const url = new URL(page.url);
+    return page.type === 'page' && url.protocol === 'vibeface-app:' && url.host === 'app';
+  } catch { return false; }
 }
 
-async function waitLauncher() {
+async function clientPage() {
+  const pages = await devtools('/json/list');
+  return pages.find(isClientPage);
+}
+
+async function waitClient() {
   const deadline = Date.now() + 120000;
   let last = '';
   while (Date.now() < deadline) {
     assert(child && child.exitCode === null, 'The application exited before startup completed');
-    const launcher = await launcherPage();
-    if (launcher) {
+    const client = await clientPage();
+    if (client) {
       try {
-        if (await inPage(launcher, `(async () => {
-          if (document.readyState !== 'complete' || typeof window.vibefaceLauncher !== 'object') return false;
-          const status = await window.vibefaceLauncher.getStatus();
-          if (!['ready', 'failed'].includes(status.discovery.kind) || status.backgroundNode.kind === 'checking') return false;
+        if (await inPage(client, `(async () => {
+          const api = window.vibefaceClient?.desktop;
+          if (document.readyState !== 'complete' || typeof api?.getStatus !== 'function') return false;
+          const status = await api.getStatus();
+          if (status.hostPhase !== 'ready') return false;
           const opensClient = status.nodeMode !== 'undecided' && status.preferences.openBusinessOnConnect;
-          return !opensClient || status.businessOpen;
+          return !opensClient || status.clientVisible;
         })()`)) return;
-        last = 'launcher preload is not ready';
+        last = 'client preload is not ready';
       } catch (error) { last = error instanceof Error ? error.message : String(error); }
     }
     await sleep(100);
   }
-  throw new Error(`The packaged desktop launcher did not become ready: ${last}`);
+  throw new Error(`The packaged desktop client did not become ready: ${last}`);
 }
 
 async function prepareProfileParent() {
@@ -249,7 +259,7 @@ async function start() {
     } catch { await sleep(500); }
   }
   assert(inspected, 'The app-owned loopback main-process inspector became ready');
-  await waitLauncher();
+  await waitClient();
 }
 
 /** Invoke the product quit menu in this app's main process and report only its owned Core children. */
@@ -339,9 +349,9 @@ function pageSummary(pages) {
 
 async function status() {
   assert(child && child.exitCode === null, 'The desktop application is running');
-  const launcher = await launcherPage();
-  assert(launcher, 'The trusted launcher window exists');
-  return inPage(launcher, 'window.vibefaceLauncher.getStatus()');
+  const client = await clientPage();
+  assert(client, 'The trusted client window exists');
+  return inPage(client, 'window.vibefaceClient.desktop.getStatus()');
 }
 
 async function closeWindows() {
@@ -359,14 +369,34 @@ async function closeWindows() {
 
 async function invoke(method, args = []) {
   assert(child && child.exitCode === null, 'The desktop application is running');
-  const launcher = await launcherPage();
-  assert(launcher, 'The trusted launcher window exists');
+  const client = await clientPage();
+  assert(client, 'The trusted client window exists');
   const allowed = new Set(['chooseNodeMode', 'discoverNodes', 'connectDiscoveredNode', 'startDiscoveredNode',
-    'startOwned', 'stopOwned', 'openBusiness', 'installBackgroundNode', 'startBackgroundNode',
-    'stopBackgroundNode', 'removeBackgroundNode']);
-  assert(allowed.has(method), 'Only the fixed public launcher API can be invoked');
+    'startOwned', 'stopOwned', 'focusClient', 'installBackgroundNode', 'startBackgroundNode',
+    'stopBackgroundNode', 'removeBackgroundNode', 'updateBackgroundNode']);
+  assert(allowed.has(method), 'Only the fixed public client desktop API can be invoked');
   const encoded = JSON.stringify(args);
-  return inPage(launcher, `window.vibefaceLauncher[${JSON.stringify(method)}](...${encoded})`);
+  const result = await inPage(client, `window.vibefaceClient.desktop[${JSON.stringify(method)}](...${encoded})`);
+  const reconnecting = new Set(['connectDiscoveredNode', 'startDiscoveredNode', 'startOwned', 'stopOwned',
+    'installBackgroundNode', 'startBackgroundNode', 'stopBackgroundNode', 'removeBackgroundNode', 'updateBackgroundNode', 'focusClient']);
+  if (reconnecting.has(method)) {
+    const stopping = ['stopOwned', 'stopBackgroundNode', 'removeBackgroundNode'].includes(method);
+    const showChat = !stopping && result.preferences.openBusinessOnConnect;
+    // Like Settings, acknowledge the confirmed mutation before asking the existing page to reconnect.
+    const previousDocument = await inPage(client, 'performance.timeOrigin');
+    await inPage(client, `window.vibefaceClient.desktop.reconnectClient(${JSON.stringify(showChat)})`);
+    const deadline = Date.now() + 30000;
+    let reloaded = false;
+    while (Date.now() < deadline) {
+      try {
+        if (await inPage(client, 'performance.timeOrigin') !== previousDocument) { reloaded = true; break; }
+      } catch { /* navigation replaces the document, while retaining this target */ }
+      await sleep(50);
+    }
+    assert(reloaded, 'the acknowledged operation refreshes the document in the same window');
+    await waitClient();
+  }
+  return result;
 }
 
 async function inspect() {
@@ -589,7 +619,7 @@ const address = control.address();
 assert(address && typeof address === 'object');
 try { await start(); }
 catch (error) {
-  console.error(`The packaged desktop launcher did not start: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`The packaged desktop client did not start: ${error instanceof Error ? error.message : String(error)}`);
   await shutdown(); process.exit(1);
 }
 await writePrivateControlFile(controlPath, JSON.stringify({ url: `http://127.0.0.1:${address.port}`, token }),

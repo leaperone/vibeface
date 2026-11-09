@@ -512,6 +512,7 @@ impl Net {
             &config.discovery_servers()?,
             config.relay_mode == RelayServiceMode::DiscoveryOnly,
             issuer.clone(),
+            config.own_relay()?,
         )?;
         // Bootstrapping runs in the background: the local API, maintenance and LAN start
         // whether or not the public infrastructure answers.
@@ -571,6 +572,15 @@ impl Net {
                     .await;
             }
         }
+    }
+
+    /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
+    /// relay, so this comes before the first dial through it.
+    pub async fn insert_relay(&self, url: RelayUrl, token: Option<String>) {
+        self.relays.lock().await.insert(url.clone());
+        self.endpoint
+            .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
+            .await;
     }
 
     /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
@@ -668,14 +678,17 @@ impl Net {
             return Ok(connection.clone());
         }
         let connection = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let hint = self.discovery.resolve(id).await;
+            let hint = self.discovery.resolve(id, Duration::from_secs(1)).await;
             let mut addresses = self
                 .lookup
                 .get_endpoint_info(id)
                 .map(|info| info.addrs().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            if let Some(address) = hint {
-                addresses.push(iroh::TransportAddr::Ip(address));
+            // Dialed as given, not added to the relay map: a relay there could become this
+            // Node's home relay and refuse it.
+            if let Some(found) = hint {
+                addresses.push(iroh::TransportAddr::Ip(found.address));
+                addresses.extend(found.relays.into_iter().map(iroh::TransportAddr::Relay));
             }
             let lan = self.lan.get().map(|lan| lan.hints(device_id));
             addresses.extend(lan.into_iter().flatten().map(iroh::TransportAddr::Ip));
@@ -691,6 +704,17 @@ impl Net {
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
         Ok(connection)
+    }
+
+    /// The relays Discovery has registered for `device_id`, waiting up to `wait` for this
+    /// endpoint's registration sessions to come up.
+    pub async fn discovered_relays(
+        &self,
+        device_id: &str,
+        wait: Duration,
+    ) -> Result<Vec<RelayUrl>> {
+        let found = self.discovery.resolve(endpoint_id(device_id)?, wait).await;
+        Ok(found.map(|found| found.relays).unwrap_or_default())
     }
 
     pub(crate) fn discovery_router(self: &Arc<Self>) -> iroh::protocol::Router {

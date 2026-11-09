@@ -1,11 +1,11 @@
 import { lstat, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { LauncherStatus } from '../shared/contract.js'
+import type { DesktopStatus } from '../shared/contract.js'
 
 export type ClientPreferences = {
-  nodeMode: LauncherStatus['nodeMode']
-  selectedNode: LauncherStatus['selectedNode']
+  nodeMode: DesktopStatus['nodeMode']
+  selectedNode: DesktopStatus['selectedNode']
   rememberedDataDirs: string[]
 }
 const FILE = 'client-preferences.json'

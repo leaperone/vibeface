@@ -6631,7 +6631,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibeface"
-version = "0.0.1-nightly.20261108.2"
+version = "0.0.1-nightly.20261108.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6670,6 +6670,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tokio-util",
@@ -6700,7 +6701,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-core"
-version = "0.0.1-nightly.20261108.2"
+version = "0.0.1-nightly.20261108.4"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6726,6 +6727,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rusqlite",
+ "security-framework",
  "semver 1.0.28",
  "serde",
  "serde_json",

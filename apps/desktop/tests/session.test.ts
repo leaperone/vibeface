@@ -79,6 +79,21 @@ describe('CoreSession against protocol fixtures', () => {
     expect(session.state().kind).toBe('owned')
   })
 
+  it('refuses both App-owned and discovered starts while an update is unconfirmed', async () => {
+    await session.useDataDir(dataDir)
+    await session.startOwned()
+    await session.stopOwned()
+    const pending = join(dataDir, 'update-pending.json')
+    const journal = '{"phase":"prepared"}'
+    await writeFile(pending, journal)
+    const before = await readFile(join(dataDir, 'identity.json'), 'utf8')
+    await expect(session.startOwned()).rejects.toThrow(/更新尚未完成/)
+    await expect(session.startDiscoveredNode(dataDir, 'a'.repeat(64))).rejects.toThrow(/更新尚未完成/)
+    expect(session.ownsCore()).toBe(false)
+    expect(await readFile(pending, 'utf8')).toBe(journal)
+    expect(await readFile(join(dataDir, 'identity.json'), 'utf8')).toBe(before)
+  })
+
   it('refuses to start a second Core over a directory that already serves one', async () => {
     await session.useDataDir(dataDir)
     await session.startOwned()

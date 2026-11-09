@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { authenticationSourceLabels, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -23,11 +23,11 @@ const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon
 }
 /** Where each provider's program comes from, and how the device uses it. */
 const install: Record<ProviderId, string> = {
-  codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-sdk", claude: "https://docs.anthropic.com/en/docs/claude-code",
+  codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-cli", claude: "https://docs.anthropic.com/en/docs/claude-code",
   pi: "https://www.npmjs.com/package/@earendil-works/pi-coding-agent", opencode: "https://opencode.ai",
 }
 const agents = docs + "node.md#使用-claude-codepi-或-opencode"
-const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk", claude: agents, pi: agents, opencode: agents }
+const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-cli", claude: agents, pi: agents, opencode: agents }
 const services: Record<string, string> = { CURSOR_API_KEY: "Cursor", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
 /** A variable the provider needs, named after its service where there is one; the variable itself goes in a tooltip. */
 const keyName = (name: string) => services[name] ? `${services[name]} ${terms.secret.label}` : name
@@ -252,7 +252,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     const failures: string[] = []
     let reconciled = true
     try {
-      for (const provider of ["codex", "cursor"] as const) {
+      for (const provider of localProviderIds) {
         if (owner !== sequence.current || !connection.isCurrent()) return
         try {
           const parsed = parseNodeSettings(await connection.request("configure_provider", { provider, connect_local: true }))
@@ -305,7 +305,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="grid min-w-0 flex-1 basis-44 gap-1">
           <h3 className="text-heading font-semibold">AI 服务</h3>
-          <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex 和 Cursor` : "检测这台电脑的 Codex 和 Cursor"}</p>
+          <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex、Claude Code 和 Cursor` : "检测这台电脑的 Codex、Claude Code 和 Cursor"}</p>
         </div>
         <Button type="button" variant={compact ? "default" : "outline"} className="min-h-11" disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
       </div>
@@ -486,12 +486,13 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
     <div className="grid gap-1 px-4 pb-3 empty:hidden sm:ps-12">
+      <p className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</p>
       {!compact && 'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
       {item.setup && (compact ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
-        <p>需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。使用独立登录，不复制个人会话。</p>
-        <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
+        <p>需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。已配置的环境认证仍优先。</p>
+        {item.setup.directory ? <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} /> : null}
         <div className="flex min-w-0 gap-2">
-          <Input readOnly aria-label={`${name} 私有目录认证命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Input readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
           <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
       </Details> : null}

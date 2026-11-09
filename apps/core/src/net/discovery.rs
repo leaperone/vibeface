@@ -5,7 +5,8 @@ use super::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _,
+    dns::DnsResolver,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,15 +21,27 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-/// A request names at most a relay origin; a reply may carry the signed catalogue.
-const MAX_REQUEST: usize = 1024;
+/// A registration names at most `MAX_HOME_RELAYS` relay URLs; a reply may carry the signed
+/// catalogue.
+const MAX_REQUEST: usize = 2048;
 const MAX_REPLY: usize = bootstrap::MAX_SIGNED_CATALOG_BYTES + 512;
 const MAX_SESSIONS: usize = 512;
 const MAX_PER_IP: usize = 8;
+/// Requests other than lookups per session; lookups are rate limited instead, so a dialer that
+/// keeps resolving peers does not lose its registration.
 const MAX_REQUESTS: usize = 60;
+const LOOKUPS_PER_SECOND: usize = 20;
 const LEASE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_HOME_RELAYS: usize = 4;
+const MAX_RELAY_URL: usize = 256;
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Registrations from every session share this, so names that never answer hold at most this many
+/// lookups; a registration that finds none free drops the relay.
+static RESOLVES: Semaphore = Semaphore::const_new(16);
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Server {
@@ -85,7 +98,11 @@ pub(super) fn validate_server(value: &str) -> Result<()> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Register {},
+    /// The relays the connecting device is reachable through; the QUIC handshake proved the
+    /// device, and a wrong relay only makes it unreachable.
+    Register {
+        relays: Vec<RelayUrl>,
+    },
     Lookup {
         device_id: EndpointId,
     },
@@ -107,6 +124,7 @@ enum Reply {
     Peer {
         device_id: EndpointId,
         address: SocketAddr,
+        relays: Vec<RelayUrl>,
     },
     Notice {
         device_id: EndpointId,
@@ -128,6 +146,7 @@ enum Reply {
 struct Registration {
     generation: usize,
     address: SocketAddr,
+    relays: Vec<RelayUrl>,
     notices: mpsc::Sender<(EndpointId, SocketAddr)>,
     last_notice: Option<Instant>,
 }
@@ -250,6 +269,7 @@ pub(super) struct Discovery {
     /// Signs the catalogue and grants when this service publishes a catalogue.
     issuer: Option<Arc<Issuer>>,
     registry: Arc<Mutex<Registry>>,
+    dns: DnsResolver,
     sessions: Semaphore,
     clients: Vec<(Server, Arc<Client>)>,
     tasks: Vec<JoinHandle<()>>,
@@ -269,6 +289,7 @@ impl Discovery {
         servers: &[String],
         server: bool,
         issuer: Option<Arc<Issuer>>,
+        own_relay: Option<RelayUrl>,
     ) -> Result<Self> {
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
@@ -284,15 +305,38 @@ impl Discovery {
             let endpoint = endpoint.clone();
             let probes = probes.clone();
             let observations = observations.clone();
+            let own_relay = own_relay.clone();
             tasks.push(tokio::spawn(async move {
+                let mut retry = RETRY_MIN;
                 while !endpoint.is_closed() {
-                    if let Err(error) =
-                        register(&endpoint, &server, &client, &probes, &observations).await
+                    let result = register(
+                        &endpoint,
+                        &server,
+                        &client,
+                        &probes,
+                        &observations,
+                        own_relay.as_ref(),
+                    )
+                    .await;
+                    if client
+                        .connection
+                        .lock()
+                        .expect("discovery connection")
+                        .take()
+                        .is_some()
                     {
-                        tracing::debug!(%error, "discovery registration ended");
+                        retry = RETRY_MIN;
                     }
-                    *client.connection.lock().expect("discovery connection") = None;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // A session that ended normally (lease, request budget, new home relay)
+                    // reconnects at once: until then lookups and relay joiners find nothing.
+                    // Failures back off with jitter, so an unreachable server is not hammered
+                    // by every device in step.
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "discovery registration ended");
+                        let jitter = rand::random::<f64>() * 0.5 + 0.5;
+                        tokio::time::sleep(retry.mul_f64(jitter)).await;
+                        retry = (retry * 2).min(RETRY_MAX);
+                    }
                 }
             }));
         }
@@ -300,6 +344,7 @@ impl Discovery {
             server,
             issuer,
             registry: Default::default(),
+            dns: endpoint.dns_resolver()?.clone(),
             sessions: Semaphore::new(MAX_SESSIONS),
             clients,
             tasks,
@@ -315,9 +360,10 @@ impl Discovery {
             .map(|(_, client)| DiscoveryClient(client.clone()))
     }
 
-    pub async fn resolve(&self, device_id: EndpointId) -> Option<SocketAddr> {
+    /// Where `device_id` is registered, waiting up to `wait` for this endpoint's own sessions.
+    pub async fn resolve(&self, device_id: EndpointId, wait: Duration) -> Option<Located> {
         let queries = self.clients.iter().map(|(_, client)| async move {
-            let connection = client.connection_or_wait(Duration::from_secs(1)).await?;
+            let connection = client.connection_or_wait(wait).await?;
             tokio::time::timeout(CONTROL_TIMEOUT, async {
                 let (mut send, mut recv) = connection.open_bi().await?;
                 write(&mut send, &Request::Lookup { device_id }, MAX_REQUEST).await?;
@@ -326,9 +372,15 @@ impl Discovery {
                     Reply::Peer {
                         device_id: found,
                         address,
+                        relays,
                     } if found == device_id => {
                         validate_address(address)?;
-                        Ok::<_, anyhow::Error>(Some(address))
+                        let count = relays.len();
+                        let relays = usable_relays(relays, local(&connection));
+                        if relays.len() < count {
+                            tracing::debug!(%device_id, dropped = count - relays.len(), "dropped relays from a discovery record");
+                        }
+                        Ok::<_, anyhow::Error>(Some(Located { address, relays }))
                     }
                     Reply::Missing {} => Ok(None),
                     _ => bail!("invalid discovery lookup reply"),
@@ -339,11 +391,14 @@ impl Discovery {
             .ok()
             .flatten()
         });
-        futures_util::future::join_all(queries)
-            .await
-            .into_iter()
-            .flatten()
-            .next()
+        // The first answer wins, so a server that is down costs no more than its own wait.
+        let mut queries = queries.collect::<futures_util::stream::FuturesUnordered<_>>();
+        while let Some(found) = futures_util::StreamExt::next(&mut queries).await {
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     pub async fn serve(&self, connection: Connection) -> Result<()> {
@@ -365,8 +420,10 @@ impl Discovery {
             };
             let mut work = JoinSet::new();
             let mut registered = false;
+            let mut requests = 0;
+            let mut lookups = (Instant::now(), 0);
             async {
-                for _ in 0..MAX_REQUESTS {
+                loop {
                     let streams = tokio::select! {
                         _ = connection.closed() => break,
                         streams = connection.accept_bi() => streams?,
@@ -376,6 +433,13 @@ impl Discovery {
                         tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REQUEST))
                             .await
                             .context("discovery request timed out")??;
+                    let counted = !matches!(request, Request::Lookup { .. });
+                    if !counted {
+                        if lookups.0.elapsed() >= Duration::from_secs(1) {
+                            lookups = (Instant::now(), 0);
+                        }
+                        lookups.1 += 1;
+                    }
                     match request {
                         Request::Probe {} => {
                             write(&mut send, &Reply::Probed {}, MAX_REPLY).await?;
@@ -421,7 +485,20 @@ impl Discovery {
                             write(&mut send, &reply, MAX_REPLY).await?;
                             send.finish()?;
                         }
-                        Request::Register {} if self.server && !registered => {
+                        Request::Register { relays } if self.server && !registered => {
+                            let count = relays.len();
+                            let relays = registered_relays(
+                                &self.dns,
+                                relays,
+                                !crate::fetch::public(address.ip()),
+                            )
+                            .await;
+                            if relays.len() < count {
+                                tracing::debug!(
+                                    dropped = count - relays.len(),
+                                    "dropped relays from a discovery registration"
+                                );
+                            }
                             registered = true;
                             let (notices, mut incoming) = mpsc::channel(8);
                             let device_id = connection.remote_id();
@@ -435,6 +512,7 @@ impl Discovery {
                                 .push(Registration {
                                     generation,
                                     address,
+                                    relays,
                                     notices,
                                     last_notice: None,
                                 });
@@ -457,6 +535,13 @@ impl Discovery {
                                 Ok::<_, anyhow::Error>(())
                             });
                         }
+                        Request::Lookup { .. } if self.server && lookups.1 > LOOKUPS_PER_SECOND => {
+                            let reply = Reply::Refused {
+                                reason: "too many discovery lookups".into(),
+                            };
+                            write(&mut send, &reply, MAX_REPLY).await?;
+                            send.finish()?;
+                        }
                         Request::Lookup { device_id } if self.server => {
                             let found = {
                                 let mut registry =
@@ -476,11 +561,15 @@ impl Discovery {
                                         {
                                             entry.last_notice = Some(Instant::now());
                                         }
-                                        entry.address
+                                        (entry.address, entry.relays.clone())
                                     })
                             };
                             let reply = match found {
-                                Some(address) => Reply::Peer { device_id, address },
+                                Some((address, relays)) => Reply::Peer {
+                                    device_id,
+                                    address,
+                                    relays,
+                                },
                                 None => Reply::Missing {},
                             };
                             write(&mut send, &reply, MAX_REPLY).await?;
@@ -489,6 +578,12 @@ impl Discovery {
                         _ => bail!("this endpoint only accepts discovery probes"),
                     }
                     while work.try_join_next().is_some() {}
+                    if counted {
+                        requests += 1;
+                        if requests == MAX_REQUESTS {
+                            break;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -499,6 +594,87 @@ impl Discovery {
         connection.close(0u32.into(), b"discovery session ended");
         result?
     }
+}
+
+/// Where Discovery last saw a device: its observed UDP address and the relays it registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Located {
+    pub address: SocketAddr,
+    pub relays: Vec<RelayUrl>,
+}
+
+/// Dialers use registered relays as given, so a record keeps only relays off this host and
+/// private networks, unless the registering device or the queried server is itself on one.
+/// Dropping a relay leaves the rest of the record usable.
+fn usable_relays(relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
+    relays
+        .into_iter()
+        .filter(|url| {
+            url.as_str().len() <= MAX_RELAY_URL
+                && super::relay_url(url.as_str()).is_ok()
+                && (local || public_host(url))
+        })
+        .take(MAX_HOME_RELAYS)
+        .collect()
+}
+
+fn public_host(url: &RelayUrl) -> bool {
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(ip) => crate::fetch::public(ip),
+        Err(_) => !host.is_empty() && host != "localhost" && !host.ends_with(".localhost"),
+    }
+}
+
+/// The relays a registration may publish: names must also resolve only to public addresses.
+async fn registered_relays(dns: &DnsResolver, relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
+    let relays = usable_relays(relays, local);
+    if local {
+        return relays;
+    }
+    let public =
+        futures_util::future::join_all(relays.iter().map(|url| resolves_public(dns, url))).await;
+    relays
+        .into_iter()
+        .zip(public)
+        .filter_map(|(url, public)| public.then_some(url))
+        .collect()
+}
+
+/// A name that fails to resolve in time is dropped: a dialer cannot use it either.
+/// The lookup is async and cancelled on drop, unlike `getaddrinfo` on the blocking pool.
+async fn resolves_public(dns: &DnsResolver, url: &RelayUrl) -> bool {
+    if !public_host(url) {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let Ok(_permit) = RESOLVES.try_acquire() else {
+        return false;
+    };
+    let Ok(addresses) = dns.lookup_ipv4_ipv6(host, RESOLVE_TIMEOUT).await else {
+        return false;
+    };
+    let mut any = false;
+    for address in addresses {
+        if !crate::fetch::public(address) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Whether the peer of `connection` is on this host or a private network.
+fn local(connection: &Connection) -> bool {
+    observed(connection).is_ok_and(|address| !crate::fetch::public(address.ip()))
 }
 
 fn validate_address(address: SocketAddr) -> Result<()> {
@@ -529,10 +705,39 @@ async fn register(
     client: &Client,
     probes: &Arc<Semaphore>,
     observations: &tokio::sync::Mutex<HashMap<SocketAddr, usize>>,
+    own_relay: Option<&RelayUrl>,
 ) -> Result<()> {
+    let mut addr = endpoint.watch_addr();
     let connection = server.connect(endpoint).await?;
+    // A public server keeps only public relays, so non-public ones never reach it.
+    let local = local(&connection);
+    let candidates = |addr: &EndpointAddr| {
+        let mut relays = addr.relay_urls().cloned().collect::<Vec<_>>();
+        if let Some(own) = own_relay
+            && !relays.contains(own)
+        {
+            relays.push(own.clone());
+        }
+        relays
+    };
+    let home = |addr: &EndpointAddr| usable_relays(candidates(addr), local);
+    let all = candidates(&addr.get());
+    let relays = usable_relays(all.clone(), local);
+    if relays.len() < all.len() {
+        tracing::debug!(
+            dropped = all.len() - relays.len(),
+            "relays left out of the discovery registration"
+        );
+    }
     let (mut send, mut recv) = connection.open_bi().await?;
-    write(&mut send, &Request::Register {}, MAX_REQUEST).await?;
+    write(
+        &mut send,
+        &Request::Register {
+            relays: relays.clone(),
+        },
+        MAX_REQUEST,
+    )
+    .await?;
     send.finish()?;
     let Reply::Registered { address } =
         tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REPLY)).await??
@@ -551,11 +756,31 @@ async fn register(
     *client.connection.lock().expect("discovery connection") = Some(connection.clone());
     client.ready.notify_waiters();
     let mut work = JoinSet::new();
+    // One stream of frames across loop turns, so an address change never cancels a half-read
+    // frame.
+    let replies = futures_util::stream::unfold(recv, |mut recv| async move {
+        let reply = read::<Reply>(&mut recv, MAX_REPLY).await;
+        Some((reply, recv))
+    });
+    let mut replies = std::pin::pin!(replies);
     let result = async {
         loop {
             let reply: Reply = tokio::select! {
                 _ = connection.closed() => break,
-                reply = read(&mut recv, MAX_REPLY) => reply?,
+                // A new home relay ends this session, so the next one registers it.
+                changed = addr.updated() => match changed {
+                    Ok(changed) if home(&changed) != relays => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                },
+                // The server closing the session fails the read as well, and that is a normal end.
+                reply = futures_util::StreamExt::next(&mut replies) => {
+                    match reply.context("discovery notifications ended")? {
+                        Ok(reply) => reply,
+                        Err(_) if connection.close_reason().is_some() => break,
+                        Err(error) => return Err(error),
+                    }
+                }
             };
             let Reply::Notice { device_id, address } = reply else {
                 bail!("invalid discovery notification");
@@ -727,11 +952,94 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<Request>(
-                json!({"type":"register","address":"127.0.0.1:1234"})
+                json!({"type":"register","relays":[],"address":"127.0.0.1:1234"})
             )
             .is_err()
         );
+        assert!(serde_json::from_value::<Request>(json!({"type":"register"})).is_err());
+        let relays = |count: usize| -> Vec<RelayUrl> {
+            (0..count)
+                .map(|i| {
+                    format!("https://relay{i}.example/")
+                        .parse()
+                        .expect("relay URL")
+                })
+                .collect()
+        };
+        let parsed = |urls: &[&str]| -> Vec<RelayUrl> {
+            urls.iter()
+                .map(|url| url.parse().expect("relay URL"))
+                .collect()
+        };
+        assert_eq!(
+            usable_relays(relays(MAX_HOME_RELAYS + 1), false),
+            relays(MAX_HOME_RELAYS)
+        );
+        let long: RelayUrl =
+            format!("https://relay.example/{}", "a".repeat(MAX_RELAY_URL)).parse()?;
+        // A bad relay is dropped, and the rest of the record stays.
+        let mut mixed = parsed(&["ftp://relay.example/", "http://127.0.0.1:3340/"]);
+        mixed.push(long);
+        mixed.extend(relays(1));
+        assert_eq!(usable_relays(mixed.clone(), false), relays(1));
+        assert_eq!(
+            usable_relays(mixed, true),
+            [parsed(&["http://127.0.0.1:3340/"]), relays(1)].concat()
+        );
+        let local = parsed(&[
+            "http://127.0.0.1:3340/",
+            "http://10.0.0.2/",
+            "http://192.168.1.5:3340/",
+            "http://169.254.0.1/",
+            "http://[::1]:3340/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://localhost:3340/",
+            "http://relay.localhost/",
+        ]);
+        assert!(usable_relays(local.clone(), false).is_empty());
+        assert_eq!(usable_relays(local.clone(), true), local[..MAX_HOME_RELAYS]);
+        // Four relay URLs at the length limit still fit one registration frame.
+        let longest: RelayUrl = format!(
+            "https://relay.example/{}",
+            "a".repeat(MAX_RELAY_URL - "https://relay.example/".len())
+        )
+        .parse()?;
+        assert_eq!(longest.as_str().len(), MAX_RELAY_URL);
+        let register = Request::Register {
+            relays: vec![longest; MAX_HOME_RELAYS],
+        };
+        assert!(serde_json::to_vec(&register)?.len() <= MAX_REQUEST);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_drops_relays_that_resolve_to_private_addresses() {
+        let parsed = |urls: &[&str]| -> Vec<RelayUrl> {
+            urls.iter()
+                .map(|url| url.parse().expect("relay URL"))
+                .collect()
+        };
+        // IP literals and `localhost` resolve without the network.
+        let dns = DnsResolver::new();
+        assert!(resolves_public(&dns, &"https://1.1.1.1/".parse().expect("relay URL")).await);
+        for url in parsed(&[
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://localhost:3340/",
+        ]) {
+            assert!(!resolves_public(&dns, &url).await, "{url}");
+        }
+        let urls = parsed(&[
+            "https://1.1.1.1/",
+            "http://10.0.0.2/",
+            "https://[2606:4700::1111]/",
+        ]);
+        assert_eq!(
+            registered_relays(&dns, urls.clone(), false).await,
+            [urls[0].clone(), urls[2].clone()]
+        );
+        assert_eq!(registered_relays(&dns, urls.clone(), true).await, urls);
     }
 
     #[test]
@@ -744,6 +1052,7 @@ mod tests {
             vec![Registration {
                 generation: 2,
                 address: "127.0.0.1:1234".parse()?,
+                relays: vec![],
                 notices,
                 last_notice: None,
             }],
@@ -879,7 +1188,7 @@ mod tests {
         ];
         let a_id = LocalIdentity::generate();
         let b_id = LocalIdentity::generate();
-        let mut a_config = NetworkConfig {
+        let a_config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
             discovery: discovery.clone(),
             ..Default::default()
@@ -915,20 +1224,37 @@ mod tests {
             "http://{}",
             relay.http_addr().context("relay listener missing")?
         );
-        a_config.relays = vec![relay_url.clone()];
+        // Only B uses the relay: A dials it as Discovery names it, outside its own relay map.
         b_config.relays = vec![relay_url];
         let a = net(&a_id, &a_config).await?;
         let b = net(&b_id, &b_config).await?;
         let a_router = router(&a);
         let b_router = router(&b);
         registered(&service, 2).await?;
+        let b_endpoint = b.endpoint.id();
+        // B registers again once its home relay is up; A learns that relay only from Discovery.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while b.addr().relay_urls().next().is_none() {
+            loop {
+                let relays = service
+                    .discovery
+                    .registry
+                    .lock()
+                    .expect("registry")
+                    .entries
+                    .get(&b_endpoint)
+                    .and_then(|entries| entries.last())
+                    .map(|entry| entry.relays.clone());
+                if relays.is_some_and(|relays| {
+                    !relays.is_empty() && relays.iter().eq(b.addr().relay_urls())
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await?;
-        a.learn(&b.addr()).await;
+        .await
+        .context("B's home relay was not registered")?;
+        assert!(a.lookup.get_endpoint_info(b_endpoint).is_none());
         let peer = b_id.device_id()?;
         assert_eq!(
             a.request(&peer, SYNC, &json!({"fallback":true}), CONTROL_TIMEOUT)

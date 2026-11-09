@@ -872,10 +872,10 @@ mod tests {
         let token = "ab".repeat(32);
         assert_eq!(
             redact(
-                &format!("join https://e.example/join#vibeface1qq2ww3 failed; token {token}."),
+                &format!("join vibeface://join/vibeface1qq2ww3 failed; token {token}."),
                 std::slice::from_ref(&token)
             ),
-            "join https://e.example/join#[invite] failed; token [redacted]."
+            "join vibeface://join/[invite] failed; token [redacted]."
         );
         assert_eq!(
             redact("Authorization: Bearer sk.abc-123/x= ok", &[]),
@@ -899,14 +899,14 @@ mod tests {
         let mut leaked = record(1, Level::Info, Source::Web, "key model-key-1234567890");
         leaked.fields.insert(
             "link".into(),
-            json!("https://e.example/join#vibeface1secretticket"),
+            json!("vibeface://join/vibeface1secretticket"),
         );
         sink.write(&leaked);
         let text = fs::read_to_string(dir.join(FILE)).unwrap();
         assert!(!text.contains("model-key-1234567890") && !text.contains("vibeface1"));
         let back = read(&dir, &Filter::default()).unwrap();
         assert_eq!(back[0].message, "key [redacted]");
-        assert_eq!(back[0].fields["link"], "https://e.example/join#[invite]");
+        assert_eq!(back[0].fields["link"], "vibeface://join/[invite]");
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "vibeface-core"
-version = "0.0.1-nightly.20261108.2"
+version = "0.0.1-nightly.20261108.4"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -47,6 +47,9 @@ vibeface-secure = { path = "../../crates/secure" }
 vibeface-secure-ffi = { path = "../../crates/secure-ffi" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

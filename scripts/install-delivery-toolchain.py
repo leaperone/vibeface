@@ -2,6 +2,7 @@
 """Install the checksum-pinned guest compiler inside this checkout's artifacts."""
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +12,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 
@@ -22,6 +25,13 @@ ASSETS = {
     ("Linux", "x86_64"): ("x86_64-unknown-linux-gnu", "100b597d605b706bec94e1d32bfaaf5851df8d75173f986d4b56a3e90916be53"),
 }
 
+TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_BACKOFF_SECONDS = (2, 4, 8, 16)
+
+_urlopen = urllib.request.urlopen
+_sleep = time.sleep
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -29,6 +39,63 @@ def sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def transient_download_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in TRANSIENT_HTTP
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, ConnectionResetError, BrokenPipeError)):
+            return True
+        if isinstance(reason, OSError):
+            return reason.errno in (
+                errno.ECONNRESET,
+                errno.ETIMEDOUT,
+                errno.ECONNABORTED,
+                errno.EPIPE,
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+            )
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionResetError, BrokenPipeError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (
+            errno.ECONNRESET,
+            errno.ETIMEDOUT,
+            errno.ECONNABORTED,
+            errno.EPIPE,
+            errno.ENETUNREACH,
+            errno.EHOSTUNREACH,
+        )
+    return False
+
+
+def download_pinned_archive(url, destination, expected_digest):
+    last_error = None
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        destination.unlink(missing_ok=True)
+        try:
+            with _urlopen(url, timeout=120) as source:
+                with destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            if sha256(destination) != expected_digest:
+                destination.unlink(missing_ok=True)
+                raise ValueError("Downloaded guest compiler archive checksum mismatch")
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            if not transient_download_error(exc) or attempt == DOWNLOAD_ATTEMPTS - 1:
+                raise
+            last_error = exc
+            if attempt < len(DOWNLOAD_BACKOFF_SECONDS):
+                _sleep(DOWNLOAD_BACKOFF_SECONDS[attempt])
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Guest compiler download failed without an error")
 
 
 def compiler_root(directory):
@@ -72,15 +139,11 @@ def install():
             url = f"https://github.com/risc0/rust/releases/download/{RELEASE}/{name}"
             with tempfile.NamedTemporaryFile(prefix=name + ".", suffix=".download", dir=ARTIFACTS, delete=False) as output:
                 temporary = Path(output.name)
-                try:
-                    with urllib.request.urlopen(url, timeout=120) as source:
-                        shutil.copyfileobj(source, output)
-                    output.flush()
-                    if sha256(temporary) != expected:
-                        raise ValueError("Downloaded guest compiler archive checksum mismatch")
-                    os.replace(temporary, archive)
-                finally:
-                    temporary.unlink(missing_ok=True)
+            try:
+                download_pinned_archive(url, temporary, expected)
+                os.replace(temporary, archive)
+            finally:
+                temporary.unlink(missing_ok=True)
         if sha256(archive) != expected:
             raise ValueError("Guest compiler archive checksum mismatch")
         version.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +156,139 @@ def install():
     if not result.startswith("rustc 1.97.0"):
         raise ValueError("Installed guest compiler reports the wrong version")
     print(json.dumps({"risc0Home": str(home), "release": RELEASE, "target": target, "archiveSha256": expected, "compiler": result}))
+
+
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+        self._offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, size=-1):
+        if size < 0:
+            chunk = self._payload[self._offset :]
+            self._offset = len(self._payload)
+            return chunk
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+def _self_test_download_retries():
+    global _urlopen, _sleep
+    sleeps = []
+    opens = []
+    root = ARTIFACTS / "installer-download-self-test"
+    root.mkdir(parents=True, exist_ok=True)
+    original_urlopen = _urlopen
+    original_sleep = _sleep
+
+    def track_sleep(seconds):
+        sleeps.append(seconds)
+
+    try:
+        _sleep = track_sleep
+        url = f"https://github.com/risc0/rust/releases/download/{RELEASE}/rust-toolchain-fixture.tar.gz"
+        good = b"checksum-pinned-guest-archive-fixture"
+        expected = hashlib.sha256(good).hexdigest()
+
+        def open_504_then_ok(open_url, timeout=120):
+            opens.append(open_url)
+            if len(opens) <= 2:
+                raise urllib.error.HTTPError(open_url, 504, "Gateway Time-out", None, None)
+            return _Response(good)
+
+        _urlopen = open_504_then_ok
+        destination = root / "retry-success.download"
+        download_pinned_archive(url, destination, expected)
+        assert destination.is_file() and sha256(destination) == expected
+        assert len(opens) == 3
+        assert sleeps == [2, 4]
+        destination.unlink(missing_ok=True)
+        opens.clear()
+        sleeps.clear()
+
+        def open_always_504(open_url, timeout=120):
+            opens.append(open_url)
+            raise urllib.error.HTTPError(open_url, 504, "Gateway Time-out", None, None)
+
+        _urlopen = open_always_504
+        destination = root / "retry-exhaust.download"
+        try:
+            download_pinned_archive(url, destination, expected)
+        except urllib.error.HTTPError as error:
+            assert error.code == 504
+        else:
+            raise AssertionError("Transient download exhaustion must fail")
+        assert not destination.exists()
+        assert len(opens) == DOWNLOAD_ATTEMPTS
+        assert sum(sleeps) == sum(DOWNLOAD_BACKOFF_SECONDS)
+        opens.clear()
+        sleeps.clear()
+
+        def open_403(open_url, timeout=120):
+            opens.append(open_url)
+            raise urllib.error.HTTPError(open_url, 403, "Forbidden", None, None)
+
+        _urlopen = open_403
+        destination = root / "no-retry-403.download"
+        try:
+            download_pinned_archive(url, destination, expected)
+        except urllib.error.HTTPError as error:
+            assert error.code == 403
+        else:
+            raise AssertionError("Permanent HTTP errors must not retry")
+        assert len(opens) == 1
+        assert sleeps == []
+        opens.clear()
+
+        def open_bad_digest(open_url, timeout=120):
+            opens.append(open_url)
+            return _Response(b"wrong-archive-bytes")
+
+        _urlopen = open_bad_digest
+        destination = root / "digest-mismatch.download"
+        try:
+            download_pinned_archive(url, destination, expected)
+        except ValueError as error:
+            assert "checksum mismatch" in str(error)
+        else:
+            raise AssertionError("Checksum mismatch must fail without retry")
+        assert not destination.exists()
+        assert len(opens) == 1
+        opens.clear()
+
+        class _BrokenStream(_Response):
+            def read(self, size=-1):
+                if self._offset == 0:
+                    self._offset = 1
+                    return b"x"
+                raise urllib.error.URLError(ConnectionResetError())
+
+        calls = []
+
+        def open_reset_then_ok(open_url, timeout=120):
+            calls.append(open_url)
+            if len(calls) == 1:
+                return _BrokenStream(good)
+            return _Response(good)
+
+        _urlopen = open_reset_then_ok
+        destination = root / "partial-retry.download"
+        download_pinned_archive(url, destination, expected)
+        assert destination.is_file() and sha256(destination) == expected
+        assert len(calls) == 2
+        assert sleeps == [2]
+        destination.unlink(missing_ok=True)
+    finally:
+        _urlopen = original_urlopen
+        _sleep = original_sleep
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def self_test():
@@ -115,6 +311,7 @@ def self_test():
             pass
         else:
             raise AssertionError("Archive traversal must fail before extraction")
+    _self_test_download_retries()
     print("Guest installer layout and checksum self-tests passed; no compiler was downloaded or executed")
 
 

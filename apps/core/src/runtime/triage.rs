@@ -1758,14 +1758,17 @@ impl Runtime {
             .manager()
             .context("no coordination Agent is configured")
             .map_err(manager::ManagerError::not_started)?;
-        crate::scheduler::ensure_readiness(
-            &self
-                .provider_readiness(settings.provider, &settings.model)
-                .await,
-        )?;
-        let config = self
+        let mut config = self
             .manager_config(settings, &providers)
             .map_err(manager::ManagerError::not_started)?;
+        self.prepare_manager_login(&mut config)
+            .await
+            .map_err(manager::ManagerError::not_started)?;
+        crate::scheduler::ensure_readiness(
+            &self
+                .provider_readiness(config.sdk.provider(), &config.model)
+                .await,
+        )?;
         drop(launch);
         self.run_coordination(config, attempt, prompt).await
     }
@@ -1813,6 +1816,9 @@ impl Runtime {
     async fn wake_agent(&self) -> Result<()> {
         self.queue_live_answers().await?;
         let answering = self.store.lock().await.has_pending_answer_controls()?;
+        if !answering && let Some(manager) = self.manager() {
+            self.refresh_provider_login(manager.provider).await?;
+        }
         if !answering && (!self.apply_provider_launches().await? || self.manager().is_none()) {
             return Ok(());
         }
@@ -1959,6 +1965,9 @@ impl Runtime {
             "coordination Agent permission was revoked"
         );
         drop(self.answer_permission_lease(control).await?);
+        self.prepare_manager_login(&mut config)
+            .await
+            .map_err(manager::ManagerError::not_started)?;
         config.timeout_secs = config.timeout_secs.min(AGENT_ANSWER_WITHIN.as_secs());
         self.run_coordination(config, Some(attempt), |cli| {
             Ok(format!(
@@ -3076,7 +3085,7 @@ pub(super) mod tests {
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
-    pub(in crate::runtime) async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
+    pub(crate) async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
         let (node, dir) = bare_node().await?;
         let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
@@ -3098,7 +3107,7 @@ pub(super) mod tests {
         });
     }
 
-    pub(in crate::runtime) async fn bot(
+    pub(crate) async fn bot(
         node: &Runtime,
         admin: &LocalIdentity,
         scope: &str,
@@ -6115,7 +6124,7 @@ pub(super) mod tests {
         Ok(())
     }
 
-    pub(in crate::runtime) async fn start_reply(
+    pub(crate) async fn start_reply(
         node: &Runtime,
         admin: &LocalIdentity,
         id: &str,
@@ -7891,6 +7900,62 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ordinary_coordination_refreshes_source_access_before_taking_the_turn_lock()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut node, _admin, dir) = node().await?;
+        let runtime = Arc::get_mut(&mut node).context("exclusive fixture runtime")?;
+        let source = dir.join("source-codex");
+        config::private_dir(&source)?;
+        runtime.host.codex_home = Some(source.clone());
+        let program = dir.join("controlled-codex");
+        config::private_write(&program, b"#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let original_server = {
+            let mut local = runtime.providers.lock().unwrap();
+            let original = local.switches.codex_app_server.clone();
+            local.bins.insert(Provider::Codex, program);
+            local.switches.codex_app_server.mode = crate::providers::AppServerMode::Spawn;
+            local.switches.codex_app_server.socket = None;
+            original
+        };
+        with_agent(&node);
+        let result = async {
+            let roots = crate::providers::ProviderRoots::new(&dir);
+            for (index, access) in ["synthetic-first-access", "synthetic-next-access"]
+                .into_iter()
+                .enumerate()
+            {
+                config::private_write(
+                    &source.join("auth.json"),
+                    &serde_json::to_vec(&json!({"tokens":{"access_token":access,
+                        "refresh_token":"synthetic-source-owned-refresh","account_id":"fixture"}}))?,
+                )?;
+                let active = (index == 1).then(|| node.triage.turn.try_lock().unwrap());
+                tokio::time::timeout(Duration::from_secs(5), node.wake_agent()).await??;
+                let local = node.providers();
+                assert_eq!(local.codex_external_auth().context("borrowed access")?.access_token, access);
+                assert_eq!(
+                    node.pending_provider_launches.load(Ordering::SeqCst),
+                    active.is_some(),
+                    "a busy turn defers the launch without blocking access refresh"
+                );
+                drop(active);
+                tokio::time::timeout(Duration::from_secs(5), node.wake_agent()).await??;
+                assert!(!node.pending_provider_launches.load(Ordering::SeqCst));
+                let source_login: Value = serde_json::from_slice(&std::fs::read(source.join("auth.json"))?)?;
+                assert_eq!(source_login["tokens"]["refresh_token"], "synthetic-source-owned-refresh");
+                assert!(roots.codex_home.join("local-login-access.json").is_file());
+            }
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.providers.lock().unwrap().switches.codex_app_server = original_server;
         cleanup(node, dir).await?;
         result
     }

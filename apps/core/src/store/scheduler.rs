@@ -1310,19 +1310,29 @@ pub(super) fn trigger_scope_from(
     conversation: &str,
     trigger: &str,
 ) -> Result<SessionScope> {
+    known_trigger_scope_from(connection, network, conversation, trigger)?
+        .context("trigger target is unknown")
+}
+
+/// A trigger whose destination the projection cannot prove belongs to no session.
+fn known_trigger_scope_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<Option<SessionScope>> {
     if let Some(target) = super::scope_projection::trigger_input_target_from(
         connection,
         network,
         conversation,
         trigger,
     )? {
-        return Ok(target_scope(&target));
+        return Ok(Some(target_scope(&target)));
     }
-    ensure!(
-        super::scope_projection::trigger_is_main_from(connection, network, conversation, trigger)?,
-        "trigger target is unknown"
-    );
-    Ok(SessionScope::Main)
+    Ok(
+        super::scope_projection::trigger_is_main_from(connection, network, conversation, trigger)?
+            .then_some(SessionScope::Main),
+    )
 }
 
 pub(super) fn event_in_session_scope_from(
@@ -1362,14 +1372,20 @@ pub(super) fn event_in_session_scope_from(
             if matches!(scope, SessionScope::Task { work_id: own } if own == work_id) {
                 return Ok(true);
             }
-            trigger_scope_from(connection, network, conversation, trigger)?
+            match known_trigger_scope_from(connection, network, conversation, trigger)? {
+                Some(scope) => scope,
+                None => return Ok(false),
+            }
         }
         EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
             if matches!(scope, SessionScope::Task { work_id: own } if own == work_id) {
                 return Ok(true);
             }
-            match super::reduce::work_from(connection, network, work_id)? {
-                Some(work) => trigger_scope_from(connection, network, conversation, &work.trigger)?,
+            let Some(work) = super::reduce::work_from(connection, network, work_id)? else {
+                return Ok(false);
+            };
+            match known_trigger_scope_from(connection, network, conversation, &work.trigger)? {
+                Some(scope) => scope,
                 None => return Ok(false),
             }
         }
@@ -3844,8 +3860,13 @@ fn end_job_from(
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?
             .into_iter()
             .filter_map(|work| {
-                match trigger_scope_from(connection, network, &job.conversation_id, &work.trigger) {
-                    Ok(SessionScope::Main) => Some(Ok(work)),
+                match known_trigger_scope_from(
+                    connection,
+                    network,
+                    &job.conversation_id,
+                    &work.trigger,
+                ) {
+                    Ok(Some(SessionScope::Main)) => Some(Ok(work)),
                     Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 }

@@ -13,12 +13,12 @@ import { addDeviceCopy, deviceCopy, joinCopy } from "@vibeface/client/identity/c
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { JoinRequests, useOpenJoins, type Added } from "./join"
 
-/** `image`: the QR code of `qr`, which a phone's camera opens when the link is public, and the Vibeface app scans otherwise. */
+/** `image`: the QR code of the link, which the Vibeface app scans. */
 type Share = Invitation & { image: string | null }
 
 function share(invitation: Invitation): Share {
   let image: string | null = null
-  try { const code = qrcode(0, "M"); code.addData(invitation.qr); code.make(); image = code.createDataURL(4, 16) } catch {}
+  try { const code = qrcode(0, "M"); code.addData(invitation.link); code.make(); image = code.createDataURL(4, 16) } catch {}
   return { ...invitation, image }
 }
 
@@ -136,8 +136,8 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); setCopied(null); setCopyFailed(false); setError(""); setShown("link") }} />
             {kind === "phone" ? <>
               <p className="text-meta text-muted-foreground">{addDeviceCopy.clientHint}</p>
-              {result.image ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.image} alt={result.publicEntry ? "用手机相机扫码打开" : "用手机 App 扫码"} /> : null}
-              {result.publicEntry ? null : <p className="flex items-center justify-center gap-1.5 text-meta text-muted-foreground"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>}
+              {result.image ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.image} alt="用手机 App 扫码" /> : null}
+              <p className="flex items-center justify-center gap-1.5 text-meta text-muted-foreground"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>
               {copyButton("link", result.link, "复制链接", true)}
             </> : <>
               <ol className="grid gap-3">

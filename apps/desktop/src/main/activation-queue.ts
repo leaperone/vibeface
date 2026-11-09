@@ -6,7 +6,7 @@ export type ActivationResult = 'handled' | 'defer'
 const MAX_PENDING = 32
 
 function activationKey(link: JoinActivation): string {
-  return `${link.ticket}\n${link.origin ?? ''}`
+  return link.ticket
 }
 
 /**

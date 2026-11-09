@@ -338,8 +338,6 @@ extern "C" {
     RustBuffer uniffi_vibeface_secure_ffi_fn_func_ticket_encode(
         RustBuffer entry_id, 
         RustBuffer secret_hex, 
-        RustBuffer relay_url, 
-        RustBuffer direct_addrs, 
         RustCallStatus *uniffi_out_err
     );
     void uniffi_vibeface_secure_ffi_fn_func_verify(
@@ -2500,7 +2498,7 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
     props["ubrn_uniffi_vibeface_secure_ffi_fn_func_ticket_encode"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_ticket_encode"),
-        4,
+        2,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_fn_func_ticket_encode(rt, thisVal, args, count);
         }
@@ -3936,7 +3934,7 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_ticke
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_ticket_encode(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_vibeface_secure_ffi_fn_func_ticket_encode(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[3]), 
+        auto value = uniffi_vibeface_secure_ffi_fn_func_ticket_encode(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), 
             &status
         );
         uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);

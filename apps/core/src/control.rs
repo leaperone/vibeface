@@ -177,6 +177,13 @@ fn wallet(data_dir: &Path, operation: Value) -> Result<Value> {
     }
 }
 
+fn authoritative_core_version(health: Option<&maintenance::Health>) -> &str {
+    match health {
+        Some(health) => health.version.as_str(),
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 pub async fn inspect(data_dir: &Path) -> Result<Value> {
     validate_data_dir(data_dir)?;
     let data_dir = fs::canonicalize(data_dir)
@@ -225,7 +232,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
             "status": health.as_ref().ok().and_then(|health| health.bootstrap.as_ref()),
         },
         "peers": health.as_ref().ok().map(|health| &health.peers),
-        "core_version": env!("CARGO_PKG_VERSION"),
+        "core_version": authoritative_core_version(health.as_ref().ok()),
         "error": error,
     }))
 }
@@ -560,9 +567,20 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         options.public_entry,
         options.entry.is_some(),
     )?;
+    let mut discovery = options.discovery;
+    // A private entry's Node still registers with the official Discovery, so others find it by
+    // device ID. Bootstrap stays off: an official relay grant could become its home relay in
+    // place of the entry's.
+    if options.entry.is_some()
+        && !options.public_entry
+        && options.bootstrap.is_none()
+        && discovery.is_empty()
+    {
+        discovery.push(net::bootstrap::PublicDefaults::load()?.discovery_url());
+    }
     configuration.network = NetworkConfig {
         relays: options.relays,
-        discovery: options.discovery,
+        discovery,
         relay_mode,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
@@ -764,6 +782,49 @@ mod tests {
         std::env::temp_dir().join(format!("vibeface-{label}-{}", uuid::Uuid::new_v4()))
     }
 
+    #[test]
+    fn authoritative_core_version_prefers_running_health_over_inspector_binary() {
+        use maintenance::Health;
+        let running = "0.0.1-nightly.20261107.1";
+        let health = Health {
+            device_id: "device-fixture".into(),
+            version: running.into(),
+            web_enabled: true,
+            http_enabled: true,
+            write_state: None,
+            bootstrap: None,
+            peers: vec![],
+        };
+        assert_eq!(
+            super::authoritative_core_version(Some(&health)),
+            running,
+            "a health-confirmed daemon must report its own version"
+        );
+        assert_eq!(
+            super::authoritative_core_version(None),
+            env!("CARGO_PKG_VERSION"),
+            "offline inspection reports the inspecting Core binary"
+        );
+        assert_ne!(running, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_stopped_nodes_with_inspector_core_version() -> Result<()> {
+        let dir = temp_dir("inspect-stopped-version");
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        let identity = crypto::LocalIdentity::generate();
+        Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false).save(&dir)?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
+        let inspected = inspect(&dir).await?;
+        assert_eq!(inspected["status"], "stopped");
+        assert!(inspected["version"].is_null());
+        assert_eq!(inspected["core_version"], env!("CARGO_PKG_VERSION"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn free_addr() -> SocketAddr {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
@@ -943,6 +1004,43 @@ mod tests {
         .unwrap();
         let error = initialize_from_options(options).unwrap_err().to_string();
         assert!(error.contains("relay-token-file"), "{error}");
+    }
+
+    #[test]
+    fn a_private_entry_node_registers_with_the_official_discovery_without_its_bootstrap() {
+        let official = net::bootstrap::PublicDefaults::load()
+            .unwrap()
+            .discovery_url();
+        let own = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
+        for (extra, discovery, bootstrap) in [
+            (json!({}), vec![official.clone()], "off"),
+            (json!({"discovery": [own]}), vec![own.to_owned()], "off"),
+            (json!({"bootstrap": "off"}), vec![], "off"),
+            (json!({"bootstrap": "public"}), vec![], "public"),
+        ] {
+            let dir = temp_dir("private-entry");
+            let token = dir.with_extension("token");
+            fs::write(&token, "ab".repeat(32)).unwrap();
+            let mut options = json!({
+                "data_dir": dir,
+                "no_web": true,
+                "listen": free_addr(),
+                "local_listen": free_addr(),
+                "entry": "https://entry.example",
+                "relay_token_file": token,
+            });
+            options
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = initialize_from_options(serde_json::from_value(options).unwrap()).unwrap();
+            assert_eq!(result["bootstrap"], bootstrap, "{extra}");
+            let saved = Config::load(&dir).unwrap();
+            assert_eq!(saved.network.discovery, discovery, "{extra}");
+            assert_eq!(saved.network.bootstrap.label(), bootstrap, "{extra}");
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_file(token).unwrap();
+        }
     }
 
     #[test]

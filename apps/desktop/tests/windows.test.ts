@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { shell } from 'electron'
-import { createClientWindow, createLauncherWindow } from '../src/main/windows.js'
+import { createClientWindow } from '../src/main/windows.js'
 
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events')
@@ -17,7 +17,7 @@ vi.mock('electron', async () => {
 beforeEach(() => vi.clearAllMocks())
 
 describe.each(['will-navigate', 'will-redirect'])('%s boundary', (eventName) => {
-  it('keeps a same-origin page in the business window', () => {
+  it('keeps a same-origin page in the client window', () => {
     const window = createClientWindow('/fixture/main')
     const event = { preventDefault: vi.fn() }
     window.webContents.emit(eventName, event, 'vibeface-app://app/join')
@@ -41,13 +41,10 @@ describe.each(['will-navigate', 'will-redirect'])('%s boundary', (eventName) => 
     expect(event.preventDefault).toHaveBeenCalledOnce()
     expect(shell.openExternal).not.toHaveBeenCalled()
   })
+})
 
-  it('prevents the trusted launcher from following an external page', () => {
-    const window = createLauncherWindow('/fixture/main')
-    const event = { preventDefault: vi.fn() }
-    window.webContents.emit(eventName, event, 'https://outside.example/path')
-    expect(event.preventDefault).toHaveBeenCalledOnce()
-    expect(shell.openExternal).toHaveBeenCalledOnce()
-    expect(shell.openExternal).toHaveBeenCalledWith('https://outside.example/path')
+describe('single client window', () => {
+  it('creates only the sealed client window factory', () => {
+    expect(typeof createClientWindow).toBe('function')
   })
 })

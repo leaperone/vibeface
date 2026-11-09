@@ -4,7 +4,7 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 
 ## 两个窗口
 
-- **启动器**（`src/launcher`）：从固定的 `vibeface-launcher://app/index.html` 载入，带受限 preload。
+- **单窗口客户端**（`vibeface-app://app/`）：内置 React 业务界面；本机节点管理在 App 设置 `/settings/desktop-node`，经受限 client preload 调用主进程。
   负责选择数据目录、初始化、启动与停止本机 Core、仅连接已有服务、打开业务窗口和桌面设置。
 - **业务窗口**：`sandbox`、`contextIsolation` 为真，`nodeIntegration` 为假，**没有 preload，也没有任何原生桥**。
   它加载 Core 在 `local_listen`（默认 `http://127.0.0.1:4791`）提供的真实界面。
@@ -35,9 +35,9 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 ## 命令
 
 ```
-pnpm --dir apps/desktop typecheck   # tsconfig.json（主进程/preload/测试）+ tsconfig.launcher.json（渲染层）
+pnpm --dir apps/desktop typecheck   # tsconfig.json（主进程/preload/测试）
 pnpm --dir apps/desktop test        # vitest
-pnpm --dir apps/desktop build       # dist/main/index.cjs, dist/preload/launcher.cjs, dist/launcher/**
+pnpm --dir apps/desktop build       # dist/main/index.cjs, dist/preload/client.cjs
 pnpm --dir apps/desktop package     # scripts/build-desktop.mjs（由交付侧拥有）
 node apps/desktop/scripts/make-icons.mjs   # 仅 macOS：从品牌矢量重新生成已提交的图标
 ```

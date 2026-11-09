@@ -35,7 +35,7 @@
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
 | `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
-| `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
+| `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为官方 `agent` CLI。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制；协调 Agent 的分诊唤醒按同一上限另行计数 |
 
@@ -48,7 +48,7 @@
 | `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
 | `relay_listen` | `--relay-listen ADDR` | `forward` 模式的 TCP relay 地址，或 `discovery-only` 模式的 UDP 发现地址 |
 | `relay_mode` | `--relay-mode MODE` | `forward` 默认，或 `discovery-only`；后者要求 `public_entry=true` |
-| `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
+| `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份；有 `--entry` 的非公共入口新 Node 在没给 `--bootstrap` 和 `--discovery` 时写官方发现服务 |
 | `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
 | `bootstrap` | `--bootstrap MODE\|URL`、`--bootstrap-https URL` | `{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`；`init` 和首次直接启动在没有 `--entry` 的新 Node 上写 `public`，公共入口恒为 `off`，见[公共接入](#公共接入) |
@@ -72,11 +72,11 @@
 
 `reasoning_effort` 为可选推理档位。`backup` 保存本机备用策略，默认关闭。候选项为 `{provider, model, reasoning_effort}`，最多 5 个不同的 Provider 与模型组合，自动策略只允许原回合已确认未执行时尝试一次。
 
-`provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、Claude Code、pi 与 opencode 支持活动补充，分别使用原生 steer 或持续输入；Cursor 的 standalone Bridge 尚未暴露所需 RPC，活动补充明确拒绝。接纳与回合归属分别记录，不代表模型已读。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
+`provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机适配器能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、Claude Code、pi 与 opencode 支持活动补充，分别使用原生 steer 或持续输入；当前 Cursor ACP 适配器未提供原生 steer，活动补充明确拒绝。接纳与回合归属分别记录，不代表模型已读。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
 
-Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。任务也使用独立进程和存储，续接同一本机任务会话时复用原有 owner。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
+Cursor 每轮启动官方 CLI ACP 进程，按个人网络、Bot 会话、任务或设备协调会话隔离 owner 和私有存储。同一个 owner 串行运行，不同 Bot 可同时运行。`CURSOR_CONFIG_DIR` 保存私有 ACP 会话，`CURSOR_DATA_DIR` 保存私有项目数据，真实 HOME 留给 CLI 已有登录。Node 仅新建或加载自己记录归属的会话，忽略加载阶段回放，不扫描或导入个人历史。CLI 仍可能加载用户或项目 MCP、规则与 hooks，这两个私有目录不表示全部个人配置隔离。退出时停止全部受管进程组。
 
-Cursor 执行器在发送前保存 Agent ID，流首次给出 Run ID 时记录该运行。工作进度和结果使用既有工作状态与事件；取消只在 Provider 终态确认后结算。断流或重启后按已知 Agent ID、Run ID 和原有私有存储调用 `GetRun`；缺少运行 ID 或读取失败时保持待核对，绝不按最新运行猜测或重新发送。任务回读不改变 Bot 的 `run_reconcile=false` 能力声明。
+Cursor 执行器先保存 Node 自己的 session 归属和 prompt receipt，再发送提示；终态先写本机 journal，再报告完成。receipt 是 Node 的读回定位，不是 Cursor 原生 Run ID。ACP 没有持久运行查询或幂等 prompt 契约，断流、重启或缺少终态时保持 Unknown，只读回已有 journal，不重发 prompt，也不以历史内容猜测完成。取消只有原 prompt 返回 cancelled 才确认，进程退出不作为取消证据。Bot 的 `run_reconcile=false` 能力声明不变。
 
 pi 的实际会话保存在 `<data-dir>/providers/pi/sessions`，真实启动同时固定 `--session-dir` 与 `PI_CODING_AGENT_SESSION_DIR`。原有 pi 认证配置不变。OpenCode 的数据、配置、状态和缓存分别使用 `<data-dir>/providers/opencode/{data,config,state,cache}`，`OPENCODE_DB` 固定为该 data 根中的 `opencode/opencode.db`。Node 强制私有 `OPENCODE_CONFIG_DIR`，忽略外部 `OPENCODE_CONFIG`、额外 CLI 配置和项目配置覆盖，Shell 工具继承相同私有根。
 
@@ -109,11 +109,14 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 这张表说明各文件的用途和私密程度，不是备份白名单：`node.sqlite3` 以 WAL 模式运行，去重、待补依赖和投影状态都在数据库文件里，备份须在停止 Node 后复制整个目录。
 | `join.json` | `vibeface join` 或本机网页进行中的加入请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
-| `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
-| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务会话的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
+| `cursor-agent.pid` | 受管 Cursor Agent CLI 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
+| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务 owner 的私有目录；`config/`、`data/` 是官方 CLI 根，`sessions/` 记录归属，`prompts/` 保存发送前及终态 journal，目录 0700，不进入共享 DAG |
+| `providers/codex/local-login.json` | 首次导入的私有 auth.json 摘要标记，不含认证值；用户独立修改该文件后不再借用本机登录 |
+| `providers/claude/local-login.json` | 当前 Node access 快照的摘要标记，不含认证值；每次启动前先检查私有登录，只有确认未登录时才重新建立借用标记 |
+| `providers/codex/local-login-access.json`、`providers/claude/local-login-access.json` | Node 专属访问令牌快照，0600，不含源刷新令牌；后续更新不写入 CLI 的 auth.json 或 .credentials.json |
 | `providers/pi/sessions/` | pi 原生会话文件，Node 的 `pi/` 仍保存恢复指针 |
 | `providers/opencode/` | OpenCode 私有 XDG 数据、配置、状态、缓存及数据库，不复制用户认证 |
-| `cursor/work-owners.json` | 本机 Cursor 任务到原生 Agent、会话 owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
+| `cursor/work-owners.json` | 本机 Cursor 任务到 ACP 会话、owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 
@@ -136,7 +139,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `/api/relay/grant` | POST | `grants` 策略的公共入口：登记一张许可 `{grant}`，回 `{device_id, expires_at_ms}`，无效回 403 |
 | `/api/local/setup` | POST | 本机状态与所有者材料：所有者进程凭 `local-access.json` 的 bearer 读取一次性初始化邀请、当前入口和本机启动 token，匿名本机网页只得到状态；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
-| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 的 owner 进程在每轮发送前安装该 attempt 的 bearer，回调按 bearer 授权，`agentId` 不授予权限 |
+| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的回环工具端口上提供；`vibeface tool` 发 `{toolName, args, agentId}`，回 `{result}`；按当前 attempt bearer 授权，`agentId` 不授予权限 |
+| `/mcp` | POST | 只在同一私有回环工具端口提供的无状态 Streamable HTTP MCP；initialize、tools/list、tools/call 均验证当前 attempt bearer，调用同一 Runtime.tool 与 call_ref 去重路径 |
 
 网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。所有者身份另由 `Authorization: Bearer <capability>` 证明：capability 连同 `origin`、`node_id` 记在数据目录私有的 `local-access.json`，Node 每次启动重新生成，只有能读该目录的 OS 账户进程拿得到，回环连接本身不证明账户；`vibeface` 命令和桌面应用经 Core 的 `local_setup` 控制请求读取它并代为调用。未初始化时所有者得到 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，匿名请求得到 `{ kind: "owner_required", initialized: false }`，本机网页只能用 `vibeface access` 打印的链接随 fragment 带来的邀请；已有网络时两者都得到 `{ kind: "initialized", entry, removed, local_launch? }`，`removed` 表示这台电脑已被移出，`local_launch { url, device_id, token }` 只在所有者请求且本机访问开启时给出。只有 `local_listen` 的本机 router 接受所有者凭据；公开 listener 上的同名路径不签发邀请或启动 token，隐藏真实来源的回环反代也不行。该响应不授予成员资格。
 
@@ -148,7 +152,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 
 - `target` 是本 Node 且本 Node 不是公共入口时，Noise 在这里终止。
 - `target` 是其他成员 Node 时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。目标不是成员时回 `{"type":"error","code":"target_not_member"}`，连不上时回 `target_unreachable`，随后关闭。
-- 公共入口没有地址簿，它把目标当作挂在自己 relay 上的设备去连接。只有持有入口令牌的 Node 能连上这台 relay，其他目标得到 `target_unreachable`。
+- 公共入口没有地址簿，只按设备编号连接目标：自己的 relay 是一个候选，另向配置的发现服务查询目标登记的 relay 和观察到的 IP。网关拨号最多 7 秒，在浏览器 10 秒连接超时之前回 `target_unreachable`；没有共同 relay 且无法直连时也是这个结果。
 - 每台网关同时最多转发 256 个会话，超出时回 `gateway_busy` 并关闭。`connect` 首帧须在 10 秒内到达。
 
 随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人自己的 Gateway 或本人自己服务器上的公共入口。
@@ -175,7 +179,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `provider_models` | `provider` | 读取共享模型目录 `ModelCatalog`，Bot 和执行任务复用。`available` 带模型和覆盖范围，`unavailable` 带原因；两种状态都保留默认和手填。Codex 经 App Server `model/list`，pi 经无会话 RPC 列出 |
 | `provider_probe` | `provider` | 主动刷新该 Provider 的无 prompt 检查，返回完整 `ProviderStatus`；不调用模型或执行登录 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
-| `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
+| `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id` 和 `gateway_url` |
 | `join_check` | `secret` | 打开链接时询问入口还收不收它，回 `invite` 为 `open`、`used` 或 `expired`，不占用链接。必须持有 secret 才能问。没登记过的 secret 与过期的回答相同，回答也不超出 `join` 拒绝时给的信息。本设备已提交且仍在等待的请求回 `open` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
 | `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数，请求已有 `admin_id` 时另带该管理设备的名字 `admin_name`；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
@@ -192,7 +196,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 
 未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器和原生客户端用它复算核对（WASM 与 FFI 的 `verify_membership` 都接受 `now`），签否决或确认时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`provider_models`、`provider_probe`、`configure_node`、`configure_provider`、`test_codex_app_server`、`triage_settings`、`configure_triage`、`test_webhook`、`create_decision_token` 和 `revoke_decision_token` 另要求管理设备或本机会话（后六个的参数见 [Agent 直连 App Server](design/agent-direct-app-server.md)），`invite`、`approve`、`approve_recovery` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
 
-加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://app.vibeface.dev/join#vibeface1…` 链接或二维码交给新设备。链接 origin 只用来打开 App；浏览器按顺序经 ticket 中 relay 的 origin、本页入口、链接 origin 和服务目录入口连接 `/api/client`，设备身份仍以 ticket 中的设备公钥核验。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
+加入使用承诺加短码。管理设备生成 ticket（入口设备编号和一次性 secret，不含地址），以 `vibeface://join/vibeface1…` 链接或同一链接的二维码交给新设备；Core、网页、桌面端和手机 App 只接受这种链接和单独的 `vibeface1…` 票据。桌面端和手机 App 注册 `vibeface` scheme 打开链接，浏览器由用户粘贴。浏览器按顺序经本页入口和服务目录入口连接 `/api/client`，由入口按设备编号转发，设备身份仍以 ticket 中的设备公钥核验。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
 浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、网页删除的 `BotDeleted`、`ConversationOwner`、本人结清的 `WorkFinished`、`NotificationAcked`、`PrimaryBotSet`、`BotProjectSet`、`BotAvatarSet` 和 `ScheduleControlled` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
 
@@ -286,11 +290,11 @@ job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`re
 
 逐条 receipt 分开保存 Provider 接受与实际原生回合归属。Codex 以稳定 `clientUserMessageId` 回读，Claude 以已登记 UUID 和持续输入组恢复，pi 与 OpenCode 读取各自原生记录。输入可能属于实际后续回合，必须记录其真实 turn。工具调用中的中间 assistant 消息不证明整个回答完成。只有原生证据证明输入及其终态才能结算为 `answered` 或 `unfinished`；仅有提交或接收不能显示模型已读。不可读与宿主结束后持续 Pending 分别计时，不能解释成一个固定的总等待期限。确认未到达才允许后续调度，持续无法核定则保留 `unknown`。
 
-steer 状态只在本机调度日志保存，同步和恢复不重放输入。结算为 `answered` 时同事务写入 `message_steered`，避免新 owner 把它当未回复。当前 Cursor 独立 Bridge 没有暴露新版 SDK 的文本 steer，不能声称活动补充已支持。
+steer 状态只在本机调度日志保存，同步和恢复不重放输入。结算为 `answered` 时同事务写入 `message_steered`，避免新 owner 把它当未回复。当前 Cursor ACP 适配器没有提供原生文本 steer，不能声称活动补充已支持。
 
 跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合。Bot 回答与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断保留已输出部分。`failed` 与 `interrupted` 带失败类别，原始错误留在本机 job 与 `node.log`，客户端按类别说明。
 
-失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor SDK 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
+失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor ACP 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
 
 ```text
 queued → claimed → running ─→ completed | failed
@@ -540,9 +544,9 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 `relay_mode=discovery-only` 的公共入口只注册 `vibeface/discovery/1`，不启动 `iroh-relay`，不提供 HTTP 浏览器转发，也不接受 `SYNC`、`BLOB`、`RPC`、`CLIENT`、`JOIN` 或 `DECISION` 业务 ALPN。网页开启时只提供静态资源和服务信息；配置了 `catalog` 时另提供 `/bootstrap/catalog` 和 `/bootstrap/grant`。
 
-发现协议使用长度前缀 JSON，请求帧最多 1024 字节，应答帧最多 4608 字节以容纳签名目录，未知字段被拒绝。请求有 `register`、`lookup {device_id}`、空的 `probe`，以及配置了 `catalog` 的服务才回答的 `catalog` 和 `grant {relay_url}`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；`catalog` 回 `catalog {catalog}`，`grant` 回绑定连接 TLS 身份的 `granted {grant}` 或 `refused {reason}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
+发现协议使用长度前缀 JSON，请求帧最多 2048 字节，应答帧最多 4608 字节以容纳签名目录，未知字段被拒绝。请求有 `register {relays}`、`lookup {device_id}`、空的 `probe`，以及配置了 `catalog` 的服务才回答的 `catalog` 和 `grant {relay_url}`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address,relays}` 和 `notice {device_id,address}`；`catalog` 回 `catalog {catalog}`，`grant` 回绑定连接 TLS 身份的 `granted {grant}` 或 `refused {reason}`；不接受客户端提交 IP 地址或任意转发载荷。`relays` 是登记者当前的 home relay 加上自己运行的 relay，最多 4 个，每个 URL 最多 256 字节；QUIC 握手已证明设备身份。拨号方会直接连登记的 relay，所以发现服务从登记里剔除格式不对、超长或主机为 `localhost`、回环、私有、链路本地、未指定或组播等非公网地址的 relay，域名还要在 1 秒内解析且所有结果都是公网地址，超过 4 个时只留前 4 个；地址和其余 relay 照常登记。登记连接自身来自回环或私有地址时不做公网和解析判断。登记方在所连发现服务不在本机或私有网络时，上报前就去掉非公网 relay（含自己运行的 relay）；查询方按同样规则剔除 `peer` 里的 relay，不丢弃整条记录。服务端只在登记时解析一次，之后 DNS 改指向私有地址（DNS 重绑定）的风险仍在，由拨号方的 relay 连接自行承担。home relay 变化时客户端结束这次登记并重新登记；会话因租约或请求数用完正常结束时立即重连，出错时按 1 秒起、翻倍、最多 30 秒并带随机抖动的退避重连，成功登记后退避归零。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
 
-总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个请求。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
+总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个 `lookup` 以外的请求；`lookup` 不计入这个上限，改为每连接每秒最多 20 个，超出时回 `refused {reason}`，会话不关闭。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
 
 已知设备编号可以查询在线状态和观察地址，不提供枚举接口。运营者可见设备、IP、查询关系和许可申请。仅发现不能补偿被封锁或不可打洞的 UDP 路径；这类流量经目录里的公共 relay 或用户另行配置的 relay 转发，由 iroh 自动回退。部署步骤见[运行公共发现服务](node.md#运行不转发业务数据的公共发现服务)。
 

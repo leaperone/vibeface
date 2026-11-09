@@ -16,6 +16,7 @@ import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
+import { Route as SettingsDesktopNodeRouteImport } from './routes/settings_.desktop-node'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppChannelsIndexRouteImport } from './routes/_app/channels.index'
 import { Route as AppChannelsChannelIdRouteImport } from './routes/_app/channels.$channelId'
@@ -60,6 +61,11 @@ const AppTasksRoute = AppTasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
   getParentRoute: () => AppRoute,
+} as any)
+const SettingsDesktopNodeRoute = SettingsDesktopNodeRouteImport.update({
+  id: '/settings_/desktop-node',
+  path: '/settings/desktop-node',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const AppBBotIdRoute = AppBBotIdRouteImport.update({
   id: '/b/$botId',
@@ -119,6 +125,7 @@ export interface FileRoutesByFullPath {
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/tasks': typeof AppTasksRoute
+  '/settings/desktop-node': typeof SettingsDesktopNodeRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
@@ -136,6 +143,7 @@ export interface FileRoutesByTo {
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/tasks': typeof AppTasksRoute
+  '/settings/desktop-node': typeof SettingsDesktopNodeRoute
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/channels/$channelId': typeof AppChannelsChannelIdRoute
@@ -156,6 +164,7 @@ export interface FileRoutesById {
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/tasks': typeof AppTasksRoute
+  '/settings_/desktop-node': typeof SettingsDesktopNodeRoute
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/channels/$channelId': typeof AppChannelsChannelIdRoute
@@ -177,6 +186,7 @@ export interface FileRouteTypes {
     | '/inbox'
     | '/settings'
     | '/tasks'
+    | '/settings/desktop-node'
     | '/b/$botId'
     | '/channels/$channelId'
     | '/devices/$deviceId'
@@ -194,6 +204,7 @@ export interface FileRouteTypes {
     | '/inbox'
     | '/settings'
     | '/tasks'
+    | '/settings/desktop-node'
     | '/'
     | '/b/$botId'
     | '/channels/$channelId'
@@ -213,6 +224,7 @@ export interface FileRouteTypes {
     | '/_app/inbox'
     | '/_app/settings'
     | '/_app/tasks'
+    | '/settings_/desktop-node'
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/channels/$channelId'
@@ -230,6 +242,7 @@ export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
   ConnectRoute: typeof ConnectRoute
   JoinRoute: typeof JoinRoute
+  SettingsDesktopNodeRoute: typeof SettingsDesktopNodeRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -282,6 +295,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/tasks'
       preLoaderRoute: typeof AppTasksRouteImport
       parentRoute: typeof AppRoute
+    }
+    '/settings_/desktop-node': {
+      id: '/settings_/desktop-node'
+      path: '/settings/desktop-node'
+      fullPath: '/settings/desktop-node'
+      preLoaderRoute: typeof SettingsDesktopNodeRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_app/b/$botId': {
       id: '/_app/b/$botId'
@@ -406,6 +426,7 @@ const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
   ConnectRoute: ConnectRoute,
   JoinRoute: JoinRoute,
+  SettingsDesktopNodeRoute: SettingsDesktopNodeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

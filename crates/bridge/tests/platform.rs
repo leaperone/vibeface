@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use vibeface_bridge::platform::{ipc, privatefs, program, secret, tree};
 
@@ -75,23 +75,16 @@ fn echoing_program(directory: &Path, name: &str) -> PathBuf {
     }
 }
 
-fn eventually(description: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if ready() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting for {description}");
-}
-
 #[test]
 fn private_paths_belong_to_this_account_and_are_written_whole() -> Result<()> {
     let directory = scratch("private");
     privatefs::ensure_private(&directory, "the scratch directory")?;
 
     let inside = directory.join("名前 with spaces");
+    #[cfg(windows)]
+    let inside = inside.join("nested-".repeat(30));
+    #[cfg(windows)]
+    assert!(inside.to_string_lossy().encode_utf16().count() > 260);
     privatefs::create_dir(&inside)?;
     privatefs::ensure_private(&inside, "a nested private directory")?;
 
@@ -236,59 +229,6 @@ async fn a_local_endpoint_admits_this_account_and_refuses_a_second_holder() -> R
     right.read_exact(&mut read).await?;
     assert_eq!(&read, b"paired\n");
     std::fs::remove_dir_all(&directory)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
-    let directory = scratch("unconfirmed-journal");
-    let journal = directory.join("cursor.pid");
-    let (mut spawned, mut child) = tree::Tree::spawn(long_lived(), "platform-test", true)?;
-    let root = spawned.root();
-    assert!(spawned.is_running());
-
-    let record = format!("{} never-matches-this-owned-tree\n", spawned.token());
-    privatefs::write_atomic(&journal, record.as_bytes())?;
-    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
-    assert_eq!(std::fs::read_to_string(&journal)?, record);
-    assert!(tree::root_is_running(root));
-    assert!(tree::token_is_running(spawned.token()));
-
-    let left = tree::stop_recorded(spawned.token(), |_| false)?;
-    assert!(
-        left.is_none(),
-        "a tree the Node does not recognize is left running"
-    );
-    assert!(spawned.is_running());
-
-    spawned.stop();
-    let _ = child.start_kill();
-    child.wait().await?;
-    eventually("the tree to be cleared", || !spawned.is_running());
-    assert!(!tree::token_is_running(spawned.token()));
-    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
-    assert!(!journal.exists());
-    privatefs::write_atomic(&journal, b"unqueryable-tree fixture\n")?;
-    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
-    assert!(tree::token_is_running("unqueryable-tree"));
-    assert_eq!(
-        std::fs::read_to_string(&journal)?,
-        "unqueryable-tree fixture\n"
-    );
-    let bridge = vibeface_bridge::agent::SdkBridge::new(
-        Default::default(),
-        vibeface_bridge::agent::ToolCallbackConfig {
-            url: "http://127.0.0.1:9".into(),
-            auth_token: "fixture-callback-token-".repeat(2),
-        },
-        Some(journal.clone()),
-    )?;
-    bridge.stop().await;
-    assert!(
-        journal.exists(),
-        "stopping a new owner preserves an unconfirmed old tree"
-    );
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 

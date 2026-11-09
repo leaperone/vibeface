@@ -83,6 +83,17 @@ function selectedTarget(value: SelectedLocalNode | null): LocalTarget | null {
   return { nodeId: inspect.deviceId, dataDir: inspect.dataDir, host: privateOrigin.host.replace(/^\[|\]$/g, ''), port: privateOrigin.port, origin: privateOrigin.origin }
 }
 
+function selectedGatewayAddress(address: string, target: LocalTarget, publicListen: string): boolean {
+  try {
+    const requested = new URL(address)
+    if (requested.protocol !== 'http:' || requested.username || requested.password || requested.search || requested.hash || requested.pathname !== '/') return false
+    const requestedPort = Number(requested.port || '80')
+    parsePrivateOrigin(`${requested.hostname}:${requestedPort}`)
+    const publicPort = Number(publicListen.slice(publicListen.lastIndexOf(':') + 1))
+    return requestedPort === target.port || (Number.isInteger(publicPort) && publicPort > 0 && publicPort <= 65535 && requestedPort === publicPort)
+  } catch { return false }
+}
+
 function readBoundedBody(response: IncomingMessage): Promise<Buffer> {
   return new Promise((resolveBody, reject) => {
     const chunks: Buffer[] = []
@@ -195,6 +206,22 @@ function pathForAsset(rawPath: string): string | null {
   const segments = relativePath.split('/')
   if (segments.some(part => !part || part.startsWith('.')) || ['_headers', '_redirects', '_shell.html'].includes(relativePath)) return null
   return relativePath
+}
+
+const SPA_ROUTE_ROOTS = new Set(['connect', 'join', 'inbox', 'settings', 'tasks', 'devices', 'channels', 'b'])
+
+/** Client-router paths that load the signed SPA shell when no static file exists. */
+function shouldServeSpaShell(rawPath: string): boolean {
+  let decoded: string
+  try { decoded = decodeURIComponent(rawPath) } catch { return false }
+  if (decoded.startsWith('/api/') || decoded === '/api') return false
+  const trimmed = decoded.replace(/^\/+|\/+$/g, '')
+  if (!trimmed) return false
+  if (pathForAsset(rawPath) === null) return false
+  const segments = trimmed.split('/')
+  const last = segments.at(-1)
+  if (last && /\.[a-z0-9][-+.a-z0-9]*$/i.test(last)) return false
+  return SPA_ROUTE_ROOTS.has(segments[0] ?? '')
 }
 
 /** Bounded WebSocket channel for Core's fixed local client endpoints. */
@@ -436,12 +463,7 @@ export function createClientHost(options: ClientHostOptions) {
     root = canonical
   }
 
-  async function serve(request: Request): Promise<Response> {
-    await initAssets()
-    const url = new URL(request.url)
-    if (url.protocol !== `${CLIENT_SCHEME}:` || url.host !== CLIENT_HOST || (request.method !== 'GET' && request.method !== 'HEAD')) return new Response(null, { status: 404 })
-    const relativePath = pathForAsset(url.pathname)
-    if (!relativePath) return new Response(null, { status: 403 })
+  async function serveAsset(relativePath: string, request: Request): Promise<Response | null> {
     const target = resolve(root, relativePath)
     const relation = relative(root, target)
     if (!relation || relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) return new Response(null, { status: 403 })
@@ -450,7 +472,7 @@ export function createClientHost(options: ClientHostOptions) {
       const resolvedRelation = relative(root, canonicalTarget)
       if (resolvedRelation === '..' || resolvedRelation.startsWith(`..${sep}`) || isAbsolute(resolvedRelation)) return new Response(null, { status: 403 })
       const info = await stat(canonicalTarget)
-      if (!info.isFile()) return new Response(null, { status: 404 })
+      if (!info.isFile()) return null
       const headers = {
         'content-type': MIME.get(extname(canonicalTarget).toLowerCase()) ?? 'application/octet-stream',
         'content-security-policy': csp,
@@ -459,7 +481,22 @@ export function createClientHost(options: ClientHostOptions) {
         'content-length': String(info.size),
       }
       return new Response(request.method === 'HEAD' ? null : await readFile(canonicalTarget), { status: 200, headers })
-    } catch { return new Response(null, { status: 404 }) }
+    } catch { return null }
+  }
+
+  async function serve(request: Request): Promise<Response> {
+    await initAssets()
+    const url = new URL(request.url)
+    if (url.protocol !== `${CLIENT_SCHEME}:` || url.host !== CLIENT_HOST || (request.method !== 'GET' && request.method !== 'HEAD')) return new Response(null, { status: 404 })
+    const relativePath = pathForAsset(url.pathname)
+    if (!relativePath) return new Response(null, { status: 403 })
+    const direct = await serveAsset(relativePath, request)
+    if (direct) return direct
+    if (shouldServeSpaShell(url.pathname)) {
+      const shell = await serveAsset('index.html', request)
+      if (shell) return shell
+    }
+    return new Response(null, { status: 404 })
   }
 
   async function currentTarget(): Promise<LocalTarget | null> {
@@ -519,9 +556,11 @@ export function createClientHost(options: ClientHostOptions) {
 
   async function openGateway(contents: WebContents, deviceId: string, address: unknown, timeoutMs: unknown): Promise<string | null> {
     if (!DEVICE_ID.test(deviceId) || typeof address !== 'string' || typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error('Invalid local Gateway target')
-    const target = await currentTarget()
-    if (!target) return null
-    if (target.nodeId !== deviceId || target.origin !== address) return null
+    const selected = await options.resolveSelectedNode()
+    const target = selectedTarget(selected)
+    if (!selected || !target) return null
+    if (target.nodeId !== deviceId || !selectedGatewayAddress(address, target, selected.inspect.listen)) return null
+    // Invitations name the public listener; the native broker uses this same Node's private listener.
     const socket = await ClientWebSocket.open(target, '/api/client', null, timeoutMs, deviceId)
     const id = randomUUID()
     sockets.set(id, { nodeId: target.nodeId, contents, socket, receiving: false, sending: 0 })
@@ -614,13 +653,19 @@ export function createClientHost(options: ClientHostOptions) {
     protocol.handle(CLIENT_SCHEME, serve)
   }
 
-  function dispose(): void {
+  function disconnect(): void {
     for (const id of sockets.keys()) closeSocket(id)
+    const contents = options.getClientContents()
+    if (contents) cookies.delete(contents)
+  }
+
+  function dispose(): void {
+    disconnect()
     if (installed) {
       for (const channel of Object.values(CLIENT_IPC)) ipcMain.removeHandler(channel)
       installed = false
     }
   }
 
-  return { clientUrl: CLIENT_URL, registerProtocol, installIpc, dispose }
+  return { clientUrl: CLIENT_URL, registerProtocol, installIpc, disconnect, dispose }
 }

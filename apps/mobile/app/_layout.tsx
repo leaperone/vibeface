@@ -13,8 +13,6 @@ import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
-import { mobilePlatform } from '@/platform'
 import { factoryReset } from '@/lib/factory-reset'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -52,8 +50,7 @@ function Screens() {
     const link = openedLink(url)
     if (!ready || !link || url === answered) return
     answered = url
-    const target = joinDestination(link, ticket => mobilePlatform.secure.ticketDecode(ticket))
-    if (target && device.linkTarget(link) === 'other') router.push({ pathname: '/switch-network', params: { link, entryId: target.entryId, address: target.address ?? '' } })
+    if (device.linkTarget(link) === 'other') router.push({ pathname: '/switch-network', params: { link } })
     else router.navigate('/')
   }, [url, ready])
   const wide = useWide()

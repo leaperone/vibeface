@@ -114,6 +114,11 @@ def guard(info):
                 'relay admission does not match the selected role')
         require(APP_ORIGIN in config.get('allowed_origins', []),
                 'browser access needs the App origin in allowed_origins')
+    if role == 'entry':
+        # Tickets name the target only by device ID; the entry finds its relay through the grant issuer's Discovery.
+        issuer = network['relay_admission'].get('issuer')
+        require(any(url.startswith(f'vibeface://{issuer}@') for url in network.get('discovery', [])),
+                'Entry role needs the grant issuer Discovery in network.discovery')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
@@ -217,6 +222,20 @@ def self_test():
                 else:
                     raise AssertionError('Relay without the App origin accepted')
                 (data / 'config.json').write_text(json.dumps(dict(relay, allowed_origins=[APP_ORIGIN])))
+                assert guard(info)['device_id'] == 'b' * 64
+            issuer = 'c' * 64
+            entry = dict(config, allowed_origins=[APP_ORIGIN], network={
+                'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'grants', 'issuer': issuer}})
+            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'entry'}):
+                (data / 'config.json').write_text(json.dumps(entry))
+                try:
+                    guard(info)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('Entry without Discovery accepted')
+                entry['network']['discovery'] = [f'vibeface://{issuer}@discovery.example.invalid:4792']
+                (data / 'config.json').write_text(json.dumps(entry))
                 assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')
 
