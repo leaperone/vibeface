@@ -44,10 +44,10 @@ launchctl print "gui/$USER_UID/$LABEL"
 4. 使用 `xcodebuild`、`Vibeface.xcworkspace`、`Vibeface` scheme、`Release` 配置、`iphoneos` SDK 和 `generic/platform=iOS` 构建。显式设置任务内的 `-derivedDataPath`、已核对的 `DEVELOPMENT_TEAM`、Automatic 开发签名和 `Apple Development` 身份；不要照搬 CI 的禁用签名参数。仅构建时使用 `build`，不让运行命令隐式安装手机。
 5. 对最终 App 执行 `codesign --verify --deep --strict`；检查实际签名身份、entitlements、embedded profile、版本和非空 `main.jsbundle`，用 [设备程序校验](../../../../scripts/ios_device.py)确认每个 Mach-O slice 均为 iPhoneOS 且包含 arm64。再校验输入摘要，全部通过后才写成功回执。
 
-`kickstart` 返回只表示触发请求完成。等待本次任务退出，核对该次运行的 exit code、日志及新成功回执，记录源码 SHA、版本、build number、产物路径和校验结果。旧日志中的成功记录、上一轮的 exit code 或仅有 `BUILD SUCCEEDED` 都不足以证明本次签名和产物检查通过。
+`kickstart` 返回只表示触发请求完成。等待本次任务退出，核对该次运行的 exit code、日志及新成功回执，记录源码 SHA、版本、build number、产物路径、制品文件摘要和校验结果。旧日志中的成功记录、上一轮的 exit code 或仅有 `BUILD SUCCEEDED` 都不足以证明本次签名和产物检查通过。
 
-## 真机安装
+## 交付制品
 
-只在用户已授权安装时，使用精确 UDID 执行 `devicectl device install app` 原位安装，再独立读回版本、启动 App 并查询运行进程。保留安装和启动回执，不卸载、不清数据或钥匙串。安装成功、进程启动、界面验收和数据完整性分别报告，文件元数据相同不能代替完整数据校验。本机开发签名产物不代表公开 Release、TestFlight 或 App Store 已交付。
+向用户交付 App 路径与签名、来源回执。安装已有制品交给 [Deploy skill](../../deploy/SKILL.md)；本机构建完成不自动安装手机，也不代表公开 Release、TestFlight 或 App Store 已交付。
 
 原理与平台说明见 [Apple TN2083](https://developer.apple.com/library/archive/technotes/tn2083/_index.html) 和 [GitLab macOS Runner](https://docs.gitlab.com/runner/install/osx/)。真正无人值守的 CI 专用钥匙串方案见 [GitHub 签名文档](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications)，不得直接在共享开发 Mac 上照搬覆盖钥匙串搜索列表的命令。
