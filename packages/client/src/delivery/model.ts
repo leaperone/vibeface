@@ -1,5 +1,5 @@
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
-import type { Acceptance, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
+import type { Acceptance, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
 const protocolMaxBytes = 16 * 65_536
@@ -189,6 +189,18 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
 
 /** Where a file can go without pasting an ID: my other computers, since a Node is what receives. */
 export const receiverChoices = (members: readonly Member[], self: string): Member[] => members.filter(item => item.kind === 'node' && item.device_id !== self)
+/** Devices that announce they relay deliveries; one whose record does not read right is left out, not the list. */
+export function parseProviders(value: unknown): DeliveryProvider[] {
+  return array(record(value).providers).flatMap((item): DeliveryProvider[] => {
+    try {
+      const v = record(item), offer = v.offer === null ? null : record(v.offer), settlement = offer && record(offer.settlement)
+      return [{ device_id: peer(v.device_id), paid: boolean(v.paid), last_seen_ms: integer(v.last_seen_ms),
+        offer: offer && settlement && { settlement: { chain_id: integer(settlement.chain_id), escrow: text(settlement.escrow), asset: text(settlement.asset) }, price: amount(offer.price) } }]
+    } catch { return [] }
+  })
+}
+/** Paid delivery offers only providers that quote a price; free delivery any of them. */
+export const providerChoices = (providers: readonly DeliveryProvider[], mode: DeliveryMode): DeliveryProvider[] => mode === 'paid' ? providers.filter(item => item.paid && item.offer) : [...providers]
 
 export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '免费传输' }, { value: 'paid', label: '付费传输' }]
 export const acceptanceOptions: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
@@ -237,6 +249,7 @@ export const transferCopy = {
   otherDevice: '发给别人的设备',
   receiver: '接收方的连接 ID',
   provider: '中转设备的连接 ID',
+  providers: '可选的中转设备',
   providerHint: '只经手加密后的文件，不会加入你的设备',
   noRecords: '还没有传输记录',
   serviceCap: '服务费上限',

@@ -1537,7 +1537,7 @@ mod tests {
             "public_url": null,
             "web_enabled": true,
             "write_state": null,
-            "bootstrap": "public",
+            "mesh": {"enabled": true, "network": "vibeface", "records": 4, "neighbors": 2},
             "peers": [],
             "error": null
         });

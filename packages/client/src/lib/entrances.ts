@@ -4,7 +4,10 @@ import publicBootstrap from '../../../../config/public-bootstrap.json' with { ty
 
 /** The official page: static, with no Node behind it. */
 export const APP_ORIGIN = 'https://app.vibeface.dev'
-/** The official public node, which forwards to any Node by device ID and takes the official page's origin. */
+/**
+ * The official public node, the way in before this device has reached any Node: it forwards to any Node by device ID
+ * and takes the official page's origin. Once connected, the Node names other public gateways as well.
+ */
 export const PUBLIC_GATEWAY: string = publicBootstrap.gateway_url
 
 /**
@@ -88,6 +91,24 @@ export function storedEntrances(value: unknown): Entrance[] {
   })
 }
 
+/** A public gateway outside this network that the Node checked serves its device ID; it forwards to any Node by device ID. */
+export type Gateway = { device_id: string; url: string }
+
+/** Gateways as the Node returns them and this device stores them: HTTPS origins only, at most 16, anything else dropped. */
+export function gatewaysOf(value: unknown): Gateway[] {
+  if (!Array.isArray(value)) return []
+  const found = new Map<string, Gateway>()
+  for (const item of value.slice(0, 16)) {
+    const { device_id, url } = (item ?? {}) as Partial<Gateway>
+    if (typeof device_id !== 'string' || !devicePattern.test(device_id) || typeof url !== 'string') continue
+    try {
+      const origin = new URL(url)
+      if (origin.protocol === 'https:' && origin.pathname === '/' && !origin.search && !origin.hash && !origin.username && !origin.password) found.set(origin.origin, { device_id, url: origin.origin })
+    } catch { /* not a URL */ }
+  }
+  return [...found.values()]
+}
+
 /** A newer record replaces an address, an older one is ignored; success times carry over and revoked Nodes leave. */
 export function mergeEntrances(saved: Entrance[], fresh: Entrance[], view: MembershipView): Entrance[] {
   const nodes = members(view)
@@ -113,9 +134,10 @@ export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.
  * recently reached. With `seen`, the member Nodes this app sees on its LAN right now with where, the current Node is
  * tried directly first and the others before the other web entrances. Only addresses seen now are dialed: a dial names
  * the Node to whoever holds that address, which on another LAN is a stranger. When no web address is left, the current
- * Node is tried where it was last reached or last signed it listens, as a last resort.
+ * Node is tried where it was last reached or last signed it listens, as a last resort. `gateways` reach the current Node
+ * by its device ID after every member's web entrance and before that last resort.
  */
-export function candidates(list: Entrance[], current: ConnectionEntry, seen?: Map<string, string[]>): ConnectionEntry[] {
+export function candidates(list: Entrance[], current: ConnectionEntry, seen?: Map<string, string[]>, gateways: Gateway[] = []): ConnectionEntry[] {
   const web: ConnectionEntry[] = openEntrances(list)
     .filter(item => {
       if (current.kind === 'lan') return true
@@ -123,14 +145,17 @@ export function candidates(list: Entrance[], current: ConnectionEntry, seen?: Ma
     })
     .sort((a, b) => b.last_ok_ms - a.last_ok_ms)
     .map(item => ({ kind: 'gateway', address: item.gateway_url, device_id: item.device_id }))
+  const relayed: ConnectionEntry[] = gateways
+    .filter(item => current.kind === 'lan' || item.url !== current.address)
+    .map(item => ({ kind: 'gateway', address: item.url, device_id: current.device_id }))
   const own = current.kind === 'lan' ? [] : [current]
-  if (!seen) return [...own, ...web]
+  if (!seen) return [...own, ...web, ...relayed]
   const lan = (device_id: string, addrs: string[]): ConnectionEntry => ({ kind: 'lan', addrs, device_id })
   const here = lanAddrs(seen.get(current.device_id))
   const others = [...seen].filter(([device]) => device !== current.device_id).map(([device, addrs]) => lan(device, lanAddrs(addrs))).filter(entry => entry.kind === 'lan' && entry.addrs.length)
   const ways = [...here.length ? [lan(current.device_id, here)] : [], ...own, ...others, ...web]
-  if (ways.some(entry => entry.kind !== 'lan')) return ways
+  if (ways.some(entry => entry.kind !== 'lan')) return [...ways, ...relayed]
   const last = lanAddrs([...current.kind === 'lan' ? current.addrs : [], ...list.find(item => item.device_id === current.device_id)?.direct ?? []])
     .filter(addr => !here.includes(addr))
-  return last.length ? [...ways, lan(current.device_id, last)] : ways
+  return [...ways, ...relayed, ...last.length ? [lan(current.device_id, last)] : []]
 }

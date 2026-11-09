@@ -1,4 +1,5 @@
 use super::store::{SignedTransaction, SpendIntent};
+use crate::net::mesh::record::Settlement;
 use alloy_consensus::TxEip1559;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_sol_types::{SolCall, SolStruct, SolValue, eip712_domain};
@@ -34,6 +35,14 @@ pub struct ChainConfig {
     pub confirmations: u64,
 }
 impl ChainConfig {
+    pub fn settlement(&self) -> Settlement {
+        Settlement {
+            chain_id: self.chain_id,
+            escrow: self.escrow.clone(),
+            asset: self.asset.clone(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.rpc_url)?;
         let host = url
@@ -61,12 +70,9 @@ impl ChainConfig {
             (1..=64).contains(&self.confirmations),
             "invalid delivery confirmation depth"
         );
-        let escrow = address(&self.escrow)?;
-        let asset = address(&self.asset)?;
-        ensure!(
-            escrow != Address::ZERO && asset != Address::ZERO && escrow != asset,
-            "invalid delivery deployment addresses"
-        );
+        self.settlement()
+            .validate()
+            .context("invalid delivery deployment addresses")?;
         self.profile.validate()?;
         let expected: ProofProfile = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

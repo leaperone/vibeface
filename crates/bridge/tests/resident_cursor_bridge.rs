@@ -422,8 +422,7 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
 }
 
 #[tokio::test]
-async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays_supported()
--> Result<()> {
+async fn a_signed_out_or_partial_status_never_starts_acp_even_with_explicit_auth() -> Result<()> {
     let root = root()?;
     let agent = agent(&root)?;
     for state in ["FAKE_STATUS_SIGNED_OUT", "FAKE_STATUS_PARTIAL"] {
@@ -444,7 +443,11 @@ async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays
             "status exit 0 does not authorize starting ACP"
         );
     }
-    for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+    for name in [
+        "CURSOR_API_KEY",
+        "CURSOR_AUTH_TOKEN",
+        "AGENT_CLI_CREDENTIAL_STORE",
+    ] {
         let env = BTreeMap::from([
             (name.into(), "synthetic-explicit-auth".into()),
             ("FAKE_STATUS_SIGNED_OUT".into(), "1".into()),
@@ -452,8 +455,25 @@ async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays
         let result = agent
             .provider_observation(&fixture(), &root, &root.join(name), &env)
             .await?;
-        assert_eq!(result.authentication, CursorAuthentication::Authenticated);
-        assert!(result.launchable);
+        assert_eq!(result.authentication, CursorAuthentication::SignInRequired);
+        assert!(!result.launchable);
+        assert!(!root.join("acp-starts").exists());
+        let mut turn = turn(&root, name);
+        turn.env = env;
+        assert!(
+            agent
+                .run(
+                    &turn,
+                    "must not run",
+                    None,
+                    |_| async { Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) }
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.join("prompts.jsonl").exists());
     }
     agent.stop().await;
     std::fs::remove_dir_all(root)?;

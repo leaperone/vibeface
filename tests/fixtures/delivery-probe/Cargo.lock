@@ -3556,10 +3556,8 @@ name = "vibeface-delivery-probe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures-util",
  "hex",
  "iroh",
- "iroh-dns",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

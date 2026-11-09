@@ -380,7 +380,7 @@ struct Inner {
     agent_alias: Alias,
     pidfile: PathBuf,
     link: std::sync::Mutex<Link>,
-    tree: std::sync::Mutex<Option<tree::Tree>>,
+    tree: tokio::sync::Mutex<Option<tree::Tree>>,
     stopping: std::sync::atomic::AtomicBool,
 }
 
@@ -653,9 +653,8 @@ impl Inner {
     }
 
     /// A tree recorded by an earlier run is ended, not adopted: its requests belong to a dead
-    /// epoch and its turns are settled by probes on the new App Server. Only a tree still
-    /// running an App Server on the Node's own endpoint is touched, never the system App Server
-    /// and never a program the recorded identifier was handed to since.
+    /// epoch and its turns are settled by probes on the new App Server. Recovery matches the
+    /// recorded program against an App Server on the Node's own endpoint, never the system server.
     fn kill_orphan(&self) {
         let Ok(token) = std::fs::read_to_string(&self.pidfile) else {
             return;
@@ -675,10 +674,25 @@ impl Inner {
                 "the App Server left by an earlier run was not ended"
             ),
         }
-        let _ = std::fs::remove_file(&self.pidfile);
+        if matches!(tree::Leftover::find(token.trim()), Ok(None)) {
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
     }
 
-    fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
+    async fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
+        let mut owned = self.tree.lock().await;
+        ensure!(!self.stopping(), "the App Server is stopping");
+        match std::fs::read_to_string(&self.pidfile) {
+            Ok(token) => {
+                ensure!(
+                    matches!(tree::Leftover::find(token.trim()), Ok(None)),
+                    "the previous App Server tree has not been confirmed gone"
+                );
+                std::fs::remove_file(&self.pidfile)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
@@ -704,8 +718,27 @@ impl Inner {
             ));
         }
         config::private_write(&self.pidfile, spawned.token().as_bytes())?;
-        *self.tree.lock().expect("tree lock") = Some(spawned);
+        *owned = Some(spawned);
         Ok(child)
+    }
+
+    async fn end_spawned(&self, child: &mut tokio::process::Child) {
+        let mut owned = self.tree.lock().await;
+        let cleared = if let Some(mut tree) = owned.take() {
+            vibeface_bridge::agent::terminate_process_tree(child, &mut tree).await
+        } else {
+            // stop() finished all group signals before releasing this lock.
+            let reaped = matches!(
+                tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+                Ok(Ok(_))
+            );
+            reaped
+                && std::fs::read_to_string(&self.pidfile)
+                    .is_ok_and(|token| matches!(tree::Leftover::find(token.trim()), Ok(None)))
+        };
+        if cleared {
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
     }
 
     /// Runs the Node's own App Server once. `true` when a new target ended it; its turns are
@@ -737,7 +770,7 @@ impl Inner {
                 .is_none()
                 .then(|| self.spawn_endpoint.path().to_owned()),
         );
-        let mut child = match self.spawn(launch) {
+        let mut child = match self.spawn(launch).await {
             Ok(child) => child,
             Err(error) => {
                 tracing::warn!(event = "app_server.start_failed", %error, "App Server could not start");
@@ -768,14 +801,10 @@ impl Inner {
             let authenticated = tokio::select! {
                 result=tokio::time::timeout(START_LIMIT,bootstrap)=>matches!(result,Ok(Ok(()))),
                 _=self.changed.notified()=>false,
-                _=child.wait()=>false,
+                _=tree::observe_exit(&mut child)=>false,
             };
             if !authenticated {
-                let tree = self.tree.lock().expect("tree lock").take();
-                if let Some(mut tree) = tree {
-                    vibeface_bridge::agent::terminate_process_tree(&mut child, &mut tree).await;
-                }
-                let _ = std::fs::remove_file(&self.pidfile);
+                self.end_spawned(&mut child).await;
                 self.set_link(Link::LaunchFailed {reason:"Codex external authentication could not be prepared; refresh the source CLI login or sign in for this Node".into()});
                 return false;
             }
@@ -792,7 +821,7 @@ impl Inner {
         let mut late = false;
         let status = loop {
             tokio::select! {
-                status = child.wait() => break Some(status),
+                status = tree::observe_exit(&mut child) => break Some(status),
                 () = self.changed.notified() => break None,
                 () = &mut limit, if !late => {
                     late = true;
@@ -803,13 +832,9 @@ impl Inner {
                 }
             }
         };
-        let mut spawned = self.tree.lock().expect("tree lock").take();
+        self.end_spawned(&mut child).await;
         let replaced = match status {
             Some(status) => {
-                if let Some(spawned) = &mut spawned {
-                    // Tools the App Server started belong to its tree and end with it.
-                    spawned.kill();
-                }
                 tracing::warn!(event = "app_server.exited", ?status, "App Server exited");
                 if !self.stopping() {
                     self.set_link(Link::LaunchFailed {
@@ -822,12 +847,6 @@ impl Inner {
                 false
             }
             None => {
-                if let Some(spawned) = &mut spawned {
-                    spawned.ask_to_stop();
-                    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-                    spawned.kill();
-                }
-                let _ = child.wait().await;
                 tracing::info!(
                     event = "app_server.restarted",
                     "App Server restarts with new provider settings"
@@ -835,7 +854,6 @@ impl Inner {
                 true
             }
         };
-        let _ = std::fs::remove_file(&self.pidfile);
         self.target.lock().expect("target lock").applied = None;
         replaced
     }
@@ -942,7 +960,7 @@ impl CodexServer {
             })),
             pidfile: data_dir.join("codex-app-server.pid"),
             link: std::sync::Mutex::new(Link::Starting),
-            tree: std::sync::Mutex::new(None),
+            tree: tokio::sync::Mutex::new(None),
             stopping: std::sync::atomic::AtomicBool::new(false),
         };
         inner.kill_orphan();
@@ -1161,13 +1179,19 @@ impl CodexServer {
         self.inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let spawned = self.inner.tree.lock().expect("tree lock").take();
-        if let Some(mut spawned) = spawned {
-            tokio::task::spawn_blocking(move || spawned.stop())
-                .await
-                .ok();
-        }
-        let _ = std::fs::remove_file(&self.inner.pidfile);
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut owned = inner.tree.blocking_lock();
+            if let Some(mut spawned) = owned.take() {
+                let token = spawned.token().to_owned();
+                spawned.stop();
+                if matches!(tree::Leftover::find(&token), Ok(None)) {
+                    let _ = std::fs::remove_file(&inner.pidfile);
+                }
+            }
+        })
+        .await
+        .ok();
     }
 }
 
@@ -1597,6 +1621,166 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("App Server link stayed {:?}", server.link().await);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelling_stop_keeps_tree_ownership_until_group_signals_finish() -> Result<()> {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+        let dir = artifacts("codex-cancel-stop")?;
+        let (program, _) = recording_codex(&dir)?;
+        let launch = CodexLaunch {
+            bin: program,
+            env: BTreeMap::from([("HOME".into(), dir.display().to_string())]),
+            external_auth: None,
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let server = Arc::new(CodexServer::open(
+            CodexTarget::Spawn(launch.clone()),
+            &LocalIdentity::generate(),
+            &dir,
+            events,
+        )?);
+        let mut child = server.inner.spawn(&launch).await?;
+        let root = child.id().unwrap();
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(120)"])
+            .env("HOME", &dir)
+            .stdout(std::process::Stdio::piped())
+            .process_group(root as i32);
+        let mut member = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(member.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .await?;
+        assert_eq!(ready, "ready\n");
+        let stopping = tokio::spawn({
+            let server = server.clone();
+            async move { server.stop().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut child)).await??;
+        assert_eq!(
+            child.id(),
+            Some(root),
+            "the stop still has its owned root anchor"
+        );
+        assert!(
+            tree::try_observe_exit(&mut member)?.is_none(),
+            "the controlled member keeps stop in its grace period"
+        );
+        stopping.abort();
+        assert!(stopping.await.unwrap_err().is_cancelled());
+        let retained_lock = server.inner.tree.try_lock().is_err();
+        let (_, status) = tokio::join!(server.inner.end_spawned(&mut child), member.wait());
+        assert_eq!(status?.signal(), Some(libc::SIGKILL));
+        assert!(child.id().is_none());
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(dir)?;
+        assert!(
+            retained_lock,
+            "cancelling stop cannot release tree ownership while blocking group signals continue"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn failed_auth_bootstrap_keeps_an_unconfirmed_tree_record() -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+        let dir = artifacts("codex-bootstrap-cleanup")?;
+        let program = dir.join("early-codex");
+        std::fs::write(
+            &program,
+            r#"#!/usr/bin/env python3
+import os, pathlib, time
+release = pathlib.Path(os.environ['HOME']) / 'release-root'
+while not release.exists():
+    time.sleep(0.01)
+raise SystemExit(7)
+"#,
+        )?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let launch = CodexLaunch {
+            bin: program,
+            env: BTreeMap::from([("HOME".into(), dir.display().to_string())]),
+            external_auth: Some(crate::providers::ExternalCodexLogin {
+                access_token: "synthetic-bootstrap-access".into(),
+                account_id: "fixture".into(),
+                plan_type: None,
+            }),
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let server = CodexServer::open(
+            CodexTarget::Spawn(launch.clone()),
+            &LocalIdentity::generate(),
+            &dir,
+            events,
+        )?;
+        let running = tokio::spawn({
+            let inner = server.inner.clone();
+            let launch = launch.clone();
+            async move { inner.run_spawned(&launch).await }
+        });
+        let token = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(token) = std::fs::read_to_string(&server.inner.pidfile) {
+                    break token;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", "import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: (pathlib.Path(sys.argv[1]).write_text('term'), sys.exit(0))); print('ready', flush=True); time.sleep(120)"])
+            .arg(dir.join("member-term"))
+            .stdout(std::process::Stdio::piped())
+            .process_group(token.trim().parse()?);
+        let mut member = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(member.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .await?;
+        assert_eq!(ready, "ready\n");
+        std::fs::write(dir.join("release-root"), b"exit")?;
+        assert!(!tokio::time::timeout(Duration::from_secs(10), running).await??);
+        let recorded = std::fs::read_to_string(&server.inner.pidfile).ok();
+        let received_term = dir.join("member-term").exists();
+        let retry = server.inner.spawn(&launch).await;
+        let refused = retry.is_err();
+        if let Ok(mut child) = retry {
+            server.inner.end_spawned(&mut child).await;
+        }
+        let retained = std::fs::read_to_string(&server.inner.pidfile).ok();
+        let _ = member.start_kill();
+        member.wait().await?;
+        let mut resumed = server.inner.spawn(&launch).await?;
+        server.inner.end_spawned(&mut resumed).await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(&dir)?;
+        assert_eq!(
+            recorded.as_deref(),
+            Some(token.as_str()),
+            "unconfirmed bootstrap cleanup retains its exact process record"
+        );
+        assert!(
+            received_term,
+            "bootstrap failure asks its owned live member to finish"
+        );
+        assert!(
+            refused,
+            "another launch cannot replace an unconfirmed process record"
+        );
+        assert_eq!(
+            retained, recorded,
+            "a refused retry preserves the exact record"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -51,7 +51,8 @@ export interface SecureApi {
   shortCode(networkId: string, inviteId: string, joiner: string, admin: string, adminNonce: string, joinerNonce: string): string
   signingMessage(domain: string, payload: Uint8Array): Uint8Array
   ticketDecode(text: string): string
-  ticketEncode(entryId: string, secretHex: string): string
+  /** `entry`: the entry Node's node link, as its `invite` answer gives it. */
+  ticketEncode(entry: string, secretHex: string): string
   verify(deviceId: string, domain: string, payload: Uint8Array, signature: string): void
   /** `now`: the Node's clock in ms, so both sides see the same directory in effect; this device's clock when absent. */
   verifyMembership(stateJson: string, expectedNetwork: string, now?: number | null): SecureMembership

@@ -124,9 +124,8 @@ pub struct NodeStatus {
     pub write_state: Option<WriteState>,
     pub peers: Option<Vec<PeerStatus>>,
     pub error: Option<String>,
-    /// `off`, `public` or `custom`.
     #[serde(default)]
-    pub bootstrap: Option<String>,
+    pub mesh: Value,
 }
 
 impl NodeStatus {
@@ -169,6 +168,47 @@ impl NodeStatus {
             },
         )
     }
+}
+
+/// `on · vibeface · 12 records · 3 neighbors` from the `mesh` object of a Node status.
+pub fn mesh_summary(mesh: &Value) -> Option<String> {
+    if !mesh["enabled"].as_bool()? {
+        return Some("off".into());
+    }
+    let mut summary = format!(
+        "on · {}",
+        safe_text(mesh["network"].as_str().unwrap_or_default())
+    );
+    if let (Some(records), Some(neighbors)) = (mesh["records"].as_u64(), mesh["neighbors"].as_u64())
+    {
+        summary.push_str(&format!(" · {records} records · {neighbors} neighbors"));
+    }
+    Some(summary)
+}
+
+/// One line for a mesh record, which another Node signed: device, reachability, addresses,
+/// relay and roles.
+pub fn mesh_record(record: &Value) -> String {
+    let text = |value: &Value| safe_text(value.as_str().unwrap_or("?"));
+    let mut line = format!(
+        "{} {}",
+        text(&record["device_id"]),
+        text(&record["reachable"])
+    );
+    for addr in record["addrs"].as_array().into_iter().flatten() {
+        line.push_str(&format!(" {}", text(addr)));
+    }
+    if record["relay_url"].is_string() {
+        line.push_str(&format!(" relay={}", text(&record["relay_url"])));
+    }
+    for role in record["roles"].as_array().into_iter().flatten() {
+        line.push_str(&match role["kind"].as_str() {
+            Some("relay") => format!(" [relay {} {}]", text(&role["url"]), text(&role["access"])),
+            Some("gateway") => format!(" [gateway {}]", text(&role["url"])),
+            _ => format!(" [{} {}]", text(&role["kind"]), text(&role["service"])),
+        });
+    }
+    line
 }
 
 pub fn age(seconds: u64) -> String {
@@ -247,8 +287,8 @@ pub fn print_status(node: &NodeStatus) -> io::Result<()> {
         ),
         ("Version", node.version().into()),
         (
-            "Bootstrap",
-            node.bootstrap.clone().unwrap_or_else(|| "off".into()),
+            "Mesh",
+            mesh_summary(&node.mesh).unwrap_or_else(|| "unknown".into()),
         ),
         ("Data", node.data_dir.to_string_lossy().into_owned()),
     ] {

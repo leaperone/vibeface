@@ -63,6 +63,9 @@ export type ProviderChange = {
   provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
   env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
 }
+export function canSetProviderEnvironment(provider: ProviderId, name: string): boolean {
+  return provider !== 'cursor' || !['CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE'].includes(name)
+}
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 export type ProviderObservation = {
@@ -262,6 +265,31 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     suggested_roots: strings(v.suggested_roots),
   }
 }
+const relayStates = ['off', 'checking', 'announced', 'unreachable'] as const
+/** This Node's open relay for other people's devices; `announced` once a neighbour reached it from outside. */
+export type RelaySettings = {
+  volunteer: boolean; url: string | null; listen: string | null; rate: number; max_clients: number; max_clients_per_ip: number
+  status: typeof relayStates[number]; error: string | null
+}
+/** `share_link`: this Node's node link, `vibeface://node/<device-id>?addr=…&relay=…`, which another Node takes as its bootstrap. */
+export function parseShareLink(value: unknown): string {
+  const link = text(record(value, '节点链接').link)
+  if (!/^vibeface:\/\/node\/[0-9a-f]{64}(\?\S*)?$/.test(link)) throw new Error('节点链接格式无效。')
+  return link
+}
+/** The limits `configure_relay` applies when turned on without them: bytes per second per connection, connections, connections per IP. */
+export const relayDefaults = { rate: 16384, max_clients: 128, max_clients_per_ip: 8 } as const
+export function parseRelaySettings(value: unknown): RelaySettings {
+  const v = record(value, '转发设置'), status = relayStates.find(state => state === v.status)
+  const count = (input: unknown) => { if (typeof input !== 'number' || !Number.isSafeInteger(input) || input < 0) throw new Error('转发设置格式无效。'); return input }
+  const optional = (input: unknown) => input === null ? null : text(input)
+  if (!status) throw new Error('转发设置格式无效。')
+  return {
+    volunteer: boolean(v.volunteer), url: optional(v.url), listen: optional(v.listen),
+    rate: count(v.rate), max_clients: count(v.max_clients), max_clients_per_ip: count(v.max_clients_per_ip),
+    status, error: optional(v.error),
+  }
+}
 export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']
 /** A provider named by a peer's capabilities, or null when it names none this client knows. */
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
@@ -336,7 +364,7 @@ export function probeIssueText(provider: ProviderId, issue: ProbeIssue): string 
   const messages: Record<ProbeCode, string> = {
     not_installed: `找不到 ${name} 程序，请在运行设备安装或检查路径`, config_invalid: `${name} 配置无法读取，请检查运行设备上的配置`,
     missing_credential: `${name} 缺少认证信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
-    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
+    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: provider === 'cursor' ? 'Cursor 需要在运行设备上完成官方 CLI 订阅登录' : `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
     authentication_unverified: `${name} 认证状态尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
     model_unverified: `${name} 尚未确认这个模型，可发送消息或先检查可用性`, model_unavailable: `${name} 无法使用所选模型，请检查模型设置`,
   }

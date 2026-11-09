@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Pencil, RadioTower, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -14,6 +14,7 @@ import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
 import { entryAddress, throughEntry, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings } from "./ai-settings"
+import { RelaySettings, ShareLink, relayLabel } from "./relay-settings"
 import { JoinRequests } from "./join"
 import { localCopy } from "@/features/workspace/local-session"
 
@@ -243,6 +244,11 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       </div> : null}
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
+
+    {row.entry && row.kind === "node" && (canManage || localSession) ? <ShareLink /> : null}
+    {row.entry && row.kind === "node" ? canManage || localSession ? <RelaySettings /> : <SettingsGroup>
+      <SettingsRow icon={RadioTower} label={relayLabel}>{editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</SettingsRow>
+    </SettingsGroup> : null}
 
     {canManage && row.member?.kind === "client" && !row.browser ? <SettingsGroup>
       <SettingsRow icon={terms.admin.icon} label={unmanaging ? deviceCopy.unmanageAsk(row.name) : terms.admin.label} tone={unmanaging ? "danger" : undefined} stacked={unmanaging}

@@ -19,6 +19,7 @@ use vibeface_control::{
 };
 
 mod desktop_node;
+mod manage;
 mod service;
 mod terminal;
 mod triage;
@@ -72,6 +73,24 @@ enum Action {
     Join(Join),
     /// Manage this Node's delivery wallet.
     Wallet(WalletOptions),
+    /// Inspect the public mesh or change the Nodes this one joins it through.
+    Mesh(MeshOptions),
+    /// Call a client method on this Node as its local operator.
+    Call(manage::Call),
+    /// Change one config.json value after init.
+    Config(manage::ConfigOptions),
+    /// Show or change this Node's project roots, bot and write state.
+    Node(manage::NodeOptions),
+    /// Configure and check the AI providers on this Node.
+    Provider(manage::ProviderOptions),
+    /// List, create and manage bots, their schedules and memories.
+    Bots(manage::BotsOptions),
+    /// Inspect delivery orders and the Nodes that offer delivery.
+    Delivery(manage::DeliveryOptions),
+    /// Volunteer this Node's relay to the public mesh.
+    Relay(manage::RelayOptions),
+    /// Manage the personal network as an approved management client.
+    Client(manage::ClientOptions),
     /// Manage the installed user service.
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
@@ -185,12 +204,6 @@ struct Init {
     /// File with the token a listed --relay asks of this Node. Repeat for each such relay.
     #[arg(long = "relay-token", value_name = "URL=FILE", value_parser = relay_token)]
     relay_tokens: Vec<(String, PathBuf)>,
-    /// Discovery URL. Repeat for multiple entries.
-    #[arg(long = "discovery", value_name = "URL")]
-    discovery: Vec<String>,
-    /// Answer other devices' discovery registrations and lookups on this Node's UDP port.
-    #[arg(long)]
-    serve_discovery: bool,
     /// Address for an embedded relay.
     #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
@@ -231,10 +244,17 @@ struct Init {
     /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
     #[arg(long = "trusted-proxy", value_name = "IP")]
     trusted_proxies: Vec<IpAddr>,
-    /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
-    /// a self-hosted `vibeface://` discovery URL.
-    #[arg(long, value_name = "MODE|URL")]
-    bootstrap: Option<String>,
+    /// Stay off the public mesh.
+    #[arg(long)]
+    no_mesh: bool,
+    /// Mesh to join instead of the public one; it starts without the default bootstrap node.
+    #[arg(long, value_name = "NAME")]
+    mesh_network: Option<String>,
+    /// The first Node you know, as its node link from `vibeface mesh share`:
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>. Repeat for more; replaces
+    /// the default bootstrap node.
+    #[arg(long = "bootstrap", value_name = "LINK")]
+    bootstrap: Vec<String>,
 }
 
 #[derive(Args)]
@@ -357,6 +377,67 @@ enum WalletAction {
         /// Destination backup file.
         output: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct MeshOptions {
+    /// Node data directory.
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
+    #[command(subcommand)]
+    command: MeshAction,
+}
+
+#[derive(Subcommand)]
+enum MeshAction {
+    /// Show whether the mesh is on, its records and neighbors, and this Node's record.
+    Status {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the records this Node holds, most recently seen first.
+    Records {
+        /// Only Nodes offering this role.
+        #[arg(long, value_enum)]
+        role: Option<MeshRole>,
+        /// Maximum number of records to show.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the Nodes this one joins the mesh through first.
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapAction,
+    },
+    /// Print this running Node's node link, for another Node's --bootstrap.
+    Share,
+}
+
+#[derive(Subcommand)]
+enum BootstrapAction {
+    /// Add bootstrap nodes, each a node link
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>.
+    Add {
+        #[arg(required = true, value_name = "LINK")]
+        nodes: Vec<String>,
+    },
+    /// Remove bootstrap nodes by node link or device ID.
+    Remove {
+        #[arg(required = true, value_name = "LINK|DEVICE_ID")]
+        nodes: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MeshRole {
+    Relay,
+    Gateway,
+    Service,
 }
 
 #[derive(Subcommand)]
@@ -499,6 +580,43 @@ enum TriageAction {
         #[arg(long)]
         event_id: String,
     },
+    /// Show the triage, webhook and decision token settings.
+    #[serde(skip)]
+    Settings,
+    /// Change triage settings with a JSON object; absent fields keep their value.
+    #[serde(skip)]
+    Configure { change: String },
+    /// Send a test message to the configured webhook.
+    #[serde(skip)]
+    TestWebhook,
+    /// Create a decision token; it is shown once.
+    #[serde(skip)]
+    CreateToken {
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Revoke a decision token.
+    #[serde(skip)]
+    RevokeToken { token_id: String },
+}
+
+impl TriageAction {
+    /// The settings actions run as the local operator; the rest go to the local triage API.
+    fn operator(&self) -> Result<Option<(&'static str, Value)>> {
+        Ok(Some(match self {
+            Self::Settings => ("triage_settings", json!({})),
+            Self::Configure { change } => (
+                "configure_triage",
+                serde_json::from_str(change).context("the change must be JSON")?,
+            ),
+            Self::TestWebhook => ("test_webhook", json!({})),
+            Self::CreateToken { label } => ("create_decision_token", json!({"label":label})),
+            Self::RevokeToken { token_id } => {
+                ("revoke_decision_token", json!({"token_id":token_id}))
+            }
+            _ => return Ok(None),
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
@@ -643,16 +761,15 @@ async fn main() -> Result<()> {
             if let Some(open) = result["open"].as_str() {
                 println!("打开 {open}");
             }
-            if options.serve_discovery
-                && let Some(device_id) = result["device_id"].as_str()
-            {
-                println!("Discovery device ID: {device_id}");
-            }
-            match result["bootstrap"].as_str() {
-                Some("public") => println!("公共接入: 启用（--bootstrap off 可关闭）"),
-                Some("custom") => println!("公共接入: 自建 Discovery"),
-                Some("off") if !options.serve_discovery => println!("公共接入: 关闭"),
-                _ => {}
+            let mesh = &result["mesh"];
+            if mesh["enabled"] == true {
+                println!(
+                    "全网: 开启（{}，bootstrap 节点 {} 个；--no-mesh 可关闭）",
+                    mesh["network"].as_str().unwrap_or_default(),
+                    mesh["bootstrap"].as_array().map_or(0, Vec::len)
+                );
+            } else {
+                println!("全网: 关闭");
             }
             Ok(())
         }
@@ -661,6 +778,15 @@ async fn main() -> Result<()> {
         Some(Action::Access(options)) => access(options).await,
         Some(Action::Join(options)) => join(options).await,
         Some(Action::Wallet(options)) => wallet(options).await,
+        Some(Action::Mesh(options)) => mesh(options).await,
+        Some(Action::Call(options)) => manage::call(options).await,
+        Some(Action::Config(options)) => manage::config(options).await,
+        Some(Action::Node(options)) => manage::node(options).await,
+        Some(Action::Provider(options)) => manage::provider(options).await,
+        Some(Action::Bots(options)) => manage::bots(options).await,
+        Some(Action::Delivery(options)) => manage::delivery(options).await,
+        Some(Action::Relay(options)) => manage::relay(options).await,
+        Some(Action::Client(options)) => manage::client(options).await,
         Some(Action::Tool {
             name,
             json,
@@ -674,9 +800,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Action::Hooks(options)) => hooks(options).await,
-        Some(Action::Triage(options)) => {
-            post_triage(&options.local, serde_json::to_value(options.action)?).await
-        }
+        Some(Action::Triage(options)) => match options.action.operator()? {
+            Some((method, params)) => {
+                let result = manage::operator(&options.local.data_dir, method, params).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
+            None => post_triage(&options.local, serde_json::to_value(options.action)?).await,
+        },
         Some(Action::Requests(local)) => post_triage(&local, json!({"action":"requests"})).await,
         Some(Action::Respond {
             request_id,
@@ -784,8 +915,8 @@ async fn status(options: Access) -> Result<()> {
         if let Some(write_state) = result["write_state"].as_str() {
             println!("Writes: {write_state}");
         }
-        if let Some(bootstrap) = result["bootstrap"].as_str() {
-            println!("Bootstrap: {bootstrap}");
+        if let Some(mesh) = terminal::mesh_summary(&result["mesh"]) {
+            println!("Mesh: {mesh}");
         }
         if let Some(peers) = result["peers"].as_array() {
             let now = now_ms();
@@ -815,6 +946,97 @@ async fn status(options: Access) -> Result<()> {
         result["status"] == "running",
         "node is not reachable through its private maintenance socket"
     );
+    Ok(())
+}
+
+async fn mesh(options: MeshOptions) -> Result<()> {
+    let operation = match &options.command {
+        MeshAction::Share => {
+            let shared = manage::operator(&options.data_dir, "share_link", json!({})).await?;
+            println!("{}", shared["link"].as_str().unwrap_or_default());
+            return Ok(());
+        }
+        MeshAction::Status { .. } => json!({"op":"status"}),
+        MeshAction::Records { role, limit, .. } => {
+            json!({"op":"records","role":role,"limit":limit})
+        }
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Add { nodes },
+        } => json!({"op":"bootstrap","add":nodes}),
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Remove { nodes },
+        } => json!({"op":"bootstrap","remove":nodes}),
+    };
+    let result = control(
+        &options.data_dir,
+        ControlRequest::Mesh {
+            data_dir: options.data_dir.clone(),
+            operation,
+        },
+    )
+    .await?;
+    match options.command {
+        MeshAction::Status { json: true } | MeshAction::Records { json: true, .. } => {
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        MeshAction::Status { json: false } => {
+            println!(
+                "Mesh: {} ({})",
+                if result["enabled"] == true {
+                    "on"
+                } else {
+                    "off"
+                },
+                result["network"].as_str().unwrap_or_default()
+            );
+            println!("Records: {}", result["records"]);
+            match result["neighbors"].as_u64() {
+                Some(neighbors) => println!("Neighbors: {neighbors}"),
+                None => println!("Neighbors: - (Node not running)"),
+            }
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("Bootstrap: {}", node.as_str().unwrap_or_default());
+            }
+            match result["own"].as_object() {
+                Some(_) => println!("Own record: {}", terminal::mesh_record(&result["own"])),
+                None => println!("Own record: none yet"),
+            }
+        }
+        MeshAction::Records { json: false, .. } => {
+            let now = now_ms();
+            for entry in result["records"].as_array().into_iter().flatten() {
+                let seen = now.saturating_sub(entry["last_seen_ms"].as_i64().unwrap_or(now)) / 1000;
+                println!(
+                    "{} {} seen {seen}s ago",
+                    terminal::mesh_record(&entry["record"]),
+                    if entry["online"] == true {
+                        "online"
+                    } else {
+                        "expired"
+                    },
+                );
+            }
+            let shown = result["records"].as_array().map_or(0, Vec::len);
+            if result["total"]
+                .as_u64()
+                .is_some_and(|total| total > shown as u64)
+            {
+                println!(
+                    "{shown} of {} records shown; use --limit for more",
+                    result["total"]
+                );
+            }
+        }
+        MeshAction::Share => unreachable!("answered by the running Node above"),
+        MeshAction::Bootstrap { .. } => {
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("{}", node.as_str().unwrap_or_default());
+            }
+            if result["running"] != true {
+                println!("Saved; the Node joins through these when it starts.");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1185,12 +1407,37 @@ fn widely_readable_file(path: &Path) -> Result<PathBuf> {
 }
 
 fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
+    read_secret(
+        handed_over,
+        "Delivery wallet passphrase",
+        "wallet passphrase",
+        false,
+    )
+}
+
+/// A passphrase from a protected channel or the terminal; `confirm` asks twice for a new one.
+pub(crate) fn read_passphrase(
+    handed_over: Option<i64>,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
+    let mut prompt = label.to_owned();
+    prompt[..1].make_ascii_uppercase();
+    read_secret(handed_over, &prompt, label, confirm)
+}
+
+fn read_secret(
+    handed_over: Option<i64>,
+    prompt: &str,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
     use vibeface_bridge::platform::secret;
     use zeroize::Zeroizing;
     let mut bytes = Zeroizing::new(Vec::new());
     if let Some(reference) = handed_over {
         let channel = secret::handed_over(reference)
-            .context("read the wallet passphrase the caller handed over")?;
+            .with_context(|| format!("read the {label} the caller handed over"))?;
         channel.take(1026).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
@@ -1200,27 +1447,36 @@ fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
         }
     } else {
         let mut console = secret::Console::open()
-            .context("wallet passphrase requires a terminal or --passphrase-fd")?;
-        console.prompt("Delivery wallet passphrase: ")?;
-        loop {
-            let byte = console
-                .read_byte()?
-                .context("the terminal closed before a passphrase was entered")?;
-            if matches!(byte, b'\n' | b'\r') {
-                break;
+            .with_context(|| format!("{label} requires a terminal or --passphrase-fd"))?;
+        let mut read = |prompt: &str, bytes: &mut Vec<u8>| -> Result<()> {
+            console.prompt(prompt)?;
+            loop {
+                let byte = console
+                    .read_byte()?
+                    .context("the terminal closed before a passphrase was entered")?;
+                if matches!(byte, b'\n' | b'\r') {
+                    break;
+                }
+                ensure!(bytes.len() < 1024, "{label} exceeds its limit");
+                bytes.push(byte);
             }
-            ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
-            bytes.push(byte);
+            console.prompt("\n")?;
+            Ok(())
+        };
+        read(&format!("{prompt}: "), &mut bytes)?;
+        if confirm {
+            let mut again = Zeroizing::new(Vec::new());
+            read(&format!("{prompt} again: "), &mut again)?;
+            ensure!(*again == *bytes, "the two entries differ");
         }
-        console.prompt("\n")?;
     }
     ensure!(
         (12..=1024).contains(&bytes.len())
             && !bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-        "wallet passphrase must contain 12 to 1024 bytes on one line"
+        "{label} must contain 12 to 1024 bytes on one line"
     );
     Ok(SecretString::new(
-        String::from_utf8(bytes.to_vec()).context("wallet passphrase must be UTF-8")?,
+        String::from_utf8(bytes.to_vec()).with_context(|| format!("{label} must be UTF-8"))?,
     ))
 }
 
@@ -2439,6 +2695,31 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["vibeface", "--data-dir", "relative"]).is_err());
+    }
+
+    #[test]
+    fn mesh_share_and_bootstrap_take_node_links() {
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "--data-dir", TEST_DATA_NODE, "share"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Share,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["vibeface", "mesh", "share", "extra"]).is_err());
+        let link = "vibeface://node/82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235?addr=203.0.113.5:4790";
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "bootstrap", "add", link]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Bootstrap {
+                    command: BootstrapAction::Add { nodes }
+                },
+                ..
+            })) if nodes == [link]
+        ));
     }
 
     #[test]

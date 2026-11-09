@@ -60,6 +60,16 @@ pub enum ControlRequest {
         data_dir: PathBuf,
         operation: Value,
     },
+    Mesh {
+        data_dir: PathBuf,
+        operation: Value,
+    },
+    /// Set one config.json value in the running Node or, stopped, in the file.
+    ConfigSet {
+        data_dir: PathBuf,
+        key: String,
+        value: Value,
+    },
 }
 
 /// Read by owner processes only. A loopback connection does not prove an OS account.
@@ -293,6 +303,7 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 }
 
 pub mod agent;
+pub mod client;
 pub mod maintenance;
 
 #[cfg(test)]

@@ -20,7 +20,7 @@
 - [What you can do](#what-you-can-do)
 - [Get started](#get-started)
 - [Add another device](#add-another-device)
-- [Public discovery service](#public-discovery-service)
+- [Public mesh](#public-mesh)
 - [Privacy and permissions](#privacy-and-permissions)
 - [Documentation](#documentation)
 - [Build from source](#build-from-source)
@@ -76,15 +76,15 @@ vibeface join '<join link>' --name '<device name>'
 
 Compare the six-digit code on both devices before approving. Join the existing network instead of creating a new one. Read [first-time setup](packages/docs/onboarding.md) for joining and recovery.
 
-## Public discovery service
+## Public mesh
 
-The official public node is an ordinary Node outside every personal network. It serves discovery, an open relay and browser access, each with small limits. Its device ID and UDP address are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
+Every Node joins one public mesh by default: it announces a signed record with its device ID, direct addresses, home relay and the roles it offers, and keeps every other Node's record. The official public node is an ordinary Node outside every personal network and the default bootstrap node. It also runs an open relay and browser access, each with small limits. Its device ID, UDP address and relay are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
 
 ```text
-vibeface://<issuer>@8.217.72.118:4792
+vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3340
 ```
 
-New personal Nodes register with it by default, and use its open relay when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url` (`https://node.vibeface.dev:4792`), and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards only ciphertext. Use `--bootstrap off` during first initialization to disable public bootstrap, or point a Node at a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
+New personal Nodes join the mesh through it, and pick verified open relays from the mesh when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url` (`https://node.vibeface.dev:4792`), and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards ciphertext and sees addresses, device IDs and traffic volume, not content. Use `--no-mesh` during first initialization to stay off the mesh, or `--bootstrap <node link>` to join through the first Node you know (`vibeface mesh share` prints a running Node's link). See [The mesh](packages/docs/node.md#全网) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 

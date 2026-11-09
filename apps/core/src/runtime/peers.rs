@@ -4,7 +4,7 @@
 //! Sync only stores events. It never creates scheduler jobs or work, so pulling history again
 //! after a restart or from another Node replays no side effect.
 use super::*;
-use crate::net::{self, AddressRecord, Net, SignedAddress};
+use crate::net::{self, AddressRecord, Net, SignedAddress, relay::RelayGrant};
 use crate::store::admission::{PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope};
 use iroh::{
     endpoint::{Connection, ConnectionError},
@@ -95,11 +95,20 @@ impl ProtocolHandler for Inbound {
 }
 
 /// The relay admits this device, the personal network's Nodes, joiners holding an open invite,
-/// holders of the operator token and, when open, anyone, but never a blocked device. Only
-/// connections from outside the personal network count toward `relay_max_clients`.
+/// holders of the operator token or of a grant this Node signed and, when open, anyone, but
+/// never a blocked device. Only connections from outside the personal network count toward
+/// `relay_max_clients`.
 pub(super) struct RelayAccess {
     node: Weak<Runtime>,
     counted: std::sync::Mutex<std::collections::HashSet<iroh_relay::server::ConnectionId>>,
+}
+impl RelayAccess {
+    pub(super) fn new(node: Weak<Runtime>) -> Self {
+        Self {
+            node,
+            counted: Default::default(),
+        }
+    }
 }
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,16 +121,22 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
         let allowed = match self.node.upgrade() {
-            Some(node) => match node.relay_admits(request).await {
-                Some(true) => {
-                    let max = node.config.network.relay_max_clients;
-                    let mut counted = self.counted.lock().expect("relay clients");
-                    max.is_none_or(|max| counted.len() < max.get())
-                        && counted.insert(request.connection_id())
+            Some(node) => {
+                let allowed = match node.relay_admits(request).await {
+                    Some(true) => {
+                        let max = node.relay_config().relay_max_clients;
+                        let mut counted = self.counted.lock().expect("relay clients");
+                        max.is_none_or(|max| counted.len() < max.get())
+                            && counted.insert(request.connection_id())
+                    }
+                    Some(false) => true,
+                    None => false,
+                };
+                if allowed {
+                    node.volunteer.usage.bind(request);
                 }
-                Some(false) => true,
-                None => false,
-            },
+                allowed
+            }
             None => false,
         };
         if allowed {
@@ -202,6 +217,19 @@ impl Runtime {
         self.net.get().context("the Node network has not started")
     }
 
+    /// This Node's node link, which bootstraps other Nodes and goes into its invites; only its
+    /// device ID until the network starts.
+    pub(crate) fn share_link(&self) -> Result<vibeface_secure::link::NodeLink> {
+        match self.net() {
+            Ok(net) => net.share_link(),
+            Err(_) => Ok(vibeface_secure::link::NodeLink::new(
+                &self.identity.device_id()?,
+                vec![],
+                None,
+            )?),
+        }
+    }
+
     pub(super) async fn start_network(self: &Arc<Self>) -> Result<()> {
         let net = Arc::new(
             Net::bind(
@@ -213,6 +241,14 @@ impl Runtime {
             .await?,
         );
         ensure!(self.net.set(net.clone()).is_ok(), "network already started");
+        let mesh = &self.config.network.mesh;
+        if mesh.enabled
+            && let Err(error) = net
+                .start_mesh(mesh, &self.data_dir.join("mesh.sqlite3"))
+                .await
+        {
+            tracing::warn!(event = "mesh.off", %error, "the mesh is off");
+        }
         let weak = Arc::downgrade(self);
         let mut router = Router::builder(net.endpoint.clone());
         for alpn in net::ALPNS {
@@ -224,22 +260,11 @@ impl Runtime {
                 },
             );
         }
-        *self.router.lock().await = Some(router.spawn());
-        if let Some(listen) = self.config.network.relay_listen {
-            let access = RelayAccess {
-                node: weak,
-                counted: Default::default(),
-            };
-            let relay = net::spawn_relay(
-                listen,
-                Arc::new(access),
-                self.config.network.relay_rate,
-                self.config.network.relay_max_clients_per_ip,
-            )
-            .await?;
-            tracing::info!(event = "relay.started", %listen, "relay started");
-            *self.relay.lock().await = Some(relay);
+        if let Some(mesh) = net.mesh() {
+            router = mesh.accept(router);
         }
+        *self.router.lock().await = Some(router.spawn());
+        self.start_relay().await?;
         self.delivery.attach(Arc::downgrade(self))?;
         let bind = self.config.network.bind;
         // A Node bound to one address listens nowhere else.
@@ -271,12 +296,21 @@ impl Runtime {
         let node = self.clone();
         self.background_tasks
             .spawn(async move { node.outbox_loop().await })?;
+        let node = self.clone();
+        self.background_tasks
+            .spawn(async move { node.volunteer_loop().await })?;
+        let node = self.clone();
+        self.background_tasks
+            .spawn(async move { node.adopt_loop().await })?;
         Ok(())
     }
 
     pub(super) async fn stop_network(&self) {
         if let Ok(net) = self.net() {
             net.stop_lan().await;
+            if let Some(mesh) = net.mesh() {
+                mesh.close().await;
+            }
         }
         if let Some(router) = self.router.lock().await.take() {
             let _ = router.shutdown().await;
@@ -290,7 +324,8 @@ impl Runtime {
     /// counts toward `relay_max_clients`.
     async fn relay_admits(&self, request: &iroh_relay::server::ClientRequest) -> Option<bool> {
         let device = net::device_id(&request.endpoint_id());
-        if self.config.network.relay_blocked.contains(&device) {
+        let relay = self.relay_config();
+        if relay.relay_blocked.contains(&device) {
             return None;
         }
         if self.identity.device_id().is_ok_and(|own| own == device)
@@ -299,9 +334,9 @@ impl Runtime {
             return Some(false);
         }
         let granted = match request.auth_token() {
+            Some(token) if RelayGrant::is_grant(&token) => self.grant_admits(&token, &device),
             Some(token) => {
-                self.config
-                    .network
+                relay
                     .relay_operator_token
                     .as_ref()
                     .is_some_and(|operator| net::same_token(&token, operator))
@@ -314,7 +349,7 @@ impl Runtime {
             }
             None => false,
         };
-        (self.config.network.relay_open || granted).then_some(true)
+        (relay.relay_open || granted).then_some(true)
     }
 
     async fn removed_here(&self, device: &str) -> bool {
@@ -357,9 +392,6 @@ impl Runtime {
         alpn: &'static [u8],
         connection: Connection,
     ) -> Result<()> {
-        if alpn == net::DISCOVERY {
-            return self.net()?.serve_discovery(connection).await;
-        }
         let remote = net::device_id(&connection.remote_id());
         if alpn == net::SERVICE {
             return self.delivery.serve(self.clone(), connection).await;
@@ -765,10 +797,14 @@ impl Runtime {
 
     async fn sync_loop(self: Arc<Self>) {
         let Ok(net) = self.net().cloned() else { return };
+        let mut joined = Vec::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                 _ = self.sync_wakeup.notified() => {},
+            }
+            if let Some(mesh) = net.mesh() {
+                mesh.set_roles(self.mesh_roles());
             }
             let Ok(state) = self.membership_state().await else {
                 continue;
@@ -799,6 +835,12 @@ impl Runtime {
                 .collect();
             // The loop also rolls the LAN tag over each hour.
             net.refresh_lan(Some(&network), &peers);
+            if let Some(mesh) = net.mesh()
+                && joined != peers
+            {
+                mesh.join_peers(&peers).await;
+                joined.clone_from(&peers);
+            }
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");
@@ -1576,13 +1618,51 @@ impl Runtime {
             .then(|| self.config.public_url.clone())
     }
 
+    /// What this Node offers on the mesh: a gateway when its web app is at a public HTTPS origin
+    /// and forwards for any device, and its delivery service.
+    pub(crate) fn mesh_roles(&self) -> Vec<net::mesh::record::Role> {
+        let url = &self.config.public_url;
+        let reachable = reqwest::Url::parse(url).is_ok_and(|parsed| {
+            self.config.network.mesh.allow_private || net::mesh::public_host(&parsed)
+        });
+        let gateway = (self.config.web_enabled
+            && self.config.forwarding.any
+            && reachable
+            && net::mesh::record::gateway_url(url).is_ok())
+        .then(|| net::mesh::record::Role::Gateway { url: url.clone() });
+        gateway
+            .into_iter()
+            .chain(self.relay_role())
+            .chain(self.delivery.mesh_role())
+            .collect()
+    }
+
+    /// Saves the bootstrap nodes `vibeface mesh bootstrap` changed and joins through them.
+    pub(crate) async fn edit_mesh_bootstrap(
+        &self,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        let bootstrap = {
+            let _save = self.config_save.lock().await;
+            let mut config = crate::config::Config::load(&self.data_dir)?;
+            config.network.mesh.edit_bootstrap(add, remove)?;
+            config.save(&self.data_dir)?;
+            config.network.mesh.bootstrap
+        };
+        if let Some(mesh) = self.net().ok().and_then(|net| net.mesh()) {
+            mesh.set_bootstrap(bootstrap).await;
+        }
+        Ok(())
+    }
+
     /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
     async fn refresh_own_address(&self, network: &str) -> Result<bool> {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
         let gateway_url = self.gateway_url();
-        let relay = self.config.network.own_relay()?.map(|url| url.to_string());
+        let relay = self.relay_config().own_relay()?.map(|url| url.to_string());
         let mut store = self.store.lock().await;
         let previous = store
             .address_book()?
@@ -1680,6 +1760,28 @@ impl Runtime {
                     .open(network)
                     .is_ok_and(|record| view.node(&record.device_id).is_ok())
             })
+            .collect())
+    }
+
+    /// Verified public gateways on the mesh outside the personal network, at most 16.
+    pub(crate) async fn mesh_gateways(&self) -> Result<Vec<Value>> {
+        let Some(mesh) = self.net().ok().and_then(|net| net.mesh()) else {
+            return Ok(vec![]);
+        };
+        let members: Vec<String> = match self.membership_state().await {
+            Ok(state) => state
+                .project()?
+                .members
+                .into_iter()
+                .map(|member| member.device_id)
+                .collect(),
+            Err(_) => vec![],
+        };
+        Ok(mesh
+            .gateways(&members)
+            .await
+            .into_iter()
+            .map(|(device_id, url)| json!({"device_id":device_id,"url":url}))
             .collect())
     }
 
