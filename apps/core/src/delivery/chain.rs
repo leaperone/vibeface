@@ -1,4 +1,5 @@
 use super::store::{SignedTransaction, SpendIntent};
+use crate::net::mesh::record::Settlement;
 use alloy_consensus::TxEip1559;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_sol_types::{SolCall, SolStruct, SolValue, eip712_domain};
@@ -33,31 +34,6 @@ pub struct ChainConfig {
     pub profile: ProofProfile,
     pub confirmations: u64,
 }
-/// Where a paid service settles: the chain, its escrow contract and the asset it is paid in,
-/// named as [`ChainConfig`] names them. Delivery and relay offers carry it, so a buyer pays any
-/// offer through the delivery escrow it already uses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Settlement {
-    pub chain_id: u64,
-    pub escrow: String,
-    pub asset: String,
-}
-impl Settlement {
-    pub fn validate(&self) -> Result<()> {
-        let escrow = address(&self.escrow)?;
-        let asset = address(&self.asset)?;
-        ensure!(
-            self.chain_id != 0
-                && escrow != Address::ZERO
-                && asset != Address::ZERO
-                && escrow != asset,
-            "invalid settlement chain, escrow or asset"
-        );
-        Ok(())
-    }
-}
-
 impl ChainConfig {
     pub fn settlement(&self) -> Settlement {
         Settlement {

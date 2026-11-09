@@ -1,6 +1,5 @@
 // A Node's signed public record on the mesh. The delivery probe includes this file and pins its
 // SHA-256, so it uses only anyhow, serde, serde_json, vibeface_secure and std.
-use crate::delivery::chain::Settlement;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv6Addr, SocketAddr};
@@ -92,10 +91,52 @@ pub struct Offer {
 impl Offer {
     pub fn check(&self) -> Result<()> {
         self.settlement.validate()?;
-        vibeface_delivery::Amount::from_decimal_str(&self.price)
-            .map_err(|error| anyhow::anyhow!("invalid offer price: {error}"))?;
+        ensure!(uint256_decimal(&self.price), "invalid offer price");
         Ok(())
     }
+}
+
+/// Where a paid service settles: the chain, its escrow contract and the asset it is paid in,
+/// named as the delivery chain configuration names them. Delivery and relay offers carry it, so
+/// a buyer pays any offer through the delivery escrow it already uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settlement {
+    pub chain_id: u64,
+    pub escrow: String,
+    pub asset: String,
+}
+impl Settlement {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.chain_id != 0
+                && wallet_address(&self.escrow)
+                && wallet_address(&self.asset)
+                && self.escrow != self.asset,
+            "invalid settlement chain, escrow or asset"
+        );
+        Ok(())
+    }
+}
+
+/// A canonical, nonzero `0x` address in lowercase hex.
+fn wallet_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && value[2..].bytes().any(|b| b != b'0')
+}
+
+/// A canonical decimal uint256: digits without a leading zero, at most `2^256 - 1`.
+fn uint256_decimal(value: &str) -> bool {
+    const MAX: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    !value.is_empty()
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && (value.len() == 1 || !value.starts_with('0'))
+        && (value.len() < MAX.len() || (value.len() == MAX.len() && value <= MAX))
 }
 
 impl SignedMeshRecord {
@@ -389,6 +430,38 @@ mod tests {
                 offer: Some(broken),
             }];
             assert!(SignedMeshRecord::sign(&bad, |_| Ok(String::new())).is_err());
+        }
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let over = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+        for price in [
+            "0",
+            "1",
+            "01",
+            "",
+            "-1",
+            "1.5",
+            max,
+            over,
+            &format!("1{max}"),
+        ] {
+            assert_eq!(
+                uint256_decimal(price),
+                vibeface_delivery::Amount::from_decimal_str(price).is_ok(),
+                "{price}"
+            );
+        }
+        for wallet in [
+            format!("0x{}", "11".repeat(20)),
+            format!("0x{}", "00".repeat(20)),
+            format!("0x{}", "AB".repeat(20)),
+            format!("0x{}", "1".repeat(39)),
+        ] {
+            assert_eq!(
+                wallet_address(&wallet),
+                crate::delivery::chain::address(&wallet)
+                    .is_ok_and(|address| address != alloy_primitives::Address::ZERO),
+                "{wallet}"
+            );
         }
     }
 
