@@ -857,9 +857,20 @@ async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_i
                         let _share = share;
                         // The relay sends small QUIC datagrams that must not wait to coalesce.
                         let _ = client.set_nodelay(true);
+                        // A client gone without closing would otherwise keep its share.
+                        let keepalive = socket2::TcpKeepalive::new()
+                            .with_time(Duration::from_secs(60))
+                            .with_interval(Duration::from_secs(15));
+                        let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
                         if let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await {
                             let _ = relay.set_nodelay(true);
-                            let _ = tokio::io::copy_bidirectional(&mut client, &mut relay).await;
+                            let (mut from_client, mut to_client) = client.split();
+                            let (mut from_relay, mut to_relay) = relay.split();
+                            // Either side ending closes both, so a half-closed peer keeps no share.
+                            tokio::select! {
+                                _ = tokio::io::copy(&mut from_client, &mut to_relay) => {}
+                                _ = tokio::io::copy(&mut from_relay, &mut to_client) => {}
+                            }
                         }
                     });
                 }
@@ -901,11 +912,11 @@ impl Drop for Share {
     }
 }
 
-/// The address one client controls: an IPv4 address, or the /64 of an IPv6 one, which a single
-/// subscriber usually holds whole.
+/// The address one client controls: an IPv4 address, or the /56 of an IPv6 one, which ISPs
+/// commonly delegate to a single subscriber.
 pub fn client_address(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 72))),
         v4 => v4,
     }
 }
@@ -981,24 +992,28 @@ mod tests {
     }
 
     #[test]
-    fn a_client_address_is_an_ipv4_address_or_an_ipv6_slash_64() {
+    fn a_client_address_is_an_ipv4_address_or_an_ipv6_slash_56() {
         let address = |ip: &str| client_address(ip.parse().unwrap()).to_string();
         assert_eq!(address("203.0.113.7"), "203.0.113.7");
         assert_eq!(address("::ffff:203.0.113.7"), "203.0.113.7");
-        assert_eq!(address("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+        assert_eq!(address("2001:db8:1:2ff:3:4:5:6"), "2001:db8:1:200::");
         let shares = Shares::default();
         let two = NonZeroUsize::new(2).unwrap();
         let first = shares.take("2001:db8::1".parse().unwrap(), two).unwrap();
-        let _second = shares.take("2001:db8::2".parse().unwrap(), two).unwrap();
+        let _second = shares
+            .take("2001:db8:0:1::2".parse().unwrap(), two)
+            .unwrap();
         assert!(
-            shares.take("2001:db8::3".parse().unwrap(), two).is_none(),
-            "one /64 holds two"
+            shares
+                .take("2001:db8:0:ff::3".parse().unwrap(), two)
+                .is_none(),
+            "one /56 holds two"
         );
         assert!(
             shares
-                .take("2001:db8:0:1::3".parse().unwrap(), two)
+                .take("2001:db8:0:100::3".parse().unwrap(), two)
                 .is_some(),
-            "the next /64 has its own"
+            "the next /56 has its own"
         );
         drop(first);
         assert!(
@@ -1008,7 +1023,7 @@ mod tests {
     }
 
     /// A relay limited per address refuses the connection past the limit and admits it again
-    /// once one closes, with relay traffic passing through the front.
+    /// once one closes from either end, with relay traffic passing through the front.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_relay_front_holds_each_address_to_its_share() -> Result<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1020,35 +1035,45 @@ mod tests {
             NonZeroUsize::new(1),
         )
         .await?;
-        let probe = || async {
-            let mut stream = tokio::net::TcpStream::connect(relay.addr).await?;
-            stream
-                .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: relay\r\n\r\n")
-                .await?;
+        let addr = relay.addr;
+        let probe = move |headers: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            let request = format!("GET /generate_204 HTTP/1.1\r\nHost: relay\r\n{headers}\r\n");
+            stream.write_all(request.as_bytes()).await?;
             let mut head = [0; 12];
             let read =
                 tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head)).await??;
             Ok::<_, anyhow::Error>((stream, head[..read].to_vec()))
         };
-        let (held, head) = probe().await?;
+        // The first connection the relay answers once the address's share is back, left open.
+        let admitted = move |headers: &'static str| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match probe(headers).await {
+                        Ok((stream, head)) if head == b"HTTP/1.1 204" => return stream,
+                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                }
+            })
+            .await
+        };
+        let (held, head) = probe("").await?;
         assert_eq!(head, b"HTTP/1.1 204", "the relay answers through the front");
         // The front closes it unread, which the peer may see as a reset.
-        let refused = probe().await.map(|(_, head)| head);
+        let refused = probe("").await.map(|(_, head)| head);
         assert!(
             refused.as_ref().map_or(true, Vec::is_empty),
             "a second connection from the address is closed: {refused:?}"
         );
         drop(held);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if probe().await.is_ok_and(|(_, head)| head == b"HTTP/1.1 204") {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .context("the closed connection's share never came back")?;
+        let _ended = admitted("Connection: close\r\n")
+            .await
+            .context("the closed connection's share never came back")?;
+        // The relay closes `_ended` after answering, so the front ends it while the client
+        // still holds its end open.
+        admitted("")
+            .await
+            .context("a connection the relay closed kept its share")?;
         relay.shutdown().await;
         Ok(())
     }

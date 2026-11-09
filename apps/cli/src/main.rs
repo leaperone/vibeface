@@ -224,7 +224,7 @@ struct Init {
     /// Bytes a second each forwarded browser session carries.
     #[arg(long, value_name = "BYTES")]
     forward_rate: Option<NonZeroU32>,
-    /// Browser sessions, forwarded or waiting, from one client address.
+    /// Browser connections one client address holds at once, whatever their target.
     #[arg(long, value_name = "N")]
     forward_per_ip: Option<NonZeroUsize>,
     /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.

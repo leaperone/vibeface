@@ -6733,6 +6733,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "tar",
  "tokio",
  "tokio-rustls",

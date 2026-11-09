@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -233,7 +234,10 @@ def compose_runtime(config, image, version, source, fingerprint):
         service.update(network_mode='host', user=f'{config["uid"]}:{config["gid"]}',
                        environment=core_environment(config, version, source),
                        volumes=[{'type': 'bind', 'source': config['data_dir'], 'target': '/data',
-                                 'bind': {'create_host_path': False}}])
+                                 'bind': {'create_host_path': False}}],
+                       # Each relay or browser connection takes descriptors; containers often start
+                       # with a soft limit of 1024.
+                       ulimits={'nofile': {'soft': 65536, 'hard': 65536}})
     else:
         service.update(user='101:101', ports=[{'target': 8080, 'published': config['listen'].split(':')[1],
                                              'host_ip': '127.0.0.1', 'protocol': 'tcp'}])
@@ -301,6 +305,13 @@ def nginx_nodes(text):
     return parse(0, False)[0]
 
 
+def every_address(value):
+    try:
+        return ipaddress.ip_network(value, strict=False).prefixlen == 0
+    except ValueError:
+        return False
+
+
 def transform_nginx(text, config, certificate=None):
     servers = [node for node in nginx_nodes(text) if node['words'] == ['server'] and node['children']]
     targets = [server for server in servers
@@ -312,9 +323,11 @@ def transform_nginx(text, config, certificate=None):
         # The official node limits each browser by the address in X-Real-IP; behind Cloudflare,
         # `$remote_addr` is that address only once realip takes it from Cloudflare's header.
         directives = [n['words'] for n in targets[0]['children']]
-        require(any(words[0] == 'set_real_ip_from' for words in directives)
-                and ['real_ip_header', 'CF-Connecting-IP'] in directives,
+        trusted = [value.strip('"\'') for words in directives if words[0] == 'set_real_ip_from' for value in words[1:]]
+        require(trusted and ['real_ip_header', 'CF-Connecting-IP'] in directives,
                 'the App server must set set_real_ip_from and real_ip_header CF-Connecting-IP')
+        # Trusting every address lets any client name its own X-Real-IP.
+        require(not any(every_address(value) for value in trusted), 'set_real_ip_from must not trust every address')
     def indent(start):
         return text[text.rfind('\n', 0, start) + 1:start]
     def location(selector, body, start):
@@ -699,6 +712,7 @@ def self_test():
     assert runtime['network_mode'] == 'host' and runtime['user'] == '1001:1001'
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
     assert runtime['environment']['VIBEFACE_ROLE'] == 'node'
+    assert runtime['ulimits'] == {'nofile': {'soft': 65536, 'hard': 65536}}
     nginx = '''server { listen 80; server_name app.example.invalid; return 301 https://$host$request_uri; }
 server {
     listen 443 ssl;
@@ -755,7 +769,9 @@ server {
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
                 nginx.replace('location / {', 'include /old/routes.conf; location / {', 1),
                 nginx.replace('    real_ip_header CF-Connecting-IP;\n', '', 1),
-                nginx.replace('    set_real_ip_from 173.245.48.0/20;\n', '', 1)):
+                nginx.replace('    set_real_ip_from 173.245.48.0/20;\n', '', 1),
+                nginx.replace('173.245.48.0/20', '0.0.0.0/0', 1), nginx.replace('173.245.48.0/20', '::/0', 1),
+                nginx.replace('173.245.48.0/20', '"0::0/0"', 1)):
         try:
             transform_nginx(bad, app, pem)
         except ValueError:

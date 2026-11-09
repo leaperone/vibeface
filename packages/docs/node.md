@@ -230,14 +230,14 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 官方公共节点是一台不加入任何个人网络的普通 Node，没有域名，同时提供三项服务，各有上限：
 
 - **发现服务**：UDP `8.217.72.118:4792`。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
-- **开放 relay**：`http://8.217.72.118:3340`，显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一来源地址（IPv6 按 /64 计）最多 16 个。
-- **浏览器接入**：`https://app.vibeface.dev` 的 `/api/client`、`/api/info` 和 `/api/decision` 由网页服务器的 nginx 经 TLS 反代给它。它的网页端口只接受 TLS，证书是 `init --tls` 生成的自签证书，nginx 钉住这张证书；这个 TCP 端口只对 App 主机开放。nginx 用 Cloudflare 给出的浏览器地址覆盖 `X-Real-IP`，公共节点只认 App 主机发来的这个头。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多占 8 个，每个会话每秒最多 256 KiB。
+- **开放 relay**：`http://8.217.72.118:3340`，显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一来源地址（IPv6 按 /56 计）最多 16 个。
+- **浏览器接入**：`https://app.vibeface.dev` 的 `/api/client`、`/api/info` 和 `/api/decision` 由网页服务器的 nginx 经 TLS 反代给它。它的网页端口只接受 TLS，证书是 `init --tls` 生成的自签证书，nginx 钉住这张证书；这个 TCP 端口只对 App 主机开放。nginx 用 Cloudflare 给出的浏览器地址覆盖 `X-Real-IP`，公共节点只认 App 主机发来的这个头。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
 `vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台向官方发现服务登记自己的地址和 relay，本机网页、维护接口和局域网发现不等待它。登记应答附上公共节点的开放 relay，Node 把它加为候选 relay，所以直连不通的设备之间也能经它连通。浏览器在官方页面按设备编号连接，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
 `vibeface status` 的 `Bootstrap` 一行显示 `public`、`custom` 或 `off`。登记失败不影响本机使用和局域网内同步，只是外网设备暂时找不到它。
 
-公共节点看不到对话内容，个人网络仍按邀请和成员目录授权；一台公共节点服务多个人的 Node，各人的网络互不相通。转发名额用完时，新的浏览器会话排队，页面显示“排队中，第 n 位”；队列也满，或同一地址已占满份额时，页面显示“访问地址正忙”。
+公共节点看不到对话内容，个人网络仍按邀请和成员目录授权；一台公共节点服务多个人的 Node，各人的网络互不相通。转发名额用完时，新的浏览器会话排队，页面显示“排队中，第 n 位”；队列也满时，页面显示“访问地址正忙”；同一浏览器地址的连接已满时，新连接直接被拒，页面显示“连不上这个节点”。
 
 不想使用官方服务时，初始化加 `--bootstrap off`。自建发现服务后，用 `--bootstrap 'vibeface://<设备编号>@<主机>:<UDP 端口>'` 指向它；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…"}`）再启动。
 
@@ -261,7 +261,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    vibeface serve --data-dir "$VIBEFACE_NODE_DATA_DIR"
    ```
 
-   `init` 打印设备编号，发现服务的地址就是 `vibeface://<设备编号>@vb.example.com:4790`。UDP 端口必须能从公网直接访问，不能用 HTTP 反向代理替代。`--relay-open` 让 relay 接纳任何设备，必须同时设上限：`--relay-rate` 是 relay 每秒从每个连接读取的字节数，`--relay-max-clients` 是个人网络以外的同时连接数。`--relay-max-clients-per-ip` 限制同一来源地址的连接数，只用于直接对外的 relay 端口；经 nginx 反代时 relay 看到的来源都是回环地址，不要设它。`--forward-sessions`、`--forward-queue` 和 `--forward-rate` 是同时转发的浏览器会话数、排队数和每个会话每秒的字节数；`--forward-per-ip` 是同一浏览器地址最多占用的转发和排队名额，地址取自 `--trusted-proxy` 所列反代发来的 `X-Real-IP`。只给自己和熟人用时去掉 `--relay-open`，见 [私有 relay](#私有-relay)。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
+   `init` 打印设备编号，发现服务的地址就是 `vibeface://<设备编号>@vb.example.com:4790`。UDP 端口必须能从公网直接访问，不能用 HTTP 反向代理替代。`--relay-open` 让 relay 接纳任何设备，必须同时设上限：`--relay-rate` 是 relay 每秒从每个连接读取的字节数，`--relay-max-clients` 是个人网络以外的同时连接数。`--relay-max-clients-per-ip` 限制同一来源地址的连接数，只用于直接对外的 relay 端口；经 nginx 反代时 relay 看到的来源都是回环地址，不要设它。`--forward-sessions`、`--forward-queue` 和 `--forward-rate` 是同时转发的浏览器会话数、排队数和每个会话每秒的字节数；`--forward-per-ip` 是同一浏览器地址最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，地址取自 `--trusted-proxy` 所列反代发来的 `X-Real-IP`。只给自己和熟人用时去掉 `--relay-open`，见 [私有 relay](#私有-relay)。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
 
 3. nginx 把 relay 的三个路径转给 relay 端口，其余转给网页端口，两者都允许 WebSocket 升级：
 
@@ -305,7 +305,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    }
    ```
 
-   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址分配转发名额，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上初始化 Node 时指向它的发现服务，然后启动：
 
@@ -369,7 +369,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay-open` | `relay_open` | 本 relay 接纳任何设备，必须同时设 `relay_rate` 和 `relay_max_clients`，不能与运营者令牌同用 |
 | `--relay-rate <BYTES>` | `relay_rate` | relay 每秒从每个连接读取的字节数，默认不限 |
 | `--relay-max-clients <N>` | `relay_max_clients` | relay 同时保持的个人网络以外的连接数，默认不限 |
-| `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /64 计）同时保持的 TCP 连接数，含成员，默认不限 |
+| `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限 |
 | 无 | `relay_blocked` | relay 拒绝的设备编号 |
 | `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--serve-discovery` | `serve_discovery` | 在本 Node 的 UDP 端口上回答其他设备的登记和查询 |
@@ -377,7 +377,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址最多占用的转发和排队名额，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
+浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
 
 `--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名生成自签证书 `tls-cert.pem` 和私钥 `tls-key.pem`，由前面的反代钉住这张证书。
 

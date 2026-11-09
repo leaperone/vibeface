@@ -20,7 +20,7 @@ Relay 默认只接纳自己、本网络的 Node 和持邀请令牌的加入者�
 
 `app.vibeface.dev` 是静态网页。它的 Nginx 经 TLS 把 `/api/client`、`/api/info` 和 `/api/decision` 反代给公共节点，钉住公共节点的自签证书，并透传 `Host: app.vibeface.dev` 和取自 Cloudflare 的浏览器地址 `X-Real-IP`，公共节点的网页端口只对 App 主机开放；公共节点以这个 origin 为 `public_url` 检查 Host 和 Origin。浏览器在 `connect` 帧里指定设备编号，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
-转发名额用完时，新会话排队并收到 `{"type":"queued","position":n}`，页面显示“排队中，第 n 位”；队列也满，或同一浏览器地址占满它的份额时回 `gateway_busy`。每个会话的速率也受限。Node 默认不限速、不排队，只有官方公共节点在部署配置里设上限，见 [`deploy/README.md`](../../../deploy/README.md)。
+转发名额用完时，新会话排队并收到 `{"type":"queued","position":n}`，页面显示“排队中，第 n 位”；队列也满时回 `gateway_busy`。同一浏览器地址的连接超出份额时，在升级前直接拒绝。每个会话的速率也受限。Node 默认不限速、不排队，只有官方公共节点在部署配置里设上限，见 [`deploy/README.md`](../../../deploy/README.md)。
 
 ## 信任边界
 

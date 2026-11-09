@@ -38,6 +38,8 @@ struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
     clients: Arc<tokio::sync::Semaphore>,
+    /// The `/api/client` connections each browser address holds, counted on `listen` alone.
+    addresses: Option<crate::net::Shares>,
     assets: Option<Arc<StaticAssets>>,
 }
 
@@ -47,6 +49,7 @@ impl App {
             node,
             sites,
             clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+            addresses: None,
             assets,
         }
     }
@@ -324,7 +327,11 @@ fn browser_router_with_assets(
     local: bool,
     assets: Option<Arc<StaticAssets>>,
 ) -> Router {
-    let app = App::new(node, sites, assets);
+    let mut app = App::new(node, sites, assets);
+    // Anyone may reach `listen`; every connection to the local listener is this computer's.
+    if !local {
+        app.addresses = Some(Default::default());
+    }
     let mut routes = Router::new();
     if app.node.config.web_enabled {
         routes = routes
@@ -969,11 +976,22 @@ async fn client_gateway(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
-    let client = client_ip(
-        peer.ip(),
-        &headers,
-        &app.node.config.forwarding.trusted_proxies,
-    );
+    let forwarding = &app.node.config.forwarding;
+    // Taken before the shared sockets, so one address cannot hold them all.
+    let share = match (&app.addresses, forwarding.per_ip) {
+        (Some(addresses), Some(limit)) => {
+            let client = client_ip(peer.ip(), &headers, &forwarding.trusted_proxies);
+            let Some(share) = addresses.take(client, limit) else {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "this address holds too many client connections",
+                )
+                    .into_response();
+            };
+            Some(share)
+        }
+        _ => None,
+    };
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -986,10 +1004,10 @@ async fn client_gateway(
         .max_frame_size(65535)
         .on_upgrade(move |socket| async move {
             let socket = crate::client::ClientSocket::server(socket);
-            if let Err(error) = crate::client::serve_gateway(app.node, socket, client).await {
+            if let Err(error) = crate::client::serve_gateway(app.node, socket).await {
                 tracing::debug!(%error, "client connection closed");
             }
-            drop(permit);
+            drop((permit, share));
         })
 }
 

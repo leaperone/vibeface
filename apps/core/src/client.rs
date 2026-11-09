@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     num::NonZeroU32,
     path::Path,
     sync::{
@@ -299,14 +299,12 @@ impl Client {
 }
 
 /// Browser sessions this Gateway forwards to other devices. Anyone can open `/api/client`, so
-/// `forwarding.sessions` go at once and up to `forwarding.queue` wait, served in arrival order,
-/// with at most `forwarding.per_ip` of them from one client address.
+/// `forwarding.sessions` go at once and up to `forwarding.queue` wait, served in arrival order.
 pub(crate) struct Forwards {
     slots: Arc<tokio::sync::Semaphore>,
     /// Tickets of the waiting sessions, oldest first: a ticket's index is its place in line.
     waiting: std::sync::Mutex<VecDeque<u64>>,
     tickets: AtomicU64,
-    addresses: net::Shares,
 }
 
 impl Forwards {
@@ -315,7 +313,6 @@ impl Forwards {
             slots: Arc::new(tokio::sync::Semaphore::new(forwarding.sessions)),
             waiting: Default::default(),
             tickets: AtomicU64::new(0),
-            addresses: Default::default(),
         }
     }
 
@@ -337,13 +334,9 @@ impl Drop for InLine<'_> {
     }
 }
 
-/// `/api/client` from `client`'s address: read the connect frame, then end Noise here when the
-/// target is this Node, or relay the ciphertext to the target over `vibeface/client/1`.
-pub async fn serve_gateway(
-    node: Arc<Runtime>,
-    mut socket: ClientSocket,
-    client: IpAddr,
-) -> Result<()> {
+/// `/api/client`: read the connect frame, then end Noise here when the target is this Node,
+/// or relay the ciphertext to the target over `vibeface/client/1`.
+pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Result<()> {
     let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
         .await
         .context("connect frame timed out")?
@@ -367,16 +360,6 @@ pub async fn serve_gateway(
             return refuse(&mut socket, "target_not_member", error).await;
         }
     }
-    let _share = match node.config.forwarding.per_ip {
-        Some(limit) => match node.forwards.addresses.take(client, limit) {
-            Some(share) => Some(share),
-            None => {
-                let error = anyhow!("this address holds too many sessions on this Gateway");
-                return refuse(&mut socket, "gateway_busy", error).await;
-            }
-        },
-        None => None,
-    };
     let (_slot, early) = forward_slot(&node, &mut socket).await?;
     let mut forwarded = match open_forward(&node, &target).await {
         Ok(forwarded) => forwarded,
@@ -4460,14 +4443,19 @@ mod tests {
         let origin = node.config.public_url.clone();
         let server = tokio::spawn(crate::api::serve(node.clone(), None));
         let result: Result<()> = async {
-            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
             let origin = &origin;
             // The trusted proxy on loopback names each browser's address.
+            let request = |address: &'static str| -> Result<_> {
+                let mut request = client_url(origin)?.into_client_request()?;
+                request.headers_mut().insert("x-real-ip", address.parse()?);
+                Ok(request)
+            };
             let open = |address: &'static str| async move {
                 for _ in 0..100 {
-                    let mut request = client_url(origin)?.into_client_request()?;
-                    request.headers_mut().insert("x-real-ip", address.parse()?);
-                    if let Ok((socket, _)) = tokio_tungstenite::connect_async(request).await {
+                    if let Ok((socket, _)) =
+                        tokio_tungstenite::connect_async(request(address)?).await
+                    {
                         let mut socket = ClientSocket::Client(Box::new(socket));
                         let target = LocalIdentity::generate().device_id()?;
                         let connect = json!({"type":"connect","target":target});
@@ -4486,12 +4474,11 @@ mod tests {
                 text(&mut first).await?,
                 json!({"type":"queued","position":1})
             );
-            let mut again = open("203.0.113.1").await?;
-            assert_eq!(
-                text(&mut again).await?["code"],
-                "gateway_busy",
-                "an address holds one session"
-            );
+            // Refused before the upgrade, whatever its target, so it takes no shared socket.
+            match tokio_tungstenite::connect_async(request("203.0.113.1")?).await {
+                Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 429),
+                other => bail!("an address holds one connection: {:?}", other.map(|_| ())),
+            }
             let mut second = open("203.0.113.2").await?;
             assert_eq!(
                 text(&mut second).await?["code"],
@@ -4516,19 +4503,10 @@ mod tests {
                     .expect("forwarding queue")
                     .is_empty()
             );
-            let limit = std::num::NonZeroUsize::MIN;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while node
-                    .forwards
-                    .addresses
-                    .take("203.0.113.1".parse().unwrap(), limit)
-                    .is_none()
-                {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("the ended session kept its address's share")?;
+            drop(first);
+            open("203.0.113.1")
+                .await
+                .context("the ended connection kept its address's share")?;
             Ok(())
         }
         .await;

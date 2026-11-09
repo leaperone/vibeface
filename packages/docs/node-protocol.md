@@ -32,7 +32,7 @@
 | `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和发现服务设置，见下表 |
-| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址同时占用的转发和排队名额，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是反代地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`） |
+| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是反代地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`） |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
 | `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
@@ -53,7 +53,7 @@
 | `relay_open` | `--relay-open` | 本 relay 接纳任何设备，默认 `false` |
 | `relay_rate` | `--relay-rate BYTES` | relay 每秒从每个连接读取的字节数，省略时不限 |
 | `relay_max_clients` | `--relay-max-clients N` | relay 同时保持的个人网络以外的连接数，本 Node 和成员 Node 不计，省略时不限 |
-| `relay_max_clients_per_ip` | `--relay-max-clients-per-ip N` | 同一 IPv4 地址或 IPv6 /64 同时保持的 TCP 连接数，含成员，省略时不限 |
+| `relay_max_clients_per_ip` | `--relay-max-clients-per-ip N` | 同一 IPv4 地址或 IPv6 /56 同时保持的 TCP 连接数，含成员，省略时不限 |
 | `relay_blocked` | 无 | relay 拒绝的设备编号 |
 | `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
 | `serve_discovery` | `--serve-discovery` | 在本 Node 的 UDP 端口上回答其他设备的发现登记和查找，默认 `false` |
@@ -144,7 +144,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 - `target` 是本 Node 时，Noise 在这里终止。
 - `target` 是其他设备时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。`forwarding.any` 为 `false` 时只转发给本网络的 Node，目标不是成员时不排队，直接回 `{"type":"error","code":"target_not_member"}`；连不上时回 `target_unreachable`，随后关闭。
 - 网关按设备编号拨号，候选地址来自地址簿、局域网广播，以及配置的发现服务查到的 relay 和观察到的 IP；自己提供发现服务的网关先查本机登记。拨号最多 7 秒，在浏览器 10 秒连接超时之前回 `target_unreachable`；没有共同 relay 且无法直连时也是这个结果。
-- 网关同时最多转发 `forwarding.sessions` 个会话。名额用完时，新会话最多 `forwarding.queue` 个排队：网关立即回 `{"type":"queued","position":n}`，之后每 2 秒更新一次，轮到时回 `position` 为 0 再拨号；排队期间浏览器发来的最多 4 帧暂存，之后转给目标。队列也满时回 `gateway_busy` 并关闭。设了 `forwarding.per_ip` 时，同一浏览器地址（IPv6 按 /64 计）转发和排队中的会话合计不超过它，超出也回 `gateway_busy`；浏览器地址是 TCP 对端，对端列在 `forwarding.trusted_proxies` 里时取它发来的唯一一个 `X-Real-IP`。`forwarding.rate` 限制每个会话双向合计的字节速率。`connect` 首帧须在 10 秒内到达。浏览器把 `queued` 当作等待而不是拒绝，每收到一帧就重新开始连接超时计时。
+- 网关同时最多转发 `forwarding.sessions` 个会话。名额用完时，新会话最多 `forwarding.queue` 个排队：网关立即回 `{"type":"queued","position":n}`，之后每 2 秒更新一次，轮到时回 `position` 为 0 再拨号；排队期间浏览器发来的最多 4 帧暂存，之后转给目标。队列也满时回 `gateway_busy` 并关闭。设了 `forwarding.per_ip` 时，同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接不超过它，含目标为本 Node 的会话；超出的连接在 WebSocket 升级前收到 HTTP 429，浏览器只看到连接失败。浏览器地址是 TCP 对端，对端列在 `forwarding.trusted_proxies` 里时取它发来的唯一一个 `X-Real-IP`。`forwarding.rate` 限制每个会话双向合计的字节速率。`connect` 首帧须在 10 秒内到达。浏览器把 `queued` 当作等待而不是拒绝，每收到一帧就重新开始连接超时计时。
 
 随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人信任的网页：自己的 Gateway、自己服务器上的公共节点或官方 App。
 
@@ -470,7 +470,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### Relay 与公共节点
 
-启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。设了 `relay_max_clients_per_ip` 时 relay 只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它，同一 IPv4 地址或 IPv6 /64 超出上限的连接直接关闭。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
+启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。设了 `relay_max_clients_per_ip` 时 relay 只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它，同一 IPv4 地址或 IPv6 /56 超出上限的连接直接关闭；转发的连接任一方向结束即关闭两端，客户端连接开启 TCP keepalive。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
 公共节点是不加入个人网络的 Node，通常同时提供发现服务（`serve_discovery`）、开放 relay（`relay_open`）和面向任何设备的浏览器转发（`forwarding.any`）。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它只搬运 Noise 密文。部署步骤见[从外网访问](node.md#从外网访问)。
 

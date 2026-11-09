@@ -71,7 +71,8 @@ pub struct Forwarding {
     pub queue: usize,
     /// Bytes a second each session carries, both ways together; unlimited when unset.
     pub rate: Option<NonZeroU32>,
-    /// Sessions, forwarded or waiting, from one client address; unlimited when unset.
+    /// `/api/client` connections one client address holds on `listen`, whatever their target;
+    /// unlimited when unset.
     pub per_ip: Option<NonZeroUsize>,
     /// Reverse proxies whose single `X-Real-IP` names the client; any other peer is the client.
     pub trusted_proxies: Vec<IpAddr>,
