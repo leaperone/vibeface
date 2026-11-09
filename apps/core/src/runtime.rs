@@ -36,6 +36,7 @@ mod permission_fences;
 pub mod pi;
 mod provider_adapter;
 mod provider_probe;
+mod relay;
 mod schedule_delivery;
 mod settings;
 mod triage;
@@ -460,6 +461,7 @@ pub struct Runtime {
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<crate::net::RelayServer>>,
+    volunteer: relay::Volunteer,
     /// Runtime-owned workers, cancelled and joined by final shutdown.
     background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
@@ -721,6 +723,7 @@ impl Runtime {
             dir.to_owned(),
             config.timeout_secs,
         )?;
+        let volunteer = relay::Volunteer::new(&config.network, dir);
         let node = Self {
             delivery,
             data_dir: dir.to_owned(),
@@ -744,6 +747,7 @@ impl Runtime {
             net: std::sync::OnceLock::new(),
             router: Mutex::new(None),
             relay: Mutex::new(None),
+            volunteer,
             background_tasks: BackgroundTasks::new(),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
@@ -1455,7 +1459,7 @@ impl Runtime {
                 .execution
                 .contains(&Provider::Codex)
         );
-        json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
+        json!({"roots":settings.roots,"relay":self.relay_config().relay_listen.is_some(),
             "manager":manager,
             "manager_state":self.manager_state().await,
             "manager_readiness":self.manager_readiness().await,

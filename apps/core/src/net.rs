@@ -23,6 +23,7 @@ use std::{
 
 mod lan;
 pub mod mesh;
+pub mod relay;
 
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
@@ -296,7 +297,10 @@ pub struct Net {
     lookup: MemoryLookup,
     lan: OnceLock<lan::Lan>,
     mesh: OnceLock<Arc<mesh::Mesh>>,
+    /// Relays configured, run here or by member Nodes, which stay in the relay map.
     relays: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
+    /// Open relays the mesh announces, adopted while they rank among the best.
+    adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
 }
 impl std::fmt::Debug for Net {
@@ -383,6 +387,7 @@ impl Net {
             lan: OnceLock::new(),
             mesh: OnceLock::new(),
             relays: known,
+            adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
         })
     }
@@ -406,6 +411,7 @@ impl Net {
             return;
         };
         let mut relays = self.relays.lock().await;
+        self.adopted.lock().await.remove(&url);
         if relays.insert(url.clone()) {
             self.endpoint
                 .insert_relay(url.clone(), Arc::new(relay_config(url, None)))
@@ -415,13 +421,15 @@ impl Net {
 
     #[cfg(test)]
     pub async fn knows_relay(&self, url: &RelayUrl) -> bool {
-        self.relays.lock().await.contains(url)
+        self.relays.lock().await.contains(url) || self.adopted.lock().await.contains(url)
     }
 
     /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
     /// relay, so this comes before the first dial through it.
     pub async fn insert_relay(&self, url: RelayUrl, token: Option<String>) {
-        self.relays.lock().await.insert(url.clone());
+        let mut relays = self.relays.lock().await;
+        relays.insert(url.clone());
+        self.adopted.lock().await.remove(&url);
         self.endpoint
             .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
             .await;
@@ -430,6 +438,26 @@ impl Net {
     pub async fn remove_relay(&self, url: &RelayUrl) {
         self.relays.lock().await.remove(url);
         self.endpoint.remove_relay(url).await;
+    }
+
+    /// Makes `urls` the adopted relays: new ones join the relay map and the rest leave it,
+    /// apart from relays kept for another reason.
+    pub async fn set_adopted(&self, urls: Vec<RelayUrl>) {
+        let pinned = self.relays.lock().await;
+        let mut adopted = self.adopted.lock().await;
+        let next: HashSet<RelayUrl> = urls
+            .into_iter()
+            .filter(|url| !pinned.contains(url))
+            .collect();
+        for url in adopted.difference(&next) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in next.difference(&adopted) {
+            self.endpoint
+                .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
+                .await;
+        }
+        *adopted = next;
     }
 
     /// Joins the mesh `config` names, keeping its records in `db`.
@@ -705,12 +733,13 @@ where
     }
 }
 
-/// A relay this Node runs, behind a front on `listen` when it limits connections per address.
+/// A relay this Node runs on loopback, behind a front on `listen` that limits connections per
+/// address and meters each endpoint's bytes.
 pub struct RelayServer {
     server: iroh_relay::server::Server,
     /// Where devices reach the relay.
     pub addr: SocketAddr,
-    front: Option<Front>,
+    front: Front,
 }
 
 struct Front(tokio::task::JoinHandle<()>);
@@ -728,30 +757,24 @@ impl RelayServer {
 }
 
 /// The relay this Node runs; `access` decides who it admits, `rate` caps the bytes a second it
-/// reads from each connection and `per_ip` the connections one client address holds.
+/// reads from each connection and `per_ip` the connections one client address holds. `usage`
+/// learns from `access` which endpoint each front connection carries.
 pub async fn spawn_relay(
     listen: SocketAddr,
     access: Arc<dyn iroh_relay::server::DynAccessControl>,
     rate: Option<NonZeroU32>,
     per_ip: Option<NonZeroUsize>,
+    usage: Arc<relay::Usage>,
 ) -> Result<RelayServer> {
     let refused =
         |error: &dyn std::fmt::Display| anyhow!("relay failed to start on {listen}: {error}");
     // The relay never sees client addresses, so a front counts them and passes the bytes on to
     // the relay on loopback.
-    let front = match per_ip {
-        Some(per_ip) => Some((
-            tokio::net::TcpListener::bind(listen)
-                .await
-                .map_err(|error| refused(&error))?,
-            per_ip,
-        )),
-        None => None,
-    };
-    let mut relay = iroh_relay::server::RelayConfig::new(match front {
-        Some(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        None => listen,
-    });
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| refused(&error))?;
+    let mut relay =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     relay.access = access;
     relay.limits.client_rx = rate.map(iroh_relay::server::ClientRateLimit::new);
     let mut config = iroh_relay::server::ServerConfig::default();
@@ -760,56 +783,84 @@ pub async fn spawn_relay(
         .await
         .map_err(|error| refused(&error))?;
     let relay = server.http_addr().context("relay listener missing")?;
-    let (addr, front) = match front {
-        Some((listener, per_ip)) => (
-            listener.local_addr()?,
-            Some(Front(tokio::spawn(relay_front(listener, relay, per_ip)))),
-        ),
-        None => (relay, None),
-    };
     Ok(RelayServer {
         server,
-        addr,
-        front,
+        addr: listener.local_addr()?,
+        front: Front(tokio::spawn(relay_front(listener, relay, per_ip, usage))),
     })
 }
 
-/// Passes each connection on to the relay unless its client address already holds `per_ip`.
-async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_ip: NonZeroUsize) {
+/// Passes each connection on to the relay unless its client address already holds `per_ip`,
+/// numbering it in a header the relay's access check reads, and counts its bytes.
+async fn relay_front(
+    listener: tokio::net::TcpListener,
+    relay: SocketAddr,
+    per_ip: Option<NonZeroUsize>,
+    usage: Arc<relay::Usage>,
+) {
     let shares = Shares::default();
     let mut connections = tokio::task::JoinSet::new();
+    let mut flush = tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! {
             Some(_) = connections.join_next() => {}
+            _ = flush.tick() => usage.flush(),
             accepted = listener.accept() => match accepted {
-                Ok((mut client, peer)) => {
+                Ok((client, peer)) => {
                     // A refused connection closes as it drops.
-                    let Some(share) = shares.take(peer.ip(), per_ip) else { continue };
-                    connections.spawn(async move {
-                        let _share = share;
-                        // The relay sends small QUIC datagrams that must not wait to coalesce.
-                        let _ = client.set_nodelay(true);
-                        // A client gone without closing would otherwise keep its share.
-                        let keepalive = socket2::TcpKeepalive::new()
-                            .with_time(Duration::from_secs(60))
-                            .with_interval(Duration::from_secs(15));
-                        let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
-                        if let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await {
-                            let _ = relay.set_nodelay(true);
-                            let (mut from_client, mut to_client) = client.split();
-                            let (mut from_relay, mut to_relay) = relay.split();
-                            // Either side ending closes both, so a half-closed peer keeps no share.
-                            tokio::select! {
-                                _ = tokio::io::copy(&mut from_client, &mut to_relay) => {}
-                                _ = tokio::io::copy(&mut from_relay, &mut to_client) => {}
-                            }
-                        }
-                    });
+                    let share = match per_ip {
+                        Some(limit) => match shares.take(peer.ip(), limit) {
+                            Some(share) => Some(share),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    connections.spawn(front_connection(client, relay, share, usage.clone()));
                 }
                 // Out of descriptors, say; retrying at once would spin.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             },
         }
+    }
+}
+
+async fn front_connection(
+    mut client: tokio::net::TcpStream,
+    relay: SocketAddr,
+    _share: Option<Share>,
+    usage: Arc<relay::Usage>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt as _;
+    let (front, counter, _guard) = usage.open_front();
+    // The relay sends small QUIC datagrams that must not wait to coalesce.
+    let _ = client.set_nodelay(true);
+    // A client gone without closing would otherwise keep its share.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
+    let head = tokio::time::timeout(
+        Duration::from_secs(10),
+        relay::read_head(&mut client, front),
+    );
+    let Ok(Some((head, received))) = head.await else {
+        return;
+    };
+    counter.read.fetch_add(received as u64, Ordering::Relaxed);
+    let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await else {
+        return;
+    };
+    let _ = relay.set_nodelay(true);
+    if relay.write_all(&head).await.is_err() {
+        return;
+    }
+    let (from_client, to_client) = client.split();
+    let (from_relay, to_relay) = relay.split();
+    // Either side ending closes both, so a half-closed peer keeps no share.
+    tokio::select! {
+        _ = relay::pump(from_client, to_relay, &counter.read) => {}
+        _ = relay::pump(from_relay, to_client, &counter.written) => {}
     }
 }
 
@@ -965,6 +1016,7 @@ mod tests {
             Arc::new(iroh_relay::server::AllowAll),
             None,
             NonZeroUsize::new(1),
+            Default::default(),
         )
         .await?;
         let addr = relay.addr;
@@ -1088,7 +1140,14 @@ mod tests {
             token: token.clone(),
             attempts,
         };
-        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy), None, None).await?;
+        let relay = spawn_relay(
+            "127.0.0.1:0".parse()?,
+            Arc::new(policy),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
         let url = format!("http://{}", relay.addr);
         let config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),

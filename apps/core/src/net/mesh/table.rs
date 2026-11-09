@@ -13,7 +13,7 @@ pub const MIN_INTERVAL_MS: u64 = 30_000;
 /// Records seen this recently stay, expired or not, as candidates for joining again.
 const KEEP_MS: u64 = 30 * 24 * 3600 * 1000;
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS mesh_records(device_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
   expires_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, reachable TEXT NOT NULL,
   record TEXT NOT NULL);

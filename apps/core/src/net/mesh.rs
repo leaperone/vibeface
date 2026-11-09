@@ -59,6 +59,12 @@ const GATEWAY_OK_FOR: Duration = Duration::from_secs(1800);
 const GATEWAY_FAILED_FOR: Duration = Duration::from_secs(300);
 const DIGEST_EVERY: Duration = Duration::from_secs(10);
 const LOOKUPS_PER_SECOND: u32 = 5;
+/// A device's relay probes are answered once a minute; tests wait less.
+const PROBE_EVERY: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(60)
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -351,6 +357,7 @@ struct Limit {
     /// The last digest answer had more pages; the next page is not limited.
     more: bool,
     lookups: (Option<Instant>, u32),
+    probe_at: Option<Instant>,
 }
 
 pub struct Mesh {
@@ -973,6 +980,20 @@ impl Mesh {
                     .map(|entry| entry.signed.clone());
                 Ok(json!({"record":record}))
             }
+            Some("probe_relay") => {
+                {
+                    let mut limits = self.limits.lock().expect("mesh limits");
+                    let limit = limits.entry(remote).or_default();
+                    ensure!(
+                        limit.probe_at.is_none_or(|at| at.elapsed() >= PROBE_EVERY),
+                        "a device asks for a relay probe at most once a minute"
+                    );
+                    limit.probe_at = Some(Instant::now());
+                }
+                let url = request["url"].as_str().context("probe_relay needs a url")?;
+                let latency = super::relay::check_relay(url, self.allow_private).await?;
+                Ok(json!({"ok":true,"latency_ms":latency.as_millis() as u64}))
+            }
             _ => bail!("unknown mesh request"),
         }
     }
@@ -981,7 +1002,7 @@ impl Mesh {
         let mut limits = self.limits.lock().expect("mesh limits");
         if limits.len() >= 4096 {
             limits.retain(|_, limit| {
-                [limit.digest_at, limit.lookups.0]
+                [limit.digest_at, limit.lookups.0, limit.probe_at]
                     .into_iter()
                     .flatten()
                     .any(|at| at.elapsed() < Duration::from_secs(60))

@@ -4,7 +4,7 @@
 //! Sync only stores events. It never creates scheduler jobs or work, so pulling history again
 //! after a restart or from another Node replays no side effect.
 use super::*;
-use crate::net::{self, AddressRecord, Net, SignedAddress};
+use crate::net::{self, AddressRecord, Net, SignedAddress, relay::RelayGrant};
 use crate::store::admission::{PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope};
 use iroh::{
     endpoint::{Connection, ConnectionError},
@@ -95,11 +95,20 @@ impl ProtocolHandler for Inbound {
 }
 
 /// The relay admits this device, the personal network's Nodes, joiners holding an open invite,
-/// holders of the operator token and, when open, anyone, but never a blocked device. Only
-/// connections from outside the personal network count toward `relay_max_clients`.
+/// holders of the operator token or of a grant this Node signed and, when open, anyone, but
+/// never a blocked device. Only connections from outside the personal network count toward
+/// `relay_max_clients`.
 pub(super) struct RelayAccess {
     node: Weak<Runtime>,
     counted: std::sync::Mutex<std::collections::HashSet<iroh_relay::server::ConnectionId>>,
+}
+impl RelayAccess {
+    pub(super) fn new(node: Weak<Runtime>) -> Self {
+        Self {
+            node,
+            counted: Default::default(),
+        }
+    }
 }
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,16 +121,22 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
         let allowed = match self.node.upgrade() {
-            Some(node) => match node.relay_admits(request).await {
-                Some(true) => {
-                    let max = node.config.network.relay_max_clients;
-                    let mut counted = self.counted.lock().expect("relay clients");
-                    max.is_none_or(|max| counted.len() < max.get())
-                        && counted.insert(request.connection_id())
+            Some(node) => {
+                let allowed = match node.relay_admits(request).await {
+                    Some(true) => {
+                        let max = node.relay_config().relay_max_clients;
+                        let mut counted = self.counted.lock().expect("relay clients");
+                        max.is_none_or(|max| counted.len() < max.get())
+                            && counted.insert(request.connection_id())
+                    }
+                    Some(false) => true,
+                    None => false,
+                };
+                if allowed {
+                    node.volunteer.usage.bind(request);
                 }
-                Some(false) => true,
-                None => false,
-            },
+                allowed
+            }
             None => false,
         };
         if allowed {
@@ -236,21 +251,7 @@ impl Runtime {
             router = mesh.accept(router);
         }
         *self.router.lock().await = Some(router.spawn());
-        if let Some(listen) = self.config.network.relay_listen {
-            let access = RelayAccess {
-                node: weak,
-                counted: Default::default(),
-            };
-            let relay = net::spawn_relay(
-                listen,
-                Arc::new(access),
-                self.config.network.relay_rate,
-                self.config.network.relay_max_clients_per_ip,
-            )
-            .await?;
-            tracing::info!(event = "relay.started", %listen, "relay started");
-            *self.relay.lock().await = Some(relay);
-        }
+        self.start_relay().await?;
         self.delivery.attach(Arc::downgrade(self))?;
         let bind = self.config.network.bind;
         // A Node bound to one address listens nowhere else.
@@ -282,6 +283,12 @@ impl Runtime {
         let node = self.clone();
         self.background_tasks
             .spawn(async move { node.outbox_loop().await })?;
+        let node = self.clone();
+        self.background_tasks
+            .spawn(async move { node.volunteer_loop().await })?;
+        let node = self.clone();
+        self.background_tasks
+            .spawn(async move { node.adopt_loop().await })?;
         Ok(())
     }
 
@@ -304,7 +311,8 @@ impl Runtime {
     /// counts toward `relay_max_clients`.
     async fn relay_admits(&self, request: &iroh_relay::server::ClientRequest) -> Option<bool> {
         let device = net::device_id(&request.endpoint_id());
-        if self.config.network.relay_blocked.contains(&device) {
+        let relay = self.relay_config();
+        if relay.relay_blocked.contains(&device) {
             return None;
         }
         if self.identity.device_id().is_ok_and(|own| own == device)
@@ -313,9 +321,9 @@ impl Runtime {
             return Some(false);
         }
         let granted = match request.auth_token() {
+            Some(token) if RelayGrant::is_grant(&token) => self.grant_admits(&token, &device),
             Some(token) => {
-                self.config
-                    .network
+                relay
                     .relay_operator_token
                     .as_ref()
                     .is_some_and(|operator| net::same_token(&token, operator))
@@ -328,7 +336,7 @@ impl Runtime {
             }
             None => false,
         };
-        (self.config.network.relay_open || granted).then_some(true)
+        (relay.relay_open || granted).then_some(true)
     }
 
     async fn removed_here(&self, device: &str) -> bool {
@@ -1601,6 +1609,7 @@ impl Runtime {
         .then(|| net::mesh::record::Role::Gateway { url: url.clone() });
         gateway
             .into_iter()
+            .chain(self.relay_role())
             .chain(self.delivery.mesh_role())
             .collect()
     }
@@ -1630,7 +1639,7 @@ impl Runtime {
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
         let gateway_url = self.gateway_url();
-        let relay = self.config.network.own_relay()?.map(|url| url.to_string());
+        let relay = self.relay_config().own_relay()?.map(|url| url.to_string());
         let mut store = self.store.lock().await;
         let previous = store
             .address_book()?
