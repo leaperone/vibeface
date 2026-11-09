@@ -725,6 +725,24 @@ impl Delivery {
         if orders.is_empty() && transaction.is_none() {
             return Ok(());
         }
+        let budget_id = orders
+            .first()
+            .map(|first| {
+                first
+                    .view
+                    .payment
+                    .budget_id
+                    .clone()
+                    .context("protected provider order has no budget")
+            })
+            .transpose()?;
+        // Persist rotation before any await can fail or be cancelled by the step deadline.
+        for order in orders
+            .iter_mut()
+            .filter(|order| order.view.payment.budget_id == budget_id)
+        {
+            self.save(order)?;
+        }
         let chain = self.chain().await?;
         if let Some(transaction) = transaction {
             let observed = chain
@@ -733,36 +751,34 @@ impl Delivery {
             self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
                 .await?;
         }
-        let Some(first) = orders.first() else {
+        let Some(budget_id) = budget_id else {
             return Ok(());
         };
-        let budget_id = first
-            .view
-            .payment
-            .budget_id
-            .clone()
-            .context("protected provider order has no budget")?;
         let mut operation_error = self
             .flush_budget_holds(&budget_id)
             .await
             .err()
             .map(|error| error.to_string());
-        let snapshot = self.budget_snapshot(&budget_id).await?;
-        if snapshot.earned != snapshot.withdrawn {
-            let record = self.budget_record(&budget_id)?;
-            let result = chain
-                .execute(
-                    self,
-                    &format!("budget-{budget_id}/withdraw-{}", snapshot.earned),
-                    chain::Call::Budget(Box::new(budget::BudgetAction::Withdraw {
-                        budget_id: parse_word(&budget_id)?,
-                    })),
-                    &record.provider_gas_cap,
-                )
-                .await;
-            if let Err(error) = result {
-                operation_error = Some(error.to_string());
+        let result = async {
+            let snapshot = self.budget_snapshot(&budget_id).await?;
+            if snapshot.earned != snapshot.withdrawn {
+                let record = self.budget_record(&budget_id)?;
+                chain
+                    .execute(
+                        self,
+                        &format!("budget-{budget_id}/withdraw-{}", snapshot.earned),
+                        chain::Call::Budget(Box::new(budget::BudgetAction::Withdraw {
+                            budget_id: parse_word(&budget_id)?,
+                        })),
+                        &record.provider_gas_cap,
+                    )
+                    .await?;
             }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            operation_error = Some(error.to_string());
         }
         for mut order in orders
             .into_iter()

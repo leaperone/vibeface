@@ -2349,11 +2349,13 @@ def project_observer_summary(value, bindings):
         raise ValueError("Invalid observer exit code")
     passed = (value["failureCode"] == "none" and value["nativeResultSha256"] is not None
         and all(value[name] for name in (*OBSERVER_CHECKS,"windowStarted","windowEnded"))
+        and all(value[name] is not None for name in OBSERVER_COUNTS)
         and value["nativeExitCode"] == value["observerExitCode"] == value["calibrationExitCode"] == 0
         and value["proofsGeneratedByObserver"] == value["proverOpensInWindow"] == 0
         and value["calibrationOpens"] is not None and value["calibrationOpens"] > 0
         and value["rawTransactionsBefore"] is not None and value["rawTransactionsBefore"] >= 7
         and value["rawTransactionsAfter"] is not None and value["rawTransactionsAfter"] >= 7
+        and value["rawTransactionsBefore"] == value["rawTransactionsAfter"]
         and value["chainSamples"] is not None and value["chainSamples"] >= 2)
     if (value["status"] == "PASS") != passed:
         raise ValueError("Observer status contradicts its certified conditions")
@@ -2377,11 +2379,16 @@ def write_observer_summary(run, expected, native_exit, observer_exit):
             start,end = raw.get("window_start",{}),raw.get("window_end",{})
             before,after = start.get("rpc_baseline",{}),end.get("rpc_final",{})
             first,last = raw.get("first_anchored_snapshot_in_window") or {},raw.get("last_anchored_snapshot_in_window") or {}
-            counts_before,counts_after = before.get("rpc_counts",{}),after.get("rpc_counts",{})
+            counts_before,counts_after = before["rpc_counts"],after["rpc_counts"]
+            if any(not isinstance(counts,dict) or "eth_sendRawTransaction" not in counts or any(
+                    type(item) is not int or item < 0 for item in counts.values()) for counts in (counts_before,counts_after)):
+                raise ValueError("Invalid cumulative RPC counters")
             counters = set(counts_before) | set(counts_after)
             accounts = first.get("accounts",{})
             calibration = raw.get("calibration",{})
             delta = raw.get("write_rpc_delta")
+            observed_delta = {key:counts_after.get(key,0)-counts_before.get(key,0) for key in counters}
+            write_delta = {key:item for key,item in observed_delta.items() if key.startswith(("eth_send","eth_sign","personal_","evm_","miner_","debug_"))}
             native = json.loads(regular(run / "native/public/native-result.json",131072))
             value.update(windowStarted=raw.get("window_started") is True,windowEnded=raw.get("window_ended") is True,
                 calibrationExitCode=calibration.get("exit_code"),calibrationOpens=calibration.get("observed_inode_open_events"),
@@ -2390,10 +2397,10 @@ def write_observer_summary(run, expected, native_exit, observer_exit):
                 chainSamples=raw.get("chain_samples"),chainSampleErrors=raw.get("chain_sample_errors"),
                 prewindowSnapshotMissing=raw.get("prewindow_rpc_snapshot_missing",{}).get("count"),
                 counterReadyToStopped=before.get("state")=="ready" and after.get("state")=="stopped",
-                otherMethodsZero=before.get("other_logged_methods")==after.get("other_logged_methods")==0,
-                counterNondecreasing=bool(counters) and all(type(counts_before.get(key,0)) is int and type(counts_after.get(key,0)) is int
-                    and counts_after.get(key,0)>=counts_before.get(key,0)>=0 for key in counters),
-                writeRpcZero=isinstance(delta,dict) and "eth_sendRawTransaction" in delta and all(type(item) is int and item==0 for item in delta.values()),
+                otherMethodsZero=all(type(snapshot.get("other_logged_methods")) is int and snapshot["other_logged_methods"]==0 for snapshot in (before,after)),
+                counterNondecreasing=all(item>=0 for item in observed_delta.values()),
+                writeRpcZero=isinstance(delta,dict) and all(type(item) is int for item in delta.values())
+                    and delta==write_delta and all(item==0 for item in write_delta.values()),
                 proverIdentityUnchanged=raw.get("prover_inode_and_identity_unchanged") is True,
                 inotifyIntact=raw.get("flags")==[] and calibration.get("status")=="PASS",
                 accountSnapshotsAgree=bool(accounts) and accounts==last.get("accounts"),
@@ -2611,6 +2618,8 @@ def self_test_observer_summary():
                    {"schemaVersion":True},{"rawTransactionsBefore":True},{"nativeExitCode":1},{"observerExitCode":1},
                    {"chainSamples":1},{"calibrationOpens":0},{"proverOpensInWindow":1},{"counterReadyToStopped":False}]
         changes += [{name:"0"*64} for name in OBSERVER_BINDINGS]
+        changes += [{name:None} for name in OBSERVER_COUNTS]
+        changes += [{"rawTransactionsAfter":8}]
         for change in changes:
             invalid={**deepcopy(positive),**change}
             try: project_observer_summary(invalid,bindings)
@@ -2626,6 +2635,55 @@ def self_test_observer_summary():
             raw_path.write_text(json.dumps({**raw,**change})); target.unlink()
             _,passed=write_observer_summary(run,expected,0,0)
             assert not passed and b"UNAPPROVED_PRIVATE_SENTINEL" not in target.read_bytes()
+        contradictory=[]
+        for method in ("eth_sendRawTransaction","eth_sign","personal_sign","evm_mine","eth_sendTransaction",
+                       "eth_signTypedData","personal_unlockAccount","evm_setTime","miner_start","debug_traceTransaction"):
+            changed=deepcopy(raw)
+            counts=changed["window_end"]["rpc_final"]["rpc_counts"]
+            counts[method]=counts.get(method,0)+1
+            contradictory.append(("unreported-"+method,changed))
+            changed=deepcopy(changed); changed["write_rpc_delta"][method]=1
+            contradictory.append(("reported-"+method,changed))
+        for declaration in ({},{"eth_sendRawTransaction":False},{"eth_sendRawTransaction":0.0},
+                            {"eth_sendRawTransaction":0,"personal_sign":0}):
+            contradictory.append(("inexact-or-mismatched-declaration",{**deepcopy(raw),"write_rpc_delta":declaration}))
+        changed=deepcopy(raw)
+        for snapshot in (changed["window_start"]["rpc_baseline"],changed["window_end"]["rpc_final"]):
+            snapshot["rpc_counts"]["personal_sign"]=0
+        contradictory.append(("omitted-zero-write-method",changed))
+        for boundary in ("window_start","window_end"):
+            field="rpc_baseline" if boundary=="window_start" else "rpc_final"
+            for invalid in (None,[],{}, {"eth_call":1}, {"eth_sendRawTransaction":7,"eth_call":True},
+                            {"eth_sendRawTransaction":7,"eth_call":-1}, {"eth_sendRawTransaction":7,"eth_call":1.0},
+                            {"eth_sendRawTransaction":7,"eth_call":"1"}, {"eth_sendRawTransaction":7,"eth_call":None}):
+                changed=deepcopy(raw); changed[boundary][field]["rpc_counts"]=invalid
+                contradictory.append(("invalid-counter-map-"+boundary,changed))
+            changed=deepcopy(raw); del changed[boundary][field]["rpc_counts"]
+            contradictory.append(("missing-counter-map-"+boundary,changed))
+            changed=deepcopy(raw); changed[boundary][field]["other_logged_methods"]=False
+            contradictory.append(("inexact-other-method-count-"+boundary,changed))
+        for field in ("chain_samples","chain_sample_errors"):
+            for invalid in (None,True,-1,"0"):
+                changed=deepcopy(raw); changed[field]=invalid
+                contradictory.append(("invalid-"+field,changed))
+            changed=deepcopy(raw); del changed[field]
+            contradictory.append(("missing-"+field,changed))
+        for invalid in (None,False,-1,"0"):
+            changed=deepcopy(raw); changed["prewindow_rpc_snapshot_missing"]["count"]=invalid
+            contradictory.append(("invalid-prewindow-missing-count",changed))
+        changed=deepcopy(raw); del changed["prewindow_rpc_snapshot_missing"]["count"]
+        contradictory.append(("missing-prewindow-missing-count",changed))
+        for name,changed in contradictory:
+            raw_path.write_text(json.dumps(changed)); target.unlink()
+            _,passed=write_observer_summary(run,expected,0,0)
+            assert not passed and json.loads(target.read_bytes())["status"]=="INCONCLUSIVE",name
+        restored=deepcopy(raw)
+        restored["chain_sample_errors"]=3; restored["prewindow_rpc_snapshot_missing"]["count"]=1
+        restored["window_end"]["rpc_final"]["rpc_counts"]["eth_coinbase"]=2
+        raw_path.write_text(json.dumps(restored)); target.unlink()
+        _,passed=write_observer_summary(run,expected,0,0)
+        result=json.loads(target.read_bytes())
+        assert passed and result["chainSampleErrors"]==3 and result["prewindowSnapshotMissing"]==1
         sentinel = "UNAPPROVED_PRIVATE_SENTINEL"
         projected = project_wrapper_summary("artifact-provenance.json", {"status":"FAIL","sourceCommit":expected,"raw":sentinel,
             "failureCode":sentinel,"runtimeIdentity":{"uid":123,"raw":sentinel},"guestInfo":{"imageId":"a"*64,"raw":sentinel},
@@ -2633,7 +2691,7 @@ def self_test_observer_summary():
         assert sentinel not in json.dumps(projected) and projected["failureCode"]=="OtherFailure"
         projected = project_wrapper_summary("resources.json", {"status":"FAIL","initial":{"memory.current":"1","raw":sentinel},"raw":sentinel})
         assert sentinel not in json.dumps(projected)
-    print("Protected observer projection self-tests passed; raw diagnostics were not exported")
+    print(f"Protected observer projection self-tests passed; {len(contradictory)} counter/stat contradictions rejected, sample errors>0 retained; raw diagnostics were not exported")
 
 
 def project_wrapper_summary(name, value):
@@ -3072,7 +3130,8 @@ def self_test_protected(original):
         observer_bytes,provenance_bytes = observer_path.read_bytes(),provenance_path.read_bytes()
         observer_value = json.loads(observer_bytes)
         for change in ({"raw_diagnostic":"UNAPPROVED_PRIVATE_SENTINEL"},{"status":"UNKNOWN"},{"observerExitCode":1},
-                       {"nativeExitCode":1},{"windowStarted":False},{"calibrationOpens":0},
+                       {"nativeExitCode":1},{"windowStarted":False},{"calibrationOpens":0},{"rawTransactionsAfter":8},
+                       {"chainSampleErrors":None},{"prewindowSnapshotMissing":None},
                        *({name:"0"*64} for name in OBSERVER_BINDINGS)):
             observer_path.write_text(json.dumps({**observer_value,**change}))
             provenance = json.loads(provenance_bytes)

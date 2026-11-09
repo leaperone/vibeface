@@ -1904,13 +1904,16 @@ mod tests {
     }
     impl PublicationFixture {
         async fn new(phases: [u8; 2]) -> Result<Self> {
+            Self::with_claims(phases, true).await
+        }
+        async fn with_claims(phases: [u8; 2], with_claims: bool) -> Result<Self> {
             let now = super::super::now();
             let mut config = chain::tests::config();
             config.escrow = format!("0x{}", "44".repeat(20));
             config.asset = format!("0x{}", "33".repeat(20));
             let mut orders = Vec::new();
             let mut capsules = Vec::new();
-            for seed in [1, 2, 3] {
+            for seed in [1, 2, 3].into_iter().take(if with_claims { 3 } else { 2 }) {
                 let fixture = support::fixture_with_profile(&[4, 4], config.profile.clone());
                 let mut terms = fixture.order.unsigned.terms;
                 terms.payer_order_nonce = [seed; 32];
@@ -1984,9 +1987,24 @@ mod tests {
             let observed = observation.clone();
             let rpc_orders = orders.clone();
             let rpc_capsules = capsules.clone();
+            let rpc_profile = config.profile.clone();
+            let trust: Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contracts/delivery/trust.json"
+            )))?;
             let rpc = chain::tests::rpc_fixture(config, move |request| {
                 let state = observed.lock().unwrap().clone();
                 match request["method"].as_str().unwrap() {
+                    "eth_chainId" => json!("0x7a69"),
+                    "eth_getCode" => {
+                        let address=request["params"][0].as_str().unwrap();
+                        let name=if address==format!("0x{}","44".repeat(20)) {"DeliveryEscrow"}
+                            else if address==format!("0x{}","33".repeat(20)) {"TestToken"}
+                            else if address==format!("0x{}","55".repeat(20)) {"RiscZeroAdapter"}
+                            else if address==format!("0x{}","66".repeat(20)) {"RiscZeroGroth16Verifier"}
+                            else {panic!("unexpected runtime address {address}")};
+                        trust["contracts"][name]["runtime"].clone()
+                    }
                     "eth_blockNumber" => json!("0x15"),
                     "eth_getBlockByNumber" => {
                         let tag = request["params"][0].as_str().unwrap();
@@ -2015,6 +2033,30 @@ mod tests {
                         let data = request["params"][0]["data"].as_str().unwrap();
                         assert!(!data.starts_with(&format!("0x{}",hex::encode(abi::revealBatchCall::SELECTOR))));
                         let encoded = |bytes: Vec<u8>| json!(format!("0x{}",hex::encode(bytes)));
+                        macro_rules! getter {
+                            ($call:ident, $value:expr) => {
+                                if data==format!("0x{}",hex::encode(abi::$call {}.abi_encode())) {
+                                    return encoded(abi::$call::abi_encode_returns(&$value));
+                                }
+                            };
+                        }
+                        getter!(adapterCall, Address::repeat_byte(0x55));
+                        getter!(verifierCall, Address::repeat_byte(0x66));
+                        getter!(decimalsCall, 6u8);
+                        getter!(profileIdCall, B256::from(rpc_profile.digest().unwrap()));
+                        getter!(imageIdCall, B256::from(rpc_profile.guest_image_id));
+                        getter!(SELECTORCall, alloy_primitives::FixedBytes::<4>::from([0x73,0xc4,0x57,0xba]));
+                        let control=B256::from_slice(&hex::decode("04446e66d300eb7fb45c9726bb53c793dda407a62e9601618bb43c5c14657ac0").unwrap());
+                        getter!(BN254_CONTROL_IDCall, control);
+                        let root=B256::from_slice(&hex::decode("a54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56").unwrap());
+                        getter!(CONTROL_ROOTCall, root);
+                        let mut first=root[..16].to_vec(); first.reverse();
+                        let mut second=root[16..].to_vec(); second.reverse();
+                        getter!(CONTROL_ROOT_0Call, alloy_primitives::FixedBytes::<16>::from_slice(&first));
+                        getter!(CONTROL_ROOT_1Call, alloy_primitives::FixedBytes::<16>::from_slice(&second));
+                        if data==format!("0x{}",hex::encode(abi::getProfileCall {}.abi_encode())) {
+                            return encoded(rpc_profile.abi_bytes().unwrap());
+                        }
                         for (index, order) in rpc_orders.iter().enumerate() {
                             let id = B256::from(order.order.unsigned.terms.order_id().unwrap());
                             let budget_id = B256::repeat_byte((index + 1) as u8);
@@ -2028,6 +2070,13 @@ mod tests {
                             let earned = phases.iter().filter(|phase| **phase == 3).count() * 3 + usize::from(bonus_earned);
                             let refunded = phases.iter().filter(|phase| **phase == 4).count() * 3 + usize::from(bonus_refunded);
                             if call(abi::getBudgetCall { id: budget_id }.abi_encode()) {
+                                if !with_claims && index==0 {
+                                    return encoded(abi::getBudgetCall::abi_encode_returns(&abi::ChainBudget {
+                                        payer:Address::ZERO,payee:Address::ZERO,providerPeer:B256::ZERO,asset:Address::ZERO,
+                                        deposit:U256::ZERO,locked:U256::ZERO,earned:U256::ZERO,withdrawn:U256::ZERO,refunded:U256::ZERO,
+                                        maxClaimUntil:0,assetDecimals:0,state:0,
+                                    }));
+                                }
                                 return encoded(abi::getBudgetCall::abi_encode_returns(&abi::ChainBudget {
                                     payer: Address::repeat_byte(0x11),payee:Address::repeat_byte(0x22),providerPeer:order.order.unsigned.terms.provider_peer.into(),
                                     asset:Address::repeat_byte(0x33),deposit:U256::from(7),locked:U256::from(7-earned-refunded),earned:U256::from(earned),
@@ -2112,7 +2161,7 @@ mod tests {
                     }
                     Ok(())
                 })?;
-                if index == 2 {
+                if index == 2 || !with_claims {
                     continue;
                 }
                 let items = (0..2)
@@ -2177,8 +2226,8 @@ mod tests {
                 claims.push(claim);
             }
             let mut settings = delivery.config();
-            settings.enabled = false;
-            settings.paid_enabled = false;
+            settings.enabled = !with_claims;
+            settings.paid_enabled = !with_claims;
             delivery.configure_local(settings)?;
             Ok(Self {
                 delivery,
@@ -2189,6 +2238,19 @@ mod tests {
                 dir,
                 now,
             })
+        }
+        async fn provider() -> Result<Self> {
+            let mut fixture = Self::with_claims([3, 3], false).await?;
+            for (index, order) in fixture.orders.iter_mut().enumerate() {
+                order.view.updated_at_ms = index as i64 + 1;
+                if index == 0 {
+                    order.view.error = Some("original uncertain provider state".into());
+                }
+                fixture
+                    .delivery
+                    .with_store(|store| store.save_order(order))?;
+            }
+            Ok(fixture)
         }
         fn age_candidates(&mut self) -> Result<()> {
             for claim in &mut self.claims {
@@ -2233,6 +2295,104 @@ mod tests {
             )));
             Ok(())
         }
+        fn assert_provider_reached_second_withdraw(&self) -> Result<()> {
+            let order = &self.orders[1];
+            let id = order.view.payment.budget_id.as_ref().unwrap();
+            let getter = format!(
+                "0x{}",
+                hex::encode(
+                    abi::getBudgetCall {
+                        id: parse_word(id)?.into()
+                    }
+                    .abi_encode()
+                )
+            );
+            assert!(
+                self.rpc
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "eth_call"
+                        && request["params"][0]["data"] == getter),
+                "an unavailable oldest budget must not starve a later canonical budget"
+            );
+            let stored = self
+                .delivery
+                .with_store(|store| store.order(&order.view.order_id))?;
+            assert_eq!(stored.view.payment.earned, "7");
+            assert_eq!(stored.view.payment.withdrawn, "0");
+            assert_eq!(
+                stored.view.error.as_deref(),
+                Some("unlock the local delivery wallet before reserving a new spend"),
+                "the later budget must reach the actual automatic withdrawal wallet guard"
+            );
+            assert!(
+                self.delivery
+                    .with_store(|store| store.find_transaction(&format!("budget-{id}/withdraw-7")))?
+                    .is_none()
+            );
+            assert!(
+                self.delivery
+                    .with_store(|store| store.next_transaction_for_reconcile())?
+                    .is_none()
+            );
+            self.assert_read_only(&[])
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_rotates_a_missing_budget_before_advancing_another_budget() -> Result<()> {
+        let fixture = PublicationFixture::provider().await?;
+        let first = fixture.delivery.run_provider().await;
+        let second = fixture.delivery.run_provider().await;
+        fixture.assert_provider_reached_second_withdraw()?;
+        assert!(first.is_ok() && second.is_ok());
+        let original = &fixture.orders[0];
+        let mut stored = fixture
+            .delivery
+            .with_store(|store| store.order(&original.view.order_id))?;
+        assert!(stored.view.error.as_deref().is_some_and(|error| error.contains("invalid protected budget deployment or terms")));
+        assert_eq!(
+            stored.view.payment.state,
+            super::super::types::PaymentState::Unknown
+        );
+        stored.view = original.view.clone();
+        assert_eq!(
+            serde_json::to_value(stored)?,
+            serde_json::to_value(original)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_rotation_survives_cancellation_at_the_first_rpc_await() -> Result<()> {
+        use std::future::Future;
+        let fixture = PublicationFixture::provider().await?;
+        let mut step = Box::pin(fixture.delivery.run_provider());
+        std::future::poll_fn(|cx| {
+            assert!(step.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(step);
+        assert!(fixture.delivery.provider_operations.try_lock().is_ok());
+        let original = &fixture.orders[0];
+        let mut stored = fixture
+            .delivery
+            .with_store(|store| store.order(&original.view.order_id))?;
+        assert!(
+            stored.view.updated_at_ms > fixture.orders[1].view.updated_at_ms,
+            "cancelling an awaited step must preserve the selected budget rotation"
+        );
+        stored.view.updated_at_ms = original.view.updated_at_ms;
+        assert_eq!(
+            serde_json::to_value(stored)?,
+            serde_json::to_value(original)?
+        );
+        fixture.delivery.run_provider().await?;
+        fixture.assert_provider_reached_second_withdraw()?;
+        Ok(())
     }
 
     #[tokio::test]
