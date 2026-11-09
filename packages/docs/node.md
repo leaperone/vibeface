@@ -227,13 +227,11 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 ### 官方公共节点
 
-官方公共节点是一台不加入任何个人网络的普通 Node，同时提供三项服务，各有上限：
+官方公共节点是一台不加入任何个人网络的普通 Node，没有域名，同时提供三项服务，各有上限：
 
-- **发现服务**：UDP `8.217.72.118:4792`，不经过代理。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
-- **开放 relay**：`https://node.vibeface.dev`，经 Cloudflare 代理，`/relay`、`/ping` 和 `/generate_204` 转到节点的 relay 端口。显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一客户端地址（IPv6 按 /56 计）最多 16 个。
-- **浏览器接入**：`https://node.vibeface.dev`，即 `config/public-bootstrap.json` 的 `gateway_url`，经 Cloudflare 代理到节点的网页接口。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。源站只接受 TLS，证书是 Cloudflare Origin CA 证书，节点只信任 Cloudflare 网段给出的 `CF-Connecting-IP`，限额按真实客户端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
-
-在连接设置里可以把接入地址改成任何人的公共节点，包括没有域名、按 IP 直连的 `https://<IP>:4792`。部署方式见 [`deploy/README.md`](../../deploy/README.md)。
+- **发现服务**：UDP `8.217.72.118:4792`。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
+- **开放 relay**：`http://8.217.72.118:3340`，显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一来源地址（IPv6 按 /56 计）最多 16 个。
+- **浏览器接入**：`https://8.217.72.118:4792`，即 `config/public-bootstrap.json` 的 `gateway_url`。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。这个端口只接受 TLS，证书是 Let's Encrypt 签给这个 IP 的短期证书，由宿主续期后写进数据目录，Node 不重启就换用新证书。浏览器直连，限额按 TCP 对端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
 `vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台向官方发现服务登记自己的地址和 relay，本机网页、维护接口和局域网发现不等待它。登记应答附上公共节点的开放 relay，Node 把它加为候选 relay，所以直连不通的设备之间也能经它连通。浏览器在官方页面按设备编号连接，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
@@ -307,7 +305,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    }
    ```
 
-   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端属于 `--trusted-proxy`（`forwarding.trusted_proxies`，地址或 CIDR 网段）时读取 `--client-ip-header`（`forwarding.client_ip_header`，默认 `X-Real-IP`）指定的单个请求头，用它按浏览器地址限制连接数，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。不经 nginx、直接由 Cloudflare 回源时，把 Cloudflare 的网段列为 `--trusted-proxy` 并设 `--client-ip-header CF-Connecting-IP`，官方节点即如此。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上初始化 Node 时指向它的发现服务，然后启动：
 
@@ -371,7 +369,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay-open` | `relay_open` | 本 relay 接纳任何设备，必须同时设 `relay_rate` 和 `relay_max_clients`，不能与运营者令牌同用 |
 | `--relay-rate <BYTES>` | `relay_rate` | relay 每秒从每个连接读取的字节数，默认不限 |
 | `--relay-max-clients <N>` | `relay_max_clients` | relay 同时保持的个人网络以外的连接数，默认不限 |
-| `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一客户端地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限；对端属于 `forwarding.trusted_proxies` 时按它在 `client_ip_header` 里给出的地址计 |
+| `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限 |
 | 无 | `relay_blocked` | relay 拒绝的设备编号 |
 | `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--serve-discovery` | `serve_discovery` | 在本 Node 的 UDP 端口上回答其他设备的登记和查询 |
@@ -379,9 +377,9 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出 `listen` 和 relay 前面反代的地址或 CIDR 网段，只有来自这些网段的连接才按 `--client-ip-header`（`client_ip_header`，默认 `X-Real-IP`，Cloudflare 用 `CF-Connecting-IP`）的单个值认定客户端地址，其余以 TCP 对端为准。只读这一个头而不按优先级回退，因为代理会原样转发客户端自带的其他头。relay 设了 `--relay-max-clients-per-ip` 时同样按这个地址计数：对端可信时先读完 HTTP 请求头（最多 16 KiB、10 秒），再把读到的字节原样交给 relay。
+浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
 
-`--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名或 IP 生成自签占位证书 `tls-cert.pem` 和私钥 `tls-key.pem`；浏览器直连时把它们换成 CA 签发的证书链和私钥（例如按 IP 直连时用 acme.sh `--install-cert` 安装 Let's Encrypt IP 证书），经 Cloudflare 回源时换成 Cloudflare Origin CA 证书，见 [`deploy/README.md`](../../deploy/README.md)。Node 在文件变化后的下一个连接重新加载，不需要重启；证书和私钥不配对或无法解析时继续用上一对，5 秒后再试。
+`--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名或 IP 生成自签占位证书 `tls-cert.pem` 和私钥 `tls-key.pem`；浏览器直连时把它们换成 CA 签发的证书链和私钥（例如 acme.sh `--install-cert`，见 [`deploy/README.md`](../../deploy/README.md)）。Node 在文件变化后的下一个连接重新加载，不需要重启；证书和私钥不配对或无法解析时继续用上一对，5 秒后再试。
 
 公网 Node 承担 relay 角色。例如在服务器上用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 

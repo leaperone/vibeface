@@ -597,10 +597,7 @@ fn check_local_setup(site: &Site, headers: &HeaderMap, peer: IpAddr) -> ApiResul
         || !site.loopback
         || one_header(headers, header::ORIGIN.as_str()) != Some(site.origin.as_str())
         || headers.keys().any(|name| {
-            matches!(
-                name.as_str(),
-                "forwarded" | "x-real-ip" | "cf-connecting-ip"
-            ) || name.as_str().starts_with("x-forwarded-")
+            name == "forwarded" || name == "x-real-ip" || name.as_str().starts_with("x-forwarded-")
         })
     {
         return Err(ApiError::forbidden());
@@ -613,10 +610,7 @@ fn check_hook(headers: &HeaderMap, peer: IpAddr) -> ApiResult<()> {
     if !peer.is_loopback()
         || headers.contains_key(header::ORIGIN)
         || headers.keys().any(|name| {
-            matches!(
-                name.as_str(),
-                "forwarded" | "x-real-ip" | "cf-connecting-ip"
-            ) || name.as_str().starts_with("x-forwarded-")
+            name == "forwarded" || name == "x-real-ip" || name.as_str().starts_with("x-forwarded-")
         })
     {
         return Err(ApiError::forbidden());
@@ -1073,7 +1067,7 @@ async fn client_gateway(
     // Taken before the shared sockets, so one address cannot hold them all.
     let share = match (&app.addresses, forwarding.per_ip) {
         (Some(addresses), Some(limit)) => {
-            let client = client_ip(peer.ip(), &headers, forwarding);
+            let client = client_ip(peer.ip(), &headers, &forwarding.trusted_proxies);
             let Some(share) = addresses.take(client, limit) else {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1104,13 +1098,13 @@ async fn client_gateway(
         })
 }
 
-/// The browser's address: what a trusted proxy's single client header names, or else the peer.
-fn client_ip(peer: IpAddr, headers: &HeaderMap, forwarding: &crate::config::Forwarding) -> IpAddr {
+/// The browser's address: what a trusted proxy's single `X-Real-IP` names, or else the peer.
+fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAddr {
     let peer = peer.to_canonical();
-    if !forwarding.trusts(peer) {
+    if !trusted.iter().any(|proxy| proxy.to_canonical() == peer) {
         return peer;
     }
-    one_header(headers, &forwarding.client_ip_header)
+    one_header(headers, "x-real-ip")
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(peer)
 }
@@ -1220,60 +1214,28 @@ mod tests {
 
     #[test]
     fn only_a_trusted_proxy_names_the_client_address() {
-        let headers = |name: &'static str, values: &[&str]| {
+        let headers = |values: &[&str]| {
             let mut headers = HeaderMap::new();
             for value in values {
-                headers.append(name, value.parse().unwrap());
+                headers.append("x-real-ip", value.parse().unwrap());
             }
             headers
         };
+        let proxy: IpAddr = "198.51.100.1".parse().unwrap();
+        let named = headers(&["203.0.113.9"]);
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();
-        let cloudflare = crate::config::Forwarding {
-            trusted_proxies: ["173.245.48.0/20", "2400:cb00::/32"]
-                .map(|net| crate::config::proxy_network(net).unwrap())
-                .into(),
-            client_ip_header: "cf-connecting-ip".into(),
-            ..Default::default()
-        };
-        let named = headers("cf-connecting-ip", &["203.0.113.9"]);
-        for proxy in [
-            "173.245.48.1",
-            "173.245.63.254",
-            "::ffff:173.245.48.9",
-            "2400:cb00:2::1",
-        ] {
-            assert_eq!(
-                client_ip(ip(proxy), &named, &cloudflare),
-                ip("203.0.113.9"),
-                "{proxy}"
-            );
-        }
-        for outside in ["173.245.64.1", "2400:cb01::1", "192.0.2.4"] {
-            assert_eq!(
-                client_ip(ip(outside), &named, &cloudflare),
-                ip(outside),
-                "a peer outside every trusted network names nobody: {outside}"
-            );
-        }
-        let proxy = ip("173.245.48.1");
+        assert_eq!(client_ip(proxy, &named, &[proxy]), ip("203.0.113.9"));
         assert_eq!(
-            client_ip(proxy, &headers("x-real-ip", &["203.0.113.9"]), &cloudflare),
-            proxy,
-            "a header the proxy passes on from the client names nobody"
+            client_ip(ip("::ffff:198.51.100.1"), &named, &[proxy]),
+            ip("203.0.113.9")
         );
-        let doubled = headers("cf-connecting-ip", &["203.0.113.9", "203.0.113.10"]);
-        assert_eq!(client_ip(proxy, &doubled, &cloudflare), proxy);
-        let nonsense = headers("cf-connecting-ip", &["nonsense"]);
-        assert_eq!(client_ip(proxy, &nonsense, &cloudflare), proxy);
-        let nginx = crate::config::Forwarding {
-            trusted_proxies: vec![crate::config::proxy_network("127.0.0.1").unwrap()],
-            ..Default::default()
-        };
-        let loopback = ip("127.0.0.1");
-        let real = headers("x-real-ip", &["203.0.113.9"]);
-        assert_eq!(client_ip(loopback, &real, &nginx), ip("203.0.113.9"));
-        assert_eq!(client_ip(loopback, &named, &nginx), loopback);
-        assert_eq!(client_ip(ip("127.0.0.2"), &real, &nginx), ip("127.0.0.2"));
+        assert_eq!(
+            client_ip(ip("192.0.2.4"), &named, &[proxy]),
+            ip("192.0.2.4")
+        );
+        let doubled = headers(&["203.0.113.9", "203.0.113.10"]);
+        assert_eq!(client_ip(proxy, &doubled, &[proxy]), proxy);
+        assert_eq!(client_ip(proxy, &headers(&["nonsense"]), &[proxy]), proxy);
     }
 
     #[tokio::test]
@@ -1460,7 +1422,6 @@ mod tests {
                 "x-forwarded-host",
                 "x-forwarded-proto",
                 "x-real-ip",
-                "cf-connecting-ip",
             ] {
                 headers.insert(name, "127.0.0.1".parse().unwrap());
                 assert!(!allowed(&headers, "127.0.0.1".parse().unwrap()));

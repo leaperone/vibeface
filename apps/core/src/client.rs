@@ -4435,7 +4435,7 @@ mod tests {
         config.forwarding.queue = 1;
         config.forwarding.any = true;
         config.forwarding.per_ip = std::num::NonZeroUsize::new(1);
-        config.forwarding.trusted_proxies = vec![crate::config::proxy_network("127.0.0.1")?];
+        config.forwarding.trusted_proxies = vec!["127.0.0.1".parse()?];
         drop((public, local));
         config.save(&dir)?;
         crate::config::private_write(

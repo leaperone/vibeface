@@ -2976,7 +2976,7 @@ pub(super) mod tests {
         config.network.bootstrap = net::bootstrap::Bootstrap::Public;
         assert_eq!(
             decision_url(&config)?,
-            "https://node.vibeface.dev/api/decision"
+            "https://8.217.72.118:4792/api/decision"
         );
         config.public_url = "https://node.example/".into();
         assert_eq!(decision_url(&config)?, "https://node.example/api/decision");

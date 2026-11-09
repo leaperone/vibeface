@@ -795,20 +795,13 @@ impl RelayServer {
     }
 }
 
-/// The connections one client address holds on a relay, and the proxies in front of it whose
-/// client header names that address.
-pub struct PerIp {
-    pub limit: NonZeroUsize,
-    pub proxies: crate::config::Forwarding,
-}
-
 /// The relay this Node runs; `access` decides who it admits, `rate` caps the bytes a second it
 /// reads from each connection and `per_ip` the connections one client address holds.
 pub async fn spawn_relay(
     listen: SocketAddr,
     access: Arc<dyn iroh_relay::server::DynAccessControl>,
     rate: Option<NonZeroU32>,
-    per_ip: Option<PerIp>,
+    per_ip: Option<NonZeroUsize>,
 ) -> Result<RelayServer> {
     let refused =
         |error: &dyn std::fmt::Display| anyhow!("relay failed to start on {listen}: {error}");
@@ -849,37 +842,19 @@ pub async fn spawn_relay(
     })
 }
 
-/// The most of a trusted proxy's request head the front reads for its client header.
-const PROXY_HEAD_LIMIT: usize = 16 * 1024;
-/// How long a trusted proxy has to send that head.
-const PROXY_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Passes each connection on to the relay unless its client address already holds its share.
-/// The client address is the peer's, or the one a trusted proxy names in its request head.
-async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_ip: PerIp) {
+/// Passes each connection on to the relay unless its client address already holds `per_ip`.
+async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_ip: NonZeroUsize) {
     let shares = Shares::default();
-    let proxies = Arc::new(per_ip.proxies);
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             Some(_) = connections.join_next() => {}
             accepted = listener.accept() => match accepted {
                 Ok((mut client, peer)) => {
-                    let (shares, proxies, limit) = (shares.clone(), proxies.clone(), per_ip.limit);
+                    // A refused connection closes as it drops.
+                    let Some(share) = shares.take(peer.ip(), per_ip) else { continue };
                     connections.spawn(async move {
-                        let mut head = Vec::new();
-                        let mut address = peer.ip();
-                        if proxies.trusts(address) {
-                            // A proxy that sends no head in time holds nothing.
-                            let Ok(Ok(named)) = tokio::time::timeout(
-                                PROXY_HEAD_TIMEOUT,
-                                read_client_header(&mut client, &proxies.client_ip_header, &mut head),
-                            )
-                            .await else { return };
-                            address = named.unwrap_or(address);
-                        }
-                        // A refused connection closes as it drops.
-                        let Some(_share) = shares.take(address, limit) else { return };
+                        let _share = share;
                         // The relay sends small QUIC datagrams that must not wait to coalesce.
                         let _ = client.set_nodelay(true);
                         // A client gone without closing would otherwise keep its share.
@@ -888,12 +863,7 @@ async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_i
                             .with_interval(Duration::from_secs(15));
                         let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
                         if let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await {
-                            use tokio::io::AsyncWriteExt as _;
                             let _ = relay.set_nodelay(true);
-                            // The bytes read for the header go on first, unchanged.
-                            if relay.write_all(&head).await.is_err() {
-                                return;
-                            }
                             let (mut from_client, mut to_client) = client.split();
                             let (mut from_relay, mut to_relay) = relay.split();
                             // Either side ending closes both, so a half-closed peer keeps no share.
@@ -907,44 +877,6 @@ async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_i
                 // Out of descriptors, say; retrying at once would spin.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             },
-        }
-    }
-}
-
-/// Reads into `head` until it holds a whole HTTP request head, or `PROXY_HEAD_LIMIT` bytes, and
-/// returns the address named once in `header`. Fails if the stream ends first.
-async fn read_client_header(
-    stream: &mut tokio::net::TcpStream,
-    header: &str,
-    head: &mut Vec<u8>,
-) -> std::io::Result<Option<IpAddr>> {
-    use tokio::io::AsyncReadExt as _;
-    let mut chunk = [0; 4096];
-    loop {
-        let room = PROXY_HEAD_LIMIT - head.len();
-        let read = stream.read(&mut chunk[..room.min(4096)]).await?;
-        if read == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        head.extend_from_slice(&chunk[..read]);
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut request = httparse::Request::new(&mut headers);
-        match request.parse(head) {
-            Ok(httparse::Status::Partial) if head.len() < PROXY_HEAD_LIMIT => continue,
-            Ok(httparse::Status::Complete(_)) => {
-                let mut values = request
-                    .headers
-                    .iter()
-                    .filter(|field| field.name.eq_ignore_ascii_case(header));
-                return Ok(match (values.next(), values.next()) {
-                    (Some(field), None) => std::str::from_utf8(field.value)
-                        .ok()
-                        .and_then(|value| value.trim().parse().ok()),
-                    _ => None,
-                });
-            }
-            // Too long, too many headers or not HTTP: the peer is the client.
-            _ => return Ok(None),
         }
     }
 }
@@ -1100,10 +1032,7 @@ mod tests {
             "127.0.0.1:0".parse()?,
             Arc::new(iroh_relay::server::AllowAll),
             None,
-            Some(PerIp {
-                limit: NonZeroUsize::MIN,
-                proxies: Default::default(),
-            }),
+            NonZeroUsize::new(1),
         )
         .await?;
         let addr = relay.addr;
@@ -1146,92 +1075,6 @@ mod tests {
             .await
             .context("a connection the relay closed kept its share")?;
         relay.shutdown().await;
-        Ok(())
-    }
-
-    /// Behind a trusted proxy the front counts the address its client header names and passes
-    /// the relay every byte the proxy sent, the head it read first; any other peer's header
-    /// counts for nothing.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_relay_front_counts_the_client_a_trusted_proxy_names() -> Result<()> {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        use tokio::net::{TcpListener, TcpStream};
-
-        let front = |trusted: &'static str| async move {
-            let upstream = TcpListener::bind("127.0.0.1:0").await?;
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let addr = listener.local_addr()?;
-            let per_ip = PerIp {
-                limit: NonZeroUsize::MIN,
-                proxies: crate::config::Forwarding {
-                    trusted_proxies: vec![crate::config::proxy_network(trusted)?],
-                    client_ip_header: "cf-connecting-ip".into(),
-                    ..Default::default()
-                },
-            };
-            let task = Front(tokio::spawn(relay_front(
-                listener,
-                upstream.local_addr()?,
-                per_ip,
-            )));
-            Ok::<_, anyhow::Error>((addr, upstream, task))
-        };
-        // The head arrives split mid-header, followed at once by the first relay bytes.
-        let open = |addr: SocketAddr, client: &'static str| async move {
-            let mut stream = TcpStream::connect(addr).await?;
-            let first = b"GET /relay HTTP/1.1\r\nHost: node.example\r\nCF-Conn".to_vec();
-            let rest = format!("ecting-IP: {client}\r\nUpgrade: websocket\r\n\r\n\x00frame");
-            // A front that refuses the peer outright may close before the rest is written.
-            let _ = stream.write_all(&first).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = stream.write_all(rest.as_bytes()).await;
-            Ok::<_, anyhow::Error>((stream, [first, rest.into_bytes()].concat()))
-        };
-        async fn passed(upstream: &TcpListener, sent: Vec<u8>) -> Result<TcpStream> {
-            let (mut relay, _) =
-                tokio::time::timeout(Duration::from_secs(5), upstream.accept()).await??;
-            let mut got = vec![0; sent.len()];
-            tokio::time::timeout(Duration::from_secs(5), relay.read_exact(&mut got)).await??;
-            assert_eq!(got, sent, "the relay gets the bytes unchanged");
-            Ok(relay)
-        }
-        let refused = |mut stream: TcpStream| async move {
-            let read =
-                tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0; 1])).await?;
-            Ok::<_, anyhow::Error>(matches!(read, Ok(0) | Err(_)))
-        };
-
-        let (addr, upstream, _front) = front("127.0.0.0/8").await?;
-        let (held, sent) = open(addr, "203.0.113.1").await?;
-        let _relayed = passed(&upstream, sent).await?;
-        let (again, _) = open(addr, "203.0.113.1").await?;
-        assert!(
-            refused(again).await?,
-            "the named address holds its one share"
-        );
-        let (other, sent) = open(addr, "203.0.113.2").await?;
-        let _other = passed(&upstream, sent).await?;
-        let (six, sent) = open(addr, "2001:db8:0:ff::1").await?;
-        let _six = passed(&upstream, sent).await?;
-        let (same, _) = open(addr, "2001:db8::2").await?;
-        assert!(refused(same).await?, "one IPv6 /56 is one client");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), upstream.accept())
-                .await
-                .is_err(),
-            "a refused connection never reaches the relay"
-        );
-        drop((held, other, six));
-
-        let (addr, upstream, _front) = front("192.0.2.0/24").await?;
-        let (held, sent) = open(addr, "203.0.113.1").await?;
-        let _relayed = passed(&upstream, sent).await?;
-        let (forged, _) = open(addr, "203.0.113.2").await?;
-        assert!(
-            refused(forged).await?,
-            "an untrusted peer's header names nobody, so the peer holds the share"
-        );
-        drop(held);
         Ok(())
     }
 

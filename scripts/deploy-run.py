@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import re
-import runpy
 import shlex
 import shutil
 import subprocess
@@ -91,10 +90,8 @@ def core_smoke(identity, info, output):
     try:
         # The official node's shape, offline; the runtime guard refuses anything less bounded.
         gateway = 'https://127.0.0.1:4793'
-        cloudflare = runpy.run_path(str(ROOT / 'deploy/runtime.py'))['CLOUDFLARE']
         options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': gateway, 'tls': True,
                    'allowed_origins': ['https://app.vibeface.dev'], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
-                   'relay_url': gateway, 'trusted_proxies': list(cloudflare), 'client_ip_header': 'CF-Connecting-IP',
                    'relay_open': True, 'relay_rate': 65536, 'relay_max_clients': 512,
                    'relay_max_clients_per_ip': 16, 'forward_any': True, 'forward_sessions': 32,
                    'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8, 'bootstrap': 'off'}
