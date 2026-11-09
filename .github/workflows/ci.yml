@@ -510,7 +510,7 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
-      - name: Verify packaged free discovery and charity delivery over real Node processes
+      - name: Verify packaged free mesh and charity delivery over real Node processes
         if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
@@ -581,11 +581,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-node --public-node
-      - name: Verify discovery assistance and headless Nodes
+      - name: Verify the mesh, volunteer relay adoption and headless Nodes
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-mesh --mesh
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
@@ -618,8 +618,8 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
             .artifacts/ci-phase4/phase4-*/report.json
             .artifacts/ci-phase4/phase4-*/*/node.log
-            .artifacts/ci-discovery/discovery-*/report.json
-            .artifacts/ci-discovery/discovery-*/*/node.log
+            .artifacts/ci-mesh/mesh-*/report.json
+            .artifacts/ci-mesh/mesh-*/*/node.log
             .artifacts/ci-public-node/public-node-*/report.json
             .artifacts/ci-public-node/public-node-*/*/node.log
             .artifacts/ci-phase5/phase5-*/report.json

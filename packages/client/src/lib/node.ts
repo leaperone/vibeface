@@ -265,6 +265,31 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     suggested_roots: strings(v.suggested_roots),
   }
 }
+const relayStates = ['off', 'checking', 'announced', 'unreachable'] as const
+/** This Node's open relay for other people's devices; `announced` once a neighbour reached it from outside. */
+export type RelaySettings = {
+  volunteer: boolean; url: string | null; listen: string | null; rate: number; max_clients: number; max_clients_per_ip: number
+  status: typeof relayStates[number]; error: string | null
+}
+/** `share_link`: this Node's node link, `vibeface://node/<device-id>?addr=…&relay=…`, which another Node takes as its bootstrap. */
+export function parseShareLink(value: unknown): string {
+  const link = text(record(value, '节点链接').link)
+  if (!/^vibeface:\/\/node\/[0-9a-f]{64}(\?\S*)?$/.test(link)) throw new Error('节点链接格式无效。')
+  return link
+}
+/** The limits `configure_relay` applies when turned on without them: bytes per second per connection, connections, connections per IP. */
+export const relayDefaults = { rate: 16384, max_clients: 128, max_clients_per_ip: 8 } as const
+export function parseRelaySettings(value: unknown): RelaySettings {
+  const v = record(value, '转发设置'), status = relayStates.find(state => state === v.status)
+  const count = (input: unknown) => { if (typeof input !== 'number' || !Number.isSafeInteger(input) || input < 0) throw new Error('转发设置格式无效。'); return input }
+  const optional = (input: unknown) => input === null ? null : text(input)
+  if (!status) throw new Error('转发设置格式无效。')
+  return {
+    volunteer: boolean(v.volunteer), url: optional(v.url), listen: optional(v.listen),
+    rate: count(v.rate), max_clients: count(v.max_clients), max_clients_per_ip: count(v.max_clients_per_ip),
+    status, error: optional(v.error),
+  }
+}
 export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']
 /** A provider named by a peer's capabilities, or null when it names none this client knows. */
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null

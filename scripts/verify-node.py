@@ -332,7 +332,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const secret = invites.get(input.invite_hash);
         if (!secret) throw new Error('unknown invite');
         invites.delete(input.invite_hash);
-        result = ticketEncode(input.entry_id, hex(secret));
+        result = ticketEncode(input.entry, hex(secret));
         secret.fill(0);
         break;
       }
@@ -559,8 +559,8 @@ class Client:
         tampered = copy.deepcopy(made["record"])
         tampered["expires_at_ms"] += 1
         self.call("invite", {"record": tampered}, status=400)
-        self.call("invite", {"record": made["record"]})
-        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id)
+        registered = self.call("invite", {"record": made["record"]})
+        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry=registered["entry"])
         return f"vibeface://join/{ticket}"
 
     def directory_state(self):
@@ -648,8 +648,8 @@ class Node:
             arguments = [str(binary), "init", "--data-dir", str(self.directory),
                          "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
                          *(init_args if init_args is not None else ["--root", str(workspace)])]
-            if not any(arg == "--bootstrap" or arg.startswith("--bootstrap=") for arg in arguments):
-                arguments.extend(["--bootstrap", "off"])
+            if not any(arg.split("=")[0] in ("--no-mesh", "--bootstrap", "--mesh-network") for arg in arguments):
+                arguments.append("--no-mesh")
             result = subprocess.run(arguments, capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
@@ -679,6 +679,16 @@ class Node:
     def configure_network(self, **values):
         network = json.loads((self.directory / "config.json").read_text())["network"]
         self.configure(network={**network, **values})
+
+    @property
+    def mesh_address(self):
+        """This Node as a mesh bootstrap node."""
+        return f"vibeface://node/{self.device_id}?addr=127.0.0.1:{self.quic_port}"
+
+    def configure_mesh(self, network, bootstrap=()):
+        """Joins the loopback mesh `network` through `bootstrap`; loopback fixtures need private addresses."""
+        self.configure_network(mesh={"enabled": True, "network": network, "bootstrap": list(bootstrap),
+                                     "allow_private": True})
 
     def environment(self):
         """A private HOME, so session scans and hooks never see the operator's own ~/.codex or ~/.claude."""
@@ -778,7 +788,7 @@ class Node:
         link = owner.invite()
         encoded = link.removeprefix("vibeface://join/vibeface1").upper()
         ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
-        require(len(ticket) == 65 and ticket[0] == 1, "CLI join ticket holds only the entry device ID and secret")
+        require(ticket[0] == 1 and len(ticket) > 65, "CLI join ticket carries the entry's node link and secret")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
@@ -844,12 +854,19 @@ def pinned_info(node, certificate=None):
     return json.loads(body)
 
 
-def local_discovery(run, binary, workspace, helper, cleanup, name="DISCOVERY"):
-    """A started Node serving discovery on loopback, with no relay. Invites carry only the entry's device ID,
-    so a CLI join finds its entry here; give `discovery_address` to the joiner and the entry before they start."""
-    node = Node(run, name, binary, workspace, helper, init_args=["--serve-discovery"])
+def mesh_network():
+    """A fresh mesh name, so a run never meets another run's or the public mesh's records."""
+    return "t-" + uuid.uuid4().hex[:12]
+
+
+def local_bootstrap(run, binary, workspace, helper, cleanup, name="BOOT"):
+    """A started Node that is the bootstrap node of a fresh loopback mesh, with no relay. Invites carry only
+    the entry's device ID, so a CLI join finds its entry through this mesh: call
+    `configure_mesh(boot.mesh_network, [boot.mesh_address])` on the joiner and the entry before they start."""
+    node = Node(run, name, binary, workspace, helper)
     cleanup.append(node)
-    node.discovery_address = f"vibeface://{node.device_id}@localhost:{node.quic_port}"
+    node.mesh_network = mesh_network()
+    node.configure_mesh(node.mesh_network)
     node.start()
     return node
 
@@ -3520,12 +3537,12 @@ def phase1_acceptance(options):
         wait_for("A receives its client grant", lambda: a.client.authenticate())
 
     try:
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         a = Node(run, "A", binary, workspace, helper)
         nodes.append(a)
         a.configure(timeout_secs=600, manager=manager, bins={"codex": str(codex)}, app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
-        a.configure_network(discovery=[discovery])
+        a.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         a.client.call("subscribe")
@@ -3861,7 +3878,7 @@ def phase1_acceptance(options):
         b.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(child_fixture, child_workspace),
                     bins={"codex": str(fixture_wrapper(child_fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
-        b.configure_network(discovery=[discovery])
+        b.configure_mesh(boot.mesh_network, [boot.mesh_address])
         b.pair(a)
         b.start()
         root_workspace = run / "delegate-root-workspace"
@@ -3875,7 +3892,7 @@ def phase1_acceptance(options):
                             manager=fixture_manager_settings(root_fixture, root_workspace),
                             bins={"codex": str(fixture_wrapper(root_fixture, "fixture-codex", "--fixture-codex"))},
                             app_server=SPAWN_APP_SERVER)
-        root_node.configure_network(discovery=[discovery])
+        root_node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         root_node.pair(a)
         root_node.start()
         root_node.client = Client(root_node.url, helper, identity_file=a.client.identity_file)
@@ -4290,7 +4307,7 @@ def memory_sync_acceptance(options):
         return rows
 
     try:
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         for name in ("A", "B"):
             node = Node(run, name, binary, workspace, helper)
             nodes.append(node)
@@ -4299,7 +4316,8 @@ def memory_sync_acceptance(options):
             node.configure(timeout_secs=600, daily_decision_limit=100, app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace),
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))})
-            node.configure_network(relays=[], n0_relays=False, discovery=[discovery])
+            node.configure_network(relays=[])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         _, a, b = nodes
         a.start()
         network = a.bootstrap()
@@ -4623,11 +4641,11 @@ def acceptance(options):
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         # B cannot reach the IPv4-only Discovery, so its join hands the invite token to P's relay,
         # which admits only members and those P invited.
         for node in (a, p, c):
-            node.configure_network(discovery=[discovery])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
@@ -4948,7 +4966,7 @@ def phase4_acceptance(options):
         for name in ("A", "P", "B", "C"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c = nodes
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         for node in (a, b, c):
             root = roots[node.name] = run / ("fixture-" + node.name)
             root.mkdir(mode=0o700)
@@ -4956,8 +4974,10 @@ def phase4_acceptance(options):
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))},
                            app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
-            node.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
-        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
+            node.configure_network(relays=[{"url": relay_url}])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
+        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        p.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -5373,9 +5393,9 @@ def phase4_acceptance(options):
 
 
 def public_node_acceptance(options):
-    """A public node P in no personal network: an ordinary Node that serves discovery, runs an open relay and
-    forwards browsers to any device, with one forwarding slot and one place in line. M is the only member Node
-    and configures nothing but P's discovery; a browser opens P's origin, joins M and chats with it. A private
+    """A public node P in no personal network: an ordinary Node that is the bootstrap node of a fresh mesh, runs
+    an open relay and forwards browsers to any device, with one forwarding slot and one place in line. M is the
+    only member Node and configures nothing but P as its bootstrap node; a browser opens P's origin, joins M and chats with it. A private
     relay R with an operator token then carries A's traffic to an IPv6-only X while X holds the token, and
     nothing once it holds a wrong one."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
@@ -5389,9 +5409,9 @@ def public_node_acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "public node P (not a member) serving discovery, an open relay limited per address and "
-                          "browser forwarding with one slot and one place in line; member M configured only with "
-                          "P's discovery; private relay R with an operator token between A and an IPv6-only X; "
+              "coverage": "public node P (not a member) as a mesh bootstrap node, an open relay limited per address "
+                          "and browser forwarding with one slot and one place in line; member M configured only with "
+                          "P as its bootstrap node; private relay R with an operator token between A and an IPv6-only X; "
                           "TLS-only T as a reverse proxy pinning its certificate sees it; WASM browser client on P's origin",
               "not_checked": ["real NAT and the nginx reverse proxy (loopback ports stand in for nginx paths)",
                               "rendered browser UI (see the browser screenshots)"]}
@@ -5424,19 +5444,22 @@ def public_node_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
+        mesh = mesh_network()
         p = Node(run, "P", binary, workspace, helper, init_args=[
-            "--serve-discovery", "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
+            "--mesh-network", mesh, "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
             "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
         nodes.append(p)
-        discovery = f"vibeface://{p.device_id}@127.0.0.1:{p.quic_port}"
         fixture = run / "fixture-M"
         fixture.mkdir(mode=0o700)
-        m = Node(run, "M", binary, workspace, helper, init_args=["--root", str(workspace), "--bootstrap", discovery])
+        p.configure_mesh(mesh)
+        m = Node(run, "M", binary, workspace, helper, init_args=[
+            "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", p.mesh_address])
         nodes.append(m)
         configured = json.loads((m.directory / "config.json").read_text())["network"]
-        require(configured["bootstrap"] == {"mode": "custom", "discovery": discovery}
-                and configured["relays"] == [] and configured["discovery"] == [],
-                "M configures nothing but P's discovery")
+        require(configured["mesh"] == {"enabled": True, "network": mesh, "bootstrap": [p.mesh_address],
+                                       "allow_private": False} and configured["relays"] == [],
+                "M configures nothing but P as its bootstrap node")
+        m.configure_mesh(mesh, [p.mesh_address])
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
                     bins={"codex": str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
@@ -5450,10 +5473,15 @@ def public_node_acceptance(options):
         phone = Client(p.url, helper, identity_file=run / "phone-identity.json")
         clients.append(phone)
         started = time.monotonic()
-        wait_for("M registers with P's discovery", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
+        wait_for("P finds M through the mesh", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
         phone.join(m.client, "phone", via=p.url)
         require(phone.url == p.url, "the phone joined through P's origin")
         passed("browser-joins-the-member-through-the-public-node", elapsed_ms=round((time.monotonic() - started) * 1000))
+        announced = wait_for("M learns P's volunteer relay from the mesh", lambda: [
+            role["url"].rstrip("/") for entry in mesh_records(m, "relay") if entry["record"]["device_id"] == p.device_id
+            for role in entry["record"]["roles"] if role["kind"] == "relay"], timeout=120)
+        require(announced == [relay_url], "P announces exactly its open relay")
+        passed("public-node-announces-its-open-relay-on-the-mesh", relay=relay_url)
 
         conversation = "public-node-chat"
         phone.rpc("create_bot", bot_id="public-node-bot", conversation_id=conversation, name="经公共节点",
@@ -5562,11 +5590,13 @@ def public_node_acceptance(options):
             "--relay-operator-token", str(token_file)])
         nodes.append(r)
         # D offers no relay, so R is the only one A and X can use.
-        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
+        d = local_bootstrap(run, binary, workspace, helper, nodes, name="D")
         a, x = (Node(run, name, binary, workspace, helper, init_args=[
-            "--root", str(workspace), "--discovery", d.discovery_address,
+            "--root", str(workspace),
             "--relay", private_url, "--relay-token", f"{private_url}={token_file}"]) for name in ("A", "X"))
         nodes += [a, x]
+        for node in (a, x):
+            node.configure_mesh(d.mesh_network, [d.mesh_address])
         r.start(no_web=True)
         a.start()
         private = a.bootstrap()
@@ -5639,10 +5669,14 @@ def public_node_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
-def discovery_acceptance(options):
+def mesh_acceptance(options):
+    """Four Nodes on a fresh loopback mesh, driven by the CLI: A is the bootstrap node and volunteers a relay;
+    B and C join through A, learn every record, take A's relay as home and sync through it once their direct
+    path is gone; D joins through B alone, gets all four records, then rejoins from its old table with B gone
+    and no bootstrap node configured; A stops volunteering and B, C and D drop its relay."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
     options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("discovery-" + uuid.uuid4().hex[:10])
+    run = options.artifacts.resolve() / ("mesh-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
@@ -5651,25 +5685,42 @@ def discovery_acceptance(options):
     helper.chmod(0o600)
     nodes = []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "not_checked": ["public NAT types and UDP-blocked networks", "rendered browser UI", "live Agent tool execution"]}
+              "not_checked": ["public NAT types and UDP-blocked networks", "public HTTPS gateways",
+                              "rendered browser UI", "live Agent tool execution"]}
 
     def passed(name, **evidence):
         report["cases"][name] = evidence
         print("PASS " + name, flush=True)
 
-    def clear_addresses(*members):
-        for node in members:
-            require(node.process is None, "only stopped task-owned Nodes have their cached paths cleared")
-            with sqlite3.connect(node.directory / "node.sqlite3") as database:
-                database.execute("DELETE FROM addresses")
-
     def peer(node, target):
         return next((row for row in node_status(node).get("peers", []) if row["device_id"] == target.device_id), {})
 
-    def reconnect(node, network):
+    def online(node):
+        return {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]}
+
+    def record_of(node, target):
+        return next((entry["record"] for entry in mesh_records(node) if entry["record"]["device_id"] == target.device_id), None)
+
+    def relay_roles(record):
+        return [role["url"].rstrip("/") for role in (record or {}).get("roles", []) if role["kind"] == "relay"]
+
+    def home(node):
+        return ((mesh_status(node).get("own") or {}).get("relay_url") or "").rstrip("/") or None
+
+    def member(name, *bootstrap):
+        node = Node(run, name, binary, workspace, helper, init_args=[
+            "--root", str(workspace), "--mesh-network", network, *[arg for url in bootstrap for arg in ("--bootstrap", url)]])
+        nodes.append(node)
+        node_cli(node, "config", "set", "mesh.allow_private", "true")
+        mesh = json.loads((node.directory / "config.json").read_text())["network"]["mesh"]
+        require(mesh == {"enabled": True, "network": network, "bootstrap": list(bootstrap), "allow_private": True},
+                f"{name}: init joins the named mesh through exactly its bootstrap nodes")
+        return node
+
+    def reconnect(node, personal):
         node.client.close()
         node.client.connect(node.device_id)
-        node.client.authenticate(network)
+        node.client.authenticate(personal)
         wait_for("the management Node is aligned and writable", lambda: node_status(node).get("write_state") == "writable", timeout=60)
 
     def stopped_browser(node):
@@ -5691,110 +5742,102 @@ def discovery_acceptance(options):
         return node_status(node)
 
     try:
-        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
-        served = json.loads((d.directory / "config.json").read_text())["network"]
-        require(served["serve_discovery"] and served["relay_listen"] is None,
-                "discovery is a capability of an ordinary Node and brings no relay")
-        require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
-        passed("discovery-runs-on-an-ordinary-node-without-a-relay")
-        address = d.discovery_address
-        a, b = [Node(run, name, binary, workspace, helper) for name in ("A", "B")]
-        nodes += [a, b]
-        for node in (a, b):
-            node.configure_network(discovery=[address])
+        network = mesh_network()
+        a = member("A")
         a.start()
-        network = a.bootstrap()
-        b.pair(a)
+        b, c = member("B", a.mesh_address), member("C", a.mesh_address)
         b.start()
-        wait_for("discovery establishes A-to-B direct sync", lambda: peer(a, b).get("path") == "direct", timeout=60)
-        a.client.rpc("create_conversation", conversation_id="discovery-first", title="Discovery direct sync")
-        wait_for("discovery members sync their first event", lambda: converged((a, b), network), timeout=60)
-        passed("cli-join-with-only-target-id-and-invite-uses-discovery", path=peer(a, b)["path"])
+        c.start()
+        everyone = {a.device_id, b.device_id, c.device_id}
+        wait_for("B and C learn every record through A", lambda: all(online(node) >= everyone for node in (b, c)), timeout=90)
+        status = mesh_status(b)
+        require(status["enabled"] and status["network"] == network and status["neighbors"] >= 1
+                and status["own"]["network"] == network, "B reports the mesh it joined, its neighbors and its record")
+        require(node_status(a)["mesh"]["neighbors"] >= 1, "inspect reports the bootstrap node's mesh neighbors")
+        passed("bootstrap-node-introduces-members", records=status["records"], neighbors=status["neighbors"])
 
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        clear_addresses(a, b)
-        d.stop()
-        d.start(no_web=True)
-        a.start()
-        b.start()
-        wait_for("fresh caches recover through restarted discovery", lambda: peer(a, b).get("path") == "direct", timeout=60)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-restart", title="Discovery restart")
-        wait_for("restarted discovery restores synchronization", lambda: converged((a, b), network), timeout=60)
-        passed("discovery-restart-restores-direct-sync-with-empty-address-caches", path=peer(a, b)["path"], web_enabled=node_status(d)["web_enabled"])
-
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        b.configure_network(bind=f"[::1]:{b.port}")
-        clear_addresses(a, b)
-        a.start()
-        b.start()
-        wait_for("disjoint IP families cannot complete business through discovery", lambda: peer(a, b).get("reachable") is False, timeout=45)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-blocked", title="Direct path blocked")
-        require_quiet("discovery never forwards the blocked event", lambda: heads(b, network) != heads(a, network))
-        require(peer(a, b).get("path") is None, "no data path is hidden behind discovery")
-        passed("blocked-direct-path-does-not-fall-back-to-discovery")
-
-        b.stop()
-        b.configure_network(bind=f"127.0.0.1:{b.port}")
-        b.start()
-        wait_for("restored IP path catches up", lambda: converged((a, b), network), timeout=60)
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        r = Node(run, "R", binary, workspace, helper, init_args=[
-            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
-        nodes.append(r)
-        r.configure_network(discovery=[address])
-        r.pair(a)
-        r.start()
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-            node.configure_network(relays=[{"url": relay_url}])
-            node.start()
-        reconnect(a, network)
-        wait_for("members publish normal relay paths", lambda: all(
-            any("Relay" in item for item in json.loads(row["payload"])["endpoint"]["addrs"])
-            for row in a.client.call("entrances")["entrances"]), timeout=60)
-        wait_for("relay members align before isolating B", lambda: converged((a, b, r), network), timeout=60)
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        b.configure_network(bind=f"[::1]:{b.port}")
-        a.start()
-        b.start()
-        wait_for("ordinary relay recovers the disjoint direct paths automatically", lambda: peer(a, b).get("path") == "relay", timeout=60)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-relay", title="Automatic relay fallback")
-        wait_for("business sync succeeds on the normal relay", lambda: converged((a, b, r), network), timeout=60)
-        passed("normal-relay-fallback-is-automatic", path=peer(a, b)["path"])
+        settings = json.loads(node_cli(a, "relay", "volunteer", "on", "--listen", f"127.0.0.1:{relay_port}", "--url", relay_url,
+                                       "--rate", "1048576", "--max-clients", "64", "--max-clients-per-ip", "64").stdout)
+        require(settings["volunteer"] and settings["url"].rstrip("/") == relay_url, "A volunteers its relay at the given URL")
+        wait_for("a neighbor checks A's relay from outside", lambda:
+                 json.loads(node_cli(a, "relay", "status").stdout)["status"] == "announced", timeout=120)
+        wait_for("B and C learn A's relay role", lambda: all(relay_roles(record_of(node, a)) == [relay_url] for node in (b, c)), timeout=90)
+        wait_for("B and C take A's relay as their home relay", lambda: home(b) == relay_url and home(c) == relay_url, timeout=150)
+        passed("volunteer-relay-is-announced-and-adopted", relay=relay_url)
 
+        personal = b.bootstrap()
+        c.stop()
+        c.pair(b)
+        c.start()
+        wait_for("B and C sync directly first", lambda: peer(b, c).get("path") == "direct", timeout=60)
+        b.client.rpc("create_conversation", conversation_id="mesh-direct", title="Mesh direct sync")
+        wait_for("B and C sync their first event", lambda: converged((b, c), personal), timeout=60)
+        b.client.close()
         b.stop()
-        b.start(no_web=True)
-        status = stopped_browser(b)
-        a.client.rpc("create_conversation", conversation_id="discovery-headless", title="Headless sync")
-        wait_for("headless B still synchronizes", lambda: converged((a, b, r), network), timeout=60)
-        wait_for("B withdraws its closed webpage", lambda: any(
-            json.loads(row["payload"])["device_id"] == b.device_id and json.loads(row["payload"])["gateway_url"] is None
-            for row in a.client.call("entrances")["entrances"]), timeout=60)
-        passed("serve-no-web-keeps-hooks-tool-auth-maintenance-and-sync", web_enabled=status["web_enabled"])
-        b.stop()
-        b.start(no_web=True, bare=True)
-        stopped_browser(b)
-        b.stop()
-        b.configure(web_enabled=False)
+        c.stop()
+        c.configure_network(bind=f"[::1]:{c.port}")
         b.start()
-        stopped_browser(b)
+        c.start()
+        wait_for("C, IPv6 only, reaches B through A's relay", lambda: peer(b, c).get("path") == "relay", timeout=120)
+        reconnect(b, personal)
+        b.client.rpc("create_conversation", conversation_id="mesh-relay", title="Through the volunteer relay")
+        wait_for("business sync succeeds on the adopted relay", lambda: converged((b, c), personal), timeout=60)
+        wait_for("C announces A's relay as home again after its restart", lambda: home(c) == relay_url, timeout=90)
+        passed("members-connect-through-the-adopted-relay", path=peer(b, c)["path"])
+
+        d = member("D", b.mesh_address)
+        d.start()
+        everyone.add(d.device_id)
+        wait_for("D, configured only with B, gets all four records", lambda: online(d) == everyone, timeout=90)
+        passed("records-spread-beyond-the-bootstrap-node", records=len(everyone))
+
+        d.stop()
+        listed = node_cli(d, "mesh", "bootstrap", "remove", b.device_id).stdout
+        require(b.mesh_address not in listed, "the stopped Node drops its only bootstrap node")
+        require(json.loads((d.directory / "config.json").read_text())["network"]["mesh"]["bootstrap"] == [],
+                "D has no bootstrap node configured")
+        b.client.close()
+        b.stop()
+        d.start()
+        wait_for("D rejoins from its old table without B", lambda: (mesh_status(d)["neighbors"] or 0) >= 1, timeout=150)
+        b.start()
+        reconnect(b, personal)
+        passed("old-table-rejoins-without-bootstrap-nodes", neighbors=mesh_status(d)["neighbors"])
+
+        # C reaches the others directly again, so it hears A withdraw its relay.
+        c.stop()
+        c.configure_network(bind=f"127.0.0.1:{c.port}")
+        c.start()
+        settings = json.loads(node_cli(a, "relay", "volunteer", "off").stdout)
+        require(not settings["volunteer"] and settings["status"] == "off", "A stops volunteering")
+        wait_for("D, rejoined, hears that A withdrew its relay", lambda: relay_roles(record_of(d, a)) == [], timeout=120)
+        wait_for("B, C and D drop A's relay", lambda: relay_url not in {home(b), home(c), home(d)}, timeout=180)
+        passed("withdrawn-relay-is-dropped", homes=[home(node) for node in (b, c, d)])
+
+        c.stop()
+        c.start(no_web=True)
+        status = stopped_browser(c)
+        b.client.rpc("create_conversation", conversation_id="mesh-headless", title="Headless sync")
+        wait_for("headless C still synchronizes", lambda: converged((b, c), personal), timeout=60)
+        wait_for("C withdraws its closed webpage", lambda: any(
+            json.loads(row["payload"])["device_id"] == c.device_id and json.loads(row["payload"])["gateway_url"] is None
+            for row in b.client.call("entrances")["entrances"]), timeout=60)
+        passed("serve-no-web-keeps-hooks-tool-auth-maintenance-and-sync", web_enabled=status["web_enabled"])
+        c.stop()
+        c.start(no_web=True, bare=True)
+        stopped_browser(c)
+        c.stop()
+        c.configure(web_enabled=False)
+        c.start()
+        stopped_browser(c)
         passed("bare-no-web-and-persisted-web-off")
-        with sqlite3.connect(f"file:{d.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
             counts = {table: database.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("networks", "events", "conversations", "log_heads")}
-        require(all(count == 0 for count in counts.values()), "discovery stores no personal network or business records")
-        passed("discovery-stores-no-business-records", **counts)
+        require(all(count == 0 for count in counts.values()), "the bootstrap node stores no personal network or business records")
+        passed("bootstrap-node-stores-no-business-records", **counts)
         report["status"] = "passed"
     except BaseException as error:
         report.update(status="failed", failure=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
@@ -5805,6 +5848,16 @@ def discovery_acceptance(options):
             node.stop()
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+
+
+def mesh_status(node):
+    """`vibeface mesh status --json`: whether the mesh is on, its records and neighbors and this Node's record."""
+    return json.loads(node_cli(node, "mesh", "status", "--json").stdout)
+
+
+def mesh_records(node, role=None):
+    """`vibeface mesh records --json`, optionally only the Nodes offering `role`."""
+    return json.loads(node_cli(node, "mesh", "records", "--json", *(["--role", role] if role else [])).stdout)["records"]
 
 
 def node_status(node):
@@ -5866,9 +5919,11 @@ def phase5_acceptance(options):
         nodes += [a, b]
         for node in nodes:
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
-        a.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
+        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        b.configure_mesh(boot.mesh_network, [boot.mesh_address])
+        a.configure_network(relays=[{"url": relay_url}])
+        a.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         b.pair(a)
@@ -6043,8 +6098,8 @@ def auto_route_acceptance(options):
         nodes.append(target)
         target.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        target.configure_network(discovery=[discovery])
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
+        target.configure_mesh(boot.mesh_network, [boot.mesh_address])
         target.start()
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)
@@ -6072,6 +6127,7 @@ def auto_route_acceptance(options):
         # /api/info is cross-origin for configured origins since the official App reaches its access Node from elsewhere.
         target.client.request("/api/info", headers={"Origin": allowed}, origin=False)
         target.client.request("/api/info", headers={"Origin": "https://elsewhere.example"}, origin=False, status=403)
+        target.client.request("/api/local/info", headers={"Origin": allowed}, origin=False, status=403)
         cross = fresh(target.url)
         cross.connect(target.device_id, origin=allowed)
         require(cross.call("info")["device_id"] == target.device_id, "a cross-origin page completes Noise to the target")
@@ -6174,7 +6230,7 @@ def auto_route_acceptance(options):
 
         joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
-        joining.configure_network(discovery=[discovery])
+        joining.configure_mesh(boot.mesh_network, [boot.mesh_address])
         code = joining.pair(target)
         listed = target.client.call("directory")["view"]["members"]
         require(any(row["device_id"] == joining.device_id and row["kind"] == "node" for row in listed),
@@ -6223,66 +6279,6 @@ def auto_route_acceptance(options):
                              "remaining_clients": sum(client.process is not None for client in clients)}
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
-
-
-class PkarrRelay:
-    def __init__(self, *, unavailable=False):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        self.packets = {}
-        self.reads = 0
-        self.writes = 0
-        self.lock = threading.Lock()
-        relay = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def key(self):
-                match = re.fullmatch(r"/pkarr/([a-z0-9]{52})", self.path)
-                return match[1] if match else None
-
-            def do_PUT(self):
-                key = self.key()
-                length = int(self.headers.get("Content-Length", "0"))
-                if key is None or not 72 <= length <= 1072:
-                    self.send_error(400)
-                    return
-                packet = self.rfile.read(length)
-                with relay.lock:
-                    relay.writes += 1
-                    if not unavailable:
-                        relay.packets[key] = packet
-                self.send_response(503 if unavailable else 200)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-
-            def do_GET(self):
-                with relay.lock:
-                    relay.reads += 1
-                    packet = relay.packets.get(self.key())
-                if unavailable:
-                    self.send_error(503)
-                    return
-                if packet is None:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(packet)))
-                self.end_headers()
-                self.wfile.write(packet)
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}/pkarr"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
 
 
 class DeliveryRpcSpy:
@@ -6354,7 +6350,7 @@ def delivery_free_state(nodes, spy):
     transactions = sum((delivery_rows(node, "SELECT count(*) FROM transactions") or [(0,)])[0][0]
                        for node in nodes)
     require(wallets == 0 and transactions == 0 and spy.calls == 0,
-            "free discovery and charity create no wallet, transactions or chain RPC calls")
+            "the free mesh and charity create no wallet, transactions or chain RPC calls")
     return {"wallet_files": wallets, "transaction_rows": transactions, "chain_rpc_calls": spy.calls}
 
 
@@ -6394,8 +6390,8 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     public = json.loads(result.stdout)
     require(public.get("passed") is True, "probe returned a positive bounded result")
     if action is None:
-        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/pkarr.rs"),
-                "probe resolves with the current product discovery implementation")
+        require(public["mesh"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/mesh/record.rs"),
+                "probe opens mesh records with the current product implementation")
     return public
 
 
@@ -6413,7 +6409,7 @@ def delivery_charity_acceptance(options):
     workspace.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    relay, fault_directory, spy = PkarrRelay(), PkarrRelay(unavailable=True), DeliveryRpcSpy()
+    spy = DeliveryRpcSpy()
     nodes = []
     report = {"status": "running", "mode": "charity", "source_binary": str(binary),
               "binary_sha256": file_sha256(binary), "profile_sha256": file_sha256(profile),
@@ -6458,11 +6454,16 @@ def delivery_charity_acceptance(options):
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
-            node.configure_network(pkarr={"publish": True, "resolve": True,
-                                             "urls": [fault_directory.url, relay.url], "publish_direct": True})
             private_json(node.directory / "delivery-settings.json", free_delivery_settings(spy, profile, enabled=False))
-            node.start()
         source, receiver, provider, outsider = nodes
+        # The public provider is the mesh's bootstrap node; the others list a Node that never starts before it.
+        gone = Node(run, "GONE", binary, workspace, helper)
+        mesh = mesh_network()
+        provider.configure_mesh(mesh)
+        for node in (source, receiver, outsider):
+            node.configure_mesh(mesh, [gone.mesh_address, provider.mesh_address])
+        for node in nodes:
+            node.start()
         source.bootstrap()
         receiver.bootstrap()
         require(source.client.network_id != receiver.client.network_id, "source and receiver use different personal networks")
@@ -6472,8 +6473,11 @@ def delivery_charity_acceptance(options):
             state = call(node, "status")
             require(state["enabled"] is False and state["wallet"]["state"] == "absent",
                     "object delivery starts disabled with no independent wallet")
-        wait_for("free peer publication", lambda: relay.writes >= 3)
-        passed("default-disabled-and-free-discovery", **delivery_free_state(nodes, spy), published=relay.writes)
+        everyone = {node.device_id for node in nodes}
+        wait_for("every Node learns every record through the free mesh", lambda: all(
+            {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]} == everyone for node in nodes),
+            timeout=90)
+        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone))
         for node in (source, receiver):
             state = call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
             require(state["enabled"] and not state["paid_enabled"], "manager explicitly enables charity")
@@ -6537,8 +6541,10 @@ def delivery_charity_acceptance(options):
 
         outsider.stop()
         security = delivery_probe(options, run, outsider, [source, receiver, provider], order_id)
-        require(security["discovery"]["fresh"] and len(security["targets"]) == 3,
-                "real signed discovery and service positive controls accompany all boundary rejections")
+        require(security["mesh"]["valid"] and all(security["mesh"][case] for case in (
+                    "expiredRejected", "aheadRejected", "badSignatureRejected", "oversizeRejected", "wrongNetworkRejected"))
+                and len(security["targets"]) == 3,
+                "real signed mesh records and service positive controls accompany all boundary rejections")
         passed("real-service-and-private-network-boundaries", **security)
         call(receiver, "accept", order_id=order_id)
         restart(receiver)
@@ -6558,20 +6564,18 @@ def delivery_charity_acceptance(options):
         wait_for("source reconciles the receiver receipt", lambda:
                  call(source, "get", order_id=order_id)["evidence"] == "charity_receipt", timeout=60)
         no_private_payload(provider, original_name, original)
-        require(relay.reads > 0 and relay.writes > 0, "delivery resolves PeerIDs through the free signed directory")
+        offered = wait_for("the source sees the provider's delivery service on the mesh", lambda: [
+            item for item in call(source, "providers")["providers"] if item["device_id"] == provider.device_id], timeout=60)
+        require(offered[0]["paid"] is False and offered[0]["offer"] is None, "the charity provider announces no price")
         for node in (source, receiver):
             orders = call(node, "list")["orders"]
             require(sum(order["order_id"] == order_id for order in orders) == 1, "retry and restart retain exactly one order")
         passed("receiver-restart-original-file-and-charity-receipt", bytes=len(original), sha256=digest,
                evidence=received["evidence"], provider_plaintext_absent=True, provider_private_events_absent=True)
-        passed("free-path-has-no-financial-side-effects", **delivery_free_state(nodes, spy),
-               pkarr_reads=relay.reads, pkarr_writes=relay.writes)
-        require(fault_directory.reads > 0 and fault_directory.writes > 0 and relay.reads > 0 and relay.writes > 0,
-                "actual discovery tries both the unavailable directory and the working signed directory")
+        passed("free-path-has-no-financial-side-effects", **delivery_free_state(nodes, spy))
         require(initial_members == {node.name: sorted(member["device_id"] for member in node.client.call("directory")["view"]["members"])
-                                   for node in (source, receiver)}, "directory failover does not add or merge personal network members")
-        passed("free-directory-failover-preserves-membership-and-no-finance", unavailable_reads=fault_directory.reads,
-               unavailable_writes=fault_directory.writes, available_reads=relay.reads, available_writes=relay.writes,
+                                   for node in (source, receiver)}, "the shared mesh does not add or merge personal network members")
+        passed("unreachable-bootstrap-node-preserves-membership-and-no-finance", unreachable=gone.device_id,
                member_counts={name: len(members) for name, members in initial_members.items()}, **delivery_free_state(nodes, spy))
         report["status"] = "passed"
     except BaseException as error:
@@ -6582,8 +6586,6 @@ def delivery_charity_acceptance(options):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        relay.close()
-        fault_directory.close()
         spy.close()
         private_json(run / "summary.json", report)
         print("Delivery report: " + str(run / "summary.json"), flush=True)
@@ -7345,7 +7347,7 @@ def delivery_paid_run(options, configuration, deployment):
     principals.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    relay, nodes, passwords = PkarrRelay(), [], {}
+    nodes, passwords, mesh = [], {}, mesh_network()
     chain_recorder = DeliveryRpcForwarder(chain["rpc_url"]) if options.delivery_ui_control is not None else None
     node_chain = {**chain, "rpc_url": chain_recorder.url} if chain_recorder else chain
     inherited_proof = {}
@@ -8266,7 +8268,8 @@ def delivery_paid_run(options, configuration, deployment):
             if name == "S" and chain_recorder:
                 node.configure(timeout_secs=600, manager=fixture_manager_settings(principals, workspace),
                     bins={"codex": str(fixture_wrapper(principals, "fixture-codex", "--fixture-codex"))}, app_server=SPAWN_APP_SERVER)
-            node.configure_network(pkarr={"publish": True, "resolve": True, "urls": [relay.url], "publish_direct": True})
+            # S is the mesh's bootstrap node; R and P join through it.
+            node.configure_mesh(mesh, [nodes[0].mesh_address] if nodes[0] is not node else [])
             node.start()
             if name != "P":
                 node.bootstrap()
@@ -8789,7 +8792,6 @@ def delivery_paid_run(options, configuration, deployment):
             node.client.close()
             node.stop()
         stop_fixture_processes(principals)
-        relay.close()
         if chain_recorder:
             chain_recorder.close()
         private_json(run / "summary.json", report)
@@ -8812,16 +8814,17 @@ def e2e_fixture(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
     nodes = {}
-    relay = PkarrRelay() if options.fixture_kind == "delivery" else None
-    rpc = DeliveryRpcSpy() if relay else None
+    delivery_kind = options.fixture_kind == "delivery"
+    rpc = DeliveryRpcSpy() if delivery_kind else None
+    mesh = mesh_network()
     native_ready = False
     native_invitation = None
     native_provider = None
     native_queue = None
     workspace_gates = {name: run / ("workspace-release-" + name) for name in ("taskA", "taskB", "main", "channel")} \
         if options.fixture_kind == "workspace" else None
-    bootstrap_invitation = None
-    bootstrap_kind = options.fixture_kind == "bootstrap"
+    mesh_invitation = None
+    mesh_kind = options.fixture_kind == "mesh"
     cursor_bin = run / "cursor-cli"
     cursor_bin.mkdir(mode=0o700)
     cursor_program = cursor_bin / "agent"
@@ -8862,17 +8865,17 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        if bootstrap_kind:
-            # The page's own Node is a public node; the member configures nothing but its discovery.
-            relay_port = available_port()
-            relay_url = f"http://127.0.0.1:{relay_port}"
-            public = Node(run, "public", binary, workspace, helper, port=options.fixture_port, init_args=[
-                "--serve-discovery", "--forward-any",
-                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
+        if mesh_kind:
+            # The page's own Node is the bootstrap node of a fresh mesh, volunteers a relay and forwards
+            # browsers to any device; the member configures nothing but it as its bootstrap node.
+            public = Node(run, "public", binary, workspace, helper, port=options.fixture_port,
+                          init_args=["--mesh-network", mesh, "--forward-any", *public_node_args()])
             nodes["public"] = public
+            public.configure_mesh(mesh)
             member = Node(run, "member", binary, workspace, helper, init_args=[
-                "--root", str(workspace), "--bootstrap", f"vibeface://{public.device_id}@127.0.0.1:{public.quic_port}"])
+                "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", public.mesh_address])
             nodes["member"] = member
+            node_cli(member, "config", "set", "mesh.allow_private", "true")
             configure_cursor(public)
             configure_cursor(member)
             public.start()
@@ -8880,23 +8883,23 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             member.bootstrap()
             probe = Client(public.url, helper, identity_file=run / "probe-identity.json")
             try:
-                wait_for("the member registers with the page Node's discovery",
+                wait_for("the page Node finds the member through the mesh",
                          lambda: probe.connect(member.device_id, check=False).get("ok"), timeout=60)
             finally:
                 probe.close()
-            member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
-                              name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
-            bootstrap_invitation = member.client.invite().removeprefix("vibeface://join/")
-        for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
+            member.client.rpc("create_bot", bot_id="mesh-fixture-bot", conversation_id="mesh-fixture-chat",
+                              name="Mesh fixture assistant", instructions="Controlled fixture; no provider enabled")
+            mesh_invitation = member.client.invite().removeprefix("vibeface://join/")
+        for role in ([] if mesh_kind else ["source", "receiver", "provider"] if delivery_kind else ["source"]):
             args = public_node_args() if role == "provider" else []
             # The e2e runner's port is the browser's origin: the source Node's local listener, where its owner link opens.
             node = Node(run, role, binary, workspace, helper, init_args=args,
                         local_port=options.fixture_port if role == "source" else None)
             nodes[role] = node
             isolate_delivery_node(node)
-            if relay:
-                node.configure_network(pkarr={"publish": True, "resolve": True,
-                                                 "urls": [relay.url], "publish_direct": True})
+            if delivery_kind:
+                # The source is the mesh's bootstrap node; the others join through it.
+                node.configure_mesh(mesh, [] if role == "source" else [nodes["source"].mesh_address])
             if rpc:
                 private_json(node.directory / "delivery-settings.json",
                              free_delivery_settings(rpc, options.fixture_profile, enabled=role == "provider"))
@@ -8941,8 +8944,8 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                 elif op == "inspect":
                     result = {"wallet_files": sum((node.directory / "delivery-wallet.json").exists()
                                                   for node in nodes.values()),
-                              "pkarr_reads": relay.reads if relay else 0,
-                              "pkarr_writes": relay.writes if relay else 0,
+                              "mesh_records": min((sum(entry["online"] for entry in mesh_records(node))
+                                                   for node in nodes.values()), default=0) if delivery_kind else 0,
                               "chain_rpc_calls": rpc.calls if rpc else 0}
                 elif op == "workspace_release":
                     require(set(request) == {"op", "gate"} and workspace_gates and request["gate"] in workspace_gates,
@@ -8989,35 +8992,39 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                         output.write(invitation)
                     native_ready = True
                     result = details()
-                elif op == "bootstrap_info":
-                    require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
+                elif op == "mesh_info":
+                    require(mesh_kind, "mesh info belongs to its controlled fixture")
                     network = json.loads((nodes["member"].directory / "config.json").read_text())["network"]
-                    result = {**details(), "invitation": bootstrap_invitation, "bootstrap": network["bootstrap"],
-                              "relays": network["relays"], "discovery": network["discovery"]}
-                elif op == "bootstrap_pairing":
-                    require(bootstrap_kind, "bootstrap pairing belongs to its controlled fixture")
+                    relays = wait_for("the member learns the page Node's volunteer relay", lambda: [
+                        role["url"] for entry in mesh_records(nodes["member"], "relay")
+                        if entry["online"] and entry["record"]["device_id"] == nodes["public"].device_id
+                        for role in entry["record"]["roles"] if role["kind"] == "relay"], timeout=75)
+                    result = {**details(), "invitation": mesh_invitation, "mesh": network["mesh"],
+                              "relays": network["relays"], "announced_relays": relays}
+                elif op == "mesh_pairing":
+                    require(mesh_kind, "mesh pairing belongs to its controlled fixture")
                     owner = nodes["member"].client
-                    def revealed_bootstrap():
+                    def revealed_mesh():
                         pending = next((item for item in owner.call("join_status")["requests"]
-                                        if item["name"] == "Bootstrap browser" and item["kind"] == "client"
+                                        if item["name"] == "Mesh browser" and item["kind"] == "client"
                                         and item["status"] in ("pending", "confirming")), None)
                         if pending and pending["status"] == "pending":
                             owner.start_approval(pending["join_id"])
                             return None
                         return pending if pending and pending.get("joiner_nonce") else None
-                    pending = wait_for("browser reveals its real bootstrap pairing nonce", revealed_bootstrap, timeout=20)
+                    pending = wait_for("browser reveals its real pairing nonce", revealed_mesh, timeout=20)
                     result = {"peer": pending["device_id"], "code": owner.command("short_code", request=pending)}
-                elif op == "bootstrap_approve":
-                    require(bootstrap_kind, "bootstrap approval belongs to its controlled fixture")
+                elif op == "mesh_approve":
+                    require(mesh_kind, "mesh approval belongs to its controlled fixture")
                     owner = nodes["member"].client
                     pending = owner.pending_join(request["peer"])
-                    require(pending and pending["name"] == "Bootstrap browser" and pending.get("joiner_nonce")
+                    require(pending and pending["name"] == "Mesh browser" and pending.get("joiner_nonce")
                             and request["code"] == owner.command("short_code", request=pending),
                             "browser and manager display the same actual safety code")
                     owner.grant(pending)
                     result = {"approved": True}
                 elif op == "native_setup":
-                    require(relay is not None and not native_ready, "native setup initializes only its own fresh delivery fixture")
+                    require(delivery_kind and not native_ready, "native setup initializes only its own fresh delivery fixture")
                     for role in ("source", "receiver"):
                         node = nodes[role]
                         node.bootstrap()
@@ -9171,7 +9178,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
     finally:
         cleanup_failed = False
         actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
-        actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
+        actions += ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
         for action in actions:
             try:
                 action()
@@ -9201,13 +9208,13 @@ if __name__ == "__main__":
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
-        modes.add_argument("--discovery", action="store_true", help="check discovery connection assistance, automatic normal-relay fallback, and headless Nodes")
-        modes.add_argument("--public-node", action="store_true", help="check a public node that serves discovery, an open relay and queued browser forwarding to a member Node, and a private relay's token")
+        modes.add_argument("--mesh", action="store_true", help="check joining the mesh through a bootstrap node, rejoining from the old table, volunteer relay adoption, and headless Nodes")
+        modes.add_argument("--public-node", action="store_true", help="check a public node that is a mesh bootstrap node, an open relay and queued browser forwarding to a member Node, and a private relay's token")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
-        modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
+        modes.add_argument("--delivery-charity", action="store_true", help="check the free mesh, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
         parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
@@ -9216,7 +9223,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "bootstrap", "cursor"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "mesh", "cursor"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
@@ -9257,8 +9264,8 @@ if __name__ == "__main__":
                 delivery_paid_acceptance(arguments)
             elif arguments.delivery_charity:
                 delivery_charity_acceptance(arguments)
-            elif arguments.discovery:
-                discovery_acceptance(arguments)
+            elif arguments.mesh:
+                mesh_acceptance(arguments)
             elif arguments.phase5:
                 phase5_acceptance(arguments)
             elif arguments.public_node:

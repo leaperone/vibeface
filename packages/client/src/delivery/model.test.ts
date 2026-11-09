@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, receiverChoices, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, providerChoices, receiverChoices, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -248,4 +248,23 @@ test('a file goes to my other computers without pasting, never to this one or a 
     { device_id: provider, kind: 'client' as const, name: 'Mac 上的 Chrome', manage: true },
   ]
   assert.deepEqual(receiverChoices(members, source).map(item => item.device_id), [receiver])
+})
+
+test('the provider field offers announced devices: paid delivery those that quote a price, free delivery all', async () => {
+  const offer = { settlement: { chain_id: 31337, escrow: `0x${'66'.repeat(20)}`, asset: `0x${'55'.repeat(20)}` }, price: '9007199254740993' }
+  const asked: unknown[] = []
+  const client = createDeliveryClient(connection(async (method, params) => {
+    asked.push([method, params])
+    return { providers: [
+      { device_id: provider, paid: true, offer, last_seen_ms: 5 },
+      { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 },
+      { device_id: 'not-a-device', paid: false, offer: null, last_seen_ms: 1 },
+      { device_id: source, paid: true, offer: { ...offer, price: '1.5' }, last_seen_ms: 2 },
+    ] }
+  }), { getItem: () => null, setItem: () => {} })
+  const providers = await client.providers()
+  assert.deepEqual(asked, [['delivery', { op: 'providers' }]])
+  assert.deepEqual(providers, [{ device_id: provider, paid: true, offer, last_seen_ms: 5 }, { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 }], 'a malformed record drops only itself')
+  assert.deepEqual(providerChoices(providers, 'paid').map(item => item.device_id), [provider])
+  assert.deepEqual(providerChoices(providers, 'charity').map(item => item.device_id), [provider, receiver])
 })

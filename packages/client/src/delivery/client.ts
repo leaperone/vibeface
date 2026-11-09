@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReadyConnection } from '../lib/node.ts'
 import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
-import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, parseOrder, parseOrders, parsePending, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
-import type { DeliveryDraft, DeliveryOrder, DeliverySettings, DeliveryStatus, PendingIntent, TransferFile } from './types.ts'
+import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
+import type { DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, TransferFile } from './types.ts'
 
 function authorization(order: DeliveryOrder) {
   const p = order.payment
@@ -59,6 +59,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       return status
     },
     list: async () => parseOrders(await request('list')),
+    providers: async () => parseProviders(await request('providers')),
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
@@ -121,6 +122,7 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const client = useMemo(() => createDeliveryClient(connection, platform.storage), [connection, platform.storage])
   const [status, setStatus] = useState<DeliveryStatus | null>(null)
   const [orders, setOrders] = useState<DeliveryOrder[]>([])
+  const [providers, setProviders] = useState<DeliveryProvider[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -154,10 +156,13 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   }
   useEffect(() => {
     alive.current = true; running.current = null
-    setStatus(null); setOrders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
+    setStatus(null); setOrders([]); setProviders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
     void refresh()
+    // Only a hint for the provider field, read once per connection; without it the ID is still typed in.
+    let live = true
+    void client.providers().then(list => { if (live && current()) setProviders(list) }, () => {})
     const foreground = platform.onForeground(() => { void refresh() })
-    return () => { alive.current = false; sequence.current += 1; foreground() }
+    return () => { live = false; alive.current = false; sequence.current += 1; foreground() }
   }, [client])
   const polling = shouldPollDelivery(status?.enabled === true, orders)
   useEffect(() => {
@@ -174,7 +179,7 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   }
   const selected = orders.find(order => order.order_id === selectedId) ?? null
   return {
-    status, orders, selected, busy, error: error || readError, notice,
+    status, orders, providers, selected, busy, error: error || readError, notice,
     canManage: connection.principal.source === 'membership' && connection.principal.can_manage,
     select: setSelectedId,
     refresh: () => run('refresh', refresh),

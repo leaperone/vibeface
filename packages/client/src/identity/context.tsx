@@ -15,8 +15,8 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { candidates, defaultGateway, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
-import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
+import { candidates, defaultGateway, gatewaysOf, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
+import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
 
@@ -177,13 +177,14 @@ function deviceStore(storage: KeyValue, self: string) {
   }
   function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
   const loadEntrances = (networkId: string): Entrance[] => storedEntrances(load(`entrances.${networkId}`))
+  const loadGateways = (networkId: string): Gateway[] => gatewaysOf(load(`gateways.${networkId}`))
   function loadWait(): WaitRecord | null {
     try {
       const v = record(load('recovery-wait'))
       return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId), genesis: record(v.genesis), rootKey: validTarget(v.rootKey), checkpoint: v.checkpoint === undefined ? undefined : record(v.checkpoint) }
     } catch { return null }
   }
-  return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadWait }
+  return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadGateways, loadWait }
 }
 function publicIdentity({ deviceId }: { deviceId: string }): PublicIdentity { return { deviceId } }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
@@ -202,7 +203,7 @@ function absorb(seen: Vector, vector: unknown) {
 /** `restart` mounts a fresh provider after a factory reset, so the app starts over as on first launch. */
 export function DeviceProvider({ platform, children, restart }: { platform: Platform; children: ReactNode; restart?(): void }) {
   const { self, page } = platform
-  const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadWait } = deviceStore(platform.storage, self)
+  const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadGateways, loadWait } = deviceStore(platform.storage, self)
   const { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } = secureKit(platform.secure)
   const { connectDevice, initClient, parseJoinLink, replaceClient, signClient } = platform.transport
   const discoverLocalSetup = async (signal: AbortSignal) => page ? page.discoverLocalSetup(signal) : null
@@ -388,12 +389,16 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (principal.source === 'membership') void refreshEntrances(active, view)
     return view
   }
-  /** Signed entrance records, checked against the verified directory, merged into this origin's list. */
+  /**
+   * Signed entrance records, checked against the verified directory, merged into this origin's list; the public
+   * gateways the Node verified replace the saved ones.
+   */
   async function refreshEntrances(active: Session, view: MembershipView) {
     try {
-      const fresh = verifiedEntrances(record(await callSession(active, 'entrances')).entrances, view, verifyAddress)
+      const result = record(await callSession(active, 'entrances'))
+      const fresh = verifiedEntrances(result.entrances, view, verifyAddress)
       const merged = markReached(mergeEntrances(loadEntrances(view.network_id), fresh, view), active.entry)
-      store(`entrances.${view.network_id}`, merged); setEntrances(openEntrances(merged))
+      store(`entrances.${view.network_id}`, merged); store(`gateways.${view.network_id}`, gatewaysOf(result.gateways)); setEntrances(openEntrances(merged))
     } catch { /* the saved list stays usable; the next connection refreshes it */ }
   }
   /** While the entry catches up with what this page already showed, ask again until it has. */
@@ -477,7 +482,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const entrances = loadEntrances(target.networkId)
     const list = target.entry.kind === 'local'
       ? [target.entry]
-      : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]))
+      : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]), loadGateways(target.networkId))
     // The access address is the way left when the Node's own are gone; added as a last resort, it does not shorten a
     // lone way's longer wait.
     const access: ConnectionEntry = { kind: 'gateway', address: currentGateway(), device_id: target.entry.device_id }
@@ -693,10 +698,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const record_ = { network_id: connection.principal.network_id, invite_hash: inviteHash, issuer: own().deviceId, expires_at_ms: expiresAt, signature: '' }
     record_.signature = await signClient('identity-invite', inviteSigningPayload(JSON.stringify(record_)))
     const result = record(await request('invite', { record: record_ }))
-    const entryId = validTarget(result.entry_id)
-    if (entryId !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
-    const ticket = ticketEncode(entryId, hex(secret))
+    // The ticket carries the entry's node link, so a new device reaches it at its addresses and relay.
+    const ticket = ticketEncode(String(result.entry), hex(secret))
     secret.fill(0)
+    if (validTarget(JSON.parse(platform.secure.ticketDecode(ticket)).entry_id) !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
     return { link: joinLink(ticket), expiresAt }
   }
   async function startApproval(joinId: string) {

@@ -3,8 +3,8 @@ import test from 'node:test'
 import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { entryAddress } from '@vibeface/client/lib/node.ts'
+import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, gatewaysOf, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { entryAddress, parseRelaySettings, parseShareLink } from '@vibeface/client/lib/node.ts'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { passphrase, passwordStrength } from '@vibeface/client/lib/secure.ts'
 import { failureKinds, failureText, humanError, outcomeUnknown, rawError, spentInvite, spentInviteText, workFailure } from '@vibeface/client/lib/errors.ts'
@@ -141,6 +141,40 @@ test('the app dials only the Nodes it sees on its LAN, and an unseen one only wh
   const lanOnly = list.filter(item => item.device_id === b)
   assert.deepEqual(candidates(lanOnly, lan, new Map()), [{ kind: 'lan', addrs: ['192.168.1.8:7002', '192.168.1.5:7002'], device_id: b }], 'with no web address left, where it was last reached or signed')
   assert.deepEqual(ways(lanOnly, lan, new Map([[b, ['192.168.1.5:7002']]])), ['lan 192.168.1.5:7002', 'lan 192.168.1.8:7002'])
+})
+
+test('public gateways reach the current Node after every web entrance and before the last LAN resort', () => {
+  const a = 'a'.repeat(64), b = 'b'.repeat(64), g = 'f'.repeat(64)
+  const gateways = gatewaysOf([{ device_id: g, url: 'https://gw.example.com/' }, { device_id: g, url: 'http://plain.example.com' }, { device_id: g, url: 'https://gw.example.com/path' },
+    { device_id: 'f', url: 'https://short.example.com' }, { device_id: b, url: 'https://node.example.com' }, 'junk'])
+  assert.deepEqual(gateways, [{ device_id: g, url: 'https://gw.example.com' }, { device_id: b, url: 'https://node.example.com' }])
+  assert.deepEqual(gatewaysOf(JSON.parse(JSON.stringify(gateways))), gateways, 'stored as returned')
+  assert.deepEqual(gatewaysOf({ gateways }), [], 'a stored value of another shape is dropped')
+  const list = [{ device_id: b, seq: 1, gateway_url: 'https://b.example.com', public: true, direct: [], last_ok_ms: 0 }, { device_id: a, seq: 1, gateway_url: null, public: false, direct: ['192.168.1.4:7001'], last_ok_ms: 0 }]
+  const ways = (...args: Parameters<typeof candidates>) => candidates(...args).map(entry => `${entry.kind} ${entryAddress(entry)} ${entry.device_id[0]}`)
+  const web = { kind: 'gateway' as const, address: 'https://node.example.com', device_id: a }
+  assert.deepEqual(ways(list, web, undefined, gateways), ['gateway https://node.example.com a', 'gateway https://b.example.com b', 'gateway https://gw.example.com a'], 'the address that dropped is not tried twice')
+  const lan = { kind: 'lan' as const, addrs: ['192.168.1.8:7001'], device_id: a }
+  assert.deepEqual(ways(list.slice(1), lan, new Map(), gateways), ['gateway https://gw.example.com a', 'gateway https://node.example.com a', 'lan 192.168.1.8:7001 a'])
+})
+
+test('relay settings read as the Node reports them and refuse an unknown state', () => {
+  const on = { volunteer: true, url: 'http://203.0.113.7:3340', listen: '0.0.0.0:3340', rate: 16384, max_clients: 128, max_clients_per_ip: 8, status: 'checking', error: null }
+  assert.deepEqual(parseRelaySettings(on), on)
+  const off = { volunteer: false, url: null, listen: null, rate: 0, max_clients: 0, max_clients_per_ip: 0, status: 'off', error: 'relay port 3340 is in use' }
+  assert.deepEqual(parseRelaySettings(off), off)
+  assert.throws(() => parseRelaySettings({ ...on, status: 'pending' }))
+  assert.throws(() => parseRelaySettings({ ...on, rate: -1 }))
+})
+
+test('a share link reads only as a node link', () => {
+  const link = `vibeface://node/${'ab'.repeat(32)}?addr=203.0.113.5:4790&relay=https://relay.example`
+  assert.equal(parseShareLink({ link }), link)
+  assert.equal(parseShareLink({ link: `vibeface://node/${'ab'.repeat(32)}` }), `vibeface://node/${'ab'.repeat(32)}`)
+  for (const bad of [`vibeface://join/vibeface1abc`, `vibeface://${'ab'.repeat(32)}@203.0.113.5:4790`, `vibeface://node/${'AB'.repeat(32)}`, `vibeface://node/${'ab'.repeat(32)}?addr=a b`, '']) {
+    assert.throws(() => parseShareLink({ link: bad }), bad)
+  }
+  assert.throws(() => parseShareLink(null))
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {

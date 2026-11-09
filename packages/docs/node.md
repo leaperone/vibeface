@@ -161,9 +161,9 @@ Node 把每个事件作为 JSON 正文 POST 到该地址，附带 `X-Vibeface-Ev
 
 每个 Node 和每个浏览器有独立密钥，设备编号就是设备公钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
 
-在管理设备打开**添加设备**，页面随即生成一条 `vibeface://join/vibeface1…` 加入链接和同一链接的二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。链接只由桌面端和手机 App 打开，二维码下方提示“用手机 App 扫码”；只有浏览器的设备在 `https://app.vibeface.dev`、自建公共节点或成员 Gateway 的网页上粘贴链接或单独的 `vibeface1…` 票据加入。票据只含发出邀请的 Node 的设备编号和一次性 secret，不含地址，浏览器经本页的 Gateway 按设备编号转发过去。链接含一次性 secret，只交给自己的设备。新浏览器填入链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
+在管理设备打开**添加设备**，页面随即生成一条 `vibeface://join/vibeface1…` 加入链接和同一链接的二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。链接只由桌面端和手机 App 打开，二维码下方提示“用手机 App 扫码”；只有浏览器的设备在 `https://app.vibeface.dev`、自建公共节点或成员 Gateway 的网页上粘贴链接或单独的 `vibeface1…` 票据加入。票据含发出邀请的 Node 的节点链接（设备编号、最多 4 个直连地址和 home relay）和一次性 secret；浏览器不用其中的地址，经本页的 Gateway 按设备编号转发过去。链接含一次性 secret，只交给自己的设备。新浏览器填入链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
 
-票据里没有局域网地址，App 扫码后经官方公共节点按设备编号转发到发出邀请的 Node；局域网直连见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [从外网访问](#从外网访问)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
+App 扫码后经官方公共节点按设备编号转发到发出邀请的 Node；局域网直连见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [从外网访问](#从外网访问)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
 
 添加另一个节点时，不要在新机器的本机网页上建网。先在电脑或服务器上安装 Vibeface，见[安装](install.md)。管理设备的**添加设备**选**节点**，有两种方式：
 
@@ -174,9 +174,9 @@ Node 把每个事件作为 JSON 正文 POST 到该地址，附带 `X-Vibeface-Ev
 vibeface join 'vibeface://join/vibeface1…' --name '<设备显示名称>'
 ```
 
-链接也可以是单独的 `vibeface1…` 票据。CLI 解码邀请票据，按其中的设备编号通过 iroh 连接目标：向配置的发现服务查询它的 relay 和 IP，再用配置的 relay 和查到的 relay。没有配置任何 relay 或发现服务时，`vibeface join` 直接报错。
+链接也可以是单独的 `vibeface1…` 票据。CLI 先拨票据里的直连地址和 home relay，同时在[全网](#全网)表里查目标，表里没有时问邻居，再加上配置的 relay。所以新机器关闭全网、换了网络名，或 bootstrap 节点连不上时，也能连到发出邀请的 Node。票据没有地址、全网里找不到目标、也没有配置 relay 时，`vibeface join` 直接报错。
 
-Node 复用新 Node 已配置的 `network.relays`，以及显式启用的 `n0_relays`，并加入发现服务查到的入口 Node relay。邀请令牌让入口 Node 自己的私有 relay 认得新 Node：配置了发现服务时，只有发现服务查到的、没配令牌的 relay 带邀请令牌，已配置但没查到的 relay 不带；没配置发现服务时，没配令牌的 `network.relays` 都带邀请令牌。配了令牌的 relay 始终用自己的令牌，`n0_relays` 从不带邀请令牌，开放 relay 不看令牌。使用同一 relay 要求两端都能到达它并具备对应授权。发现服务只提供地址提示，不授予私有 relay 使用权。
+Node 复用新 Node 已配置的 `network.relays`，并加入票据里和全网表里入口 Node 的 home relay。邀请令牌让入口 Node 自己的私有 relay 认得新 Node：票据里的 relay 没配令牌时带邀请令牌；在全网表里找到入口时，它没配令牌的 home relay 带邀请令牌，这台 relay 是全网里的开放 relay 时不带，其他已配置的 relay 不带；找不到入口时，没配令牌的 `network.relays` 都带邀请令牌。配了令牌的 relay 始终用自己的令牌，开放 relay 不看令牌。使用同一 relay 要求两端都能到达它并具备对应授权。全网表只提供地址提示，不授予私有 relay 使用权。
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入。Node 原本没在运行时，再启动它（后台服务用 `vibeface service start`）。`--name` 必须明确指定设备名，不读取系统主机名。设备名和已有设备或进行中的请求重名时，Node 自动加序号，例如“我的电脑 2”，重试同一请求沿用该名称。连接中断或按了 Ctrl-C 时，用同一链接、名称和目录重跑，命令先核对原请求，不重新创建；Node 正在运行时，按 Ctrl-C 不会取消加入，批准后照样完成。链接已用过、过期或被拒绝时，命令说明原因，请在管理设备上重新生成链接。
 
@@ -208,7 +208,7 @@ Node 复用新 Node 已配置的 `network.relays`，以及显式启用的 `n0_re
 手机 App 和 Node 在同一局域网时，不经网页入口，直接用 iroh QUIC 连这台 Node，再在这条连接上做和网页入口相同的 Noise 握手，由设备密钥证明对方就是要连的 Node。App 每次启动换一个临时的 QUIC 密钥，不用 relay。网页没有这条路径。
 
 - App 在前台时收听 Node 的 mDNS 广播；iOS 每分钟重新解析一次地址，Android 14 及以上跟随地址变化，更早的 Android 等 Node 整点换标签时更新（见 [Node 之间的连接](#node-之间的连接) 的“局域网发现”），用个人网络编号和已知 Node 的设备编号比对标签，认出本人的 Node 和它当前的地址；退到后台就停止。
-- 重连顺序：当前 Node 的局域网直连、当前网页入口、局域网里看到的其他本人 Node、其他网页入口，最后是官方公共节点。局域网直连每次最多等 2 秒，只剩一种可试时等 10 秒。拨号会在 TLS 里明文带上对方的设备编号，所以 App 不盲拨没看到的地址；只有没有任何网页入口可试时，才按上次连上或 Node 签名记录里的地址试一次。
+- 重连顺序：当前 Node 的局域网直连、当前网页入口、局域网里看到的其他本人 Node、其他网页入口，最后是“接入地址”（默认官方公共节点，可在设置里改）。局域网直连每次最多等 2 秒，只剩一种可试时等 10 秒。拨号会在 TLS 里明文带上对方的设备编号，所以 App 不盲拨没看到的地址；只有没有任何网页入口可试时，才按上次连上或 Node 签名记录里的地址试一次。
 - 已经经网页入口在线时，一发现当前连着的这台 Node 出现在局域网，就先试连一次；退出网络或恢复出厂时，试连随即取消。成功后最多等 30 秒让进行中的请求返回，再切到直连；仍有请求未返回、正在做需要确认的操作或试连失败时，保持当前连接。
 - 扫码加入时，票据只有 Node 的设备编号，App 经官方公共节点按设备编号转发。
 - 直连时连接状态显示“局域网直连”。
@@ -221,25 +221,25 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 手机或另一台电脑要从外网打开网页，需要一个 HTTPS 页面，以及一台按设备编号把浏览器会话转发给你的 Node 的 Gateway。有三种做法：
 
-- **官方公共节点（默认）**：打开 `https://app.vibeface.dev`。新初始化的 Node 自动向官方公共节点登记，不需要令牌或任何服务器。见下文 [官方公共节点](#官方公共节点)。
-- **自建公共节点**：在有公网地址的机器上运行一个不加入个人网络的 Node，提供网页、发现服务、relay 和浏览器转发，不保存个人网络的事件或附件。个人设备不需要入站端口。
+- **官方公共节点（默认）**：打开 `https://app.vibeface.dev`。新初始化的 Node 默认加入[全网](#全网)，官方公共节点在全网表里按设备编号找到它，不需要令牌或任何服务器。见下文 [官方公共节点](#官方公共节点)。
+- **自建公共节点**：在有公网地址的机器上运行一个不加入个人网络的 Node，提供网页、relay 和浏览器转发，不保存个人网络的事件或附件。个人设备不需要入站端口。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
 ### 官方公共节点
 
-官方公共节点是一台不加入任何个人网络的普通 Node，域名 `node.vibeface.dev` 只是指向 `8.217.72.118` 的 DNS-only A 记录，没有代理，同时提供三项服务，各有上限：
+官方公共节点是一台不加入任何个人网络的普通 Node，域名 `node.vibeface.dev` 只是指向 `8.217.72.118` 的 DNS-only A 记录，没有代理。它是全网的默认 bootstrap 节点，同时在全网记录里宣告 `relay` 和 `gateway` 角色，各有上限：
 
-- **发现服务**：UDP `8.217.72.118:4792`。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
+- **Bootstrap 节点**：UDP `8.217.72.118:4792`。它的设备编号、地址和 relay 固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
 - **开放 relay**：`http://node.vibeface.dev:3340`，显式开放，不要求令牌；每个连接每秒最多上行 16 KiB，同时最多 128 个连接，同一来源地址（IPv6 按 /56 计）最多 8 个；整台 relay 的出口另限 500 kbit/s。
 - **浏览器接入**：`https://node.vibeface.dev:4792`，即 `config/public-bootstrap.json` 的 `gateway_url`。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。这个端口只接受 TLS，证书是 Let's Encrypt 签给这个域名的证书，由宿主续期后写进数据目录，Node 不重启就换用新证书。浏览器直连，限额按 TCP 对端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
-`vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台向官方发现服务登记自己的地址和 relay，本机网页、维护接口和局域网发现不等待它。登记应答附上公共节点的开放 relay，Node 把它加为候选 relay，所以直连不通的设备之间也能经它连通。浏览器在官方页面按设备编号连接，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
+`vibeface init` 和首次直接启动在空数据目录里把官方公共节点写成 `network.mesh.bootstrap`。Node 启动后在后台经它加入全网并宣告自己的记录，本机网页、维护接口和局域网发现不等待它。Node 从全网表里选经验证的开放 relay 作为候选，所以直连不通的设备之间也能经公共节点的 relay 连通。浏览器在官方页面按设备编号连接，公共节点在全网表里找到这台 Node，转发 Noise 密文；它能看到浏览器地址、目标设备编号和流量大小，看不到内容。
 
-`vibeface status` 的 `Bootstrap` 一行显示 `public`、`custom` 或 `off`。登记失败不影响本机使用和局域网内同步，只是外网设备暂时找不到它。
+`vibeface status` 的 `Mesh` 一行显示全网是否开启、记录数和邻居数，`vibeface mesh status` 显示详情。入网失败不影响本机使用和局域网内同步，只是外网设备暂时找不到它。
 
 公共节点看不到对话内容，个人网络仍按邀请和成员目录授权；一台公共节点服务多个人的 Node，各人的网络互不相通。转发名额用完时，新的浏览器会话排队，页面显示“排队中，第 n 位”；队列也满时，页面显示“访问地址正忙”；同一浏览器地址的连接已满时，新连接直接被拒，页面显示“连不上这个节点”。
 
-不想使用官方服务时，初始化加 `--bootstrap off`。自建发现服务后，用 `--bootstrap 'vibeface://<设备编号>@<主机>:<UDP 端口>'` 指向它；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…"}`）再启动。
+不想加入全网时，初始化加 `--no-mesh`；只想换入网起点时，用 `--bootstrap '<节点链接>'` 指向你认识的第一台 Node，见[全网](#全网)。
 
 ### 自建公共节点：Linux 服务器加 nginx
 
@@ -247,13 +247,13 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 1. 域名解析到服务器的公网地址，用 certbot 或其他方式为它签发证书。
 
-2. 在服务器上初始化公共节点并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放；发现服务用同号 UDP 4790，直接对公网开放：
+2. 在服务器上初始化公共节点并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放；iroh 用同号 UDP 4790，直接对公网开放，其他 Node 可以把它当 bootstrap 节点：
 
    ```sh
    export VIBEFACE_NODE_DATA_DIR='<公共节点数据目录的绝对路径>'
    vibeface init --data-dir "$VIBEFACE_NODE_DATA_DIR" \
        --public-url https://vb.example.com \
-       --serve-discovery --forward-any \
+       --forward-any \
        --relay-listen 127.0.0.1:3340 --relay-url https://vb.example.com \
        --relay-open --relay-rate 65536 --relay-max-clients 512 \
        --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
@@ -261,7 +261,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    vibeface serve --data-dir "$VIBEFACE_NODE_DATA_DIR"
    ```
 
-   `init` 打印设备编号，发现服务的地址就是 `vibeface://<设备编号>@vb.example.com:4790`。UDP 端口必须能从公网直接访问，不能用 HTTP 反向代理替代。`--relay-open` 让 relay 接纳任何设备，必须同时设上限：`--relay-rate` 是 relay 每秒从每个连接读取的字节数，`--relay-max-clients` 是个人网络以外的同时连接数。`--relay-max-clients-per-ip` 限制同一来源地址的连接数，只用于直接对外的 relay 端口；经 nginx 反代时 relay 看到的来源都是回环地址，不要设它。`--forward-sessions`、`--forward-queue` 和 `--forward-rate` 是同时转发的浏览器会话数、排队数和每个会话每秒的字节数；`--forward-per-ip` 是同一浏览器地址最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，地址取自 `--trusted-proxy` 所列反代发来的 `X-Real-IP`。只给自己和熟人用时去掉 `--relay-open`，见 [私有 relay](#私有-relay)。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
+   `init` 打印设备编号，它的节点链接就是 `vibeface://node/<设备编号>?addr=vb.example.com:4790&relay=https://vb.example.com`；服务运行后 `vibeface mesh share` 打印它当前的节点链接。UDP 端口必须能从公网直接访问，不能用 HTTP 反向代理替代。它默认加入全网，开放 relay 和网页入口在外网探测通过后宣告给所有 Node。`--relay-open` 让 relay 接纳任何设备，必须同时设上限：`--relay-rate` 是 relay 每秒从每个连接读取的字节数，`--relay-max-clients` 是个人网络以外的同时连接数。`--relay-max-clients-per-ip` 限制同一来源地址的连接数，只用于直接对外的 relay 端口；经 nginx 反代时 relay 看到的来源都是回环地址，不要设它。`--forward-sessions`、`--forward-queue` 和 `--forward-rate` 是同时转发的浏览器会话数、排队数和每个会话每秒的字节数；`--forward-per-ip` 是同一浏览器地址最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，地址取自 `--trusted-proxy` 所列反代发来的 `X-Real-IP`。只给自己和熟人用时去掉 `--relay-open`，见 [私有 relay](#私有-relay)。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
 
 3. nginx 把 relay 的三个路径转给 relay 端口，其余转给网页端口，两者都允许 WebSocket 升级：
 
@@ -307,20 +307,20 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数和 `/api/decision` 的预算，忽略 `Forwarded` 和 `X-Forwarded-For`。decision 预算是每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429；经反代而没设 `--trusted-proxy` 时，所有 decision 都记在回环这一个来源上。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
-4. 在个人电脑上初始化 Node 时指向它的发现服务，然后启动：
+4. 在个人电脑上初始化 Node 时经它入网，然后启动：
 
    ```sh
    vibeface init \
        --root /absolute/path/to/projects \
-       --bootstrap 'vibeface://<公共节点设备编号>@vb.example.com:4790'
+       --bootstrap 'vibeface://node/<公共节点设备编号>?addr=vb.example.com:4790&relay=https://vb.example.com'
    vibeface serve
    ```
 
-   Node 向这台公共节点登记，并把它的开放 relay 加为候选 relay，不需要令牌。
+   Node 经这台公共节点加入全网，从表里取到它宣告的开放 relay 作为候选，不需要令牌。
 
 5. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成 `vibeface://join/…` 链接和二维码。手机 App 扫码后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。只用手机浏览器时，打开 `https://vb.example.com`，点**扫码加入**扫描**添加设备**里的二维码，或粘贴链接。
 
-公共节点只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。`config.json` 的 `network.relay_blocked` 列出 relay 拒绝的设备编号，修改后重启生效。
+公共节点只转发浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件；它能看到浏览器地址、目标设备编号和流量大小。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。`config.json` 的 `network.relay_blocked` 列出 relay 拒绝的设备编号，修改后重启生效。
 
 ### 私有 relay
 
@@ -347,9 +347,60 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 后台服务要保持关闭网页时，在 `init` 时传入 `--no-web`，或把 `config.json` 的 `web_enabled` 设为 `false` 后重启。直接启动和 `serve` 的开关只影响本次运行。
 
+## 命令行管理
+
+网页能做的设置和管理都有对应命令，分两种身份：
+
+- **本机操作者**：在这台电脑上、经只有同一用户能访问的维护 socket 调用运行中的 Node，权限同本机网页，不需要网页或 cookie。能改本机设置、Provider、relay，能读数据；不能签成员授权。
+- **管理客户端**（`vibeface client`、`bots` 的写操作）：CLI 自己的设备密钥，像浏览器一样经邀请加入、双方核对短码、由管理设备签发授权，之后签它自己的写操作。Node 从不替任何人签成员授权，所以邀请、批准、撤销和恢复必须走管理客户端。
+
+| 命令 | 身份 | 用途 |
+|---|---|---|
+| `call <method> [json]` | 本机操作者 | 直接调用一个客户端方法；需要管理客户端签名的 `invite`、`approve`、`grant`、`revoke`、`veto`、`approve_recovery`、`recover`、`recovery_state`、`join`、`join_withdraw` 和不带 `join_id` 的 `join_status` 被拒绝，`subscribe`、`log`、`local_access`、`node_join` 不经维护 socket 提供 |
+| `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；`mesh.` 即 `network.mesh.`。按加载时的规则校验，不接受 token，Node 运行中时重启后生效 |
+| `node settings / configure / write-state / confirm-writable / diagnostics / rejoin` | 本机操作者 | 项目目录（`--root`、`--no-roots`）、本机 Bot（`--manager <JSON>`、`--no-manager`）、恢复后确认可写、诊断包、被移出后重新开始 |
+| `provider configure / probe / models / test-codex` | 本机操作者 | 改 Provider（`codex`、`claude`、`opencode`、`cursor`、`pi`）设置、检查就绪、列模型、测 App Server |
+| `bots list / memory` | 本机操作者 | 列 Bot、读一条记忆 |
+| `bots create / delete / set-primary / set-project / schedule / remember / forget` | 管理客户端 | 用客户端密钥签名的 Bot 写操作 |
+| `delivery status / list / get / providers` | 本机操作者 | 交付状态、订单和全网里提供交付的 Node |
+| `relay status / volunteer on / off` | 本机操作者 | 见[公共转发](#公共转发) |
+| `triage settings / configure / test-webhook / create-token / revoke-token` | 本机操作者 | 分诊、webhook 和决定 token；token 只显示一次 |
+| `mesh status / records / share / bootstrap add / remove` | 本机操作者 | 见[全网](#全网) |
+| `client create-network / enroll / status / invite / requests / approve / grant / revoke / recovery approve / veto / recover / call` | 管理客户端 | 建网、加入、成员管理、恢复，`call` 以客户端身份调用任意方法 |
+
+管理客户端的密钥默认在 `~/.vibeface-client/client.json`（`--client-dir` 或 `VIBEFACE_CLIENT_DIR`），用口令经 argon2id 和 XChaCha20-Poly1305 封存。口令在终端输入，自动化用 `--passphrase-fd`。客户端经 HTTP Gateway 的 `/api/client` 连接，默认用本机 Node 的 Gateway，`--url` 指定其他 Gateway，所以目标 Node 或中转的 Gateway 必须开着网页。
+
+不开浏览器初始化首台设备：
+
+```sh
+vibeface init --root /absolute/path/to/projects
+vibeface serve
+# 另一个终端
+vibeface client create-network --recovery-file /absolute/path/vibeface-recovery.json --node-name 工作站
+vibeface provider probe codex
+```
+
+`create-network` 用 `init` 留下的一次性本机授权，只能在 Node 所在电脑运行；恢复文件路径必须不存在，口令和恢复包口令都在终端输入。
+
+让另一台电脑上的 CLI 成为管理客户端：
+
+```sh
+vibeface client invite                             # 已有管理客户端，输出十分钟内有效的一次性链接
+vibeface client enroll '<邀请链接>' --name 笔记本    # 新电脑，显示短码并等待批准
+vibeface client requests                           # 已有管理客户端
+vibeface client approve <join_id> --code <短码>     # 加 --manage 授予管理权限，--reject 拒绝
+```
+
+开放本机 relay 给全网：
+
+```sh
+vibeface relay volunteer on --rate 32768 --max-clients 64
+vibeface relay status
+```
+
 ## Node 之间的连接
 
-Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。不使用 n0 的 DNS 和 pkarr 地址发布，成员 Node 的持久地址来自邀请和个人网络内部交换的签名地址记录。同一局域网内的 Node 还经 mDNS 互相找到当前地址，见下文“局域网发现”。显式配置发现服务后，还可查询临时直连地址。
+Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。不使用 n0 的 DNS 和 pkarr 地址发布。成员 Node 的地址来自个人网络内部交换的签名地址记录；默认开启的[全网](#全网)表另外提供任何 Node 的直连地址和 home relay。同一局域网内的 Node 还经 mDNS 互相找到当前地址，见下文“局域网发现”。
 
 每台 Node 定期为自己签一条地址记录，内容是 iroh 地址（relay URL 和直连 IP）、网页入口 `gateway_url`，以及它自己运行的 relay。成员只把对方自己运行的 relay 加为候选。同步时双方交换记录，地址变化后几秒内传到其他成员。浏览器从当前入口读取这些记录，自己验签后作为可切换的访问地址，见下文“多个访问地址”。
 
@@ -357,7 +408,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 
 把 `bind` 设为具体地址（例如 `127.0.0.1`）的 Node 不启用局域网发现，尚未加入或已被移出个人网络的 Node 不广播。mDNS 无法启动时只记一条警告，Node 照常用其他地址连接。防火墙需放行局域网内 UDP 5353 端口的组播（IPv4 `224.0.0.251`、IPv6 `ff02::fb`）和 iroh 的 UDP 端口。
 
-两台 Node 不能直连时经 relay 转发。relay 只转发 QUIC 密文；默认只接纳本 Node、当前成员 Node 和持有本 Node 所发邀请的加入者，设了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备，见 [私有 relay](#私有-relay)。默认不使用 n0 公共 relay。网络设置只在 `init` 或首次直接启动时写入 `config.json`，修改后重启生效：
+两台 Node 不能直连时经 relay 转发。relay 只转发 QUIC 密文；默认只接纳本 Node、当前成员 Node 和持有本 Node 所发邀请的加入者，设了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备，见 [私有 relay](#私有-relay)。不使用 n0 公共 relay。网络设置在 `init` 或首次直接启动时写入 `config.json`，之后用 `vibeface config set` 修改，重启生效；`vibeface mesh bootstrap` 和网页的**公共转发**不用重启：
 
 | 参数 | `config.json` 中的 `network` 字段 | 作用 |
 |---|---|---|
@@ -371,11 +422,11 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay-max-clients <N>` | `relay_max_clients` | relay 同时保持的个人网络以外的连接数，默认不限 |
 | `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限 |
 | 无 | `relay_blocked` | relay 拒绝的设备编号 |
-| `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
-| `--serve-discovery` | `serve_discovery` | 在本 Node 的 UDP 端口上回答其他设备的登记和查询 |
-| `--bootstrap <MODE\|URL>` | `bootstrap` | `public`（不提供发现服务的新 Node 默认值）、`off`，或自建发现服务的 `vibeface://` 地址 |
+| `--no-mesh` | `mesh.enabled` | 不加入全网；`init` 默认加入 |
+| `--mesh-network <NAME>` | `mesh.network` | 全网名称，默认 `vibeface`；换名时不带默认 bootstrap 节点 |
+| `--bootstrap <LINK>` | `mesh.bootstrap` | 你认识的第一台 Node 的节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，可重复，最多 16 个，替换默认的官方公共节点 |
+| 无 | `mesh.allow_private` | 采用私网和回环地址上的 relay 与网关，默认关闭 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
-| 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
 浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准；`/api/decision` 的预算（同时 16 个、每分钟 256 个来源、每来源 12 次）按同一地址认定。
 
@@ -390,7 +441,7 @@ vibeface init \
 vibeface join '<管理设备给出的加入链接>' --name '<设备显示名称>'
 ```
 
-个人设备上的 Node 用 `--relay https://relay.example` 初始化，无需入站端口。邀请票据不含地址，加入者经发现服务查到发出邀请的 Node 的 relay，没配发现服务时用自己配置的 relay。这台 relay 不开放时只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
+个人设备上的 Node 用 `--relay https://relay.example` 初始化，无需入站端口。邀请票据不含地址，加入者在全网表里查到发出邀请的 Node 的 home relay，查不到时用自己配置的 relay。这台 relay 不开放时只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
 
 公网 Node 也是普通成员，可同时运行调度或执行。relay 不读取会话内容，也不给其他设备增加任何权限。不想让公网机器保存个人网络数据时，改用 [自建公共节点](#从外网访问)。
 
@@ -419,18 +470,7 @@ S 是发送 Node，R 是接收 Node，P 是服务 Node。
    vibeface wallet --data-dir /path/to/node-data configure /path/to/delivery-charity.json
    ```
 
-3. 确保 S、R 和 P 能按 PeerID 建立连接。沿用已有地址和 relay，或在停掉 Node 后为 `config.json` 的 `network` 增加明确选择的 pkarr 发现目录，再重启。以下设置发布 relay 地址并解析 PeerID，默认不发布直连 IP。
-
-   ```json
-   "pkarr": {
-       "publish": true,
-       "resolve": true,
-       "urls": ["https://discovery.example/pkarr"],
-       "publish_direct": false
-   }
-   ```
-
-   发现目录只返回签名地址，不转发文件，也不收取协议服务费。启用发布会公开这台 Node 的 PeerID 和所发布的地址，请使用自己选择和维护的目录。
+3. 确保 S、R 和 P 能按 PeerID 建立连接。三台都加入[全网](#全网)（默认）即可：P 在全网记录里宣告 `service` 角色，S 和 R 按 PeerID 在全网表里找到对方和 P 的地址。关闭全网的 Node 只能沿用已有地址和 relay。
 
 4. 在 S 的传输页面选择文件，在**接收方的连接 ID**和**中转设备的连接 ID**分别填写 R、P 的 PeerID，点击**下一步**，核对后点击**确认发送**。S 所在个人网络还有其他电脑时，页面先显示**发给**：R 是其中一台就直接选它；否则展开**发给别人的设备**再填写。当前原文件上限为 130816 字节。
 5. 在 R 的传输页面选择该订单，点击**接收文件**，完成后点击**保存文件**。Web 把已核对文件交给浏览器保存，Mobile 写入并再次核对后提供分享副本。
@@ -453,44 +493,41 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 
 钱包备份和个人恢复文件都不包含订单接收私钥。停掉 Node 后备份完整数据目录，尤其是整个 `delivery/`。注册、轮换和撤销接收密钥的命令及原意图重试规则见[接收密钥和恢复材料](paid-delivery.md#接收密钥和恢复材料)。
 
-## 使用公共发现服务
+## 全网
 
-官方公共节点的发现服务帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连，见 [官方公共节点](#官方公共节点)。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。它的设备编号和 UDP 地址固定在仓库的 `config/public-bootstrap.json`（`issuer`、`udp_host`、`udp_port`）：
+每台 Node 默认加入同一张全网表：向全网宣告一条自己签名的记录，内容是设备编号、直连地址、home relay 和它提供的角色（`relay`、`gateway`、`service`），同时保存并转发所有 Node 的记录。iroh 拨号时先查本地表，表里没有时问邻居。记录里的 IP 对全网可见。全网不合并个人网络，也不授予成员权限；加入仍需邀请和批准。协议见[全网层](design/mesh.md)。
+
+`init` 和首次直接启动把官方公共节点写成默认 bootstrap 节点，地址由 `config/public-bootstrap.json` 的 `issuer`、`udp_host`、`udp_port` 和 `relay_url` 生成：
 
 ```text
-vibeface://<issuer>@8.217.72.118:4792
+vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3340
 ```
 
-新初始化的 Node 默认（`bootstrap` 为 `public`）就向它登记地址，不需要再传 `--discovery`。`--bootstrap off` 的 Node 不会连接它；之后要启用，停掉 Node，把 `config.json` 里 `network.bootstrap` 改为 `{"mode": "public"}` 再启动。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
+表保存在数据目录的 `mesh.sqlite3`。重启后先用旧表里的 Node 入网，bootstrap 节点不可达也能回到全网。任何在表里的 Node 都能当入网起点，官方公共节点只是默认值。
 
-服务使用 UDP 4792，通过地址中的设备编号核验身份。运营者能看到设备编号、UDP 地址和查询关系；地址登记只保存在内存中，不保存会话或附件。对称 NAT 或 UDP 被封锁时仍可能无法直连，业务流量经公共节点的开放 relay 转发。自建同类服务见下一节。
-
-## 运行公共发现服务
-
-任何 Node 加 `--serve-discovery` 就在自己的 UDP 端口（`listen` 的端口，或 `network.bind`）上回答其他设备的登记和查询，可与 relay 和网页共存，自建公共节点就是这样。只提供发现和连接协助、不承担业务流量时，不运行 relay，也不开网页：
+- `--no-mesh`：不加入全网，只用个人网络内的地址、局域网发现和配置的 relay。
+- `--bootstrap <LINK>`（可重复）：换成你认识的第一台 Node，取它的节点链接。任何 UDP 端口或 relay 能从这里访问的 Node 都可以。
+- `--mesh-network <NAME>`：加入另一张独立的表，不带默认 bootstrap 节点，一般同时给 `--bootstrap`。
 
 ```sh
-vibeface init --data-dir /srv/vibeface-discovery \
-    --serve-discovery --listen 127.0.0.1:4792 --no-web
-vibeface serve --data-dir /srv/vibeface-discovery
+vibeface mesh status
+vibeface mesh records --role relay
+vibeface mesh share
+vibeface mesh bootstrap add 'vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>'
+vibeface mesh bootstrap remove <设备编号>
 ```
 
-`init` 输出发现服务的设备编号。UDP 4792 在全部网卡上监听，必须能从公网直接访问，不能用 HTTP 反向代理替代。
+两种 `vibeface://` 链接用途不同：节点链接 `vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>&relay=<URL>` 说明一台 Node 是谁、在哪里，最多 4 个 `addr`、1 个 `relay`，公开无妨，用作 bootstrap；加入链接 `vibeface://join/vibeface1…` 加入个人网络，含一次性 secret，只交给自己的设备。`vibeface mesh share` 打印运行中的 Node 的节点链接，网页设备页「公共转发」旁的「节点链接」显示同一条并可复制。格式见[两种链接](design/mesh.md#两种链接)。
 
-用户在自己的 Node 上明确配置这个发现服务的编号和公网地址：
+`mesh bootstrap add|remove` 写入 `config.json` 的 `network.mesh.bootstrap`，Node 运行时立即改用新列表。开关全网或换网络名时，用 `vibeface config set mesh.enabled false` 或 `vibeface config set mesh.network <名称>` 后重启 Node，不要重新运行 `init`，也不需要重新创建个人网络。
 
-```sh
-vibeface init --data-dir /absolute/personal-node \
-    --bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792'
-```
+Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数、再按延迟取最好的 8 台加入候选，同一网段（IPv4 /24、IPv6 /48）只取 1 台，iroh 从中选 home relay。配置的 relay、本个人网络成员的 relay、bootstrap 节点的 relay 和自己的 relay 始终保留。私网和回环地址上的 relay 与网关默认不用，`network.mesh.allow_private` 打开后才用，供局域网和测试使用。
 
-要同时保留官方发现服务时，改传 `--discovery 'vibeface://…'`；已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay`，它不是 relay。
+全网不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，业务流量经 relay 转发，Node 自动选择。
 
-Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证连接上观察到的地址，并通知双方发起直连探测；运行开放 relay 的发现服务还在登记应答里附上这个 relay。服务端没有转发客户端数据报的实现。加入设备仍需有效邀请，读取、同步和执行仍按原有成员权限校验。
+### 公共转发
 
-发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址和 relay。运营者能看到设备编号、UDP 地址和查询关系。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个查询以外的固定请求，查询每秒最多 20 个，租约为 60 秒，请求帧和应答帧最多 2048 字节。连接通知队列和并发探测也有上限。
-
-发现服务不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，直连探测失败，业务流量要经 relay 转发。Node 自动选择直连或 relay。新 Node 默认只连接 `config/public-bootstrap.json` 里固定的官方发现服务，`--bootstrap off` 关闭自动公共引导，显式配置的 `--discovery` 或 `network.discovery` 来源仍会使用。
+运行 relay 的 Node 可以把它开放给全网：网页设备页的**公共转发**开关，或 `vibeface relay volunteer on|off`（`--url`、`--listen`、`--rate`、`--max-clients`、`--max-clients-per-ip` 改地址和限额，不给的保持不变），`vibeface relay status` 查看状态。打开后 relay 接纳任何设备，默认每个连接 16 KiB/s、最多 128 个连接、同一地址最多 8 个，地址和限额可在同一卡片修改。它先请邻居（最多 3 台）从外网探测 relay 地址，通过后才在记录里宣告 `relay` 角色。关闭后从记录里移除，并撤掉打开时设的开放和限额；只为公共转发运行的 relay 连同监听和 URL 一起停掉，`relay_operator_token` 和屏蔽列表保留，有屏蔽列表时 relay 继续为本个人网络运行。relay 只转发 QUIC 密文，运营者能看到连接的设备编号、地址和流量大小。
 
 ## 多个访问地址
 

@@ -8,13 +8,13 @@
 
 个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态在 checkpoint 链兼容时的合并是并集；同一 epoch 出现两个不同 checkpoint 时合并失败，本机状态不变。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。每个 `RootCheckpoint` 带下一把恢复密钥 `recovery_key`，由上一把签名，第一把是根密钥。恢复私钥只在加密恢复文件里，Node 不持有。
 
-`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员，或用一条新的 `grant` 改变已加入设备的 `name`（电脑、浏览器或手机）或客户端的 `manage`，`kind` 不变。客户端成员不需要管理权限也能撤销自己（`issuer` 与被撤销设备相同），不能撤销其他设备；Node 成员不能撤销自己。取消管理或撤销都不能让网络失去最后一台管理设备，权限变化后该设备的订阅会断开重连以取得新权限；Node 成员不能持有管理权限。Node 不分类型：加入个人网络的 Node 承担网页、同步、调度和执行，`network` 决定它是否另外运行 relay 或发现服务；不加入任何个人网络、只按配置提供发现服务、relay 和浏览器转发的 Node 称为公共节点。任何 Node 都可显式启用独立的文件交付服务，服务权限不改变成员关系。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员，或用一条新的 `grant` 改变已加入设备的 `name`（电脑、浏览器或手机）或客户端的 `manage`，`kind` 不变。客户端成员不需要管理权限也能撤销自己（`issuer` 与被撤销设备相同），不能撤销其他设备；Node 成员不能撤销自己。取消管理或撤销都不能让网络失去最后一台管理设备，权限变化后该设备的订阅会断开重连以取得新权限；Node 成员不能持有管理权限。Node 不分类型：加入个人网络的 Node 承担网页、同步、调度和执行，`network` 决定它是否另外运行 relay、是否加入全网；不加入任何个人网络、只按配置提供 relay 和浏览器转发的 Node 称为公共节点。任何 Node 都可显式启用独立的文件交付服务，服务权限不改变成员关系。
 
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。管理事件签发者有没有权限，按该事件因果祖先里的授权投影判定，不看最终目录。一台设备被撤销后，只有撤销事件因果祖先里它已签的管理事件计入；不在祖先里的事件，包括 `parents` 或签名时间写在撤销之前的授权，以及由这些授权派生的成员和管理权限，一律不计入，事件本身仍保留在历史里。客户端的管理权被取消时同理，只有之后因果上重新授予才恢复。互相撤销或派生成环而无法确定的权限按无权处理；同一设备被并发授予不同权限时取较窄的一份。根恢复由当前恢复密钥签名、epoch 加一的 checkpoint 建立新授权并换恢复密钥；`directory` 为空的 checkpoint 只换恢复密钥，目录沿用上一 epoch，立即生效；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。
 
 换目录的 checkpoint 带签名时间 `issued_at_ms` 和 `heads`（签名时恢复密钥所在 epoch 的管理事件 heads，rotation 为空），默认从这时起等 48 小时（`RECOVERY_DELAY_MS`）生效，之前视图仍是原目录，`pending` 给出它的哈希、`effective_at_ms` 和待生效成员。等待期内，原目录里的管理设备可以在原 epoch 签 `approve` 立即确认或签 `veto` 拦截。立即确认的事件是 `{"type":"approve","checkpoint":<checkpoint 哈希>,"at_ms":<签名时间>}`，只能由当前管理设备针对当前 `pending` 生成，并且 `at_ms` 必须早于自然生效时间；它的因果祖先须包含 checkpoint 的全部 `heads`。确认事件到达后，Node 在 `at_ms` 到达时按同一事件 DAG 投影新目录。时钟落后的 Node 将 `pending.effective_at_ms` 提前到最早合法确认时间，让已有恢复定时器在该时刻重新安装目录。管理设备也可以签 `veto`：`{"type":"veto","checkpoint":<checkpoint 哈希>,"at_ms":<签名时间>}`。否决优先于确认，算不算数只看它自己和它的因果祖先，之后到达的事件改变不了：因果祖先须包含该 checkpoint 的全部 `heads`，签发者在这些祖先里是管理设备且未被撤销（否则整份状态无效），`at_ms` 早于生效时刻；目标不符或祖先不全的否决不起作用。所以改写 `parents` 绕不过找回前的撤销，而先否决、后被撤销的设备，否决仍然有效。`heads` 含本机没有的事件的 checkpoint 不生效，`recover` 直接拒绝（`this recovery rests on device changes this Node has not received; sync it first`），同步合并时它保持等待，补齐事件后再按签名时间判定。同一把恢复密钥在找回生效前签出的 rotation（`issued_at_ms` 早于该找回的生效时刻）也会让它作废，换恢复密码不受等待中的找回阻塞。被否决或被 rotation 取代的 checkpoint 及建在它上面的 checkpoint 作废，哈希列入视图的 `stopped`，原目录继续有效。同一把恢复密钥只能出现一次；一把密钥再签时，此前签的每个找回要么有合法否决，要么被这次 rotation 取代，否则整份状态无效。最多 64 个未被否决的 checkpoint。生效不是终局：生效目录是签名记录和墙钟的纯函数，Node 不拒绝任何合法历史。窗口内签的否决或确认（或倒签到窗口内的 rotation）晚到时，所有 Node 按签名时间收敛；否决晚到时可将已按墙钟或确认翻转的 Node 回到旧目录。回滚前，它可能短暂按新目录放行。所以翻转时不往共享日志写不可撤回的记录：找回移出的 Node 上未完成的工作不记为待确认，它超出上限的写入只是在投影里不计入，回滚后重新计入；只有管理设备签名的 `revoke` 才把被移除设备的工作记为待确认（`unverified`）。作废邀请、`identity_meta.recovery_since`（首次见到某把密钥生效的时间，只用于展示）和地址簿清理都是本机可重做的。认为对方已被移除的 Node 仍接受对方推来的成员状态，所以被找回移出、又因否决回到目录的 Node 也能收敛。未被移除的被偷管理设备可以随时拦下找回或确认找回（含补签迟到否决），这个限制早已存在，补救是先移除它再找回；移除后它签出的管理事件，包括倒签到撤销之前的授权及由此派生的身份，都不计入（见上文）。曾考虑过的方案：生效即终局会让休眠错过窗口的 Node 拒绝否决、永久分叉；成员时钟会让丢失的 Node 永远拦住找回，且两台都过期的 Node 互相交换后仍会分叉；否决按 epoch 最终投影计数会让事后撤销否决人立即复活找回。视图的 `epoch` 是生效的 epoch。`attestation` 的签名设备须在任一 epoch 做过客户端。
 
-一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。地址默认只在个人网络内传播；`network.discovery` 是明确选择公开临时传输地址的配置，显式启用 `network.pkarr.publish` 才向指定 pkarr 目录发布地址。
+一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。签名地址记录只在个人网络内传播；`network.mesh.enabled`（`init` 默认开启）另向[全网](#全网)公开本 Node 的设备编号、直连地址、home relay 和角色。
 
 ## 本机配置
 
@@ -31,7 +31,7 @@
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
 | `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
-| `network` | iroh 传输、relay 和发现服务设置，见下表 |
+| `network` | iroh 传输、relay 和全网设置，见下表 |
 | `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是自建反代的地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`），浏览器直连的 Node（如官方公共节点）不设 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
@@ -46,7 +46,6 @@
 |---|---|---|
 | `bind` | 无 | iroh 的 UDP 地址；省略时在 `listen` 端口上绑定 IPv4 与 IPv6 通配地址，IPv6 失败不阻止启动 |
 | `relays` | `--relay URL`、`--relay-token URL=FILE` | 额外使用的 relay `[{url, token?}]`，最多 16 个；`token` 是该 relay 向个人网络以外的设备要求的令牌 |
-| `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
 | `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 TCP relay 的地址 |
 | `relay_url` | `--relay-url URL` | 其他设备访问本 relay 的 URL，默认 `http://<relay_listen>` |
 | `relay_operator_token` | `--relay-operator-token FILE` | 个人网络以外的设备出示后可用本 relay 的令牌，64 个十六进制字符 |
@@ -55,12 +54,9 @@
 | `relay_max_clients` | `--relay-max-clients N` | relay 同时保持的个人网络以外的连接数，本 Node 和成员 Node 不计，省略时不限 |
 | `relay_max_clients_per_ip` | `--relay-max-clients-per-ip N` | 同一 IPv4 地址或 IPv6 /56 同时保持的 TCP 连接数，含成员，省略时不限 |
 | `relay_blocked` | 无 | relay 拒绝的设备编号 |
-| `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
-| `serve_discovery` | `--serve-discovery` | 在本 Node 的 UDP 端口上回答其他设备的发现登记和查找，默认 `false` |
-| `bootstrap` | `--bootstrap off\|public\|URL` | `{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…"}`；`init` 和首次直接启动在新 Node 上写 `public`，提供发现服务的 Node 默认 `off`，见[公共接入](#公共接入) |
-| `pkarr` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
+| `mesh` | `--no-mesh`、`--mesh-network NAME`、`--bootstrap URL` | `{enabled, network, bootstrap, allow_private}`，见[全网](#全网)。省略时关闭；`init` 和首次直接启动写 `enabled: true`、`network: "vibeface"` 和官方 bootstrap 节点 |
 
-配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_open`、`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 和 `relay_blocked` 要求 `relay_listen`；`relay_open` 要求 `relay_rate` 和 `relay_max_clients`，且不能有 `relay_operator_token`；relay 监听通配地址时必须给 `relay_url`。`bootstrap` 的 `off` 是明确选择而不是回退：`custom` 来源不可用时不会改用官方服务。
+iroh 默认开启路由器端口映射；配置了 `network.bind` 时关闭，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_open`、`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 和 `relay_blocked` 要求 `relay_listen`；`relay_open` 要求 `relay_rate` 和 `relay_max_clients`，且不能有 `relay_operator_token`；relay 监听通配地址时必须给 `relay_url`。`mesh.bootstrap` 最多 16 个，同一设备只列一次；给了 `--bootstrap` 或换了 `--mesh-network` 时不再带官方 bootstrap 节点。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -153,7 +149,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 
 - `target` 是本 Node 时，Noise 在这里终止。
 - `target` 是其他设备时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。`forwarding.any` 为 `false` 时只转发给本网络的 Node，目标不是成员时不排队，直接回 `{"type":"error","code":"target_not_member"}`；连不上时回 `target_unreachable`，随后关闭。
-- 网关按设备编号拨号，候选地址来自地址簿、局域网广播，以及配置的发现服务查到的 relay 和观察到的 IP；自己提供发现服务的网关先查本机登记。拨号最多 7 秒，在浏览器 10 秒连接超时之前回 `target_unreachable`；没有共同 relay 且无法直连时也是这个结果。
+- 网关按设备编号拨号，候选地址来自地址簿、局域网广播和全网表；表里没有时向全网邻居查询。拨号最多 7 秒，在浏览器 10 秒连接超时之前回 `target_unreachable`；没有共同 relay 且无法直连时也是这个结果。
 - 网关同时最多转发 `forwarding.sessions` 个会话。名额用完时，新会话最多 `forwarding.queue` 个排队：网关立即回 `{"type":"queued","position":n}`，之后每 2 秒更新一次，轮到时回 `position` 为 0 再拨号；排队期间浏览器发来的最多 4 帧暂存，之后转给目标。队列也满时回 `gateway_busy` 并关闭。设了 `forwarding.per_ip` 时，同一浏览器地址（IPv6 按 /56 计）在 `listen` 上同时保持的 `/api/client` 连接不超过它，含目标为本 Node 的会话；超出的连接在 WebSocket 升级前收到 HTTP 429，浏览器只看到连接失败。浏览器地址是 TCP 对端，对端列在 `forwarding.trusted_proxies` 里时取它发来的唯一一个 `X-Real-IP`。`forwarding.rate` 限制每个会话双向合计的字节速率。`connect` 首帧须在 10 秒内到达。浏览器把 `queued` 当作等待而不是拒绝，每收到一帧就重新开始连接超时计时。
 
 随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人信任的网页：自己的 Gateway、自己服务器上的公共节点或官方 App。
@@ -180,7 +176,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `provider_models` | `provider` | 读取共享模型目录 `ModelCatalog`，Bot 和执行任务复用。`available` 带模型和覆盖范围，`unavailable` 带原因；两种状态都保留默认和手填。Codex 经 App Server `model/list`，pi 经无会话 RPC 列出 |
 | `provider_probe` | `provider` | 主动刷新该 Provider 的无 prompt 检查，返回完整 `ProviderStatus`；不调用模型或执行登录 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
-| `invite` | `record` | 管理设备登记签名邀请，返回 `join_id` 和 `entry_id` |
+| `invite` | `record` | 管理设备登记签名邀请，返回 `join_id` 和本 Node 的节点链接 `entry` |
+| `share_link` | 无 | 返回 `{link}`，本 Node 当前的节点链接 `vibeface://node/<设备编号>?addr=…&relay=…` |
 | `join_check` | `secret` | 打开链接时询问入口还收不收它，回 `invite` 为 `open`、`used` 或 `expired`，不占用链接。必须持有 secret 才能问。没登记过的 secret 与过期的回答相同，回答也不超出 `join` 拒绝时给的信息。本设备已提交且仍在等待的请求回 `open` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
 | `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数，请求已有 `admin_id` 时另带该管理设备的名字 `admin_name`；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
@@ -195,9 +192,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 
 `ProviderStatus.setup` 为 `{directory, command}` 或 `null`，只含非敏感私有目录和可复制登录命令。Codex spawn、Claude Code 和 OpenCode 提供入口，Web 和 Mobile 保留复制与检查可用性。Codex system 共享外部服务的会话且 `setup=null`。pi 只隔离会话目录并保留本机认证，`setup=null`。
 
-未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器和原生客户端用它复算核对（WASM 与 FFI 的 `verify_membership` 都接受 `now`），签否决或确认时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`provider_models`、`provider_probe`、`configure_node`、`configure_provider`、`test_codex_app_server`、`triage_settings`、`configure_triage`、`test_webhook`、`create_decision_token` 和 `revoke_decision_token` 另要求管理设备或本机会话（后六个的参数见 [Agent 直连 App Server](design/agent-direct-app-server.md)），`invite`、`approve`、`approve_recovery` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
+未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器和原生客户端用它复算核对（WASM 与 FFI 的 `verify_membership` 都接受 `now`），签否决或确认时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`provider_models`、`provider_probe`、`configure_node`、`configure_provider`、`test_codex_app_server`、`triage_settings`、`configure_triage`、`test_webhook`、`create_decision_token`、`revoke_decision_token`、`relay_settings`、`configure_relay` 和 `share_link` 另要求管理设备或本机会话（`test_codex_app_server` 到 `revoke_decision_token` 的参数见 [Agent 直连 App Server](design/agent-direct-app-server.md)）。本机维护接口上的所有者在 Node 尚未加入个人网络时也能调用不属于某个网络的方法，例如 relay 设置和 `share_link`，公共节点和 bootstrap 节点因此不必建网；`confirm_writable`、`diagnostics` 这类方法仍回 `personal network is not installed`，`invite`、`approve`、`approve_recovery` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
 
-加入使用承诺加短码。管理设备生成 ticket（入口设备编号和一次性 secret，不含地址），以 `vibeface://join/vibeface1…` 链接或同一链接的二维码交给新设备；Core、网页、桌面端和手机 App 只接受这种链接和单独的 `vibeface1…` 票据。桌面端和手机 App 注册 `vibeface` scheme 打开链接，浏览器由用户粘贴。浏览器经本页的 `/api/client`、手机 App 经官方页面的 `/api/client` 连接，由该 Gateway 按设备编号转发，设备身份仍以 ticket 中的设备公钥核验。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
+加入使用承诺加短码。管理设备生成 ticket（入口 Node 在 `invite` 应答里给出的节点链接和一次性 secret，节点链接含最多 4 个直连地址和 home relay，见[两种链接](design/mesh.md#两种链接)），以 `vibeface://join/vibeface1…` 链接或同一链接的二维码交给新设备；Node 加入时先把票据里的地址和 relay 放进地址簿，入口的 relay 拿到邀请凭证，再查全网和配置的 relay，所以关闭全网或 bootstrap 节点连不上时也能连到入口；Core、网页、桌面端和手机 App 只接受这种链接和单独的 `vibeface1…` 票据。桌面端和手机 App 注册 `vibeface` scheme 打开链接，浏览器由用户粘贴。浏览器经本页的 `/api/client`、手机 App 经官方页面的 `/api/client` 连接，由该 Gateway 按设备编号转发，设备身份仍以 ticket 中的设备公钥核验。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
 浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、网页删除的 `BotDeleted`、`ConversationOwner`、本人结清的 `WorkFinished`、`NotificationAcked`、`PrimaryBotSet`、`BotProjectSet`、`BotAvatarSet` 和 `ScheduleControlled` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
 
@@ -423,20 +420,22 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### iroh Endpoint
 
-每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、发现服务在登记应答中提供的开放 relay，以及可选的 n0 公共 relay。同一个 relay URL 出现多次时合并为一条配置，带凭证的配置不会被无凭证的副本覆盖，地址簿和发现服务里学到的裸 URL 也不会替换已配置的同一 relay 及其令牌。默认不向 n0 DNS 或 pkarr 发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务（含 `bootstrap` 来源）可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经 relay 转发 QUIC 密文。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、成员签名地址记录里成员运行的 relay，以及从全网表选出的开放 relay，不使用 n0 公共 relay。同一个 relay URL 出现多次时合并为一条配置，带凭证的配置不会被无凭证的副本覆盖，地址簿和全网表里学到的裸 URL 也不会替换已配置的同一 relay 及其令牌。不向 n0 DNS 或 pkarr 发布地址；ticket 只有设备编号，不含地址。成员地址来自个人网络内部交换的签名地址记录，其他设备的地址来自全网表，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经 relay 转发 QUIC 密文。
 
-成员 Node 另在局域网用 mDNS 广播 `_vibeface._udp.local.`。实例名和 TXT 记录 `t` 都是标签 `hex(HMAC-SHA256(network_id, "vibeface:lan:v1\0" ‖ device_id ‖ hour)[..16])`，`hour` 是 Unix 毫秒除以 3600000 的 u64 大端字节；主机名为 `<标签>.local.`，SRV 端口是 iroh 实际监听的 UDP 端口，A 和 AAAA 是本机非回环网卡地址，网卡变化时自动更新；iroh 在该端口没有监听的地址族不广播。每到整点，同步循环在几秒内改用新标签重新登记，旧实例发出 mDNS 告别。收到的广播在拨号时才比对，用前一、当前和后一小时的标签匹配要拨的成员 Node，过了时间窗的标签自然失效。比对上的地址在 `connect` 中与地址簿和发现服务提示合并；新出现或变化的广播只要属于当前成员 Node（不含自己），就立即唤醒与它的同步，同一 Node 每 10 秒最多唤醒一次；是否属于成员在收到时判定并记下，网络或成员变化时重新判定。只收私网 IPv4 和 ULA IPv6 地址，IPv4 在前，每条最多 4 个；拨号只用比对上的最新一条广播。最多保留 64 条广播，满时先删不属于成员 Node 的，再删最早收到的；收到告别或 SRV 记录过期后删除。Node 关闭网络时撤回自己的广播，最多等 1 秒让告别发出。`bind` 为具体地址的 Node 不启用 mDNS，尚未加入或已被移出网络的 Node（包括公共节点）不广播；mDNS 失败只记录日志，不影响 Node 运行。知道 `network_id` 和 `device_id` 的任何人（包括前成员和持有过邀请或恢复材料的人）都能算出并关联标签；标签只提示拨号地址，不是授权，小时轮换也不是撤销手段，成员资格仍由 QUIC TLS 证明的设备身份另行检查。
+成员 Node 另在局域网用 mDNS 广播 `_vibeface._udp.local.`。实例名和 TXT 记录 `t` 都是标签 `hex(HMAC-SHA256(network_id, "vibeface:lan:v1\0" ‖ device_id ‖ hour)[..16])`，`hour` 是 Unix 毫秒除以 3600000 的 u64 大端字节；主机名为 `<标签>.local.`，SRV 端口是 iroh 实际监听的 UDP 端口，A 和 AAAA 是本机非回环网卡地址，网卡变化时自动更新；iroh 在该端口没有监听的地址族不广播。每到整点，同步循环在几秒内改用新标签重新登记，旧实例发出 mDNS 告别。收到的广播在拨号时才比对，用前一、当前和后一小时的标签匹配要拨的成员 Node，过了时间窗的标签自然失效。比对上的地址在 `connect` 中与地址簿和全网表提示合并；新出现或变化的广播只要属于当前成员 Node（不含自己），就立即唤醒与它的同步，同一 Node 每 10 秒最多唤醒一次；是否属于成员在收到时判定并记下，网络或成员变化时重新判定。只收私网 IPv4 和 ULA IPv6 地址，IPv4 在前，每条最多 4 个；拨号只用比对上的最新一条广播。最多保留 64 条广播，满时先删不属于成员 Node 的，再删最早收到的；收到告别或 SRV 记录过期后删除。Node 关闭网络时撤回自己的广播，最多等 1 秒让告别发出。`bind` 为具体地址的 Node 不启用 mDNS，尚未加入或已被移出网络的 Node（包括公共节点）不广播；mDNS 失败只记录日志，不影响 Node 运行。知道 `network_id` 和 `device_id` 的任何人（包括前成员和持有过邀请或恢复材料的人）都能算出并关联标签；标签只提示拨号地址，不是授权，小时轮换也不是撤销手段，成员资格仍由 QUIC TLS 证明的设备身份另行检查。
 
 `Router` 按 ALPN 分发连接。私人 Node 请求每次占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。`service` 的独立 Noise 帧和容量见[服务传输](#服务传输)。
 
 | ALPN | 用途 | 接受的对端 |
 |---|---|---|
-| `vibeface/discovery/1` | 固定的地址登记、查找与空探测 | 任意通过 TLS 证明身份的设备；不授予业务权限 |
+| `vibeface/mesh-gossip/<network>/1` | 全网 iroh-gossip 主题 | 任意设备；不授予业务权限 |
+| `vibeface/mesh/<network>/1` | 全网记录交换和按设备编号查询 | 任意设备；不授予业务权限 |
 | `vibeface/sync/1` | `hello`、`membership`、`pull`、`forks`、`have` | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
 | `vibeface/client/1` | 网关转发的浏览器 Noise 会话，或手机 App 在局域网用临时密钥直接拨入的会话；每条流一个会话，帧为 `tag ‖ u32 BE 长度 ‖ 内容` | 任意设备，会话本身由 Noise 认证 |
 | `vibeface/join/1` | 只开放 `join_check`、`join`、`join_status` 和 `join_withdraw` | 任意设备 |
+| `vibeface/decision/1` | 经另一台设备送达会话的决定，目标核对决定令牌 | 任意设备，由决定令牌授权 |
 | `vibeface/service/1` | 可选的公益和付费文件对象交付 | 已认证 PeerID，另验服务开关、条款、证明及对象授权，不要求成为私人成员 |
 
 `sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。这些私人通道接受连接时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共节点不在任何个人网络里，私人 `sync`、`blob` 和 `rpc` 一律拒绝；显式启用文件交付时，只在独立 `vibeface/service/1` 上按服务规则接收。
@@ -484,33 +483,19 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。设了 `relay_max_clients_per_ip` 时 relay 只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它，同一 IPv4 地址或 IPv6 /56 超出上限的连接直接关闭；转发的连接任一方向结束即关闭两端，客户端连接开启 TCP keepalive。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
-公共节点是不加入个人网络的 Node，通常同时提供发现服务（`serve_discovery`）、开放 relay（`relay_open`）和面向任何设备的浏览器转发（`forwarding.any`）。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它只搬运 Noise 密文。部署步骤见[从外网访问](node.md#从外网访问)。
+公共节点是不加入个人网络的 Node，通常同时提供开放 relay（`relay_open`）和面向任何设备的浏览器转发（`forwarding.any`），并在全网记录里宣告 `relay` 和 `gateway` 角色。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它转发 Noise 密文，看不到内容，但能看到浏览器地址、目标设备编号、时间和流量大小。部署步骤见[从外网访问](node.md#从外网访问)。
 
-### 公共接入
+### 全网
 
-`bootstrap` 不为 `off` 的 Node 把它的来源加进发现服务列表，Endpoint 绑定后在后台登记，本机 API、维护接口和局域网发现不等待它。来源是一台发现服务：`public` 读取仓库文件 `config/public-bootstrap.json` 里固定的 `issuer`（官方公共节点的设备编号）、`udp_host` 和 `udp_port`，Core 用 `include_str!` 编入同一文件，不另抄一份；`custom` 的 `issuer` 取自 `vibeface://` 地址里的设备编号。QUIC 握手证明对端就是这台设备，编号不符时连接失败。
+`network.mesh` 开启时，Node 加入 iroh-gossip 主题 `SHA-256("vibeface:mesh:v1:" ‖ network)`，向全网宣告一条以设备密钥签名（域 `mesh-v1`）的记录 `{network, device_id, seq, ttl_s, addrs, relay_url, reachable, roles}`，并持有、转发、持久化所有 Node 的记录。Endpoint 绑定后在后台入网，本机 API、维护接口和局域网发现不等待它。记录格式、交换、入网顺序和 relay 选择见[全网层](design/mesh.md)。
 
-发现服务所在 Node 的 relay 开放（`relay_open`）时，`registered` 应答附上这台 relay。登记方把它加为候选 relay，iroh 可以选它做 home relay，于是直连不通的设备之间也能经它连通；已配置的同一 relay 和它的令牌保持不变。`vibeface status` 的 `Bootstrap` 显示配置的来源 `public`、`custom` 或 `off`。登记失败按发现协议的退避重连，不回退到其他来源，也不把失败当作成功。
+接收端验签，核对网络名、有效期和大小后才入表；同一设备只留一条，新记录的 `seq` 必须不小于已持有记录的 `seq` 加 30 秒。表最多 65536 条，保存在数据目录的 `mesh.sqlite3`，保留 30 天内见过的记录，删除后从 bootstrap 节点重新入网。
 
-`vibeface join` 和本机网页的 `node_join` 只凭票据里的设备编号：加入方经同一发现服务查到发出邀请的 Node 登记的地址和 relay，带邀请令牌连接这些 relay。
+`mesh.bootstrap` 的每一项是节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，最多 4 个 `addr`、1 个 `relay`，至少有其一；relay 只是拨号提示，不加入 relay 列表。`vibeface mesh share` 或 `share_link` 给出本机的节点链接。官方 bootstrap 节点由仓库文件 `config/public-bootstrap.json` 的 `issuer`、`udp_host`、`udp_port` 和 `relay_url` 生成，Core 用 `include_str!` 编入同一文件，不另抄一份。QUIC 握手证明对端就是这台设备，编号不符时连接失败。`vibeface mesh bootstrap add|remove` 改写这个列表，Node 运行时立即生效。
 
-### 发现协议
+角色只说明一台设备愿意提供什么：`relay {url, access, rate, max_clients, offer?}`、`gateway {url}`、`service {service, offer?}`。采用方先验证：relay 用 `/generate_204` 和真实握手，网关请求 `<url>/api/info` 并核对设备编号；私网和回环地址只在 `mesh.allow_private` 时采用。运行 relay 的 Node 经 `configure_relay`（网页**公共转发**、`vibeface relay volunteer on|off`）开放 relay，请邻居从外部探测通过后才宣告 `relay` 角色。
 
-`serve_discovery` 的 Node 在自己的 UDP 端口上回答 `vibeface/discovery/1` 的登记和查找，与它的 relay、网页和浏览器转发并存；其他 Node 只回答空探测。
-
-发现协议使用长度前缀 JSON，请求帧和应答帧都最多 2048 字节，未知字段被拒绝。请求只有 `register {relays}`、`lookup {device_id}` 和空的 `probe`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address, relay?}`、`peer {device_id,address,relays}` 和 `notice {device_id,address}`，不接受客户端提交 IP 地址或任意转发载荷。`relays` 是登记者当前的 home relay 加上自己运行的 relay，最多 4 个，每个 URL 最多 256 字节；QUIC 握手已证明设备身份。拨号方会直接连登记的 relay，所以发现服务从登记里剔除格式不对、超长或主机为 `localhost`、回环、私有、链路本地、未指定或组播等非公网地址的 relay，域名还要在 1 秒内解析且所有结果都是公网地址，超过 4 个时只留前 4 个；地址和其余 relay 照常登记。登记连接自身来自回环或私有地址时不做公网和解析判断。登记方在所连发现服务不在本机或私有网络时，上报前就去掉非公网 relay（含自己运行的 relay）；查询方按同样规则剔除 `peer` 里的 relay，不丢弃整条记录。服务端只在登记时解析一次，之后 DNS 改指向私有地址（DNS 重绑定）的风险仍在，由拨号方的 relay 连接自行承担。home relay 变化时客户端结束这次登记并重新登记；会话因租约或请求数用完正常结束时立即重连，出错时按 1 秒起、翻倍、最多 30 秒并带随机抖动的退避重连，成功登记后退避归零。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
-
-总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个 `lookup` 以外的请求；`lookup` 不计入这个上限，改为每连接每秒最多 20 个，超出时回 `refused {reason}`，会话不关闭。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
-
-已知设备编号可以查询在线状态和观察地址，不提供枚举接口。运营者可见设备、IP 和查询关系。发现服务不能补偿被封锁或不可打洞的 UDP 路径；这类流量经登记应答提供的开放 relay 或用户另行配置的 relay 转发，由 iroh 自动回退。部署步骤见[运行公共发现服务](node.md#运行公共发现服务)。
-
-## 免费节点发现
-
-`network.pkarr` 的字段为 `publish`、`resolve`、`urls`、`publish_direct`。布尔值默认均为 `false`，`urls` 默认空，最多 4 个。发布或解析必须指定非空目录列表。URL 只接受无凭证、查询参数和 fragment 的 HTTPS，或字面回环地址的 HTTP。
-
-发现只搬运签名地址包，不调用钱包、合约或付费服务。`publish=true` 发布本 Node 的 PeerID 和可达地址，默认过滤直连 IP；只有 `publish_direct=true` 才请求发布直连地址。成员关系、会话和项目不进入记录。目录不提供成员授权，也不证明节点在线或愿意接单。
-
-解析器核对 pkarr 签名、目标 PeerID、包大小和签名时间。超过 900 秒的旧包或领先本机时间超过 120 秒的包被拒绝。每个解析器最多 16 个并发请求，不跟随 HTTP 重定向。已有的成员、签名地址簿和目标 Noise 身份核验仍独立执行。
+`vibeface join` 和本机网页的 `node_join` 只凭票据里的设备编号：加入方在全网表里查发出邀请的 Node，表里没有时问邻居，用查到的直连地址和 home relay 连接，只给这台 home relay 带邀请令牌；查不到时用配置的 relay。`vibeface status` 的 `Mesh` 和 `vibeface mesh status` 显示全网是否开启、网络名、记录数和邻居数。入网失败按退避重试，不影响个人网络内的功能。
 
 ## 可选文件交付
 

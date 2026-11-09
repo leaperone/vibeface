@@ -6,16 +6,20 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 libc = "0.2"
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 vibeface-bridge.workspace = true
 vibeface-protocol.workspace = true
+vibeface-secure = { path = "../secure" }
 zeroize = { version = "1", features = ["derive", "serde"] }
 
 [dev-dependencies]
-futures-util.workspace = true
 uuid.workspace = true

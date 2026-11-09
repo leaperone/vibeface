@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, FlaskConical, RefreshCw, type LucideIcon } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, providerChoices, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
@@ -42,6 +42,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const other = useRef(false)
   if (!picked && draft.receiver_peer) other.current = true
   const receiverId = <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={picked ? '' : draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required={!picked} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
+  const providers = providerChoices(delivery.providers, draft.mode)
   const unusable = working || !status?.enabled || !file || !draft.receiver_peer || status.max_file_bytes === 0 || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
@@ -76,7 +77,14 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           </Field>
           <Details label={transferCopy.otherDevice} open={other.current || undefined}>{receiverId}</Details>
         </> : receiverId}
-        <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
+        <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} />
+          {providers.length ? <ul aria-label={transferCopy.providers} className="flex flex-wrap gap-2">{providers.map(item => <li key={item.device_id}>
+            <Button type="button" size="sm" variant={draft.provider_peer === item.device_id ? 'secondary' : 'outline'} aria-pressed={draft.provider_peer === item.device_id} title={item.device_id} disabled={working} onClick={() => setDraft({ ...draft, provider_peer: item.device_id })}>
+              <ArrowRightLeft aria-hidden="true" />{directory?.members.find(member => member.device_id === item.device_id)?.name ?? <span className="font-mono">{item.device_id.slice(0, 8)}…</span>}
+              {draft.mode === 'paid' && item.offer ? <span className="text-muted-foreground tabular-nums">{item.offer.price}</span> : null}
+            </Button>
+          </li>)}</ul> : null}
+          <FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
         <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
         {draft.mode === 'paid' ? <>
           <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />

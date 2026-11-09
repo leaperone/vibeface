@@ -93,10 +93,11 @@ def core_smoke(identity, info, output):
         # The official node's shape, offline; the runtime guard refuses anything less bounded.
         gateway = 'https://127.0.0.1:4793'
         options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': gateway, 'tls': True,
-                   'allowed_origins': ['https://app.vibeface.dev'], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
-                   'relay_open': True, 'relay_rate': 65536, 'relay_max_clients': 512,
-                   'relay_max_clients_per_ip': 16, 'forward_any': True, 'forward_sessions': 32,
-                   'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8, 'bootstrap': 'off'}
+                   'allowed_origins': ['https://app.vibeface.dev'], 'relay_listen': '127.0.0.1:4792',
+                   'relay_url': 'http://127.0.0.1:4792', 'relay_open': True, 'relay_rate': 16384,
+                   'relay_max_clients': 128, 'relay_max_clients_per_ip': 8, 'forward_any': True,
+                   'forward_sessions': 32, 'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
+                   'mesh_network': 'deploy-fixture'}
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
