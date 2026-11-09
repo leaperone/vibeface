@@ -220,6 +220,8 @@ struct Session {
     /// Set by `subscribe` to the management permission the device had then.
     subscribed: Option<bool>,
     observation: Option<crate::runtime::ObservationGuard>,
+    /// The owner at this computer over the owner-only maintenance socket; see `operator_call`.
+    operator: bool,
 }
 
 #[derive(Serialize)]
@@ -551,6 +553,7 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             };
             let result = dispatch(&node, &mut session, method, request["params"].clone()).await?;
             Ok(json!({"result":result}))
@@ -603,6 +606,7 @@ async fn serve_session(
         cookie,
         subscribed: None,
         observation: None,
+        operator: false,
     };
     let opened = Instant::now();
     let mut guest = if session.cookie.is_none() && principal(&node, &session).await.is_err() {
@@ -894,6 +898,14 @@ async fn dispatch(
         "configure_triage" => {
             node_operator(node, session).await?;
             node.configure_triage(params).await
+        }
+        "relay_settings" => {
+            node_operator(node, session).await?;
+            node.relay_settings()
+        }
+        "configure_relay" => {
+            node_operator(node, session).await?;
+            node.configure_relay(params).await
         }
         "test_webhook" => {
             node_operator(node, session).await?;
@@ -1435,6 +1447,15 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
         view.revocation(&node_id).is_none(),
         "this Node has been removed from the personal network"
     );
+    if session.operator {
+        return Ok(Principal {
+            source: "local_operator",
+            network_id: view.network_id,
+            device_id: node_id,
+            epoch: view.epoch,
+            can_manage: false,
+        });
+    }
     if let Ok(member) = view.client(&session.device_id) {
         return Ok(Principal {
             source: "membership",
@@ -1473,6 +1494,9 @@ async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
         view.revocation(&node_id).is_some(),
         "this Node has not been removed from the personal network"
     );
+    if session.operator {
+        return Ok(());
+    }
     let cookie = session
         .cookie
         .as_deref()
@@ -1498,10 +1522,51 @@ async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
                 .is_err()))
 }
 
+/// Methods whose authority is a management client's signature, never the Node's own.
+const SIGNED_METHODS: [&str; 10] = [
+    "invite",
+    "approve",
+    "grant",
+    "revoke",
+    "veto",
+    "approve_recovery",
+    "recover",
+    "recovery_state",
+    "join",
+    "join_withdraw",
+];
+
+/// The owner at this computer, over the owner-only maintenance socket: what this Node's local
+/// page may do, without its cookie. Governance needs a management client's signature.
+pub(crate) async fn operator_call(
+    node: &Arc<Runtime>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    ensure!(
+        !SIGNED_METHODS.contains(&method)
+            && !(method == "join_status" && params.get("join_id").is_none()),
+        "{method} needs the signature of a management client; enroll one with `vibeface client enroll`"
+    );
+    ensure!(
+        !matches!(method, "subscribe" | "log" | "local_access" | "node_join"),
+        "{method} is not available from the maintenance socket"
+    );
+    ensure!(params.is_object(), "invalid client method or params");
+    let mut session = Session {
+        device_id: node.identity.device_id()?,
+        cookie: None,
+        subscribed: None,
+        observation: None,
+        operator: true,
+    };
+    dispatch(node, &mut session, method, params).await
+}
+
 async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
     let principal = principal(node, session).await?;
     ensure!(
-        principal.can_manage || principal.source == "local_session",
+        principal.can_manage || matches!(principal.source, "local_session" | "local_operator"),
         "management permission or local browser access required"
     );
     Ok(())
@@ -2314,7 +2379,14 @@ mod tests {
             .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let access = Arc::new(PrivateRelay::default());
-        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None, None).await?;
+        let relay = net::spawn_relay(
+            "127.0.0.1:0".parse()?,
+            access.clone(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
         let relay_url = format!("http://{}", relay.addr);
         let mesh = |bootstrap: Vec<String>| net::mesh::MeshConfig {
             enabled: true,
@@ -2578,6 +2650,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             })
         };
         let mut browser = session(&member)?;
@@ -2713,6 +2786,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             })
         };
         let record =
@@ -2800,6 +2874,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             })
         };
         for identity in [&client, &LocalIdentity::generate()] {
@@ -3093,6 +3168,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             })
         };
         let codex_key = "fixture-codex-secret-0123456789";
@@ -3523,12 +3599,14 @@ mod tests {
                 cookie: Some(cookie),
                 subscribed: None,
                 observation: None,
+                operator: false,
             };
             let mut remote_manager = Session {
                 device_id: admin.device_id()?,
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             };
             assert!(
                 dispatch(&node, &mut local, "rejoin", json!({}))
@@ -3599,6 +3677,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             };
             let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
             assert_eq!(
@@ -3714,6 +3793,7 @@ mod tests {
                 cookie: None,
                 subscribed: None,
                 observation: None,
+operator: false,
             };
             let nonce = || -> Result<String> {
                 let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
@@ -3907,6 +3987,7 @@ mod tests {
             let mut local_session = Session {
                 device_id: browser_id.clone(), cookie: Some(cookie.into()),
                 subscribed: None, observation: None,
+operator: false,
             };
             let save = node.config_save.lock().await;
             let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
@@ -3929,6 +4010,7 @@ mod tests {
             let mut manager_session = Session {
                 device_id: manager.device_id()?, cookie: None,
                 subscribed: None, observation: None,
+operator: false,
             };
             let save = node.config_save.lock().await;
             let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
@@ -4021,6 +4103,7 @@ mod tests {
             cookie: None,
             subscribed: None,
             observation: None,
+            operator: false,
         };
         let view = state.project_at(now)?.clone();
         let event = GovernanceEvent::unsigned(
@@ -4067,6 +4150,7 @@ mod tests {
             cookie: None,
             subscribed: None,
             observation: None,
+            operator: false,
         };
         assert!(
             dispatch(

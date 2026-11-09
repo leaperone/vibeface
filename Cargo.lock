@@ -6742,15 +6742,19 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "futures-util",
+ "hex",
  "libc",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "uuid",
  "vibeface-bridge",
  "vibeface-protocol",
+ "vibeface-secure",
  "zeroize",
 ]
 

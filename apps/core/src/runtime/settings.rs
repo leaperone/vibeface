@@ -547,7 +547,7 @@ impl Runtime {
     }
 
     /// Only the owner changes this Node's settings: a management device, or a browser on this
-    /// machine through its local session.
+    /// machine through its local session, or the owner over the maintenance socket.
     async fn authorize_settings_write(
         &self,
         subject: &str,
@@ -564,7 +564,9 @@ impl Runtime {
                 session.device_id == subject,
                 "local session identity changed"
             );
-        } else {
+        } else if subject != self.identity.device_id()? {
+            // Only the maintenance socket's operator session carries this Node's own ID: a
+            // client's is the key it proved in the handshake. See `client::operator_call`.
             view.manager(subject)?;
         }
         Ok(())

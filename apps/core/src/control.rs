@@ -143,7 +143,29 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
             data_dir,
             operation,
         } => mesh_control(&data_dir, operation).await,
+        vibeface_control::ControlRequest::ConfigSet {
+            data_dir,
+            key,
+            value,
+        } => config_set(&data_dir, &key, value).await,
     }
+}
+
+/// `vibeface config set`: the running Node saves it under its config lock; a stopped one's
+/// file is edited here. Either way it takes effect when the Node starts.
+async fn config_set(data_dir: &Path, key: &str, value: Value) -> Result<Value> {
+    validate_data_dir(data_dir)?;
+    let data_dir = fs::canonicalize(data_dir)
+        .context("initialized data directory is required; run vibeface init first")?;
+    let running = match maintenance::config_set(&data_dir, key, value.clone()).await {
+        Ok(()) => true,
+        Err(error) if stopped(&error) => {
+            Config::set(&data_dir, key, value)?;
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(json!({"running":running}))
 }
 
 /// The socket is missing or refuses: the Node is not running.

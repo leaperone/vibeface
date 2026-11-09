@@ -18,6 +18,8 @@ use zeroize::Zeroizing;
 
 const PROTOCOL: u32 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A `Client` answer carries a whole RPC result, such as diagnostics or a bot list.
+const MAX_PACKET: usize = 1024 * 1024;
 const SOCKET_NAME: &str = "maintenance.sock";
 /// Names the maintenance endpoint in the message a person reads.
 const LABEL: &str = "the maintenance socket";
@@ -234,6 +236,16 @@ enum Command {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// Set one config.json value; the running Node applies it when it restarts.
+    ConfigSet {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Call a client method as the owner at this computer, with what a local page may do.
+    Client {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -263,6 +275,8 @@ struct Response {
     delivery: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     join: Option<crate::client::NodeJoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut Stream) -> Result<T> {
@@ -274,13 +288,21 @@ async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     tokio::time::timeout(timeout, async {
         let mut packet = Zeroizing::new(Vec::new());
-        let mut chunk = Zeroizing::new([0u8; 256]);
+        let mut chunk = Zeroizing::new([0u8; 8192]);
         loop {
             let count = stream.read(&mut chunk[..]).await?;
             ensure!(count != 0, "maintenance socket closed before response");
+            let start = packet.len();
             packet.extend_from_slice(&chunk[..count]);
-            ensure!(packet.len() <= 4096, "maintenance packet is too large");
-            if let Some(end) = packet.iter().position(|byte| *byte == b'\n') {
+            ensure!(
+                packet.len() <= MAX_PACKET,
+                "maintenance packet is too large"
+            );
+            if let Some(end) = chunk[..count]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|at| start + at)
+            {
                 ensure!(
                     end + 1 == packet.len(),
                     "unexpected maintenance packet data"
@@ -455,6 +477,19 @@ pub async fn mesh_bootstrap(data_dir: &Path, add: Vec<String>, remove: Vec<Strin
     Ok(())
 }
 
+/// Set one config.json value in the running Node; see `crate::config::Config::set`.
+pub async fn config_set(data_dir: &Path, key: &str, value: serde_json::Value) -> Result<()> {
+    request(
+        data_dir,
+        Command::ConfigSet {
+            key: key.to_owned(),
+            value,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn delivery_wallet(
     data_dir: &Path,
     command: crate::delivery::wallet::WalletCommand,
@@ -541,6 +576,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
         wallet: None,
         delivery: None,
         join: None,
+        result: None,
     };
     match request.command {
         Command::Probe => write_packet(&mut stream, &response).await?,
@@ -623,6 +659,31 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             if let Err(error) = runtime.edit_mesh_bootstrap(&add, &remove).await {
                 response.status = Status::Error;
                 response.error = Some(error.to_string());
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::ConfigSet { key, value } => {
+            let result = {
+                let _save = runtime.config_save.lock().await;
+                crate::config::Config::set(&runtime.data_dir, &key, value)
+            };
+            if let Err(error) = result {
+                response.status = Status::Error;
+                response.error = Some(error.to_string());
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::Client { method, params } => {
+            match crate::client::operator_call(&runtime, &method, params).await {
+                Ok(result) => response.result = Some(result),
+                Err(error) => {
+                    response.status = if error.downcast_ref::<Busy>().is_some() {
+                        Status::Busy
+                    } else {
+                        Status::Error
+                    };
+                    response.error = Some(crate::logging::scrub(&error.to_string()));
+                }
             }
             write_packet(&mut stream, &response).await?;
         }
