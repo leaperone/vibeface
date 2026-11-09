@@ -178,6 +178,7 @@ pub struct Health {
     pub device_id: String,
     pub version: String,
     pub web_enabled: bool,
+    pub http_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_state: Option<crate::store::WriteState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -502,6 +503,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
         device_id: runtime.identity.device_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
         web_enabled: runtime.config.web_enabled,
+        http_enabled: runtime.config.web_enabled,
         write_state: Some(write_state),
         peers: runtime.peer_health().await,
     };
@@ -838,7 +840,8 @@ mod tests {
 
     #[test]
     fn device_id_health_uses_only_the_current_field() -> Result<()> {
-        let wire = r#"{"device_id":"device","version":"version","web_enabled":true}"#;
+        let wire =
+            r#"{"device_id":"device","version":"version","web_enabled":true,"http_enabled":true}"#;
         let health: Health = serde_json::from_str(wire)?;
         assert_eq!(health.device_id, "device");
         assert_eq!(serde_json::to_string(&health)?, wire);

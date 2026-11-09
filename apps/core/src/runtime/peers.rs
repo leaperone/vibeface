@@ -321,7 +321,7 @@ impl Runtime {
         self.membership_state()
             .await
             .and_then(|state| state.project())
-            .is_ok_and(|view| view.revocation(device).is_some())
+            .is_ok_and(|view| view.removed_node(device))
     }
 
     /// A member Node refusing this one hands back the signed history that removed it. Installing
@@ -515,6 +515,7 @@ impl Runtime {
         let _work = (!matches!(
             kind,
             "capabilities"
+                | "work_evidence"
                 | "progress_read"
                 | "addresses"
                 | "scheduler_jobs"
@@ -526,6 +527,15 @@ impl Runtime {
         .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
+            "work_evidence" => {
+                let conversation = field(input, "conversation_id")?;
+                let work_id = field(input, "work_id")?;
+                let vouches = self
+                    .local_work_vouches(network, conversation, work_id)
+                    .await?;
+                Ok(json!({"network_id":network,"conversation_id":conversation,
+                    "work_id":work_id,"vouches":vouches}))
+            }
             "addresses" => {
                 let records: Vec<SignedAddress> =
                     serde_json::from_value(input["records"].clone()).unwrap_or_default();
@@ -563,7 +573,7 @@ impl Runtime {
             }
             "respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
-                self.answer_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                self.respond_unclaimed_request(field(input, "request_id")?, result)
                     .await
             }
             "hand_over_session" => {
@@ -1519,7 +1529,7 @@ impl Runtime {
         let Ok(view) = state.project() else {
             return;
         };
-        let removed = signed_removals(&state, &view);
+        let removed = view.signed_removals().to_vec();
         if removed.is_empty() {
             return;
         }
@@ -2183,7 +2193,6 @@ impl Runtime {
             return Default::default();
         }
         let fetch = async {
-            let _download = self.blob_fetch.lock().await;
             for (author, blob) in &wanted {
                 if local.as_ref() == Some(author)
                     || self.store.lock().await.has_blob(blob).unwrap_or(false)
@@ -2207,7 +2216,6 @@ impl Runtime {
     /// Downloads from `peer` every attachment stored events reference that is not here yet. Each
     /// sync round runs it, so one a turn left pending arrives once a member holding it is reached.
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
-        let _download = self.blob_fetch.lock().await;
         let missing = self.store.lock().await.missing_blobs(network)?;
         let mut failed = 0;
         for blob in &missing {
@@ -2225,6 +2233,7 @@ impl Runtime {
     pub(crate) async fn fetch_blob(&self, network: &str, peer: &str, blob: &BlobRef) -> Result<()> {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(blob.size as usize <= MAX_BLOB_BYTES, "attachment too large");
+        let _download = self.blob_fetch.lock().await;
         let (part, target, committed) = {
             let store = self.store.lock().await;
             (
@@ -2233,10 +2242,18 @@ impl Runtime {
                 store.committed_offset(&blob.hash)?,
             )
         };
+        if tokio::fs::metadata(&target)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == blob.size)
+        {
+            return Ok(());
+        }
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
-        if !part.exists() {
-            staging_room(dir, blob.size)?;
+        if !tokio::fs::try_exists(&part).await? {
+            let dir = dir.to_owned();
+            let size = blob.size;
+            tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -2290,8 +2307,12 @@ impl Runtime {
             .commit_offset(&blob.hash, Some(offset))?;
         ensure!(offset == blob.size, "attachment stream ended early");
         drop(file);
-        let bytes = tokio::fs::read(&part).await?;
-        if crate::crypto::digest(&bytes) != blob.hash {
+        let hash_part = part.clone();
+        let hash = tokio::task::spawn_blocking(move || {
+            std::fs::read(hash_part).map(|bytes| crate::crypto::digest(&bytes))
+        })
+        .await??;
+        if hash != blob.hash {
             let _ = tokio::fs::remove_file(&part).await;
             self.store.lock().await.commit_offset(&blob.hash, None)?;
             bail!("downloaded attachment failed its hash check");
@@ -2301,32 +2322,6 @@ impl Runtime {
         self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(())
     }
-}
-
-/// Devices out of `view` by a manager's signed revocation in an epoch in effect, not only
-/// because a recovery left them out.
-fn signed_removals(state: &NetworkState, view: &AuthorizationView) -> Vec<String> {
-    let stopped: BTreeSet<u64> = state
-        .checkpoints
-        .iter()
-        .filter(|checkpoint| {
-            checkpoint
-                .hash()
-                .is_ok_and(|hash| view.stopped.contains(&hash))
-        })
-        .map(|checkpoint| checkpoint.epoch)
-        .collect();
-    view.revoked
-        .iter()
-        .filter(|revoked| {
-            state.events.iter().any(|event| {
-                event.epoch <= view.epoch
-                    && !stopped.contains(&event.epoch)
-                    && matches!(&event.action, GovernanceAction::Revoke(revocation) if revocation.device_id == revoked.device_id)
-            })
-        })
-        .map(|revoked| revoked.device_id.clone())
-        .collect()
 }
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
@@ -2378,6 +2373,104 @@ mod tests {
         )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test]
+    async fn an_online_target_without_the_original_work_journal_allows_one_signed_settlement()
+    -> Result<()> {
+        use crate::model::{ResolvedModel, WorkKind, WorkOutcome};
+        use crate::work::{Signal, WorkSpec};
+
+        let (entry, target) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (entry_id, target_id) = (entry.device_id()?, target.device_id()?);
+        let network = entry.fixture_network_id()?;
+        let state = entry.sign_network_fixture(1, vec![entry_id.clone(), target_id.clone()])?;
+        let (a, dir_a) = node(&entry).await?;
+        let (b, dir_b) = node(&target).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            b.net()?.learn(&a.net()?.addr()).await;
+            {
+                let mut store = a.store.lock().await;
+                store.create_conversation(&entry, &network, "c", "Settlement",
+                    entry.owner_fixture(&network, "c", &entry_id)?, now_ms())?;
+                store.append_event(&entry, &network, "c", posted(&entry, &network, "c", "m1")?, vec![], now_ms())?;
+            }
+            b.sync_peer(&network, &entry_id).await?;
+            let spec = WorkSpec {
+                work_id: WorkSpec::id("c", "message:m1", "original"),
+                conversation: "c".into(), trigger: "message:m1".into(),
+                target: target_id.clone(), dispatcher: entry_id.clone(), call_ref: "original".into(),
+                kind: WorkKind::Agent(Provider::Pi), model: None,
+                resolved: ResolvedModel { provider: Provider::Pi, model: None },
+                cwd: dir_b.to_string_lossy().into_owned(), title: "original".into(), prompt: "fixture only".into(),
+                continues: None, parent: None, thread: None,
+            };
+            b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms())?;
+            a.sync_peer(&network, &target_id).await?;
+            ready_member_rpc(&a, &network, &target_id).await?;
+            let access = Access { network_id: network.clone(), human: true,
+                conversation_id: Some("c".into()), manager: None };
+            let choice = |work_id: &str| -> Result<Value> {
+                let signed = entry.fixture_admin().attest(&network, "c", EventBody::WorkFinished {
+                    work_id: work_id.into(), outcome: WorkOutcome::Completed, result_text: "checked".into(),
+                    failure_reason: None, attestation: None, failure: None,
+                })?;
+                Ok(json!({"conversation_id":"c","check_id":format!("work:{work_id}"),
+                    "outcome":"completed","note":"checked","attestation":signed.attestation()}))
+            };
+            let answer = choice(&spec.work_id)?;
+            assert!(a.resolve_check(&access, &answer).await.is_err(), "the original journal can still report");
+            let evidence = || json!({"type":"work_evidence","conversation_id":"c","work_id":spec.work_id});
+            assert_eq!(a.peer_request(&network, &target_id, evidence()).await?["vouches"], true);
+            assert!(a.peer_request(&network, &target_id, json!({"type":"work_evidence",
+                "conversation_id":"other","work_id":spec.work_id})).await.is_err());
+            {
+                let store = b.store.lock().await;
+                assert!(store.work_record_in_scope("another-network", "c", &spec.work_id, &target_id).is_err());
+                store.connection.execute("DELETE FROM work_runs WHERE work_id=?", [&spec.work_id])?;
+            }
+            assert!(a.peer_request(&network, &target_id, json!({"type":"capabilities"})).await?.is_object(),
+                "the target is still reachable");
+            assert_eq!(a.peer_request(&network, &target_id, evidence()).await?["vouches"], false);
+            assert_eq!(a.resolve_check(&access, &answer).await?["resolved"], true);
+            assert!(a.resolve_check(&access, &answer).await.is_err(), "the signed result is admitted once");
+            b.sync_peer(&network, &entry_id).await?;
+            b.sync_peer(&network, &entry_id).await?;
+            assert!(b.store.lock().await.work_record(&spec.work_id)?.is_none(), "sync does not rebuild an execution");
+            assert!(b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms()).is_err(),
+                "missing admission evidence cannot start the old dispatch again");
+            let finished = a.store.lock().await.events_from(&network, &entry_id, 1, 100)?.into_iter()
+                .filter_map(|event| serde_json::from_str::<crate::model::Event>(&event.canonical_body).ok())
+                .filter(|event| matches!(&event.body, EventBody::WorkFinished { work_id, outcome: WorkOutcome::Completed, .. } if work_id == &spec.work_id)).count();
+            assert_eq!(finished, 1);
+
+            let mut unknown = spec.clone();
+            unknown.call_ref = "unknown".into();
+            unknown.work_id = WorkSpec::id("c", "message:m1", &unknown.call_ref);
+            b.store.lock().await.accept_work_fixture(&target, &network, unknown.clone(), now_ms())?;
+            b.store.lock().await.apply_work_signal(&target, &network, &unknown.work_id,
+                Signal::SubmissionUnverified("fixture cannot prove its outcome".into()), now_ms())?;
+            a.sync_peer(&network, &target_id).await?;
+            assert_eq!(a.store.lock().await.work(&network, &unknown.work_id)?.context("unknown work")?.outcome,
+                Some(WorkOutcome::Unverified));
+            assert_eq!(a.resolve_check(&access, &choice(&unknown.work_id)?).await?["resolved"], true);
+            for node in [&a, &b] {
+                assert!(node.agent_tokens.lock().await.is_empty());
+                assert!(node.manager_controls.lock().await.is_empty());
+                let store = node.store.lock().await;
+                let native: u64 = store.connection.query_row(
+                    "SELECT (SELECT count(*) FROM manager_turns)+(SELECT count(*) FROM manager_processes)",
+                    [], |row| row.get(0))?;
+                assert_eq!(native, 0, "settlement never starts or sends a native turn");
+            }
+            Ok(())
+        }.await;
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b)]).await
     }
 
     #[tokio::test]

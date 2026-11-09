@@ -154,6 +154,7 @@ pub(super) struct BudgetRecord {
     pub provider_gas_cap: String,
     pub network_id: Option<String>,
     pub authorized_by: Option<String>,
+    pub role: Role,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -607,7 +608,7 @@ impl ClaimState {
     }
 }
 
-fn order_is_settled(state: &chain::OrderState, order: &Order) -> Result<bool> {
+pub(super) fn order_is_settled(state: &chain::OrderState, order: &Order) -> Result<bool> {
     if state
         .windows
         .iter()
@@ -699,6 +700,65 @@ impl PublicationClaim {
         })
     }
 }
+pub(super) fn publication_has_order_reference(
+    store: &super::store::ServiceStore,
+    order_id: &str,
+) -> Result<bool> {
+    for body in store.values_with_prefix("protected-claim:")? {
+        let claim: PublicationClaim = serde_json::from_slice(&body)?;
+        if claim
+            .terms
+            .items
+            .iter()
+            .any(|item| item.window.order_id == order_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+pub(super) fn publication_retains_objects(
+    store: &super::store::ServiceStore,
+    order_id: &str,
+) -> Result<bool> {
+    let mut linked = std::collections::BTreeSet::new();
+    for index in 0..MAX_BATCH_WINDOWS {
+        if let Some(body) = store.value(&claim_window_key(&WindowRef {
+            order_id: order_id.into(),
+            index: index as u16,
+        }))? {
+            linked.insert(String::from_utf8(body)?);
+        }
+    }
+    for body in store.values_with_prefix("protected-claim:")? {
+        let claim: PublicationClaim = serde_json::from_slice(&body)?;
+        let mapped = linked.remove(&claim.id);
+        if !mapped
+            && !claim
+                .terms
+                .items
+                .iter()
+                .any(|item| item.window.order_id == order_id)
+        {
+            continue;
+        }
+        if claim.occupies_publication_window(super::now())? {
+            return Ok(true);
+        }
+        for id in claim.attempts {
+            if !store.find_transaction(&id)?.is_some_and(|tx| {
+                tx.raw_tx.is_some()
+                    && matches!(
+                        tx.phase.as_str(),
+                        "confirmed" | "failed" | "reverted" | "conflicted"
+                    )
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(!linked.is_empty())
+}
 fn record_key(id: &str) -> String {
     format!("protected-budget:{id}")
 }
@@ -749,6 +809,11 @@ impl Delivery {
             provider_gas_cap: self.config().provider_gas_cap,
             network_id: None,
             authorized_by: None,
+            role: if self.identity.device_id()? == snapshot.terms.provider_peer {
+                Role::Provider
+            } else {
+                Role::Receiver
+            },
         };
         self.with_store(|s| {
             s.put_value(
@@ -945,6 +1010,7 @@ impl Delivery {
                     provider_gas_cap: self.config().provider_gas_cap,
                     network_id: None,
                     authorized_by: None,
+                    role: Role::Sender,
                 };
                 let key = record_key(&budget_id);
                 self.with_store(|s| {
@@ -1097,7 +1163,7 @@ impl Delivery {
         Ok(json!({"budgets":budgets}))
     }
     async fn budget_ready_windows(&self, id: &str) -> Result<Vec<WindowRef>> {
-        let orders = self.with_store(|s| s.orders(None))?;
+        let orders = self.with_store(|s| s.progress_orders(None))?;
         let mut ready = Vec::new();
         for order in orders.into_iter().filter(|o| {
             o.accepted
@@ -1218,7 +1284,18 @@ impl Delivery {
         let snapshot = chain.budget_at(&position, parse_word(id)?.into()).await?;
         let record = self.register_budget(&snapshot, "0")?;
         let mut candidates = Vec::new();
-        let mut orders = self.with_store(|s| s.orders(None))?;
+        let mut orders = self.with_store(|store| {
+            let mut orders = Vec::<StoredOrder>::new();
+            for window in &authorized {
+                if !orders
+                    .iter()
+                    .any(|order| order.view.order_id == window.order_id)
+                {
+                    orders.push(store.order(&window.order_id)?);
+                }
+            }
+            Ok(orders)
+        })?;
         orders.retain(|o| {
             o.view.role == Role::Provider
                 && o.accepted
@@ -1279,7 +1356,7 @@ impl Delivery {
             self.identity.device_id()? == record.terms.provider_peer,
             "only the fixed provider Node can flush its protected budget"
         );
-        let mut orders = self.with_store(|s| s.orders(None))?;
+        let mut orders = self.with_store(|s| s.progress_orders(None))?;
         orders.retain(|o| {
             o.view.role == Role::Provider
                 && o.accepted
@@ -1765,33 +1842,29 @@ impl Delivery {
                     && current.chain.as_ref() == Some(chain.config()),
                 "publication policy changed before reserving a signature"
             );
+            self.authorize_transaction(&intent, chain.config()).await?;
+            let mut attempted = claim.clone();
+            attempted.attempts.push(id.clone());
+            let wallet = self
+                .wallet
+                .lock()
+                .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
             let transaction = self.with_store(|s| {
-                s.reserve_budget_transaction(
+                s.signed_publication_transaction(
                     &intent,
                     pending,
                     &group(&claim.terms.budget_id),
                     &claim.terms.gas_cap,
+                    (&claim.key(), &serde_json::to_vec(&attempted)?),
+                    |intent, nonce| {
+                        ensure!(nonce == pending, "publication nonce is not contiguous");
+                        let signed = wallet.sign_transaction(chain.config(), intent, nonce)?;
+                        Ok((signed.raw_tx, signed.tx_hash))
+                    },
                 )
             })?;
-            ensure!(
-                transaction.nonce == pending,
-                "publication nonce is not contiguous"
-            );
-            let signed = self
-                .wallet
-                .lock()
-                .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?
-                .sign_transaction(chain.config(), &transaction.intent, transaction.nonce)?;
-            claim.attempts.push(id.clone());
-            self.with_store(|s| {
-                s.sign_transaction_with_claim(
-                    &id,
-                    &signed.raw_tx,
-                    &signed.tx_hash,
-                    Some((&claim.key(), &serde_json::to_vec(&claim)?)),
-                )
-            })?;
-            self.with_store(|s| s.transaction(&id))?
+            *claim = attempted;
+            transaction
         };
         // Signing is private. Recheck immediately before the first possible E-bearing RPC.
         chain.verify_position(&position).await?;
@@ -1832,7 +1905,7 @@ impl Delivery {
             )?,
             "original disclosure gate expired at the RPC boundary"
         );
-        self.authorize_spend(&transaction.intent.id, chain.config())
+        self.authorize_transaction(&transaction.intent, chain.config())
             .await?;
         let current = self.config();
         ensure!(
@@ -1893,6 +1966,7 @@ mod tests {
         current_reorg: bool,
         current_hash_changed: bool,
         broken: bool,
+        quote: Option<(BudgetTerms, vibeface_delivery::SignedKeyBinding)>,
     }
     impl Observation {
         fn tip(&mut self, elapsed: u64) -> u64 {
@@ -1953,6 +2027,12 @@ mod tests {
             Self::with_claims(phases, true).await
         }
         async fn with_claims(phases: [u8; 2], with_claims: bool) -> Result<Self> {
+            Self::setup(phases, with_claims, false).await
+        }
+        async fn with_current_orders(phases: [u8; 2]) -> Result<Self> {
+            Self::setup(phases, false, true).await
+        }
+        async fn setup(phases: [u8; 2], with_claims: bool, current_orders: bool) -> Result<Self> {
             let now = super::super::now();
             let clock = std::time::Instant::now();
             let mut config = chain::tests::config();
@@ -1964,7 +2044,7 @@ mod tests {
                 let fixture = support::fixture_with_profile(&[4, 4], config.profile.clone());
                 let mut terms = fixture.order.unsigned.terms;
                 terms.payer_order_nonce = [seed; 32];
-                if seed == 3 {
+                if seed == 3 || current_orders {
                     terms.binding.valid_from = now;
                     terms.binding.valid_until = now + 700;
                     terms.quote_expires_at = now + 200;
@@ -1985,13 +2065,8 @@ mod tests {
                     vibeface_delivery::Amount::from_u64(1),
                 );
                 let intent = uuid::Uuid::new_v4().to_string();
-                let mut view = super::super::orders::view(
-                    &intent,
-                    Role::Provider,
-                    Mode::Paid,
-                    &fixture.order,
-                    8,
-                )?;
+                let mut view =
+                    super::super::orders::view(&intent, Role::Provider, &fixture.order, 8)?;
                 view.payment.budget_id = Some(format!("{seed:02x}").repeat(32));
                 capsules.push(
                     fixture
@@ -2014,6 +2089,8 @@ mod tests {
                     accepted: true,
                     notified: true,
                     allocation_batch: Vec::new(),
+                    chain_observed_at_ms: 0,
+                    settlement_complete: false,
                 });
             }
             let observation = Arc::new(Mutex::new(Observation {
@@ -2031,6 +2108,7 @@ mod tests {
                 current_reorg: false,
                 current_hash_changed: false,
                 broken: false,
+                quote: None,
             }));
             {
                 let mut probe = observation.lock().unwrap().clone();
@@ -2128,6 +2206,19 @@ mod tests {
                         if data==format!("0x{}",hex::encode(abi::getProfileCall {}.abi_encode())) {
                             return encoded(rpc_profile.abi_bytes().unwrap());
                         }
+                        if let Some((terms, binding)) = &state.quote {
+                            if data == format!("0x{}",hex::encode(abi::getBudgetCall {id:parse_word(&terms.budget_id).unwrap().into()}.abi_encode())) {
+                                return encoded(abi::getBudgetCall::abi_encode_returns(&abi::ChainBudget {
+                                    payer:chain::address(&terms.payer).unwrap(),payee:chain::address(&terms.payee).unwrap(),
+                                    providerPeer:parse_word(&terms.provider_peer).unwrap().into(),asset:chain::address(&terms.asset).unwrap(),
+                                    deposit:chain::amount(&terms.deposit).unwrap(),locked:U256::ZERO,earned:U256::ZERO,withdrawn:U256::ZERO,refunded:U256::ZERO,
+                                    maxClaimUntil:0,assetDecimals:6,state:1,
+                                }));
+                            }
+                            if data == format!("0x{}",hex::encode(abi::keysCall {peer:binding.binding.receiver_peer.into()}.abi_encode())) {
+                                return encoded((B256::from(binding.binding.digest().unwrap()),binding.binding.serial,binding.binding.valid_from,binding.binding.valid_until,true).abi_encode());
+                            }
+                        }
                         for (index, order) in rpc_orders.iter().enumerate() {
                             let id = B256::from(order.order.unsigned.terms.order_id().unwrap());
                             let budget_id = B256::repeat_byte((index + 1) as u8);
@@ -2220,6 +2311,7 @@ mod tests {
                             provider_gas_cap: "100000000000000000".into(),
                             network_id: None,
                             authorized_by: None,
+                            role: Role::Provider,
                         })?,
                     )?;
                     for (window, capsule) in capsules[index].iter().enumerate() {
@@ -2281,18 +2373,23 @@ mod tests {
                     &policy(),
                 )?;
                 delivery.with_store(|store| {
-                    store.reserve_budget_transaction(
+                    let mut original = claim.clone();
+                    original.attempts.clear();
+                    store.put_value(&claim.key(), &serde_json::to_vec(&original)?)?;
+                    store.signed_publication_transaction(
                         &intent,
                         index as u64,
                         &group(&budget_id),
                         &claim.terms.gas_cap,
+                        (&claim.key(), &serde_json::to_vec(&claim)?),
+                        |_, _| {
+                            Ok((
+                                "0x02".into(),
+                                format!("0x{}", format!("{:02x}", 0x99 + index).repeat(32)),
+                            ))
+                        },
                     )?;
-                    store.sign_transaction_with_claim(
-                        &attempt,
-                        "0x02",
-                        &format!("0x{}", format!("{:02x}", 0x99 + index).repeat(32)),
-                        Some((&claim.key(), &serde_json::to_vec(&claim)?)),
-                    )
+                    Ok(())
                 })?;
                 claims.push(claim);
             }
@@ -2410,6 +2507,318 @@ mod tests {
             );
             self.assert_read_only(&[])
         }
+    }
+
+    #[tokio::test]
+    async fn review_regression_old_active_budget_survives_new_history_for_ready_hold_and_publication()
+    -> Result<()> {
+        let mut fixture = PublicationFixture::with_current_orders([0, 0]).await?;
+        fixture.delivery.identity = crate::crypto::LocalIdentity {
+            secret_key_hex: hex::encode([3; 32]),
+        };
+        let mark_historical = |order: &mut StoredOrder| {
+            order.settlement_complete = true;
+            order.chain_observed_at_ms = crate::runtime::now_ms();
+            order.view.phase = super::super::types::Phase::Paid;
+            order.view.payment.state = super::super::types::PaymentState::Withdrawn;
+            order.view.payment.settlement = Some(super::super::types::BudgetSettlement {
+                earned: "7".into(),
+                withdrawn: "7".into(),
+                refunded: "0".into(),
+                publication: None,
+            });
+            for window in &mut order.view.windows {
+                window.state = super::super::types::WindowState::Earned;
+            }
+            assert!(order.historical());
+        };
+        mark_historical(&mut fixture.orders[0]);
+        fixture
+            .delivery
+            .with_store(|store| store.save_order(&fixture.orders[0]))?;
+        let mut settings = fixture.delivery.config();
+        settings.max_orders = 4;
+        fixture.delivery.configure_local(settings)?;
+        let active = fixture.orders[1].clone();
+        let id = active.view.payment.budget_id.clone().unwrap();
+        let windows = (0..2)
+            .map(|index| WindowRef {
+                order_id: active.view.order_id.clone(),
+                index,
+            })
+            .collect::<Vec<_>>();
+        let mut seal = vec![0; 260];
+        seal[..4].copy_from_slice(&[0x73, 0xc4, 0x57, 0xba]);
+        for window in &windows {
+            fixture
+                .delivery
+                .queue_hold(&active, window.index, seal.clone())?;
+        }
+        assert_eq!(
+            fixture.delivery.budget_ready_windows(&id).await?,
+            windows,
+            "positive control before history churn"
+        );
+        fixture.delivery.authorize_budget_batch(&id).await?;
+        let before_hold = fixture.delivery.flush_budget_holds(&id).await.unwrap_err();
+        assert!(
+            before_hold
+                .to_string()
+                .contains("unlock the local delivery wallet"),
+            "the positive hold control reaches the existing wallet gate"
+        );
+        for seed in 10..16 {
+            let mut terms = fixture.orders[0].order.unsigned.terms.clone();
+            terms.payer_order_nonce = [seed; 32];
+            let protocol = support::fixture_from_terms(
+                fixture.rpc.chain.config().profile.clone(),
+                terms,
+                vec![
+                    vibeface_delivery::SecretBytes::new(vec![seed; 4]),
+                    vibeface_delivery::SecretBytes::new(vec![seed + 1; 4]),
+                ],
+                vibeface_delivery::Amount::from_u64(2),
+                vibeface_delivery::Amount::from_u64(1),
+            );
+            let mut historical = fixture.orders[0].clone();
+            historical.order = protocol.order;
+            historical.view = super::super::orders::view(
+                &uuid::Uuid::new_v4().to_string(),
+                Role::Provider,
+                &historical.order,
+                8,
+            )?;
+            historical.view.payment.budget_id = fixture.orders[0].view.payment.budget_id.clone();
+            mark_historical(&mut historical);
+            fixture
+                .delivery
+                .with_store(|store| store.save_order(&historical))?;
+        }
+        let list = fixture.delivery.with_store(|store| store.orders(None))?;
+        assert_eq!(list.len(), 4);
+        assert!(list.iter().all(StoredOrder::historical));
+        assert!(
+            !list
+                .iter()
+                .any(|order| order.view.order_id == active.view.order_id),
+            "the UI-sized list actually hides the old active order"
+        );
+        let ready = fixture.delivery.budget_ready_windows(&id).await?;
+        let authorized = fixture.delivery.authorize_budget_batch(&id).await.is_ok();
+        let held = fixture
+            .delivery
+            .flush_budget_holds(&id)
+            .await
+            .err()
+            .is_some_and(|error| {
+                error
+                    .to_string()
+                    .contains("unlock the local delivery wallet")
+            });
+        fixture.observation.lock().unwrap().phases = [1, 1];
+        fixture.delivery.flush_budget_holds(&id).await?;
+        let claims = fixture.delivery.claims()?;
+        let published = claims.iter().any(|claim| {
+            claim
+                .terms
+                .items
+                .iter()
+                .map(|item| item.window.clone())
+                .collect::<Vec<_>>()
+                == windows
+        });
+        assert_eq!(
+            (ready, authorized, held, published),
+            (windows, true, true, true),
+            "history must not hide ready windows, batch authorization, a pending hold or its durable publication claim"
+        );
+        assert!(
+            fixture
+                .delivery
+                .with_store(|store| store.recent_transactions())?
+                .is_empty()
+        );
+        fixture.assert_read_only(&[])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_regression_foreign_quote_keeps_private_budget_and_receiver_capacity_unchanged()
+    -> Result<()> {
+        use super::super::{DeliveryConfig, types::ServiceRequest, wallet::SecretString};
+        let mut fixture = PublicationFixture::with_current_orders([0, 0]).await?;
+        let identity = crate::crypto::LocalIdentity {
+            secret_key_hex: hex::encode([3; 32]),
+        };
+        fixture.delivery.identity = identity.clone();
+        crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false).save(&fixture.dir)?;
+        crate::config::private_write(
+            &fixture.dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &fixture.dir.join("identity.json"),
+            &serde_json::to_vec(&identity)?,
+        )?;
+        let mut node = crate::runtime::Runtime::open(&fixture.dir).await?;
+        node.delivery = fixture.delivery;
+        let passphrase = SecretString::new("synthetic quote regression wallet".into());
+        let wallet = {
+            let mut wallet = node.delivery.wallet.lock().unwrap();
+            wallet.create(&passphrase)?;
+            wallet.unlock(&passphrase)?;
+            wallet.address()?
+        };
+        let config = DeliveryConfig {
+            delivery_fee_per_window: "2".into(),
+            reservation_fee_per_window: "1".into(),
+            priority_fee: "1".into(),
+            ..node.delivery.config()
+        };
+        node.delivery.configure_local(config.clone())?;
+        let original =
+            support::fixture_with_profile(&[4, 4], fixture.rpc.chain.config().profile.clone());
+        let mut terms = original.order.unsigned.terms;
+        let deadlines =
+            super::super::paid_deadlines(super::super::now(), &fixture.rpc.chain.config().profile);
+        terms.quote_expires_at = deadlines.quote_expires_at;
+        terms.hold_deadline = deadlines.hold_deadline;
+        terms.key_deadline = deadlines.key_deadline;
+        terms.open_deadline = deadlines.open_deadline;
+        terms.retain_until = deadlines.retain_until;
+        terms.priority_deadline = deadlines.priority_deadline;
+        terms.binding.valid_from = super::super::now();
+        terms.binding.valid_until = deadlines.retain_until;
+        terms.provider_wallet = wallet.into_array();
+        let quoted = |terms: vibeface_delivery::Terms| -> Result<(
+            vibeface_delivery::UnsignedOrder,
+            vibeface_delivery::SignedKeyBinding,
+        )> {
+            let binding = vibeface_delivery::SignedKeyBinding {
+                signature: support::sign(1, "delivery-key", &terms.binding.signing_payload()?),
+                binding: terms.binding.clone(),
+            };
+            let windows = (0..2)
+                .map(|index| {
+                    Ok(vibeface_delivery::encrypt_window(
+                        &terms,
+                        index as u16,
+                        (index * 4) as u64,
+                        &[8; 4],
+                        &support::randomness(index),
+                        vibeface_delivery::Amount::from_u64(2),
+                        vibeface_delivery::Amount::from_u64(1),
+                    )?
+                    .spec)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let order = vibeface_delivery::UnsignedOrder {
+                terms,
+                windows,
+                quote_nonce: [0x77; 32],
+            };
+            order.validate()?;
+            Ok((order, binding))
+        };
+        let budget_terms = |id: &str, terms: &vibeface_delivery::Terms| BudgetTerms {
+            budget_id: id.into(),
+            chain_id: 31337,
+            escrow: config.chain.as_ref().unwrap().escrow.clone(),
+            payer: chain::address_hex(terms.payer.into()),
+            payee: chain::address_hex(terms.provider_wallet.into()),
+            provider_peer: hex::encode(terms.provider_peer),
+            asset: chain::address_hex(terms.asset.into()),
+            deposit: "7".into(),
+        };
+        let own = "91".repeat(32);
+        let (order, binding) = quoted(terms.clone())?;
+        fixture.observation.lock().unwrap().quote =
+            Some((budget_terms(&own, &terms), binding.clone()));
+        let remote = hex::encode(terms.source_peer);
+        let result = node
+            .delivery
+            .handle_service(
+                &node,
+                &remote,
+                ServiceRequest::Quote {
+                    mode: super::super::types::Mode::Paid,
+                    order,
+                    binding,
+                    file_bytes: 8,
+                    intent_id: uuid::Uuid::new_v4().to_string(),
+                    budget_id: own.clone(),
+                },
+            )
+            .await?;
+        assert!(
+            !result["wallet_signature"].as_array().unwrap().is_empty(),
+            "a designated local Provider still issues its paid quote"
+        );
+        assert_eq!(node.delivery.budget_record(&own)?.role, Role::Provider);
+        let budget_snapshot = || -> Result<(Vec<Word>, usize)> {
+            let values = node
+                .delivery
+                .with_store(|store| store.values_with_prefix("protected-budget:"))?;
+            let receiver_bytes = values
+                .iter()
+                .map(|body| Ok((body, serde_json::from_slice::<BudgetRecord>(body)?)))
+                .collect::<Result<Vec<_>>>()?
+                .iter()
+                .filter(|(_, record)| record.role == Role::Receiver)
+                .map(|(body, record)| body.len() + record_key(&record.terms.budget_id).len() + 128)
+                .sum();
+            Ok((
+                values.iter().map(|body| hash(body)).collect(),
+                receiver_bytes,
+            ))
+        };
+        let before = budget_snapshot()?;
+        let transactions = node
+            .delivery
+            .with_store(|store| store.recent_transactions())?;
+        let foreign = "92".repeat(32);
+        terms.provider_peer = ed25519_dalek::SigningKey::from_bytes(&[4; 32])
+            .verifying_key()
+            .to_bytes();
+        let (order, binding) = quoted(terms.clone())?;
+        fixture.observation.lock().unwrap().quote =
+            Some((budget_terms(&foreign, &terms), binding.clone()));
+        let error = node
+            .delivery
+            .handle_service(
+                &node,
+                &remote,
+                ServiceRequest::Quote {
+                    mode: super::super::types::Mode::Paid,
+                    order,
+                    binding,
+                    file_bytes: 8,
+                    intent_id: uuid::Uuid::new_v4().to_string(),
+                    budget_id: foreign.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("different sender or provider"),
+            "foreign-provider rejection must be the exercised boundary: {error}"
+        );
+        let absent = node
+            .delivery
+            .with_store(|store| store.value(&record_key(&foreign)))?
+            .is_none();
+        let after = budget_snapshot()?;
+        let unchanged_transactions = node
+            .delivery
+            .with_store(|store| store.recent_transactions())?
+            == transactions;
+        assert_eq!(
+            (absent, after, unchanged_transactions),
+            (true, before, true),
+            "rejecting a foreign canonical quote must not create a Receiver budget or consume its capacity"
+        );
+        node.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
-//! The target Node's work state machine. It is the only authority for a work unit:
-//! `transition` is the only source of Work events in the DAG, and the DAG projection,
-//! the pending-check list and the Web state all derive from it.
+//! The target Node's work state machine. It is the authority for a work unit's execution
+//! states: `transition` writes the Work events the target itself produces, and the DAG
+//! projection, the pending-check list and the Web state derive from them. Two other Work events
+//! come from the Store on purpose: the user's signed settlement (`settle_work`) and the
+//! conversation owner's `unverified` record for a removed target (`unverify_removed_works`).
 use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
 use vibeface_bridge::{failure::ExecFailure, turn::TurnStatus};

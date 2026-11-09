@@ -112,7 +112,7 @@ export const eraseSoleManagerText = (self: string) => `${self}是唯一的管理
 /** A join link from another network, opened on a device already in one. */
 export const switchCopy = {
   title: '换到新的网络？',
-  erase: (self: string) => `${self}会离开当前网络，并清除本机数据`,
+  erase: (self: string) => `${self}会离开当前网络，并清除 Vibeface 应用内数据。已导出的副本和照片、文件原件仍由你保管。`,
   leave: (self: string) => `${self}会离开当前网络`,
   confirm: '换网络',
 }

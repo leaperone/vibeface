@@ -221,6 +221,18 @@ impl Delivery {
             return Ok(());
         };
         let _maintenance = node.maintenance.enter()?;
+        if self.data_dir.join("delivery/service.sqlite3").exists() {
+            let config = self.config();
+            self.with_store(|store| {
+                if config.charity_enabled {
+                    store.reclaim_unaccepted_receivers(now(), Mode::Charity)?;
+                }
+                if config.paid_enabled {
+                    store.reclaim_unaccepted_receivers(now(), Mode::Paid)?;
+                }
+                Ok(())
+            })?;
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(30), self.run_provider()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -230,9 +242,18 @@ impl Delivery {
         }
         if node.has_membership().await? {
             let network = node.membership_state().await?.genesis.network_id;
-            let mut orders = self.with_store(|store| store.orders(Some(&network)))?;
+            let mut orders = if self.config().paid_enabled {
+                self.with_store(|store| store.progress_orders(Some(&network)))?
+            } else {
+                Vec::new()
+            };
             orders.sort_by_key(|order| order.view.updated_at_ms);
-            for order in orders {
+            let history = orders
+                .iter()
+                .filter(|order| order.historical())
+                .min_by_key(|order| order.chain_observed_at_ms)
+                .cloned();
+            for order in orders.into_iter().filter(|order| !order.historical()) {
                 if !(order.confirmed || order.accepted) {
                     continue;
                 }
@@ -265,7 +286,10 @@ impl Delivery {
                         let mut order = self.with_store(|store| store.order(&id))?;
                         order.resume_requested = error.is::<proof::Busy>();
                         order.view.error = Some(error.to_string());
-                        if order.view.mode == Mode::Paid
+                        if error.is::<ReceivingKeyUnavailable>() {
+                            order.view.phase = Phase::KeyUnavailable;
+                            order.view.evidence = Evidence::None;
+                        } else if order.view.mode == Mode::Paid
                             && !matches!(order.view.phase, Phase::Prepared | Phase::Proving)
                         {
                             order.view.chain_unknown();
@@ -274,6 +298,17 @@ impl Delivery {
                     }
                 }
                 break;
+            }
+            if let Some(mut order) = history {
+                if let Err(error) = self.update_paid_view(&mut order).await {
+                    order.view.chain_unknown();
+                    if error.is::<ReceivingKeyUnavailable>() {
+                        order.view.phase = Phase::KeyUnavailable;
+                    }
+                    order.resume_requested = true;
+                    order.view.error = Some(error.to_string());
+                }
+                self.save(&mut order)?;
             }
             self.charity_run_authorized(node).await?;
         }
@@ -335,6 +370,47 @@ impl Delivery {
         ensure!(
             current.enabled && current.paid_enabled && current.chain.as_ref() == Some(chain),
             "delivery configuration changed; preserve the original transaction for read-only reconciliation"
+        );
+        Ok(())
+    }
+    pub(crate) async fn authorize_transaction(
+        &self,
+        intent: &store::SpendIntent,
+        chain: &chain::ChainConfig,
+    ) -> Result<()> {
+        self.authorize_spend(&intent.id, chain).await?;
+        let group = intent
+            .id
+            .split('/')
+            .next()
+            .context("spend intent has no order")?;
+        let cap = if let Some(id) = group.strip_prefix("budget-") {
+            let record = self.budget_record(id)?;
+            if chain::address(&intent.wallet)? == chain::address(&record.terms.payer)? {
+                record.payer_gas_cap
+            } else {
+                ensure!(
+                    chain::address(&intent.wallet)? == chain::address(&record.terms.payee)?,
+                    "budget transaction wallet differs from its fixed payer and payee"
+                );
+                record.provider_gas_cap
+            }
+        } else if group.starts_with("key-") {
+            String::from_utf8(
+                self.with_store(|store| store.value(&format!("local-spend:{group}")))?
+                    .context("key registration has no local gas authorization")?,
+            )?
+        } else {
+            let order = self.with_store(|store| store.order(group))?;
+            if order.view.role == Role::Provider {
+                self.config().provider_gas_cap
+            } else {
+                order.view.payment.gas_cap
+            }
+        };
+        ensure!(
+            intent.gas_cap == cap,
+            "delivery gas authorization changed; restore the original intent authorization before signing or rebroadcasting"
         );
         Ok(())
     }
@@ -447,12 +523,12 @@ impl Delivery {
             self.with_store(|store| {
                 store.value(&format!("receiving-key:{}", hex::encode(key_id)))
             })?
-            .context("receiving key is unavailable; restore the independent delivery backup")?,
+            .ok_or(ReceivingKeyUnavailable)?,
         );
         let material: ReceivingMaterial = serde_json::from_slice(&bytes)?;
         material
             .secret
-            .context("receiving key material has been revoked")
+            .ok_or_else(|| ReceivingKeyUnavailable.into())
     }
     fn ensure_mode(&self, mode: Mode) -> Result<()> {
         let config = self.config();
@@ -631,11 +707,12 @@ impl Delivery {
                     "batch confirmation requires the original prepared orders"
                 );
                 let active: usize = self
-                    .with_store(|store| store.orders(Some(network)))?
+                    .with_store(|store| store.progress_orders(Some(network)))?
                     .iter()
                     .filter(|other| {
                         other.view.role == Role::Sender
                             && other.confirmed
+                            && !other.historical()
                             && !ids.contains(&other.view.order_id)
                             && !matches!(
                                 other.view.phase,
@@ -690,14 +767,16 @@ impl Delivery {
                         self.charity_confirm(node, network, intent, device).await?,
                     )?);
                 };
+                self.ensure_mode(Mode::Paid)?;
                 if !order.confirmed {
                     let active: usize = self
-                        .with_store(|store| store.orders(Some(network)))?
+                        .with_store(|store| store.progress_orders(Some(network)))?
                         .iter()
                         .filter(|other| {
                             other.view.order_id != order.view.order_id
                                 && other.view.role == Role::Sender
                                 && other.confirmed
+                                && !other.historical()
                                 && !matches!(
                                     other.view.phase,
                                     Phase::Paid | Phase::Refunded | Phase::Failed
@@ -751,6 +830,13 @@ impl Delivery {
                             && !matches!(order.view.phase, Phase::Refunded | Phase::Failed),
                         "batch acceptance requires live receiving orders"
                     );
+                    if !order.accepted {
+                        ensure!(
+                            now() <= order.order.unsigned.terms.hold_deadline,
+                            "delivery acceptance deadline expired"
+                        );
+                        self.receiver_secret(order.order.unsigned.terms.binding.key_id)?;
+                    }
                     orders.push(order);
                 }
                 let budget_id = orders[0]
@@ -768,11 +854,12 @@ impl Delivery {
                     "receiving batch uses one budget and at most two windows"
                 );
                 let active: usize = self
-                    .with_store(|store| store.orders(Some(network)))?
+                    .with_store(|store| store.progress_orders(Some(network)))?
                     .iter()
                     .filter(|o| {
                         o.view.role == Role::Receiver
                             && o.accepted
+                            && !o.historical()
                             && !ids.contains(&o.view.order_id)
                             && !matches!(
                                 o.view.phase,
@@ -806,19 +893,26 @@ impl Delivery {
                     )?);
                 }
                 let mut order = self.scoped_order(network, id)?;
+                self.ensure_mode(Mode::Paid)?;
                 if op == "accept" {
                     ensure!(
                         order.view.role == Role::Receiver,
                         "only the receiving Node can accept delivery"
                     );
                     if !order.accepted {
+                        ensure!(
+                            now() <= order.order.unsigned.terms.hold_deadline,
+                            "delivery acceptance deadline expired"
+                        );
+                        self.receiver_secret(order.order.unsigned.terms.binding.key_id)?;
                         let active: usize = self
-                            .with_store(|store| store.orders(Some(network)))?
+                            .with_store(|store| store.progress_orders(Some(network)))?
                             .iter()
                             .filter(|other| {
                                 other.view.order_id != order.view.order_id
                                     && other.view.role == Role::Receiver
                                     && other.accepted
+                                    && !other.historical()
                                     && !matches!(
                                         other.view.phase,
                                         Phase::Paid | Phase::Refunded | Phase::Failed
@@ -851,7 +945,17 @@ impl Delivery {
                     order.view.role == Role::Receiver && order.accepted,
                     "delivery must be accepted on the receiving Node"
                 );
-                self.read(&order)
+                match self.read(&order) {
+                    Err(error) if error.is::<ReceivingKeyUnavailable>() => {
+                        let mut order = order;
+                        order.view.phase = Phase::KeyUnavailable;
+                        order.view.evidence = Evidence::None;
+                        order.view.error = Some(error.to_string());
+                        self.save(&mut order)?;
+                        Err(error)
+                    }
+                    result => result,
+                }
             }
             _ => bail!("unknown delivery operation"),
         }
@@ -861,6 +965,15 @@ impl Delivery {
         self.with_store(|store| store.save_order(order))
     }
 }
+
+#[derive(Debug)]
+struct ReceivingKeyUnavailable;
+impl std::fmt::Display for ReceivingKeyUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("receiving key is unavailable; restore the independent delivery backup")
+    }
+}
+impl std::error::Error for ReceivingKeyUnavailable {}
 
 fn now() -> u64 {
     (crate::runtime::now_ms().max(0) as u64) / 1000

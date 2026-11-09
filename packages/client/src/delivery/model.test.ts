@@ -288,7 +288,8 @@ test('only completed delivery or a full refund permits an explicit new paid orde
   paid.windows = paid.windows.map(window => ({ ...window, state: 'earned' }))
   assert.equal(canRestart(parseOrder(paid)), true)
   assert.equal(canRestart({ ...paid, payment: { ...paid.payment, state: 'unknown' } }), false)
-  assert.equal(canRestart({ ...paid, payment: { ...paid.payment, state: 'included' } }), false)
+  for (const state of ['submitted', 'included']) assert.throws(() => parseOrder({ ...paid, payment: { ...paid.payment, state } }), /\u72b6\u6001/)
+  assert.throws(() => parseOrder({ ...paid, phase: 'refundable' }), /\u72b6\u6001/)
   for (const phase of ['failed', 'prepared', 'partial', 'reconciling'] satisfies DeliveryOrder['phase'][]) assert.equal(canRestart({ ...paid, phase }), false)
   const refunded: DeliveryOrder = { ...paidOrder(), phase: 'refunded', payment: { ...paidOrder().payment, state: 'refunded', refunded: paid.payment.total } }
   assert.equal(canRestart(parseOrder(refunded)), true)

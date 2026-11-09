@@ -677,7 +677,7 @@ impl Chain {
             );
             wallet.address()?
         };
-        let transaction = if let Some(transaction) = existing {
+        let (intent, pending_nonce) = if let Some(transaction) = existing {
             let (target, calldata) = encode_call(&self.config, call, wallet)?;
             ensure!(
                 transaction.intent.to == address_hex(target)
@@ -686,40 +686,73 @@ impl Chain {
                     && transaction.intent.gas_cap == gas_cap,
                 "delivery spend intent changed; reconcile the original authorization"
             );
-            transaction
+            if transaction.raw_tx.is_some() {
+                return self.reconcile_transaction(delivery, id).await;
+            }
+            (transaction.intent, transaction.nonce)
         } else {
             delivery.authorize_spend(id, &self.config).await?;
             let intent = self
                 .prepare_intent(id.to_owned(), wallet, call, gas_cap.to_owned())
                 .await?;
-            let pending_nonce = self.pending_nonce(wallet).await?;
-            delivery.authorize_spend(id, &self.config).await?;
-            let group = id
-                .split('/')
-                .next()
-                .context("delivery intent has no budget group")?;
-            ensure!(
-                !group.is_empty()
-                    && group
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
-                "invalid delivery transaction budget group"
-            );
-            delivery.with_store(|store| {
-                store.reserve_budget_transaction(&intent, pending_nonce, group, gas_cap)
-            })?
+            (intent, self.pending_nonce(wallet).await?)
         };
-        if transaction.raw_tx.is_none() {
-            delivery.authorize_spend(id, &self.config).await?;
-            let signed = delivery
-                .wallet
-                .lock()
-                .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?
-                .sign_transaction(&self.config, &transaction.intent, transaction.nonce)?;
-            delivery
-                .with_store(|store| store.sign_transaction(id, &signed.raw_tx, &signed.tx_hash))?;
-        }
+        self.sign_original(delivery, &intent, pending_nonce).await?;
         self.reconcile_transaction(delivery, id).await
+    }
+
+    async fn sign_original(
+        &self,
+        delivery: &super::Delivery,
+        intent: &SpendIntent,
+        pending_nonce: u64,
+    ) -> Result<()> {
+        delivery.authorize_transaction(intent, &self.config).await?;
+        let group = intent
+            .id
+            .split('/')
+            .next()
+            .context("delivery intent has no budget group")?;
+        let wallet = delivery
+            .wallet
+            .lock()
+            .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
+        delivery.with_store(|store| {
+            store.signed_budget_transaction(
+                intent,
+                pending_nonce,
+                group,
+                &intent.gas_cap,
+                |intent, nonce| {
+                    let signed = wallet.sign_transaction(&self.config, intent, nonce)?;
+                    Ok((signed.raw_tx, signed.tx_hash))
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(super) async fn unfunded_after(&self, order_id: Word, retain_until: u64) -> Result<bool> {
+        let position = self.confirmed_position().await?;
+        if position.timestamp <= retain_until {
+            return Ok(false);
+        }
+        let topic = keccak256(b"Funded(bytes32,address,uint256)");
+        let logs = self
+            .rpc(
+                "eth_getLogs",
+                json!([{
+                    "address":self.config.escrow,"fromBlock":"0x0",
+                    "toBlock":format!("0x{:x}",position.block_number),
+                    "topics":[format!("{topic:#x}"),format!("0x{}",hex::encode(order_id))]
+                }]),
+            )
+            .await?;
+        let logs = logs
+            .as_array()
+            .context("invalid delivery funding log response")?;
+        self.verify_position(&position).await?;
+        Ok(logs.is_empty())
     }
 
     pub(super) async fn reconcile_transaction(
@@ -727,7 +760,7 @@ impl Chain {
         delivery: &super::Delivery,
         id: &str,
     ) -> Result<TxObservation> {
-        let transaction = delivery.with_store(|store| store.transaction(id))?;
+        let mut transaction = delivery.with_store(|store| store.transaction(id))?;
         ensure!(
             !is_disclosure_calldata(&hex_data(
                 &Value::String(transaction.intent.calldata.clone()),
@@ -737,6 +770,26 @@ impl Chain {
         );
         let wallet = address(&transaction.intent.wallet)?;
         checked_transaction(&self.config, &transaction.intent, wallet, transaction.nonce)?;
+        if transaction.raw_tx.is_none() {
+            if let Err(error) = self
+                .sign_original(delivery, &transaction.intent, transaction.nonce)
+                .await
+            {
+                let result = observation(
+                    "reserved",
+                    None,
+                    None,
+                    Some(&format!(
+                        "recover the original unsigned delivery intent: {error}"
+                    )),
+                );
+                delivery.with_store(|store| {
+                    store.observe_transaction(id, "reserved", None, None, result.error.as_deref())
+                })?;
+                return Ok(result);
+            }
+            transaction = delivery.with_store(|store| store.transaction(id))?;
+        }
         let mut result = self.observe(&transaction).await.unwrap_or_else(|_| {
             observation(
                 "unknown",
@@ -753,7 +806,10 @@ impl Chain {
             let pending_nonce = self.pending_nonce(wallet).await;
             let nonce_available =
                 matches!(&pending_nonce, Ok(nonce) if *nonce <= transaction.nonce);
-            let authorized = delivery.authorize_spend(id, &self.config).await.is_ok();
+            let authorized = delivery
+                .authorize_transaction(&transaction.intent, &self.config)
+                .await
+                .is_ok();
             let unlocked = matches!(delivery.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), super::wallet::WalletStatus::Unlocked { address } if address == transaction.intent.wallet);
             if !authorized || !unlocked || !nonce_available {
                 result.phase = "unknown".into();
@@ -1496,6 +1552,69 @@ pub(super) mod tests {
             .expect("built-in delivery profile"),
         }
     }
+    #[tokio::test]
+    async fn no_funding_requires_the_original_confirmed_interval_and_rejects_unknown_or_reorg()
+    -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let mode = Arc::new(AtomicUsize::new(0));
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let app = axum::Router::new().route("/", axum::routing::post({
+            let mode = mode.clone(); let blocks = blocks.clone(); let requests = requests.clone();
+            move |axum::Json(input): axum::Json<Value>| {
+                let mode = mode.clone(); let blocks = blocks.clone(); let requests = requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let mode = mode.load(Ordering::Relaxed);
+                    let result = match input["method"].as_str().unwrap() {
+                        "eth_blockNumber" => json!("0x65"),
+                        "eth_getBlockByNumber" => {
+                            assert_eq!(input["params"][0], "0x64");
+                            let read = blocks.fetch_add(1, Ordering::Relaxed);
+                            json!({"number":"0x64","timestamp":if mode==4 {"0x1f4"}else{"0x3e8"},
+                                "hash":format!("0x{}", if mode==3 && read>0 {"bb"}else{"aa"}.repeat(32))})
+                        },
+                        "eth_getLogs" => {
+                            assert_eq!(input["params"][0]["fromBlock"], "0x0");
+                            assert_eq!(input["params"][0]["toBlock"], "0x64");
+                            assert_eq!(input["params"][0]["topics"][1], format!("0x{}", "07".repeat(32)));
+                            if mode == 1 {json!([{"funded":true}])} else {json!([])}
+                        },
+                        _ => panic!("unexpected controlled RPC method"),
+                    };
+                    axum::Json(if mode == 2 {json!({"jsonrpc":"2.0","id":input["id"],"error":{"code":-32000,"message":"synthetic offline"}})}
+                        else {json!({"jsonrpc":"2.0","id":input["id"],"result":result})})
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut config = config();
+        config.rpc_url = origin;
+        let chain = Chain {
+            config,
+            client: reqwest::Client::builder().no_proxy().build()?,
+            request_id: AtomicU64::new(1),
+        };
+        assert!(chain.unfunded_after([7; 32], 600).await?);
+        mode.store(1, Ordering::Relaxed);
+        blocks.store(0, Ordering::Relaxed);
+        assert!(!chain.unfunded_after([7; 32], 600).await?);
+        mode.store(2, Ordering::Relaxed);
+        blocks.store(0, Ordering::Relaxed);
+        assert!(chain.unfunded_after([7; 32], 600).await.is_err());
+        mode.store(3, Ordering::Relaxed);
+        blocks.store(0, Ordering::Relaxed);
+        assert!(chain.unfunded_after([7; 32], 600).await.is_err());
+        mode.store(4, Ordering::Relaxed);
+        blocks.store(0, Ordering::Relaxed);
+        assert!(!chain.unfunded_after([7; 32], 600).await?);
+        assert!(requests.load(Ordering::Relaxed) > 0);
+        server.abort();
+        Ok(())
+    }
     #[test]
     fn a_missing_receipt_and_advanced_pending_nonce_never_prove_payment_failure() {
         for pending in [6, 7, 8, 100] {
@@ -1861,6 +1980,33 @@ pub(super) mod tests {
                 )
                 .is_err()
         );
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("disclosure-reconciler-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery =
+            super::super::Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
+        delivery.configure_local(super::super::DeliveryConfig {
+            enabled: true,
+            ..Default::default()
+        })?;
+        let mut disguised = offline;
+        disguised.id = "ordinary/disguised".into();
+        delivery.with_store(|store| {
+            store.signed_budget_transaction(&disguised, 0, "ordinary", cap, |_, _| {
+                Ok(("0x02".into(), format!("0x{}", "aa".repeat(32))))
+            })
+        })?;
+        let error = chain
+            .reconcile_transaction(&delivery, &disguised.id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("durable claim"),
+            "calldata guard also rejects E under an unrelated intent name"
+        );
+        drop(delivery);
+        std::fs::remove_dir_all(dir)?;
         assert!(
             tokio::time::timeout(Duration::from_millis(20), listener.accept())
                 .await

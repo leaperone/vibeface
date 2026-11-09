@@ -56,15 +56,17 @@ export type Platform = {
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
   foreground(): boolean
-  /** Hands a sealed recovery file to the person to keep, under `name`. */
+  /** Opens a sealed file's download or share; completion does not confirm an external saved copy. */
   saveRecovery(bytes: Uint8Array, name: string): void | Promise<void>
+  /** A sealed pending file and its index, stored together before recovery is committed. Web uses tab storage. */
+  recoveryStorage?: { read(): string | null; write(value: string | null): void }
   files?: {
     pick(): Promise<TransferFile | null>
     save(bytes: Uint8Array, name: string): Promise<'saved' | 'handed_off'>
   }
   /** How messages name this device: 这个浏览器, 这台手机. */
   self: string
-  /** Deletes this device's key and everything it stored, for a factory reset. */
+  /** Deletes this device's key and app-owned local data. External originals and exported copies stay with the person. */
   erase?(): Promise<void>
   page?: LocalPage
   joinTabs?: JoinTabs

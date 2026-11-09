@@ -38,7 +38,6 @@ pub enum Phase {
     Recoverable,
     Paid,
     Partial,
-    Refundable,
     Refunded,
     Reconciling,
     KeyUnavailable,
@@ -58,8 +57,6 @@ pub enum Evidence {
 pub enum PaymentState {
     Free,
     Prepared,
-    Submitted,
-    Included,
     Confirmed,
     Earned,
     Withdrawn,
@@ -206,6 +203,45 @@ pub struct StoredOrder {
     pub accepted: bool,
     pub notified: bool,
     pub allocation_batch: Vec<String>,
+    #[serde(skip)]
+    pub chain_observed_at_ms: i64,
+    #[serde(skip)]
+    pub settlement_complete: bool,
+}
+impl StoredOrder {
+    pub(super) fn historical(&self) -> bool {
+        self.settlement_complete
+            && self
+                .view
+                .payment
+                .settlement
+                .as_ref()
+                .is_some_and(|budget| budget.earned == budget.withdrawn)
+            && self
+                .view
+                .windows
+                .iter()
+                .all(|window| matches!(window.state, WindowState::Earned | WindowState::Refunded))
+            && !self.resume_requested
+            && self.view.error.is_none()
+            && !matches!(
+                self.view.phase,
+                Phase::Reconciling | Phase::KeyUnavailable | Phase::Failed
+            )
+            && self.view.payment.state != PaymentState::Unknown
+            && (self.view.role != Role::Receiver
+                || self
+                    .view
+                    .windows
+                    .iter()
+                    .all(|window| window.state == WindowState::Refunded)
+                || self.view.name.is_some()
+                    && self.view.sha256.is_some()
+                    && matches!(
+                        self.view.evidence,
+                        Evidence::Recoverable | Evidence::DecryptionProven
+                    ))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -10,7 +10,9 @@
 
 在 S、P 的本机维护命令中创建并解锁独立钱包，备份保管方式沿用钱包命令。密码只通过受保护 FD 传递。R 先用现有 `register-key` 操作完成真实接收密钥注册，再准备订单；历史接收密钥仍保留给已分配订单。
 
-S 和 R 各自管理个人网络，可以属于不同网络。P 是普通公共 Node，可以不加入二者的个人网络。服务通道认证 PeerID，个人网络通道另外验证成员资格；服务 PeerID 不授予个人网络成员权限。
+S 和 R 各自管理个人网络，可以属于不同网络。P 是普通公共 Node，可以不加入二者的个人网络。服务通道认证 PeerID，个人网络通道另外验证成员资格；服务 PeerID 不授予个人网络成员权限。付款、报价或发现记录不能访问私人事件、附件、Agent 或模型密钥。
+
+浏览器把明文文件交给当前连接的可信 S。传输加密不能隔离恶意发送端、接收端或提供客户端代码的网页 origin。P 看不到文件名和正文，但能看到 PeerID、对象大小、哈希、时间和访问关系。合约公开钱包、条款、证明和 E；E 是给 R 的加密密钥包，不是明文文件密钥。
 
 ```sh
 node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output "$VDP_RUN/deployment.json"
@@ -96,10 +98,18 @@ vibeface wallet --data-dir "$VDP_SOURCE" budget refund \
 
 R 拒绝 Hold 时没有 delivery earned，预算到期可退，P 的资源支出不一定获得补偿。Source/Hold+E 不证明中继实际物理路径、独有带宽或持续存储时长；传输/预留费只是报价组成，没有新增存储或带宽证明。
 
+## 本机安全与容量
+
+网页只设置服务开关；链部署、prover 和独立钱包由本机所有者配置。钱包口令通过关闭回显的 TTY 或受保护 FD 输入，不进入参数、环境变量、网页或聊天。历史接收密钥缺失时订单显示 `key_unavailable`，停止证明与恢复，保留原订单、密文、恢复包和债权；须从独立备份恢复，不能生成新密钥冒充旧密钥。
+
+订单、对象、私密材料、证明收据、交易账本和 gas 预算共享 `storage_limit_bytes`。本人授权订单、未接受的外来 Receiver 和外部 Provider 分三类；后两类各不超过 `max_orders` 和字节上限的四分之一，合计不超过总上限，数据库及对象文件另受同一物理上限约束。预算交易、Hold、claim 和其窗口关联按同一实际归属计入配额，未找到归属不会自动归到本人容量。历史订单只在当前 canonical 逐窗和奖金会计完整、预算收入已提取，且 Receiver 确已本地恢复时释放活动槽；记录及字节继续计入。未知、重组、缺密钥或待办使订单重新活跃，claim 另行持续对账。
+
+签名、nonce、累计 gas 及本次 attempt 绑定在同一事务内提交；签名或配额失败回滚本次预留，保留既存逻辑 claim、旧 raw 和未知广播账本。最早 unsigned intent 未恢复前禁止新 nonce。Provider 仅在保留期限已过、历史复查成立且没有预算、claim 或 attempt 的待处理引用时回收密文。过期未资助报价须由确认锚后的 Funded 日志与原期限核验，RPC 错误或重组不能当作未付款。
+
 ## 验证范围
 
 默认相关检查仍执行合约编译/trust、`run.mjs` 受保护资金正反例、schema2 证据边界自检、官方 verifier 和真实 fixture seal 验真。账务测试使用明确标记的 digest test verifier，不能替代 genuine proof 或真实 Node。
 
 原 fee5 公益拒签、genuine17 提前披露/退款失败保留在固定旧源码及任务证据中，不因新名称变成通过。新 fee5 必须创建发送前选择的新 paid 订单并产生对应 genuine Source/Hold；旧17不能改成5，也不能变成不同订单的第二窗。最小两单样本需要一份 KeyBinding、A/B 各一份 Source/Hold，共五份真实证明。必须实际观察 reserve/hold/reveal 各自含两个不同 slot、payer 离线、R 恢复原文件及预算累计真实提款。
 
-旧 `--delivery-channel` 和 Strict/13-proof live 协议已撤下；旧 `verify-node.py --delivery`/`run-delivery-live.py` 明确拒绝原启动方式。正式 native 入口是 `run-delivery-live.py --protected-package <same-head-linux-package> --source-commit <HEAD>`，由宿主或默认关闭的手动 CI 共用；已准备受限环境和核验制品时，也可使用低层 `--protected-config` 或 `verify-node.py --delivery-protected`；配置、资源和命令见 [e2e](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 只自检配置与公开证据边界，不启动进程或证明。genuine5/双单运行、实际重启、渲染及制品证据必须分别完成；只读 schema2 observer、genuine17 重验或本地单元通过不能替代这些覆盖。
+旧 `--delivery-channel` 和 Strict/13-proof live 协议已撤下；旧 `verify-node.py --delivery`/`run-delivery-live.py` 明确拒绝原启动方式。正式 native 入口是 `run-delivery-live.py --protected-package <same-head-linux-package> --source-commit <HEAD>`，由宿主或默认关闭的手动 CI 共用；已准备受限环境和核验制品时，也可使用低层 `--protected-config` 或 `verify-node.py --delivery-protected`；配置、资源和命令见 [e2e](e2e.md#验证受保护付费交付)。`run-delivery-live.py --protected-selfcheck` 只自检配置与公开证据边界，不启动进程或证明。genuine5/双单运行、实际重启、渲染及制品证据必须分别完成；只读 schema2 observer、genuine17 重验或本地单元通过不能替代这些覆盖。

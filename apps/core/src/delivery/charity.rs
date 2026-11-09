@@ -1221,27 +1221,12 @@ impl Delivery {
                         save_record(store, &mut stored)?;
                         stored
                     };
-                    for spec in &stored.order.windows {
-                        store.reserve_object(
-                            &stored.view.order_id,
-                            spec.index,
-                            "ciphertext",
-                            &hex::encode(spec.ciphertext_hash),
-                            spec.ciphertext_bytes,
-                        )?;
-                        store.reserve_object(
-                            &stored.view.order_id,
-                            spec.index,
-                            "capsule",
-                            &hex::encode(spec.capsule_hash),
-                            80,
-                        )?;
-                    }
                     snapshot(&stored)
                 })
             }
             Request::Offer { order } => {
                 order.verify()?;
+                order.terms.active_offer(now())?;
                 ensure!(
                     order.terms.receiver_peer == self.identity.device_id()?
                         && order.terms.source_peer == remote,
@@ -1467,6 +1452,7 @@ fn save_record(store: &mut ServiceStore, stored: &mut StoredCharity) -> Result<(
         stored.network.as_deref(),
         &intent,
         &serde_json::to_string(stored)?,
+        &stored.order.windows,
     )
 }
 
