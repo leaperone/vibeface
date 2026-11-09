@@ -618,6 +618,7 @@ async fn handoff(
 
 /// Confirm and open admission only after the caller has proved the final state.
 async fn acknowledge(
+    policy: &Policy,
     data: &Path,
     service: &impl ServiceControl,
     journal: &mut Journal,
@@ -625,8 +626,7 @@ async fn acknowledge(
     journal.phase = Phase::Confirmed;
     persist(&data.join("update-pending.json"), journal)?;
     service.commit(data).await?;
-    let policy = policy(data)?;
-    retain_committed_backups(&policy, data, journal);
+    retain_committed_backups(policy, data, journal);
     Ok(())
 }
 
@@ -637,7 +637,7 @@ async fn activate(
     journal: &mut Journal,
 ) -> Result<()> {
     handoff(policy, data, service, journal).await?;
-    acknowledge(data, service, journal).await?;
+    acknowledge(policy, data, service, journal).await?;
     Ok(())
 }
 
@@ -994,7 +994,7 @@ where
         if let Err(error) = prove(journal.candidate.clone()).await {
             return reconcile_running(&policy, data, &service, error).await;
         }
-        acknowledge(data, &service, &mut journal).await?;
+        acknowledge(&policy, data, &service, &mut journal).await?;
         drop(lease);
         return Ok(());
     }
@@ -2311,7 +2311,7 @@ mod tests {
             previous,
             candidate,
             device_id: "device".into(),
-            backup: root.join("backups/fixture"),
+            backup: root.join("backups").join(uuid::Uuid::new_v4().to_string()),
             resume_service: true,
         };
         persist(&data.join("update-pending.json"), &journal).unwrap();
@@ -2674,7 +2674,9 @@ mod tests {
         assert_eq!(stored.phase, Phase::Prepared);
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
-        acknowledge(&data, &service, &mut journal).await.unwrap();
+        acknowledge(&policy, &data, &service, &mut journal)
+            .await
+            .unwrap();
         assert!(!data.join("update-pending.json").exists());
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);

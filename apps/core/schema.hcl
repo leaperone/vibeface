@@ -232,8 +232,9 @@ table "messages" {
     type = text
   }
   column "author" {
-    null = false
-    type = text
+    null    = false
+    type    = text
+    default = ""
   }
   column "role" {
     null = false
@@ -1099,18 +1100,18 @@ table "scheduler_sessions" {
     type = text
   }
   column "session_generation" {
-    null = false
-    type = integer
+    null    = false
+    type    = integer
     default = 0
   }
   column "handoff_revision" {
-    null = false
-    type = integer
+    null    = false
+    type    = integer
     default = 0
   }
   column "handoff_source" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = "{}"
   }
   primary_key {
@@ -1120,8 +1121,8 @@ table "scheduler_sessions" {
 table "scheduler_jobs" {
   schema = schema.main
   column "scope" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = "main"
   }
   column "conversation_id" {
@@ -1185,8 +1186,8 @@ table "scheduler_jobs" {
     type = integer
   }
   column "partial_text" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = ""
   }
   primary_key {

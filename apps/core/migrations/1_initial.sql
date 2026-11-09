@@ -8,7 +8,7 @@ CREATE INDEX `events_kind` ON `events` (`network_id`, `scope_id`, `kind`, `subje
 CREATE TABLE `event_blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `blob` text NOT NULL, `size` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`, `blob`));
 CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
 CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));
-CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `envelope` text NOT NULL, `author` text NOT NULL, `missing` text NOT NULL, PRIMARY KEY (`network_id`, `hash`));
+CREATE TABLE `pending_events` (`network_id` text NOT NULL, `hash` text NOT NULL, `envelope` text NOT NULL, `author` text NOT NULL DEFAULT '', `missing` text NOT NULL, PRIMARY KEY (`network_id`, `hash`));
 CREATE INDEX `pending_events_author` ON `pending_events` (`network_id`, `author`);
 CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));

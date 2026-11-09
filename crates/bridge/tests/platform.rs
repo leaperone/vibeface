@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use vibeface_bridge::platform::{ipc, privatefs, program, secret, tree};
 
@@ -73,6 +73,17 @@ fn echoing_program(directory: &Path, name: &str) -> PathBuf {
         .expect("write the batch entry point used by Windows provider wrappers");
         path
     }
+}
+
+fn eventually(description: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {description}");
 }
 
 #[test]
@@ -229,6 +240,29 @@ async fn a_local_endpoint_admits_this_account_and_refuses_a_second_holder() -> R
     right.read_exact(&mut read).await?;
     assert_eq!(&read, b"paired\n");
     std::fs::remove_dir_all(&directory)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
+    let (mut spawned, mut child) = tree::Tree::spawn(long_lived(), "platform-test", true)?;
+    let root = spawned.root();
+    assert!(spawned.is_running());
+    assert!(tree::root_is_running(root));
+    assert!(tree::token_is_running(spawned.token()));
+
+    let left = tree::stop_recorded(spawned.token(), |_| false)?;
+    assert!(
+        left.is_none(),
+        "a tree the Node does not recognize is left running"
+    );
+    assert!(spawned.is_running());
+
+    spawned.stop();
+    let _ = child.start_kill();
+    child.wait().await?;
+    eventually("the tree to be cleared", || !spawned.is_running());
+    assert!(!tree::token_is_running(spawned.token()));
     Ok(())
 }
 
