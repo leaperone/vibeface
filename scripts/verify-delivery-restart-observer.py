@@ -373,7 +373,8 @@ def self_test():
     with patch.object(subprocess, 'Popen', forbidden), patch.object(socket, 'socket', forbidden):
         ARTIFACTS.mkdir(exist_ok=True)
         def run(name, initial, steps, *, expected_pass=False, read_error=None, boundaries=True,
-                sample_count=2, changed_accounts=False, pending_nonce=False, native_status='PASS', history=True):
+                sample_count=2, changed_accounts=False, pending_nonce=False, native_status='PASS', history=True,
+                statistics_mode=0o600, wrong_owner=False, statistics_kind='regular'):
             with tempfile.TemporaryDirectory(prefix='restart-observer-selftest-', dir=ARTIFACTS) as temporary:
                 outer = Path(temporary); native = outer / 'native'; public = native / 'public'; public.mkdir(parents=True)
                 target = native / 'deployment.json.rpc.json'; program = outer / 'inert-program'
@@ -381,7 +382,9 @@ def self_test():
                 def replace(value):
                     if value is unchanged: return
                     if value is missing: target.unlink(missing_ok=True)
-                    else: target.write_text(value if isinstance(value, str) else json.dumps(value))
+                    else:
+                        target.write_text(value if isinstance(value, str) else json.dumps(value))
+                        target.chmod(statistics_mode)
                 replace(initial)
                 if not boundaries: public.rmdir(); native.rmdir()
                 tick, cursor, timeline = [0], [0], []
@@ -420,6 +423,17 @@ def self_test():
                 def info(arguments, **_options):
                     assert arguments == [str(program),'info']
                     return SimpleNamespace(returncode=0,stdout=json.dumps({'elfSha256':'offline-elf'}))
+                original_lstat=Path.lstat
+                def lstat(path,*args,**kwargs):
+                    metadata=original_lstat(path,*args,**kwargs)
+                    if path != target: return metadata
+                    fields=list(metadata)
+                    if wrong_owner: fields[4]=metadata.st_uid+1
+                    if statistics_kind != 'regular':
+                        kinds={'fifo':stat.S_IFIFO,'directory':stat.S_IFDIR,'symlink':stat.S_IFLNK}
+                        fields[0]=kinds[statistics_kind] | statistics_mode
+                        fields[6]=0
+                    return type(metadata)(fields)
                 values = {'outer':outer,'native':native,'public':public,'rpc_statistics_file':target,'program':program,
                     'original':program.stat(),'config':{'source_commit':'a'*40,'elf_sha256':'offline-elf','paths':{'r0vm':'inert'}},
                     'expected':'b'*64,'fd':99,'binary_watch':101,'public_watch':102,
@@ -431,10 +445,12 @@ def self_test():
                     'subprocess':SimpleNamespace(run=info),'wait_events':events,
                     'read_events':lambda wait:[(101,IN_OPEN,'')],'running_provers':lambda:[],
                     'save':save_stub,'print':lambda *args,**kwargs:None}
-                with patch.dict(globals(), values):
+                with patch.dict(globals(), values), patch.object(Path,'lstat',lstat):
                     exec(compile(ast.Module(body=[assignment],type_ignores=[]),'<observer-summary-fixture>','exec'),globals())
                     if read_error:
-                        def fail(): raise read_error(target)
+                        def fail():
+                            timeline.append(('rpc_stats_refused',statistics_kind))
+                            raise read_error(target)
                         globals()['rpc_stats'] = fail
                     try: watch(97,98)
                     except SystemExit as error: code=error.code
@@ -492,6 +508,36 @@ def self_test():
             assert read_events(0)==[(101,IN_OPEN,''),(-1,0x4000,'')]
         assert run_binding(Path('/host/.artifacts/a'),b'config',Path('/host')) == run_binding(Path('/work/.artifacts/a'),b'config',Path('/work'))
         assert run_binding(Path('/work/.artifacts/a'),b'config',Path('/work')) != run_binding(Path('/work/.artifacts/b'),b'config',Path('/work'))
+        first_empty_case=len(results)
+        result,_=run('empty_after_valid_baseline',stats(),[{'snapshot':''},{'snapshot':stats()},start,end])
+        assert result['failure_type']=='JSONDecodeError' and not result['window_started']
+        result,_=run('empty_at_final_marker',stats(),[{},start,{'events':['end'],'snapshot':'','done':True}])
+        assert result['failure_type']=='JSONDecodeError' and result['window_started']
+        result,_=run('window_empty_through_final',stats(),[{},start,{'snapshot':''},{'events':['end'],'done':True}])
+        assert result['failure_type']=='JSONDecodeError' and result['window_started']
+        for name,invalid in (('malformed','{'),('whitespace',' \n')):
+            run('nonempty_'+name+'_before_baseline',invalid,[{'snapshot':stats()},{},start,end])
+            run('empty_then_nonempty_'+name,'',[{'snapshot':invalid},{'snapshot':stats()},{},start,end])
+        for name,options in (('world_readable_empty',{'statistics_mode':0o644}),
+                             ('group_readable_empty',{'statistics_mode':0o640}),
+                             ('wrong_owner_empty',{'wrong_owner':True})):
+            _,timeline=run(name,'',[{'snapshot':stats()},{},start,end],**options)
+            assert not any(item[0]=='drain' for item in timeline), 'unsafe empty file entered the startup wait'
+        for kind in ('fifo','directory','symlink'):
+            _,timeline=run('unsafe_metadata_'+kind,'',[{'snapshot':stats()},{},start,end],statistics_kind=kind,
+                read_error=lambda path:ObservationIncomplete('inert unsafe-file reader refused access'))
+            assert not any(item[0]=='drain' for item in timeline), 'unsafe file type entered the startup wait'
+        result,_=run('empty_without_baseline_and_start_same_batch','',[{'events':['start'],'snapshot':stats()},end])
+        assert not result['window_started']
+        print(json.dumps({'status':'F19_REJECTION_CONTROLS_PASS','scope':'synthetic empty-reservation rejection checks only',
+            'legacy_case_count':first_empty_case,'cases':results[first_empty_case:],'external_processes':0,'network_sockets':0}))
+        result,_=run('initial_empty_reservation_then_ready_recovers','',[{'snapshot':stats()},{},start,end],expected_pass=True)
+        assert result['window_started'] and result['window_ended'] and result['prewindow_rpc_snapshot_missing']['count']==0
+        assert result['window_start']['rpc_baseline']['state']=='ready' and result['window_end']['rpc_final']['state']=='stopped'
+        for kind in ('fifo','directory','symlink'):
+            _,timeline=run('unsafe_metadata_not_read_'+kind,'',[{'snapshot':stats()},{},start,end],statistics_kind=kind,
+                read_error=lambda path:AssertionError('unsafe metadata must be rejected before rpc_stats'))
+            assert not any(item[0] in ('rpc_stats_refused','drain') for item in timeline), 'unsafe object was read or entered the startup wait'
     print(json.dumps({'status':'SELF_TEST_PASS','scope':'synthetic observer behavior only',
         'external_processes':0,'network_sockets':0,'genuine_receipts_generated':0,'cases':results}))
 
