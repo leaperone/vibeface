@@ -234,7 +234,13 @@ impl Runtime {
                 listen,
                 Arc::new(access),
                 self.config.network.relay_rate,
-                self.config.network.relay_max_clients_per_ip,
+                self.config
+                    .network
+                    .relay_max_clients_per_ip
+                    .map(|limit| net::PerIp {
+                        limit,
+                        proxies: self.config.forwarding.clone(),
+                    }),
             )
             .await?;
             tracing::info!(event = "relay.started", %listen, "relay started");

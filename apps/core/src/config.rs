@@ -75,8 +75,13 @@ pub struct Forwarding {
     /// `/api/client` connections one client address holds on `listen`, whatever their target;
     /// unlimited when unset.
     pub per_ip: Option<NonZeroUsize>,
-    /// Reverse proxies whose single `X-Real-IP` names the client; any other peer is the client.
-    pub trusted_proxies: Vec<IpAddr>,
+    /// Networks of the reverse proxies in front of `listen` and the relay; a peer in one names
+    /// the client in `client_ip_header`, any other peer is the client.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// The one header a trusted proxy names the client in, lowercase: `x-real-ip` for nginx,
+    /// `cf-connecting-ip` for Cloudflare. Only this header is read, as a proxy passes the others
+    /// on from the client unchanged.
+    pub client_ip_header: String,
 }
 
 impl Default for Forwarding {
@@ -88,6 +93,7 @@ impl Default for Forwarding {
             rate: None,
             per_ip: None,
             trusted_proxies: vec![],
+            client_ip_header: "x-real-ip".into(),
         }
     }
 }
@@ -101,8 +107,28 @@ impl Forwarding {
             "forwarded and waiting sessions must fit the {} browser sockets",
             crate::api::MAX_CLIENT_SOCKETS
         );
+        ensure!(
+            axum::http::HeaderName::from_bytes(self.client_ip_header.as_bytes())
+                .is_ok_and(|name| name.as_str() == self.client_ip_header),
+            "client_ip_header must be a lowercase header name"
+        );
         Ok(())
     }
+
+    /// Whether `peer` is a trusted proxy, so the client address it names counts.
+    pub fn trusts(&self, peer: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        self.trusted_proxies.iter().any(|net| net.contains(&peer))
+    }
+}
+
+/// A trusted proxy network: CIDR, or one address.
+pub fn proxy_network(text: &str) -> Result<ipnet::IpNet> {
+    let text = text.trim();
+    text.parse::<ipnet::IpNet>()
+        .map(|net| net.trunc())
+        .or_else(|_| text.parse::<IpAddr>().map(ipnet::IpNet::from))
+        .with_context(|| format!("{text} is not an IP address or CIDR network"))
 }
 
 pub const NO_HOME: &str =

@@ -84,7 +84,7 @@ vibeface join '<加入链接>' --name '<设备名称>'
 vibeface://<issuer>@8.217.72.118:4792
 ```
 
-新建的个人 Node 默认向它登记，直连不通时经它的开放 Relay 连通。`https://app.vibeface.dev` 直接连它的浏览器接入地址 `gateway_url`，再按设备编号连到你的 Node，也可以在连接设置里换成自己的 Gateway；局域网直连仍优先。它只转发密文。首次初始化时可用 `--bootstrap off` 关闭公共引导，也可以指向自建服务。配置方法、可见元数据和连接限制见[使用公共发现服务](packages/docs/node.md#使用公共发现服务)。加入个人网络仍需邀请和批准。
+新建的个人 Node 默认向它登记，直连不通时经它的开放 Relay 连通。`https://app.vibeface.dev` 直接连它的浏览器接入地址 `gateway_url`（`https://node.vibeface.dev`，经 Cloudflare 代理，开放 Relay 也在这个地址），再按设备编号连到你的 Node，也可以在连接设置里换成自己的 Gateway，包括按 IP 直连的 `https://<IP>:4792`；局域网直连仍优先。它只转发密文。首次初始化时可用 `--bootstrap off` 关闭公共引导，也可以指向自建服务。配置方法、可见元数据和连接限制见[使用公共发现服务](packages/docs/node.md#使用公共发现服务)。加入个人网络仍需邀请和批准。
 
 ## 隐私与权限
 

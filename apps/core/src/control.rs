@@ -72,7 +72,8 @@ struct InitOptions {
     forward_rate: Option<NonZeroU32>,
     forward_per_ip: Option<NonZeroUsize>,
     #[serde(default)]
-    trusted_proxies: Vec<IpAddr>,
+    trusted_proxies: Vec<String>,
+    client_ip_header: Option<String>,
     manager: Option<Provider>,
     workspace: Option<PathBuf>,
     model: Option<String>,
@@ -487,7 +488,14 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     forwarding.queue = options.forward_queue.unwrap_or(forwarding.queue);
     forwarding.rate = options.forward_rate;
     forwarding.per_ip = options.forward_per_ip;
-    forwarding.trusted_proxies = options.trusted_proxies;
+    forwarding.trusted_proxies = options
+        .trusted_proxies
+        .iter()
+        .map(|net| config::proxy_network(net))
+        .collect::<Result<_>>()?;
+    if let Some(header) = options.client_ip_header {
+        forwarding.client_ip_header = header.to_ascii_lowercase();
+    }
     if let Some(url) = options.public_url {
         configuration.public_url = config::http_origin(&url)?
             .to_string()
@@ -792,7 +800,8 @@ mod tests {
             "forward_queue": 192,
             "forward_rate": 262144,
             "forward_per_ip": 8,
-            "trusted_proxies": ["203.0.113.1"],
+            "trusted_proxies": ["203.0.113.1", "173.245.48.9/20", "2400:cb00::/32"],
+            "client_ip_header": "CF-Connecting-IP",
         }))
         .unwrap();
         let result = initialize_from_options(options).unwrap();
@@ -819,9 +828,16 @@ mod tests {
         assert_eq!(forwarding.rate.map(NonZeroU32::get), Some(262144));
         assert_eq!(forwarding.per_ip.map(NonZeroUsize::get), Some(8));
         assert_eq!(
-            forwarding.trusted_proxies,
-            ["203.0.113.1".parse::<IpAddr>().unwrap()]
+            forwarding
+                .trusted_proxies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["203.0.113.1/32", "173.245.48.0/20", "2400:cb00::/32"]
         );
+        assert_eq!(forwarding.client_ip_header, "cf-connecting-ip");
+        assert!(forwarding.trusts("::ffff:173.245.63.1".parse().unwrap()));
+        assert!(!forwarding.trusts("173.245.64.1".parse().unwrap()));
         assert!(saved.tls);
         let certificate = fs::read_to_string(dir.join(config::TLS_CERT)).unwrap();
         assert!(certificate.starts_with("-----BEGIN CERTIFICATE-----"));
@@ -849,6 +865,21 @@ mod tests {
         .unwrap();
         let error = initialize_from_options(crowded).unwrap_err().to_string();
         assert!(error.contains("browser sockets"), "{error}");
+        for (field, value, expected) in [
+            ("trusted_proxies", json!(["203.0.113.0/33"]), "CIDR"),
+            ("client_ip_header", json!("cf connecting ip"), "header name"),
+        ] {
+            let mut options = json!({
+                "data_dir": temp_dir("proxies"),
+                "no_web": true,
+                "listen": free_addr(),
+                "local_listen": free_addr(),
+            });
+            options[field] = value;
+            let options: InitOptions = serde_json::from_value(options).unwrap();
+            let error = format!("{:#}", initialize_from_options(options).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

@@ -228,9 +228,14 @@ struct Init {
     /// Browser connections one client address holds at once, whatever their target.
     #[arg(long, value_name = "N")]
     forward_per_ip: Option<NonZeroUsize>,
-    /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
-    #[arg(long = "trusted-proxy", value_name = "IP")]
-    trusted_proxies: Vec<IpAddr>,
+    /// Address or CIDR network of a reverse proxy in front of --listen or the relay, whose
+    /// --client-ip-header names the client's address. Repeat for each proxy.
+    #[arg(long = "trusted-proxy", value_name = "IP|CIDR")]
+    trusted_proxies: Vec<String>,
+    /// The one header a trusted proxy names the client in (default X-Real-IP; Cloudflare:
+    /// CF-Connecting-IP).
+    #[arg(long, value_name = "NAME")]
+    client_ip_header: Option<String>,
     /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
     /// a self-hosted `vibeface://` discovery URL.
     #[arg(long, value_name = "MODE|URL")]

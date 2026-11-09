@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,15 @@ import urllib.request
 ROOT = Path('/opt/vibeface')
 DATA = Path('/data')
 APP_ORIGIN = 'https://app.vibeface.dev'
+# Cloudflare's published ranges (https://www.cloudflare.com/ips/): the only peers the official node trusts to
+# name a client, and the only sources the host firewall admits on TCP 4792 and 3340.
+CLOUDFLARE = (
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18',
+    '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17',
+    '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
+    '2a06:98c0::/29', '2c0f:f248::/32',
+)
 
 
 def require(condition, message):
@@ -111,13 +121,19 @@ def guard(info):
             and network.get('relay_max_clients_per_ip') and forwarding['any'] is True and forwarding.get('rate')
             and forwarding.get('per_ip'),
             'the official node needs discovery, an open relay and browser forwarding, each within limits')
-    # Browsers connect straight to this Node, so every limit counts the real peer address.
-    require(not forwarding.get('trusted_proxies'), 'the official node has no proxy in front to trust')
+    # Cloudflare fronts the browser and relay ports, so every limit counts the client it names, and only it.
+    trusted = forwarding.get('trusted_proxies')
+    require(isinstance(trusted, list) and trusted
+            and {ipaddress.ip_network(net) for net in trusted} == {ipaddress.ip_network(net) for net in CLOUDFLARE}
+            and forwarding.get('client_ip_header') == 'cf-connecting-ip',
+            "the official node trusts exactly Cloudflare's ranges and reads CF-Connecting-IP")
     anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
-    # Browsers on the App page reach this Node at the address the image pins, over its own TLS certificate.
+    # Browsers on the App page and other Nodes reach this Node at the address the image pins; Cloudflare routes the
+    # relay paths to the relay and the rest to the TLS listener.
     require(config['web_enabled'] is True and config.get('tls') is True and config['public_url'] == anchor['gateway_url']
+            and str(network.get('relay_url', '')).rstrip('/') == anchor['gateway_url']
             and APP_ORIGIN in config.get('allowed_origins', []),
-            'browser access needs TLS, the pinned gateway_url as public_url and the App origin in allowed_origins')
+            'browser access needs TLS, the pinned gateway_url as public_url and relay_url, and the App origin')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
@@ -181,7 +197,7 @@ def self_test():
         (directory / 'COMPONENT-INFO.json').write_text(json.dumps(info))
         assert component_info(directory) == info
         anchor = {'issuer': 'b' * 64, 'udp_host': '203.0.113.7', 'udp_port': 4792,
-                  'gateway_url': 'https://203.0.113.7:4792'}
+                  'gateway_url': 'https://node.example.invalid'}
         (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
         data = directory / 'data'; data.mkdir(mode=0o700)
         for name in ('identity.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
@@ -190,8 +206,9 @@ def self_test():
         config = {'listen': '0.0.0.0:4792', 'public_url': anchor['gateway_url'], 'allowed_origins': [APP_ORIGIN],
                   'web_enabled': True, 'tls': True, 'roots': [], 'manager': None,
                   'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
-                                 'trusted_proxies': []},
-                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_open': True,
+                                 'trusted_proxies': list(CLOUDFLARE), 'client_ip_header': 'cf-connecting-ip'},
+                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340',
+                              'relay_url': anchor['gateway_url'] + '/', 'relay_open': True,
                               'relay_operator_token': None, 'relay_rate': 65536, 'relay_max_clients': 512,
                               'relay_max_clients_per_ip': 16}}
         (data / 'config.json').write_text(json.dumps(config))
@@ -242,7 +259,12 @@ def self_test():
                            {'public_url': APP_ORIGIN},
                            {'web_enabled': False}, {'tls': False}, {'forwarding': dict(forwarding, any=False)},
                            {'forwarding': dict(forwarding, rate=None)}, {'forwarding': dict(forwarding, per_ip=None)},
-                           {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
+                           {'forwarding': dict(forwarding, trusted_proxies=[])},
+                           {'forwarding': dict(forwarding, trusted_proxies=list(CLOUDFLARE) + ['203.0.113.0/24'])},
+                           {'forwarding': dict(forwarding, trusted_proxies=list(CLOUDFLARE) + ['0.0.0.0/0'])},
+                           {'forwarding': dict(forwarding, trusted_proxies=list(CLOUDFLARE)[1:])},
+                           {'forwarding': dict(forwarding, client_ip_header='x-real-ip')},
+                           {'network': dict(network, relay_url='http://203.0.113.7:3340')},
                            {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
                            {'network': dict(network, relay_open=False)},
                            {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
