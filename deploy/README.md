@@ -56,8 +56,11 @@ vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --t
   --relay-open --relay-rate 65536 --relay-max-clients 512 --relay-max-clients-per-ip 16 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
+touch /opt/apps/vibeface-node/state/node.lock
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
+
+`init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 
 `config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和发现服务都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
 
