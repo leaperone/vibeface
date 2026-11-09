@@ -84,7 +84,9 @@ def core_smoke(identity, info, output):
     volume = 'vibeface-deploy-check-' + uuid.uuid4().hex
     def docker(*args, **kwargs):
         return subprocess.check_output(['docker', *args], text=True, **kwargs)
+    tls = volume + '-tls'
     docker('volume', 'create', volume)
+    docker('volume', 'create', tls)
     container = None
     base = ['--platform', 'linux/amd64', '--network', 'none', '-v', volume + ':/data']
     try:
@@ -99,9 +101,14 @@ def core_smoke(identity, info, output):
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
         release.require(result.get('ok') is True, 'isolated Core fixture initialization failed')
-        docker('run', '--rm', *base, '--entrypoint', 'python3', identity, '-c',
-               "from pathlib import Path; import os; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch(); "
-               "[os.chown(x,1001,1001) for x in [p,*p.rglob('*')]]")
+        # Like the host's root-owned TLS directory: root writes the pair, the Node only reads it.
+        docker('run', '--rm', *base, '-v', tls + ':/tls', '--entrypoint', 'python3', identity, '-c',
+               "from pathlib import Path; import os, shutil; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch(); "
+               "[os.chown(x,1001,1001) for x in [p,*p.rglob('*')]]; "
+               "[(shutil.copyfile(p/n,'/tls/'+n), os.chown('/tls/'+n,0,1001), os.chmod('/tls/'+n,m)) "
+               "for n,m in (('tls-cert.pem',0o644),('tls-key.pem',0o640))]")
+        for name in ('tls-cert.pem', 'tls-key.pem'):
+            base += ['--mount', f'type=volume,src={tls},dst=/data/{name},volume-subpath={name},readonly']
         result = json.loads(docker('run', '--rm', '-i', *base, '--user', '1001:1001', '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
@@ -144,7 +151,7 @@ def core_smoke(identity, info, output):
     finally:
         if container:
             docker('rm', '-f', container)
-        docker('volume', 'rm', volume)
+        docker('volume', 'rm', volume, tls)
 
 
 def static_smoke(identity, component, role, sha):
