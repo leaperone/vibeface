@@ -409,7 +409,7 @@ mod tests {
         use alloy_consensus::{Transaction, transaction::SignerRecoverable};
         use alloy_eips::eip2718::Decodable2718;
         let key = SigningKey::from_slice(&[2; 32])?;
-        let wallet = Wallet {
+        let mut wallet = Wallet {
             path: PathBuf::new(),
             address: Some(Address::from_public_key(key.verifying_key())),
             key: Some(key),
@@ -432,6 +432,46 @@ mod tests {
             envelope.kind(),
             alloy_primitives::TxKind::Call(chain::address(&config.asset)?)
         );
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/wallet-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&dir)?;
+        let mut store = crate::delivery::store::ServiceStore::open(&dir, 1_000_000, 8)?;
+        let mut original = intent.clone();
+        original.id = "provider/approve".into();
+        let signed = store.signed_budget_transaction(
+            &original,
+            7,
+            "provider",
+            &original.gas_cap,
+            |intent, nonce| {
+                let signed = wallet.sign_transaction(&config, intent, nonce)?;
+                Ok((signed.raw_tx, signed.tx_hash))
+            },
+        )?;
+        assert_eq!(signed.raw_tx.as_deref(), Some(first.raw_tx.as_str()));
+        assert_eq!(signed.tx_hash.as_deref(), Some(first.tx_hash.as_str()));
+        wallet.lock();
+        let mut next = original.clone();
+        next.id = "key-original/register".into();
+        assert!(
+            store
+                .signed_budget_transaction(
+                    &next,
+                    8,
+                    "key-original",
+                    &next.gas_cap,
+                    |intent, nonce| {
+                        let signed = wallet.sign_transaction(&config, intent, nonce)?;
+                        Ok((signed.raw_tx, signed.tx_hash))
+                    }
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&next.id)?.is_none());
+        assert_eq!(store.transaction(&original.id)?, signed);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

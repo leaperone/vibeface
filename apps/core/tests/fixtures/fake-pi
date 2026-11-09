@@ -50,7 +50,11 @@ def read(path):
     return lines[0], lines[1:]
 
 
-log({"argv": sys.argv[1:], "run": os.environ.get("VIBEFACE_PI_RUN"), "session_dir": DIRECTORY})
+guide = argument("--append-system-prompt")
+with open(guide) if guide else open(os.devnull) as file:
+    guide_text = file.read() if guide else None
+log({"argv": sys.argv[1:], "run": os.environ.get("VIBEFACE_PI_RUN"), "session_dir": DIRECTORY,
+     "guide": guide_text, "guide_private": os.stat(guide).st_mode & 0o077 == 0 if guide and os.name != "nt" else None})
 os.makedirs(DIRECTORY, exist_ok=True)
 stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
 if argument("--session"):

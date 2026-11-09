@@ -288,7 +288,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "finish", "check", "self-test"))
     parser.add_argument("component", choices=tuple(OUTPUTS), nargs="?")
-    parser.add_argument("--cargo", action="store_true")
     args = parser.parse_args()
     if args.action == "self-test":
         self_test()
@@ -296,16 +295,7 @@ def main():
     if not args.component:
         parser.error("component is required")
     if args.action == "check":
-        receipt = check(ROOT, args.component)
-        if args.cargo:
-            for component in dict.fromkeys(("crypto", args.component)):
-                component_receipt = check(ROOT, component)
-                for name in component_receipt["inputs"]["source"]:
-                    print(f"cargo:rerun-if-changed={ROOT / name}")
-                for name in INPUTS[component]:
-                    print(f"cargo:rerun-if-changed={ROOT / name}")
-                print(f"cargo:rerun-if-changed={ROOT / OUTPUTS[component]}")
-                print(f"cargo:rerun-if-changed={ROOT / OUTPUTS[component] / RECEIPT}")
+        check(ROOT, args.component)
     elif args.action == "prepare":
         prepare(ROOT, args.component)
     else:

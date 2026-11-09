@@ -259,6 +259,7 @@ pub fn relay_token(invite_hash: &str) -> String {
 }
 
 pub fn endpoint_id(device_id: &str) -> Result<EndpointId> {
+    vibeface_secure::validate_device_id(device_id)?;
     let bytes: [u8; 32] = hex::decode(device_id)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -300,6 +301,7 @@ impl SignedAddress {
     pub fn open(&self, network_id: &str) -> Result<AddressRecord> {
         ensure!(self.payload.len() <= 8192, "address record too large");
         let record: AddressRecord = serde_json::from_str(&self.payload)?;
+        vibeface_secure::membership::validate_hash(&record.network_id)?;
         ensure!(
             record.version == 1 && record.network_id == network_id,
             "address record belongs to another network"
@@ -309,11 +311,7 @@ impl SignedAddress {
             "address record names another endpoint"
         );
         if let Some(url) = &record.gateway_url {
-            let url = reqwest::Url::parse(url)?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https") && url.path() == "/",
-                "invalid gateway URL"
-            );
+            crate::config::http_origin(url)?;
         }
         vibeface_secure::verify(
             &record.device_id,
@@ -365,9 +363,10 @@ impl Net {
         listen_port: u16,
         relays: Vec<(RelayUrl, Option<String>)>,
     ) -> Result<Self> {
-        let seed: [u8; 32] = hex::decode(secret_key_hex)?
-            .try_into()
-            .map_err(|_| anyhow!("invalid device key"))?;
+        let identity = crate::crypto::LocalIdentity {
+            secret_key_hex: secret_key_hex.to_owned(),
+        };
+        let seed = identity.seed()?;
         let map = RelayMap::empty();
         let mut urls: Vec<(RelayUrl, Option<String>)> = relays;
         for relay in &config.relays {
@@ -1145,6 +1144,45 @@ mod tests {
             merged,
             vec![(url, Some("grant".into())), (other, Some("token".into()))]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_addresses_require_canonical_ids_and_gateway_origins() -> Result<()> {
+        let identity = crate::crypto::LocalIdentity::generate();
+        let device = identity.device_id()?;
+        let network = identity.fixture_network_id()?;
+        let record = AddressRecord {
+            version: 1,
+            network_id: network.clone(),
+            device_id: device.clone(),
+            seq: 1,
+            endpoint: EndpointAddr::new(endpoint_id(&device)?),
+            gateway_url: Some("https://node.example:8443".into()),
+            relay: None,
+        };
+        let sign = |record: &AddressRecord| -> Result<SignedAddress> {
+            let payload = serde_json::to_string(record)?;
+            Ok(SignedAddress {
+                signature: identity.sign_payload(ADDRESS_DOMAIN, payload.as_bytes())?,
+                payload,
+            })
+        };
+        let signed = sign(&record)?;
+        assert_eq!(signed.open(&network)?, record);
+        assert_eq!(signed.payload, serde_json::to_string(&record)?);
+        for url in [
+            "https://user:secret@node.example",
+            "https://node.example?query=1",
+            "https://node.example#fragment",
+            "https://node.example/path",
+        ] {
+            let mut bad = record.clone();
+            bad.gateway_url = Some(url.into());
+            assert!(sign(&bad)?.open(&network).is_err(), "{url}");
+        }
+        assert!(endpoint_id(&device.to_uppercase()).is_err());
+        assert!(endpoint_id(&"00".repeat(32)).is_err());
         Ok(())
     }
 

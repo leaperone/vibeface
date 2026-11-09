@@ -10,6 +10,16 @@ use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
 const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure,runtime,tool_calls,scope";
 
+/// Kept only by the live consumer; a restarted process cannot refund an old attempt.
+pub(crate) struct SchedulerBudgetReservation {
+    network: String,
+    conversation: String,
+    trigger: String,
+    attempt: ManagerAttempt,
+    day: String,
+    units: u64,
+}
+
 type JobRow = (
     String,
     String,
@@ -931,6 +941,53 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
         .checked_add(1)
         .context("scheduler permission version overflow")?;
     Ok(())
+}
+
+fn attempt_not_started_from(connection: &Connection, job: &SchedulerJob) -> Result<bool> {
+    let Some(attempt) = job.state.attempt() else {
+        return Ok(false);
+    };
+    if job.tool_calls
+        || job.pending_check
+        || job
+            .runtime
+            .as_ref()
+            .map_or(!matches!(job.state, JobState::Claimed { .. }), |runtime| {
+                runtime.delivery_id != attempt.id || runtime.execution != TurnExecution::NotStarted
+            })
+    {
+        return Ok(false);
+    }
+    let recorded: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM manager_processes WHERE attempt_id=?1)
+            OR EXISTS(SELECT 1 FROM manager_turns WHERE attempt_id=?1)",
+        [&attempt.id],
+        |row| row.get(0),
+    )?;
+    Ok(!recorded)
+}
+
+fn requeue_unstarted_claim_from(
+    connection: &Connection,
+    session: &mut SchedulerSession,
+    job: &mut SchedulerJob,
+) -> Result<bool> {
+    if !matches!(job.state, JobState::Claimed { .. }) || !attempt_not_started_from(connection, job)?
+    {
+        return Ok(false);
+    }
+    ensure!(
+        session.active.as_deref() == Some(job.trigger.as_str()),
+        "scheduler claim is no longer active"
+    );
+    fence(session)?;
+    session.active = None;
+    session.shown.staged_memories.clear();
+    session.shown.context = None;
+    job.state = JobState::Queued;
+    job.runtime = None;
+    save_job(connection, job)?;
+    Ok(true)
 }
 
 const BOT_DELETED: &str = "bot 已删除";
@@ -3920,14 +3977,11 @@ fn recover_session(
     if attempt.boot == boot {
         return Ok(());
     }
+    if requeue_unstarted_claim_from(connection, session, &mut job)? {
+        return Ok(());
+    }
     match job.state {
-        JobState::Claimed { .. } => {
-            job.state = JobState::Queued;
-            session.active = None;
-            session.shown.staged_memories.clear();
-            save_job(connection, &job)?;
-        }
-        JobState::Running { .. } | JobState::Cancelling { .. } => {
+        JobState::Claimed { .. } | JobState::Running { .. } | JobState::Cancelling { .. } => {
             end_job_from(
                 connection,
                 blob_dir,
@@ -4321,6 +4375,116 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Called only after the missing consumer's tool token was revoked and its tools drained.
+    pub(crate) fn requeue_abandoned_scheduler_claim(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        boot: &str,
+    ) -> Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        let Some(attempt) = job.state.attempt() else {
+            return Ok(false);
+        };
+        if attempt.id != attempt_id || attempt.boot != boot {
+            return Ok(false);
+        }
+        let mut session = load_job_session(&tx, &job)?;
+        let requeued = requeue_unstarted_claim_from(&tx, &mut session, &mut job)?;
+        if requeued {
+            save_session(&tx, &session)?;
+        }
+        tx.commit()?;
+        Ok(requeued)
+    }
+
+    pub(crate) fn scheduler_attempt_not_started(&self, job: &SchedulerJob) -> Result<bool> {
+        attempt_not_started_from(&self.connection, job)
+    }
+
+    pub(crate) fn reserve_scheduler_budget(
+        &mut self,
+        network: &str,
+        job: &SchedulerJob,
+        units: u64,
+        limit: u64,
+        at_ms: i64,
+    ) -> Result<SchedulerBudgetReservation> {
+        ensure!(
+            units > 0 && limit <= i64::MAX as u64 && at_ms >= 0,
+            "invalid budget units/limit/date"
+        );
+        let attempt = job.state.attempt().context("scheduler attempt missing")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            load_job(&tx, &job.conversation_id, &job.trigger)?.context("scheduler job missing")?;
+        ensure!(
+            current.state.attempt() == Some(attempt)
+                && matches!(
+                    current.state,
+                    JobState::Claimed { .. } | JobState::Running { .. }
+                )
+                && current.runtime.is_some()
+                && attempt_not_started_from(&tx, &current)?,
+            "scheduler budget requires an unstarted live attempt"
+        );
+        let (day, used): (String, u64) = tx.query_row(
+            "SELECT date(?2/1000,'unixepoch'), COALESCE((SELECT used FROM budget_days WHERE network_id=?1 AND day=date(?2/1000,'unixepoch')), 0)",
+            params![network, at_ms],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let next = used.checked_add(units).context("budget overflow")?;
+        ensure!(next <= limit, "daily model budget exhausted");
+        tx.execute(
+            "INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",
+            params![network, day, next],
+        )?;
+        tx.commit()?;
+        Ok(SchedulerBudgetReservation {
+            network: network.into(),
+            conversation: job.conversation_id.clone(),
+            trigger: job.trigger.clone(),
+            attempt: attempt.clone(),
+            day,
+            units,
+        })
+    }
+
+    pub(crate) fn refund_scheduler_budget(
+        &mut self,
+        reservation: SchedulerBudgetReservation,
+        boot: &str,
+    ) -> Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let job = load_job(&tx, &reservation.conversation, &reservation.trigger)?
+            .context("scheduler job missing")?;
+        if reservation.attempt.boot != boot
+            || job.state.attempt().is_none_or(|attempt| {
+                attempt.id != reservation.attempt.id || attempt.boot != reservation.attempt.boot
+            })
+            || !attempt_not_started_from(&tx, &job)?
+        {
+            return Ok(false);
+        }
+        ensure!(
+            tx.execute(
+                "UPDATE budget_days SET used=used-?1 WHERE network_id=?2 AND day=?3 AND used>=?1",
+                params![reservation.units, reservation.network, reservation.day],
+            )? == 1,
+            "scheduler reservation charge is missing"
+        );
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn refuse_queued_tasks(

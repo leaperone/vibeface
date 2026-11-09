@@ -195,8 +195,30 @@ async fn service(
         .open_record(&read_packet(&mut recv).await?)?
         .context("response exceeds one record")?;
     let result = serde_json::from_slice(&value)?;
-    connection.close(0u32.into(), b"probe complete");
+    let closed = tokio::time::timeout(Duration::from_secs(6), connection.closed())
+        .await
+        .context("single-request service did not release its connection")?;
+    ensure!(
+        closed.to_string().contains("service request finished"),
+        "service response did not end its single-request session"
+    );
     Ok(result)
+}
+async fn handshake_budget_releases(endpoint: &Endpoint, target: &Target) -> Result<()> {
+    let first = endpoint
+        .connect(target.addr()?, b"vibeface/service/1")
+        .await?;
+    let second = endpoint
+        .connect(target.addr()?, b"vibeface/service/1")
+        .await?;
+    let (mut send, _recv) = first.open_bi().await?;
+    send.write_all(&[0]).await?;
+    tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(first.closed(), second.closed());
+    })
+    .await
+    .context("stalled service handshake or first stream kept its peer budget")?;
+    Ok(())
 }
 async fn private_rejected(endpoint: &Endpoint, target: &Target, alpn: &[u8]) -> Result<()> {
     let closed = match endpoint.connect(target.addr()?, alpn).await {
@@ -823,6 +845,7 @@ async fn main() -> Result<()> {
     }
     let mut cases = Vec::new();
     for target in &input.targets {
+        handshake_budget_releases(&endpoint, target).await?;
         let value = tokio::time::timeout(
             Duration::from_secs(15),
             service(
@@ -882,7 +905,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        cases.push(json!({"peer":target.peer,"positiveService":true,"privateAlpnsRejected":3,"foreignObjectsRejected":target.public_node}));
+        cases.push(json!({"peer":target.peer,"positiveService":true,"singleRequestClosed":true,"stalledHandshakeReleased":true,"privateAlpnsRejected":3,"foreignObjectsRejected":target.public_node}));
     }
     let discovery = discovery_checks(&key).await?;
     endpoint.close().await;

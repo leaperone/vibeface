@@ -66,7 +66,14 @@ impl Delivery {
         node: &Runtime,
         mut stored: StoredOrder,
     ) -> Result<StoredOrder> {
-        self.ensure_mode(stored.view.mode)?;
+        self.ensure_mode(Mode::Paid)?;
+        ensure!(
+            stored.view.mode == Mode::Paid,
+            "charity uses its independent signed protocol"
+        );
+        if stored.view.role == Role::Receiver && stored.accepted {
+            self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?;
+        }
         if stored.view.role == Role::Receiver && !stored.accepted {
             return Ok(stored);
         }
@@ -108,9 +115,6 @@ impl Delivery {
         self.authorize_order_effect(&stored).await?;
         match stored.view.role {
             Role::Sender => {
-                if stored.view.mode == Mode::Charity && stored.view.phase == Phase::Prepared {
-                    return Ok(stored);
-                }
                 let refunding = self.refund_expired(&mut stored).await?;
                 self.save(&mut stored)?;
                 if refunding || matches!(stored.view.phase, Phase::Paid | Phase::Refunded) {
@@ -160,25 +164,14 @@ impl Delivery {
                     local.state = remote.state;
                     local.decryption_proven = remote.decryption_proven;
                 }
-                if stored.view.mode == Mode::Paid {
-                    self.update_paid_view(&mut stored).await?;
-                    self.refund_expired(&mut stored).await?;
-                } else if snapshot.evidence == Evidence::CharityReceipt {
-                    stored.view.evidence = Evidence::CharityReceipt;
-                    if stored.view.windows.iter().all(|w| {
-                        matches!(
-                            w.state,
-                            WindowState::Held | WindowState::KeyPublished | WindowState::Earned
-                        )
-                    }) {
-                        stored.view.phase = Phase::Recoverable;
-                    }
-                }
+                self.update_paid_view(&mut stored).await?;
+                self.refund_expired(&mut stored).await?;
             }
             Role::Receiver => {
                 if !stored.accepted {
                     return Ok(stored);
                 }
+                let recovered_locally = stored.view.name.is_some() && stored.view.sha256.is_some();
                 for index in 0..stored.order.unsigned.windows.len() {
                     let index = index as u16;
                     let state = self.paid_state(&stored.order).await?;
@@ -227,9 +220,7 @@ impl Delivery {
                         };
                         stored.view.phase = Phase::Proving;
                         self.save(&mut stored)?;
-                        let seal = self
-                            .prove_cached(&config, &stored, index, "hold", input)
-                            .await?;
+                        let seal = self.prove_cached(&config, &stored, index, input).await?;
                         self.authorize_order_effect(&stored).await?;
                         let value = service::request(
                             node,
@@ -267,13 +258,15 @@ impl Delivery {
                     let ciphertext = self.with_store(|store| {
                         store.object(&stored.view.order_id, index, "ciphertext")
                     })?;
-                    recover_window(
-                        &stored.order.unsigned,
-                        index,
-                        &self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?,
-                        &ciphertext,
-                        &capsule,
-                    )?;
+                    if !recovered_locally {
+                        recover_window(
+                            &stored.order.unsigned,
+                            index,
+                            &self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?,
+                            &ciphertext,
+                            &capsule,
+                        )?;
+                    }
                     stored.view.windows[index as usize].state = WindowState::KeyPublished;
                     if new_hold {
                         stored.view.phase = Phase::Partial;
@@ -281,11 +274,13 @@ impl Delivery {
                         return Ok(stored);
                     }
                 }
-                let recovered = self.read(&stored)?;
-                stored.view.name = Some(text(&recovered, "name")?.into());
-                stored.view.sha256 = Some(text(&recovered, "sha256")?.into());
-                stored.view.phase = Phase::Recoverable;
-                stored.view.evidence = Evidence::Recoverable;
+                if !recovered_locally {
+                    let recovered = self.read(&stored)?;
+                    stored.view.name = Some(text(&recovered, "name")?.into());
+                    stored.view.sha256 = Some(text(&recovered, "sha256")?.into());
+                    stored.view.phase = Phase::Recoverable;
+                    stored.view.evidence = Evidence::Recoverable;
+                }
                 self.update_paid_view(&mut stored).await?;
                 self.save(&mut stored)?;
                 for index in 0..stored.order.unsigned.windows.len() {
@@ -323,9 +318,7 @@ impl Delivery {
                     };
                     stored.view.phase = Phase::Proving;
                     self.save(&mut stored)?;
-                    let seal = self
-                        .prove_cached(&config, &stored, index, "open", input)
-                        .await?;
+                    let seal = self.prove_cached(&config, &stored, index, input).await?;
                     self.authorize_order_effect(&stored).await?;
                     service::request(
                         node,
@@ -342,11 +335,7 @@ impl Delivery {
                     return Ok(stored);
                 }
             }
-            Role::Provider => {
-                if stored.view.mode == Mode::Paid {
-                    self.update_paid_view(&mut stored).await?;
-                }
-            }
+            Role::Provider => self.update_paid_view(&mut stored).await?,
         }
         self.save(&mut stored)?;
         Ok(stored)
@@ -518,7 +507,6 @@ impl Delivery {
         config: &proof::ProofConfig,
         stored: &StoredOrder,
         index: u16,
-        _relation: &str,
         input: ProofInput,
     ) -> Result<Vec<u8>> {
         let digest = hex::encode(input.statement.digest());
@@ -930,27 +918,19 @@ impl Delivery {
             confirmed: false,
             resume_requested: false,
             request_hash,
-            view: view(
-                &request.intent_id,
-                Role::Sender,
-                request.mode,
-                &order,
-                file.len() as u64,
-            )?,
+            view: view(&request.intent_id, Role::Sender, &order, file.len() as u64)?,
             order,
             wallet_signature: quotation.wallet_signature,
             source_seals: Vec::new(),
             grants: quotation.grants,
             accepted: false,
             notified: false,
+            chain_observed_at_ms: 0,
+            settlement_complete: false,
         };
         stored.view.name = Some(request.name);
         stored.view.sha256 = Some(hex::encode(hash(&file)));
-        stored.view.payment.gas_cap = if stored.view.mode == Mode::Paid {
-            request.max_gas_amount
-        } else {
-            "0".into()
-        };
+        stored.view.payment.gas_cap = request.max_gas_amount;
         self.with_store(|store| {
             for (index, randomness) in randomness.into_iter().enumerate() {
                 let statement =
@@ -1046,7 +1026,7 @@ impl Delivery {
                 );
                 let input: ProofInput = serde_json::from_slice(&encoded)?;
                 let seal = self
-                    .prove_cached(&prover, &order, index as u16, "source", input)
+                    .prove_cached(&prover, &order, index as u16, input)
                     .await?;
                 order.source_seals.push(seal);
                 self.save(&mut order)?;
@@ -1111,20 +1091,18 @@ pub(super) fn address_bytes(value: &str) -> Result<[u8; 20]> {
 pub(super) fn view(
     intent: &str,
     role: Role,
-    mode: Mode,
     order: &Order,
     file_bytes: u64,
 ) -> Result<DeliveryOrder> {
     let terms = &order.unsigned.terms;
-    let mut payment = Payment::free();
-    if mode == Mode::Paid {
+    let payment = {
         let mut delivery = Amount::ZERO;
         let mut reservation = Amount::ZERO;
         for window in &order.unsigned.windows {
             delivery = delivery.checked_add(window.delivery_fee)?;
             reservation = reservation.checked_add(window.reservation_fee)?;
         }
-        payment = Payment {
+        Payment {
             state: PaymentState::Prepared,
             chain_id: Some(
                 u64::from_be_bytes(terms.binding.chain_id[24..].try_into().expect("chain"))
@@ -1142,13 +1120,13 @@ pub(super) fn view(
             withdrawn: "0".into(),
             refunded: "0".into(),
             tx_hash: None,
-        };
-    }
+        }
+    };
     Ok(DeliveryOrder {
         order_id: hex::encode(terms.order_id()?),
         intent_id: intent.into(),
         role,
-        mode,
+        mode: Mode::Paid,
         acceptance: match terms.acceptance {
             vibeface_delivery::Acceptance::Recoverable => Acceptance::Recoverable,
             vibeface_delivery::Acceptance::Strict => Acceptance::Strict,

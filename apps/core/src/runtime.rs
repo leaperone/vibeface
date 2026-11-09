@@ -594,16 +594,16 @@ impl Runtime {
         let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
-            env: crate::providers::ProviderEnv::load(dir)?,
+            env: config.provider_env.clone(),
         };
         let codex_agent = config
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         provider_roots.apply(&mut local)?;
-        let mut codex_config = if local.launches(Provider::Codex)
-            && local.switches.app_server_used(codex_agent)
-        {
+        let mut codex_config = if config.codex_config.is_some() {
+            config.codex_config.clone()
+        } else if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
             match provider_roots.prepare_codex_config(&host) {
                 Ok(projected) => projected,
                 Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
@@ -618,7 +618,6 @@ impl Runtime {
         } else {
             None
         };
-        let mut completed_env = false;
         for provider in [Provider::Codex, Provider::Claude, Provider::Cursor] {
             let enabled = if provider == Provider::Codex {
                 local.switches.app_server_used(codex_agent)
@@ -643,10 +642,10 @@ impl Runtime {
             )
             .await
             {
-                Ok(changed) => completed_env |= changed,
+                Ok(_) => {}
                 Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
                     if provider == Provider::Codex {
-                        codex_config = None;
+                        codex_config = config.codex_config.clone();
                     }
                     tracing::warn!(
                         event = "providers.local_source_failed",
@@ -657,11 +656,13 @@ impl Runtime {
                 Err(error) => return Err(error),
             }
         }
-        if completed_env {
-            local.env.save(dir)?;
-        }
-        if config.bins != local.bins {
+        if local.env != config.provider_env
+            || local.bins != config.bins
+            || codex_config != config.codex_config
+        {
+            config.provider_env = local.env.clone();
             config.bins = local.bins.clone();
+            config.codex_config = codex_config.clone();
             config.save(dir)?;
         }
         if let Some(projected) = codex_config {
@@ -695,7 +696,7 @@ impl Runtime {
             .clone();
         local.validate(codex_agent)?;
         let claude_env = local.env.get(Provider::Claude).clone();
-        let claude = claude::Claude::open(dir, &claude_env);
+        let claude = claude::Claude::open(dir, &claude_env).await;
         let codex_target = local.codex_target(codex_agent);
         let codex = Arc::new(codex_server::CodexServer::open(
             codex_target,
@@ -771,7 +772,7 @@ impl Runtime {
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             claude,
-            pi: Arc::new(pi::Pi::new(dir)),
+            pi: Arc::new(pi::Pi::new(dir).await),
             opencode,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
@@ -1444,7 +1445,8 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
-    /// What this Node offers its peers right now; work it does not execute is not offered.
+    /// The workspace roots this Node publishes and the state of each capability. A root listed
+    /// here is not an execution grant: the submitting side checks execution and roots again.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
         let manager = self.manager().map(|m| m.provider);

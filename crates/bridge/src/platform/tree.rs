@@ -197,14 +197,15 @@ impl Leftover {
     pub fn find(token: &str) -> Result<Option<Self>> {
         #[cfg(unix)]
         {
-            let Some(group) = token
+            let group = token
                 .trim()
                 .parse::<i32>()
                 .ok()
-                .filter(|group| *group > 1 && signal_group(*group, 0))
-            else {
+                .filter(|group| *group > 1)
+                .context("invalid process-tree record")?;
+            if !signal_group(group, 0) {
                 return Ok(None);
-            };
+            }
             Ok(Some(Self { group }))
         }
         #[cfg(windows)]
@@ -285,7 +286,8 @@ fn signal_group(group: i32, signal: i32) -> bool {
         return false;
     }
     // SAFETY: kill(2) with a negative pid signals one process group and touches no memory.
-    unsafe { libc::kill(-group, signal) == 0 }
+    let result = unsafe { libc::kill(-group, signal) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Whether the process the scheduler recorded as the root of a coordination tree could still be
@@ -313,7 +315,7 @@ pub fn root_is_running(process: u32) -> bool {
 /// Whether a tree recorded under `token` could still be running, used where the Node only needs
 /// to know whether to wait rather than to end anything.
 pub fn token_is_running(token: &str) -> bool {
-    Leftover::find(token).is_ok_and(|found| found.is_some())
+    Leftover::find(token).map_or(true, |found| found.is_some())
 }
 
 /// Ends the tree `token` names when it is still running and at least one program in it is one

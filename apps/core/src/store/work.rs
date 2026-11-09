@@ -488,6 +488,32 @@ impl Store {
         load_run(&self.connection, work_id)
     }
 
+    /// A local journal can vouch only for the same work accepted by this target in this scope.
+    pub(crate) fn work_record_in_scope(
+        &self,
+        network: &str,
+        conversation: &str,
+        work_id: &str,
+        target: &str,
+    ) -> Result<Option<WorkRecord>> {
+        self.authorize_node(network, target)?;
+        let Some(work) = reduce::work_from(&self.connection, network, work_id)? else {
+            return Ok(None);
+        };
+        ensure!(
+            work.conversation_id == conversation && work.target_node == target,
+            "work evidence belongs to another conversation or target"
+        );
+        let record = load_run(&self.connection, work_id)?;
+        ensure!(
+            record.as_ref().is_none_or(|record| {
+                record.conversation == conversation && record.kind == work.kind
+            }),
+            "local work evidence does not match its shared work"
+        );
+        Ok(record)
+    }
+
     pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "1", [])
     }

@@ -5,7 +5,9 @@ import { test as base } from '@e2e-dev/web';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/e2e');
-export type NodeInfo = { url: string; peer: string; directory: string };
+export type NodeInfo = { url: string; entry: string | null; peer: string; directory: string };
+/** A Node whose owner access link a browser opens; `url` is that link's origin. */
+export type OwnerNode = NodeInfo & { entry: string };
 type Role = 'source' | 'receiver' | 'provider';
 type Control = (request: Record<string, unknown>) => Promise<unknown>;
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -20,11 +22,17 @@ function node(value: unknown): NodeInfo {
   const fields = record(value);
   const url = new URL(text(fields.url));
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Fixture uses literal loopback');
+  const entry = fields.entry === null ? null : new URL(text(fields.entry));
+  assert(entry === null || entry.origin === url.origin && entry.pathname === '/' && !entry.search && /^#bootstrap=[A-Za-z0-9_-]+$/.test(entry.hash), 'The owner access link opens this Node with its bootstrap entry in the fragment');
   const peer = text(fields.peer), directory = text(fields.directory);
   assert(/^[a-f0-9]{64}$/.test(peer), 'Fixture peer is a Node identity');
   const inside = relative(artifacts, resolve(directory));
   assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Fixture data remains in this task');
-  return { url: url.origin, peer, directory };
+  return { url: url.origin, entry: entry === null ? null : entry.href, peer, directory };
+}
+function owner(info: NodeInfo): OwnerNode {
+  assert(info.entry !== null, 'A browser Node publishes its owner access link');
+  return { ...info, entry: info.entry };
 }
 function nodes(value: unknown) { return record(record(value).nodes); }
 async function control(baseUrl: string | undefined): Promise<Control> {
@@ -47,12 +55,12 @@ async function control(baseUrl: string | undefined): Promise<Control> {
     return response.json();
   };
 }
-export const test = base.extend<{ node: NodeInfo }>({
+export const test = base.extend<{ node: OwnerNode }>({
   node: async ({ app }, use) => {
     const call = await control(app.baseUrl);
     try {
       const value = nodes(await call({ op: 'reset', kind: 'single' }));
-      const source = node(value.source);
+      const source = owner(node(value.source));
       assert(app.baseUrl);
       assert.equal(source.url, new URL(app.baseUrl).origin);
       await use(source);
@@ -60,7 +68,7 @@ export const test = base.extend<{ node: NodeInfo }>({
   },
 });
 export type DeliveryFixture = {
-  source: NodeInfo; receiver: NodeInfo; provider: NodeInfo;
+  source: OwnerNode; receiver: OwnerNode; provider: NodeInfo;
   restart(role: Role, crash?: boolean): Promise<void>;
   inspect(): Promise<{ wallet_files: number; pkarr_reads: number; pkarr_writes: number; chain_rpc_calls: number }>;
 };
@@ -69,7 +77,7 @@ export const deliveryTest = base.extend<{ network: DeliveryFixture }>({
     const call = await control(app.baseUrl);
     try {
       const value = nodes(await call({ op: 'reset', kind: 'delivery' }));
-      const source = node(value.source), receiver = node(value.receiver), provider = node(value.provider);
+      const source = owner(node(value.source)), receiver = owner(node(value.receiver)), provider = node(value.provider);
       assert(app.baseUrl);
       assert.equal(source.url, new URL(app.baseUrl).origin);
       assert(new Set([source.peer, receiver.peer, provider.peer]).size === 3, 'Each Node has its own identity');
@@ -97,7 +105,7 @@ export type WorkspaceEvidence = {
   turns: { thread_id: string; turn_id: string; state: string }[];
 };
 type WorkspaceFixture = {
-  source: NodeInfo;
+  source: OwnerNode;
   gates: Record<WorkspaceGate, string>;
   release(gate: WorkspaceGate): Promise<void>;
   inspect(): Promise<WorkspaceEvidence>;
@@ -125,7 +133,7 @@ export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
     const call = await control(app.baseUrl);
     try {
       const ready = record(await call({ op: 'reset', kind: 'workspace' }));
-      const source = node(nodes(ready).source);
+      const source = owner(node(nodes(ready).source));
       assert(app.baseUrl);
       assert.equal(source.url, new URL(app.baseUrl).origin);
       const paths = record(ready.gates);

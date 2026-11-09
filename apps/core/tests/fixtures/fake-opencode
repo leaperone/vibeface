@@ -21,5 +21,8 @@ database = Path(os.environ['OPENCODE_DB'])
 database.parent.mkdir(parents=True, exist_ok=True)
 with database.open('a') as output:
     output.write('fixture session store\n')
+startup_gate = os.environ.get('FAKE_OPENCODE_STARTUP_GATE')
+while startup_gate and not Path(startup_gate).exists():
+    time.sleep(0.01)
 print('opencode server listening on http://127.0.0.1:' + os.environ['FAKE_OPENCODE_PORT'], flush=True)
 time.sleep(120)

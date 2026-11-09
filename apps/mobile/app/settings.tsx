@@ -93,7 +93,7 @@ export default function Settings() {
         </View>
       </View> : confirming === 'reset' ? <View className="gap-3 px-1">
         {sole ? <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{eraseSoleManagerText(self)}</Text></View> : null}
-        <Text>{`清除${self}上的所有 Vibeface 数据，回到欢迎页。`}</Text>
+        <Text>{`清除${self}上的 Vibeface 应用内数据，回到欢迎页。已导出的文件、照片和文件原件仍由你保管。`}</Text>
         <ErrorText error={error} />
         <View className="flex-row justify-end gap-2">
           <Button variant="ghost" onPress={() => setConfirming(null)}><Text>取消</Text></Button>

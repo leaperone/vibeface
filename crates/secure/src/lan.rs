@@ -1,6 +1,6 @@
-//! The tag a Node advertises over mDNS. Members know the network ID and can tell which Node a
-//! tag names; anyone else on the LAN sees a value that changes every hour. A tag only hints
-//! where to dial: QUIC TLS still proves the device.
+//! The tag a Node advertises over mDNS. Anyone knowing the network and device IDs can identify
+//! its hourly tag, including former members. A tag only hints where to dial; QUIC TLS proves
+//! the device, and membership is checked separately.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

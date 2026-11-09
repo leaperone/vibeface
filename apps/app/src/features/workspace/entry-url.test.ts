@@ -15,6 +15,8 @@ import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingC
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
+import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
@@ -1447,6 +1449,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@/features/chat/chrome' || specifier === './chrome') return { ChatMaterial: 'ChatMaterial', useChatChrome: () => ({ kind: 'solid' }), ...dependencies[specifier] as object }
     if (specifier === '@vibeface/client/workspace/storage.ts') return { storageOf, networkKey, ...dependencies[specifier] as object }
     if (specifier === '@/lib/platform') return { webPlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
+    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
@@ -4296,4 +4299,200 @@ test("device id boundaries require the device_id field", () => {
   assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备地址无效/)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备地址无效/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, node_id: id }] }), /缺少文字/)
+})
+
+function nativeFileFixture() {
+  const index = new Map<string, string>()
+  const files = new Map<string, Uint8Array>(), directories = new Set<string>(['file:///documents', 'file:///cache'])
+  let failure = ''
+  const uriOf = (...parts: (string | { uri: string })[]) => parts.map(part => typeof part === 'string' ? part : part.uri).join('/').replace(/\/$/, '')
+  class Directory {
+    readonly uri: string
+    constructor(...parts: (string | { uri: string })[]) { this.uri = uriOf(...parts) }
+    get exists() { return directories.has(this.uri) }
+    create() { directories.add(this.uri) }
+    list() {
+      const direct = (uri: string) => uri.startsWith(this.uri + '/') && !uri.slice(this.uri.length + 1).includes('/')
+      return [...[...directories].filter(direct).map(uri => new Directory(uri)), ...[...files.keys()].filter(direct).map(uri => new File(uri))]
+    }
+    delete() {
+      if (failure === this.uri) throw new Error('controlled delete failure')
+      for (const uri of files.keys()) if (uri.startsWith(this.uri + '/')) files.delete(uri)
+      directories.delete(this.uri)
+    }
+  }
+  class File {
+    uri: string
+    constructor(...parts: (string | { uri: string })[]) { this.uri = uriOf(...parts) }
+    get exists() { return files.has(this.uri) }
+    get name() { return this.uri.split('/').at(-1) ?? '' }
+    get size() { return files.get(this.uri)?.length ?? 0 }
+    create() { files.set(this.uri, new Uint8Array()) }
+    writeSync(value: string | Uint8Array) { if (failure === this.uri || failure === 'recovery-write' && this.uri.endsWith('.tmp')) throw new Error('controlled write failure'); files.set(this.uri, typeof value === 'string' ? new TextEncoder().encode(value) : value.slice()) }
+    async write(value: string | Uint8Array) { this.writeSync(value) }
+    textSync() { return new TextDecoder().decode(files.get(this.uri)) }
+    async text() { return this.textSync() }
+    async bytes() { return files.get(this.uri)?.slice() ?? new Uint8Array() }
+    copySync(destination: File) { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value) }
+    moveSync(destination: File) { this.copySync(destination); files.delete(this.uri); this.uri = destination.uri }
+    delete() { if (failure === this.uri) throw new Error('controlled delete failure'); files.delete(this.uri) }
+  }
+  const native = { Directory, File, Paths: { document: new Directory('file:///documents'), cache: new Directory('file:///cache') } }
+  const mmkv = { createMMKV: () => ({ getString: (key: string) => index.get(key), getAllKeys: () => [...index.keys()], set: (key: string, value: string) => { if (failure === 'recovery-index') throw new Error('controlled index failure'); index.set(key, value) }, remove: (key: string) => index.delete(key), clearAll: () => index.clear() }) }
+  return { native, mmkv, files, fail: (uri: string) => { failure = uri } }
+}
+
+test('native private files preserve sealed records and external originals while erase fences delayed pickers and retries failed deletes', async () => {
+  const fixture = nativeFileFixture()
+  const app = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  const { privateFiles } = app.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
+  const source = new fixture.native.File('file:///provider/original.json'), exported = new fixture.native.File('file:///export/kept.json')
+  source.writeSync('original'); exported.writeSync('external export')
+  const envelope = JSON.stringify({ version: 1, network_id: 'a'.repeat(64), envelope: { header: { format: 'vibeface-recovery', version: 1, kdf: 'argon2id', memory_kib: 19456, iterations: 2, parallelism: 1, salt: '1'.repeat(32), cipher: 'xchacha20poly1305', nonce: '2'.repeat(48) }, ciphertext: '3'.repeat(64) } })
+  const earlier = new fixture.native.File('file:///documents/vibeface-recovery-ABCDEF12-2026-11-08.json')
+  const similar = new fixture.native.File('file:///documents/vibeface-recovery-ABCDEF12-2026-11-08-notes.json')
+  const nonRecovery = new fixture.native.File('file:///documents/vibeface-recovery-ABCDEF13-2026-11-08.json')
+  const externalRecovery = new fixture.native.File('file:///export/vibeface-recovery-ABCDEF12-2026-11-08.json')
+  earlier.writeSync(envelope); similar.writeSync(envelope); nonRecovery.writeSync('{"user":"notes"}'); externalRecovery.writeSync(envelope)
+  privateFiles.recoveryStorage.write('sealed copy with index')
+  const reloaded = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  assert.equal((reloaded.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')).privateFiles.recoveryStorage.read(), 'sealed copy with index')
+  fixture.fail('recovery-write')
+  assert.throws(() => privateFiles.recoveryStorage.write('not committed'), /controlled write failure/)
+  assert.equal(privateFiles.recoveryStorage.read(), 'sealed copy with index')
+  fixture.fail('recovery-index')
+  assert.throws(() => privateFiles.recoveryStorage.write('not indexed'), /controlled index failure/)
+  assert.equal(privateFiles.recoveryStorage.read(), 'sealed copy with index')
+  fixture.fail('')
+  const picked = privateFiles.retain(source.uri)
+  assert.notEqual(picked.uri, source.uri)
+  const nativeCopy = new fixture.native.File('file:///cache/DocumentPicker/copied.json')
+  nativeCopy.writeSync('picker cache')
+  fixture.fail(nativeCopy.uri)
+  assert.throws(() => privateFiles.releasePicker(nativeCopy.uri), /controlled delete failure/)
+  await assert.rejects(privateFiles.erase(async () => {}), /controlled delete failure/)
+  assert.equal(picked.exists, true, 'failed cleanup retains retry evidence and owned copies')
+  fixture.fail('')
+  const delayed = pendingResult()
+  let returned = false, erased = false
+  const work = privateFiles.run(async current => {
+    await delayed.promise
+    nativeCopy.writeSync('late picker cache')
+    try { if (current()) { privateFiles.retain(nativeCopy.uri); returned = true } }
+    finally { privateFiles.releasePicker(nativeCopy.uri) }
+  })
+  const rejected = assert.rejects(work, /正在清除/)
+  const erase = privateFiles.erase(async () => { erased = true })
+  await settleComponent()
+  assert.equal(erased, false)
+  await assert.rejects(privateFiles.run(async () => {}), /正在清除/)
+  delayed.resolve(undefined)
+  await Promise.all([erase, rejected])
+  assert.equal(returned, false)
+  assert.equal(erased, true)
+  assert.equal(nativeCopy.exists, false)
+  assert.equal(picked.exists, false)
+  assert.equal(privateFiles.recoveryStorage.read(), null)
+  assert.equal(source.textSync(), 'original')
+  assert.equal(exported.textSync(), 'external export')
+  assert.equal(earlier.exists, false, 'the earlier writer-owned root copy is erased')
+  assert.equal(similar.textSync(), envelope, 'a similar user filename is preserved')
+  assert.equal(nonRecovery.textSync(), '{"user":"notes"}', 'a matching name without a sealed recovery shape is preserved')
+  assert.equal(externalRecovery.textSync(), envelope, 'an external same-name exported recovery is preserved')
+})
+
+test('a missing native or web recovery copy never enables external-save confirmation', () => {
+  for (const [path, name, saveProp] of [
+    ['../../../../../apps/mobile/src/features/recovery/recovery.tsx', 'SaveRecoveryFile', 'save'],
+    ['../identity/recovery-controls.tsx', 'SaveRecoveryFile', 'download'],
+  ]) {
+    const app = componentHarness(path, {
+      '@vibeface/client/identity/copy.ts': { recoveryCopy: { why: '', onlyCopy: '', keptApart: '文件和密码分开保存' } },
+      '@vibeface/client/lib/secure.ts': { recoveryFileStem: (code: string) => code },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      '@/components/app/kit': { claimFocus() {}, InlineError: 'InlineError' },
+    }, {}, path.includes('/mobile/') ? 'SaveRecoveryFile' : '')
+    try {
+      const missing = app.render(name, { code: 'ABCDEF12', saved: false, onSaved() {} })
+      const confirmation = missing.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')
+      assert.equal(confirmation?.props.disabled, true)
+      const handed = app.render(name, { code: 'ABCDEF12', saved: false, onSaved() {}, [saveProp]: { done: true, run() {} } })
+      assert.equal(handed.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
+      const confirmed = app.render(name, { code: 'ABCDEF12', saved: true, onSaved() {} })
+      assert.equal(confirmed.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
+    } finally { app.close() }
+  }
+})
+
+test('native notification callbacks replace tags, open once, stay bounded and clear on erase', async () => {
+  const fixture = nativeFileFixture()
+  const owned = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
+  let response: ((value: { notification: { request: { content: { data: { tag: string } } } } }) => void) | undefined
+  let calls = 0, dismissed = 0, forgotten = 0
+  const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
+    'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+    'expo-file-system': fixture.native,
+    'expo-notifications': {
+      setNotificationHandler() {}, AndroidImportance: { HIGH: 1 }, setNotificationChannelAsync: async () => {},
+      addNotificationResponseReceivedListener(listener: typeof response) { response = listener },
+      scheduleNotificationAsync: async () => 'scheduled', dismissAllNotificationsAsync: async () => { dismissed++ },
+    },
+    'react-native-mmkv': { createMMKV: () => ({ getString() {}, set() {}, clearAll() {}, getAllKeys: () => [] }) },
+    '@vibeface/secure-native': { lan: {}, secure: {} },
+    '@vibeface/client/lib/transport.ts': { createTransport: () => ({ forgetClient: async () => { forgotten++ } }) },
+    '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
+    './files': { privateFiles },
+  }, {}, 'opens')
+  const { mobilePlatform, opens } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts') & { opens: Map<string, () => void> }
+  const show = (tag: string, open = () => { calls++ }) => mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag }, open)
+  const click = (tag: string) => response?.({ notification: { request: { content: { data: { tag } } } } })
+  show('same', () => { calls += 10 }); show('same')
+  assert.equal(opens.size, 1)
+  click('same'); click('same')
+  assert.equal(calls, 1)
+  assert.equal(opens.size, 0)
+  for (let index = 0; index < 1100; index++) show(String(index))
+  assert.equal(opens.size, 1000)
+  click('0'); assert.equal(calls, 1)
+  click('1099'); assert.equal(calls, 2)
+  await mobilePlatform.erase?.()
+  assert.equal(opens.size, 0)
+  assert.equal(dismissed, 1)
+  assert.equal(forgotten, 1)
+  click('1000'); assert.equal(calls, 2)
+})
+
+test('the native switch confirmation fixes the decoded entry and never erases for a changed link or cancellation', async () => {
+  const entryId = 'a'.repeat(64), link = 'vibeface://join/vibeface1fixture'
+  let url = link, erased = 0, canceled = 0
+  const kept: (string | null)[] = [], failures: unknown[] = []
+  const app = componentHarness('../../../../../apps/mobile/app/switch-network.tsx', {
+    'expo-router': { router: { back: () => { canceled++ } }, useLocalSearchParams: () => ({ link }) },
+    'expo-linking': { useLinkingURL: () => url },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: { members: [] }, linkTarget: () => 'other' }) },
+    '@vibeface/client/identity/copy.ts': { soleManager: () => false, switchCopy: { title: '换到新的网络？', erase: () => '清除应用内数据', confirm: '换网络' } },
+    '@vibeface/client/identity/switch-network.ts': { joinDestination },
+    '@/platform': { mobilePlatform: { secure: { ticketDecode: () => JSON.stringify({ entry_id: entryId }) } }, self: '这台手机' },
+    '@/lib/join-link': { openedLink: (value: string | null) => value?.startsWith('vibeface://join/') && joinTicket(value) ? value : null, keepSwitchedLink: (value: string | null) => kept.push(value) },
+    '@/lib/factory-reset': { factoryReset: async () => { erased++ } },
+    '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_name: string, action: () => Promise<void>) => { try { await action() } catch (cause) { failures.push(cause) } } }) },
+  })
+  try {
+    app.render('default')
+    assert.match(componentText(app.output), new RegExp(entryId))
+    const cancel = app.render('default').find(({ props }) => props.variant === 'ghost')?.props.onPress
+    assert.ok(typeof cancel === 'function'); cancel()
+    assert.equal(canceled, 1); assert.equal(erased, 0)
+    url = 'vibeface://join/vibeface1different'
+    const changed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
+    assert.equal(changed?.disabled, true)
+    assert.ok(typeof changed?.onPress === 'function'); changed.onPress(); await settleComponent()
+    assert.equal(erased, 0); assert.equal(failures.length, 1)
+    url = link
+    const confirmed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
+    assert.equal(confirmed?.disabled, false)
+    assert.ok(typeof confirmed?.onPress === 'function'); confirmed.onPress(); await settleComponent()
+    assert.equal(erased, 1); assert.deepEqual(kept, [link])
+  } finally { app.close() }
 })
