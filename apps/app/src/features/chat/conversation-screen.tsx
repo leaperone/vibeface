@@ -325,6 +325,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
+        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" className="max-md:min-h-11" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
         <InputQueue target={inputTarget} />
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
