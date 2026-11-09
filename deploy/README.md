@@ -41,19 +41,19 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 
 | role | 运行方式 | 额外配置 |
 | --- | --- | --- |
-| node | Core host network，官方公共节点：发现服务、开放 relay 和浏览器接入，各有限额；文件描述符上限 65536；无静态 App、无 Nginx | 上例全部 Core 字段，可选 `legacy_service` 与 `maintenance_socket` |
+| node | Core host network，官方公共节点：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额；文件描述符上限 65536；无静态 App、无 Nginx | 上例全部 Core 字段，可选 `legacy_service` 与 `maintenance_socket` |
 | app | 静态 App，bridge network；浏览器直连公共节点，App 主机不转发任何接口 | 通用字段，另加 `nginx_config`、`server_name` |
 | www | 静态 WWW，bridge network | 通用字段，另加 `nginx_config`、`server_name`，tag 使用 `www-v` 前缀 |
 
-通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，网页接口的 TCP 端口直接对公网只讲 TLS，前面没有代理，同号 UDP 端口对外提供发现服务。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。网页直接从浏览器连接公共节点的 `gateway_url`，App 主机不反代任何接口：其余非静态 location（包括 `/api/client`、`/api/info`、`/api/decision`）只能是 `return 404`，旧的反代规则、`/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除或改成 `return 404`，未知规则会拒绝激活。
+通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，网页接口的 TCP 端口直接对公网只讲 TLS，前面没有代理，同号 UDP 端口是 iroh 端口，其他 Node 经它加入全网。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。网页直接从浏览器连接公共节点的 `gateway_url`，App 主机不反代任何接口：其余非静态 location（包括 `/api/client`、`/api/info`、`/api/decision`）只能是 `return 404`，旧的反代规则、`/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除或改成 `return 404`，未知规则会拒绝激活。
 
-公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.serve_discovery` 开启；`relay_listen` 已设、`relay_open` 开启且没有 `relay_operator_token`，`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 已设；`forwarding.any` 开启，设了 `forwarding.rate` 和 `forwarding.per_ip`，没有 `forwarding.trusted_proxies`（浏览器直连，限额按真实对端地址计）；网页和 `tls` 开启，`tls_dir` 的证书和私钥以只读方式挂到数据目录的 `tls-cert.pem` 和 `tls-key.pem` 上、属主是 root，`public_url` 等于镜像里 `public-bootstrap.json` 的 `gateway_url`，`allowed_origins` 包含 `https://app.vibeface.dev`；没有 `manager` 和项目根目录；设备编号等于镜像里 `public-bootstrap.json` 的 `issuer`。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 16 KiB/s、最多 128 个连接、同一地址最多 8 个，同时转发 32 个浏览器会话、另有 192 个排队、同一浏览器地址最多 8 个连接、每会话 256 KiB/s。香港主机总上行约 3 Mbit/s，主机上的 `vibeface-relay-shape.service` 用 `tc` 把 relay 端口 3340 的出口限在 500 kbit/s，即总带宽的六分之一。浏览器接入端口本身最多接 1024 个连接，同一地址（IPv4 地址或 IPv6 /56，与 relay 相同）最多 32 个，超出的连接不读直接关闭；TLS 握手 10 秒内未完成、请求头 20 秒内未读完（包括两个请求之间的空闲）的连接被关闭，升级成 WebSocket 后不受这个超时影响。这些值写在 Core 里，不随配置变化。数据目录在首次激活前按下面初始化：
+公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.mesh.enabled` 开启；`relay_listen` 和 `relay_url` 已设、`relay_open` 开启且没有 `relay_operator_token`，`relay_rate` 不超过 16384、`relay_max_clients` 不超过 128、`relay_max_clients_per_ip` 不超过 8；`forwarding.any` 开启，设了 `forwarding.rate` 和 `forwarding.per_ip`，没有 `forwarding.trusted_proxies`（浏览器直连，限额按真实对端地址计）；网页和 `tls` 开启，`tls_dir` 的证书和私钥以只读方式挂到数据目录的 `tls-cert.pem` 和 `tls-key.pem` 上、属主是 root，`public_url` 等于镜像里 `public-bootstrap.json` 的 `gateway_url`，`allowed_origins` 包含 `https://app.vibeface.dev`；没有 `manager` 和项目根目录；设备编号等于镜像里 `public-bootstrap.json` 的 `issuer`。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 16 KiB/s、最多 128 个连接、同一地址最多 8 个，同时转发 32 个浏览器会话、另有 192 个排队、同一浏览器地址最多 8 个连接、每会话 256 KiB/s。香港主机总上行约 3 Mbit/s，主机上的 `vibeface-relay-shape.service` 用 `tc` 把 relay 端口 3340 的出口限在 500 kbit/s，即总带宽的六分之一。浏览器接入端口本身最多接 1024 个连接，同一地址（IPv4 地址或 IPv6 /56，与 relay 相同）最多 32 个，超出的连接不读直接关闭；TLS 握手 10 秒内未完成、请求头 20 秒内未读完（包括两个请求之间的空闲）的连接被关闭，升级成 WebSocket 后不受这个超时影响。这些值写在 Core 里，不随配置变化。数据目录在首次激活前按下面初始化：
 
 ```sh
 vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --tls \
   --public-url https://node.vibeface.dev:4792 --allowed-origin https://app.vibeface.dev \
-  --serve-discovery --relay-listen 0.0.0.0:3340 --relay-url http://node.vibeface.dev:3340 \
-  --relay-open --relay-rate 65536 --relay-max-clients 512 --relay-max-clients-per-ip 16 \
+  --relay-listen 0.0.0.0:3340 --relay-url http://node.vibeface.dev:3340 \
+  --relay-open --relay-rate 16384 --relay-max-clients 128 --relay-max-clients-per-ip 8 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
 touch /opt/apps/vibeface-node/state/node.lock
@@ -62,7 +62,7 @@ chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibefac
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 
-`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和发现服务都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
+`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`relay_url` 是上面的 `--relay-url`，Core 用这四项生成默认 bootstrap 节点；`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址。网页和 relay 满足条件后，Node 在全网记录里宣告 `gateway` 和 `relay` 角色。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和全网 UDP 都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
 
 `init --tls` 写的是自签占位证书，浏览器不信任它；部署后它只是挂载点，容器里看到的是 `tls_dir` 的文件。真实证书由宿主 root 的 acme.sh 向 Let's Encrypt 申请，写进 root 所有的 `tls_dir`，不碰 1001 可写的数据目录，因此不会被数据目录里的符号链接引到别处。HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot。先建好目录和两个文件，属主和权限此后保持不变：
 
@@ -89,7 +89,7 @@ acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w
 
 `tls-cert.pem` 是完整证书链，属 root、权限 0644；`tls-key.pem` 属 root:1001、权限 0640，容器用户只能读。`tls_dir` 属 root:1001、权限 0750。激活脚本在宿主上核对这些属主和权限，容器里的 guard 再核对两个文件来自只读挂载、属主是 root、组和其他用户不可写。两个文件按单文件 bind mount 挂进容器，挂载跟随 inode：续期必须原地改写文件内容。acme.sh 的 `--install-cert` 用 `cat >` 原地写，inode 不变，符合要求；不要用先写临时文件再 `mv` 替换的方式，否则容器继续看到旧文件，直到重新激活。Core 每次接受连接时检查这两个文件，内容变化后重新加载，不需要重启容器，也不需要 reloadcmd；证书与私钥暂时不配对（例如只写完一个）时继续用旧证书，5 秒后再试。
 
-**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（发现服务）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
+**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分三种情况：
 

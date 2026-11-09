@@ -1,6 +1,6 @@
 # 全网层（Mesh）
 
-每台 Node 默认加入同一个 iroh-gossip 主题，向全网宣告一条自己签名的记录，并持有、转发、持久化所有 Node 的记录。任何在表里的 Node 都能当入网起点，官方公共节点只是默认种子和一台普通的志愿 relay 与网关。
+每台 Node 默认加入同一个 iroh-gossip 主题，向全网宣告一条自己签名的记录，并持有、转发、持久化所有 Node 的记录。任何在表里的 Node 都能当入网起点，官方公共节点只是默认 bootstrap 节点和一台普通的志愿 relay 与网关。
 
 ## 记录
 
@@ -17,7 +17,7 @@
 | `reachable` | `public`、`nat` 或 `unknown`，只影响别人选入网起点的顺序 |
 | `roles` | `relay`、`gateway`、`service`，最多 4 个 |
 
-单条记录不超过 1 KiB。Node 每 10 分钟重发一次，地址、relay 或角色变化时立即重发，两次宣告至少间隔 30 秒。表最多 65536 条，每个设备一条，每个设备 30 秒内只接受一次更新。IP 地址对全网可见。
+单条记录不超过 1 KiB。Node 每 10 分钟重发一次，地址、relay 或角色变化时立即重发，两次宣告至少间隔 30 秒。表最多 65536 条，每个设备一条；新记录的 `seq` 必须不小于已持有记录的 `seq` 加 30 秒，发送方取当前时间与已持有 `seq` 加 30 秒中的较大者，乱序到达的旧包不会挡住新记录。IP 地址对全网可见。
 
 角色：
 
@@ -35,7 +35,7 @@
 
 gossip 只送新消息。两台 Node 成为邻居时，各自把 `(device_id, seq)` 摘要发给对方，再只取回自己缺少或更旧的记录。同一条流也回答按设备编号的查询，作为表里没有目标时的兜底。
 
-表保存在数据目录的 `mesh.sqlite3`，保留 30 天内见过的记录。重启后先用旧表入网，最初的种子不可达也能回到原来的网络。这个文件只是公共数据的缓存，删除后 Node 会重新从种子入网。
+表保存在数据目录的 `mesh.sqlite3`，保留 30 天内见过的记录。重启后先用旧表入网，最初的 bootstrap 节点不可达也能回到原来的网络。这个文件只是公共数据的缓存，删除后 Node 会重新从 bootstrap 节点入网。
 
 ## 发现
 
@@ -45,7 +45,7 @@ Mesh 实现 iroh 的地址查找：拨号时先查本地表，得到直连地址
 
 ## 志愿 relay
 
-Node 在网页设置里打开「公共中继」后运行一台开放 relay，默认每连接 16 KiB/s、最多 128 个连接、同一地址最多 8 个。它先请一台邻居从外部探测自己的 relay URL，探测通过才在记录里宣告 `relay` 角色。关闭后从记录里移除并重发。
+Node 在网页设备页打开「公共转发」或运行 `vibeface relay volunteer on` 后运行一台开放 relay，默认每连接 16 KiB/s、最多 128 个连接、同一地址最多 8 个。它先请一台邻居从外部探测自己的 relay URL，探测通过才在记录里宣告 `relay` 角色。关闭后从记录里移除并重发。
 
 其他 Node 从表里取开放 relay，逐个用 `/generate_204` 和真实握手验证，按延迟和历史成功率评分，取最好的 8 台加入 relay 列表。iroh 在其中按延迟选 home relay。评分保存在 `mesh_relays`。配置的 relay、本个人网络成员运行的 relay 和自己的 relay 始终保留。
 
@@ -62,10 +62,10 @@ relay 前置代理按 endpoint 累计双向字节，写入 `mesh.sqlite3` 的 `r
 ## 配置
 
 ```json
-"mesh": {"enabled": true, "network": "vibeface", "seeds": ["vibeface://<设备编号>@<主机>:<UDP 端口>?relay=<relay URL>"], "allow_private": false}
+"mesh": {"enabled": true, "network": "vibeface", "bootstrap": ["vibeface://<设备编号>@<主机>:<UDP 端口>?relay=<relay URL>"], "allow_private": false}
 ```
 
-`init` 默认开启并写入官方种子。`--no-mesh` 关闭，`--mesh-network` 改网络名，`--bootstrap` 指定种子（可重复）。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
+`init` 默认开启并写入官方 bootstrap 节点。`--no-mesh` 关闭，`--mesh-network` 改网络名（不再带官方 bootstrap 节点），`--bootstrap` 指定 bootstrap 节点（可重复，最多 16 个）。`vibeface mesh bootstrap add|remove` 修改列表，Node 运行时立即生效；`vibeface mesh status` 和 `vibeface mesh records [--role relay|gateway|service]` 查看全网。`NetworkConfig::default()` 关闭 Mesh，单元测试不访问公共网络。
 
 ## 信任边界
 

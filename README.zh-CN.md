@@ -20,7 +20,7 @@
 - [可以做什么](#可以做什么)
 - [快速开始](#快速开始)
 - [添加另一台设备](#添加另一台设备)
-- [公共发现服务](#公共发现服务)
+- [全网](#全网)
 - [隐私与权限](#隐私与权限)
 - [使用文档](#使用文档)
 - [从源码构建](#从源码构建)
@@ -76,15 +76,15 @@ vibeface join '<加入链接>' --name '<设备名称>'
 
 在两台设备上核对 6 位安全码后再批准。请加入已有网络，不要重新建网。加入和恢复步骤见[首次配置](packages/docs/onboarding.md)。
 
-## 公共发现服务
+## 全网
 
-官方公共节点是一台不加入任何个人网络的普通 Node，提供发现服务、开放 Relay 和浏览器接入，各有很小的上限。它的设备编号和 UDP 地址固定在 [`config/public-bootstrap.json`](config/public-bootstrap.json)：
+每台 Node 默认加入同一张全网表：宣告一条自己签名的记录，内容是设备编号、直连地址、home relay 和它提供的角色，并保存其他 Node 的记录。官方公共节点是一台不加入任何个人网络的普通 Node，是默认的 bootstrap 节点，同时提供开放 Relay 和浏览器接入，各有很小的上限。它的设备编号、UDP 地址和 Relay 固定在 [`config/public-bootstrap.json`](config/public-bootstrap.json)：
 
 ```text
-vibeface://<issuer>@8.217.72.118:4792
+vibeface://<issuer>@8.217.72.118:4792?relay=http://node.vibeface.dev:3340
 ```
 
-新建的个人 Node 默认向它登记，直连不通时经它的开放 Relay 连通。`https://app.vibeface.dev` 直接连它的浏览器接入地址 `gateway_url`（`https://node.vibeface.dev:4792`），再按设备编号连到你的 Node，也可以在连接设置里换成自己的 Gateway；局域网直连仍优先。它只转发密文。首次初始化时可用 `--bootstrap off` 关闭公共引导，也可以指向自建服务。配置方法、可见元数据和连接限制见[使用公共发现服务](packages/docs/node.md#使用公共发现服务)。加入个人网络仍需邀请和批准。
+新建的个人 Node 默认经它入网，直连不通时用全网表里经验证的开放 Relay 连通。`https://app.vibeface.dev` 直接连它的浏览器接入地址 `gateway_url`（`https://node.vibeface.dev:4792`），再按设备编号连到你的 Node，也可以在连接设置里换成自己的 Gateway；局域网直连仍优先。它只转发密文，能看到地址、设备编号和流量大小。首次初始化时可用 `--no-mesh` 不加入全网，或用 `--bootstrap <URL>` 经别的 Node 入网。配置方法、可见元数据和连接限制见[全网](packages/docs/node.md#全网)。加入个人网络仍需邀请和批准。
 
 ## 隐私与权限
 

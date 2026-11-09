@@ -145,7 +145,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 **对端一直 `unreachable`。** 两台 Node 没有直连路径时要经 relay 转发。确认至少一台 Node 用 `--relay-listen` 运行 relay，其他 Node 的 `config.json` 里 `network.relays` 指向它，反向代理允许 WebSocket 升级。改了 `network` 字段要重启。见 [Node 之间的连接](node.md#node-之间的连接)。
 
-**手机打开官方页面或自建公共节点后连不上个人设备。** 公共节点按设备编号经发现服务找到个人设备上的 Node。检查这台 Node 正在运行，`vibeface status` 的 `Bootstrap` 不是 `off`，自建时 `--bootstrap` 指向的是这台公共节点；两边没有直连路径时还要有共同的 relay，公共节点的开放 relay 会在登记时提供给 Node。见 [从外网访问](node.md#从外网访问)。
+**手机打开官方页面或自建公共节点后连不上个人设备。** 公共节点按设备编号在全网表里找到个人设备上的 Node。检查这台 Node 正在运行，`vibeface status` 的 `Mesh` 不是 `off`，`vibeface mesh status` 有邻居，自建时两边在同一个网络名下；两边没有直连路径时还要有共同的 relay，Node 会从全网表里选用公共节点宣告的开放 relay。见 [从外网访问](node.md#从外网访问)。
 
 **任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
 
