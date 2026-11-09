@@ -650,9 +650,21 @@ def activate(config, image, tag, source, version):
         except BaseException:
             rollback(journal, journal_path)
             raise
+        prune(directory, release, current, image)
         return {'status': 'activated', 'image': image, 'source_sha': source, 'version': version}
     finally:
         os.close(descriptor)
+
+
+def prune(directory, release, previous, image):
+    # The backups and the old release only serve a rollback; once confirmed, the host keeps the new one.
+    for name in ('nginx.before', 'data.before.tar.gz'):
+        (release / name).unlink(missing_ok=True)
+    for old in directory.glob('release-*'):
+        if old != release:
+            shutil.rmtree(old)
+    if previous and previous['image'] != image:
+        docker('image', 'rm', previous['image'], check=False)
 
 
 def self_test():
@@ -888,6 +900,18 @@ server {
         else:
             raise AssertionError('backup followed a symbolic link')
         assert (data / 'identity.json').read_text() == 'keep'
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        old, new = directory / 'release-old', directory / 'release-new'
+        for release in (old, new):
+            release.mkdir()
+            for name in ('compose.yaml', 'nginx.before', 'data.before.tar.gz'):
+                (release / name).write_text(name)
+        with patch(__name__ + '.docker') as remove:
+            prune(directory, new, {'image': 'sha256:old'}, 'sha256:new')
+        assert sorted(path.name for path in directory.iterdir()) == ['release-new']
+        assert [path.name for path in new.iterdir()] == ['compose.yaml'], 'confirmed release keeps no backups'
+        remove.assert_called_once_with('image', 'rm', 'sha256:old', check=False)
     print('deployment activation self-test passed')
 
 
