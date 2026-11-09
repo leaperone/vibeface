@@ -230,7 +230,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 官方公共节点是一台不加入任何个人网络的普通 Node，域名 `node.vibeface.dev` 只是指向 `8.217.72.118` 的 DNS-only A 记录，没有代理，同时提供三项服务，各有上限：
 
 - **发现服务**：UDP `8.217.72.118:4792`。它的设备编号和地址固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
-- **开放 relay**：`http://node.vibeface.dev:3340`，显式开放，不要求令牌；每个连接每秒最多上行 64 KiB，同时最多 512 个连接，同一来源地址（IPv6 按 /56 计）最多 16 个。
+- **开放 relay**：`http://node.vibeface.dev:3340`，显式开放，不要求令牌；每个连接每秒最多上行 16 KiB，同时最多 128 个连接，同一来源地址（IPv6 按 /56 计）最多 8 个；整台 relay 的出口另限 500 kbit/s。
 - **浏览器接入**：`https://node.vibeface.dev:4792`，即 `config/public-bootstrap.json` 的 `gateway_url`。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。这个端口只接受 TLS，证书是 Let's Encrypt 签给这个域名的证书，由宿主续期后写进数据目录，Node 不重启就换用新证书。浏览器直连，限额按 TCP 对端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
 `vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台向官方发现服务登记自己的地址和 relay，本机网页、维护接口和局域网发现不等待它。登记应答附上公共节点的开放 relay，Node 把它加为候选 relay，所以直连不通的设备之间也能经它连通。浏览器在官方页面按设备编号连接，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
