@@ -789,6 +789,93 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
 }
 
 #[test]
+fn confirming_a_stopped_main_turn_skips_a_work_of_unknown_scope() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let mut unknown = question(&store, &net, "c", "q-unknown", "external-thread")?;
+    if let EventBody::QuestionAsked { target, .. } = &mut unknown {
+        *target = None;
+    }
+    store.ask(&net.a, &net.network, "c", unknown, 4)?;
+    let mut answer = user(&net, "a-q-unknown", "go on");
+    if let EventBody::MessagePosted {
+        answers,
+        attestation,
+        ..
+    } = &mut answer
+    {
+        *answers = Some("q-unknown".into());
+        *attestation = None;
+    }
+    let answer = net.a.fixture_admin().attest(&net.network, "c", answer)?;
+    store.append_event(&net.a, &net.network, "c", answer, vec![], 5)?;
+    let dispatched = EventBody::WorkDispatched {
+        work_id: "work-unknown-scope".into(),
+        trigger: message_trigger("a-q-unknown"),
+        dispatcher: net.a.device_id()?,
+        call_ref: "a-q-unknown".into(),
+        kind: WorkKind::Task,
+        cwd: "/w".into(),
+        title: "unknown".into(),
+        prompt: "p".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+        model: None,
+        resolved: ResolvedModel {
+            provider: Provider::Codex,
+            model: None,
+        },
+    };
+    store.append_event(&net.a, &net.network, "c", dispatched, vec![], 6)?;
+    assert_eq!(
+        store.trigger_input_target(&net.network, "c", &message_trigger("a-q-unknown"))?,
+        None
+    );
+
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m2",
+        "status?",
+        vec![],
+        true,
+        signature(&net, "m2", "status?")?,
+        7,
+    )?;
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .context("job")?;
+    assert_eq!(claimed.job.trigger, message_trigger("m2"));
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &claimed.job.trigger, &attempt)?;
+    store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
+    let check = store
+        .pending_checks()?
+        .into_iter()
+        .find(|check| check.attempt_id == attempt)
+        .context("pending check")?;
+    store.confirm_manager_stopped(&net.a, &net.network, &check, 8)?;
+    assert_eq!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .context("confirmed reply")?
+            .status,
+        Some(ReplyStatus::Interrupted)
+    );
+    assert!(store.pending_checks()?.is_empty());
+    assert!(matches!(
+        store
+            .scheduler_job("c", &message_trigger("m2"))?
+            .context("job")?
+            .state,
+        JobState::Interrupted { .. }
+    ));
+    Ok(())
+}
+
+#[test]
 fn a_reply_stopped_before_it_started_is_recorded_once() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
