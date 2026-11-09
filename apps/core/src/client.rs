@@ -2101,12 +2101,13 @@ mod tests {
                 tokio::net::TcpStream::connect(listener.local_addr()?),
                 listener.accept()
             );
-            let client = WebSocketStream::from_raw_socket(
-                MaybeTlsStream::Plain(client?),
-                Role::Client,
-                None,
-            )
-            .await;
+            // Real clients get this from `connect_async`; with Nagle on, Linux holds a small
+            // request behind the client's unacknowledged pong for up to 40ms.
+            let client = client?;
+            client.set_nodelay(true)?;
+            let client =
+                WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client), Role::Client, None)
+                    .await;
             let server = WebSocketStream::from_raw_socket(
                 MaybeTlsStream::Plain(accepted?.0),
                 Role::Server,
@@ -2125,6 +2126,48 @@ mod tests {
             ))
         }
 
+        /// Sends a ping and then `frames` in one flush and waits for the pong. The server
+        /// writes the pong inside the read that hands it the next buffered frame, so once the
+        /// pong is back it has read every frame in order, even one whose dispatch then blocks.
+        /// Returns whether a heartbeat ping arrived first: tungstenite answers that with a pong
+        /// of its own, which is then still on the wire.
+        async fn ping(client: &mut Client, frames: &[Vec<u8>]) -> Result<bool> {
+            let ClientSocket::Client(socket) = &mut client.socket else {
+                unreachable!()
+            };
+            socket.feed(NativeMessage::Ping(Vec::new().into())).await?;
+            for frame in frames {
+                socket
+                    .feed(NativeMessage::Binary(frame.clone().into()))
+                    .await?;
+            }
+            socket.flush().await?;
+            let mut heartbeat = false;
+            loop {
+                match client
+                    .socket
+                    .next()
+                    .await
+                    .context("client disconnected")??
+                {
+                    Message::Pong(_) => return Ok(heartbeat),
+                    Message::Ping(_) => heartbeat = true,
+                    other => bail!("unexpected {other:?} before the pong"),
+                }
+            }
+        }
+
+        /// Jumps the clock while nothing is on the wire and lets the heartbeat run, then returns
+        /// to real time: a paused runtime that waits on a socket auto-advances to the next timer.
+        async fn jump(duration: Duration) {
+            tokio::time::pause();
+            tokio::time::advance(duration).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::resume();
+        }
+
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("client-idle-{}", uuid::Uuid::new_v4()));
@@ -2141,37 +2184,28 @@ mod tests {
             let (mut client, serving) = connect(node.clone(), &admin).await?;
             client.call("authenticate", json!({})).await?;
             let save = node.config_save.lock().await;
-            send_value(
-                &mut client.socket,
-                &mut client.channel,
-                &Request {
-                    id: "slow".into(),
-                    method: "configure_node".into(),
-                    params: json!({"roots":[],"manager":null}),
-                },
-            )
-            .await?;
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
-            }
-            tokio::time::pause();
-            tokio::time::advance(IDLE_TIMEOUT + HEARTBEAT).await;
+            let slow = client.channel.seal_message(&serde_json::to_vec(&Request {
+                id: "slow".into(),
+                method: "configure_node".into(),
+                params: json!({"roots":[],"manager":null}),
+            })?)?;
+            ping(&mut client, &slow).await?;
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
             drop(save);
             let reply: Value = serde_json::from_slice(
                 &receive_value(&mut client.socket, &mut client.channel).await?,
             )?;
             assert_eq!(reply["id"], "slow");
             assert!(reply["error"].is_null(), "{reply}");
-            tokio::time::advance(HEARTBEAT).await;
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
-            }
+            jump(HEARTBEAT).await;
             assert!(
                 !serving.is_finished(),
                 "a completed slow dispatch starts a fresh idle interval"
             );
             client.call("authenticate", json!({})).await?;
-            tokio::time::advance(IDLE_TIMEOUT + HEARTBEAT).await;
+            // Nothing of the client's may still be on the wire when the clock jumps.
+            while ping(&mut client, &[]).await? {}
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
             assert!(
                 serving
                     .await?
@@ -2179,28 +2213,20 @@ mod tests {
                     .to_string()
                     .contains("client channel idle")
             );
-            tokio::time::resume();
 
             let (mut client, serving) = connect(node.clone(), &admin).await?;
             client.call("authenticate", json!({})).await?;
             let records = client.channel.seal_message(&vec![b'x'; 70_000])?;
             assert!(records.len() > 1);
             send_frame(&mut client.socket, records[0].clone()).await?;
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
-            }
-            tokio::time::pause();
+            ping(&mut client, &[]).await?;
             for _ in 0..4 {
-                tokio::time::advance(HEARTBEAT).await;
-                client.socket.send(Message::Ping(Vec::new().into())).await?;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
+                jump(HEARTBEAT).await;
+                ping(&mut client, &[]).await?;
             }
-            tokio::time::advance(HEARTBEAT * 2).await;
+            jump(HEARTBEAT * 2).await;
             let error = serving.await?.unwrap_err().to_string();
             assert!(error.contains("fragmented message timed out"), "{error}");
-            tokio::time::resume();
             Ok::<_, anyhow::Error>(())
         }
         .await;
