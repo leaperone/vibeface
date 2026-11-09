@@ -1391,9 +1391,11 @@ pub fn kill_recorded_programs(pidfile: &Path) {
             unconfirmed.push_str(&format!("{line}\n"));
             continue;
         }
-        if let Err(error) =
-            platform::tree::stop_recorded(token, |member| member.contains(executable))
-        {
+        // The Windows job token already binds the root's creation time and job key, and a
+        // program started through a script runs under its interpreter's image.
+        if let Err(error) = platform::tree::stop_recorded(token, |member| {
+            cfg!(windows) || member.contains(executable)
+        }) {
             tracing::debug!(
                 event = "agent.leftover_left_alone",
                 %error,

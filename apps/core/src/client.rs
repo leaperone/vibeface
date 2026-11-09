@@ -2870,7 +2870,28 @@ mod tests {
         service_router.shutdown().await?;
         service.close().await;
         relay.shutdown().await;
-        drop((target, joining));
+        // Windows refuses to delete a database that is still open, so every owner of the
+        // Nodes' stores and the mesh tables lets go first.
+        let meshes = [
+            Arc::downgrade(&service_mesh),
+            Arc::downgrade(&target_net.mesh().context("the target mesh")?),
+        ];
+        drop((
+            router,
+            service_router,
+            service_mesh,
+            service,
+            target_net,
+            target,
+            joining,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while meshes.iter().any(|mesh| mesh.strong_count() > 0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("a closed mesh stayed open")?;
         std::fs::remove_dir_all(dir)?;
         result
     }
