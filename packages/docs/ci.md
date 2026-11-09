@@ -168,7 +168,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
 | 跨设备协作、换负责人与附件验收 | Linux x64 一次，使用 `--phase4` |
 | 公共节点、排队与私有 relay 令牌验收 | Linux x64 一次，使用 `--public-node` |
-| 全网入网、志愿 relay 与 relay 选择验收 | Linux x64 一次，使用 `--mesh` |
+| 全网入网、志愿 relay、relay 选择与无网页 Node 验收 | Linux x64 一次，使用 `--mesh` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
 | Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本，POSIX 平台另执行 `--web-only` 冒烟 |
 
@@ -262,7 +262,7 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 公共节点、relay 准入和浏览器转发排队的改动跑 `--public-node`。P 是不入个人网络的公共节点，在随机网络名的全网里当 bootstrap 节点，提供显式开放并设限的 relay 和面向任何设备的浏览器转发，转发名额和队列各为 1；M 只把 P 配成 bootstrap 节点。覆盖浏览器经 P 加入 M 并对话、P 重启后重连、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 转给 M（P 不核对成员、不验 token）并回答 M 上的提问一次、回答经 M 的 Bot 送达线程一次且错误 token 得 401、名额占满时第二个浏览器排队并在轮到后接通、带运营者令牌的私有 relay R 在 A 与只有 IPv6 的 X 之间转发且 X 换成错误令牌后不可达，只开 TLS 的 Node 用 `init --tls` 的证书应答钉住它的客户端、换一张证书校验失败、明文 HTTP 得不到应答、数据目录换成另一对证书和私钥后不重启即用新证书应答，以及 P 不存事件、会话、日志和附件。
 
-全网、志愿 relay 或 relay 选择改动另跑 `--mesh`。四台 Node 用一个随机网络名：A 是 bootstrap 节点并打开志愿 relay；B、C 入网后表里有 A，选 A 的 relay 做 home 并经它连通；D 只把 B 配成 bootstrap 节点，入网后拿到全部四条记录；D 撤掉 bootstrap 配置后重启，凭旧表重新入网；A 关闭志愿 relay 后，B、C 在下一轮宣告后不再用它。真实公网 NAT 与真实 Agent 工具执行另行验收。
+全网、志愿 relay、relay 选择或无网页 Node 改动另跑 `--mesh`，全程用 CLI 和 RPC 驱动，不开浏览器。四台 Node 用一个随机网络名并打开 `mesh.allow_private`：A 是 bootstrap 节点并打开志愿 relay，自己不存业务记录；B、C 入网后都持有 A、B、C 的在线记录，先直连同步，C 改为只用 `[::1]` 重启后选 A 的 relay 做 home 并经它与 B 同步业务数据；D 只把 B 配成 bootstrap 节点，入网后拿到全部四条记录；D 停止时用 `mesh bootstrap remove` 撤掉 bootstrap 配置，B 也停止，D 重启后凭旧表重新入网；A 关闭志愿 relay 后，D 看到 A 撤回 relay 角色，B、C、D 都不再用它做 home。无网页 Node 覆盖 `serve --no-web`、单独的 `--no-web` 和持久化的 `web_enabled=false`：没有公网 TCP 监听、本地路径 404、真实 hook 照常工作、工具鉴权 401、同步继续，入口撤回且 `gateway_url` 为空。真实公网 NAT、公网 HTTPS 网关、浏览器渲染与真实 Agent 工具执行另行验收。
 
 写入闸门、对齐、分叉、日志、`status` 与诊断导出改动跑 `--phase5`。A、B 两台 Node：A 从备份恢复后对齐前拒绝写入、对齐后无分叉；B 离线时 A 只读，用户确认后才写；复制的数据目录在 B 处分叉后只有副本停写并列出冲突，原 A 与 B 继续写；同时检查 `status` 的对端连通与上次同步、`node.log` 权限与内容、诊断包和日志里没有能力、口令或邀请。
 

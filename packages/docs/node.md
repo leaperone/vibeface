@@ -356,7 +356,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 | 命令 | 身份 | 用途 |
 |---|---|---|
-| `call <method> [json]` | 本机操作者 | 直接调用一个客户端方法；`invite`、`approve`、`grant`、`revoke`、`veto`、恢复和加入类方法被拒绝 |
+| `call <method> [json]` | 本机操作者 | 直接调用一个客户端方法；需要管理客户端签名的 `invite`、`approve`、`grant`、`revoke`、`veto`、`approve_recovery`、`recover`、`recovery_state`、`join`、`join_withdraw` 和不带 `join_id` 的 `join_status` 被拒绝，`subscribe`、`log`、`local_access`、`node_join` 不经维护 socket 提供 |
 | `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；`mesh.` 即 `network.mesh.`。按加载时的规则校验，不接受 token，Node 运行中时重启后生效 |
 | `node settings / configure / write-state / confirm-writable / diagnostics / rejoin` | 本机操作者 | 项目目录（`--root`、`--no-roots`）、本机 Bot（`--manager <JSON>`、`--no-manager`）、恢复后确认可写、诊断包、被移出后重新开始 |
 | `provider configure / probe / models / test-codex` | 本机操作者 | 改 Provider（`codex`、`claude`、`opencode`、`cursor`、`pi`）设置、检查就绪、列模型、测 App Server |
@@ -365,7 +365,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 | `delivery status / list / get / providers` | 本机操作者 | 交付状态、订单和全网里提供交付的 Node |
 | `relay status / volunteer on / off` | 本机操作者 | 见[公共转发](#公共转发) |
 | `triage settings / configure / test-webhook / create-token / revoke-token` | 本机操作者 | 分诊、webhook 和决定 token；token 只显示一次 |
-| `mesh status / records / bootstrap add / remove` | 本机操作者 | 见[全网](#全网) |
+| `mesh status / records / share / bootstrap add / remove` | 本机操作者 | 见[全网](#全网) |
 | `client create-network / enroll / status / invite / requests / approve / grant / revoke / recovery approve / veto / recover / call` | 管理客户端 | 建网、加入、成员管理、恢复，`call` 以客户端身份调用任意方法 |
 
 管理客户端的密钥默认在 `~/.vibeface-client/client.json`（`--client-dir` 或 `VIBEFACE_CLIENT_DIR`），用口令经 argon2id 和 XChaCha20-Poly1305 封存。口令在终端输入，自动化用 `--passphrase-fd`。客户端经 HTTP Gateway 的 `/api/client` 连接，默认用本机 Node 的 Gateway，`--url` 指定其他 Gateway，所以目标 Node 或中转的 Gateway 必须开着网页。
@@ -521,13 +521,13 @@ vibeface mesh bootstrap remove <设备编号>
 
 `mesh bootstrap add|remove` 写入 `config.json` 的 `network.mesh.bootstrap`，Node 运行时立即改用新列表。开关全网或换网络名时，用 `vibeface config set mesh.enabled false` 或 `vibeface config set mesh.network <名称>` 后重启 Node，不要重新运行 `init`，也不需要重新创建个人网络。
 
-Node 从表里选开放 relay：逐个验证，按延迟和历史成功率取最好的 8 台加入候选，iroh 从中选 home relay。配置的 relay、本个人网络成员的 relay 和自己的 relay 始终保留。私网和回环地址上的 relay 与网关默认不用，`network.mesh.allow_private` 打开后才用，供局域网和测试使用。
+Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数、再按延迟取最好的 8 台加入候选，同一网段（IPv4 /24、IPv6 /48）只取 1 台，iroh 从中选 home relay。配置的 relay、本个人网络成员的 relay、bootstrap 节点的 relay 和自己的 relay 始终保留。私网和回环地址上的 relay 与网关默认不用，`network.mesh.allow_private` 打开后才用，供局域网和测试使用。
 
 全网不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，业务流量经 relay 转发，Node 自动选择。
 
 ### 公共转发
 
-运行 relay 的 Node 可以把它开放给全网：网页设备页的**公共转发**开关，或 `vibeface relay volunteer on|off`（`--url`、`--listen`、`--rate`、`--max-clients`、`--max-clients-per-ip` 改地址和限额，不给的保持不变），`vibeface relay status` 查看状态。打开后 relay 接纳任何设备，默认每个连接 16 KiB/s、最多 128 个连接、同一地址最多 8 个，地址和限额可在同一卡片修改。它先请一台邻居从外网探测 relay 地址，通过后才在记录里宣告 `relay` 角色；关闭后从记录里移除。relay 只转发 QUIC 密文，运营者能看到连接的设备编号、地址和流量大小。
+运行 relay 的 Node 可以把它开放给全网：网页设备页的**公共转发**开关，或 `vibeface relay volunteer on|off`（`--url`、`--listen`、`--rate`、`--max-clients`、`--max-clients-per-ip` 改地址和限额，不给的保持不变），`vibeface relay status` 查看状态。打开后 relay 接纳任何设备，默认每个连接 16 KiB/s、最多 128 个连接、同一地址最多 8 个，地址和限额可在同一卡片修改。它先请邻居（最多 3 台）从外网探测 relay 地址，通过后才在记录里宣告 `relay` 角色。关闭后从记录里移除，并撤掉打开时设的开放和限额；只为公共转发运行的 relay 连同监听和 URL 一起停掉，`relay_operator_token` 和屏蔽列表保留，有屏蔽列表时 relay 继续为本个人网络运行。relay 只转发 QUIC 密文，运营者能看到连接的设备编号、地址和流量大小。
 
 ## 多个访问地址
 

@@ -115,16 +115,21 @@ struct Change {
     max_clients_per_ip: Option<NonZeroUsize>,
 }
 
-/// Clears what runs a relay here.
+/// Stops volunteering: the relay no longer admits any device and its limits go. A relay kept
+/// for its blocked devices goes on running for the personal network; otherwise it stops, and
+/// its URL goes too. A relay that was not volunteering is left as it is, operator token and all.
 fn close(network: &mut NetworkConfig) {
-    network.relay_listen = None;
-    network.relay_url = None;
-    network.relay_operator_token = None;
+    if !network.relay_open {
+        return;
+    }
     network.relay_open = false;
     network.relay_rate = None;
     network.relay_max_clients = None;
     network.relay_max_clients_per_ip = None;
-    network.relay_blocked.clear();
+    if network.relay_blocked.is_empty() {
+        network.relay_listen = None;
+        network.relay_url = None;
+    }
 }
 
 impl Runtime {
@@ -429,8 +434,8 @@ impl Runtime {
         }
     }
 
-    /// Keeps the best open relays the mesh announces in the relay map, re-ranked every five
-    /// minutes and when the records change.
+    /// Keeps the bootstrap nodes' relays and the best open relays the mesh announces in the
+    /// relay map, re-ranked every five minutes and when the records change.
     pub(super) async fn adopt_loop(self: Arc<Self>) {
         let Ok(net) = self.net().cloned() else { return };
         let Some(mesh) = net.mesh() else { return };
@@ -443,6 +448,10 @@ impl Runtime {
             let started = Instant::now();
             let own = self.relay_config().own_relay().ok().flatten();
             let own_device = self.identity.device_id().unwrap_or_default();
+            net.set_bootstrap_relays(mesh.bootstrap_relays()).await;
+            if let Err(error) = db.prune() {
+                tracing::warn!(event = "relay.prune_failed", %error);
+            }
             let candidates =
                 net::relay::candidates(&mesh.records(), &own_device, own.as_ref(), allow_private);
             let check =
@@ -661,9 +670,10 @@ mod tests {
         result
     }
 
+    /// Turning volunteering off removes what it set and leaves the operator's settings alone.
     #[test]
-    fn closing_clears_every_relay_field() -> Result<()> {
-        let mut network = NetworkConfig {
+    fn volunteering_off_removes_only_what_volunteering_set() -> Result<()> {
+        let open = NetworkConfig {
             relay_listen: Some("127.0.0.1:3340".parse()?),
             relay_url: Some("http://203.0.113.7:3340".into()),
             relay_open: true,
@@ -672,11 +682,41 @@ mod tests {
             relay_max_clients_per_ip: NonZeroUsize::new(DEFAULT_MAX_CLIENTS_PER_IP),
             ..Default::default()
         };
-        network.validate()?;
-        assert!(volunteering(&network));
-        close(&mut network);
-        network.validate()?;
-        assert!(!volunteering(&network) && network.own_relay()?.is_none());
+        open.validate()?;
+        assert!(volunteering(&open));
+        let mut closed = open.clone();
+        close(&mut closed);
+        closed.validate()?;
+        assert!(!volunteering(&closed) && closed.own_relay()?.is_none());
+
+        // The blocked devices stay, and so does the relay that refuses them.
+        let blocked = crate::crypto::LocalIdentity::generate().device_id()?;
+        let mut closed = NetworkConfig {
+            relay_blocked: vec![blocked.clone()],
+            ..open.clone()
+        };
+        close(&mut closed);
+        closed.validate()?;
+        assert!(!volunteering(&closed) && closed.relay_rate.is_none());
+        assert_eq!(closed.relay_blocked, std::slice::from_ref(&blocked));
+        assert_eq!(closed.relay_listen, open.relay_listen);
+        assert_eq!(closed.own_relay()?, open.own_relay()?);
+
+        // A relay that admits by operator token is not volunteering; off leaves it running.
+        let operator = NetworkConfig {
+            relay_listen: Some("127.0.0.1:3340".parse()?),
+            relay_url: Some("http://203.0.113.7:3340".into()),
+            relay_operator_token: Some("ab".repeat(32)),
+            relay_blocked: vec![blocked],
+            ..Default::default()
+        };
+        operator.validate()?;
+        let mut closed = operator.clone();
+        close(&mut closed);
+        assert_eq!(
+            serde_json::to_value(&closed)?,
+            serde_json::to_value(&operator)?
+        );
         Ok(())
     }
 }

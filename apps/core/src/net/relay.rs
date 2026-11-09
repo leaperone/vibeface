@@ -5,10 +5,9 @@ use super::{Net, RelayUrl, mesh};
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -24,13 +23,17 @@ pub const GRANT_DOMAIN: &str = "relay-grant";
 pub const ADOPTED: usize = 8;
 /// Consecutive failed checks that drop a relay.
 const MAX_FAILS: i64 = 3;
-/// Announced relays checked in one round, most recently seen first.
+/// Announced relays taken into one round: those with the longest record of passed checks,
+/// then others drawn at random from the whole table.
 const CHECKS: usize = 32;
+/// Relays of one network prefix taken into a round, and adopted.
+const PER_PREFIX_CHECKED: usize = 2;
+const PER_PREFIX_ADOPTED: usize = 1;
 /// A relay checked this recently is not checked again in the next round.
 pub const RECHECK: Duration = Duration::from_secs(240);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-/// How much one check moves a relay's success score.
-const SCORE_WEIGHT: f64 = 0.3;
+/// A relay's history counts its passed checks up to this; a failed check halves it.
+const MAX_HISTORY: i64 = 288;
 const PROBE_NEIGHBORS: usize = 3;
 
 fn now_ms() -> u64 {
@@ -45,7 +48,22 @@ impl RelayDb {
         let db = crate::store::private_file_connection(path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(&format!("PRAGMA journal_mode=WAL;{}", mesh::table::SCHEMA))?;
-        Ok(Arc::new(Self(Mutex::new(db))))
+        let db = Arc::new(Self(Mutex::new(db)));
+        db.prune()?;
+        Ok(db)
+    }
+
+    /// Forgets relays not checked, and endpoints not seen, in the last 30 days.
+    pub fn prune(&self) -> Result<()> {
+        let before = now_ms().saturating_sub(mesh::table::KEEP_MS) as i64;
+        let db = self.db();
+        db.execute(
+            "DELETE FROM mesh_relays
+             WHERE max(coalesce(last_ok_at, 0), coalesce(last_fail_at, 0)) < ?1",
+            [before],
+        )?;
+        db.execute("DELETE FROM relay_usage WHERE last_seen_at < ?1", [before])?;
+        Ok(())
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
@@ -90,78 +108,124 @@ impl RelayDb {
         }
     }
 
-    /// Records one check of `url`, announced by `device`: its latency, or that it failed.
-    pub fn record_check(&self, url: &str, device: &str, latency: Option<Duration>) -> Result<()> {
+    /// Records one check of `url`, announced by `device`: its latency and the address it was
+    /// reached on, or that it failed.
+    pub fn record_check(
+        &self,
+        url: &str,
+        device: &str,
+        passed: Option<(Duration, IpAddr)>,
+    ) -> Result<()> {
         let now = now_ms() as i64;
-        let ok = latency.is_some();
-        let latency = latency.map(|latency| latency.as_millis().min(i64::MAX as u128) as i64);
-        // Success counts toward a score that starts halfway, so one check does not settle it.
+        let ok = passed.is_some();
+        let latency = passed.map(|(latency, _)| latency.as_millis().min(i64::MAX as u128) as i64);
+        let ip = passed.map(|(_, ip)| ip.to_canonical().to_string());
         self.db().execute(
-            "INSERT INTO mesh_relays(url, device_id, score, latency_ms, last_ok_at, last_fail_at,
-               fails) VALUES(?1, ?2, 0.5 * (1 - ?6) + ?6 * ?3, ?4, ?5, ?7, ?8)
+            "INSERT INTO mesh_relays(url, device_id, history, latency_ms, ip, last_ok_at,
+               last_fail_at, fails) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(url) DO UPDATE SET device_id = excluded.device_id,
-               score = score * (1 - ?6) + ?6 * ?3,
+               history = CASE WHEN ?3 = 1 THEN min(history + 1, ?9) ELSE history / 2 END,
                latency_ms = coalesce(excluded.latency_ms, latency_ms),
+               ip = coalesce(excluded.ip, ip),
                last_ok_at = coalesce(excluded.last_ok_at, last_ok_at),
                last_fail_at = coalesce(excluded.last_fail_at, last_fail_at),
-               fails = CASE WHEN ?3 = 1.0 THEN 0 ELSE fails + 1 END",
+               fails = CASE WHEN ?3 = 1 THEN 0 ELSE fails + 1 END",
             rusqlite::params![
                 url,
                 device,
-                if ok { 1.0 } else { 0.0 },
+                i64::from(ok),
                 latency,
+                ip,
                 ok.then_some(now),
-                SCORE_WEIGHT,
                 (!ok).then_some(now),
                 i64::from(!ok),
+                MAX_HISTORY,
             ],
         )?;
         Ok(())
     }
 
-    /// When `url` was last checked, if it was.
-    fn checked_at(&self, url: &str) -> Result<Option<u64>> {
-        let at: Option<Option<i64>> = self
-            .db()
+    /// What earlier checks found about `url`, if it was checked.
+    fn known(&self, url: &str) -> Result<Option<Known>> {
+        self.db()
             .query_row(
-                "SELECT max(coalesce(last_ok_at, 0), coalesce(last_fail_at, 0)) FROM mesh_relays
-                 WHERE url = ?1",
+                "SELECT max(coalesce(last_ok_at, 0), coalesce(last_fail_at, 0)), history, ip,
+                   latency_ms, fails
+                 FROM mesh_relays WHERE url = ?1",
                 [url],
-                |row| row.get(0),
+                |row| {
+                    Ok(Known {
+                        checked_at: row.get::<_, i64>(0)? as u64,
+                        history: row.get(1)?,
+                        ip: row
+                            .get::<_, Option<String>>(2)?
+                            .and_then(|ip| ip.parse().ok()),
+                        latency_ms: row.get(3)?,
+                        fails: row.get(4)?,
+                    })
+                },
             )
             .map(Some)
             .or_else(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 error => Err(error),
-            })?;
-        Ok(at.flatten().map(|at| at as u64))
+            })
+            .map_err(Into::into)
     }
 
-    /// The best `keep` of `urls`: ones that answered and have not failed three checks in a row,
-    /// by success score over latency.
+    /// The best `keep` of `urls`: ones that answered and have not failed three checks in a
+    /// row, by their history of passed checks, then latency, one a network prefix.
     pub fn best(&self, urls: &[String], keep: usize) -> Result<Vec<String>> {
-        let db = self.db();
-        let mut statement = db.prepare(
-            "SELECT score, latency_ms, fails FROM mesh_relays WHERE url = ?1
-             AND latency_ms IS NOT NULL",
-        )?;
         let mut ranked = Vec::new();
         for url in urls {
-            let row: Option<(f64, i64, i64)> = statement
-                .query_row([url], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .map(Some)
-                .or_else(|error| match error {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    error => Err(error),
-                })?;
-            if let Some((score, latency, fails)) = row
-                && fails < MAX_FAILS
+            if let Some(known) = self.known(url)?
+                && let (Some(latency), Some(ip)) = (known.latency_ms, known.ip)
+                && known.fails < MAX_FAILS
             {
-                ranked.push((score / (latency as f64 + 50.0), url.clone()));
+                ranked.push((known.history, latency, prefix(ip), url.clone()));
             }
         }
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        Ok(ranked.into_iter().take(keep).map(|(_, url)| url).collect())
+        ranked.sort_by_key(|(history, latency, _, _)| (std::cmp::Reverse(*history), *latency));
+        let mut taken: HashMap<Prefix, usize> = HashMap::new();
+        Ok(ranked
+            .into_iter()
+            .filter(|(_, _, prefix, _)| {
+                let count = taken.entry(*prefix).or_default();
+                *count += 1;
+                *count <= PER_PREFIX_ADOPTED
+            })
+            .take(keep)
+            .map(|(_, _, _, url)| url)
+            .collect())
+    }
+}
+
+struct Known {
+    checked_at: u64,
+    history: i64,
+    ip: Option<IpAddr>,
+    latency_ms: Option<i64>,
+    fails: i64,
+}
+
+/// A relay host's network: its IPv4 /24 or IPv6 /48. Many relays in one network are likely one
+/// operator's, so they count as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Prefix {
+    V4([u8; 3]),
+    V6([u16; 3]),
+}
+
+fn prefix(ip: IpAddr) -> Prefix {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            Prefix::V4([a, b, c])
+        }
+        IpAddr::V6(ip) => {
+            let [a, b, c, ..] = ip.segments();
+            Prefix::V6([a, b, c])
+        }
     }
 }
 
@@ -393,20 +457,76 @@ impl RelayGrant {
     }
 }
 
+/// Answers every lookup with the one address a check already resolved and vetted, so the relay
+/// handshake connects there and not to a second lookup's answer.
+#[derive(Debug)]
+struct Pinned(IpAddr);
+
+impl iroh::dns::Resolver for Pinned {
+    fn lookup_ipv4(
+        &self,
+        _host: String,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<iroh::dns::BoxIter<Ipv4Addr>, iroh::dns::DnsError>,
+    > {
+        let ip = match self.0 {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        };
+        Box::pin(async move { Ok(Box::new(ip.into_iter()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn lookup_ipv6(
+        &self,
+        _host: String,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<iroh::dns::BoxIter<Ipv6Addr>, iroh::dns::DnsError>,
+    > {
+        let ip = match self.0 {
+            IpAddr::V6(ip) => Some(ip),
+            IpAddr::V4(_) => None,
+        };
+        Box::pin(async move { Ok(Box::new(ip.into_iter()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn lookup_txt(
+        &self,
+        _host: String,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<iroh::dns::BoxIter<iroh::dns::TxtRecordData>, iroh::dns::DnsError>,
+    > {
+        Box::pin(async { Ok(Box::new(std::iter::empty()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn clear_cache(&self) {}
+
+    fn reset(&self) -> Box<dyn iroh::dns::Resolver> {
+        Box::new(Self(self.0))
+    }
+}
+
 /// Checks `url` as a device elsewhere would use it: `/generate_204` answers 204 and a relay
-/// handshake with a throwaway key is admitted. Returns how long `/generate_204` took. A relay on
-/// a private or loopback address is refused unless `allow_private`.
-pub async fn check_relay(url: &str, allow_private: bool) -> Result<Duration> {
+/// handshake with a throwaway key is admitted, both on the one address resolved and vetted.
+/// Returns how long `/generate_204` took and that address. A relay on a private or loopback
+/// address is refused unless `allow_private`.
+pub async fn check_relay(url: &str, allow_private: bool) -> Result<(Duration, IpAddr)> {
     let relay = super::relay_url(url)?;
     let parsed = reqwest::Url::parse(url)?;
     let host = parsed.host_str().context("the relay has no host")?;
     let port = parsed
         .port_or_known_default()
         .context("the relay has no port")?;
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
-        .await
-        .context("the relay does not resolve")?
-        .collect();
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(
+        CHECK_TIMEOUT,
+        tokio::net::lookup_host((host.trim_matches(['[', ']']), port)),
+    )
+    .await
+    .context("the relay did not resolve in time")?
+    .context("the relay does not resolve")?
+    .collect();
     let address = *addresses.first().context("the relay does not resolve")?;
     ensure!(
         allow_private
@@ -419,6 +539,7 @@ pub async fn check_relay(url: &str, allow_private: bool) -> Result<Duration> {
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CHECK_TIMEOUT)
         .timeout(CHECK_TIMEOUT);
     if let Some(domain) = parsed.domain() {
         // Connect to the address checked above, not to a second lookup's answer.
@@ -443,7 +564,7 @@ pub async fn check_relay(url: &str, allow_private: bool) -> Result<Duration> {
     let handshake = iroh_relay::client::ClientBuilder::new(
         relay,
         iroh::SecretKey::generate(),
-        iroh::dns::DnsResolver::new(),
+        iroh::dns::DnsResolver::custom(Pinned(address.ip())),
     )
     .tls_client_config(tls);
     let connected = tokio::time::timeout(CHECK_TIMEOUT, handshake.connect())
@@ -451,7 +572,7 @@ pub async fn check_relay(url: &str, allow_private: bool) -> Result<Duration> {
         .context("the relay handshake timed out")?
         .context("the relay refused a handshake")?;
     drop(connected);
-    Ok(latency)
+    Ok((latency, address.ip()))
 }
 
 /// Asks up to three mesh neighbors to check `url` from outside; passes when one could use it.
@@ -461,7 +582,7 @@ pub async fn probe_through(mesh: &mesh::Mesh, url: &str) -> Result<()> {
         !neighbors.is_empty(),
         "no mesh neighbor can check the relay yet"
     );
-    let request = json!({"type":"probe_relay","url":url});
+    let request = mesh::Request::ProbeRelay { url: url.into() };
     let mut failure = None;
     for neighbor in neighbors.iter().take(PROBE_NEIGHBORS) {
         match mesh.request(neighbor, &request).await {
@@ -482,22 +603,20 @@ pub struct Candidate {
     pub device_id: String,
 }
 
-/// The open relays `entries` announce, most recently seen first, other than `own_device`'s and
-/// `own_relay`, and other than ones on private hosts unless `allow_private`.
+/// The open relays `entries` announce, other than `own_device`'s and `own_relay`, and other
+/// than ones on private hosts unless `allow_private`.
 pub fn candidates(
     entries: &[mesh::table::Entry],
     own_device: &str,
     own_relay: Option<&RelayUrl>,
     allow_private: bool,
 ) -> Vec<Candidate> {
-    let mut entries: Vec<&mesh::table::Entry> = entries
-        .iter()
-        .filter(|entry| entry.record.device_id != own_device)
-        .collect();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen_ms));
     let mut seen = HashSet::new();
     let mut found = Vec::new();
-    for entry in entries {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.record.device_id != own_device)
+    {
         for role in &entry.record.roles {
             let mesh::record::Role::Relay {
                 url,
@@ -523,12 +642,54 @@ pub fn candidates(
             });
         }
     }
-    found.truncate(CHECKS);
     found
 }
 
-/// Checks the candidates not checked in the last few minutes with `check`, records the results,
-/// and keeps the best eight of the candidates in `net`'s relay map in place of those adopted
+/// The candidates one round takes, at most 32: those with the longest history of passed checks
+/// first, then the rest in random order, at most two of any network prefix known from an
+/// earlier check or the URL's address. Each comes with whether it is due for a check.
+fn sample(db: &RelayDb, candidates: Vec<Candidate>) -> Result<Vec<(Candidate, bool)>> {
+    use rand::seq::SliceRandom as _;
+    let due_before = now_ms().saturating_sub(RECHECK.as_millis() as u64);
+    let mut known = Vec::new();
+    let mut fresh = Vec::new();
+    for candidate in candidates {
+        match db.known(&candidate.url)? {
+            Some(info) if info.history > 0 => known.push((candidate, Some(info))),
+            info => fresh.push((candidate, info)),
+        }
+    }
+    known.sort_by_key(|(_, info)| std::cmp::Reverse(info.as_ref().map_or(0, |info| info.history)));
+    fresh.shuffle(&mut rand::thread_rng());
+    let mut taken: HashMap<Prefix, usize> = HashMap::new();
+    let mut sampled = Vec::new();
+    for (candidate, info) in known.into_iter().chain(fresh) {
+        if sampled.len() == CHECKS {
+            break;
+        }
+        let ip = info.as_ref().and_then(|info| info.ip).or_else(|| {
+            reqwest::Url::parse(&candidate.url)
+                .ok()?
+                .host_str()?
+                .trim_matches(['[', ']'])
+                .parse()
+                .ok()
+        });
+        if let Some(ip) = ip {
+            let count = taken.entry(prefix(ip)).or_default();
+            if *count == PER_PREFIX_CHECKED {
+                continue;
+            }
+            *count += 1;
+        }
+        let due = info.is_none_or(|info| info.checked_at <= due_before);
+        sampled.push((candidate, due));
+    }
+    Ok(sampled)
+}
+
+/// Checks the sampled candidates not checked in the last few minutes with `check`, records the
+/// results, and keeps the best eight of them in `net`'s relay map in place of those adopted
 /// before. Returns the adopted URLs.
 pub async fn adopt<F, Fut>(
     net: &Net,
@@ -538,18 +699,14 @@ pub async fn adopt<F, Fut>(
 ) -> Result<Vec<String>>
 where
     F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<Duration>>,
+    Fut: std::future::Future<Output = Result<(Duration, IpAddr)>>,
 {
-    let due_before = now_ms().saturating_sub(RECHECK.as_millis() as u64);
-    let mut due = Vec::new();
-    for candidate in &candidates {
-        if db
-            .checked_at(&candidate.url)?
-            .is_none_or(|at| at <= due_before)
-        {
-            due.push(candidate.clone());
-        }
-    }
+    let sampled = sample(db, candidates)?;
+    let due: Vec<&Candidate> = sampled
+        .iter()
+        .filter(|(_, due)| *due)
+        .map(|(candidate, _)| candidate)
+        .collect();
     let results =
         futures_util::future::join_all(due.iter().map(|candidate| check(candidate.url.clone())))
             .await;
@@ -559,9 +716,9 @@ where
         }
         db.record_check(&candidate.url, &candidate.device_id, result.ok())?;
     }
-    let urls: Vec<String> = candidates
+    let urls: Vec<String> = sampled
         .into_iter()
-        .map(|candidate| candidate.url)
+        .map(|(candidate, _)| candidate.url)
         .collect();
     let best = db.best(&urls, ADOPTED)?;
     let adopted = best
@@ -779,15 +936,23 @@ mod tests {
             .secret_key_hex
             .clone();
         let net = Net::bind(&secret, &config, 0, vec![]).await?;
+        let boot = crate::crypto::LocalIdentity::generate().device_id()?;
         let mesh_config = mesh::MeshConfig {
             enabled: true,
             network: "probe".into(),
-            bootstrap: vec![],
+            bootstrap: vec![format!(
+                "vibeface://node/{boot}?relay=http://boot.example:3340"
+            )],
             allow_private: true,
         };
         net.start_mesh(&mesh_config, &dir.join("mesh.sqlite3"))
             .await?;
         let mesh = net.mesh().context("no mesh")?;
+        assert_eq!(
+            mesh.bootstrap_relays(),
+            [super::super::relay_url("http://boot.example:3340")?],
+            "a bootstrap node's relay is pinned"
+        );
         let (relay, url) = metered_relay(Usage::new(None)).await?;
         let stranger = || {
             super::super::endpoint_id(
@@ -798,15 +963,17 @@ mod tests {
             .unwrap()
         };
         let asker = stranger();
-        let probe = json!({"type":"probe_relay","url":url});
+        let probe = mesh::Request::ProbeRelay { url: url.clone() };
         let reply = mesh.answer(asker, probe.clone()).await?;
         assert_eq!(reply["ok"], true);
         let again = mesh.answer(asker, probe.clone()).await.unwrap_err();
         assert!(again.to_string().contains("once a minute"), "{again}");
         relay.shutdown().await;
-        assert!(
-            mesh.answer(stranger(), probe).await.is_err(),
-            "a relay that stopped fails the probe"
+        let stopped = mesh.answer(stranger(), probe).await.unwrap_err();
+        assert_eq!(
+            stopped.to_string(),
+            "the relay check failed",
+            "a relay that stopped fails the probe, and the asker learns no more"
         );
         assert!(
             probe_through(&mesh, &url).await.is_err(),
@@ -840,6 +1007,7 @@ mod tests {
         mesh::table::Entry {
             signed,
             record,
+            first_seen_ms: seen,
             last_seen_ms: seen,
         }
     }
@@ -892,13 +1060,13 @@ mod tests {
                 .map(|candidate| candidate.url)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(urls(false), ["https://b.example/", "https://a.example/"]);
+        assert_eq!(urls(false), ["https://a.example/", "https://b.example/"]);
         assert_eq!(
             urls(true),
             [
-                "https://b.example/",
                 "https://a.example/",
-                "http://127.0.0.1:3340/"
+                "http://127.0.0.1:3340/",
+                "https://b.example/"
             ]
         );
         Ok(())
@@ -907,21 +1075,41 @@ mod tests {
     /// The relays `net` keeps in its relay map.
     async fn in_map(net: &Net) -> HashSet<String> {
         let pinned = net.relays.lock().await;
+        let bootstrap = net.bootstrap.lock().await;
         let adopted = net.adopted.lock().await;
-        pinned.union(&adopted).map(ToString::to_string).collect()
+        pinned
+            .iter()
+            .chain(bootstrap.iter())
+            .chain(adopted.iter())
+            .map(ToString::to_string)
+            .collect()
     }
 
-    /// Ten relays answer; the eight fastest go into the relay map. A relay that fails three
-    /// checks in a row or is no longer announced leaves it, and a configured relay stays.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_best_eight_relays_are_adopted() -> Result<()> {
-        let dir = dir("adopt");
-        let db = RelayDb::open(&dir.join("mesh.sqlite3"))?;
-        let pinned = "http://127.0.0.1:1/".to_owned();
+    /// Clears when each relay was checked, so the next round checks them all again.
+    fn recheck(db: &RelayDb) {
+        db.db()
+            .execute(
+                "UPDATE mesh_relays SET last_ok_at = 0, last_fail_at = 0",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// The number in a test relay's host name, `relay-<n>.example`.
+    fn relay_number(url: &str) -> u64 {
+        url.trim_start_matches("http://relay-")
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn test_net(pinned: &str) -> Result<Net> {
         let config = super::super::NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
             relays: vec![super::super::Relay {
-                url: pinned.clone(),
+                url: pinned.into(),
                 token: None,
             }],
             ..Default::default()
@@ -929,54 +1117,54 @@ mod tests {
         let secret = crate::crypto::LocalIdentity::generate()
             .secret_key_hex
             .clone();
-        let net = Net::bind(&secret, &config, 0, vec![]).await?;
-        let url = |port: u16| format!("http://127.0.0.1:{}/", 10 + port);
+        Net::bind(&secret, &config, 0, vec![]).await
+    }
+
+    /// Ten relays answer, each in a network of its own; the eight fastest go into the relay map.
+    /// A relay that fails three checks in a row or is no longer announced leaves it, and a
+    /// configured relay stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_best_eight_relays_are_adopted() -> Result<()> {
+        let dir = dir("adopt");
+        let db = RelayDb::open(&dir.join("mesh.sqlite3"))?;
+        let pinned = "http://127.0.0.1:1/".to_owned();
+        let net = test_net(&pinned).await?;
+        let url = |n: u64| format!("http://relay-{n}.example/");
         let device = crate::crypto::LocalIdentity::generate().device_id()?;
         let candidate = |url: String| Candidate {
             url,
             device_id: device.clone(),
         };
-        let mut all: Vec<Candidate> = (0..10).map(|port| candidate(url(port))).collect();
+        let mut all: Vec<Candidate> = (0..10).map(|n| candidate(url(n))).collect();
         all.push(candidate(pinned.clone()));
         let failing = Arc::new(Mutex::new(HashSet::<String>::new()));
         let check = |url: String| {
             let failing = failing.clone();
             async move {
                 anyhow::ensure!(!failing.lock().unwrap().contains(&url), "down");
-                // Lower ports answer faster; the configured relay is slowest.
-                let port: u64 = url
-                    .trim_end_matches('/')
-                    .rsplit(':')
-                    .next()
-                    .unwrap()
-                    .parse()?;
-                Ok(Duration::from_millis(if port == 1 {
-                    900
-                } else {
-                    port * 10
-                }))
+                // Lower numbers answer faster; the configured relay is slowest.
+                if url.starts_with("http://127.0.0.1") {
+                    return Ok((Duration::from_millis(900), IpAddr::from([127, 0, 0, 1])));
+                }
+                let n = relay_number(&url);
+                Ok((
+                    Duration::from_millis(10 + n * 10),
+                    IpAddr::from([203, 0, n as u8, 1]),
+                ))
             }
         };
         let adopted = adopt(&net, &db, all.clone(), check).await?;
         assert_eq!(adopted, (0..8).map(url).collect::<Vec<_>>());
         let map = in_map(&net).await;
-        assert!((0..8).all(|port| map.contains(&url(port))));
+        assert!((0..8).all(|n| map.contains(&url(n))));
         assert!(!map.contains(&url(8)) && !map.contains(&url(9)));
         assert!(map.contains(&pinned));
 
         // Relay 0 goes down and relay 1 stops being announced; the next two step in.
         failing.lock().unwrap().insert(url(0));
         all.retain(|candidate| candidate.url != url(1));
-        let recheck = || {
-            db.db()
-                .execute(
-                    "UPDATE mesh_relays SET last_ok_at = 0, last_fail_at = 0",
-                    [],
-                )
-                .unwrap()
-        };
         for _ in 0..3 {
-            recheck();
+            recheck(&db);
             adopt(&net, &db, all.clone(), check).await?;
         }
         let map = in_map(&net).await;
@@ -990,11 +1178,11 @@ mod tests {
         );
         let failed_once = candidate(url(2));
         failing.lock().unwrap().insert(url(2));
-        recheck();
+        recheck(&db);
         assert_eq!(
             adopt(&net, &db, vec![failed_once], check).await?,
             [url(2)],
-            "one failure lowers a relay's score but keeps it"
+            "one failure lowers a relay's history but keeps it"
         );
         // Adopting nothing leaves the configured relay in place.
         adopt(&net, &db, vec![], check).await?;
@@ -1007,5 +1195,105 @@ mod tests {
         net.close().await;
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    /// Seven relays in networks of their own have served for a while. Two hundred faster relays
+    /// appear, all in one /24: they take one place in the relay map at most, and two of a
+    /// round's checks once their network is known. The configured relay and the bootstrap
+    /// node's relay stay whatever the ranking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relays_in_one_network_cannot_crowd_out_the_others() -> Result<()> {
+        let dir = dir("eclipse");
+        let db = RelayDb::open(&dir.join("mesh.sqlite3"))?;
+        let pinned = "http://127.0.0.1:1/".to_owned();
+        let net = test_net(&pinned).await?;
+        let boot = super::super::relay_url("http://relay-99.example/")?;
+        net.set_bootstrap_relays(vec![boot.clone()]).await;
+        let url = |n: u64| format!("http://relay-{n}.example/");
+        let sybil = |n: u64| format!("http://relay-{}.example/", 1000 + n);
+        let device = crate::crypto::LocalIdentity::generate().device_id()?;
+        let candidate = |url: String| Candidate {
+            url,
+            device_id: device.clone(),
+        };
+        let checked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let check = |url: String| {
+            let checked = checked.clone();
+            async move {
+                checked.lock().unwrap().push(url.clone());
+                let n = relay_number(&url);
+                Ok(if n >= 1000 {
+                    (
+                        Duration::from_millis(1),
+                        IpAddr::from([198, 51, 100, n as u8]),
+                    )
+                } else {
+                    (
+                        Duration::from_millis(100),
+                        IpAddr::from([203, 0, n as u8, 1]),
+                    )
+                })
+            }
+        };
+        let honest: Vec<Candidate> = (0..7).map(|n| candidate(url(n))).collect();
+        for _ in 0..5 {
+            recheck(&db);
+            adopt(&net, &db, honest.clone(), check).await?;
+        }
+        let mut all = honest.clone();
+        all.push(candidate(boot.to_string()));
+        all.extend((0..200).map(|n| candidate(sybil(n))));
+        for round in 0..10 {
+            recheck(&db);
+            checked.lock().unwrap().clear();
+            let adopted = adopt(&net, &db, all.clone(), check).await?;
+            let checked = std::mem::take(&mut *checked.lock().unwrap());
+            assert!(checked.len() <= CHECKS);
+            let sybils_adopted = adopted
+                .iter()
+                .filter(|url| relay_number(url) >= 1000)
+                .count();
+            assert!(sybils_adopted <= 1, "round {round}: {adopted:?}");
+            assert!(
+                (0..7).all(|n| adopted.contains(&url(n))),
+                "round {round}: {adopted:?}"
+            );
+            let map = in_map(&net).await;
+            assert!(map.contains(&pinned) && map.contains(&boot.to_string()));
+            // Once checked, the sybils' network is known: of those, two a round at most.
+            let known_sybils = checked
+                .iter()
+                .filter(|url| relay_number(url) >= 1000)
+                .filter(|url| {
+                    db.known(url)
+                        .unwrap()
+                        .is_some_and(|known| known.history > 1)
+                })
+                .count();
+            assert!(known_sybils <= 2, "round {round}: {known_sybils}");
+        }
+        assert!(
+            !net.adopted.lock().await.contains(&boot),
+            "the bootstrap node's relay is pinned, not adopted"
+        );
+        net.close().await;
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_network_is_its_ipv4_24_or_ipv6_48() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(prefix(ip("198.51.100.1")), prefix(ip("198.51.100.250")));
+        assert_ne!(prefix(ip("198.51.100.1")), prefix(ip("198.51.101.1")));
+        assert_eq!(
+            prefix(ip("::ffff:198.51.100.1")),
+            prefix(ip("198.51.100.9"))
+        );
+        assert_eq!(
+            prefix(ip("2001:db8:1::1")),
+            prefix(ip("2001:db8:1:ffff::1"))
+        );
+        assert_ne!(prefix(ip("2001:db8:1::1")), prefix(ip("2001:db8:2::1")));
     }
 }

@@ -1,25 +1,30 @@
 //! The mesh records this Node holds, kept in `mesh.sqlite3`: a public cache it can always rebuild
-//! from its bootstrap nodes, apart from `node.sqlite3` and its schema guard. The relay tables in
-//! the same file belong to their callers.
+//! from its bootstrap nodes, apart from `node.sqlite3` and its schema guard. The table lives in
+//! memory; each change comes back as [`Write`]s the caller hands to [`Store`] later, in a batch
+//! and without holding the table. The relay tables in the same file belong to their callers.
 use super::record::{MeshRecord, SignedMeshRecord};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags, params};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 pub const CAPACITY: usize = 65536;
 /// A device's next record is dated at least this long after the one held. Its own date, not
 /// when a copy arrives: a copy pulled late must not hold back the next one broadcast.
 pub const MIN_INTERVAL_MS: u64 = 30_000;
-/// Records seen this recently stay, expired or not, as candidates for joining again.
-const KEEP_MS: u64 = 30 * 24 * 3600 * 1000;
+/// Records seen this recently stay, expired or not, as candidates for joining again; relay
+/// checks and usage are kept as long.
+pub const KEEP_MS: u64 = 30 * 24 * 3600 * 1000;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS mesh_records(device_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, reachable TEXT NOT NULL,
-  record TEXT NOT NULL);
+  expires_at INTEGER NOT NULL, first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+  reachable TEXT NOT NULL, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mesh_relays(url TEXT PRIMARY KEY, device_id TEXT NOT NULL,
-  score REAL NOT NULL, latency_ms INTEGER, last_ok_at INTEGER, last_fail_at INTEGER,
-  fails INTEGER NOT NULL);
+  history INTEGER NOT NULL, latency_ms INTEGER, ip TEXT, last_ok_at INTEGER,
+  last_fail_at INTEGER, fails INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS relay_usage(endpoint_id TEXT PRIMARY KEY, bytes_in INTEGER NOT NULL,
   bytes_out INTEGER NOT NULL, connections INTEGER NOT NULL, first_seen_at INTEGER NOT NULL,
   last_seen_at INTEGER NOT NULL);";
@@ -28,6 +33,8 @@ CREATE TABLE IF NOT EXISTS relay_usage(endpoint_id TEXT PRIMARY KEY, bytes_in IN
 pub struct Entry {
     pub signed: SignedMeshRecord,
     pub record: MeshRecord,
+    /// When this Node first accepted a record of the device.
+    pub first_seen_ms: u64,
     /// When this Node accepted the record.
     pub last_seen_ms: u64,
 }
@@ -38,18 +45,67 @@ impl Entry {
     }
 }
 
+/// A change of the table still to be written to `mesh.sqlite3`.
+#[derive(Debug)]
+pub enum Write {
+    Put(Entry),
+    Delete(String),
+}
+
+/// `mesh.sqlite3`'s connection, which writes the table's changes.
+pub struct Store(Connection);
+
+impl Store {
+    /// Writes `writes` in one transaction, in order.
+    pub fn apply(&mut self, writes: Vec<Write>) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.0.transaction()?;
+        for write in writes {
+            match write {
+                Write::Put(entry) => {
+                    transaction.execute(
+                        "INSERT OR REPLACE INTO mesh_records(device_id, seq, expires_at,
+                           first_seen_at, last_seen_at, reachable, record)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            entry.record.device_id,
+                            entry.record.seq as i64,
+                            entry.record.expires_at() as i64,
+                            entry.first_seen_ms as i64,
+                            entry.last_seen_ms as i64,
+                            serde_json::to_value(entry.record.reachable)?
+                                .as_str()
+                                .unwrap_or_default(),
+                            serde_json::to_string(&entry.signed)?,
+                        ],
+                    )?;
+                }
+                Write::Delete(device) => {
+                    transaction
+                        .execute("DELETE FROM mesh_records WHERE device_id = ?1", [device])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 pub struct Table {
-    /// `mesh.sqlite3`, also holding `mesh_relays` and `relay_usage`.
-    pub db: Connection,
     entries: HashMap<String, Entry>,
     own: String,
     network: String,
     capacity: usize,
+    /// Devices whose records a full table never drops: the personal network's Nodes and the
+    /// bootstrap nodes.
+    protected: HashSet<String>,
 }
 
 impl Table {
     /// Loads the records of `network` seen in the last 30 days; `own` is this Node's device ID.
-    pub fn open(path: &Path, own: &str, network: &str, now_ms: u64) -> Result<Self> {
+    pub fn open(path: &Path, own: &str, network: &str, now_ms: u64) -> Result<(Self, Store)> {
         let db = crate::store::private_file_connection(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(&format!("PRAGMA journal_mode=WAL;{SCHEMA}"))?;
@@ -61,24 +117,40 @@ impl Table {
         for device in stale {
             db.execute("DELETE FROM mesh_records WHERE device_id = ?1", [device])?;
         }
-        Ok(Self {
-            db,
+        let table = Self {
             entries,
             own: own.to_owned(),
             network: network.to_owned(),
             capacity: CAPACITY,
-        })
+            protected: HashSet::new(),
+        };
+        Ok((table, Store(db)))
+    }
+
+    pub fn set_protected(&mut self, devices: HashSet<String>) {
+        self.protected = devices;
+    }
+
+    pub fn is_protected(&self, device_id: &str) -> bool {
+        self.protected.contains(device_id)
+    }
+
+    #[cfg(test)]
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
     }
 
     /// Takes `records` from other devices; returns those accepted, each valid and dated at least
-    /// 30 s after the one held.
+    /// 30 s after the one held, and the writes that store them. A device not held yet is taken
+    /// only when `admit` agrees.
     pub fn insert(
         &mut self,
         records: Vec<SignedMeshRecord>,
         now_ms: u64,
-    ) -> Result<Vec<MeshRecord>> {
+        mut admit: impl FnMut(&MeshRecord) -> bool,
+    ) -> (Vec<MeshRecord>, Vec<Write>) {
         let mut accepted = Vec::new();
-        let transaction = self.db.unchecked_transaction()?;
+        let mut writes = Vec::new();
         for signed in records {
             let Ok(record) = signed.open(&self.network, now_ms) else {
                 continue;
@@ -86,24 +158,18 @@ impl Table {
             if record.device_id == self.own {
                 continue;
             }
-            if let Some(entry) = self.entries.get(&record.device_id)
-                && record.seq < entry.record.seq.saturating_add(MIN_INTERVAL_MS)
-            {
-                continue;
+            match self.entries.get(&record.device_id) {
+                Some(entry) if record.seq < entry.record.seq.saturating_add(MIN_INTERVAL_MS) => {
+                    continue;
+                }
+                None if !admit(&record) => continue,
+                _ => {}
             }
-            put(
-                &transaction,
-                &mut self.entries,
-                &self.own,
-                self.capacity,
-                signed,
-                record.clone(),
-                now_ms,
-            )?;
-            accepted.push(record);
+            if self.put(signed, record.clone(), now_ms, &mut writes) {
+                accepted.push(record);
+            }
         }
-        transaction.commit()?;
-        Ok(accepted)
+        (accepted, writes)
     }
 
     /// Stores this Node's own record.
@@ -112,19 +178,10 @@ impl Table {
         signed: SignedMeshRecord,
         record: MeshRecord,
         now_ms: u64,
-    ) -> Result<()> {
-        let transaction = self.db.unchecked_transaction()?;
-        put(
-            &transaction,
-            &mut self.entries,
-            &self.own,
-            self.capacity,
-            signed,
-            record,
-            now_ms,
-        )?;
-        transaction.commit()?;
-        Ok(())
+    ) -> Vec<Write> {
+        let mut writes = Vec::new();
+        self.put(signed, record, now_ms, &mut writes);
+        writes
     }
 
     pub fn get(&self, device_id: &str) -> Option<&Entry> {
@@ -140,6 +197,59 @@ impl Table {
         self.entries
             .values()
             .filter(move |entry| entry.online(now_ms))
+    }
+
+    /// The record a full table drops for a new device: the expired one seen longest ago, else
+    /// the one first seen most recently, so records known for long outlast a flood of new ones.
+    /// This Node's own record and protected ones are never dropped.
+    fn victim(&self, now_ms: u64) -> Option<String> {
+        // ponytail: a scan of the full table per new device once full; an ordered index if it
+        // shows.
+        let droppable = || {
+            self.entries.values().filter(|entry| {
+                entry.record.device_id != self.own
+                    && !self.protected.contains(&entry.record.device_id)
+            })
+        };
+        droppable()
+            .filter(|entry| !entry.online(now_ms))
+            .min_by_key(|entry| entry.last_seen_ms)
+            .or_else(|| droppable().max_by_key(|entry| entry.first_seen_ms))
+            .map(|entry| entry.record.device_id.clone())
+    }
+
+    /// Holds `record`, dropping another when the table is full; returns false when the table is
+    /// full of records that stay and `record` is neither this Node's nor protected.
+    fn put(
+        &mut self,
+        signed: SignedMeshRecord,
+        record: MeshRecord,
+        now_ms: u64,
+        writes: &mut Vec<Write>,
+    ) -> bool {
+        let held = self.entries.get(&record.device_id);
+        let first_seen_ms = held.map_or(now_ms, |entry| entry.first_seen_ms);
+        if held.is_none() && self.entries.len() >= self.capacity {
+            match self.victim(now_ms) {
+                Some(victim) => {
+                    self.entries.remove(&victim);
+                    writes.push(Write::Delete(victim));
+                }
+                None if record.device_id == self.own
+                    || self.protected.contains(&record.device_id) => {}
+                None => return false,
+            }
+        }
+        let entry = Entry {
+            signed,
+            record,
+            first_seen_ms,
+            last_seen_ms: now_ms,
+        };
+        self.entries
+            .insert(entry.record.device_id.clone(), entry.clone());
+        writes.push(Write::Put(entry));
+        true
     }
 }
 
@@ -166,12 +276,14 @@ pub fn read(path: &Path, network: &str) -> Result<Vec<Entry>> {
 fn load(db: &Connection, network: &str) -> Result<(HashMap<String, Entry>, Vec<String>)> {
     let mut entries = HashMap::new();
     let mut stale = Vec::new();
-    let mut statement = db.prepare("SELECT device_id, last_seen_at, record FROM mesh_records")?;
+    let mut statement =
+        db.prepare("SELECT device_id, first_seen_at, last_seen_at, record FROM mesh_records")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let device: String = row.get(0)?;
-        let last_seen_ms = row.get::<_, i64>(1)? as u64;
-        let loaded = serde_json::from_str::<SignedMeshRecord>(&row.get::<_, String>(2)?)
+        let first_seen_ms = row.get::<_, i64>(1)? as u64;
+        let last_seen_ms = row.get::<_, i64>(2)? as u64;
+        let loaded = serde_json::from_str::<SignedMeshRecord>(&row.get::<_, String>(3)?)
             .ok()
             .and_then(|signed| {
                 let record = MeshRecord::parse(&signed.payload).ok()?;
@@ -185,6 +297,7 @@ fn load(db: &Connection, network: &str) -> Result<(HashMap<String, Entry>, Vec<S
                     Entry {
                         signed,
                         record,
+                        first_seen_ms,
                         last_seen_ms,
                     },
                 );
@@ -193,50 +306,6 @@ fn load(db: &Connection, network: &str) -> Result<(HashMap<String, Entry>, Vec<S
         }
     }
     Ok((entries, stale))
-}
-
-fn put(
-    db: &Connection,
-    entries: &mut HashMap<String, Entry>,
-    own: &str,
-    capacity: usize,
-    signed: SignedMeshRecord,
-    record: MeshRecord,
-    now_ms: u64,
-) -> Result<()> {
-    if !entries.contains_key(&record.device_id) && entries.len() >= capacity {
-        // ponytail: a scan of the full table per insert once full; an ordered index if it shows.
-        let victim = entries
-            .values()
-            .filter(|entry| entry.record.device_id != own)
-            .min_by_key(|entry| (entry.online(now_ms), entry.last_seen_ms))
-            .map(|entry| entry.record.device_id.clone());
-        if let Some(victim) = victim {
-            entries.remove(&victim);
-            db.execute("DELETE FROM mesh_records WHERE device_id = ?1", [&victim])?;
-        }
-    }
-    db.execute(
-        "INSERT OR REPLACE INTO mesh_records(device_id, seq, expires_at, last_seen_at, reachable, record)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            record.device_id,
-            record.seq as i64,
-            record.expires_at() as i64,
-            now_ms as i64,
-            serde_json::to_value(record.reachable)?.as_str().unwrap_or_default(),
-            serde_json::to_string(&signed)?,
-        ],
-    )?;
-    entries.insert(
-        record.device_id.clone(),
-        Entry {
-            signed,
-            record,
-            last_seen_ms: now_ms,
-        },
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -275,56 +344,89 @@ mod tests {
             .map(|entry| entry.record.seq)
     }
 
+    fn insert(table: &mut Table, records: Vec<SignedMeshRecord>, now: u64) -> usize {
+        table.insert(records, now, |_| true).0.len()
+    }
+
     #[test]
     fn a_device_moves_forward_at_most_every_thirty_seconds() -> Result<()> {
         let own = vibeface_secure::Identity::generate()?;
         let peer = vibeface_secure::Identity::generate()?;
         let dir = dir("forward");
-        let mut table = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
-        assert_eq!(table.insert(vec![signed(&peer, NOW)], NOW)?.len(), 1);
-        assert!(
-            table
-                .insert(vec![signed(&peer, NOW - 1)], NOW + 60_000)?
-                .is_empty()
+        let (mut table, _) = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
+        assert_eq!(insert(&mut table, vec![signed(&peer, NOW)], NOW), 1);
+        assert_eq!(
+            insert(&mut table, vec![signed(&peer, NOW - 1)], NOW + 60_000),
+            0
         );
-        assert!(
-            table
-                .insert(vec![signed(&peer, NOW + 10_000)], NOW + 40_000)?
-                .is_empty()
+        assert_eq!(
+            insert(&mut table, vec![signed(&peer, NOW + 10_000)], NOW + 40_000),
+            0
         );
         assert_eq!(seq(&table, &peer), Some(NOW));
         // The first copy came late; the next is dated 30 s on and counts however soon it comes.
         assert_eq!(
-            table
-                .insert(vec![signed(&peer, NOW + 30_000)], NOW + 1_000)?
-                .len(),
+            insert(&mut table, vec![signed(&peer, NOW + 30_000)], NOW + 1_000),
             1
         );
         assert_eq!(seq(&table, &peer), Some(NOW + 30_000));
-        assert!(
-            table
-                .insert(vec![signed(&own, NOW + 40_000)], NOW + 40_000)?
-                .is_empty()
+        assert_eq!(
+            insert(&mut table, vec![signed(&own, NOW + 40_000)], NOW + 40_000),
+            0
+        );
+        // A device not held yet waits for `admit`; one held moves forward without it.
+        let other = vibeface_secure::Identity::generate()?;
+        let refused = table.insert(
+            vec![signed(&other, NOW), signed(&peer, NOW + 60_000)],
+            NOW + 60_000,
+            |_| false,
+        );
+        assert_eq!(refused.0.len(), 1);
+        assert_eq!(
+            (seq(&table, &other), seq(&table, &peer)),
+            (None, Some(NOW + 60_000))
         );
         Ok(())
     }
 
+    /// A full table drops expired records first, then the record first seen most recently; the
+    /// records known longest, protected ones and this Node's own stay.
     #[test]
-    fn a_full_table_drops_expired_records_then_the_longest_unseen() -> Result<()> {
+    fn a_full_table_keeps_long_known_and_protected_records() -> Result<()> {
         let own = vibeface_secure::Identity::generate()?;
-        let [a, b, c, d] = std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let [a, b, c, d, e, member] =
+            std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
         let dir = dir("full");
-        let mut table = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
-        table.capacity = 2;
+        let (mut table, _) = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
+        table.set_capacity(3);
+        table.set_protected(HashSet::from([member.device_id()]));
         let ttl = u64::from(DEFAULT_TTL_S) * 1000;
-        table.insert(vec![signed(&a, NOW)], NOW)?;
-        table.insert(vec![signed(&b, NOW + ttl / 2)], NOW + ttl / 2)?;
-        // a has expired: it goes before b, though b was seen later.
+        insert(&mut table, vec![signed(&a, NOW)], NOW);
+        insert(&mut table, vec![signed(&member, NOW + 1)], NOW + 1);
+        insert(&mut table, vec![signed(&b, NOW + ttl / 2)], NOW + ttl / 2);
+        // a has expired: it goes first, though it was known longest.
         let later = NOW + ttl + 1;
-        table.insert(vec![signed(&c, later)], later)?;
+        insert(&mut table, vec![signed(&c, later)], later);
         assert_eq!((seq(&table, &a), seq(&table, &c).is_some()), (None, true));
-        table.insert(vec![signed(&d, later + 1)], later + 1)?;
-        assert_eq!((seq(&table, &b), seq(&table, &d).is_some()), (None, true));
+        // b (first seen before c) stays; c, the newest, gives way to d, and d to e.
+        insert(&mut table, vec![signed(&d, later + 1)], later + 1);
+        assert_eq!((seq(&table, &c), seq(&table, &d).is_some()), (None, true));
+        // b moving forward keeps its first sighting.
+        insert(&mut table, vec![signed(&b, later + 2)], later + 2);
+        insert(&mut table, vec![signed(&e, later + 3)], later + 3);
+        assert_eq!((seq(&table, &d), seq(&table, &e).is_some()), (None, true));
+        assert!(seq(&table, &b).is_some() && seq(&table, &member).is_some());
+        // Full of records that stay, a new one is refused.
+        table.set_protected(HashSet::from([
+            member.device_id(),
+            b.device_id(),
+            e.device_id(),
+        ]));
+        assert_eq!(
+            insert(&mut table, vec![signed(&a, later + 4)], later + 4),
+            0
+        );
+        assert_eq!(table.entries().count(), 3);
         Ok(())
     }
 
@@ -334,22 +436,26 @@ mod tests {
         let [fresh, old] = std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
         let dir = dir("restart");
         let path = dir.join("mesh.sqlite3");
-        let mut table = Table::open(&path, &own.device_id(), "lab", NOW)?;
-        table.insert(vec![signed(&old, NOW)], NOW)?;
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW)?;
+        store.apply(table.insert(vec![signed(&old, NOW)], NOW, |_| true).1)?;
         let later = NOW + 20 * 24 * 3600 * 1000;
-        table.insert(vec![signed(&fresh, later)], later)?;
-        drop(table);
-        let restarted = Table::open(
+        store.apply(table.insert(vec![signed(&fresh, later)], later, |_| true).1)?;
+        drop((table, store));
+        let (restarted, _) = Table::open(
             &path,
             &own.device_id(),
             "lab",
             later + 15 * 24 * 3600 * 1000,
         )?;
         assert_eq!(seq(&restarted, &fresh), Some(later));
+        assert_eq!(
+            restarted.get(&fresh.device_id()).unwrap().first_seen_ms,
+            later
+        );
         assert_eq!(seq(&restarted, &old), None);
         assert_eq!(restarted.online(later + 1).count(), 1);
         drop(restarted);
-        let other = Table::open(&path, &own.device_id(), "other", later)?;
+        let (other, _) = Table::open(&path, &own.device_id(), "other", later)?;
         assert_eq!(other.entries().count(), 0);
         Ok(())
     }

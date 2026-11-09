@@ -5,7 +5,7 @@ pub mod record;
 pub mod table;
 
 use super::{MemoryLookup, Net, call, device_id, endpoint_id, serve_streams_within};
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use futures_util::{StreamExt as _, stream::BoxStream, stream::FuturesUnordered};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr,
@@ -29,7 +29,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
-use table::{Entry, Table};
+use table::{Entry, Store, Table, Write};
 use tokio::sync::{Notify, watch};
 use vibeface_secure::link::{Addr, NodeLink};
 
@@ -59,6 +59,9 @@ const GATEWAYS: usize = 16;
 const GATEWAY_CHECKS: usize = 32;
 const GATEWAY_OK_FOR: Duration = Duration::from_secs(1800);
 const GATEWAY_FAILED_FOR: Duration = Duration::from_secs(300);
+/// A gateway check resolves, connects and reads `/api/info` within this, at most 16 KiB of it.
+const GATEWAY_TIMEOUT: Duration = Duration::from_secs(5);
+const GATEWAY_INFO_BYTES: usize = 16 * 1024;
 const DIGEST_EVERY: Duration = Duration::from_secs(10);
 const LOOKUPS_PER_SECOND: u32 = 5;
 /// A device's relay probes are answered once a minute; tests wait less.
@@ -67,6 +70,15 @@ const PROBE_EVERY: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(60)
 };
+/// Records of devices not held yet that one neighbor's deliveries may add, per second and at
+/// once. The personal network's Nodes and the bootstrap nodes are not limited.
+const NEW_RECORDS_PER_SECOND: f64 = 20.0;
+const NEW_RECORDS_BURST: f64 = 200.0;
+/// Changes to the table are written to `mesh.sqlite3` together, this long after the first.
+const WRITE_WINDOW: Duration = Duration::from_millis(200);
+/// The largest exchange request; a digest's filter takes most of it.
+const MAX_REQUEST: usize = 96 * 1024;
+const MAX_FILTER: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,8 +203,8 @@ pub fn default_bootstrap_id() -> Result<String> {
     Ok(anchor()?.issuer)
 }
 
-/// A bootstrap node: a node link naming where to dial it. Its relay is a hint for reaching it,
-/// never put in the relay map.
+/// A bootstrap node: a node link naming where to dial it. Its relay stays in the relay map, as
+/// the members' relays do.
 pub fn bootstrap_link(value: &str) -> Result<NodeLink> {
     let link = NodeLink::parse(value)?;
     ensure!(
@@ -285,16 +297,102 @@ pub fn open_relay<'a>(entries: impl IntoIterator<Item = &'a Entry>, url: &RelayU
     })
 }
 
+/// An exchange request, read straight from a frame of at most [`MAX_REQUEST`] bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Request {
+    /// The records held here that the asker's filter lacks, a page at a time.
+    Digest { have: Have },
+    /// A device's current record.
+    Lookup { device_id: String },
+    /// Check a relay from here, as a device elsewhere would use it.
+    ProbeRelay { url: String },
+}
+
+/// A Bloom filter of the records a Node holds, each a device and its `seq`, so a digest
+/// request stays small however many it holds. A record the filter wrongly claims is missed in
+/// this pull; the next one, with another seed, or the device's next announcement brings it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Have {
+    seed: u64,
+    hashes: u8,
+    /// The filter's bits, base64url.
+    bits: String,
+}
+
+impl Have {
+    /// A filter of `held` with about 16 bits a record, at most [`MAX_FILTER`] bytes.
+    pub fn new(held: &[(String, u64)]) -> Self {
+        let bytes = (held.len() * 2).clamp(8, MAX_FILTER);
+        let bits_per_record = (bytes * 8) as f64 / held.len().max(1) as f64;
+        let hashes = (bits_per_record * std::f64::consts::LN_2)
+            .round()
+            .clamp(1.0, 8.0) as u8;
+        let mut have = Self {
+            seed: rand::random(),
+            hashes,
+            bits: String::new(),
+        };
+        let mut bits = vec![0u8; bytes];
+        for (device, seq) in held {
+            for index in have.indexes(bits.len() * 8, device, *seq) {
+                bits[index / 8] |= 1 << (index % 8);
+            }
+        }
+        have.bits = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bits);
+        have
+    }
+
+    fn indexes(&self, len: usize, device: &str, seq: u64) -> impl Iterator<Item = usize> {
+        let mut hash = sha2::Sha256::new();
+        hash.update(self.seed.to_le_bytes());
+        hash.update(device.as_bytes());
+        hash.update(seq.to_le_bytes());
+        let hash = hash.finalize();
+        let first = u64::from_le_bytes(hash[..8].try_into().expect("8 bytes"));
+        let step = u64::from_le_bytes(hash[8..16].try_into().expect("8 bytes")) | 1;
+        (0..u64::from(self.hashes))
+            .map(move |i| (first.wrapping_add(i.wrapping_mul(step)) % len as u64) as usize)
+    }
+
+    /// Whether the asker holds `seq` of `device`, as the filter says.
+    fn contains(&self, bits: &[u8], device: &str, seq: u64) -> bool {
+        !bits.is_empty()
+            && self
+                .indexes(bits.len() * 8, device, seq)
+                .all(|index| bits[index / 8] & (1 << (index % 8)) != 0)
+    }
+
+    fn open(&self) -> Result<Vec<u8>> {
+        ensure!(
+            (1..=16).contains(&self.hashes),
+            "a mesh digest filter takes 1 to 16 hashes"
+        );
+        let bits = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &self.bits,
+        )
+        .context("invalid mesh digest filter")?;
+        ensure!(
+            bits.len() <= MAX_FILTER,
+            "the mesh digest filter is too large"
+        );
+        Ok(bits)
+    }
+}
+
 /// One exchange request over a connection of its own.
 async fn exchange(
     endpoint: &Endpoint,
     addr: impl Into<EndpointAddr>,
     alpn: &[u8],
-    request: &Value,
+    request: &impl Serialize,
 ) -> Result<Value> {
+    let request = serde_json::to_value(request)?;
     tokio::time::timeout(EXCHANGE_TIMEOUT, async {
         let connection = endpoint.connect(addr, alpn).await?;
-        let reply = call(&connection, request).await;
+        let reply = call(&connection, &request).await;
         connection.close(0u32.into(), b"done");
         reply
     })
@@ -318,6 +416,37 @@ struct Limit {
     probe_at: Option<Instant>,
 }
 
+/// How many records of devices not held yet one neighbor may still deliver.
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+    /// When dropping this neighbor's records was last logged.
+    logged_at: Option<Instant>,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            tokens: NEW_RECORDS_BURST,
+            at: Instant::now(),
+            logged_at: None,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        self.tokens = (self.tokens
+            + now.duration_since(self.at).as_secs_f64() * NEW_RECORDS_PER_SECOND)
+            .min(NEW_RECORDS_BURST);
+        self.at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 pub struct Mesh {
     pub network: String,
     device_id: String,
@@ -330,10 +459,17 @@ pub struct Mesh {
     gossip_alpn: Vec<u8>,
     exchange_alpn: Vec<u8>,
     table: Mutex<Table>,
+    /// Writes the table's changes, which wait in `pending` until the writer takes them.
+    store: Mutex<Store>,
+    pending: Mutex<Vec<Write>>,
+    written: Notify,
     changes: watch::Sender<u64>,
     roles: Mutex<Vec<Role>>,
     bootstrap: Mutex<Vec<String>>,
+    /// The personal network's other Nodes.
+    members: Mutex<Vec<String>>,
     neighbors: Mutex<HashSet<EndpointId>>,
+    buckets: Mutex<HashMap<EndpointId, Bucket>>,
     /// Asks the announcer to check this Node's record.
     wake: Notify,
     limits: Mutex<HashMap<EndpointId, Limit>>,
@@ -357,7 +493,7 @@ impl Mesh {
         config.validate()?;
         let endpoint = net.endpoint.clone();
         let own = device_id(&endpoint.id());
-        let table = Table::open(db, &own, &config.network, now_ms())?;
+        let (table, store) = Table::open(db, &own, &config.network, now_ms())?;
         let gossip_alpn = gossip_alpn(&config.network);
         let gossip = Gossip::builder()
             .max_message_size(MAX_MESSAGE)
@@ -374,16 +510,22 @@ impl Mesh {
             gossip_alpn,
             exchange_alpn: exchange_alpn(&config.network),
             table: Mutex::new(table),
+            store: Mutex::new(store),
+            pending: Mutex::new(vec![]),
+            written: Notify::new(),
             changes: watch::Sender::new(0),
             roles: Mutex::new(vec![]),
             bootstrap: Mutex::new(config.bootstrap.clone()),
+            members: Mutex::new(vec![]),
             neighbors: Mutex::new(HashSet::new()),
+            buckets: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             limits: Mutex::new(HashMap::new()),
             answering: Arc::new(tokio::sync::Semaphore::new(ANSWERING)),
             gateway_checks: Mutex::new(HashMap::new()),
             tasks: Mutex::new(vec![]),
         });
+        mesh.protect();
         endpoint
             .address_lookup()?
             .add(Lookup(Arc::downgrade(&mesh)));
@@ -398,6 +540,7 @@ impl Mesh {
             tokio::spawn(mesh.clone().events(receiver)),
             tokio::spawn(mesh.clone().announcer()),
             tokio::spawn(mesh.clone().rejoin()),
+            tokio::spawn(mesh.clone().writer()),
         ];
         mesh.tasks.lock().expect("mesh tasks").extend(tasks);
         Ok(mesh)
@@ -410,12 +553,103 @@ impl Mesh {
             .accept(&self.exchange_alpn, Exchange(Arc::downgrade(self)))
     }
 
-    /// Stops gossip and the mesh's tasks, which hold it until then.
+    /// Stops gossip and the mesh's tasks, which hold it until then, and writes what is pending.
     pub async fn close(&self) {
         for task in self.tasks.lock().expect("mesh tasks").drain(..) {
             task.abort();
         }
         let _ = self.gossip.shutdown().await;
+        self.flush();
+    }
+
+    /// Queues `writes` for the writer.
+    fn queue(&self, writes: Vec<Write>) {
+        if !writes.is_empty() {
+            self.pending.lock().expect("mesh writes").extend(writes);
+            self.written.notify_one();
+        }
+    }
+
+    /// Writes the pending changes in one transaction, without holding the table.
+    fn flush(&self) {
+        let writes = std::mem::take(&mut *self.pending.lock().expect("mesh writes"));
+        if let Err(error) = self.store.lock().expect("mesh store").apply(writes) {
+            tracing::warn!(event = "mesh.table_failed", %error);
+        }
+    }
+
+    /// Writes the table's changes a short while after the first of them.
+    async fn writer(self: Arc<Self>) {
+        loop {
+            self.written.notified().await;
+            tokio::time::sleep(WRITE_WINDOW).await;
+            self.flush();
+        }
+    }
+
+    /// Protects the records of the personal network's Nodes and the bootstrap nodes from being
+    /// dropped by a full table.
+    fn protect(&self) {
+        let mut devices: HashSet<String> = self
+            .members
+            .lock()
+            .expect("mesh members")
+            .iter()
+            .cloned()
+            .collect();
+        devices.extend(
+            self.bootstrap
+                .lock()
+                .expect("mesh bootstrap")
+                .iter()
+                .filter_map(|value| bootstrap_link(value).ok())
+                .map(|link| link.device_id()),
+        );
+        self.table
+            .lock()
+            .expect("mesh table")
+            .set_protected(devices);
+    }
+
+    /// The relays of the bootstrap nodes: each link's relay, and the open relays a bootstrap
+    /// node's record announces. They stay in the relay map like the members' relays.
+    pub fn bootstrap_relays(&self) -> Vec<RelayUrl> {
+        let links: Vec<NodeLink> = self
+            .bootstrap
+            .lock()
+            .expect("mesh bootstrap")
+            .iter()
+            .filter_map(|value| bootstrap_link(value).ok())
+            .collect();
+        let mut relays: Vec<RelayUrl> = links
+            .iter()
+            .filter_map(|link| super::relay_url(link.relay.as_deref()?).ok())
+            .collect();
+        let now = now_ms();
+        let table = self.table.lock().expect("mesh table");
+        for link in &links {
+            let Some(entry) = table
+                .get(&link.device_id())
+                .filter(|entry| entry.online(now))
+            else {
+                continue;
+            };
+            relays.extend(entry.record.roles.iter().filter_map(|role| {
+                match role {
+                    Role::Relay {
+                        url,
+                        access: Access::Open,
+                        ..
+                    } => super::relay_url(url)
+                        .ok()
+                        .filter(|url| self.allow_private || public_host(url)),
+                    _ => None,
+                }
+            }));
+        }
+        relays.sort();
+        relays.dedup();
+        relays
     }
 
     /// Counts up each time the records change.
@@ -434,7 +668,7 @@ impl Mesh {
             .collect()
     }
 
-    /// The table, with `mesh_relays` and `relay_usage` in its database.
+    /// The records held, expired ones too.
     pub fn table(&self) -> std::sync::MutexGuard<'_, Table> {
         self.table.lock().expect("mesh table")
     }
@@ -473,14 +707,18 @@ impl Mesh {
 
     pub async fn set_bootstrap(&self, bootstrap: Vec<String>) {
         *self.bootstrap.lock().expect("mesh bootstrap") = bootstrap;
+        self.protect();
         if self.neighbors.lock().expect("mesh neighbors").is_empty() {
             let peers = self.candidates().await;
             self.join(peers).await;
         }
     }
 
-    /// Joins through `device_ids`, such as the personal network's other Nodes.
+    /// Joins through the personal network's other Nodes, `device_ids`, whose records a full
+    /// table keeps and whose deliveries are not limited.
     pub async fn join_peers(&self, device_ids: &[String]) {
+        *self.members.lock().expect("mesh members") = device_ids.to_vec();
+        self.protect();
         let peers = device_ids
             .iter()
             .filter_map(|device| endpoint_id(device).ok())
@@ -498,7 +736,7 @@ impl Mesh {
     }
 
     /// One exchange request to `device`, a neighbor or any Node this endpoint reaches.
-    pub async fn request(&self, device: &str, request: &Value) -> Result<Value> {
+    pub async fn request(&self, device: &str, request: &impl Serialize) -> Result<Value> {
         exchange(
             &self.endpoint,
             endpoint_id(device)?,
@@ -612,23 +850,50 @@ impl Mesh {
         ok
     }
 
-    fn accept_records(&self, records: Vec<SignedMeshRecord>) -> Vec<MeshRecord> {
-        let accepted = match self
-            .table
-            .lock()
-            .expect("mesh table")
-            .insert(records, now_ms())
-        {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                tracing::warn!(event = "mesh.table_failed", %error);
-                vec![]
+    /// Takes `records` that `from` delivered, or that this Node asked for when `None`. A
+    /// neighbor outside the personal network and the bootstrap nodes adds records of devices
+    /// not held yet at most 20 a second, 200 at once; returns the records accepted and whether
+    /// any were dropped for that.
+    fn accept_records(
+        &self,
+        records: Vec<SignedMeshRecord>,
+        from: Option<EndpointId>,
+    ) -> (Vec<MeshRecord>, bool) {
+        let mut limited = false;
+        let (accepted, writes) = {
+            let mut table = self.table.lock().expect("mesh table");
+            let from = from.filter(|peer| !table.is_protected(&device_id(peer)));
+            let mut buckets = self.buckets.lock().expect("mesh buckets");
+            if buckets.len() >= 4096 {
+                buckets.retain(|_, bucket| bucket.at.elapsed() < Duration::from_secs(60));
             }
+            let mut bucket = from.map(|peer| buckets.entry(peer).or_insert_with(Bucket::new));
+            let admit = |_: &MeshRecord| {
+                let admitted = bucket.as_mut().is_none_or(|bucket| bucket.take());
+                limited |= !admitted;
+                admitted
+            };
+            let inserted = table.insert(records, now_ms(), admit);
+            if limited
+                && let Some(bucket) = bucket
+                && bucket
+                    .logged_at
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
+            {
+                bucket.logged_at = Some(Instant::now());
+                tracing::debug!(
+                    event = "mesh.records_limited",
+                    peer = %from.map(|peer| peer.fmt_short().to_string()).unwrap_or_default(),
+                    "dropped new records past a neighbor's limit"
+                );
+            }
+            inserted
         };
+        self.queue(writes);
         if !accepted.is_empty() {
             self.changes.send_modify(|generation| *generation += 1);
         }
-        accepted
+        (accepted, limited)
     }
 
     /// The remembered Nodes and the bootstrap nodes, whose addresses go to the address book.
@@ -686,7 +951,7 @@ impl Mesh {
                 }
                 Ok(Event::Received(message)) => {
                     if let Ok(signed) = serde_json::from_slice(&message.content) {
-                        self.accept_records(vec![signed]);
+                        self.accept_records(vec![signed], Some(message.delivered_from));
                     }
                 }
                 Ok(Event::Lagged) => {
@@ -720,7 +985,8 @@ impl Mesh {
         });
     }
 
-    /// Takes the records `peer` holds that this Node lacks, a page at a time.
+    /// Takes the records `peer` holds that this Node lacks, a page at a time, until `peer`
+    /// delivers more new devices than its limit lets in.
     async fn pull(&self, peer: EndpointId) -> Result<()> {
         let mut have: Vec<(String, u64)> = self
             .table
@@ -734,7 +1000,9 @@ impl Mesh {
                 &self.endpoint,
                 peer,
                 &self.exchange_alpn,
-                &json!({"type":"digest","have":have}),
+                &Request::Digest {
+                    have: Have::new(&have),
+                },
             )
             .await?;
             let records: Vec<SignedMeshRecord> = serde_json::from_value(reply["records"].clone())?;
@@ -743,8 +1011,8 @@ impl Mesh {
                 let record = MeshRecord::parse(&signed.payload).ok()?;
                 Some((record.device_id, record.seq))
             }));
-            self.accept_records(records);
-            if reply["more"] != true {
+            let (_, limited) = self.accept_records(records, Some(peer));
+            if limited || reply["more"] != true {
                 break;
             }
         }
@@ -814,10 +1082,12 @@ impl Mesh {
             && record.addrs.pop().is_some()
         {}
         let signed = SignedMeshRecord::sign(&record, |payload| self.sign(payload))?;
-        self.table
+        let writes = self
+            .table
             .lock()
             .expect("mesh table")
-            .insert_own(signed.clone(), record, now)?;
+            .insert_own(signed.clone(), record, now);
+        self.queue(writes);
         self.changes.send_modify(|generation| *generation += 1);
         self.broadcast(&signed).await;
         Ok(true)
@@ -894,7 +1164,9 @@ impl Mesh {
             .take(LOOKUP_NEIGHBORS)
             .copied()
             .collect();
-        let request = json!({"type":"lookup","device_id":device});
+        let request = Request::Lookup {
+            device_id: device.to_owned(),
+        };
         let mut asks: FuturesUnordered<_> = neighbors
             .into_iter()
             .map(|peer| exchange(&self.endpoint, peer, &self.exchange_alpn, &request))
@@ -914,7 +1186,7 @@ impl Mesh {
         .ok()
         .flatten()?;
         let record = MeshRecord::parse(&signed.payload).ok();
-        self.accept_records(vec![signed]);
+        self.accept_records(vec![signed], None);
         record
     }
 
@@ -923,47 +1195,47 @@ impl Mesh {
         let limit = (self.answering.clone(), EXCHANGE_TIMEOUT);
         let mesh = Arc::downgrade(&self);
         drop(self);
-        serve_streams_within(connection, Some(limit), move |request: Value| {
-            let mesh = mesh.clone();
-            async move {
-                mesh.upgrade()
-                    .context("the mesh stopped")?
-                    .answer(remote, request)
-                    .await
-            }
-        })
+        serve_streams_within(
+            connection,
+            Some(limit),
+            MAX_REQUEST,
+            move |request: Request| {
+                let mesh = mesh.clone();
+                async move {
+                    mesh.upgrade()
+                        .context("the mesh stopped")?
+                        .answer(remote, request)
+                        .await
+                }
+            },
+        )
         .await;
     }
 
     /// Answers one exchange request from `remote`.
-    pub async fn answer(&self, remote: EndpointId, request: Value) -> Result<Value> {
-        match request["type"].as_str() {
-            Some("digest") => {
+    pub async fn answer(&self, remote: EndpointId, request: Request) -> Result<Value> {
+        match request {
+            Request::Digest { have } => {
                 self.admit(remote, true)?;
-                let have: Vec<(String, u64)> = serde_json::from_value(request["have"].clone())
-                    .context("invalid mesh digest")?;
-                let (records, more) = self.page(have);
+                let (records, more) = self.page(&have)?;
                 if let Some(limit) = self.limits.lock().expect("mesh limits").get_mut(&remote) {
                     limit.more = more;
                 }
                 Ok(json!({"records":records,"more":more}))
             }
-            Some("lookup") => {
+            Request::Lookup { device_id } => {
                 self.admit(remote, false)?;
-                let device = request["device_id"]
-                    .as_str()
-                    .context("lookup needs a device_id")?;
                 let now = now_ms();
                 let record = self
                     .table
                     .lock()
                     .expect("mesh table")
-                    .get(device)
+                    .get(&device_id)
                     .filter(|entry| entry.online(now))
                     .map(|entry| entry.signed.clone());
                 Ok(json!({"record":record}))
             }
-            Some("probe_relay") => {
+            Request::ProbeRelay { url } => {
                 {
                     let mut limits = self.limits.lock().expect("mesh limits");
                     let limit = limits.entry(remote).or_default();
@@ -973,11 +1245,15 @@ impl Mesh {
                     );
                     limit.probe_at = Some(Instant::now());
                 }
-                let url = request["url"].as_str().context("probe_relay needs a url")?;
-                let latency = super::relay::check_relay(url, self.allow_private).await?;
+                // The asker learns only that the check failed, not what this Node saw.
+                let (latency, _) = super::relay::check_relay(&url, self.allow_private)
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(event = "mesh.probe_failed", %url, error = %format!("{error:#}"));
+                        anyhow::anyhow!("the relay check failed")
+                    })?;
                 Ok(json!({"ok":true,"latency_ms":latency.as_millis() as u64}))
             }
-            _ => bail!("unknown mesh request"),
         }
     }
 
@@ -1017,29 +1293,26 @@ impl Mesh {
         Ok(())
     }
 
-    /// The records held here that `have` lacks or holds older, at most 2000 and about 4 MiB.
-    fn page(&self, have: Vec<(String, u64)>) -> (Vec<SignedMeshRecord>, bool) {
-        let have: HashMap<String, u64> = have.into_iter().collect();
+    /// The records held here that `have` lacks, at most 2000 and about 4 MiB.
+    fn page(&self, have: &Have) -> Result<(Vec<SignedMeshRecord>, bool)> {
+        let bits = have.open()?;
         let now = now_ms();
         let table = self.table.lock().expect("mesh table");
         let mut records = Vec::new();
         let mut bytes = 0;
         for entry in table.online(now) {
-            if have
-                .get(&entry.record.device_id)
-                .is_some_and(|seq| *seq >= entry.record.seq)
-            {
+            if have.contains(&bits, &entry.record.device_id, entry.record.seq) {
                 continue;
             }
             // Escaped inside the reply, the payload can take twice its length.
             let size = 2 * entry.signed.payload.len() + entry.signed.signature.len() + 32;
             if records.len() == PAGE_RECORDS || bytes + size > PAGE_BYTES {
-                return (records, true);
+                return Ok((records, true));
             }
             bytes += size;
             records.push(entry.signed.clone());
         }
-        (records, false)
+        Ok((records, false))
     }
 }
 
@@ -1055,7 +1328,7 @@ pub async fn find_through(
     let now = now_ms();
     let mut candidates = Vec::new();
     match Table::open(db, &own, &config.network, now) {
-        Ok(table) => {
+        Ok((table, _)) => {
             if let Some(entry) = table.get(device).filter(|entry| entry.online(now)) {
                 return Some(entry.record.clone());
             }
@@ -1075,7 +1348,9 @@ pub async fn find_through(
         }
     }
     let alpn = exchange_alpn(&config.network);
-    let request = json!({"type":"lookup","device_id":device});
+    let request = Request::Lookup {
+        device_id: device.to_owned(),
+    };
     let mut asks: FuturesUnordered<_> = candidates
         .into_iter()
         .filter(|addr| addr.id != net.endpoint.id())
@@ -1107,9 +1382,13 @@ async fn verify_gateway(url: &str, device: &str, allow_private: bool) -> Result<
     let port = url
         .port_or_known_default()
         .context("the gateway has no port")?;
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
-        .await?
-        .collect();
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(
+        GATEWAY_TIMEOUT,
+        tokio::net::lookup_host((host.trim_matches(['[', ']']), port)),
+    )
+    .await
+    .context("the gateway did not resolve in time")??
+    .collect();
     let address = *addresses.first().context("the gateway does not resolve")?;
     ensure!(
         allow_private
@@ -1121,19 +1400,27 @@ async fn verify_gateway(url: &str, device: &str, allow_private: bool) -> Result<
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5));
+        .connect_timeout(GATEWAY_TIMEOUT)
+        .timeout(GATEWAY_TIMEOUT);
     if let Some(domain) = url.domain() {
         // Connect to the address checked above, not to a second lookup's answer.
         client = client.resolve(domain, address);
     }
-    let info: Value = client
+    let mut response = client
         .build()?
         .get(url.join("/api/info")?)
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .error_for_status()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= GATEWAY_INFO_BYTES,
+            "the gateway's /api/info is too large"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let info: Value = serde_json::from_slice(&body)?;
     ensure!(
         info["device_id"] == device,
         "the gateway answers for another device"
@@ -1315,6 +1602,112 @@ mod tests {
         }
     }
 
+    fn signed_record(identity: &vibeface_secure::Identity) -> SignedMeshRecord {
+        let record = MeshRecord {
+            v: 1,
+            network: "loopback".into(),
+            device_id: identity.device_id(),
+            seq: now_ms(),
+            ttl_s: record::DEFAULT_TTL_S,
+            addrs: vec![],
+            relay_url: None,
+            reachable: Reachable::Unknown,
+            roles: vec![],
+        };
+        SignedMeshRecord::sign(&record, |payload| {
+            Ok(identity.sign(record::DOMAIN, payload)?)
+        })
+        .unwrap()
+    }
+
+    /// A neighbor delivers ten thousand records of new devices into a table that holds at
+    /// most 100. It adds about 200 of them, no more than its limit lets through, and none of
+    /// the 50 records known before is dropped; a member's deliveries are not limited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_of_new_records_neither_passes_the_limit_nor_drops_known_ones() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("mesh-flood-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let secret = crate::crypto::LocalIdentity::generate()
+            .secret_key_hex
+            .clone();
+        let node = Node::start(&secret, &dir.join("mesh.sqlite3"), vec![]).await?;
+        let result = async {
+            node.mesh.table().set_capacity(100);
+            let known: Vec<vibeface_secure::Identity> = (0..50)
+                .map(|_| vibeface_secure::Identity::generate().unwrap())
+                .collect();
+            let (accepted, _) = node
+                .mesh
+                .accept_records(known.iter().map(signed_record).collect(), None);
+            assert_eq!(accepted.len(), 50);
+
+            let flood: Vec<SignedMeshRecord> = (0..10_000)
+                .map(|_| signed_record(&vibeface_secure::Identity::generate().unwrap()))
+                .collect();
+            let neighbor = endpoint_id(&crate::crypto::LocalIdentity::generate().device_id()?)?;
+            let started = Instant::now();
+            let mut added = 0;
+            let mut limited = false;
+            for signed in flood {
+                let (accepted, dropped) = node.mesh.accept_records(vec![signed], Some(neighbor));
+                added += accepted.len();
+                limited |= dropped;
+            }
+            let allowed =
+                NEW_RECORDS_BURST + started.elapsed().as_secs_f64() * NEW_RECORDS_PER_SECOND + 1.0;
+            assert!(limited && added as f64 <= allowed, "{added} > {allowed}");
+            {
+                let table = node.mesh.table();
+                assert!(table.entries().count() <= 100);
+                assert!(
+                    known
+                        .iter()
+                        .all(|identity| table.get(&identity.device_id()).is_some()),
+                    "a record known before the flood was dropped"
+                );
+            }
+
+            let member = vibeface_secure::Identity::generate()?;
+            node.mesh.join_peers(&[member.device_id()]).await;
+            let from_member: Vec<SignedMeshRecord> = (0..300)
+                .map(|_| signed_record(&vibeface_secure::Identity::generate().unwrap()))
+                .collect();
+            let (_, limited) = node
+                .mesh
+                .accept_records(from_member, Some(endpoint_id(&member.device_id())?));
+            assert!(!limited, "a member's deliveries are not limited");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.stop().await;
+        let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+
+    /// A digest's filter of a full table fits in a request, and claims few records it lacks.
+    #[test]
+    fn a_full_tables_digest_filter_fits_in_a_request() {
+        let held: Vec<(String, u64)> = (0..table::CAPACITY as u64)
+            .map(|n| (format!("{n:064x}"), n))
+            .collect();
+        let have = Have::new(&held);
+        let request = serde_json::to_vec(&Request::Digest { have: have.clone() }).unwrap();
+        assert!(request.len() <= MAX_REQUEST, "{}", request.len());
+        let bits = have.open().unwrap();
+        assert!(
+            held.iter()
+                .all(|(device, seq)| have.contains(&bits, device, *seq))
+        );
+        let wrong = (0..10_000u64)
+            .filter(|n| have.contains(&bits, &format!("{n:064x}"), n + 1))
+            .count();
+        assert!(wrong < 500, "{wrong} of 10000 claimed wrongly");
+        let empty = Have::new(&[]);
+        assert!(!empty.contains(&empty.open().unwrap(), &held[0].0, 0));
+    }
+
     /// D joins through B alone and learns every Node; restarted with no bootstrap node, it joins
     /// again through the Nodes its table remembers.
     #[tokio::test(flavor = "multi_thread")]
@@ -1361,24 +1754,35 @@ mod tests {
                 .await?;
             assert!(found(&reply, "loopback", &c_id).is_some());
             let unknown = d.mesh.request(&a_id, &json!({"type":"relay_grant"})).await;
-            assert!(
-                unknown
-                    .unwrap_err()
-                    .to_string()
-                    .contains("unknown mesh request")
-            );
+            assert!(unknown.unwrap_err().to_string().contains("invalid request"));
+            let large = json!({"type":"lookup","device_id":"a".repeat(MAX_REQUEST)});
+            let large = d.mesh.request(&a_id, &large).await.unwrap_err();
+            assert!(large.to_string().contains("frame too large"), "{large}");
             let stranger = endpoint_id(&crate::crypto::LocalIdentity::generate().device_id()?)?;
-            let digest = json!({"type":"digest","have":[]});
-            let page = nodes[0].mesh.answer(stranger, digest.clone()).await?;
+            let digest = |have: &[(String, u64)]| Request::Digest {
+                have: Have::new(have),
+            };
+            let page = nodes[0].mesh.answer(stranger, digest(&[])).await?;
             assert!(
                 page["records"]
                     .as_array()
                     .is_some_and(|records| records.len() >= 3)
             );
             assert!(
-                nodes[0].mesh.answer(stranger, digest).await.is_err(),
+                nodes[0].mesh.answer(stranger, digest(&[])).await.is_err(),
                 "one digest every 10 s"
             );
+            // The filter leaves out the records the asker holds.
+            let held: Vec<(String, u64)> = nodes[0]
+                .mesh
+                .records()
+                .iter()
+                .map(|entry| (entry.record.device_id.clone(), entry.record.seq))
+                .collect();
+            let other = endpoint_id(&crate::crypto::LocalIdentity::generate().device_id()?)?;
+            let page = nodes[0].mesh.answer(other, digest(&held)).await?;
+            assert_eq!(page["records"], json!([]));
+            assert!(Have::new(&held).bits.len() < MAX_REQUEST);
 
             d.stop().await;
             let d = Node::start(&secrets[3], &dir.join("d.sqlite3"), vec![]).await?;

@@ -62,7 +62,7 @@ chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibefac
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 
-`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`relay_url` 是上面的 `--relay-url`，Core 用这四项生成默认 bootstrap 节点；`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址。网页和 relay 满足条件后，Node 在全网记录里宣告 `gateway` 和 `relay` 角色。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和全网 UDP 都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
+`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`relay_url` 必须与上面的 `--relay-url` 相同，Core 用这四项生成默认 bootstrap 节点，每台默认入网的 Node 都把这个 relay 固定留在 relay 列表里；guard 只核对 `public_url` 等于 `gateway_url` 和设备编号等于 `issuer`，不核对 `relay_url` 和 UDP 地址，改动时两处一起改。`gateway_url` 是上面的 `public_url`，也是官方页面和 App 默认的接入地址。网页入口开启、`forwarding.any` 打开且 `public_url` 是公网 HTTPS 时 Node 宣告 `gateway` 角色；开放 relay 经邻居从外部探测通过后才宣告 `relay` 角色。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和全网 UDP 都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
 
 `init --tls` 写的是自签占位证书，浏览器不信任它；部署后它只是挂载点，容器里看到的是 `tls_dir` 的文件。真实证书由宿主 root 的 acme.sh 向 Let's Encrypt 申请，写进 root 所有的 `tls_dir`，不碰 1001 可写的数据目录，因此不会被数据目录里的符号链接引到别处。HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot。先建好目录和两个文件，属主和权限此后保持不变：
 

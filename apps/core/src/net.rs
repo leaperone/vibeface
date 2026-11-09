@@ -321,6 +321,8 @@ pub struct Net {
     mesh: OnceLock<Arc<mesh::Mesh>>,
     /// Relays configured, run here or by member Nodes, which stay in the relay map.
     relays: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
+    /// The bootstrap nodes' relays, which stay in the relay map while they are bootstrap nodes.
+    bootstrap: tokio::sync::Mutex<HashSet<RelayUrl>>,
     /// Open relays the mesh announces, adopted while they rank among the best.
     adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
@@ -410,6 +412,7 @@ impl Net {
             lan: OnceLock::new(),
             mesh: OnceLock::new(),
             relays: known,
+            bootstrap: Default::default(),
             adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
         })
@@ -457,6 +460,7 @@ impl Net {
             return;
         };
         let mut relays = self.relays.lock().await;
+        self.bootstrap.lock().await.remove(&url);
         self.adopted.lock().await.remove(&url);
         if relays.insert(url.clone()) {
             self.endpoint
@@ -467,7 +471,9 @@ impl Net {
 
     #[cfg(test)]
     pub async fn knows_relay(&self, url: &RelayUrl) -> bool {
-        self.relays.lock().await.contains(url) || self.adopted.lock().await.contains(url)
+        self.relays.lock().await.contains(url)
+            || self.bootstrap.lock().await.contains(url)
+            || self.adopted.lock().await.contains(url)
     }
 
     /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
@@ -475,6 +481,7 @@ impl Net {
     pub async fn insert_relay(&self, url: RelayUrl, token: Option<String>) {
         let mut relays = self.relays.lock().await;
         relays.insert(url.clone());
+        self.bootstrap.lock().await.remove(&url);
         self.adopted.lock().await.remove(&url);
         self.endpoint
             .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
@@ -486,14 +493,38 @@ impl Net {
         self.endpoint.remove_relay(url).await;
     }
 
-    /// Makes `urls` the adopted relays: new ones join the relay map and the rest leave it,
-    /// apart from relays kept for another reason.
-    pub async fn set_adopted(&self, urls: Vec<RelayUrl>) {
+    /// Makes `urls` the bootstrap nodes' relays: new ones join the relay map and stay there
+    /// whatever the ranking, and the rest leave it, apart from relays kept for another reason.
+    pub async fn set_bootstrap_relays(&self, urls: Vec<RelayUrl>) {
         let pinned = self.relays.lock().await;
+        let mut bootstrap = self.bootstrap.lock().await;
         let mut adopted = self.adopted.lock().await;
         let next: HashSet<RelayUrl> = urls
             .into_iter()
             .filter(|url| !pinned.contains(url))
+            .collect();
+        for url in bootstrap.difference(&next) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in next.difference(&bootstrap) {
+            if !adopted.remove(url) {
+                self.endpoint
+                    .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
+                    .await;
+            }
+        }
+        *bootstrap = next;
+    }
+
+    /// Makes `urls` the adopted relays: new ones join the relay map and the rest leave it,
+    /// apart from relays kept for another reason.
+    pub async fn set_adopted(&self, urls: Vec<RelayUrl>) {
+        let pinned = self.relays.lock().await;
+        let bootstrap = self.bootstrap.lock().await;
+        let mut adopted = self.adopted.lock().await;
+        let next: HashSet<RelayUrl> = urls
+            .into_iter()
+            .filter(|url| !pinned.contains(url) && !bootstrap.contains(url))
             .collect();
         for url in adopted.difference(&next) {
             self.endpoint.remove_relay(url).await;
@@ -729,6 +760,14 @@ pub async fn write_frame(send: &mut SendStream, value: &Value) -> Result<()> {
 
 /// `None` when the peer finished the stream cleanly between frames.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<Value>> {
+    read_frame_within(recv, MAX_FRAME).await
+}
+
+/// A frame of at most `max` bytes, read straight into `T`.
+async fn read_frame_within<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+    max: usize,
+) -> Result<Option<T>> {
     let mut length = [0u8; 4];
     match recv.read_exact(&mut length).await {
         Ok(()) => {}
@@ -736,12 +775,14 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<Value>> {
         Err(error) => bail!("peer stream failed: {error}"),
     }
     let length = u32::from_be_bytes(length) as usize;
-    ensure!(length <= MAX_FRAME, "frame too large");
+    ensure!(length <= max, "frame too large");
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes)
         .await
         .map_err(|error| anyhow!("peer stream failed: {error}"))?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid request"))?,
+    ))
 }
 
 /// Answers each stream of `connection` with `handle`, one stream at a time per task.
@@ -750,7 +791,7 @@ where
     F: Fn(Value) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Value>> + Send,
 {
-    serve_streams_within(connection, None, handle).await
+    serve_streams_within(connection, None, MAX_FRAME, handle).await
 }
 
 /// Bounds a protocol anyone may call: at most the semaphore's permits of streams are answered
@@ -758,13 +799,16 @@ where
 /// is closed unanswered.
 pub type StreamLimit = (Arc<tokio::sync::Semaphore>, Duration);
 
-/// [`serve_streams`] under `limit`.
-pub async fn serve_streams_within<F, Fut>(
+/// [`serve_streams`] under `limit`, for requests of at most `max_request` bytes, each read
+/// straight into `T`.
+pub async fn serve_streams_within<T, F, Fut>(
     connection: Connection,
     limit: Option<StreamLimit>,
+    max_request: usize,
     handle: F,
 ) where
-    F: Fn(Value) -> Fut + Clone + Send + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Value>> + Send,
 {
     let mut replies = FuturesUnordered::new();
@@ -783,7 +827,7 @@ pub async fn serve_streams_within<F, Fut>(
                 replies.push(std::panic::AssertUnwindSafe(async move {
                     let _permit = permit;
                     let reply = async move {
-                    let response = match read_frame(&mut recv).await {
+                    let response = match read_frame_within::<T>(&mut recv, max_request).await {
                         Ok(Some(request)) => handle(request)
                             .await
                             .unwrap_or_else(|error| serde_json::json!({"error":format!("{error:#}")})),
