@@ -1,17 +1,82 @@
 //! Starting a provider so its whole process tree can be ended, and ending a tree an earlier run
 //! of this Node left behind.
 //!
-//! Unix puts the child in its own process group and signals the group. Windows puts the child in
-//! a named job object which the kernel tears down when the last handle to it closes, so a crash
-//! of this Node cannot leave the tree running. In both cases the record a journal keeps is only
-//! acted on after the identity behind it is confirmed: a bare process id is never terminated,
-//! because Windows reuses process ids and an unrelated program must never be killed.
+//! Unix puts the child in its own process group. A numeric group id alone cannot prove ownership
+//! after the root is reaped, so managed shutdown keeps its owned root unreaped until the last
+//! group signal. Recorded Unix groups use command matching during recovery.
+//!
+//! Windows puts the child in a named job object which the kernel tears down when the last handle
+//! closes, so a crash of this Node cannot leave the tree running. Its records carry the root's
+//! start identity and the job key for recovery checks.
 
 use anyhow::{Context, Result, ensure};
 use std::{path::Path, time::Duration};
 
 /// How long a tree gets to exit after being asked, before it is ended outright.
-const GRACE: Duration = Duration::from_secs(3);
+pub(crate) const GRACE: Duration = Duration::from_secs(3);
+
+/// Observes exit without releasing an owned Unix child's PID. Windows retains its Job identity.
+pub fn try_observe_exit(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        let Some(pid) = child.id() else {
+            return child.try_wait();
+        };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        if info.si_signo == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        let raw = match info.si_code {
+            libc::CLD_EXITED => status << 8,
+            libc::CLD_KILLED => status,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected child exit observation",
+                ));
+            }
+        };
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    }
+    #[cfg(windows)]
+    {
+        child.try_wait()
+    }
+}
+
+/// Waits for exit while preserving the Unix PID until managed-tree signalling is finished.
+pub async fn observe_exit(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = try_observe_exit(child)? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 /// A started process tree, kept for as long as the Node manages it.
 pub struct Tree {
@@ -102,7 +167,7 @@ impl Tree {
         self.root
     }
 
-    /// Whether any member of the tree is still running.
+    /// Whether any member of the tree could still be running.
     pub fn is_running(&self) -> bool {
         #[cfg(unix)]
         {
@@ -112,7 +177,52 @@ impl Tree {
         {
             self.job
                 .as_ref()
-                .is_some_and(|job| job.member_count().unwrap_or(0) > 0)
+                .is_some_and(|job| job.member_count().map_or(true, |count| count > 0))
+        }
+    }
+
+    /// Observes active members without reaping the owned root that anchors Unix group signals.
+    pub(crate) async fn has_live_members(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            let output = tokio::process::Command::new("/bin/ps")
+                .args(["-axo", "pid=,pgid=,stat="])
+                .kill_on_drop(true)
+                .output()
+                .await?;
+            ensure!(
+                output.status.success(),
+                "could not inspect the process tree"
+            );
+            let output = std::str::from_utf8(&output.stdout)?;
+            let mut root_seen = false;
+            let mut live = false;
+            for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                let mut fields = line.split_whitespace();
+                let pid = fields
+                    .next()
+                    .context("missing process id")?
+                    .parse::<u32>()?;
+                let group = fields
+                    .next()
+                    .context("missing process group")?
+                    .parse::<i32>()?;
+                let state = fields.next().context("missing process state")?;
+                ensure!(fields.next().is_none(), "unexpected process-state columns");
+                if group == self.group {
+                    root_seen |= pid == self.root;
+                    live |= !state.starts_with('Z');
+                }
+            }
+            ensure!(root_seen, "the owned process-tree root was not observed");
+            Ok(live)
+        }
+        #[cfg(windows)]
+        {
+            match self.job.as_ref() {
+                Some(job) => Ok(job.member_count()? > 0),
+                None => Ok(false),
+            }
         }
     }
 

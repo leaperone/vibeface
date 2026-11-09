@@ -24,6 +24,8 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web instal
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
+所有 Web fixture 显式选择受控 Cursor CLI，避免 AI 设置的自动探针启动 PATH 中的个人 CLI。`onboarding.e2e.ts` 的 Cursor 场景从旧 SDK 程序选择开始，在受控 PATH 中发现并保存官方入口，核对未登录提示、无密钥输入、受控 CLI 登录后返回页面的认证与模型状态，以及 Bot 和执行用途仍关闭。全过程不发送模型提示。
+
 示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。

@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { authenticationSourceLabels, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { authenticationSourceLabels, canSetProviderEnvironment, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -38,7 +38,7 @@ const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon
   missing: { label: '未安装', tone: 'neutral', icon: CircleDashed },
 }
 
-const services: Record<string, string> = { CURSOR_API_KEY: 'Cursor', OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
+const services: Record<string, string> = { OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
 const keyName = (name: string) => services[name] ? `${services[name]} 密钥` : name
 
 function issueText(provider: ProviderId, issue: ProviderIssue): string {
@@ -137,8 +137,8 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
     <View className="gap-1 px-4 pb-3">
       <Text className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</Text>
       {'issue' in readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
-      {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">在运行该节点的电脑或服务器上执行以下命令，为节点登录，再点“检查可用性”。已有私有登录不会被自动接入覆盖。</Text>
+      {item.setup && (item.provider === 'cursor' ? item.probe.authentication === 'sign_in_required' : (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state)) ? <View className="gap-2">
+        <Text className="text-meta text-muted-foreground">{item.provider === 'cursor' ? '在运行该节点的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。' : '在运行该节点的电脑或服务器上执行以下命令，为节点登录，再点“检查可用性”。已有私有登录不会被自动接入覆盖。'}</Text>
         {item.setup.directory ? <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text> : null}
         <CopyableId value={item.setup.command} label={`${name} 登录命令`} />
       </View> : null}
@@ -151,7 +151,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
-        <Details label="能力验证"><Text className="text-meta text-muted-foreground">程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</Text>{item.observed ? Object.entries(item.observed).map(([key, observation]) => <Text key={key} className="text-meta">{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</Text>) : <Text className="text-meta text-muted-foreground">验证记录未提供。</Text>}</Details>
+        <Details label="能力验证"><Text className="text-meta text-muted-foreground">{item.provider === 'cursor' ? '已找到程序，不代表订阅登录或模型已经验证。' : '程序和密钥已配置，不代表登录或模型已经验证。'}未验证时可以尝试运行。</Text>{item.observed ? Object.entries(item.observed).map(([key, observation]) => <Text key={key} className="text-meta">{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</Text>) : <Text className="text-meta text-muted-foreground">验证记录未提供。</Text>}</Details>
         {manager ? <Details label="运行 Bot" keepMounted>
           <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} />
         </Details> : null}
@@ -355,8 +355,8 @@ function Variables({ item, required, working, change }: { item: ProviderStatus; 
   const [newName, setNewName] = useState('')
   const [newValue, setNewValue] = useState('')
   const addName = newName.trim().toUpperCase()
-  const set = (name: string, next: string | null) => change(`env:${name}`, { env: { [name]: next } })
-  const rows = item.env.filter((row) => row.required === required)
+  const set = (name: string, next: string | null) => !canSetProviderEnvironment(item.provider, name) ? Promise.resolve(false) : change(`env:${name}`, { env: { [name]: next } })
+  const rows = item.env.filter((row) => row.required === required && canSetProviderEnvironment(item.provider, row.name))
   const list = rows.map((row) => {
       const missing = item.state === 'needs_setup' && !row.set && !row.inherited && row.required
       return <View key={row.name} className="gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
@@ -379,11 +379,12 @@ function Variables({ item, required, working, change }: { item: ProviderStatus; 
     <Input accessibilityLabel="变量名" placeholder="变量名" className="font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
     <View className="flex-row gap-2">
       <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
-      <Button variant="outline" disabled={working || !addName || !newValue} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
+      <Button variant="outline" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
     <Text className="text-meta text-muted-foreground">只保存在这个节点上，保存后看不到原值</Text>
+    {item.provider === 'cursor' ? <Text className="text-meta text-muted-foreground">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</Text> : null}
     {item.app_server?.mode === 'system' ? <Text className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</Text> : null}
   </Field>
 }

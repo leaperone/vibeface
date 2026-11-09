@@ -82,7 +82,7 @@ bash scripts/build-web.sh
 
 ### 使用 Cursor CLI
 
-Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login` 的已有订阅登录，不要求 API key。程序可用时点设备页的**自动接入**，或显式配置程序绝对路径。Vibeface 不安装 Agent，不自动执行登录。
+Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login` 的已有订阅登录。网页进入设备 AI 设置时自动发现并检查 Cursor，也可点**自动接入**或显式配置程序绝对路径。发现结果会保存，已有有效自定义 CLI 保持选择；不支持的旧 SDK Bridge 选择会重新发现官方 CLI。Vibeface 不安装 Agent，不自动执行登录。
 
 ```sh
 ./vibeface init \
@@ -93,7 +93,7 @@ Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login`
     --bin cursor=/absolute/path/to/agent
 ```
 
-此命令用于尚未初始化的 Node。Cursor 请求使用本机 CLI 当前选择的账户额度；保存或继承的 CURSOR_API_KEY/CURSOR_AUTH_TOKEN 仍优先于订阅登录。凭据不得写入命令行、URL、Git 或聊天记录。检查只观察 CLI 状态并初始化私有空会话和模型目录，不发送模型提示。需要本人登录时，设备页提供官方登录命令。
+此命令用于尚未初始化的 Node。Cursor 请求只使用本机 CLI 当前登录的订阅账户；Node 不接收、导入或传递 CURSOR_API_KEY、CURSOR_AUTH_TOKEN 或 credential-store 覆盖。检查只观察 CLI 状态并初始化私有空会话和模型目录，不发送模型提示。需要本人登录时，设备页提供官方登录命令。登录后返回网页会重新检查认证和模型，不自动启用 Bot 或执行任务。
 
 每个 Bot 和任务 owner 使用私有 ACP 配置、数据和 Node journal。各轮使用独立进程，同一 owner 串行，不同 owner 可并行。Node 工具经私有回环 MCP 入口使用当前 attempt 认证，保留网络、聊天、任务和写操作去重边界。CLI 自身的用户及项目 MCP、规则与 hooks 仍按官方行为加载。
 
