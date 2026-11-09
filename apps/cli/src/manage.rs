@@ -576,7 +576,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             Ok(())
         }
         ClientAction::Enroll { link, name } => {
-            let origin = access.local_entry(None).await?.origin;
+            let origin = match &access.url {
+                Some(url) => url.clone(),
+                None => access.local_entry(None).await?.origin,
+            };
             let mut key = access.unlock_or_create()?;
             let (network, entry) = {
                 let mut enrollment = Enrollment::start(&key, &origin, &link, &name).await?;
