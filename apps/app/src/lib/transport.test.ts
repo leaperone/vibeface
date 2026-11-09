@@ -16,8 +16,11 @@ async function key() {
   return { privateKey: pair.privateKey, deviceId: hex(await crypto.subtle.exportKey('raw', pair.publicKey)) }
 }
 
-/** A fake Gateway, or with `lan` a Node on the LAN, that answers as `serving` (normally the target) or refuses with a text frame. */
-async function harness({ local = false, lan = false, refuse = '', impostor = false, nativeLocal = false, nativeGateway = false } = {}) {
+/**
+ * A fake Gateway, or with `lan` a Node on the LAN, that answers as `serving` (normally the target) or refuses with a text frame.
+ * With `queue` it first holds the session in line, telling each place every `noticeMs`; a place below 0 is a full line.
+ */
+async function harness({ local = false, lan = false, refuse = '', impostor = false, nativeLocal = false, nativeGateway = false, queue = [] as number[], noticeMs = 0 } = {}) {
   await initCrypto({ module_or_path: readFileSync(new URL('../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
   const browser = await key(), target = await key(), serving = impostor ? await key() : target
   const urls: string[] = [], texts: string[] = []
@@ -29,6 +32,7 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
     handshake: Handshake | undefined
     channel: ReturnType<Handshake['finish']> | undefined
     dead = false
+    held: (string | Uint8Array)[] | undefined
     readonly url: string
     constructor(url: string) {
       super(); this.url = url; urls.push(url); open++
@@ -40,11 +44,22 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
       this.handshake = handshake
     }
     emit(data: unknown) { if (!this.dead) queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data }))) }
+    async wait() {
+      for (const position of queue) {
+        await new Promise(resolve => setTimeout(resolve, noticeMs))
+        this.emit(JSON.stringify(position < 0 ? { type: 'error', code: 'gateway_busy', error: 'this Gateway relays too many sessions' } : { type: 'queued', position }))
+      }
+      const held = this.held ?? []
+      this.held = undefined
+      for (const value of held) this.send(value)
+    }
     send(value: string | Uint8Array) {
       if (this.dead) return
+      if (this.held) { this.held.push(value); return }
       if (typeof value === 'string') {
         texts.push(value)
         if (refuse) { this.emit(JSON.stringify({ type: 'error', error: refuse })); this.handshake?.free(); this.handshake = undefined }
+        else if (queue.length) { this.held = []; void this.wait() }
         return
       }
       if (this.handshake) {
@@ -100,7 +115,7 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
   const entry: ConnectionEntry = lan ? { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id } : { kind: local ? 'local' : 'gateway', address, device_id }
   return {
     target: target.deviceId, urls, texts, dials, nativeCalls, open: () => open,
-    connect: (to = entry) => runtime.connectDevice(to, {}),
+    connect: (to = entry, options: Parameters<typeof runtime.connectDevice>[1] = {}) => runtime.connectDevice(to, options),
     parseJoinLink: (value: string) => runtime.parseJoinLink(value),
   }
 }
@@ -126,6 +141,23 @@ test('a Node that proves another device id is refused and its socket closed', as
 test('a text frame from the gateway ends the attempt with its reason', async () => {
   const app = await harness({ refuse: 'this Gateway can only reach itself' })
   await assert.rejects(app.connect(), /this Gateway can only reach itself/)
+  await settle()
+  assert.equal(app.open(), 0)
+})
+
+test('a busy gateway holds the session in line, each place it tells restarting the connect timeout', async () => {
+  const app = await harness({ queue: [3, 2, 1, 0], noticeMs: 50 })
+  const places: number[] = []
+  const channel = await app.connect(undefined, { timeoutMs: 150, onQueued: position => places.push(position) })
+  assert.deepEqual(places, [3, 2, 1, 0])
+  assert.equal((await channel.request('info') as { device_id: string }).device_id, app.target)
+  channel.close(); await settle()
+  assert.equal(app.open(), 0)
+})
+
+test('a gateway whose line is full refuses with gateway_busy', async () => {
+  const app = await harness({ queue: [1, -1] })
+  await assert.rejects(app.connect(), (error: Error & { code?: unknown }) => error.code === 'gateway_busy' && /too many sessions/.test(error.message))
   await settle()
   assert.equal(app.open(), 0)
 })

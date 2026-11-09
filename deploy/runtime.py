@@ -17,6 +17,8 @@ import urllib.request
 ROOT = Path('/opt/vibeface')
 DATA = Path('/data')
 APP_ORIGIN = 'https://app.vibeface.dev'
+TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
+TLS_OWNER = 0
 
 
 def require(condition, message):
@@ -30,6 +32,10 @@ def regular(path, limit=1024 * 1024):
         require(not path.is_symlink() and stat.S_ISREG(metadata.st_mode) and metadata.st_size <= limit,
                 'expected a bounded regular file')
         return handle.read(limit + 1)
+
+
+def read_only(path):
+    return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
 
 
 def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
@@ -74,7 +80,7 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
 def image_info(verify=True):
     app = json.loads(regular(ROOT / 'COMPONENT-INFO.json'))['app']
     return component_info(ROOT, None if app == 'core' else Path('/usr/share/nginx/html'),
-                          verify=verify, ignored=('runtime.py',))
+                          verify=verify, ignored=('runtime.py', 'public-bootstrap.json'))
 
 
 def inspect():
@@ -93,37 +99,44 @@ def guard(info):
     require(stat.S_ISDIR(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o700
             and metadata.st_uid == os.geteuid() and metadata.st_gid == os.getegid(),
             'existing private data directory ownership or permissions differ')
-    for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock'):
+    for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
         path = DATA / name
         require(not path.is_symlink() and path.is_file(), 'initialized Node files are required')
+    # The host's certificate client writes these as root, so they come mounted read-only from a root
+    # directory and this process can change neither.
+    for name in TLS_FILES:
+        metadata = (DATA / name).lstat()
+        require(metadata.st_uid == TLS_OWNER and not metadata.st_mode & 0o022 and read_only(DATA / name)
+                and os.access(DATA / name, os.R_OK),
+                'TLS files must be mounted read-only from the root-owned TLS directory')
     epoch = json.loads(regular(DATA / 'data-epoch.json', 4096))
     require(epoch == {'data_epoch': info['data_epoch']} and type(epoch['data_epoch']) is int,
             'data epoch differs; no migration or initialization is allowed')
     config = json.loads(regular(DATA / 'config.json'))
-    role = expected['VIBEFACE_ROLE']
-    network = config['network']
-    require(role in ('discovery', 'entry', 'relay') and config['public_entry'] is True
-            and config.get('manager') is None and config['roots'] == [] and network.get('entry') is None,
-            'official infrastructure must run outside personal networks')
+    network, forwarding = config['network'], config['forwarding']
+    require(expected['VIBEFACE_ROLE'] == 'node' and config.get('manager') is None and config['roots'] == [],
+            'the official node must run outside personal networks')
     require(config['listen'] == expected['VIBEFACE_LISTEN'], 'existing HTTP listen address differs')
-    if role == 'discovery':
-        require(network['relay_mode'] == 'discovery-only', 'Discovery role requires discovery-only mode')
-    else:
-        require(network.get('relay_mode', 'forward') == 'forward'
-                and network['relay_admission']['policy'] == ('grants' if role == 'entry' else 'operator-token'),
-                'relay admission does not match the selected role')
-        require(APP_ORIGIN in config.get('allowed_origins', []),
-                'browser access needs the App origin in allowed_origins')
-    if role == 'entry':
-        # Tickets name the target only by device ID; the entry finds its relay through the grant issuer's Discovery.
-        issuer = network['relay_admission'].get('issuer')
-        require(any(url.startswith(f'vibeface://{issuer}@') for url in network.get('discovery', [])),
-                'Entry role needs the grant issuer Discovery in network.discovery')
+    # Any device may use the official node, so every service it offers them is bounded.
+    require(network['serve_discovery'] is True and network.get('relay_listen') is not None
+            and network.get('relay_open') is True and network.get('relay_operator_token') is None
+            and network.get('relay_rate') and network.get('relay_max_clients')
+            and network.get('relay_max_clients_per_ip') and forwarding['any'] is True and forwarding.get('rate')
+            and forwarding.get('per_ip'),
+            'the official node needs discovery, an open relay and browser forwarding, each within limits')
+    # Browsers connect straight to this Node, so every limit counts the real peer address.
+    require(not forwarding.get('trusted_proxies'), 'the official node has no proxy in front to trust')
+    anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
+    # Browsers on the App page reach this Node at the address the image pins, over its own TLS certificate.
+    require(config['web_enabled'] is True and config.get('tls') is True and config['public_url'] == anchor['gateway_url']
+            and APP_ORIGIN in config.get('allowed_origins', []),
+            'browser access needs TLS, the pinned gateway_url as public_url and the App origin in allowed_origins')
     require(info['version'] == expected['VIBEFACE_EXPECTED_VERSION']
             and info['source_commit'] == expected['VIBEFACE_EXPECTED_SOURCE'], 'image pin differs')
     result = inspect()
     require(result['device_id'] == expected['VIBEFACE_EXPECTED_DEVICE']
             and result['core_version'] == info['version'], 'existing Node identity or binary version differs')
+    require(result['device_id'] == anchor['issuer'], 'the Node is not the issuer this image pins')
     return result
 
 
@@ -157,7 +170,7 @@ def health(info):
         result = inspect()
         require(result['status'] == 'running' and result['version'] == info['version']
                 and result['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE']
-                and result['web_enabled'] == (os.environ['VIBEFACE_ROLE'] != 'discovery'),
+                and result['web_enabled'] is True,
                 'Core health, version, identity or browser mode differs')
         return {key: result[key] for key in ('status', 'version', 'device_id')}
     request = urllib.request.Request('http://127.0.0.1:8080/')
@@ -180,20 +193,65 @@ def self_test():
                 'files': {'vibeface-core': hashlib.sha256(b'fixture').hexdigest()}}
         (directory / 'COMPONENT-INFO.json').write_text(json.dumps(info))
         assert component_info(directory) == info
+        anchor = {'issuer': 'b' * 64, 'udp_host': '203.0.113.7', 'udp_port': 4792,
+                  'gateway_url': 'https://203.0.113.7:4792'}
+        (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
         data = directory / 'data'; data.mkdir(mode=0o700)
-        for name in ('identity.json', 'node.lock'):
+        for name in ('identity.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
             (data / name).write_text('fixture')
         (data / 'data-epoch.json').write_text('{"data_epoch":1}')
-        config = {'listen': '127.0.0.1:4900', 'public_entry': True, 'roots': [], 'manager': None,
-                  'network': {'relay_mode': 'discovery-only', 'entry': None}}
+        config = {'listen': '0.0.0.0:4792', 'public_url': anchor['gateway_url'], 'allowed_origins': [APP_ORIGIN],
+                  'web_enabled': True, 'tls': True, 'roots': [], 'manager': None,
+                  'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
+                                 'trusted_proxies': []},
+                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_open': True,
+                              'relay_operator_token': None, 'relay_rate': 65536, 'relay_max_clients': 512,
+                              'relay_max_clients_per_ip': 16}}
         (data / 'config.json').write_text(json.dumps(config))
-        env = {'VIBEFACE_ROLE': 'discovery', 'VIBEFACE_LISTEN': config['listen'],
+        env = {'VIBEFACE_ROLE': 'node', 'VIBEFACE_LISTEN': config['listen'],
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',
                'VIBEFACE_EXPECTED_SOURCE': 'a' * 40}
         module = sys.modules[__name__]
-        with patch.object(module, 'DATA', data), patch.dict(os.environ, env), \
+        for name in TLS_FILES:
+            (data / name).chmod(0o640 if name == 'tls-key.pem' else 0o644)
+        with patch.object(module, 'DATA', data), patch.object(module, 'ROOT', directory), \
+                patch.dict(os.environ, env), patch.object(module, 'TLS_OWNER', os.geteuid()), \
+                patch.object(module, 'read_only', return_value=True), \
                 patch.object(module, 'inspect', return_value={'device_id': 'b' * 64, 'core_version': '1.0.0'}):
             assert guard(info)['device_id'] == 'b' * 64
+            for unsafe in (patch.object(module, 'read_only', return_value=False),
+                           patch.object(module, 'TLS_OWNER', os.geteuid() + 1)):
+                with unsafe:
+                    try:
+                        guard(info)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('TLS files the Node could replace accepted')
+            (data / 'tls-key.pem').chmod(0o660)
+            try:
+                guard(info)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a group-writable TLS key accepted')
+            (data / 'tls-key.pem').chmod(0o640)
+            (directory / 'public-bootstrap.json').write_text(json.dumps(dict(anchor, issuer='c' * 64)))
+            try:
+                guard(info)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a Node other than the pinned issuer accepted')
+            (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
+            (data / 'tls-cert.pem').unlink()
+            try:
+                guard(info)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('missing TLS certificate accepted')
+            (data / 'tls-cert.pem').write_text('fixture')
             for marker in ('{"data_epoch":2}', '{"data_epoch":true}'):
                 (data / 'data-epoch.json').write_text(marker)
                 try:
@@ -212,31 +270,26 @@ def self_test():
                 raise AssertionError('missing identity accepted')
             assert not (data / 'identity.json').exists()
             (data / 'identity.json').write_text('fixture')
-            relay = dict(config, network={'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'operator-token'}})
-            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'relay'}):
-                (data / 'config.json').write_text(json.dumps(relay))
+            network, forwarding = config['network'], config['forwarding']
+            for change in ({'allowed_origins': []}, {'public_url': 'https://other.example.invalid'},
+                           {'public_url': APP_ORIGIN},
+                           {'web_enabled': False}, {'tls': False}, {'forwarding': dict(forwarding, any=False)},
+                           {'forwarding': dict(forwarding, rate=None)}, {'forwarding': dict(forwarding, per_ip=None)},
+                           {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
+                           {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
+                           {'network': dict(network, relay_open=False)},
+                           {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
+                           {'network': dict(network, relay_max_clients_per_ip=None)},
+                           {'network': dict(network, relay_operator_token='c' * 64)}):
+                (data / 'config.json').write_text(json.dumps(dict(config, **change)))
                 try:
                     guard(info)
                 except ValueError:
                     pass
                 else:
-                    raise AssertionError('Relay without the App origin accepted')
-                (data / 'config.json').write_text(json.dumps(dict(relay, allowed_origins=[APP_ORIGIN])))
-                assert guard(info)['device_id'] == 'b' * 64
-            issuer = 'c' * 64
-            entry = dict(config, allowed_origins=[APP_ORIGIN], network={
-                'relay_mode': 'forward', 'entry': None, 'relay_admission': {'policy': 'grants', 'issuer': issuer}})
-            with patch.dict(os.environ, {'VIBEFACE_ROLE': 'entry'}):
-                (data / 'config.json').write_text(json.dumps(entry))
-                try:
-                    guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError('Entry without Discovery accepted')
-                entry['network']['discovery'] = [f'vibeface://{issuer}@discovery.example.invalid:4792']
-                (data / 'config.json').write_text(json.dumps(entry))
-                assert guard(info)['device_id'] == 'b' * 64
+                    raise AssertionError(f'unbounded or private official node accepted: {change}')
+            (data / 'config.json').write_text(json.dumps(config))
+            assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')
 
 
@@ -259,8 +312,6 @@ def main():
             with (DATA / 'node.lock').open('rb') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
-            if os.environ['VIBEFACE_ROLE'] == 'discovery':
-                args.append('--no-web')
             os.execv(args[0], args)
     else:
         with maintenance('acquire'):

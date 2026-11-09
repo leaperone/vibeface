@@ -1,7 +1,27 @@
 import type { ConnectionEntry, MembershipView } from './node.ts'
-import type { VerifiedCatalog } from './bootstrap.ts'
-import { catalogConnectionEntries } from './bootstrap.ts'
-import { lanAddrs } from './transport.ts'
+import { lanAddrs, validEndpoint } from './transport.ts'
+import publicBootstrap from '../../../../config/public-bootstrap.json' with { type: 'json' }
+
+/** The official page: static, with no Node behind it. */
+export const APP_ORIGIN = 'https://app.vibeface.dev'
+/** The official public node, which forwards to any Node by device ID and takes the official page's origin. */
+export const PUBLIC_GATEWAY: string = publicBootstrap.gateway_url
+
+/**
+ * Where this device reaches a Node by device ID, as a join link names one, unless the person chose another: the Node
+ * that served this page over HTTP(S), which takes its own origin; otherwise the official public node, for the official
+ * page and for the apps, whose pages come from their own bundle (`vibeface-app://app` on the desktop).
+ */
+export function defaultGateway(pageOrigin: string | undefined): string {
+  let served = false
+  try { served = !!pageOrigin && ['http:', 'https:'].includes(new URL(pageOrigin).protocol) } catch { /* not a URL */ }
+  return served && pageOrigin !== APP_ORIGIN ? pageOrigin! : PUBLIC_GATEWAY
+}
+
+/** A chosen access address as stored, or null when there is none or it no longer validates. */
+export function storedGateway(value: unknown): string | null {
+  try { return typeof value === 'string' ? validEndpoint(value) : null } catch { return null }
+}
 
 /**
  * A member Node from its latest signed address record. `seq` is the highest record accepted, kept
@@ -94,14 +114,8 @@ export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.
  * tried directly first and the others before the other web entrances. Only addresses seen now are dialed: a dial names
  * the Node to whoever holds that address, which on another LAN is a stranger. When no web address is left, the current
  * Node is tried where it was last reached or last signed it listens, as a last resort.
- * After stored entrances, signed public catalogue gateways for already-authorized device IDs are last-resort fallbacks.
  */
-export function candidates(
-  list: Entrance[],
-  current: ConnectionEntry,
-  seen?: Map<string, string[]>,
-  options?: { catalog?: VerifiedCatalog | null; allowedDeviceIds?: ReadonlySet<string> },
-): ConnectionEntry[] {
+export function candidates(list: Entrance[], current: ConnectionEntry, seen?: Map<string, string[]>): ConnectionEntry[] {
   const web: ConnectionEntry[] = openEntrances(list)
     .filter(item => {
       if (current.kind === 'lan') return true
@@ -109,21 +123,12 @@ export function candidates(
     })
     .sort((a, b) => b.last_ok_ms - a.last_ok_ms)
     .map(item => ({ kind: 'gateway', address: item.gateway_url, device_id: item.device_id }))
-  const bootstrap =
-    options?.catalog && options.allowedDeviceIds?.size
-      ? catalogConnectionEntries(options.catalog, options.allowedDeviceIds).filter((item) => {
-          if (item.kind !== 'gateway') return false
-          if (current.kind === 'lan') return true
-          if (current.kind !== 'gateway' && current.kind !== 'local') return false
-          return item.device_id !== current.device_id || item.address !== current.address
-        })
-      : []
   const own = current.kind === 'lan' ? [] : [current]
-  if (!seen) return [...own, ...web, ...bootstrap]
+  if (!seen) return [...own, ...web]
   const lan = (device_id: string, addrs: string[]): ConnectionEntry => ({ kind: 'lan', addrs, device_id })
   const here = lanAddrs(seen.get(current.device_id))
   const others = [...seen].filter(([device]) => device !== current.device_id).map(([device, addrs]) => lan(device, lanAddrs(addrs))).filter(entry => entry.kind === 'lan' && entry.addrs.length)
-  const ways = [...here.length ? [lan(current.device_id, here)] : [], ...own, ...others, ...web, ...bootstrap]
+  const ways = [...here.length ? [lan(current.device_id, here)] : [], ...own, ...others, ...web]
   if (ways.some(entry => entry.kind !== 'lan')) return ways
   const last = lanAddrs([...current.kind === 'lan' ? current.addrs : [], ...list.find(item => item.device_id === current.device_id)?.direct ?? []])
     .filter(addr => !here.includes(addr))

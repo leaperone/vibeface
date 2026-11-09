@@ -94,10 +94,13 @@ impl ProtocolHandler for Inbound {
     }
 }
 
-/// A member Node's relay admits member Nodes and joiners holding an open invite; a public
-/// entry's relay admits Nodes holding its operator token or a Discovery grant.
-#[derive(Clone)]
-pub(super) struct RelayAccess(pub(super) Weak<Runtime>);
+/// The relay admits this device, the personal network's Nodes, joiners holding an open invite,
+/// holders of the operator token and, when open, anyone, but never a blocked device. Only
+/// connections from outside the personal network count toward `relay_max_clients`.
+pub(super) struct RelayAccess {
+    node: Weak<Runtime>,
+    counted: std::sync::Mutex<std::collections::HashSet<iroh_relay::server::ConnectionId>>,
+}
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RelayAccess")
@@ -108,8 +111,17 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         &self,
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
-        let allowed = match self.0.upgrade() {
-            Some(node) => node.relay_allows(request).await,
+        let allowed = match self.node.upgrade() {
+            Some(node) => match node.relay_admits(request).await {
+                Some(true) => {
+                    let max = node.config.network.relay_max_clients;
+                    let mut counted = self.counted.lock().expect("relay clients");
+                    max.is_none_or(|max| counted.len() < max.get())
+                        && counted.insert(request.connection_id())
+                }
+                Some(false) => true,
+                None => false,
+            },
             None => false,
         };
         if allowed {
@@ -120,6 +132,17 @@ impl iroh_relay::server::AccessControl for RelayAccess {
                 reason: Some("not allowed on this relay".into()),
             }
         }
+    }
+
+    fn on_disconnect(
+        &self,
+        _endpoint: iroh::EndpointId,
+        connection: iroh_relay::server::ConnectionId,
+    ) {
+        self.counted
+            .lock()
+            .expect("relay clients")
+            .remove(&connection);
     }
 }
 
@@ -180,25 +203,19 @@ impl Runtime {
     }
 
     pub(super) async fn start_network(self: &Arc<Self>) -> Result<()> {
-        let relays = match (&self.config.network.entry, &self.entry_token) {
-            (Some(entry), Some(token)) => {
-                vec![(net::relay_url(&entry.relay)?, Some(token.clone()))]
-            }
-            _ => vec![],
-        };
         let net = Arc::new(
             Net::bind(
                 &self.identity.secret_key_hex,
                 &self.config.network,
                 self.config.listen.port(),
-                relays,
+                vec![],
             )
             .await?,
         );
         ensure!(self.net.set(net.clone()).is_ok(), "network already started");
         let weak = Arc::downgrade(self);
         let mut router = Router::builder(net.endpoint.clone());
-        for alpn in net::alpns(&self.config.network) {
+        for alpn in net::ALPNS {
             router = router.accept(
                 alpn,
                 Inbound {
@@ -208,20 +225,22 @@ impl Runtime {
             );
         }
         *self.router.lock().await = Some(router.spawn());
-        if let Some(listen) = self
-            .config
-            .network
-            .relay_listen
-            .filter(|_| self.config.network.relay_mode == net::RelayServiceMode::Forward)
-        {
-            let relay = net::spawn_relay(listen, Arc::new(RelayAccess(weak))).await?;
+        if let Some(listen) = self.config.network.relay_listen {
+            let access = RelayAccess {
+                node: weak,
+                counted: Default::default(),
+            };
+            let relay = net::spawn_relay(
+                listen,
+                Arc::new(access),
+                self.config.network.relay_rate,
+                self.config.network.relay_max_clients_per_ip,
+            )
+            .await?;
             tracing::info!(event = "relay.started", %listen, "relay started");
             *self.relay.lock().await = Some(relay);
         }
         self.delivery.attach(Arc::downgrade(self))?;
-        if self.config.public_entry {
-            return Ok(());
-        }
         let bind = self.config.network.bind;
         // A Node bound to one address listens nowhere else.
         if bind.is_none_or(|bind| bind.ip().is_unspecified()) {
@@ -243,18 +262,6 @@ impl Runtime {
                 }
             }
         }
-        if !self.config.network.bootstrap.is_off() {
-            // An admitted or lost public entry changes this Node's Gateway: the sync loop
-            // re-signs the address record at once instead of at its next tick.
-            let mut states = net.bootstrap().subscribe();
-            let node = Arc::downgrade(self);
-            self.background_tasks.spawn(async move {
-                while states.changed().await.is_ok() {
-                    let Some(node) = node.upgrade() else { break };
-                    node.wake_sync_all();
-                }
-            })?;
-        }
         let node = self.clone();
         self.background_tasks
             .spawn(async move { node.sync_loop().await })?;
@@ -275,48 +282,39 @@ impl Runtime {
             let _ = router.shutdown().await;
         }
         if let Some(relay) = self.relay.lock().await.take() {
-            let _ = relay.shutdown().await;
+            relay.shutdown().await;
         }
     }
 
-    async fn relay_allows(&self, request: &iroh_relay::server::ClientRequest) -> bool {
+    /// `None` when the relay refuses the request's device; otherwise whether its connection
+    /// counts toward `relay_max_clients`.
+    async fn relay_admits(&self, request: &iroh_relay::server::ClientRequest) -> Option<bool> {
         let device = net::device_id(&request.endpoint_id());
-        if self.config.public_entry {
-            if self.identity.device_id().is_ok_and(|own| own == device) {
-                return true;
+        if self.config.network.relay_blocked.contains(&device) {
+            return None;
+        }
+        if self.identity.device_id().is_ok_and(|own| own == device)
+            || self.member_node(&device).await.is_ok()
+        {
+            return Some(false);
+        }
+        let granted = match request.auth_token() {
+            Some(token) => {
+                self.config
+                    .network
+                    .relay_operator_token
+                    .as_ref()
+                    .is_some_and(|operator| net::same_token(&token, operator))
+                    || self
+                        .store
+                        .lock()
+                        .await
+                        .relay_token_open(&token)
+                        .unwrap_or(false)
             }
-            return match &self.config.network.relay_admission {
-                net::RelayAdmission::OperatorToken => request
-                    .auth_token()
-                    .zip(self.entry_token.as_deref())
-                    .is_some_and(|(token, own)| net::same_token(&token, own)),
-                // The grant must name the TLS-proven endpoint, this relay and the pinned issuer;
-                // a renewal the Node registered admits a reconnect that still shows the old one.
-                net::RelayAdmission::Grants { .. } => self
-                    .net()
-                    .ok()
-                    .and_then(|net| net.grant_admission())
-                    .is_some_and(|admission| {
-                        admission.admits(
-                            &request.endpoint_id(),
-                            request.auth_token().as_deref(),
-                            now_ms(),
-                        )
-                    }),
-            };
-        }
-        if self.member_node(&device).await.is_ok() {
-            return true;
-        }
-        match request.auth_token() {
-            Some(token) => self
-                .store
-                .lock()
-                .await
-                .relay_token_open(&token)
-                .unwrap_or(false),
             None => false,
-        }
+        };
+        (self.config.network.relay_open || granted).then_some(true)
     }
 
     async fn removed_here(&self, device: &str) -> bool {
@@ -365,10 +363,6 @@ impl Runtime {
         let remote = net::device_id(&connection.remote_id());
         if alpn == net::SERVICE {
             return self.delivery.serve(self.clone(), connection).await;
-        }
-        if self.config.public_entry {
-            connection.close(1u32.into(), b"a public entry accepts no connections");
-            bail!("a public entry accepts no connections");
         }
         if alpn == net::JOIN {
             return crate::client::serve_join(self, connection, remote).await;
@@ -1239,7 +1233,7 @@ impl Runtime {
         let dir = self.data_dir.clone();
         let records =
             tokio::task::spawn_blocking(move || crate::logging::read(&dir, &filter)).await??;
-        let secrets: Vec<String> = self.entry_token.iter().cloned().collect();
+        let secrets: Vec<String> = self.relay_tokens().cloned().collect();
         let stderr: Vec<String> = std::fs::read_to_string(self.data_dir.join("service.stderr.log"))
             .unwrap_or_default()
             .lines()
@@ -1258,7 +1252,7 @@ impl Runtime {
             "generated_at_ms":now_ms(), "version":env!("CARGO_PKG_VERSION"),
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
             "device_id":self.identity.device_id()?, "config":{
-                "public_entry":self.config.public_entry,"project_roots":settings.roots.len(),
+                "project_roots":settings.roots.len(),
                 "manager_enabled":settings.manager.is_some(),"execution":self.providers().switches.execution,
                 "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
@@ -1565,44 +1559,11 @@ impl Runtime {
         }
     }
 
-    /// Where browsers reach this Node: its configured public entry, else the public entry whose
-    /// relay currently admits it, else its own URL.
+    /// Where browsers reach this Node: its own URL, when it serves the web app.
     pub(crate) fn gateway_url(&self) -> Option<String> {
         self.config
-            .network
-            .entry
-            .as_ref()
-            .map(|entry| entry.url.clone())
-            .or_else(|| {
-                self.net
-                    .get()
-                    .and_then(|net| net.bootstrap().admitted())
-                    .map(|admitted| admitted.gateway_url)
-            })
-            .or_else(|| {
-                self.config
-                    .web_enabled
-                    .then(|| self.config.public_url.clone())
-            })
-    }
-
-    /// The public relay and grant this Node holds, for a join link's own endpoint. Before the
-    /// Node's network runs, one grant is fetched over HTTPS.
-    pub(crate) async fn public_relay_credential(&self) -> Option<(iroh::RelayUrl, String)> {
-        let source = self.config.network.bootstrap.source().ok().flatten()?;
-        if let Ok(net) = self.net() {
-            if net.bootstrap().credential().is_none() {
-                let _ = net.bootstrap().wait_admitted(Duration::from_secs(5)).await;
-            }
-            return net.bootstrap().credential();
-        }
-        match net::bootstrap::admit_once(&self.identity, &source).await {
-            Ok(credential) => Some((credential.relay, credential.token)),
-            Err(error) => {
-                tracing::warn!(event = "bootstrap.join_grant_failed", %error, "no public relay grant for this join");
-                None
-            }
-        }
+            .web_enabled
+            .then(|| self.config.public_url.clone())
     }
 
     /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
@@ -5090,7 +5051,10 @@ mod tests {
             &ids[1],
             net::NetworkConfig {
                 bind: Some("127.0.0.1:0".parse()?),
-                relays: vec![relay_url.clone()],
+                relays: vec![net::Relay {
+                    url: relay_url.clone(),
+                    token: None,
+                }],
                 ..Default::default()
             },
         )
@@ -5099,7 +5063,10 @@ mod tests {
             &ids[2],
             net::NetworkConfig {
                 bind: Some("[::1]:0".parse()?),
-                relays: vec![relay_url.clone()],
+                relays: vec![net::Relay {
+                    url: relay_url.clone(),
+                    token: None,
+                }],
                 ..Default::default()
             },
         )

@@ -387,7 +387,7 @@ export class DesktopCoordinator {
     if (nodes.length && !nodes.some((node) => node.dataDir === expected.dataDir && node.deviceId === expected.deviceId && node.kind === 'running')) return null
     try {
       const inspected = await this.options.inspect(expected.dataDir)
-      if (!await sameDirectory(inspected.dataDir, expected.dataDir) || inspected.deviceId !== expected.deviceId || inspected.status !== 'running' || !inspected.webEnabled || inspected.publicEntry) return null
+      if (!await sameDirectory(inspected.dataDir, expected.dataDir) || inspected.deviceId !== expected.deviceId || inspected.status !== 'running' || !inspected.webEnabled) return null
       const access = await this.options.access(inspected.dataDir)
       if (access.deviceId !== inspected.deviceId || access.kind !== 'local') return null
       return { inspect: inspected, access }

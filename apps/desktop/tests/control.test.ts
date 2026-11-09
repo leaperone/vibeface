@@ -15,7 +15,6 @@ describe('parseInspect', () => {
     listen: '127.0.0.1:4790',
     local_listen: '127.0.0.1:4791',
     public_url: 'http://127.0.0.1:4790',
-    public_entry: false,
     web_enabled: true,
     version: '0.0.1',
     write_state: null,
@@ -46,11 +45,6 @@ describe('parseInspect', () => {
 })
 
 describe('parseAccess', () => {
-  it('marks a published entry so it is not rewritten', () => {
-    const access = parseAccess({ url: 'https://vb.example.com', device_id: 'a', public_entry: true })
-    expect(access.kind).toBe('public_entry')
-  })
-
   it('refuses a reply with no URL', () => {
     expect(() => parseAccess({ device_id: 'a' })).toThrow(/url/)
   })

@@ -1,8 +1,4 @@
-use super::{
-    DIAL_TIMEOUT, DISCOVERY,
-    bootstrap::{self, Issuer, SignedCatalog},
-    device_id, endpoint_id,
-};
+use super::{DIAL_TIMEOUT, DISCOVERY, endpoint_id};
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _,
@@ -11,7 +7,7 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -21,10 +17,9 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-/// A registration names at most `MAX_HOME_RELAYS` relay URLs; a reply may carry the signed
-/// catalogue.
+/// A registration and a lookup reply name at most `MAX_HOME_RELAYS` relay URLs.
 const MAX_REQUEST: usize = 2048;
-const MAX_REPLY: usize = bootstrap::MAX_SIGNED_CATALOG_BYTES + 512;
+const MAX_REPLY: usize = 2048;
 const MAX_SESSIONS: usize = 512;
 const MAX_PER_IP: usize = 8;
 /// Requests other than lookups per session; lookups are rate limited instead, so a dialer that
@@ -107,19 +102,16 @@ enum Request {
         device_id: EndpointId,
     },
     Probe {},
-    /// The signed service catalogue, when this service publishes one.
-    Catalog {},
-    /// A relay grant for the connecting device, which the QUIC handshake proved.
-    Grant {
-        relay_url: String,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
+    /// `relay` is the server's own open relay, which the registrant may make its home relay.
     Registered {
         address: SocketAddr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<RelayUrl>,
     },
     Peer {
         device_id: EndpointId,
@@ -132,12 +124,6 @@ enum Reply {
     },
     Missing {},
     Probed {},
-    Catalog {
-        catalog: SignedCatalog,
-    },
-    Granted {
-        grant: String,
-    },
     Refused {
         reason: String,
     },
@@ -217,57 +203,10 @@ impl Client {
     }
 }
 
-/// Catalogue and grant requests on the authenticated registration session with one server.
-#[derive(Clone)]
-pub(super) struct DiscoveryClient(Arc<Client>);
-
-impl std::fmt::Debug for DiscoveryClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DiscoveryClient")
-    }
-}
-
-impl DiscoveryClient {
-    async fn call(&self, request: &Request, wait: Duration) -> Result<Reply> {
-        let connection = self
-            .0
-            .connection_or_wait(wait)
-            .await
-            .context("discovery server is not connected")?;
-        tokio::time::timeout(CONTROL_TIMEOUT, async {
-            let (mut send, mut recv) = connection.open_bi().await?;
-            write(&mut send, request, MAX_REQUEST).await?;
-            send.finish()?;
-            read::<Reply>(&mut recv, MAX_REPLY).await
-        })
-        .await
-        .context("discovery request timed out")?
-    }
-
-    pub async fn catalog(&self, wait: Duration) -> Result<SignedCatalog> {
-        match self.call(&Request::Catalog {}, wait).await? {
-            Reply::Catalog { catalog } => Ok(catalog),
-            Reply::Refused { reason } => bail!("{reason}"),
-            _ => bail!("invalid discovery catalogue reply"),
-        }
-    }
-
-    pub async fn grant(&self, relay_url: &str, wait: Duration) -> Result<String> {
-        let request = Request::Grant {
-            relay_url: relay_url.to_owned(),
-        };
-        match self.call(&request, wait).await? {
-            Reply::Granted { grant } => Ok(grant),
-            Reply::Refused { reason } => bail!("{reason}"),
-            _ => bail!("invalid discovery grant reply"),
-        }
-    }
-}
-
 pub(super) struct Discovery {
     server: bool,
-    /// Signs the catalogue and grants when this service publishes a catalogue.
-    issuer: Option<Arc<Issuer>>,
+    /// The open relay a serving endpoint offers its registrants.
+    relay: Option<RelayUrl>,
     registry: Arc<Mutex<Registry>>,
     dns: DnsResolver,
     sessions: Semaphore,
@@ -284,12 +223,15 @@ impl Drop for Discovery {
 }
 
 impl Discovery {
+    /// `known` is the endpoint's relay map, so a relay a server offers never replaces a
+    /// configured one and its credential.
     pub fn new(
         endpoint: &Endpoint,
         servers: &[String],
         server: bool,
-        issuer: Option<Arc<Issuer>>,
+        relay: Option<RelayUrl>,
         own_relay: Option<RelayUrl>,
+        known: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
     ) -> Result<Self> {
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
@@ -306,6 +248,7 @@ impl Discovery {
             let probes = probes.clone();
             let observations = observations.clone();
             let own_relay = own_relay.clone();
+            let known = known.clone();
             tasks.push(tokio::spawn(async move {
                 let mut retry = RETRY_MIN;
                 while !endpoint.is_closed() {
@@ -316,6 +259,7 @@ impl Discovery {
                         &probes,
                         &observations,
                         own_relay.as_ref(),
+                        &known,
                     )
                     .await;
                     if client
@@ -342,7 +286,7 @@ impl Discovery {
         }
         Ok(Self {
             server,
-            issuer,
+            relay,
             registry: Default::default(),
             dns: endpoint.dns_resolver()?.clone(),
             sessions: Semaphore::new(MAX_SESSIONS),
@@ -351,17 +295,22 @@ impl Discovery {
         })
     }
 
-    /// The session with the server `value` names, if this endpoint registers there.
-    pub fn client_for(&self, value: &str) -> Option<DiscoveryClient> {
-        let wanted = Server::parse(value).ok()?;
-        self.clients
-            .iter()
-            .find(|(server, _)| *server == wanted)
-            .map(|(_, client)| DiscoveryClient(client.clone()))
-    }
-
-    /// Where `device_id` is registered, waiting up to `wait` for this endpoint's own sessions.
+    /// Where `device_id` is registered: here when this endpoint serves Discovery, else with the
+    /// servers this endpoint registers with, waiting up to `wait` for its sessions.
     pub async fn resolve(&self, device_id: EndpointId, wait: Duration) -> Option<Located> {
+        if self.server {
+            let registry = self.registry.lock().expect("discovery registry");
+            if let Some(entry) = registry
+                .entries
+                .get(&device_id)
+                .and_then(|entries| entries.last())
+            {
+                return Some(Located {
+                    address: entry.address,
+                    relays: entry.relays.clone(),
+                });
+            }
+        }
         let queries = self.clients.iter().map(|(_, client)| async move {
             let connection = client.connection_or_wait(wait).await?;
             tokio::time::timeout(CONTROL_TIMEOUT, async {
@@ -445,46 +394,6 @@ impl Discovery {
                             write(&mut send, &Reply::Probed {}, MAX_REPLY).await?;
                             send.finish()?;
                         }
-                        Request::Catalog {} if self.server => {
-                            let reply = match &self.issuer {
-                                Some(issuer) => match issuer.catalog(bootstrap::now_ms()) {
-                                    Ok(catalog) => Reply::Catalog { catalog },
-                                    Err(error) => Reply::Refused {
-                                        reason: error.to_string(),
-                                    },
-                                },
-                                None => Reply::Refused {
-                                    reason: "this discovery service publishes no catalogue".into(),
-                                },
-                            };
-                            write(&mut send, &reply, MAX_REPLY).await?;
-                            send.finish()?;
-                        }
-                        Request::Grant { relay_url } if self.server => {
-                            // The QUIC handshake proved the device; the source address is the
-                            // observed one.
-                            let device = device_id(&connection.remote_id());
-                            let reply = match &self.issuer {
-                                Some(issuer) => match issuer.grant(
-                                    &device,
-                                    &relay_url,
-                                    address.ip(),
-                                    bootstrap::now_ms(),
-                                ) {
-                                    Ok(grant) => Reply::Granted {
-                                        grant: grant.as_str().to_owned(),
-                                    },
-                                    Err(error) => Reply::Refused {
-                                        reason: error.to_string(),
-                                    },
-                                },
-                                None => Reply::Refused {
-                                    reason: "this discovery service issues no grants".into(),
-                                },
-                            };
-                            write(&mut send, &reply, MAX_REPLY).await?;
-                            send.finish()?;
-                        }
                         Request::Register { relays } if self.server && !registered => {
                             let count = relays.len();
                             let relays = registered_relays(
@@ -521,9 +430,13 @@ impl Discovery {
                                 device_id,
                                 generation,
                             };
+                            let registered = Reply::Registered {
+                                address,
+                                relay: self.relay.clone(),
+                            };
                             work.spawn(async move {
                                 let _guard = guard;
-                                write(&mut send, &Reply::Registered { address }, MAX_REPLY).await?;
+                                write(&mut send, &registered, MAX_REPLY).await?;
                                 while let Some((device_id, address)) = incoming.recv().await {
                                     write(
                                         &mut send,
@@ -706,6 +619,7 @@ async fn register(
     probes: &Arc<Semaphore>,
     observations: &tokio::sync::Mutex<HashMap<SocketAddr, usize>>,
     own_relay: Option<&RelayUrl>,
+    known: &tokio::sync::Mutex<HashSet<RelayUrl>>,
 ) -> Result<()> {
     let mut addr = endpoint.watch_addr();
     let connection = server.connect(endpoint).await?;
@@ -739,12 +653,22 @@ async fn register(
     )
     .await?;
     send.finish()?;
-    let Reply::Registered { address } =
+    let Reply::Registered { address, relay } =
         tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REPLY)).await??
     else {
         bail!("discovery server did not register this endpoint");
     };
     validate_address(address)?;
+    // The server's open relay becomes a candidate home relay, so devices behind NATs that
+    // defeat direct paths still reach each other. Once it is home, this session ends and the
+    // next one registers it.
+    for url in usable_relays(relay.into_iter().collect(), local) {
+        if known.lock().await.insert(url.clone()) {
+            endpoint
+                .insert_relay(url.clone(), Arc::new(super::relay_config(url, None)))
+                .await;
+        }
+    }
     {
         let mut observations = observations.lock().await;
         let count = observations.entry(address).or_default();
@@ -871,7 +795,7 @@ mod tests {
     use super::*;
     use crate::{
         crypto::LocalIdentity,
-        net::{Net, NetworkConfig, PathKind, RelayServiceMode, SYNC},
+        net::{Net, NetworkConfig, PathKind, SYNC},
     };
     use iroh::protocol::{AcceptError, ProtocolHandler, Router};
     use serde_json::json;
@@ -899,9 +823,8 @@ mod tests {
                 .await
                 .with_context(|| {
                     format!(
-                        "test endpoint bind {:?}, mode {:?}",
-                        config.bind.or(config.relay_listen),
-                        config.relay_mode
+                        "test endpoint bind {:?}, serving {}",
+                        config.bind, config.serve_discovery
                     )
                 })?,
         ))
@@ -1079,8 +1002,8 @@ mod tests {
     async fn discovery_connects_unknown_addresses_and_rejects_business() -> Result<()> {
         let identity = LocalIdentity::generate();
         let mut config = NetworkConfig {
-            relay_mode: RelayServiceMode::DiscoveryOnly,
-            relay_listen: Some("127.0.0.1:0".parse()?),
+            serve_discovery: true,
+            bind: Some("127.0.0.1:0".parse()?),
             ..Default::default()
         };
         let service = net(&identity, &config).await?;
@@ -1090,7 +1013,7 @@ mod tests {
             .ip_addrs()
             .next()
             .context("service IP missing")?;
-        config.relay_listen = Some(service_address);
+        config.bind = Some(service_address);
         let discovery = format!("vibeface://{}@{service_address}", service.endpoint.id());
         let client_config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
@@ -1161,8 +1084,7 @@ mod tests {
         let service = net(
             &LocalIdentity::generate(),
             &NetworkConfig {
-                relay_mode: RelayServiceMode::DiscoveryOnly,
-                relay_listen: Some("0.0.0.0:0".parse()?),
+                serve_discovery: true,
                 ..Default::default()
             },
         )
@@ -1218,14 +1140,16 @@ mod tests {
         let relay = crate::net::spawn_relay(
             "127.0.0.1:0".parse()?,
             Arc::new(iroh_relay::server::AllowAll),
+            None,
+            None,
         )
         .await?;
-        let relay_url = format!(
-            "http://{}",
-            relay.http_addr().context("relay listener missing")?
-        );
+        let relay_url = format!("http://{}", relay.addr);
         // Only B uses the relay: A dials it as Discovery names it, outside its own relay map.
-        b_config.relays = vec![relay_url];
+        b_config.relays = vec![crate::net::Relay {
+            url: relay_url,
+            token: None,
+        }];
         let a = net(&a_id, &a_config).await?;
         let b = net(&b_id, &b_config).await?;
         let a_router = router(&a);
@@ -1265,7 +1189,7 @@ mod tests {
         a_router.shutdown().await?;
         b_router.shutdown().await?;
         service_router.shutdown().await?;
-        relay.shutdown().await?;
+        relay.shutdown().await;
         Ok(())
     }
 }

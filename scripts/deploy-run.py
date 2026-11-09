@@ -42,6 +42,7 @@ def build(service, tag, output):
             continue
         shutil.copy2(ROOT / 'deploy/runtime.py', context / 'runtime.py')
         if component == 'core':
+            shutil.copy2(ROOT / 'config/public-bootstrap.json', context / 'public-bootstrap.json')
             dockerfile = ROOT / 'deploy/core.Dockerfile'
         else:
             checked([sys.executable, '-B', str(ROOT / 'deploy/static-config.py'),
@@ -64,7 +65,7 @@ def build(service, tag, output):
             refused = subprocess.run(['docker', 'run', '--rm', '--platform', 'linux/amd64', identity],
                                      capture_output=True, timeout=60)
             release.require(refused.returncode != 0, 'Core container initialized missing deployment data')
-            core_smoke(identity, info)
+            core_smoke(identity, info, output)
         else:
             checked(['docker', 'run', '--rm', '--platform', 'linux/amd64', '--entrypoint', 'nginx', identity, '-t'])
             static_smoke(identity, context / 'component', component, info['source_sha'])
@@ -79,7 +80,7 @@ def build(service, tag, output):
     return info
 
 
-def core_smoke(identity, info):
+def core_smoke(identity, info, output):
     volume = 'vibeface-deploy-check-' + uuid.uuid4().hex
     def docker(*args, **kwargs):
         return subprocess.check_output(['docker', *args], text=True, **kwargs)
@@ -87,9 +88,13 @@ def core_smoke(identity, info):
     container = None
     base = ['--platform', 'linux/amd64', '--network', 'none', '-v', volume + ':/data']
     try:
-        options = {'data_dir': '/data', 'public_entry': True, 'listen': '127.0.0.1:4793',
-                   'public_url': 'http://127.0.0.1:4793', 'relay_mode': 'discovery-only',
-                   'relay_listen': '127.0.0.1:4792', 'bootstrap': 'off', 'no_web': True}
+        # The official node's shape, offline; the runtime guard refuses anything less bounded.
+        gateway = 'https://127.0.0.1:4793'
+        options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': gateway, 'tls': True,
+                   'allowed_origins': ['https://app.vibeface.dev'], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
+                   'relay_open': True, 'relay_rate': 65536, 'relay_max_clients': 512,
+                   'relay_max_clients_per_ip': 16, 'forward_any': True, 'forward_sessions': 32,
+                   'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8, 'bootstrap': 'off'}
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
@@ -101,10 +106,18 @@ def core_smoke(identity, info):
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
         device = result['result']['device_id']
-        environment = ['-e', 'VIBEFACE_ROLE=discovery', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
+        environment = ['-e', 'VIBEFACE_ROLE=node', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
                        '-e', 'VIBEFACE_EXPECTED_VERSION=' + info['version'],
                        '-e', 'VIBEFACE_EXPECTED_SOURCE=' + info['source_sha'],
                        '-e', 'VIBEFACE_EXPECTED_DEVICE=' + device]
+        # The image pins the official issuer, so the fixture Node runs only under its own anchor.
+        refused = subprocess.run(['docker', 'run', '--rm', *base, '--user', '1001:1001', *environment,
+                                  identity, 'guard'], capture_output=True, timeout=60)
+        release.require(refused.returncode != 0, 'the guard accepted a Node other than the pinned issuer')
+        anchor = output / 'fixture-bootstrap.json'
+        anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4793,
+                                      'gateway_url': gateway}))
+        base += ['-v', f'{anchor}:/opt/vibeface/public-bootstrap.json:ro']
         container = docker('run', '-d', *base, '--init', '--read-only', '--user', '1001:1001',
                            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
                            '--tmpfs', '/tmp:rw,nosuid,noexec,size=64m,mode=1777', *environment, identity).strip()
@@ -189,8 +202,7 @@ def activate(service, output):
     release.require(re.fullmatch(r'sha256:[0-9a-f]{64}', identity), 'invalid prepared image ID')
     host, user, port = transport(os.environ)
     config = json.loads(os.environ['DEPLOY_CONFIG'])
-    role = {'discovery': 'discovery', 'relay': 'entry', 'relay-cn': 'relay', 'app': 'app', 'www': 'www'}[service]
-    release.require(config['role'] == role, 'environment role does not match selected service')
+    release.require(config['role'] == service, 'environment role does not match selected service')
     with tempfile.TemporaryDirectory(dir=output, prefix='ssh-') as temporary:
         temporary = Path(temporary)
         os.chmod(temporary, 0o700)

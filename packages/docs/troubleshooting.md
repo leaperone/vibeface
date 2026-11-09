@@ -97,7 +97,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `codex.send`、`codex.call`、`codex.call_failed` | Agent 经命令行给 Codex 发的消息和请求 |
 | `codex.app_server.stderr`、`codex.sdk.stderr`、`cursor.stderr` | 子进程的标准错误 |
 
-写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、入口令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
+写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、relay 令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
 ## 导出诊断包
 
@@ -145,13 +145,13 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 **对端一直 `unreachable`。** 两台 Node 没有直连路径时要经 relay 转发。确认至少一台 Node 用 `--relay-listen` 运行 relay，其他 Node 的 `config.json` 里 `network.relays` 指向它，反向代理允许 WebSocket 升级。改了 `network` 字段要重启。见 [Node 之间的连接](node.md#node-之间的连接)。
 
-**手机打开公共入口后连不上个人设备。** 公共入口只经自己的 relay 找到成员 Node。检查个人设备上的 Node 是否用 `--entry` 和 `--relay-token-file` 初始化，令牌文件是否与入口数据目录里的 `entry-token` 相同，nginx 是否把 `/relay`、`/ping` 和 `/generate_204` 转给入口的 relay 端口。见 [配置公共入口](node.md#配置公共入口)。
+**手机打开官方页面或自建公共节点后连不上个人设备。** 公共节点按设备编号经发现服务找到个人设备上的 Node。检查这台 Node 正在运行，`vibeface status` 的 `Bootstrap` 不是 `off`，自建时 `--bootstrap` 指向的是这台公共节点；两边没有直连路径时还要有共同的 relay，公共节点的开放 relay 会在登记时提供给 Node。见 [从外网访问](node.md#从外网访问)。
 
 **任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
 
 **设置页提示 Codex 后台服务没启动。** Node 托管的 `codex app-server` 退出后会按 1 到 30 秒退避重启。持续失败时检查 `bins.codex` 是否可执行、Codex 是否已登录，然后重启 Node。它的 socket 在私有的 `/tmp/vibeface-<编号>/` 目录，进程组号在数据目录的 `codex-app-server.pid`。
 
-**连接页提示网关忙或加入的设备太多。** 一台 Gateway 同时最多转发 256 个会话，超出时回 `gateway_busy`；一台 Node 同时最多接待 32 个还没加入的设备，每个最多 15 分钟。正常使用碰不到这两个上限，碰到时多半有大量陌生连接，查看 `node.log` 和反向代理的访问日志，稍后再试。
+**连接页显示排队中、访问地址正忙或加入的设备太多。** Gateway 同时转发的会话数由 `forwarding.sessions` 决定，默认 256；名额用完时新会话按 `forwarding.queue` 排队，页面显示“排队中，第 n 位”，队列也满时回 `gateway_busy`。同一浏览器地址的连接已达 `forwarding.per_ip` 时，新连接在升级前收到 HTTP 429，页面显示“连不上这个节点”，关掉多余的页面后重试。官方公共节点的名额很小，排队是正常现象。一台 Node 同时最多接待 32 个还没加入的设备，每个最多 15 分钟。自己的 Gateway 碰到这些上限时多半有大量陌生连接，查看 `node.log` 和反向代理的访问日志，稍后再试。
 
 **所有管理浏览器都丢了。** 在可信浏览器打开自己设备的网页，连接页选“用恢复文件找回”，选恢复文件、输入恢复密码，勾选丢失的设备后确认。这个浏览器不需要先加入。先下载并保存新的恢复文件，再提交找回；提交不代表已取得管理权。更换成员目录的找回默认有 48 小时等待期。如果仍有已加入的管理设备，可以在它的找回提醒上点“立即生效”并再次确认。原目录中的有效管理设备也可以否决，等待期内签署的有效否决即使迟到也可能让副本返回原目录。生效后新浏览器成为管理设备，旧恢复文件才被下一把替换。只轮换恢复密钥的操作立即生效，与这里的找回不同。提示“这个恢复文件已作废”时改用最近一次有效的文件。恢复文件不备份业务正文，详见 [撤销与恢复](privacy-security.md#撤销与恢复) 与 [备份与恢复](node.md#备份与恢复)。
 

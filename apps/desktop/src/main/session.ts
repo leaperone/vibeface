@@ -137,7 +137,7 @@ export class CoreSession {
       if (owned) return { kind: 'starting', dataDir: inspect.dataDir, attempts: 0 }
       return { kind: 'offline', dataDir: inspect.dataDir, deviceId: inspect.deviceId }
     }
-    const origin = inspect.publicEntry ? '' : parsePrivateOrigin(inspect.localListen).origin
+    const origin = parsePrivateOrigin(inspect.localListen).origin
     return {
       kind: owned ? 'owned' : 'attached',
       dataDir: inspect.dataDir,
