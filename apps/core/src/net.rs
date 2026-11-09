@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
@@ -91,16 +91,22 @@ pub struct NetworkConfig {
     /// The relay's URL as other Nodes reach it; defaults to `http://<relay_listen>`.
     #[serde(default)]
     pub relay_url: Option<String>,
-    /// What the relay requires of devices outside the personal network; without it the relay
-    /// admits anyone, within `relay_rate` and `relay_max_clients`.
+    /// A token that admits devices outside the personal network to the relay.
     #[serde(default)]
     pub relay_operator_token: Option<String>,
+    /// The relay admits any device, within `relay_rate` and `relay_max_clients`.
+    #[serde(default)]
+    pub relay_open: bool,
     /// Bytes a second the relay reads from each connection; unlimited when unset.
     #[serde(default)]
     pub relay_rate: Option<NonZeroU32>,
-    /// Connections the relay holds at once; unlimited when unset.
+    /// Connections from outside the personal network the relay holds at once; unlimited when
+    /// unset.
     #[serde(default)]
     pub relay_max_clients: Option<NonZeroUsize>,
+    /// Connections the relay takes from one client address; unlimited when unset.
+    #[serde(default)]
+    pub relay_max_clients_per_ip: Option<NonZeroUsize>,
     /// Device IDs the relay refuses.
     #[serde(default)]
     pub relay_blocked: Vec<String>,
@@ -176,10 +182,20 @@ impl NetworkConfig {
             self.relay_listen.is_some()
                 || (self.relay_url.is_none()
                     && self.relay_operator_token.is_none()
+                    && !self.relay_open
                     && self.relay_rate.is_none()
                     && self.relay_max_clients.is_none()
+                    && self.relay_max_clients_per_ip.is_none()
                     && self.relay_blocked.is_empty()),
             "relay_url and the relay's admission and limits require relay_listen"
+        );
+        // Anyone may connect to an open relay, so it is bounded.
+        ensure!(
+            !self.relay_open
+                || (self.relay_operator_token.is_none()
+                    && self.relay_rate.is_some()
+                    && self.relay_max_clients.is_some()),
+            "an open relay takes no operator token and needs relay_rate and relay_max_clients"
         );
         if let Some(token) = &self.relay_operator_token {
             valid_token(token)?;
@@ -415,9 +431,8 @@ impl Net {
             .bind()
             .await
             .context("QUIC endpoint failed to start")?;
-        // Registrants may make an open relay their home relay; one that asks for a token is
-        // for those who were given it.
-        let offered = if config.relay_operator_token.is_none() {
+        // Registrants may make an open relay their home relay; any other is for those it admits.
+        let offered = if config.relay_open {
             config.own_relay()?
         } else {
             None
@@ -758,21 +773,141 @@ where
     }
 }
 
-/// The relay this Node runs; `access` decides who it admits, and `rate` caps the bytes a second
-/// it reads from each connection.
+/// A relay this Node runs, behind a front on `listen` when it limits connections per address.
+pub struct RelayServer {
+    server: iroh_relay::server::Server,
+    /// Where devices reach the relay.
+    pub addr: SocketAddr,
+    front: Option<Front>,
+}
+
+struct Front(tokio::task::JoinHandle<()>);
+impl Drop for Front {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl RelayServer {
+    pub async fn shutdown(self) {
+        drop(self.front);
+        let _ = self.server.shutdown().await;
+    }
+}
+
+/// The relay this Node runs; `access` decides who it admits, `rate` caps the bytes a second it
+/// reads from each connection and `per_ip` the connections one client address holds.
 pub async fn spawn_relay(
     listen: SocketAddr,
     access: Arc<dyn iroh_relay::server::DynAccessControl>,
     rate: Option<NonZeroU32>,
-) -> Result<iroh_relay::server::Server> {
-    let mut relay = iroh_relay::server::RelayConfig::new(listen);
+    per_ip: Option<NonZeroUsize>,
+) -> Result<RelayServer> {
+    let refused =
+        |error: &dyn std::fmt::Display| anyhow!("relay failed to start on {listen}: {error}");
+    // The relay never sees client addresses, so a front counts them and passes the bytes on to
+    // the relay on loopback.
+    let front = match per_ip {
+        Some(per_ip) => Some((
+            tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|error| refused(&error))?,
+            per_ip,
+        )),
+        None => None,
+    };
+    let mut relay = iroh_relay::server::RelayConfig::new(match front {
+        Some(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        None => listen,
+    });
     relay.access = access;
     relay.limits.client_rx = rate.map(iroh_relay::server::ClientRateLimit::new);
     let mut config = iroh_relay::server::ServerConfig::default();
     config.relay = Some(relay);
-    iroh_relay::server::Server::spawn(config)
+    let server = iroh_relay::server::Server::spawn(config)
         .await
-        .map_err(|error| anyhow!("relay failed to start on {listen}: {error}"))
+        .map_err(|error| refused(&error))?;
+    let relay = server.http_addr().context("relay listener missing")?;
+    let (addr, front) = match front {
+        Some((listener, per_ip)) => (
+            listener.local_addr()?,
+            Some(Front(tokio::spawn(relay_front(listener, relay, per_ip)))),
+        ),
+        None => (relay, None),
+    };
+    Ok(RelayServer {
+        server,
+        addr,
+        front,
+    })
+}
+
+/// Passes each connection on to the relay unless its client address already holds `per_ip`.
+async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_ip: NonZeroUsize) {
+    let shares = Shares::default();
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = connections.join_next() => {}
+            accepted = listener.accept() => match accepted {
+                Ok((mut client, peer)) => {
+                    // A refused connection closes as it drops.
+                    let Some(share) = shares.take(peer.ip(), per_ip) else { continue };
+                    connections.spawn(async move {
+                        let _share = share;
+                        // The relay sends small QUIC datagrams that must not wait to coalesce.
+                        let _ = client.set_nodelay(true);
+                        if let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await {
+                            let _ = relay.set_nodelay(true);
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut relay).await;
+                        }
+                    });
+                }
+                // Out of descriptors, say; retrying at once would spin.
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            },
+        }
+    }
+}
+
+/// What each client address holds of a per-address limit.
+#[derive(Clone, Default)]
+pub struct Shares(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+impl Shares {
+    /// One more for `ip`'s client address, unless it already holds `limit`.
+    pub fn take(&self, ip: IpAddr, limit: NonZeroUsize) -> Option<Share> {
+        let client = client_address(ip);
+        let mut held = self.0.lock().expect("address shares");
+        let count = held.entry(client).or_default();
+        (*count < limit.get()).then(|| {
+            *count += 1;
+            Share(self.clone(), client)
+        })
+    }
+}
+
+/// One share of a client address, given back when dropped.
+pub struct Share(Shares, IpAddr);
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut held = (self.0).0.lock().expect("address shares");
+        if let Some(count) = held.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// The address one client controls: an IPv4 address, or the /64 of an IPv6 one, which a single
+/// subscriber usually holds whole.
+pub fn client_address(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        v4 => v4,
+    }
 }
 
 #[cfg(test)]
@@ -818,12 +953,23 @@ mod tests {
         config.relay_operator_token = Some(token.clone());
         config.relay_rate = NonZeroU32::new(65536);
         config.relay_max_clients = NonZeroUsize::new(512);
+        config.relay_max_clients_per_ip = NonZeroUsize::new(16);
         config.relay_blocked = vec![
             crate::crypto::LocalIdentity::generate()
                 .device_id()
                 .unwrap(),
         ];
         config.validate().unwrap();
+        config.relay_open = true;
+        assert!(config.validate().is_err(), "an open relay asks no token");
+        config.relay_operator_token = None;
+        config.validate().unwrap();
+        config.relay_max_clients = None;
+        assert!(config.validate().is_err(), "an open relay is bounded");
+        config.relay_max_clients = NonZeroUsize::new(512);
+        config.relay_rate = None;
+        assert!(config.validate().is_err(), "an open relay is paced");
+        config.relay_rate = NonZeroU32::new(65536);
         config.relay_blocked = vec!["not-a-device".into()];
         assert!(config.validate().is_err());
         config.relay_blocked.clear();
@@ -832,6 +978,79 @@ mod tests {
             config.validate().is_err(),
             "admission and limits belong to a running relay"
         );
+    }
+
+    #[test]
+    fn a_client_address_is_an_ipv4_address_or_an_ipv6_slash_64() {
+        let address = |ip: &str| client_address(ip.parse().unwrap()).to_string();
+        assert_eq!(address("203.0.113.7"), "203.0.113.7");
+        assert_eq!(address("::ffff:203.0.113.7"), "203.0.113.7");
+        assert_eq!(address("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+        let shares = Shares::default();
+        let two = NonZeroUsize::new(2).unwrap();
+        let first = shares.take("2001:db8::1".parse().unwrap(), two).unwrap();
+        let _second = shares.take("2001:db8::2".parse().unwrap(), two).unwrap();
+        assert!(
+            shares.take("2001:db8::3".parse().unwrap(), two).is_none(),
+            "one /64 holds two"
+        );
+        assert!(
+            shares
+                .take("2001:db8:0:1::3".parse().unwrap(), two)
+                .is_some(),
+            "the next /64 has its own"
+        );
+        drop(first);
+        assert!(
+            shares.take("2001:db8::3".parse().unwrap(), two).is_some(),
+            "a dropped share is given back"
+        );
+    }
+
+    /// A relay limited per address refuses the connection past the limit and admits it again
+    /// once one closes, with relay traffic passing through the front.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_front_holds_each_address_to_its_share() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let relay = spawn_relay(
+            "127.0.0.1:0".parse()?,
+            Arc::new(iroh_relay::server::AllowAll),
+            None,
+            NonZeroUsize::new(1),
+        )
+        .await?;
+        let probe = || async {
+            let mut stream = tokio::net::TcpStream::connect(relay.addr).await?;
+            stream
+                .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: relay\r\n\r\n")
+                .await?;
+            let mut head = [0; 12];
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head)).await??;
+            Ok::<_, anyhow::Error>((stream, head[..read].to_vec()))
+        };
+        let (held, head) = probe().await?;
+        assert_eq!(head, b"HTTP/1.1 204", "the relay answers through the front");
+        // The front closes it unread, which the peer may see as a reset.
+        let refused = probe().await.map(|(_, head)| head);
+        assert!(
+            refused.as_ref().map_or(true, Vec::is_empty),
+            "a second connection from the address is closed: {refused:?}"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if probe().await.is_ok_and(|(_, head)| head == b"HTTP/1.1 204") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("the closed connection's share never came back")?;
+        relay.shutdown().await;
+        Ok(())
     }
 
     #[test]
@@ -862,7 +1081,10 @@ mod tests {
             serve_discovery: true,
             relay_listen: Some("0.0.0.0:3340".parse()?),
             relay_url: Some("http://203.0.113.7:3340".into()),
+            relay_open: true,
             relay_rate: NonZeroU32::new(65536),
+            relay_max_clients: NonZeroUsize::new(512),
+            relay_max_clients_per_ip: NonZeroUsize::new(16),
             ..Default::default()
         };
         public.validate()?;
@@ -924,11 +1146,8 @@ mod tests {
             token: token.clone(),
             attempts,
         };
-        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy), None).await?;
-        let url = format!(
-            "http://{}",
-            relay.http_addr().context("relay listener missing")?
-        );
+        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy), None, None).await?;
+        let url = format!("http://{}", relay.addr);
         let config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
             relays: vec![Relay {
@@ -989,10 +1208,7 @@ mod tests {
         );
         net.close().await;
         bare.close().await;
-        relay
-            .shutdown()
-            .await
-            .map_err(|error| anyhow!("relay shutdown failed: {error}"))?;
+        relay.shutdown().await;
         Ok(())
     }
 }

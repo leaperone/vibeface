@@ -135,7 +135,7 @@ vibeface hooks status [--home '<同一个目录>']
 
 公网部署使用 HTTPS 反向代理，将网页和 WebSocket 请求转发到配置的回环监听地址。域名、证书、防火墙和 relay 地址都属于部署配置。具体角色配置见 [从外网访问](node.md#从外网访问)。
 
-官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，它的 Nginx 把 `/api/client`、`/api/info` 和 `/api/decision` 反代给官方公共节点；公共节点没有域名，按 IP 提供 UDP 发现服务和开放 Relay。公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次，Core 编入同一文件；网页和手机客户端只认官方页面 `https://app.vibeface.dev`。自建发现服务和公共节点使用各自明确配置的地址与身份。
+官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，它的 Nginx 经钉住证书的 TLS 把 `/api/client`、`/api/info` 和 `/api/decision` 反代给官方公共节点；公共节点没有域名，按 IP 提供 UDP 发现服务和开放 Relay。公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次，Core 编入同一文件；网页和手机客户端只认官方页面 `https://app.vibeface.dev`。自建发现服务和公共节点使用各自明确配置的地址与身份。
 
 
 ## 安装程序和后台服务

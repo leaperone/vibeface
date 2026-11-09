@@ -3,8 +3,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
-    net::SocketAddr,
-    num::NonZeroU32,
+    net::{IpAddr, SocketAddr},
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
 use vibeface_bridge::platform::privatefs;
@@ -24,6 +24,10 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
 pub const UNNAMED_NODE: &str = "Node";
+
+/// The certificate and key `init --tls` makes for `public_url`'s host.
+pub const TLS_CERT: &str = "tls-cert.pem";
+pub const TLS_KEY: &str = "tls-key.pem";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,7 +60,7 @@ impl SchedulingLimits {
 }
 
 /// How this Node forwards browser sessions to other devices.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Forwarding {
     /// Forward to any device, not only this network's Nodes, as a public node does.
@@ -67,6 +71,10 @@ pub struct Forwarding {
     pub queue: usize,
     /// Bytes a second each session carries, both ways together; unlimited when unset.
     pub rate: Option<NonZeroU32>,
+    /// Sessions, forwarded or waiting, from one client address; unlimited when unset.
+    pub per_ip: Option<NonZeroUsize>,
+    /// Reverse proxies whose single `X-Real-IP` names the client; any other peer is the client.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl Default for Forwarding {
@@ -76,6 +84,8 @@ impl Default for Forwarding {
             sessions: 256,
             queue: 0,
             rate: None,
+            per_ip: None,
+            trusted_proxies: vec![],
         }
     }
 }
@@ -140,6 +150,9 @@ pub struct Config {
     /// Loopback-only local session listener; fixed so its origin and browser storage persist.
     pub local_listen: SocketAddr,
     pub public_url: String,
+    /// `listen` speaks only TLS, with the `TLS_CERT` a reverse proxy pins.
+    #[serde(default)]
+    pub tls: bool,
     pub web_enabled: bool,
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
@@ -179,6 +192,7 @@ impl Config {
             listen,
             local_listen: DEFAULT_LOCAL_LISTEN,
             public_url: format!("http://{listen}"),
+            tls: false,
             web_enabled: true,
             allowed_origins: vec![],
             allow_insecure_lan,
@@ -228,6 +242,10 @@ impl Config {
         self.network.validate()?;
         self.forwarding.validate()?;
         let url = http_origin(&self.public_url)?;
+        ensure!(
+            !self.tls || url.scheme() == "https",
+            "tls needs an HTTPS public_url"
+        );
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
                 || h.trim_matches(['[', ']'])

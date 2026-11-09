@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::net::TcpListener;
 
@@ -30,6 +31,7 @@ const HOOKS: &str = "/api/hooks";
 const HOOKS_WAIT: &str = "/api/hooks/wait";
 const TRIAGE: &str = "/api/triage";
 const LOG: &str = "/api/log";
+const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct App {
@@ -135,6 +137,11 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         site.secure || node.config.listen.ip().is_loopback() || node.config.allow_insecure_lan,
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
+    let tls = node
+        .config
+        .tls
+        .then(|| tls_acceptor(&node.data_dir))
+        .transpose()?;
     let listener = if node.config.web_enabled {
         Some(TcpListener::bind(node.config.listen).await?)
     } else {
@@ -180,16 +187,21 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
     node.tools_ready(tool_url)?;
     tokio::try_join!(
         async {
-            match listener {
-                Some(listener) => {
-                    axum::serve(
-                        listener,
-                        browser_router_with_assets(node.clone(), sites, false, assets.clone())
-                            .into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await
+            let service = browser_router_with_assets(node.clone(), sites, false, assets.clone())
+                .into_make_service_with_connect_info::<SocketAddr>();
+            match (listener, tls) {
+                (Some(tcp), Some(acceptor)) => {
+                    use axum::serve::ListenerExt as _;
+                    let listener = TlsListener {
+                        tcp,
+                        acceptor,
+                        handshakes: Default::default(),
+                    };
+                    // `tap_io` is how axum hands a custom listener's peer address to ConnectInfo.
+                    axum::serve(listener.tap_io(|_| {}), service).await
                 }
-                None => std::future::pending().await,
+                (Some(listener), None) => axum::serve(listener, service).await,
+                (None, _) => std::future::pending().await,
             }
         },
         async {
@@ -208,6 +220,67 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         }
     )?;
     Ok(())
+}
+
+/// The acceptor for `config::TLS_CERT`, the certificate the reverse proxy in front pins.
+fn tls_acceptor(dir: &Path) -> Result<tokio_rustls::TlsAcceptor> {
+    use tokio_rustls::rustls::{
+        self,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+    let cert = CertificateDer::from_pem_file(dir.join(crate::config::TLS_CERT))
+        .context("invalid TLS certificate")?;
+    let key = PrivateKeyDer::from_pem_file(dir.join(crate::config::TLS_KEY))
+        .context("invalid TLS key")?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// The public listener under `tls`. Handshakes run apart, so a slow client holds up no other.
+struct TlsListener {
+    tcp: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    handshakes: tokio::task::JoinSet<Option<(TlsStream, SocketAddr)>>,
+}
+
+type TlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (TlsStream, SocketAddr) {
+        loop {
+            tokio::select! {
+                Some(joined) = self.handshakes.join_next() => {
+                    if let Ok(Some(accepted)) = joined {
+                        return accepted;
+                    }
+                }
+                accepted = self.tcp.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        let acceptor = self.acceptor.clone();
+                        self.handshakes.spawn(async move {
+                            let accepting = acceptor.accept(stream);
+                            let stream = tokio::time::timeout(TLS_HANDSHAKE, accepting).await;
+                            Some((stream.ok()?.ok()?, peer))
+                        });
+                    }
+                    // Out of descriptors, say; retrying at once would spin.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                },
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tcp.local_addr()
+    }
 }
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
@@ -890,7 +963,17 @@ async fn decision(
         })
 }
 
-async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+async fn client_gateway(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let client = client_ip(
+        peer.ip(),
+        &headers,
+        &app.node.config.forwarding.trusted_proxies,
+    );
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -903,11 +986,22 @@ async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> 
         .max_frame_size(65535)
         .on_upgrade(move |socket| async move {
             let socket = crate::client::ClientSocket::server(socket);
-            if let Err(error) = crate::client::serve_gateway(app.node, socket).await {
+            if let Err(error) = crate::client::serve_gateway(app.node, socket, client).await {
                 tracing::debug!(%error, "client connection closed");
             }
             drop(permit);
         })
+}
+
+/// The browser's address: what a trusted proxy's single `X-Real-IP` names, or else the peer.
+fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|proxy| proxy.to_canonical() == peer) {
+        return peer;
+    }
+    one_header(headers, "x-real-ip")
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) -> Response {
@@ -969,6 +1063,32 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_trusted_proxy_names_the_client_address() {
+        let headers = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("x-real-ip", value.parse().unwrap());
+            }
+            headers
+        };
+        let proxy: IpAddr = "198.51.100.1".parse().unwrap();
+        let named = headers(&["203.0.113.9"]);
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip(proxy, &named, &[proxy]), ip("203.0.113.9"));
+        assert_eq!(
+            client_ip(ip("::ffff:198.51.100.1"), &named, &[proxy]),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(ip("192.0.2.4"), &named, &[proxy]),
+            ip("192.0.2.4")
+        );
+        let doubled = headers(&["203.0.113.9", "203.0.113.10"]);
+        assert_eq!(client_ip(proxy, &doubled, &[proxy]), proxy);
+        assert_eq!(client_ip(proxy, &headers(&["nonsense"]), &[proxy]), proxy);
+    }
 
     #[tokio::test]
     async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {

@@ -1141,12 +1141,10 @@ mod tests {
             "127.0.0.1:0".parse()?,
             Arc::new(iroh_relay::server::AllowAll),
             None,
+            None,
         )
         .await?;
-        let relay_url = format!(
-            "http://{}",
-            relay.http_addr().context("relay listener missing")?
-        );
+        let relay_url = format!("http://{}", relay.addr);
         // Only B uses the relay: A dials it as Discovery names it, outside its own relay map.
         b_config.relays = vec![crate::net::Relay {
             url: relay_url,
@@ -1191,7 +1189,7 @@ mod tests {
         a_router.shutdown().await?;
         b_router.shutdown().await?;
         service_router.shutdown().await?;
-        relay.shutdown().await?;
+        relay.shutdown().await;
         Ok(())
     }
 }

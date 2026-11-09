@@ -144,6 +144,10 @@ struct Init {
     /// Public browser entry URL.
     #[arg(long)]
     public_url: Option<String>,
+    /// Serve --listen over TLS only, with a self-signed certificate for --public-url's host
+    /// that the reverse proxy in front pins.
+    #[arg(long, requires = "public_url")]
+    tls: bool,
     /// Disable the browser interface.
     #[arg(long)]
     no_web: bool,
@@ -192,16 +196,22 @@ struct Init {
     /// Public URL for the embedded relay.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
-    /// File with the token the embedded relay asks of devices outside this personal network;
-    /// without it the relay is open.
+    /// File with a token that admits devices outside this personal network to the embedded
+    /// relay; without it or --relay-open, only this network and its invitees.
     #[arg(long, value_name = "FILE", requires = "relay_listen")]
     relay_operator_token: Option<PathBuf>,
+    /// Admit any device to the embedded relay; needs --relay-rate and --relay-max-clients.
+    #[arg(long, requires = "relay_listen")]
+    relay_open: bool,
     /// Bytes a second the embedded relay reads from each connection.
     #[arg(long, value_name = "BYTES", requires = "relay_listen")]
     relay_rate: Option<NonZeroU32>,
-    /// Connections the embedded relay holds at once.
+    /// Connections from outside this network the embedded relay holds at once.
     #[arg(long, value_name = "N", requires = "relay_listen")]
     relay_max_clients: Option<NonZeroUsize>,
+    /// Connections the embedded relay takes from one client address.
+    #[arg(long, value_name = "N", requires = "relay_listen")]
+    relay_max_clients_per_ip: Option<NonZeroUsize>,
     /// Forward browser sessions to any device, not only this network's Nodes.
     #[arg(long)]
     forward_any: bool,
@@ -214,6 +224,12 @@ struct Init {
     /// Bytes a second each forwarded browser session carries.
     #[arg(long, value_name = "BYTES")]
     forward_rate: Option<NonZeroU32>,
+    /// Browser sessions, forwarded or waiting, from one client address.
+    #[arg(long, value_name = "N")]
+    forward_per_ip: Option<NonZeroUsize>,
+    /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
+    #[arg(long = "trusted-proxy", value_name = "IP")]
+    trusted_proxies: Vec<IpAddr>,
     /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
     /// a self-hosted `vibeface://` discovery URL.
     #[arg(long, value_name = "MODE|URL")]

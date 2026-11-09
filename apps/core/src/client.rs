@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     path::Path,
     sync::{
@@ -299,12 +299,14 @@ impl Client {
 }
 
 /// Browser sessions this Gateway forwards to other devices. Anyone can open `/api/client`, so
-/// `forwarding.sessions` go at once and up to `forwarding.queue` wait, served in arrival order.
+/// `forwarding.sessions` go at once and up to `forwarding.queue` wait, served in arrival order,
+/// with at most `forwarding.per_ip` of them from one client address.
 pub(crate) struct Forwards {
     slots: Arc<tokio::sync::Semaphore>,
     /// Tickets of the waiting sessions, oldest first: a ticket's index is its place in line.
     waiting: std::sync::Mutex<VecDeque<u64>>,
     tickets: AtomicU64,
+    addresses: net::Shares,
 }
 
 impl Forwards {
@@ -313,6 +315,7 @@ impl Forwards {
             slots: Arc::new(tokio::sync::Semaphore::new(forwarding.sessions)),
             waiting: Default::default(),
             tickets: AtomicU64::new(0),
+            addresses: Default::default(),
         }
     }
 
@@ -334,9 +337,13 @@ impl Drop for InLine<'_> {
     }
 }
 
-/// `/api/client`: read the connect frame, then end Noise here when the target is this Node,
-/// or relay the ciphertext to the target over `vibeface/client/1`.
-pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Result<()> {
+/// `/api/client` from `client`'s address: read the connect frame, then end Noise here when the
+/// target is this Node, or relay the ciphertext to the target over `vibeface/client/1`.
+pub async fn serve_gateway(
+    node: Arc<Runtime>,
+    mut socket: ClientSocket,
+    client: IpAddr,
+) -> Result<()> {
     let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
         .await
         .context("connect frame timed out")?
@@ -349,19 +356,43 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if target == node.identity.device_id()? {
         return serve_session(node, socket, None).await;
     }
+    // A public node forwards to any device it can reach; other Nodes only to their own
+    // network's Nodes, checked before the session would wait in line.
+    if !node.config.forwarding.any {
+        let member = async {
+            let network = node.membership_state().await?.genesis.network_id;
+            node.store.lock().await.authorize_node(&network, &target)
+        };
+        if let Err(error) = member.await {
+            return refuse(&mut socket, "target_not_member", error).await;
+        }
+    }
+    let _share = match node.config.forwarding.per_ip {
+        Some(limit) => match node.forwards.addresses.take(client, limit) {
+            Some(share) => Some(share),
+            None => {
+                let error = anyhow!("this address holds too many sessions on this Gateway");
+                return refuse(&mut socket, "gateway_busy", error).await;
+            }
+        },
+        None => None,
+    };
     let (_slot, early) = forward_slot(&node, &mut socket).await?;
     let mut forwarded = match open_forward(&node, &target).await {
         Ok(forwarded) => forwarded,
-        Err((code, error)) => {
-            let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
-            let _ = socket.send(Message::Text(refusal.to_string().into())).await;
-            return Err(error.context("client target refused"));
-        }
+        Err(error) => return refuse(&mut socket, "target_unreachable", error).await,
     };
     for frame in early {
         forwarded.send(frame).await?;
     }
     relay_frames(socket, forwarded, node.config.forwarding.rate).await
+}
+
+/// Tells the browser why the Gateway ends its session.
+async fn refuse<T>(socket: &mut ClientSocket, code: &str, error: anyhow::Error) -> Result<T> {
+    let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
+    let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+    Err(error.context("client target refused"))
 }
 
 /// A forwarding slot, after waiting in line while all are taken. A waiting browser hears
@@ -385,9 +416,8 @@ async fn forward_slot(
         room
     };
     if !joined {
-        let refusal = json!({"type":"error","code":"gateway_busy","error":"this Gateway relays too many sessions"});
-        let _ = socket.send(Message::Text(refusal.to_string().into())).await;
-        bail!("gateway forwarding queue is full");
+        let error = anyhow!("this Gateway relays too many sessions");
+        return refuse(socket, "gateway_busy", error).await;
     }
     let _line = InLine(forwards, ticket);
     let queued = |position: usize| {
@@ -420,19 +450,7 @@ async fn forward_slot(
     }
 }
 
-async fn open_forward(
-    node: &Runtime,
-    target: &str,
-) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
-    // A public node forwards to any device it can reach; other Nodes only to their own
-    // network's Nodes.
-    if !node.config.forwarding.any {
-        let member = async {
-            let network = node.membership_state().await?.genesis.network_id;
-            node.store.lock().await.authorize_node(&network, target)
-        };
-        member.await.map_err(|error| ("target_not_member", error))?;
-    }
+async fn open_forward(node: &Runtime, target: &str) -> Result<ClientSocket> {
     let opened = async {
         let connection = node.net()?.connect(target, net::CLIENT).await?;
         let (send, recv) = connection
@@ -443,11 +461,8 @@ async fn open_forward(
     };
     match tokio::time::timeout(FORWARD_DIAL_TIMEOUT, opened).await {
         Ok(Ok(forwarded)) => Ok(forwarded),
-        Ok(Err(error)) => Err(("target_unreachable", unreachable(error))),
-        Err(_) => Err((
-            "target_unreachable",
-            unreachable(anyhow!("peer did not answer in time")),
-        )),
+        Ok(Err(error)) => Err(unreachable(error)),
+        Err(_) => Err(unreachable(anyhow!("peer did not answer in time"))),
     }
 }
 
@@ -2311,11 +2326,8 @@ mod tests {
             .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let access = Arc::new(PrivateRelay::default());
-        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None).await?;
-        let relay_url = format!(
-            "http://{}",
-            relay.http_addr().context("relay listener missing")?
-        );
+        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None, None).await?;
+        let relay_url = format!("http://{}", relay.addr);
         let service = Arc::new(
             Net::bind(
                 &LocalIdentity::generate().secret_key_hex,
@@ -2502,7 +2514,7 @@ mod tests {
         router.shutdown().await?;
         target_net.close().await;
         service_router.shutdown().await?;
-        relay.shutdown().await?;
+        relay.shutdown().await;
         drop((target, joining));
         std::fs::remove_dir_all(dir)?;
         result
@@ -4392,6 +4404,14 @@ mod tests {
             let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
+            // A target outside the network is refused before it would wait for a slot.
+            let full = node.forwards.slots.clone().try_acquire_many_owned(u32::try_from(node.config.forwarding.sessions)?)?;
+            let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
+            let mut socket = ClientSocket::Client(Box::new(socket));
+            socket.send(Message::Text(json!({"type":"connect","target":LocalIdentity::generate().device_id()?}).to_string().into())).await?;
+            let Some(Ok(Message::Text(refusal))) = socket.next().await else { bail!("the Gateway closed without a refusal") };
+            assert_eq!(serde_json::from_str::<Value>(&refusal)?["code"], "target_not_member");
+            drop(full);
             let http = reqwest::Client::builder().no_proxy().build()?;
             let other = http.post(format!("{origin}/api/local/setup")).header("origin", "https://app.example").json(&json!({})).send().await?;
             assert_eq!(other.status(), 403);
@@ -4423,6 +4443,9 @@ mod tests {
         config.local_listen = local.local_addr()?;
         config.forwarding.sessions = 1;
         config.forwarding.queue = 1;
+        config.forwarding.any = true;
+        config.forwarding.per_ip = std::num::NonZeroUsize::new(1);
+        config.forwarding.trusted_proxies = vec!["127.0.0.1".parse()?];
         drop((public, local));
         config.save(&dir)?;
         crate::config::private_write(
@@ -4437,11 +4460,14 @@ mod tests {
         let origin = node.config.public_url.clone();
         let server = tokio::spawn(crate::api::serve(node.clone(), None));
         let result: Result<()> = async {
-            let open = || async {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let origin = &origin;
+            // The trusted proxy on loopback names each browser's address.
+            let open = |address: &'static str| async move {
                 for _ in 0..100 {
-                    if let Ok((socket, _)) =
-                        tokio_tungstenite::connect_async(client_url(&origin)?).await
-                    {
+                    let mut request = client_url(origin)?.into_client_request()?;
+                    request.headers_mut().insert("x-real-ip", address.parse()?);
+                    if let Ok((socket, _)) = tokio_tungstenite::connect_async(request).await {
                         let mut socket = ClientSocket::Client(Box::new(socket));
                         let target = LocalIdentity::generate().device_id()?;
                         let connect = json!({"type":"connect","target":target});
@@ -4455,12 +4481,18 @@ mod tests {
                 bail!("the Gateway did not open")
             };
             let held = node.forwards.slots.clone().try_acquire_owned()?;
-            let mut first = open().await?;
+            let mut first = open("203.0.113.1").await?;
             assert_eq!(
                 text(&mut first).await?,
                 json!({"type":"queued","position":1})
             );
-            let mut second = open().await?;
+            let mut again = open("203.0.113.1").await?;
+            assert_eq!(
+                text(&mut again).await?["code"],
+                "gateway_busy",
+                "an address holds one session"
+            );
+            let mut second = open("203.0.113.2").await?;
             assert_eq!(
                 text(&mut second).await?["code"],
                 "gateway_busy",
@@ -4474,7 +4506,7 @@ mod tests {
             assert_eq!(turn, json!({"type":"queued","position":0}));
             assert_eq!(
                 text(&mut first).await?["code"],
-                "target_not_member",
+                "target_unreachable",
                 "the waiting session went on to its target"
             );
             assert!(
@@ -4484,6 +4516,19 @@ mod tests {
                     .expect("forwarding queue")
                     .is_empty()
             );
+            let limit = std::num::NonZeroUsize::MIN;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node
+                    .forwards
+                    .addresses
+                    .take("203.0.113.1".parse().unwrap(), limit)
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("the ended session kept its address's share")?;
             Ok(())
         }
         .await;

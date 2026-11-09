@@ -50,7 +50,7 @@ def validate_config(config):
     required = common | ({'data_dir', 'device_id', 'uid', 'gid', 'legacy_service', 'maintenance_socket'}
                          if config['role'] in CORE_ROLES else {'nginx_config', 'server_name'})
     if config['role'] == 'app':
-        required |= {'node_url'}
+        required |= {'node_url', 'node_certificate'}
     require(required <= config.keys() and config.keys() <= required | {'public_url'},
             'unsupported or missing deployment configuration fields')
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', config['project']), 'invalid Compose project')
@@ -72,8 +72,14 @@ def validate_config(config):
     if 'nginx_config' in config:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', config['server_name']), 'invalid nginx server name')
     if 'node_url' in config:
-        require(re.fullmatch(r'http://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{0,4}', config['node_url']),
-                'node_url must be the official node\'s HTTP IPv4 address and port')
+        require(re.fullmatch(r'https://(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{0,4}', config['node_url']),
+                'node_url must be the official node\'s HTTPS IPv4 address and port')
+    if 'node_certificate' in config:
+        # The official node's own `tls-cert.pem`, which the App host pins.
+        require(isinstance(config['node_certificate'], str) and len(config['node_certificate']) <= 16384
+                and re.fullmatch(r'-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----\n?',
+                                 config['node_certificate']),
+                'node_certificate must be one PEM certificate')
     if 'public_url' in config:
         require(re.fullmatch(r'https://[a-zA-Z0-9][a-zA-Z0-9.:-]*(?::[0-9]+)?', config['public_url']),
                 'public_url must be an HTTPS origin without credentials')
@@ -295,19 +301,31 @@ def nginx_nodes(text):
     return parse(0, False)[0]
 
 
-def transform_nginx(text, config):
+def transform_nginx(text, config, certificate=None):
     servers = [node for node in nginx_nodes(text) if node['words'] == ['server'] and node['children']]
     targets = [server for server in servers
                if any(n['words'][0] == 'server_name' and config['server_name'] in n['words'][1:] for n in server['children'])
                and any(n['words'][0] == 'listen' and 'ssl' in n['words'][1:] for n in server['children'])]
     require(len(targets) == 1, 'nginx config must contain one matching TLS server')
+    if config['role'] == 'app':
+        require(re.fullmatch(r'/[A-Za-z0-9/._-]+', str(certificate)), 'the App needs the pinned node certificate')
+        # The official node limits each browser by the address in X-Real-IP; behind Cloudflare,
+        # `$remote_addr` is that address only once realip takes it from Cloudflare's header.
+        directives = [n['words'] for n in targets[0]['children']]
+        require(any(words[0] == 'set_real_ip_from' for words in directives)
+                and ['real_ip_header', 'CF-Connecting-IP'] in directives,
+                'the App server must set set_real_ip_from and real_ip_header CF-Connecting-IP')
     def indent(start):
         return text[text.rfind('\n', 0, start) + 1:start]
     def location(selector, body, start):
         return 'location ' + selector + ' {\n' + indent(start) + '    ' + body + '\n' + indent(start) + '}'
     def node_route(route):
-        # The official node serves only the App's Host, and the browser socket outlives nginx's default timeout.
-        body = 'proxy_pass ' + config['node_url'] + ';\n        proxy_set_header Host ' + config['server_name'] + ';'
+        # The official node serves only the App's Host, over TLS with the certificate pinned here, and
+        # the browser socket outlives nginx's default timeout.
+        body = ('proxy_pass ' + config['node_url'] + ';\n        proxy_set_header Host ' + config['server_name'] + ';'
+                '\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_ssl_verify on;'
+                '\n        proxy_ssl_trusted_certificate ' + str(certificate) + ';'
+                '\n        proxy_ssl_name ' + config['server_name'] + ';')
         if route == '/api/client':
             body += ('\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;'
                      '\n        proxy_set_header Connection "upgrade";\n        proxy_read_timeout 1h;')
@@ -569,7 +587,11 @@ def activate(config, image, tag, source, version):
             require(nginx.is_file() and nginx.stat().st_size <= 1024 * 1024, 'invalid nginx configuration file')
             command('nginx', '-t')
             old_nginx = nginx.read_bytes()
-            nginx_data = transform_nginx(old_nginx.decode(), config).encode()
+            certificate = None
+            if config['role'] == 'app':
+                certificate = release / 'node.pem'
+                atomic_write(certificate, config['node_certificate'].rstrip('\n').encode() + b'\n')
+            nginx_data = transform_nginx(old_nginx.decode(), config, certificate).encode()
             target['nginx_sha256'] = hashlib.sha256(nginx_data).hexdigest()
             atomic_write(release / 'nginx.before', old_nginx)
             journal['nginx_backup'] = str(release / 'nginx.before')
@@ -651,15 +673,21 @@ def self_test():
               'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'device_id': 'a' * 64,
               'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
               'maintenance_socket': '/tmp/private-node/maintenance.sock'}
+    certificate = '-----BEGIN CERTIFICATE-----\nMIIBfixture+/=\nMIIB\n-----END CERTIFICATE-----\n'
     app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
            'listen': '127.0.0.1:8088', 'nginx_config': '/etc/nginx/conf.d/app.conf',
-           'server_name': 'app.example.invalid', 'node_url': 'http://203.0.113.7:4792'}
+           'server_name': 'app.example.invalid', 'node_url': 'https://203.0.113.7:4792',
+           'node_certificate': certificate}
     validate_config(config); validate_config(app)
     for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
                                (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
                                (config, 'legacy_service', '--help'), (config, 'node_url', app['node_url']),
+                               (config, 'node_certificate', certificate),
                                (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://node.example.invalid'),
-                               (app, 'node_url', None)):
+                               (app, 'node_url', 'http://203.0.113.7:4792'), (app, 'node_url', None),
+                               (app, 'node_certificate', None), (app, 'node_certificate', 'not a certificate'),
+                               (app, 'node_certificate', certificate + certificate),
+                               (app, 'node_certificate', certificate + 'proxy_pass http://evil;\n')):
         bad = {key: item for key, item in dict(base, **{field: value}).items() if item is not None}
         try:
             validate_config(bad)
@@ -675,6 +703,8 @@ def self_test():
 server {
     listen 443 ssl;
     server_name app.example.invalid;
+    set_real_ip_from 173.245.48.0/20;
+    real_ip_header CF-Connecting-IP;
     root /srv/static-old;
     add_header Content-Security-Policy "old policy" always;
     add_header X-Vibeface-Source old;
@@ -687,15 +717,25 @@ server {
     location / { try_files $uri $uri/ /_shell.html; }
 }
 '''
-    updated = transform_nginx(nginx, app)
+    pem = Path('/srv/service-control/app/release-1/node.pem')
+    updated = transform_nginx(nginx, app, pem)
     assert 'old policy' not in updated and 'X-Vibeface-Source old' not in updated and 'try_files' not in updated
     assert '127.0.0.1:4900' not in updated and 'location = /sdk.v1.js { return 404; }' in updated
     for route in NODE_ROUTES:
         block = updated.split('location = ' + route + ' {', 1)[1].split('}', 1)[0]
-        assert 'proxy_pass http://203.0.113.7:4792;' in block and 'proxy_set_header Host app.example.invalid;' in block
+        assert 'proxy_pass https://203.0.113.7:4792;' in block and 'proxy_set_header Host app.example.invalid;' in block
+        assert all(line in block for line in ('proxy_ssl_verify on;', f'proxy_ssl_trusted_certificate {pem};',
+                                              'proxy_ssl_name app.example.invalid;',
+                                              'proxy_set_header X-Real-IP $remote_addr;'))
         assert ('Upgrade $http_upgrade' in block) == (route == '/api/client')
     assert updated.index('location = /api/decision') < updated.index('location / {')
-    assert transform_nginx(updated, app) == updated
+    assert transform_nginx(updated, app, pem) == updated
+    try:
+        transform_nginx(nginx, app)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('the App forwarded to an unpinned node')
     try:
         transform_nginx(nginx, dict(app, role='www'))
     except ValueError:
@@ -707,15 +747,17 @@ server {
                      'location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }',
                      'location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }'):
         try:
-            transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
+            transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app, pem)
         except ValueError:
             pass
         else:
             raise AssertionError('unknown static route accepted')
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
-                nginx.replace('location / {', 'include /old/routes.conf; location / {', 1)):
+                nginx.replace('location / {', 'include /old/routes.conf; location / {', 1),
+                nginx.replace('    real_ip_header CF-Connecting-IP;\n', '', 1),
+                nginx.replace('    set_real_ip_from 173.245.48.0/20;\n', '', 1)):
         try:
-            transform_nginx(bad, app)
+            transform_nginx(bad, app, pem)
         except ValueError:
             pass
         else:

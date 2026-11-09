@@ -94,12 +94,12 @@ impl ProtocolHandler for Inbound {
     }
 }
 
-/// A relay without an operator token admits anyone; with one, it admits this device, the
-/// personal network's Nodes, joiners holding an open invite and holders of the token. Blocked
-/// devices and connections past `relay_max_clients` are refused either way.
+/// The relay admits this device, the personal network's Nodes, joiners holding an open invite,
+/// holders of the operator token and, when open, anyone, but never a blocked device. Only
+/// connections from outside the personal network count toward `relay_max_clients`.
 pub(super) struct RelayAccess {
     node: Weak<Runtime>,
-    clients: std::sync::atomic::AtomicUsize,
+    counted: std::sync::Mutex<std::collections::HashSet<iroh_relay::server::ConnectionId>>,
 }
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,18 +111,17 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         &self,
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
-        use std::sync::atomic::Ordering::SeqCst;
         let allowed = match self.node.upgrade() {
-            Some(node) => {
-                let max = node.config.network.relay_max_clients;
-                node.relay_allows(request).await
-                    && self
-                        .clients
-                        .fetch_update(SeqCst, SeqCst, |held| {
-                            max.is_none_or(|max| held < max.get()).then_some(held + 1)
-                        })
-                        .is_ok()
-            }
+            Some(node) => match node.relay_admits(request).await {
+                Some(true) => {
+                    let max = node.config.network.relay_max_clients;
+                    let mut counted = self.counted.lock().expect("relay clients");
+                    max.is_none_or(|max| counted.len() < max.get())
+                        && counted.insert(request.connection_id())
+                }
+                Some(false) => true,
+                None => false,
+            },
             None => false,
         };
         if allowed {
@@ -138,10 +137,12 @@ impl iroh_relay::server::AccessControl for RelayAccess {
     fn on_disconnect(
         &self,
         _endpoint: iroh::EndpointId,
-        _connection: iroh_relay::server::ConnectionId,
+        connection: iroh_relay::server::ConnectionId,
     ) {
-        self.clients
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.counted
+            .lock()
+            .expect("relay clients")
+            .remove(&connection);
     }
 }
 
@@ -227,10 +228,15 @@ impl Runtime {
         if let Some(listen) = self.config.network.relay_listen {
             let access = RelayAccess {
                 node: weak,
-                clients: Default::default(),
+                counted: Default::default(),
             };
-            let relay =
-                net::spawn_relay(listen, Arc::new(access), self.config.network.relay_rate).await?;
+            let relay = net::spawn_relay(
+                listen,
+                Arc::new(access),
+                self.config.network.relay_rate,
+                self.config.network.relay_max_clients_per_ip,
+            )
+            .await?;
             tracing::info!(event = "relay.started", %listen, "relay started");
             *self.relay.lock().await = Some(relay);
         }
@@ -276,26 +282,29 @@ impl Runtime {
             let _ = router.shutdown().await;
         }
         if let Some(relay) = self.relay.lock().await.take() {
-            let _ = relay.shutdown().await;
+            relay.shutdown().await;
         }
     }
 
-    async fn relay_allows(&self, request: &iroh_relay::server::ClientRequest) -> bool {
+    /// `None` when the relay refuses the request's device; otherwise whether its connection
+    /// counts toward `relay_max_clients`.
+    async fn relay_admits(&self, request: &iroh_relay::server::ClientRequest) -> Option<bool> {
         let device = net::device_id(&request.endpoint_id());
         if self.config.network.relay_blocked.contains(&device) {
-            return false;
+            return None;
         }
-        let Some(operator) = &self.config.network.relay_operator_token else {
-            return true;
-        };
         if self.identity.device_id().is_ok_and(|own| own == device)
             || self.member_node(&device).await.is_ok()
         {
-            return true;
+            return Some(false);
         }
-        match request.auth_token() {
+        let granted = match request.auth_token() {
             Some(token) => {
-                net::same_token(&token, operator)
+                self.config
+                    .network
+                    .relay_operator_token
+                    .as_ref()
+                    .is_some_and(|operator| net::same_token(&token, operator))
                     || self
                         .store
                         .lock()
@@ -304,7 +313,8 @@ impl Runtime {
                         .unwrap_or(false)
             }
             None => false,
-        }
+        };
+        (self.config.network.relay_open || granted).then_some(true)
     }
 
     async fn removed_here(&self, device: &str) -> bool {

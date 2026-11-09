@@ -459,7 +459,7 @@ pub struct Runtime {
     pub store: Arc<Mutex<Store>>,
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
     router: Mutex<Option<iroh::protocol::Router>>,
-    relay: Mutex<Option<iroh_relay::server::Server>>,
+    relay: Mutex<Option<crate::net::RelayServer>>,
     /// Runtime-owned workers, cancelled and joined by final shutdown.
     background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,

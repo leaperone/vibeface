@@ -25,13 +25,14 @@
 | `listen` | HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡；iroh 默认在同一端口号上监听 UDP |
 | `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`，让本机 origin 和浏览器存储跨重启不变 |
 | `public_url` | 本 Node 的网页 origin，公网为 HTTPS；网页开启时作为地址记录的 `gateway_url` |
+| `tls` | 默认 `false`；`true` 时 `listen` 只接受 TLS，使用 `init --tls` 为 `public_url` 主机名生成的自签证书 `tls-cert.pem` 和私钥 `tls-key.pem`，供前面的反代钉住；要求 HTTPS 的 `public_url` |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
 | `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和发现服务设置，见下表 |
-| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`） |
+| `forwarding` | 浏览器转发：`any` 默认 `false`，只转发给本网络的 Node，`true` 时转发给任何设备（`--forward-any`）；`sessions` 是同时转发的会话数，默认 256（`--forward-sessions`）；`queue` 是排队数，默认 0（`--forward-queue`），两者之和不超过 256；`rate` 是每个会话双向合计每秒的字节数，省略时不限（`--forward-rate`）；`per_ip` 是同一浏览器地址同时占用的转发和排队名额，省略时不限（`--forward-per-ip`）；`trusted_proxies` 是反代地址，只有来自它们的连接才按单个 `X-Real-IP` 认定浏览器地址（`--trusted-proxy`） |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
 | `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
@@ -48,16 +49,18 @@
 | `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
 | `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 TCP relay 的地址 |
 | `relay_url` | `--relay-url URL` | 其他设备访问本 relay 的 URL，默认 `http://<relay_listen>` |
-| `relay_operator_token` | `--relay-operator-token FILE` | 本 relay 向个人网络以外的设备要求的令牌，64 个十六进制字符；省略时 relay 对任何设备开放 |
+| `relay_operator_token` | `--relay-operator-token FILE` | 个人网络以外的设备出示后可用本 relay 的令牌，64 个十六进制字符 |
+| `relay_open` | `--relay-open` | 本 relay 接纳任何设备，默认 `false` |
 | `relay_rate` | `--relay-rate BYTES` | relay 每秒从每个连接读取的字节数，省略时不限 |
-| `relay_max_clients` | `--relay-max-clients N` | relay 同时保持的连接数，省略时不限 |
+| `relay_max_clients` | `--relay-max-clients N` | relay 同时保持的个人网络以外的连接数，本 Node 和成员 Node 不计，省略时不限 |
+| `relay_max_clients_per_ip` | `--relay-max-clients-per-ip N` | 同一 IPv4 地址或 IPv6 /64 同时保持的 TCP 连接数，含成员，省略时不限 |
 | `relay_blocked` | 无 | relay 拒绝的设备编号 |
 | `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
 | `serve_discovery` | `--serve-discovery` | 在本 Node 的 UDP 端口上回答其他设备的发现登记和查找，默认 `false` |
 | `bootstrap` | `--bootstrap off\|public\|URL` | `{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…"}`；`init` 和首次直接启动在新 Node 上写 `public`，提供发现服务的 Node 默认 `off`，见[公共接入](#公共接入) |
 | `pkarr` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
 
-配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_rate`、`relay_max_clients` 和 `relay_blocked` 要求 `relay_listen`；relay 监听通配地址时必须给 `relay_url`。`bootstrap` 的 `off` 是明确选择而不是回退：`custom` 来源不可用时不会改用官方服务。
+配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_open`、`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 和 `relay_blocked` 要求 `relay_listen`；`relay_open` 要求 `relay_rate` 和 `relay_max_clients`，且不能有 `relay_operator_token`；relay 监听通配地址时必须给 `relay_url`。`bootstrap` 的 `off` 是明确选择而不是回退：`custom` 来源不可用时不会改用官方服务。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -139,9 +142,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 浏览器连接 `/api/client` 后先发送文本帧 `{"type":"connect","target":"DEVICE_ID"}`：
 
 - `target` 是本 Node 时，Noise 在这里终止。
-- `target` 是其他设备时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。`forwarding.any` 为 `false` 时只转发给本网络的 Node，目标不是成员时回 `{"type":"error","code":"target_not_member"}`；连不上时回 `target_unreachable`，随后关闭。
+- `target` 是其他设备时，网关经 iroh `vibeface/client/1` 打开一条流，双向原样搬运二进制帧，单帧最多 1 MiB。`forwarding.any` 为 `false` 时只转发给本网络的 Node，目标不是成员时不排队，直接回 `{"type":"error","code":"target_not_member"}`；连不上时回 `target_unreachable`，随后关闭。
 - 网关按设备编号拨号，候选地址来自地址簿、局域网广播，以及配置的发现服务查到的 relay 和观察到的 IP；自己提供发现服务的网关先查本机登记。拨号最多 7 秒，在浏览器 10 秒连接超时之前回 `target_unreachable`；没有共同 relay 且无法直连时也是这个结果。
-- 网关同时最多转发 `forwarding.sessions` 个会话。名额用完时，新会话最多 `forwarding.queue` 个排队：网关立即回 `{"type":"queued","position":n}`，之后每 2 秒更新一次，轮到时回 `position` 为 0 再拨号；排队期间浏览器发来的最多 4 帧暂存，之后转给目标。队列也满时回 `gateway_busy` 并关闭。`forwarding.rate` 限制每个会话双向合计的字节速率。`connect` 首帧须在 10 秒内到达。浏览器把 `queued` 当作等待而不是拒绝，每收到一帧就重新开始连接超时计时。
+- 网关同时最多转发 `forwarding.sessions` 个会话。名额用完时，新会话最多 `forwarding.queue` 个排队：网关立即回 `{"type":"queued","position":n}`，之后每 2 秒更新一次，轮到时回 `position` 为 0 再拨号；排队期间浏览器发来的最多 4 帧暂存，之后转给目标。队列也满时回 `gateway_busy` 并关闭。设了 `forwarding.per_ip` 时，同一浏览器地址（IPv6 按 /64 计）转发和排队中的会话合计不超过它，超出也回 `gateway_busy`；浏览器地址是 TCP 对端，对端列在 `forwarding.trusted_proxies` 里时取它发来的唯一一个 `X-Real-IP`。`forwarding.rate` 限制每个会话双向合计的字节速率。`connect` 首帧须在 10 秒内到达。浏览器把 `queued` 当作等待而不是拒绝，每收到一帧就重新开始连接超时计时。
 
 随后浏览器与目标执行 `Noise_XX_25519_ChaChaPoly_SHA256`，prologue 为 `vibeface:client:v1`。双方每次会话生成临时 Noise 静态密钥，并在握手 payload 中携带 `Proof { device_id, signature }`，签名覆盖 `"vibeface:noise-static:v1" ‖ prologue ‖ 本次静态公钥`。浏览器的签名来自不可导出的 WebCrypto Ed25519 `CryptoKey`。浏览器钉住目标 `device_id`，编号不符时关闭连接。目标验证浏览器的 `Proof` 后按成员目录授权。转发会话的网关、它前面的 TLS 终止方和 relay 只能看到 Noise 密文。提供网页的 origin 不在此列：它分发浏览器运行的代码，必须是本人信任的网页：自己的 Gateway、自己服务器上的公共节点或官方 App。
 
@@ -467,15 +470,15 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### Relay 与公共节点
 
-启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。没有 `relay_operator_token` 的 relay 接纳任何设备；配置了令牌时，只接纳本 Node 自己、当前成员 Node、持该令牌的设备，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。`relay_blocked` 里的设备和超出 `relay_max_clients` 的连接一律拒绝，`relay_rate` 限制从每个连接读取的速率。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
+启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。设了 `relay_max_clients_per_ip` 时 relay 只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它，同一 IPv4 地址或 IPv6 /64 超出上限的连接直接关闭。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
-公共节点是不加入个人网络的 Node，通常同时提供发现服务（`serve_discovery`）、开放 relay 和面向任何设备的浏览器转发（`forwarding.any`）。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它只搬运 Noise 密文。部署步骤见[从外网访问](node.md#从外网访问)。
+公共节点是不加入个人网络的 Node，通常同时提供发现服务（`serve_discovery`）、开放 relay（`relay_open`）和面向任何设备的浏览器转发（`forwarding.any`）。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它只搬运 Noise 密文。部署步骤见[从外网访问](node.md#从外网访问)。
 
 ### 公共接入
 
 `bootstrap` 不为 `off` 的 Node 把它的来源加进发现服务列表，Endpoint 绑定后在后台登记，本机 API、维护接口和局域网发现不等待它。来源是一台发现服务：`public` 读取仓库文件 `config/public-bootstrap.json` 里固定的 `issuer`（官方公共节点的设备编号）、`udp_host` 和 `udp_port`，Core 用 `include_str!` 编入同一文件，不另抄一份；`custom` 的 `issuer` 取自 `vibeface://` 地址里的设备编号。QUIC 握手证明对端就是这台设备，编号不符时连接失败。
 
-发现服务所在 Node 的 relay 没有 `relay_operator_token` 时，`registered` 应答附上这台 relay。登记方把它加为候选 relay，iroh 可以选它做 home relay，于是直连不通的设备之间也能经它连通；已配置的同一 relay 和它的令牌保持不变。`vibeface status` 的 `Bootstrap` 显示配置的来源 `public`、`custom` 或 `off`。登记失败按发现协议的退避重连，不回退到其他来源，也不把失败当作成功。
+发现服务所在 Node 的 relay 开放（`relay_open`）时，`registered` 应答附上这台 relay。登记方把它加为候选 relay，iroh 可以选它做 home relay，于是直连不通的设备之间也能经它连通；已配置的同一 relay 和它的令牌保持不变。`vibeface status` 的 `Bootstrap` 显示配置的来源 `public`、`custom` 或 `off`。登记失败按发现协议的退避重连，不回退到其他来源，也不把失败当作成功。
 
 `vibeface join` 和本机网页的 `node_join` 只凭票据里的设备编号：加入方经同一发现服务查到发出邀请的 Node 登记的地址和 relay，带邀请令牌连接这些 relay。
 

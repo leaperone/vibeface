@@ -39,6 +39,7 @@ import signal
 import select
 import shlex
 import socket
+import ssl
 import struct
 import stat
 import sqlite3
@@ -707,7 +708,8 @@ class Node:
              *(["--no-web"] if no_web else [])],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env or self.environment())
-        if no_web or not json.loads((self.directory / "config.json").read_text())["web_enabled"]:
+        configuration = json.loads((self.directory / "config.json").read_text())
+        if no_web or not configuration["web_enabled"]:
             health = wait_for(f"{self.name} headless maintenance socket", lambda: (
                 value if (value := node_status(self))["status"] == "running" and value["web_enabled"] is False else None))
             require(health["device_id"] == self.device_id, f"{self.name}: maintenance pins its identity")
@@ -715,7 +717,7 @@ class Node:
             def listener():
                 if self.process.poll() is not None:
                     raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
-                return self.client.request("/api/info")
+                return pinned_info(self) if configuration.get("tls") else self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)
             require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
@@ -795,6 +797,20 @@ class Node:
         self.client.principal = result["principal"]
         require(self.client.principal["can_manage"], "creating the network makes this browser a manager")
         return self.client.network_id
+
+
+def pinned_info(node, certificate=None):
+    """`/api/info` from a `--tls` Node as a reverse proxy trusting only `certificate`, by default the Node's own."""
+    host = urllib.parse.urlsplit(json.loads((node.directory / "config.json").read_text())["public_url"]).hostname
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(certificate or node.directory / "tls-cert.pem")
+    with socket.create_connection(("127.0.0.1", node.port), timeout=5) as raw, \
+            context.wrap_socket(raw, server_hostname=host) as stream:
+        stream.sendall(f"GET /api/info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+        response = b"".join(iter(lambda: stream.recv(65536), b""))
+    head, _, body = response.partition(b"\r\n\r\n")
+    require(head.startswith(b"HTTP/1.1 200 "), f"{node.name}: /api/info answers over pinned TLS")
+    return json.loads(body)
 
 
 def local_discovery(run, binary, workspace, helper, cleanup, name="DISCOVERY"):
@@ -4555,7 +4571,9 @@ def acceptance(options):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
         discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        for node in (a, p, b, c):
+        # B cannot reach the IPv4-only Discovery, so its join hands the invite token to P's relay,
+        # which admits only members and those P invited.
+        for node in (a, p, c):
             node.configure_network(discovery=[discovery])
         a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
@@ -5318,11 +5336,11 @@ def public_node_acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "public node P (not a member) serving discovery, an open relay and browser forwarding "
-                          "with one slot and one place in line; member M configured only with P's discovery; "
-                          "private relay R with an operator token between A and an IPv6-only X; "
-                          "WASM browser client on P's origin",
-              "not_checked": ["real NAT and TLS reverse proxy (loopback ports stand in for nginx paths)",
+              "coverage": "public node P (not a member) serving discovery, an open relay limited per address and "
+                          "browser forwarding with one slot and one place in line; member M configured only with "
+                          "P's discovery; private relay R with an operator token between A and an IPv6-only X; "
+                          "TLS-only T as a reverse proxy pinning its certificate sees it; WASM browser client on P's origin",
+              "not_checked": ["real NAT and the nginx reverse proxy (loopback ports stand in for nginx paths)",
                               "rendered browser UI (see the browser screenshots)"]}
 
     def passed(name, **evidence):
@@ -5355,7 +5373,7 @@ def public_node_acceptance(options):
         relay_url = f"http://127.0.0.1:{relay_port}"
         p = Node(run, "P", binary, workspace, helper, init_args=[
             "--serve-discovery", "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
-            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
+            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
         nodes.append(p)
         discovery = f"vibeface://{p.device_id}@127.0.0.1:{p.quic_port}"
         fixture = run / "fixture-M"
@@ -5528,6 +5546,26 @@ def public_node_acceptance(options):
         require(not any((p.directory / "blobs").rglob("*")) if (p.directory / "blobs").exists() else True,
                 "P stores no attachments")
         passed("public-node-stores-nothing", **rows)
+
+        # The official node's browser API speaks only TLS, verified as the App host pins it: its own
+        # certificate for the App's name.
+        t, t2 = (Node(run, name, binary, workspace, helper, init_args=["--tls", "--public-url", "https://app.example.invalid"])
+                 for name in ("T", "T2"))
+        nodes += [t, t2]
+        t.start()
+        require(pinned_info(t)["device_id"] == t.device_id, "T answers over TLS pinned to its own certificate")
+        try:
+            pinned_info(t, t2.directory / "tls-cert.pem")
+        except ssl.SSLCertVerificationError:
+            pass
+        else:
+            raise AssertionError("another Node's certificate verifies T")
+        answer = b""
+        with socket.create_connection(("127.0.0.1", t.port), timeout=5) as raw, contextlib.suppress(ConnectionResetError):
+            raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
+            answer = raw.recv(64)
+        require(not answer.startswith(b"HTTP/"), "T answers no plain HTTP")
+        passed("tls-only-node-answers-its-pinned-certificate")
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"
@@ -6243,9 +6281,13 @@ def delivery_rows(node, query, parameters=()):
         return connection.execute(query, parameters).fetchall()
 
 
+# A relay that admits any device is bounded; loopback fixtures share one address.
+OPEN_RELAY = ["--relay-open", "--relay-rate", "1048576", "--relay-max-clients", "64", "--relay-max-clients-per-ip", "64"]
+
+
 def public_node_args():
     address = f"127.0.0.1:{available_port()}"
-    return ["--relay-listen", address, "--relay-url", "http://" + address]
+    return ["--relay-listen", address, "--relay-url", "http://" + address, *OPEN_RELAY]
 
 
 def delivery_free_state(nodes, spy):
@@ -8740,7 +8782,7 @@ def e2e_fixture(options):
             relay_url = f"http://127.0.0.1:{relay_port}"
             public = Node(run, "public", binary, workspace, helper, port=options.fixture_port, init_args=[
                 "--serve-discovery", "--forward-any",
-                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
+                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
             nodes["public"] = public
             member = Node(run, "member", binary, workspace, helper, init_args=[
                 "--root", str(workspace), "--bootstrap", f"vibeface://{public.device_id}@127.0.0.1:{public.quic_port}"])

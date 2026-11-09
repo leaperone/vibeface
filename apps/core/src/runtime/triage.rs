@@ -46,6 +46,19 @@ const WEBHOOK_KEY: &str = "triage-webhook.key";
 const DECISION_TOKENS: &str = "decision-tokens.json";
 pub const SPOOL_DIR: &str = "hook-spool";
 
+/// Where a webhook's reader answers. Without a public HTTPS URL, a Node on the public bootstrap
+/// is answered through the official App.
+fn decision_url(config: &config::Config) -> String {
+    let base = if config.public_url.starts_with("https://")
+        || config.network.bootstrap != net::bootstrap::Bootstrap::Public
+    {
+        config.public_url.trim_end_matches('/')
+    } else {
+        net::bootstrap::APP_ORIGIN
+    };
+    format!("{base}/api/decision")
+}
+
 pub(crate) struct TriageState {
     config: std::sync::Mutex<TriageConfig>,
     /// Requests sessions hold until they are answered, by the Node's own request ID. An App
@@ -2344,7 +2357,7 @@ impl Runtime {
             "schema_version":triage::SCHEMA_VERSION, "type":"question", "event_id":question_id,
             "question_id":question_id, "severity":question["severity"], "text":question["text"],
             "choices":choices, "about":question["about"], "bot":question["bot"],
-            "answer":{"url":self.decision_url(), "device_id":self.identity.device_id()?,
+            "answer":{"url":decision_url(&self.config), "device_id":self.identity.device_id()?,
                 "question_id":question_id},
         });
         self.queue_webhook(question_id, &body).await?;
@@ -2450,13 +2463,6 @@ impl Runtime {
         Ok(
             json!({"node":node,"session_id":session,"conversation_id":owner,"muted":target.is_none(),
             "version":version,"changed":event.is_some()}),
-        )
-    }
-
-    fn decision_url(&self) -> String {
-        format!(
-            "{}/api/decision",
-            self.config.public_url.trim_end_matches('/')
         )
     }
 
@@ -2599,7 +2605,7 @@ impl Runtime {
             "webhook_url":config.webhook_url, "scan_codex_sessions":config.scan_codex_sessions,
             "codex_sessions":config.codex_sessions,
             "webhook_secret_set":self.webhook_secret()?.is_some(),
-            "decision_url":self.decision_url(), "device_id":self.identity.device_id()?,
+            "decision_url":decision_url(&self.config), "device_id":self.identity.device_id()?,
             "decision_tokens":tokens, "outbox":outbox, "status":self.triage_status().await?,
         }))
     }
@@ -2962,6 +2968,19 @@ pub(super) mod tests {
     };
     use std::{collections::BTreeMap, sync::atomic::Ordering};
     use vibeface_bridge::failure::FailureKind;
+
+    #[test]
+    fn decisions_reach_a_node_without_public_https_through_the_official_app() {
+        let mut config = Config::local("127.0.0.1:4792".parse().unwrap(), vec![], false);
+        assert_eq!(decision_url(&config), "http://127.0.0.1:4792/api/decision");
+        config.network.bootstrap = net::bootstrap::Bootstrap::Public;
+        assert_eq!(
+            decision_url(&config),
+            "https://app.vibeface.dev/api/decision"
+        );
+        config.public_url = "https://node.example/".into();
+        assert_eq!(decision_url(&config), "https://node.example/api/decision");
+    }
 
     async fn bare_node() -> Result<(Arc<Runtime>, PathBuf)> {
         node_at(LocalIdentity::generate(), Default::default()).await
@@ -7682,7 +7701,7 @@ pub(super) mod tests {
             assert_eq!(headers["x-vibeface-signature"].to_str()?, triage::signature(secret.as_bytes(), timestamp, body));
             let body: Value = serde_json::from_str(body)?;
             assert_eq!((body["type"].clone(), body["choices"][1].clone()), (json!("question"), json!({"index":1,"label":"不修"})));
-            assert_eq!(body["answer"], json!({"url":node.decision_url(),"device_id":node.identity.device_id()?,"question_id":question}));
+            assert_eq!(body["answer"], json!({"url":decision_url(&node.config),"device_id":node.identity.device_id()?,"question_id":question}));
             let answered: Value = serde_json::from_str(&received[1].1)?;
             let network = node.network_id().await?;
             let hash = node.store.lock().await.message(&network, "c", &format!("a-{question}"))?.context("answer")?.event_hash;

@@ -36,6 +36,8 @@ struct InitOptions {
     local_listen: SocketAddr,
     public_url: Option<String>,
     #[serde(default)]
+    tls: bool,
+    #[serde(default)]
     no_web: bool,
     #[serde(default)]
     allowed_origins: Vec<String>,
@@ -58,13 +60,19 @@ struct InitOptions {
     relay_url: Option<String>,
     /// File with the token this Node's relay asks of devices outside its personal network.
     relay_operator_token: Option<PathBuf>,
+    #[serde(default)]
+    relay_open: bool,
     relay_rate: Option<NonZeroU32>,
     relay_max_clients: Option<NonZeroUsize>,
+    relay_max_clients_per_ip: Option<NonZeroUsize>,
     #[serde(default)]
     forward_any: bool,
     forward_sessions: Option<usize>,
     forward_queue: Option<usize>,
     forward_rate: Option<NonZeroU32>,
+    forward_per_ip: Option<NonZeroUsize>,
+    #[serde(default)]
+    trusted_proxies: Vec<IpAddr>,
     manager: Option<Provider>,
     workspace: Option<PathBuf>,
     model: Option<String>,
@@ -417,6 +425,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
     configuration.local_listen = options.local_listen;
+    configuration.tls = options.tls;
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
     configuration.allowed_origins = options.allowed_origins;
@@ -465,8 +474,10 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
             .as_deref()
             .map(net::read_token_file)
             .transpose()?,
+        relay_open: options.relay_open,
         relay_rate: options.relay_rate,
         relay_max_clients: options.relay_max_clients,
+        relay_max_clients_per_ip: options.relay_max_clients_per_ip,
         bootstrap: resolve_bootstrap(options.bootstrap.as_deref(), options.serve_discovery)?,
         ..NetworkConfig::default()
     };
@@ -475,6 +486,8 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     forwarding.sessions = options.forward_sessions.unwrap_or(forwarding.sessions);
     forwarding.queue = options.forward_queue.unwrap_or(forwarding.queue);
     forwarding.rate = options.forward_rate;
+    forwarding.per_ip = options.forward_per_ip;
+    forwarding.trusted_proxies = options.trusted_proxies;
     if let Some(url) = options.public_url {
         configuration.public_url = config::http_origin(&url)?
             .to_string()
@@ -548,6 +561,17 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&store.bootstrap_capability()?)?,
     )?;
+    if configuration.tls {
+        // Self-signed for the reverse proxy in front, which pins this very certificate.
+        let url = reqwest::Url::parse(&configuration.public_url)?;
+        let host = url.host_str().context("public_url has no host")?;
+        let made = rcgen::generate_simple_self_signed(vec![host.trim_matches(['[', ']']).into()])?;
+        create_private(&dir.join(config::TLS_CERT), made.cert.pem().as_bytes())?;
+        create_private(
+            &dir.join(config::TLS_KEY),
+            made.signing_key.serialize_pem().as_bytes(),
+        )?;
+    }
     create_private(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
     Ok(())
 }
@@ -755,14 +779,19 @@ mod tests {
             "listen": free_addr(),
             "local_listen": free_addr(),
             "public_url": "https://app.example",
+            "tls": true,
             "serve_discovery": true,
             "relay_listen": "127.0.0.1:0",
+            "relay_open": true,
             "relay_rate": 65536,
             "relay_max_clients": 512,
+            "relay_max_clients_per_ip": 16,
             "forward_any": true,
             "forward_sessions": 32,
             "forward_queue": 192,
             "forward_rate": 262144,
+            "forward_per_ip": 8,
+            "trusted_proxies": ["203.0.113.1"],
         }))
         .unwrap();
         let result = initialize_from_options(options).unwrap();
@@ -771,16 +800,43 @@ mod tests {
             "a Node serving discovery is the infrastructure"
         );
         let saved = Config::load(&dir).unwrap();
-        assert!(saved.network.serve_discovery && saved.network.relay_operator_token.is_none());
+        assert!(saved.network.serve_discovery && saved.network.relay_open);
         assert_eq!(saved.network.relay_rate.map(NonZeroU32::get), Some(65536));
         assert_eq!(
             saved.network.relay_max_clients.map(NonZeroUsize::get),
             Some(512)
         );
+        assert_eq!(
+            saved
+                .network
+                .relay_max_clients_per_ip
+                .map(NonZeroUsize::get),
+            Some(16)
+        );
         let forwarding = saved.forwarding;
         assert!(forwarding.any && forwarding.sessions == 32 && forwarding.queue == 192);
         assert_eq!(forwarding.rate.map(NonZeroU32::get), Some(262144));
+        assert_eq!(forwarding.per_ip.map(NonZeroUsize::get), Some(8));
+        assert_eq!(
+            forwarding.trusted_proxies,
+            ["203.0.113.1".parse::<IpAddr>().unwrap()]
+        );
+        assert!(saved.tls);
+        let certificate = fs::read_to_string(dir.join(config::TLS_CERT)).unwrap();
+        assert!(certificate.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(dir.join(config::TLS_KEY).is_file());
         fs::remove_dir_all(dir).unwrap();
+        let open: InitOptions = serde_json::from_value(json!({
+            "data_dir": temp_dir("open-relay"),
+            "no_web": true,
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+            "relay_listen": "127.0.0.1:0",
+            "relay_open": true,
+        }))
+        .unwrap();
+        let error = initialize_from_options(open).unwrap_err().to_string();
+        assert!(error.contains("open relay"), "{error}");
         let crowded: InitOptions = serde_json::from_value(json!({
             "data_dir": temp_dir("crowded"),
             "no_web": true,

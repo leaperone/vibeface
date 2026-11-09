@@ -6,6 +6,10 @@
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+/// The official App, whose `/api/decision` reaches the public node, which hands each decision
+/// to its Node by device ID.
+pub const APP_ORIGIN: &str = "https://app.vibeface.dev";
+
 const PUBLIC_DEFAULTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../config/public-bootstrap.json"

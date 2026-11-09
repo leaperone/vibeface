@@ -146,7 +146,7 @@ vibeface init --relay https://relay.example                                     
 
 显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认还会使用官方公共节点在发现服务登记时提供的开放 Relay，也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
-不带 `--relay-operator-token` 的 relay 对任何设备开放。只给自己和熟人用时，运行 relay 的 Node 加令牌，个人网络以外的 Node 带上同一令牌：
+relay 默认只接纳运行它的 Node、个人网络的成员 Node 和它所发邀请的加入者，加 `--relay-open` 才对任何设备开放，且必须同时设上限。还要给熟人用时，运行 relay 的 Node 加令牌，个人网络以外的 Node 带上同一令牌：
 
 ```sh
 vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example --relay-operator-token /path/to/relay-token   # 运行 relay 的公网 Node

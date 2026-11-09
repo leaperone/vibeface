@@ -254,13 +254,13 @@ Memory 签名、版本、归约或用户操作改动补跑 `--memory-sync`。它
 
 身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复进入 48 小时等待、现有管理设备签名确认后立即生效、被现有管理设备拦下后旧恢复文件仍有效、空 Node 上的找回同样等待，以及未知写入不重放。
 
-Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默认模式（不带模式参数）。它启动四台真实 Node 和一台其他网络的 Node：P 运行成员 relay，B 只绑定 IPv6 loopback，其他 Node 只绑定 IPv4 loopback，协议族隔离使 B 必须经 relay 连接，A 负责调度。覆盖经 iroh 加入与同步、签名入口记录（浏览器 WASM 验签，伪造记录被拒）、四条跨入口转发路径与非成员拒绝、成员 Gateway 的 Origin 放行、调度 Node 离线时入口保留并投递且只执行一次、经另一入口重发得到原结果、崩溃与重启后不重放、relay 中断时直连继续而只经 relay 的 Node 在 relay 恢复后追平、入口切换后每条消息只出现一次，以及撤销后不再列出和转发。
+Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默认模式（不带模式参数）。它启动四台真实 Node 和一台其他网络的 Node：P 运行不开放的成员 relay，B 只绑定 IPv6 loopback，其他 Node 只绑定 IPv4 loopback，协议族隔离使 B 必须经 relay 连接；B 也连不到只绑 IPv4 的发现服务，所以不配发现服务，凭 P 所发邀请的令牌经这台 relay 加入。A 负责调度。覆盖经 iroh 加入与同步、签名入口记录（浏览器 WASM 验签，伪造记录被拒）、四条跨入口转发路径与非成员拒绝、成员 Gateway 的 Origin 放行、调度 Node 离线时入口保留并投递且只执行一次、经另一入口重发得到原结果、崩溃与重启后不重放、relay 中断时直连继续而只经 relay 的 Node 在 relay 恢复后追平、入口切换后每条消息只出现一次，以及撤销后不再列出和转发。
 
 队列、停止回复、待核对和事件日志改动跑 `--phase1`；工作派发、App Server 直连、请求处理、分诊、决定回传、中断、托管与崩溃恢复改动跑 `--chat-agent`。两者都是单 Node 场景。`--chat-agent` 的夹具 App Server 启动时核对 `crates/bridge/schema/app-server-methods.json`，缺一个客户端请求即失败；夹具 Agent 用真实 CLI（`vibeface tool dispatch_work`、`vibeface codex call|send|watch`、`vibeface requests|respond`、`vibeface triage events|raise|dismiss`）工作。覆盖直接派发与重试只开一轮、Bot `codex send` 作为工作 steer 进行中的回合（同一 `--id` 只回读、换内容被拒、Bot 轮外拒绝，两项工作共用一个回合并各自回报一次）、未知结果按 clientId 对账不重发、服务端请求由 Agent 应答一次、置之不理时回退拒绝、无 Agent 时立即回退、hook 经分诊在拥有会话的聊天里提问并发出 HMAC 签名 webhook（重试同一 event_id、4xx 进死信、回答后再发 `answered`）、挂住请求的提问经 `answer` 回答一次并由 Bot 的 `answer` 轮应答 Codex 一次、文字回答经 Bot `codex send --id a-<问题>` 作为一项工作只送达一次、外来会话不提问、由运行它的设备归给主 Bot 一次（重复 hook 只写一次，事件照常进分诊；Bot 轮次列出名下会话，Bot 用 `hand_over_session` 转给其他 Bot 与不再关注各写一次、重试只读回、过期版本被拒、转走后原 Bot 不能再改，不再关注后静默，换主 Bot 后下一个会话归新主 Bot，之后的提问进接手的 Bot 聊天；`codex exec` 等非交互会话不归属也不分诊），以及 decision token 经 HTTP 回答拥有会话的提问一次、回答经 Bot 作为一项工作送达会话一次（不向已失效的会话发送）。
 
 跨设备派发与停止、负责人切换、撤销后结果待确认、待核对结清、跨入口加入和附件上传改动跑 `--phase4`。它启动四台 Node：A、B、C 都带夹具协调 Agent 和 App Server，P 是运行 relay 的公网角色。跨设备工作是 Agent 交给 Agent：目标设备的 Agent 自己开 Codex 线程；目标上的服务端请求变成拥有该线程的聊天里的提问，在 A 回答后由 A 的 Bot 经 `respond --node` 转发应答一次。C 接任务后离线并被撤销。
 
-公共节点、relay 准入、浏览器转发排队和公共引导的改动跑 `--public-node`。P 是不入网的公共节点，提供发现服务、开放 relay 和面向任何设备的浏览器转发，转发名额和队列各为 1；M 只配置 P 的发现服务。覆盖浏览器经 P 加入 M 并对话、P 重启后重连、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 回答 M 上的提问一次、回答经 M 的 Bot 送达线程一次且错误 token 得 401、名额占满时第二个浏览器排队并在轮到后接通、带运营者令牌的私有 relay R 在 A 与只有 IPv6 的 X 之间转发且 X 换成错误令牌后不可达，以及 P 不存事件、会话、日志和附件。
+公共节点、relay 准入、浏览器转发排队和公共引导的改动跑 `--public-node`。P 是不入网的公共节点，提供发现服务、显式开放并设限的 relay 和面向任何设备的浏览器转发，转发名额和队列各为 1；M 只配置 P 的发现服务。覆盖浏览器经 P 加入 M 并对话、P 重启后重连、decision token 经 P 的 `POST /api/decision` 以 `vibeface/decision/1` 回答 M 上的提问一次、回答经 M 的 Bot 送达线程一次且错误 token 得 401、名额占满时第二个浏览器排队并在轮到后接通、带运营者令牌的私有 relay R 在 A 与只有 IPv6 的 X 之间转发且 X 换成错误令牌后不可达，只开 TLS 的 Node 用 `init --tls` 的证书应答钉住它的客户端、换一张证书校验失败、明文 HTTP 得不到应答，以及 P 不存事件、会话、日志和附件。
 
 发现协议、连接协助或 Web 开关改动另跑 `--discovery`。它覆盖没有地址提示的 CLI 邀请加入、清空地址缓存后经重启的发现服务直连、协议族不兼容时发现服务不转发业务、配置普通成员 relay 后自动回退，以及无网页模式下 hook、工具鉴权、维护和同步仍可用。真实公网 NAT 与真实 Agent 工具执行另行验收。
 

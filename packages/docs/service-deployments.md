@@ -57,6 +57,6 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。首轮容器切换需要现有服务进入维护并正常退出，保存备份后再激活。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
 
-公共节点没有域名，也不提供网页文件。App 主机的 Nginx 把浏览器接入接口反代到公共节点并透传 `Host: app.vibeface.dev`；公共节点的网页端口只对 App 主机开放。客户端直接连接公共节点 IP 上的 relay 和 UDP 发现服务，不经过 App。
+公共节点没有域名，也不提供网页文件。App 主机的 Nginx 经 TLS 把浏览器接入接口反代到公共节点，钉住公共节点 `init --tls` 生成的证书，并透传 `Host: app.vibeface.dev`。部署前必须在阿里云安全组里让公共节点的网页 TCP 端口只放行 App 主机的 IP，脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点 IP 上的 relay 和 UDP 发现服务，不经过 App。
 
 部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表发现服务公网 UDP、relay 连接、浏览器排队接入、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。
