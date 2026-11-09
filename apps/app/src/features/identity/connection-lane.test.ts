@@ -577,6 +577,17 @@ test('a join asks this page\'s Gateway to forward to the entry Node by its devic
   } finally { app.close() }
 })
 
+test('the desktop app, whose page is its own bundle, joins through the public node', async () => {
+  const publicNode = JSON.parse(readFileSync(new URL('../../../../../config/public-bootstrap.json', import.meta.url), 'utf8')).gateway_url
+  const app = deviceHarness({ origin: 'vibeface-app://app' })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().defaultGateway, publicNode)
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    assert.deepEqual(plain(app.sockets.map(socket => socket.entry)), [{ kind: 'gateway', address: publicNode, device_id: target }])
+  } finally { app.close() }
+})
+
 test('the official page joins through the public node, or the access address this browser keeps instead', async () => {
   const publicNode = JSON.parse(readFileSync(new URL('../../../../../config/public-bootstrap.json', import.meta.url), 'utf8')).gateway_url
   const storage = new Map<string, string>()

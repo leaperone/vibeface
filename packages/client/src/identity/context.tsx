@@ -472,15 +472,17 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const list = target.entry.kind === 'local'
       ? [target.entry]
       : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]))
-    // The access address is the way left when the Node's own are gone.
+    // The access address is the way left when the Node's own are gone; added as a last resort, it does not shorten a
+    // lone way's longer wait.
     const access: ConnectionEntry = { kind: 'gateway', address: currentGateway(), device_id: target.entry.device_id }
+    const ways = list.length
     if (target.entry.kind !== 'local' && !list.some(way => entryKey(way) === entryKey(access))) list.push(access)
     for (const candidate of list) {
       let active: Session | null = null
       // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
       const own = candidate.device_id === target.entry.device_id
       try {
-        active = await open(candidate, true, list.length === 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000)
+        active = await open(candidate, true, ways <= 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000)
         if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这个节点已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (own && removed(auth, active, target.networkId)) return true

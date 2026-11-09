@@ -17,6 +17,8 @@ import urllib.request
 ROOT = Path('/opt/vibeface')
 DATA = Path('/data')
 APP_ORIGIN = 'https://app.vibeface.dev'
+TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
+TLS_OWNER = 0
 
 
 def require(condition, message):
@@ -30,6 +32,10 @@ def regular(path, limit=1024 * 1024):
         require(not path.is_symlink() and stat.S_ISREG(metadata.st_mode) and metadata.st_size <= limit,
                 'expected a bounded regular file')
         return handle.read(limit + 1)
+
+
+def read_only(path):
+    return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
 
 
 def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
@@ -96,6 +102,13 @@ def guard(info):
     for name in ('identity.json', 'data-epoch.json', 'config.json', 'node.lock', 'tls-cert.pem', 'tls-key.pem'):
         path = DATA / name
         require(not path.is_symlink() and path.is_file(), 'initialized Node files are required')
+    # The host's certificate client writes these as root, so they come mounted read-only from a root
+    # directory and this process can change neither.
+    for name in TLS_FILES:
+        metadata = (DATA / name).lstat()
+        require(metadata.st_uid == TLS_OWNER and not metadata.st_mode & 0o022 and read_only(DATA / name)
+                and os.access(DATA / name, os.R_OK),
+                'TLS files must be mounted read-only from the root-owned TLS directory')
     epoch = json.loads(regular(DATA / 'data-epoch.json', 4096))
     require(epoch == {'data_epoch': info['data_epoch']} and type(epoch['data_epoch']) is int,
             'data epoch differs; no migration or initialization is allowed')
@@ -199,10 +212,30 @@ def self_test():
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',
                'VIBEFACE_EXPECTED_SOURCE': 'a' * 40}
         module = sys.modules[__name__]
+        for name in TLS_FILES:
+            (data / name).chmod(0o640 if name == 'tls-key.pem' else 0o644)
         with patch.object(module, 'DATA', data), patch.object(module, 'ROOT', directory), \
-                patch.dict(os.environ, env), \
+                patch.dict(os.environ, env), patch.object(module, 'TLS_OWNER', os.geteuid()), \
+                patch.object(module, 'read_only', return_value=True), \
                 patch.object(module, 'inspect', return_value={'device_id': 'b' * 64, 'core_version': '1.0.0'}):
             assert guard(info)['device_id'] == 'b' * 64
+            for unsafe in (patch.object(module, 'read_only', return_value=False),
+                           patch.object(module, 'TLS_OWNER', os.geteuid() + 1)):
+                with unsafe:
+                    try:
+                        guard(info)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('TLS files the Node could replace accepted')
+            (data / 'tls-key.pem').chmod(0o660)
+            try:
+                guard(info)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('a group-writable TLS key accepted')
+            (data / 'tls-key.pem').chmod(0o640)
             (directory / 'public-bootstrap.json').write_text(json.dumps(dict(anchor, issuer='c' * 64)))
             try:
                 guard(info)

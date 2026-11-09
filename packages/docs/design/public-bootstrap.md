@@ -8,7 +8,7 @@
 
 `--bootstrap off` 关闭公共引导。自建服务用 `--bootstrap 'vibeface://<设备编号>@<主机>:<UDP 端口>'` 指定，自建配置不在失败时切到官方服务。
 
-公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次（`issuer`、`udp_host`、`udp_port`、`gateway_url`），Core 用 `include_str!` 编入。网页和手机客户端在构建时导入同一文件，取 `gateway_url` 作为默认接入地址；用户可在设置里改成自己的 Gateway，存在本设备上。
+公共节点的设备编号和地址只在 `config/public-bootstrap.json` 定义一次（`issuer`、`udp_host`、`udp_port`、`gateway_url`），Core 用 `include_str!` 编入。网页和 App 在构建时导入同一文件。由某台 Node 经 HTTP(S) 提供的页面以该页面的 origin 为默认接入地址；官方页面 `https://app.vibeface.dev`，以及页面来自自身包、origin 不是 `http:`/`https:` 的 App（如桌面端的 `vibeface-app://app`），取 `gateway_url` 作为默认接入地址。用户可在设置里改成自己的 Gateway，存在本设备上。
 
 ## 发现与 Relay
 
@@ -18,7 +18,7 @@ Relay 默认只接纳自己、本网络的 Node 和持邀请令牌的加入者�
 
 ## 浏览器接入
 
-`app.vibeface.dev` 是静态网页，不转发任何接口。浏览器直接连公共节点的 `gateway_url`（`https://node.vibeface.dev:4792`，DNS-only 解析到 `8.217.72.118`，不经代理）：`/api/client`、`/api/info` 和 `/api/decision` 都在这个地址上。公共节点以它为 `public_url` 检查 Host，`allowed_origins` 包含 `https://app.vibeface.dev`，所以官方页面的跨源 WebSocket 和 `/api/info` 被接受。这个端口的证书是 Let's Encrypt 签给该域名的证书（自建纯 IP 节点用短期 IP 证书），宿主 acme.sh 续期后写进数据目录，Core 不重启就换用；限额按浏览器的真实 TCP 地址计。网页 CSP 的 `connect-src` 为 `'self' https: ws: wss:`，因为接入地址可由用户改成任意 Gateway，不能在静态头里列举主机。浏览器在 `connect` 帧里指定设备编号，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
+`app.vibeface.dev` 是静态网页，不转发任何接口。浏览器直接连公共节点的 `gateway_url`（`https://node.vibeface.dev:4792`，DNS-only 解析到 `8.217.72.118`，不经代理）：`/api/client`、`/api/info` 和 `/api/decision` 都在这个地址上。公共节点以它为 `public_url` 检查 Host，`allowed_origins` 包含 `https://app.vibeface.dev`，所以官方页面的跨源 WebSocket 和 `/api/info` 被接受。这个端口的证书是 Let's Encrypt 签给该域名的证书（自建纯 IP 节点用短期 IP 证书），宿主 root 的 acme.sh 续期后原地写进 root 所有的 TLS 目录，该目录的文件以只读方式挂进容器，Core 不重启就换用；限额按浏览器的真实 TCP 地址计，接入端口另限总连接数和每个地址的连接数，并关闭迟迟不发请求头的连接。网页 CSP 的 `connect-src` 为 `'self' https: ws: wss:`，因为接入地址可由用户改成任意 Gateway，不能在静态头里列举主机。浏览器在 `connect` 帧里指定设备编号，公共节点经发现服务找到这台 Node，只搬运 Noise 密文。
 
 转发名额用完时，新会话排队并收到 `{"type":"queued","position":n}`，页面显示“排队中，第 n 位”；队列也满时回 `gateway_busy`。同一浏览器地址的连接超出份额时，在升级前直接拒绝。每个会话的速率也受限。Node 默认不限速、不排队，只有官方公共节点在部署配置里设上限，见 [`deploy/README.md`](../../../deploy/README.md)。
 

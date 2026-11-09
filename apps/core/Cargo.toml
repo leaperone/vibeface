@@ -19,6 +19,8 @@ ed25519-dalek.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 k256 = { version = "0.13", features = ["ecdsa"] }
 iroh.workspace = true
@@ -39,6 +41,7 @@ tar.workspace = true
 tokio.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite.workspace = true
+tower-service = "0.3"
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

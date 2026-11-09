@@ -8,12 +8,14 @@ export const APP_ORIGIN = 'https://app.vibeface.dev'
 export const PUBLIC_GATEWAY: string = publicBootstrap.gateway_url
 
 /**
- * Where this device reaches a Node by device ID, as a join link names one: the Node that served this page, which
- * takes its own origin; the official public node for the official page and the apps, which have none; or the
- * address the person chose instead.
+ * Where this device reaches a Node by device ID, as a join link names one, unless the person chose another: the Node
+ * that served this page over HTTP(S), which takes its own origin; otherwise the official public node, for the official
+ * page and for the apps, whose pages come from their own bundle (`vibeface-app://app` on the desktop).
  */
 export function defaultGateway(pageOrigin: string | undefined): string {
-  return pageOrigin && pageOrigin !== APP_ORIGIN ? pageOrigin : PUBLIC_GATEWAY
+  let served = false
+  try { served = !!pageOrigin && ['http:', 'https:'].includes(new URL(pageOrigin).protocol) } catch { /* not a URL */ }
+  return served && pageOrigin !== APP_ORIGIN ? pageOrigin! : PUBLIC_GATEWAY
 }
 
 /** A chosen access address as stored, or null when there is none or it no longer validates. */

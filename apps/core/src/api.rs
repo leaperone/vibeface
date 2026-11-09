@@ -14,8 +14,11 @@ use serde_json::{Value, json};
 use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
+    task::Poll,
     time::Duration,
 };
 use tokio::net::TcpListener;
@@ -195,21 +198,10 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
     node.tools_ready(tool_url)?;
     tokio::try_join!(
         async {
-            let service = browser_router_with_assets(node.clone(), sites, false, assets.clone())
-                .into_make_service_with_connect_info::<SocketAddr>();
-            match (listener, tls) {
-                (Some(tcp), Some(files)) => {
-                    use axum::serve::ListenerExt as _;
-                    let listener = TlsListener {
-                        tcp,
-                        files,
-                        handshakes: Default::default(),
-                    };
-                    // `tap_io` is how axum hands a custom listener's peer address to ConnectInfo.
-                    axum::serve(listener.tap_io(|_| {}), service).await
-                }
-                (Some(listener), None) => axum::serve(listener, service).await,
-                (None, _) => std::future::pending().await,
+            let router = browser_router_with_assets(node.clone(), sites, false, assets.clone());
+            match listener {
+                Some(tcp) => serve_public(tcp, tls, router, PUBLIC).await,
+                None => std::future::pending().await,
             }
         },
         async {
@@ -323,45 +315,142 @@ fn tls_acceptor(dir: &Path) -> Result<(tokio_rustls::TlsAcceptor, String)> {
     Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), leaf))
 }
 
-/// The public listener under `tls`. Handshakes run apart, so a slow client holds up no other.
-struct TlsListener {
-    tcp: TcpListener,
-    files: TlsFiles,
-    handshakes: tokio::task::JoinSet<Option<(TlsStream, SocketAddr)>>,
+/// What `listen` admits. Anyone may reach it, so each connection holds a place until it closes,
+/// or until the WebSocket it became does.
+#[derive(Clone, Copy)]
+struct Admission {
+    connections: usize,
+    /// Per client address, an IPv4 address or IPv6 /56 as the relay counts them.
+    per_address: NonZeroUsize,
+    /// How long a connection may take to send a request head, just connected or idle after its
+    /// last response.
+    request_head: Duration,
 }
 
-type TlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+/// Room for the official forwarding limits (32 sessions, 192 queued, 8 per address) and a
+/// browser's own HTTP connections, far below the descriptors the relay and discovery service in
+/// this process also need.
+const PUBLIC: Admission = Admission {
+    connections: 1024,
+    per_address: NonZeroUsize::new(32).unwrap(),
+    request_head: Duration::from_secs(20),
+};
 
-impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (TlsStream, SocketAddr) {
-        loop {
-            tokio::select! {
-                Some(joined) = self.handshakes.join_next() => {
-                    if let Ok(Some(accepted)) = joined {
-                        return accepted;
-                    }
-                }
-                accepted = self.tcp.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        let acceptor = self.files.current();
-                        self.handshakes.spawn(async move {
-                            let accepting = acceptor.accept(stream);
-                            let stream = tokio::time::timeout(TLS_HANDSHAKE, accepting).await;
-                            Some((stream.ok()?.ok()?, peer))
-                        });
-                    }
-                    // Out of descriptors, say; retrying at once would spin.
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                },
+/// Serves `listen`, over TLS when `tls` is set. A connection past either limit is closed unread.
+async fn serve_public(
+    tcp: TcpListener,
+    mut tls: Option<TlsFiles>,
+    router: Router,
+    admission: Admission,
+) -> std::io::Result<()> {
+    let places = Arc::new(tokio::sync::Semaphore::new(admission.connections));
+    let addresses = crate::net::Shares::default();
+    loop {
+        let (stream, peer) = match tcp.accept().await {
+            Ok(accepted) => accepted,
+            // Out of descriptors, say; retrying at once would spin.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-        }
+        };
+        let Ok(place) = places.clone().try_acquire_owned() else {
+            continue;
+        };
+        let Some(share) = addresses.take(peer.ip(), admission.per_address) else {
+            continue;
+        };
+        let held = (place, share);
+        let acceptor = tls.as_mut().map(TlsFiles::current);
+        let router = router.clone();
+        // Handshakes run apart, so a slow client holds up no other.
+        tokio::spawn(async move {
+            let Some(acceptor) = acceptor else {
+                return serve_connection(stream, held, peer, router, admission).await;
+            };
+            let accepting = tokio::time::timeout(TLS_HANDSHAKE, acceptor.accept(stream));
+            if let Ok(Ok(stream)) = accepting.await {
+                serve_connection(stream, held, peer, router, admission).await;
+            }
+        });
+    }
+}
+
+async fn serve_connection<I>(
+    io: I,
+    held: (tokio::sync::OwnedSemaphorePermit, crate::net::Share),
+    peer: SocketAddr,
+    router: Router,
+    admission: Admission,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |mut request: Request<hyper::body::Incoming>| {
+        request.extensions_mut().insert(ConnectInfo(peer));
+        tower_service::Service::call(&mut router.clone(), request)
+    });
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(admission.request_head);
+    let _ = http
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(Admitted { io, _held: held }),
+            service,
+        )
+        .with_upgrades()
+        .await;
+}
+
+/// A connection and its admission, given back when the connection, or the WebSocket it became,
+/// closes.
+struct Admitted<I> {
+    io: I,
+    _held: (tokio::sync::OwnedSemaphorePermit, crate::net::Share),
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Admitted<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Admitted<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
     }
 
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.tcp.local_addr()
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -1209,6 +1298,106 @@ mod tests {
         assert_eq!(files.leaf, fingerprint(&next.0));
         assert!(files.failed.is_none());
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// `listen` closes a connection past its address's share unread, and one that sends no
+    /// request head in time, just connected or idle after a response; a WebSocket stays open.
+    #[tokio::test]
+    async fn the_public_listener_bounds_each_address_and_silent_connections() -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            net::TcpStream,
+        };
+        use tokio_tungstenite::tungstenite::Message;
+        let router =
+            Router::new()
+                .route(
+                    "/",
+                    get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                        peer.ip().to_string()
+                    }),
+                )
+                .route(
+                    "/ws",
+                    get(|upgrade: WebSocketUpgrade| async move {
+                        upgrade.on_upgrade(|mut socket| async move {
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if socket.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                    }),
+                );
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = tcp.local_addr()?;
+        let head = Duration::from_millis(300);
+        let admission = Admission {
+            connections: 16,
+            per_address: NonZeroUsize::new(2).unwrap(),
+            request_head: head,
+        };
+        let server = tokio::spawn(serve_public(tcp, None, router, admission));
+        // What the connection sends until it closes, or None while it stays open.
+        let until_closed = async |stream: &mut TcpStream| {
+            let (mut sent, mut buf) = (Vec::new(), [0; 1024]);
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                    Ok(Ok(0) | Err(_)) => return Some(sent),
+                    Ok(Ok(n)) => sent.extend_from_slice(&buf[..n]),
+                    Err(_) => return None,
+                }
+            }
+        };
+        let request = b"GET / HTTP/1.1\r\nHost: node\r\n\r\n";
+
+        let (mut socket, _) = tokio_tungstenite::client_async(
+            format!("ws://{addr}/ws"),
+            TcpStream::connect(addr).await?,
+        )
+        .await?;
+        let mut silent = TcpStream::connect(addr).await?;
+        let mut third = TcpStream::connect(addr).await?;
+        let _ = third.write_all(request).await;
+        assert_eq!(
+            until_closed(&mut third).await,
+            Some(vec![]),
+            "a third connection from one address is closed unread"
+        );
+        let started = std::time::Instant::now();
+        assert!(until_closed(&mut silent).await.is_some());
+        assert!(
+            started.elapsed() < head * 4,
+            "a silent connection is closed"
+        );
+
+        tokio::time::sleep(head * 2).await;
+        socket.send(Message::text("still here")).await?;
+        assert_eq!(
+            socket.next().await.context("echo")??,
+            Message::text("still here"),
+            "a WebSocket outlives the request head timeout"
+        );
+
+        let mut idle = TcpStream::connect(addr).await?;
+        idle.write_all(request).await?;
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"127.0.0.1") {
+            let mut buf = [0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut buf)).await??;
+            ensure!(n > 0, "closed before answering");
+            answer.extend_from_slice(&buf[..n]);
+        }
+        assert!(answer.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(
+            until_closed(&mut idle).await,
+            Some(vec![]),
+            "a kept-alive connection that asks nothing more is closed"
+        );
+        drop(socket);
+        server.abort();
         Ok(())
     }
 

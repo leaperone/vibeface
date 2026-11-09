@@ -28,6 +28,10 @@ DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
 HEADER_NAMES = {'content-security-policy', 'x-content-type-options', 'x-frame-options',
                 'referrer-policy', 'cache-control', 'x-vibeface-source', 'x-vibeface-version'}
 STATIC_REGEX = r'\.(?:js|wasm|css|woff2?|svg|png|ico|json|webmanifest)$'
+# Mounted one by one over the Node's own copies, so a certificate client must rewrite them in place.
+TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
+UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/usr/local/lib/systemd/system',
+             '/usr/lib/systemd/system', '/lib/systemd/system')
 
 
 def require(condition, message):
@@ -46,7 +50,7 @@ def validate_config(config):
     common = {'project', 'role', 'deploy_dir', 'listen'}
     require(isinstance(config, dict) and config.get('role') in ROLES, 'invalid service role')
     core = config['role'] in CORE_ROLES
-    required = common | ({'data_dir', 'device_id', 'uid', 'gid'} if core else {'nginx_config', 'server_name'})
+    required = common | ({'data_dir', 'tls_dir', 'device_id', 'uid', 'gid'} if core else {'nginx_config', 'server_name'})
     # A Node that replaces a host service names it and its maintenance socket; a fresh install names neither.
     legacy = {'legacy_service', 'maintenance_socket'} if core else set()
     require(required <= config.keys() and config.keys() <= required | legacy | {'public_url'}
@@ -57,7 +61,7 @@ def validate_config(config):
     host = '0.0.0.0' if config['role'] in CORE_ROLES else '127.0.0.1'
     require(re.fullmatch(re.escape(host) + r':[1-9][0-9]{0,4}', config['listen'])
             and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit port on ' + host)
-    for name in ('deploy_dir', 'data_dir', 'nginx_config', 'maintenance_socket'):
+    for name in ('deploy_dir', 'data_dir', 'tls_dir', 'nginx_config', 'maintenance_socket'):
         if name in config:
             canonical_path(config[name])
     if config['role'] in CORE_ROLES:
@@ -66,9 +70,9 @@ def validate_config(config):
                 and ('legacy_service' not in config
                      or re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service'])),
                 'invalid existing service identity')
-        data, deploy = Path(config['data_dir']), Path(config['deploy_dir'])
-        require(data != deploy and data not in deploy.parents and deploy not in data.parents,
-                'deployment files and Node data must be separate')
+        paths = [Path(config[name]) for name in ('data_dir', 'deploy_dir', 'tls_dir')]
+        require(all(a != b and a not in b.parents for a in paths for b in paths if a is not b),
+                'deployment files, Node data and TLS files must be separate')
     if 'nginx_config' in config:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', config['server_name']), 'invalid nginx server name')
     if 'public_url' in config:
@@ -224,7 +228,9 @@ def compose_runtime(config, image, version, source, fingerprint):
         service.update(network_mode='host', user=f'{config["uid"]}:{config["gid"]}',
                        environment=core_environment(config, version, source),
                        volumes=[{'type': 'bind', 'source': config['data_dir'], 'target': '/data',
-                                 'bind': {'create_host_path': False}}],
+                                 'bind': {'create_host_path': False}},
+                                *({'type': 'bind', 'source': config['tls_dir'] + '/' + name, 'target': '/data/' + name,
+                                   'read_only': True, 'bind': {'create_host_path': False}} for name in TLS_FILES)],
                        # Each relay or browser connection takes descriptors; containers often start
                        # with a soft limit of 1024.
                        ulimits={'nofile': {'soft': 65536, 'hard': 65536}})
@@ -232,6 +238,19 @@ def compose_runtime(config, image, version, source, fingerprint):
         service.update(user='101:101', ports=[{'target': 8080, 'published': config['listen'].split(':')[1],
                                              'host_ip': '127.0.0.1', 'protocol': 'tcp'}])
     return {'services': {'service': service}}
+
+
+def tls_directory(config, owner=0):
+    """The root directory the host's certificate client writes, which the Node may read but not change."""
+    tls = checked_path(Path(config['tls_dir']))
+    metadata = tls.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == config['gid']
+            and stat.S_IMODE(metadata.st_mode) == 0o750, 'TLS directory must be root:gid with mode 0750')
+    for name, group, mode in (('tls-cert.pem', None, 0o644), ('tls-key.pem', config['gid'], 0o640)):
+        metadata = checked_path(tls / name).lstat()
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and stat.S_IMODE(metadata.st_mode) == mode
+                and group in (None, metadata.st_gid), 'TLS certificate must be root 0644 and its key root:gid 0640')
+    return tls
 
 
 def image_preflight(config, image, tag, source, version):
@@ -254,8 +273,11 @@ def image_preflight(config, image, tag, source, version):
         epoch = read_json(data / 'data-epoch.json')
         require(epoch == {'data_epoch': component['data_epoch']} and type(epoch['data_epoch']) is int,
                 'data epoch differs; migration is not allowed')
+        tls = tls_directory(config)
         options = ['--user', f'{config["uid"]}:{config["gid"]}', '--tmpfs', '/tmp:rw,nosuid,noexec,mode=1777',
                    '--mount', f'type=bind,src={data},dst=/data,readonly']
+        for name in TLS_FILES:
+            options.extend(('--mount', f'type=bind,src={tls / name},dst=/data/{name},readonly'))
         for key, value in core_environment(config, version, source).items():
             options.extend(('--env', key + '=' + value))
         docker('run', '--rm', '--network', 'none', '--read-only', *options, image, 'guard')
@@ -397,6 +419,23 @@ def legacy_channel(config, request):
         yield value['health']
     finally:
         stream.close()
+
+def units_using(path, roots=UNIT_DIRS):
+    """Unit files and drop-ins naming `path` or a path under it in any field, read as text for systemd 219."""
+    pattern = re.compile(re.escape(path) + r'(?![\w.-])')
+    found = set()
+    for root in roots:
+        for directory, _, names in os.walk(root):
+            for name in names:
+                unit = Path(directory) / name
+                try:
+                    if unit.is_file() and unit.stat().st_size <= 1024 * 1024 \
+                            and pattern.search(unit.read_text(errors='replace')):
+                        found.add(str(unit))
+                except OSError:
+                    continue
+    return sorted(found)
+
 
 @contextmanager
 def node_lock(config):
@@ -568,7 +607,11 @@ def activate(config, image, tag, source, version):
                 command('systemctl', 'is-active', '--quiet', config['legacy_service'])
                 journal['legacy_enabled'] = command('systemctl', 'is-enabled', config['legacy_service'], check=False).stdout.strip() == 'enabled'
             elif not current:
-                # A fresh install: no service of this project may already run on this data.
+                # A fresh install: no service of this project may already run on this data, and no host
+                # service may own it either; one that does is replaced only as `legacy_service`.
+                units = units_using(config['data_dir'])
+                require(not units, 'systemd units use the data directory; configure legacy_service to replace '
+                        + ', '.join(units))
                 stopped(target)
         write_json(journal_path, journal)
         try:
@@ -641,7 +684,8 @@ def self_test():
                 else:
                     raise AssertionError('accepted an ambiguous imported image')
     config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
-              'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'device_id': 'a' * 64,
+              'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'tls_dir': '/etc/official-node/tls',
+              'device_id': 'a' * 64,
               'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
               'maintenance_socket': '/tmp/private-node/maintenance.sock'}
     app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
@@ -650,6 +694,8 @@ def self_test():
     fresh = {key: item for key, item in config.items() if key not in ('legacy_service', 'maintenance_socket')}
     validate_config(config); validate_config(app); validate_config(fresh)
     for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
+                               (config, 'tls_dir', None), (config, 'tls_dir', '/var/lib/official-node/tls'),
+                               (config, 'tls_dir', '/srv/service-control/node'),
                                (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
                                (config, 'legacy_service', '--help'), (config, 'legacy_service', None),
                                (config, 'maintenance_socket', None),
@@ -668,6 +714,9 @@ def self_test():
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
     assert runtime['environment']['VIBEFACE_ROLE'] == 'node'
     assert runtime['ulimits'] == {'nofile': {'soft': 65536, 'hard': 65536}}
+    assert [(v['source'], v['target'], v.get('read_only')) for v in runtime['volumes'][1:]] == [
+        ('/etc/official-node/tls/tls-cert.pem', '/data/tls-cert.pem', True),
+        ('/etc/official-node/tls/tls-key.pem', '/data/tls-key.pem', True)]
     nginx = '''server { listen 80; server_name app.example.invalid; return 301 https://$host$request_uri; }
 server {
     listen 443 ssl;
@@ -802,6 +851,34 @@ server {
             except ValueError:
                 pass
         assert not events
+        tls = directory / 'tls'; tls.mkdir(); tls.chmod(0o750)
+        (tls / 'tls-cert.pem').write_text('cert'); (tls / 'tls-cert.pem').chmod(0o644)
+        (tls / 'tls-key.pem').write_text('key'); (tls / 'tls-key.pem').chmod(0o640)
+        owned = dict(config, tls_dir=str(tls), gid=os.getegid())
+        assert tls_directory(owned, owner=os.geteuid()) == tls
+        for unsafe in (lambda: (tls / 'tls-key.pem').chmod(0o660), lambda: (tls / 'tls-key.pem').chmod(0o644),
+                       lambda: tls.chmod(0o770), lambda: owned.update(gid=os.getegid() + 1)):
+            unsafe()
+            try:
+                tls_directory(owned, owner=os.geteuid())
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('TLS files the Node could change or not read accepted')
+            tls.chmod(0o750); (tls / 'tls-key.pem').chmod(0o640); owned['gid'] = os.getegid()
+        try:
+            tls_directory(owned)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('TLS files not owned by root accepted')
+        units = directory / 'units'; (units / 'old.service.d').mkdir(parents=True)
+        (units / 'other.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir /var/lib/official-node2\n')
+        assert units_using('/var/lib/official-node', [str(units)]) == []
+        (units / 'old.service.d' / 'data.conf').write_text('[Service]\nWorkingDirectory=/var/lib/official-node\n')
+        (units / 'old.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir=/var/lib/official-node/\n')
+        assert units_using('/var/lib/official-node', [str(units)]) == [
+            str(units / 'old.service'), str(units / 'old.service.d' / 'data.conf')]
         data = directory / 'data'; data.mkdir(); (data / 'identity.json').write_text('keep')
         (data / 'escape').symlink_to(directory)
         try:
