@@ -36,7 +36,7 @@ CRATES = {
     "delivery": "vibeface-delivery",
 }
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
+    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
@@ -69,12 +69,12 @@ DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
-    ("default", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/discovery.rs", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
+    ("default", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
     ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
     ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
     ("public-node", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
-    ("discovery", ("config/public-bootstrap.json", "apps/core/src/discovery.rs", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
+    ("mesh", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
     ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
     ("delivery-charity", PATH_RULES[0][1]),
 )
@@ -433,7 +433,7 @@ def self_test():
     assert web["local_process_modes"] == []
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
-    assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "discovery"]
+    assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "mesh"]
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]
@@ -458,8 +458,8 @@ def self_test():
         ("apps/core/src/store/log.rs", ["memory-sync", "default", "phase1", "phase5"]),
         ("apps/core/src/store/sync.rs", ["memory-sync", "default", "phase4", "phase5"]),
         ("apps/core/src/identity.rs", ["memory-sync", "auto-route", "default", "phase4", "public-node", "phase5"]),
-        ("apps/core/src/net.rs", ["auto-route", "default", "phase4", "public-node", "discovery", "delivery-charity"]),
-        ("apps/core/src/runtime/peers.rs", ["default", "phase4", "public-node", "discovery", "delivery-charity"]),
+        ("apps/core/src/net.rs", ["auto-route", "default", "phase4", "public-node", "mesh", "delivery-charity"]),
+        ("apps/core/src/runtime/peers.rs", ["default", "phase4", "public-node", "mesh", "delivery-charity"]),
         ("apps/core/src/runtime/codex_server.rs", ["chat-agent"]),
         ("crates/secure/src/recovery.rs", ["memory-sync", "auto-route", "default", "phase5"]),
         ("crates/bridge/src/codex.rs", ["chat-agent", "phase4"]),
@@ -469,8 +469,8 @@ def self_test():
     combined = make_plan(["apps/core/src/store/bot_settings.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bot_settings.rs"])
     assert combined["local_process_modes"] == ["memory-sync", "default", "phase1", "chat-agent", "phase4", "phase5"]
     for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs", "crates/protocol/src/lib.rs"):
-        assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5"]
-    assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5", "delivery-charity"]
+        assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5"]
+    assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5", "delivery-charity"]
     assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
     expected = {
         "node": ["vibeface-core"],
@@ -488,7 +488,7 @@ def self_test():
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/control/src/lib.rs"])["node"]
     assert make_plan(["crates/control/src/lib.rs"])["rust_packages"] == expected["control"]
-    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "crates/delivery/proof/guest/src/main.rs", "crates/delivery/proof/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
+    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "crates/delivery/proof/guest/src/main.rs", "crates/delivery/proof/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
         selected = make_plan([path])
         assert selected["scopes"] == ["delivery"] and selected["delivery"]
         assert selected["rust_packages"] == expected["delivery"] and selected["web"]
@@ -622,7 +622,7 @@ def self_test():
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
         assert set(paths) == {"README.md", "README.zh-CN.md", "apps/core/src/old.rs", "apps/app/old.rs"}
         assert make_plan(paths)["rust_packages"] == ["vibeface-core"]
-        assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "discovery", "phase5"]
+        assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         git("checkout", "--quiet", "--detach", base, cwd=directory)
         upstream = Path(directory) / "docs/upstream.md"

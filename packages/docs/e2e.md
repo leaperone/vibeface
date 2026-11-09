@@ -32,10 +32,10 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 
 `workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
-公共入网使用同一文件导出的 `bootstrapTest`。测试页面由一台公共节点提供，它在随机网络名的全网里当 bootstrap 节点，提供开放 relay 和面向任何设备的浏览器转发；成员 Node 只把这台公共节点配成 bootstrap 节点，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取助手列表，刷新后仍能连上。普通夹具的 Node 不入全网（`--no-mesh`），本机页面不连接官方服务。
+公共入网使用同一文件导出的 `meshTest`。测试页面由一台公共节点提供，它在随机网络名的全网里当 bootstrap 节点，提供开放 relay 和面向任何设备的浏览器转发；成员 Node 只把这台公共节点配成 bootstrap 节点，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取助手列表，刷新后仍能连上。普通夹具的 Node 不入全网（`--no-mesh`），本机页面不连接官方服务。
 
 ```sh
-pnpm exec e2e run --config tests/e2e/e2e.config.ts bootstrap.e2e.ts
+pnpm exec e2e run --config tests/e2e/e2e.config.ts mesh.e2e.ts
 ```
 
 只运行核心测试或显示浏览器：
@@ -63,9 +63,9 @@ python3 scripts/verify-node.py --delivery-charity \
   --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe
 ```
 
-该模式运行四个全新 Node，验证免费签名目录、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品发现代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共节点，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
+该模式运行四个全新 Node，验证免费全网记录（另列一台不可达的 bootstrap 节点）、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品全网记录代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共节点，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
 
-构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌发现代码的 SHA-256，拒绝使用其他源码的旧 probe。
+构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌全网记录代码（`apps/core/src/net/mesh/record.rs`）的 SHA-256，拒绝使用其他源码的旧 probe。
 
 ## 验证付费交付和实际结算
 

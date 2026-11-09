@@ -103,6 +103,5 @@ test('forwards an encrypted charity file between separate networks and survives 
   const state = await network.inspect();
   expect(state.wallet_files).toBe(0);
   expect(state.chain_rpc_calls).toBe(0);
-  expect(state.pkarr_reads).toBeGreaterThan(0);
-  expect(state.pkarr_writes).toBeGreaterThan(0);
+  expect(state.mesh_records).toBe(3);
 });

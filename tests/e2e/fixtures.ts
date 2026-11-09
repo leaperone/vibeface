@@ -62,7 +62,7 @@ export const test = base.extend<{ node: NodeInfo }>({
 export type DeliveryFixture = {
   source: NodeInfo; receiver: NodeInfo; provider: NodeInfo;
   restart(role: Role, crash?: boolean): Promise<void>;
-  inspect(): Promise<{ wallet_files: number; pkarr_reads: number; pkarr_writes: number; chain_rpc_calls: number }>;
+  inspect(): Promise<{ wallet_files: number; mesh_records: number; chain_rpc_calls: number }>;
 };
 export const deliveryTest = base.extend<{ network: DeliveryFixture }>({
   network: async ({ app }, use) => {
@@ -81,7 +81,7 @@ export const deliveryTest = base.extend<{ network: DeliveryFixture }>({
         async inspect() {
           const result = record(await call({ op: 'inspect' }));
           const integer = (value: unknown) => { assert(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0); return value; };
-          return { wallet_files: integer(result.wallet_files), pkarr_reads: integer(result.pkarr_reads), pkarr_writes: integer(result.pkarr_writes), chain_rpc_calls: integer(result.chain_rpc_calls) };
+          return { wallet_files: integer(result.wallet_files), mesh_records: integer(result.mesh_records), chain_rpc_calls: integer(result.chain_rpc_calls) };
         },
       });
     } finally { await call({ op: 'stop' }); }
@@ -145,37 +145,42 @@ export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
   },
 });
 
-type BootstrapInfo = { invitation: string; member: NodeInfo; gateway: NodeInfo };
-type BootstrapFixture = BootstrapInfo & {
+type MeshInfo = { invitation: string; member: NodeInfo; gateway: NodeInfo };
+type MeshFixture = MeshInfo & {
   pairing(): Promise<{ peer: string; code: string }>;
   approve(pairing: { peer: string; code: string }): Promise<void>;
 };
-function bootstrapInfo(value: unknown): BootstrapInfo {
-  const fields = record(value), members = nodes(value), source = record(fields.bootstrap);
+function meshInfo(value: unknown): MeshInfo {
+  const fields = record(value), members = nodes(value), mesh = record(fields.mesh);
   const member = node(members.member), gateway = node(members.public);
-  assert.equal(source.mode, 'custom');
-  assert.match(text(source.discovery), new RegExp(`^vibeface://${gateway.peer}@127\\.0\\.0\\.1:[0-9]+$`));
-  assert.deepEqual([fields.relays, fields.discovery], [[], []], 'The member configures nothing but that discovery');
+  assert.equal(mesh.enabled, true);
+  assert.match(text(mesh.network), /^t-[0-9a-f]{12}$/, 'The fixture mesh has its own random name');
+  assert(Array.isArray(mesh.bootstrap) && mesh.bootstrap.length === 1, 'The member has one bootstrap node');
+  assert.match(text(mesh.bootstrap[0]), new RegExp(`^vibeface://${gateway.peer}@127\\.0\\.0\\.1:[0-9]+$`),
+    'The member configures nothing but the page Node as its bootstrap node');
+  assert.deepEqual(fields.relays, [], 'The member configures no relay');
+  const announced = fields.announced_relays;
+  assert(Array.isArray(announced) && announced.length === 1, 'The page Node announces its volunteer relay on the mesh');
   return { invitation: text(fields.invitation), member, gateway };
 }
-export const bootstrapTest = base.extend<{ bootstrap: BootstrapFixture }>({
-  bootstrap: async ({ app }, use) => {
+export const meshTest = base.extend<{ mesh: MeshFixture }>({
+  mesh: async ({ app }, use) => {
     const call = await control(app.baseUrl);
     let primary: unknown;
     try {
-      await call({ op: 'reset', kind: 'bootstrap' });
-      const info = bootstrapInfo(await call({ op: 'bootstrap_info' }));
+      await call({ op: 'reset', kind: 'mesh' });
+      const info = meshInfo(await call({ op: 'mesh_info' }));
       assert(app.baseUrl);
       assert.equal(info.gateway.url, new URL(app.baseUrl).origin, 'The page is served by the public node');
       await use({ ...info,
         async pairing() {
-          const result = record(await call({ op: 'bootstrap_pairing' }));
+          const result = record(await call({ op: 'mesh_pairing' }));
           const peer = text(result.peer), code = text(result.code);
           assert(/^[a-f0-9]{64}$/.test(peer) && /^[0-9]{6}$/.test(code));
           return { peer, code };
         },
         async approve(pairing) {
-          const result = record(await call({ op: 'bootstrap_approve', ...pairing }));
+          const result = record(await call({ op: 'mesh_approve', ...pairing }));
           assert.equal(result.approved, true);
         },
       });

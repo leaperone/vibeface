@@ -457,7 +457,7 @@ async function createFixture(startNow = true) {
   const peerPort = await freePort(); const localPort = await freePort();
   await mkdir(fixtureRoot, { recursive: true });
   await run(cli, ['init', '--data-dir', dataDir, '--listen', `127.0.0.1:${peerPort}`,
-    '--local-listen', `127.0.0.1:${localPort}`, '--bootstrap', 'off'], { cwd: runtime });
+    '--local-listen', `127.0.0.1:${localPort}`, '--no-mesh'], { cwd: runtime });
   const inspected = await controlCore({ command: 'inspect', data_dir: dataDir });
   const fixture = { dataDir: inspected.data_dir, peerPort, localPort, deviceId: inspected.device_id, child: undefined };
   assert(typeof fixture.dataDir === 'string', 'Core reports the canonical fixture directory');
