@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, Bot, Check, ChevronRight, CircleCheck, Clock, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, ListPlus, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, SlidersHorizontal, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, Details, EmptyState, InlineError, PageActions, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
@@ -10,6 +10,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
+import { cn } from '@/lib/utils'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
@@ -25,8 +26,8 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { InputQueue, TargetContextButton, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
+import { DropdownMenu } from 'radix-ui'
+import { InputQueue, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
 import type { InputIntent, InputTarget } from '@vibeface/client/workspace/types.ts'
 import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -82,10 +83,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
   const sendDisabled = !workspace.canSaveMessages || !bot || !canSend({ ...gate, busy: false })
   const botBusy = activeJobs.length > 0
-  const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('work:') ? { kind: 'work', work_id: selectedTarget.slice(5) } : selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
-  const selectedWork = inputTarget?.kind === 'work' ? data?.works.find((work) => work.work_id === inputTarget.work_id) : undefined
-  const stopSharing = selectedWork?.turn_id ? (data?.works ?? []).filter((work) => !work.outcome && work.thread_id === selectedWork.thread_id && work.turn_id === selectedWork.turn_id) : []
-  const targetBusy = inputTarget?.kind === 'work' ? Boolean(selectedWork && !selectedWork.outcome) : inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : botBusy
+  const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
+  const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : botBusy
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
@@ -105,7 +104,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     const attention = state === 'waiting' || confirming.has(work.work_id) || currentWorks.has(work.work_id) && (taskStale(state, workspace.connectionOnline) || ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified', 'unknown', 'unverified', 'awaiting_confirmation'].includes(state))
     return { id: work.work_id, state, attention, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work), trigger: work.trigger, work, joined: joined?.title }
   })
-  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting' || task.state === 'awaiting_children')
   const groups = new Map<string, TaskRow[]>()
   for (const task of tasks) groups.set(task.trigger, [...groups.get(task.trigger) ?? [], task])
 
@@ -226,8 +224,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
 
   const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
-    : workspace.writeNotice ? '同步中，稍后可发送'
-    : targetBusy && !sendDisabled ? '可以继续补充要求，处理状态会显示在消息下方。' : ''
+    : workspace.writeNotice ? '同步中，稍后可发送' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = toAnswer.length + cards.length
@@ -312,7 +309,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         disabled={sendDisabled}
         busy={false}
         sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
-        target={<><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · {bot.name}</span><NativeSelect size="sm" aria-label="输入目标" value={selectedTarget} onChange={(event) => setSelectedTarget(event.currentTarget.value)}><NativeSelectOption value="main">主聊天</NativeSelectOption>{openTasks.map((task) => <NativeSelectOption key={task.id} value={`work:${task.id}`}>{task.work.title || '工作'}</NativeSelectOption>)}{selectedWork && !openTasks.some((task) => task.id === selectedWork.work_id) ? <NativeSelectOption value={`work:${selectedWork.work_id}`}>{selectedWork.title || '工作'} · 已结束</NativeSelectOption> : null}{(data?.scopeJobs ?? []).filter((job) => job.lane === 'schedule_routine' && (busyStates.includes(job.state) || selectedTarget === `routine:${job.trigger}`)).map((job) => <NativeSelectOption key={job.trigger} value={`routine:${job.trigger}`}>例行任务 · {scheduleName(job.trigger, data?.bot_settings, changes)}</NativeSelectOption>)}{inputTarget.kind === "routine" && !(data?.scopeJobs ?? []).some((job) => job.lane === "schedule_routine" && job.trigger === inputTarget.trigger) ? <NativeSelectOption value={selectedTarget}>例行任务 · 状态待查询</NativeSelectOption> : null}</NativeSelect><NativeSelect size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === 'continue' || value === 'new_task' || value === 'defer') setIntent(value) }}><NativeSelectOption value="continue">{targetBusy ? '补充当前工作' : '发送'}</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer">稍后处理</NativeSelectOption></NativeSelect><TargetContextButton key={JSON.stringify(inputTarget)} target={inputTarget} conversationId={conversationId} /><InputQueue target={inputTarget} /></>}
+        tools={<IntentMenu intent={intent} busy={targetBusy} onChange={setIntent} />}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}
@@ -328,8 +325,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {inputTarget.kind !== "bot_main" ? <p className="basis-full">上方是 Bot 主聊天记录，当前输入补充所选工作。</p> : null}
-        {stopSharing.length > 1 ? <p className="basis-full text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</p> : null}
+        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" className="max-md:min-h-11" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
+        <InputQueue target={inputTarget} />
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
@@ -441,4 +438,34 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
     {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
     {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
   </div>
+}
+
+const intents = [
+  { value: 'continue', label: '发送', icon: Send },
+  { value: 'new_task', label: '新任务', icon: ListPlus },
+  { value: 'defer', label: '稍后处理', icon: Clock },
+] as const
+
+/** How the next message goes, folded into one icon inside the box; the icon turns to the choice while it is not a plain send. */
+function IntentMenu({ intent, busy, onChange }: { intent: InputIntent; busy: boolean; onChange: (intent: InputIntent) => void }) {
+  const current = intents.find((item) => item.value === intent) ?? intents[0]
+  const label = (item: (typeof intents)[number]) => item.value === 'continue' && busy ? '补充当前工作' : item.label
+  return <DropdownMenu.Root>
+    <DropdownMenu.Trigger asChild>
+      <Button type="button" variant="ghost" size="icon-sm" className={cn('size-9 rounded-full max-md:size-11', intent === 'continue' ? 'text-muted-foreground hover:text-foreground' : 'bg-muted text-foreground')} aria-label={`发送方式：${label(current)}`} title="发送方式" onMouseDown={(event) => event.preventDefault()}>
+        {intent === 'continue' ? <SlidersHorizontal aria-hidden="true" /> : <current.icon aria-hidden="true" />}
+      </Button>
+    </DropdownMenu.Trigger>
+    <DropdownMenu.Portal>
+      <DropdownMenu.Content side="top" align="start" sideOffset={6} className="z-50 grid min-w-40 gap-0.5 rounded-xl border bg-popover p-1 text-popover-foreground shadow-lg">
+        <DropdownMenu.RadioGroup value={intent} onValueChange={(value) => { if (value === 'continue' || value === 'new_task' || value === 'defer') onChange(value) }}>
+          {intents.map((item) => <DropdownMenu.RadioItem key={item.value} value={item.value} className="flex min-h-9 cursor-default items-center gap-2 rounded-lg px-2.5 text-sm outline-none select-none data-highlighted:bg-muted max-md:min-h-11">
+            <item.icon aria-hidden="true" className="size-4 text-muted-foreground" />
+            <span className="flex-1">{label(item)}</span>
+            <DropdownMenu.ItemIndicator><Check aria-hidden="true" className="size-4" /></DropdownMenu.ItemIndicator>
+          </DropdownMenu.RadioItem>)}
+        </DropdownMenu.RadioGroup>
+      </DropdownMenu.Content>
+    </DropdownMenu.Portal>
+  </DropdownMenu.Root>
 }

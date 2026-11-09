@@ -1,14 +1,11 @@
-import { Link, Stack, router, useLocalSearchParams } from 'expo-router'
+import { Stack, router, useLocalSearchParams } from 'expo-router'
 import { useEffect } from 'react'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ListChecks, MessageSquare, Settings } from 'lucide-react-native'
-import { View } from 'react-native'
+import { MessageSquare } from 'lucide-react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { ConnectionMenu } from '@/components/connection-pill'
 import { ScreenFaces } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
 import { useWorkspace } from '@/data/context'
 import { HomeList, NewBotButton } from '@/features/home/list'
 import { useWide } from '@/lib/layout'
@@ -35,11 +32,7 @@ export default function Home() {
     <Stack.Screen options={{
       headerShown: true,
       headerLeft: () => <ConnectionMenu connection={workspace.connection} />,
-      headerRight: () => <View className="flex-row">
-        <Link href="/tasks" asChild><Button variant="ghost" size="icon" accessibilityLabel="任务"><Icon as={ListChecks} /></Button></Link>
-        <NewBotButton />
-        <Link href="/settings" asChild><Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} className="size-5" /></Button></Link>
-      </View>,
+      headerRight: () => <NewBotButton />,
     }} />
     <ScreenFaces><HomeList minHeight={Math.max(0, frame.height - bar - insets.bottom)} /></ScreenFaces>
   </>
