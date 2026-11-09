@@ -223,9 +223,12 @@ test('a join link and a bare ticket name the same ticket, and no other shape is 
   }
 })
 
-test('a join link names the entry Node only by device ID', async () => {
+test('a join link carries the entry Node\'s node link', async () => {
   const app = await harness()
-  const ticket = wasm.ticketEncode(app.target, '1'.repeat(64))
+  const entry = `vibeface://node/${app.target}?addr=203.0.113.5:4790&relay=https://relay.example`
+  assert.equal(JSON.parse(wasm.ticketDecode(wasm.ticketEncode(entry, '1'.repeat(64)))).entry, entry)
+  assert.throws(() => wasm.ticketEncode(app.target, '1'.repeat(64)), 'a bare device ID is no node link')
+  const ticket = wasm.ticketEncode(entry, '1'.repeat(64))
   const link = await app.parseJoinLink(`vibeface://join/${ticket}`)
   assert.deepEqual(Object.keys(link).sort(), ['entryId', 'inviteHash', 'inviteId', 'secret'])
   assert.equal(link.entryId, app.target)

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Copy, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Copy, Download, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { authenticationSourceLabels, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { authenticationSourceLabels, canSetProviderEnvironment, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -28,7 +28,7 @@ const install: Record<ProviderId, string> = {
 }
 const agents = docs + "node.md#使用-claude-codepi-或-opencode"
 const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-cli", claude: agents, pi: agents, opencode: agents }
-const services: Record<string, string> = { CURSOR_API_KEY: "Cursor", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
+const services: Record<string, string> = { OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
 /** A variable the provider needs, named after its service where there is one; the variable itself goes in a tooltip. */
 const keyName = (name: string) => services[name] ? `${services[name]} ${terms.secret.label}` : name
 
@@ -177,7 +177,9 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   const [busy, setBusy] = useState("")
   const [error, setError] = useState<Failure | null>(null)
   const sequence = useRef(0)
-  const connecting = useRef(false)
+  const connecting = useRef<typeof ready>(null)
+  const automaticallyConnected = useRef<typeof ready>(null)
+  const pendingFocus = useRef<typeof ready>(null)
   const [localResult, setLocalResult] = useState("")
   const [needsRead, setNeedsRead] = useState(false)
 
@@ -212,13 +214,19 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     } catch { /* the shown error already says what failed */ }
     return false
   }
-  useEffect(() => { setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
-  // A provider gets installed outside this page, so coming back to the page reads the device again.
+  useEffect(() => { pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
   useEffect(() => {
-    const back = () => { if (!busy) void reconcile() }
+    if (!ready || busy || needsRead || !response?.providers.some((item) => item.provider === "cursor") || automaticallyConnected.current === ready) return
+    automaticallyConnected.current = ready
+    void connectLocal(["cursor"])
+  }, [ready, response, busy, needsRead])
+  // CLI installation and login can change outside this page; read them again on return.
+  useEffect(() => {
+    if (ready && pendingFocus.current === ready) void connectLocal(["cursor"])
+    const back = () => { pendingFocus.current = ready; void connectLocal(["cursor"]) }
     window.addEventListener("focus", back)
     return () => window.removeEventListener("focus", back)
-  }, [ready, busy])
+  }, [ready, busy, needsRead])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
     try {
@@ -244,15 +252,16 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     } catch (cause) { if (owner === sequence.current && connection.isCurrent()) setError({ at: provider, cause }) }
     finally { if (owner === sequence.current) setBusy("") }
   }
-  async function connectLocal() {
-    if (!ready?.isCurrent() || busy || connecting.current || needsRead) return
+  async function connectLocal(providers: readonly ProviderId[] = localProviderIds) {
+    if (!ready?.isCurrent() || busy || connecting.current === ready || needsRead) return
     const connection = ready, owner = ++sequence.current
-    connecting.current = true
+    if (pendingFocus.current === connection) pendingFocus.current = null
+    connecting.current = connection
     setBusy("connect_local"); setError(null); setLocalResult("")
     const failures: string[] = []
     let reconciled = true
     try {
-      for (const provider of localProviderIds) {
+      for (const provider of providers) {
         if (owner !== sequence.current || !connection.isCurrent()) return
         try {
           const parsed = parseNodeSettings(await connection.request("configure_provider", { provider, connect_local: true }))
@@ -274,7 +283,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     } catch (cause) {
       if (owner === sequence.current && connection.isCurrent()) setError({ at: null, cause })
     } finally {
-      connecting.current = false
+      if (connecting.current === connection) connecting.current = null
       if (owner === sequence.current) setBusy("")
     }
   }
@@ -380,8 +389,8 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   useEffect(() => setBin(item.bin), [item.bin])
   const working = busy !== ""
   const launches = item.app_server?.mode !== "system"
-  const missingKey = compact && launches ? item.env.find((row) => row.required && !row.set && !row.inherited) : undefined
-  const issue: ProviderIssue | undefined = item.state === "needs_setup" ? item.issues[0] : compact && launches && !item.installed ? { code: "bin_missing", path: item.bin } : missingKey ? { code: "env_missing", name: missingKey.name } : undefined
+  const missingKey = compact && launches ? item.env.find((row) => row.required && !row.set && !row.inherited && canSetProviderEnvironment(item.provider, row.name)) : undefined
+  const issue: ProviderIssue | undefined = item.state === "needs_setup" ? item.issues.find((issue) => issue.code !== "env_missing" || canSetProviderEnvironment(item.provider, issue.name)) : compact && launches && !item.installed ? { code: "bin_missing", path: item.bin } : missingKey ? { code: "env_missing", name: missingKey.name } : undefined
   const server = item.app_server
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
@@ -401,11 +410,11 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
     </form>
   // Keyed by the roles, so switching one drops a test result that no longer matches what runs.
   const serverSettings = server ? <AppServerSettings key={item.roles.join()} server={server} home={item.home} sessions={item.sessions} display={display} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
-  const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
+  const setVariable = (key: string, name: string, next: string | null) => !canSetProviderEnvironment(item.provider, name) ? Promise.resolve(false) : change(key, { env: { [name]: next } })
     .then((ok) => { if (ok) toast(next === null ? `已删除「${name}」` : `已保存「${name}」`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()
   // The Codex folder shows with the App Server above.
-  const env = item.env.filter((row) => row.name !== "CODEX_HOME")
+  const env = item.env.filter((row) => row.name !== "CODEX_HOME" && canSetProviderEnvironment(item.provider, row.name))
   // The keys a provider needs show by default; the rest of its variables wait under 高级.
   const keys = env.filter((row) => row.required), others = env.filter((row) => !row.required)
   const advancedIssue = Boolean(issue && issue.code !== "env_missing")
@@ -488,8 +497,8 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
     <div className="grid gap-1 px-4 pb-3 empty:hidden sm:ps-12">
       <p className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</p>
       {!compact && 'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
-      {item.setup && (compact ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
-        <p>需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。已配置的环境认证仍优先。</p>
+      {item.setup && (compact || item.provider === "cursor" ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
+        <p>{item.provider === "cursor" ? "在运行 AI 的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。" : "需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。已配置的环境认证仍优先。"}</p>
         {item.setup.directory ? <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} /> : null}
         <div className="flex min-w-0 gap-2">
           <Input readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
@@ -506,7 +515,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
         {compact ? checkRecord : null}
         <Details label="能力验证">
-          <p>程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</p>
+          <p>{item.provider === "cursor" ? "已找到程序，不代表订阅登录或模型已经验证。" : "程序和密钥已配置，不代表登录或模型已经验证。"}未验证时可以尝试运行。</p>
           {item.observed ? <ul className="grid gap-1">{Object.entries(item.observed).map(([key, observation]) => <li key={key}>{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</li>)}</ul> : <p>验证记录未提供。</p>}
         </Details>
         {manager ? <Details label="运行 Bot">
@@ -540,10 +549,11 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
             <Input aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
             <div className="flex min-w-0 gap-2 sm:contents">
               <Input type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
-              <Button type="submit" variant="outline" disabled={working || !addName || !newValue}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
+              <Button type="submit" variant="outline" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
             </div>
           </form>
           <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
+          {item.provider === "cursor" ? <p className="text-meta text-muted-foreground">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</p> : null}
           {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
         </div>
@@ -575,9 +585,6 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
       <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
     </div>
     <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Lock aria-hidden="true" className="size-4 shrink-0" />只存在这台电脑上</p>
-    {name === "CURSOR_API_KEY" ? <a className="hit-area relative inline-flex w-fit items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" href="https://cursor.com/dashboard" target="_blank" rel="noopener noreferrer">
-      获取{terms.secret.label}<ExternalLink aria-hidden="true" className="size-3.5" />
-    </a> : null}
   </form>
 }
 

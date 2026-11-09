@@ -246,8 +246,8 @@ pub fn ticket_decode(text: String) -> Result<String> {
 }
 
 #[uniffi::export]
-pub fn ticket_encode(entry_id: String, secret_hex: String) -> Result<String> {
-    Ok(secure::join::ticket_encode(&entry_id, &secret_hex)?)
+pub fn ticket_encode(entry: String, secret_hex: String) -> Result<String> {
+    Ok(secure::join::ticket_encode(&entry, &secret_hex)?)
 }
 
 #[uniffi::export]

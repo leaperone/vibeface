@@ -93,6 +93,10 @@ def inspect():
     return response['result']
 
 
+def bounded(value, limit):
+    return type(value) is int and 0 < value <= limit
+
+
 def guard(info):
     expected = os.environ
     metadata = DATA.lstat()
@@ -118,12 +122,13 @@ def guard(info):
             'the official node must run outside personal networks')
     require(config['listen'] == expected['VIBEFACE_LISTEN'], 'existing HTTP listen address differs')
     # Any device may use the official node, so every service it offers them is bounded.
-    require(network['serve_discovery'] is True and network.get('relay_listen') is not None
+    mesh = network.get('mesh') or {}
+    require(mesh.get('enabled') is True and network.get('relay_listen') is not None and network.get('relay_url')
             and network.get('relay_open') is True and network.get('relay_operator_token') is None
-            and network.get('relay_rate') and network.get('relay_max_clients')
-            and network.get('relay_max_clients_per_ip') and forwarding['any'] is True and forwarding.get('rate')
-            and forwarding.get('per_ip'),
-            'the official node needs discovery, an open relay and browser forwarding, each within limits')
+            and bounded(network.get('relay_rate'), 16384) and bounded(network.get('relay_max_clients'), 128)
+            and bounded(network.get('relay_max_clients_per_ip'), 8) and forwarding['any'] is True
+            and forwarding.get('rate') and forwarding.get('per_ip'),
+            'the official node needs the mesh, an open relay and browser forwarding, each within limits')
     # Browsers connect straight to this Node, so every limit counts the real peer address.
     require(not forwarding.get('trusted_proxies'), 'the official node has no proxy in front to trust')
     anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
@@ -204,9 +209,11 @@ def self_test():
                   'web_enabled': True, 'tls': True, 'roots': [], 'manager': None,
                   'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
                                  'trusted_proxies': []},
-                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_open': True,
-                              'relay_operator_token': None, 'relay_rate': 65536, 'relay_max_clients': 512,
-                              'relay_max_clients_per_ip': 16}}
+                  'network': {'relay_listen': '0.0.0.0:3340', 'relay_url': 'http://203.0.113.7:3340',
+                              'relay_open': True, 'relay_operator_token': None, 'relay_rate': 16384,
+                              'relay_max_clients': 128, 'relay_max_clients_per_ip': 8,
+                              'mesh': {'enabled': True, 'network': 'vibeface', 'bootstrap': [],
+                                       'allow_private': False}}}
         (data / 'config.json').write_text(json.dumps(config))
         env = {'VIBEFACE_ROLE': 'node', 'VIBEFACE_LISTEN': config['listen'],
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',
@@ -276,7 +283,10 @@ def self_test():
                            {'web_enabled': False}, {'tls': False}, {'forwarding': dict(forwarding, any=False)},
                            {'forwarding': dict(forwarding, rate=None)}, {'forwarding': dict(forwarding, per_ip=None)},
                            {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
-                           {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
+                           {'network': dict(network, mesh=dict(network['mesh'], enabled=False))},
+                           {'network': dict(network, relay_listen=None)}, {'network': dict(network, relay_url=None)},
+                           {'network': dict(network, relay_rate=65536)}, {'network': dict(network, relay_max_clients=512)},
+                           {'network': dict(network, relay_max_clients_per_ip=16)},
                            {'network': dict(network, relay_open=False)},
                            {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
                            {'network': dict(network, relay_max_clients_per_ip=None)},

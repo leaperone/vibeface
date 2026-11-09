@@ -162,7 +162,7 @@ struct Process {
     child: Child,
     tree: tree::Tree,
     reaped: bool,
-    _tracked: Tracked,
+    processes: Arc<Processes>,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: mpsc::UnboundedReceiver<Value>,
@@ -173,7 +173,7 @@ struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        if !self.reaped {
+        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
             self.tree.kill();
         }
         if let Some(stderr) = self.stderr.take() {
@@ -501,15 +501,6 @@ async fn read_output(stdout: ChildStdout, rpc: Arc<Rpc>, events: mpsc::Unbounded
     *lock(&rpc.waiting) = None;
 }
 
-/// A pi process tree recorded in the pidfile until its process is done.
-struct Tracked(Arc<Processes>, String);
-
-impl Drop for Tracked {
-    fn drop(&mut self) {
-        self.0.forget(&self.1);
-    }
-}
-
 impl Process {
     fn spawn(
         launch: &Launch,
@@ -555,7 +546,6 @@ impl Process {
         processes
             .track(tree.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
-        let tracked = Tracked(processes.clone(), tree.token().to_owned());
         let (Some(stdin), Some(stdout), Some(mut stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -581,7 +571,7 @@ impl Process {
             child,
             tree,
             reaped: false,
-            _tracked: tracked,
+            processes: processes.clone(),
             rpc,
             events,
             stderr: Some(stderr),
@@ -593,8 +583,12 @@ impl Process {
     /// ended with its tree. Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
         self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        if self.reaped {
+            self.processes.forget(self.tree.token());
+        }
         let Some(stderr) = self.stderr.take() else {
             return String::new();
         };
@@ -2647,6 +2641,40 @@ mod tests {
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
         assert!(node.store.lock().await.stop_requests()?.is_empty());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_normal_end_preserves_eof_and_grace_for_a_cooperative_child() -> Result<()> {
+        let dir = scratch("normal-cooperative-end");
+        let processes = Arc::new(Processes::new(dir.join(PIDFILE)));
+        let process = Process::spawn(
+            &Launch {
+                bin: super::super::claude::tests::cooperative_cli(&dir)?,
+                cwd: dir.clone(),
+                env: BTreeMap::from([("HOME".into(), dir.display().to_string())]),
+                args: Vec::new(),
+                guide: None,
+            },
+            &processes,
+            &dir.join("sessions"),
+        )?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dir.join("member-ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        process.end().await;
+        let natural = std::fs::read_to_string(dir.join("natural-close"))?;
+        let completed = std::fs::read_to_string(dir.join("member-completed")).unwrap_or_default();
+        std::fs::remove_dir_all(dir)?;
+        assert_eq!(natural, "persisted");
+        assert_eq!(
+            completed, "term-finished",
+            "a normal pi end gives its live child TERM and time to finish"
+        );
         Ok(())
     }
 

@@ -1,29 +1,25 @@
 use anyhow::{Context, Result, ensure};
-use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr,
-    address_lookup::AddressLookup,
     endpoint::{PortmapperConfig, RecvStream, SendStream, presets},
 };
-use iroh_dns::endpoint_info::EndpointInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vibeface_secure::membership::MembershipSigner;
 use vibeface_secure::{Handshake, Identity};
 use zeroize::Zeroizing;
 
-mod pkarr {
+#[allow(dead_code)]
+mod record {
     include!(concat!(
         env!("VIBEFACE_PROBE_SOURCE_ROOT"),
-        "/apps/core/src/net/pkarr.rs"
+        "/apps/core/src/net/mesh/record.rs"
     ));
 }
 
@@ -231,91 +227,71 @@ async fn private_rejected(endpoint: &Endpoint, target: &Target, alpn: &[u8]) -> 
     );
     Ok(())
 }
-async fn resolver_case(
-    resolver: &pkarr::FreshResolver,
-    peer: EndpointId,
-    accepted: bool,
-) -> Result<()> {
-    let mut stream = resolver.resolve(peer).context("resolver has no stream")?;
-    let result = stream.next().await.context("resolver returned no result")?;
-    if accepted {
-        ensure!(
-            result?.endpoint_id() == peer,
-            "discovery resolved another peer"
-        );
-    } else {
-        ensure!(result.is_err(), "invalid discovery packet was accepted");
-    }
-    Ok(())
-}
-async fn discovery_checks(key: &SecretKey) -> Result<Value> {
-    let peer = key.public();
-    let address = EndpointAddr::from_parts(
-        peer,
-        [TransportAddr::Ip(SocketAddr::from((
-            Ipv4Addr::LOCALHOST,
-            43001,
-        )))],
+/// The product's mesh record rules: a current record its device signed for this network opens;
+/// expired, ahead of the clock, badly signed, oversize or foreign ones do not.
+fn mesh_checks() -> Result<Value> {
+    use record::{MeshRecord, Reachable, SignedMeshRecord};
+    let identity = Identity::generate()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    let current = MeshRecord {
+        v: 1,
+        network: "vibeface".into(),
+        device_id: identity.device_id(),
+        seq: now,
+        ttl_s: record::DEFAULT_TTL_S,
+        addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 43001))],
+        relay_url: None,
+        reachable: Reachable::Unknown,
+        roles: vec![],
+    };
+    let sign = |record: &MeshRecord| {
+        SignedMeshRecord::sign(
+            record,
+            |payload| Ok(identity.sign(record::DOMAIN, payload)?),
+        )
+    };
+    let valid = sign(&current)?;
+    ensure!(
+        valid.open("vibeface", now)? == current,
+        "a current record did not open"
     );
-    let signed = EndpointInfo::from(address).to_pkarr_signed_packet(key, 30)?;
-    let original = signed.to_relay_payload();
-    let current = Arc::new(Mutex::new(original.clone()));
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let url = format!("http://{}/pkarr", listener.local_addr()?);
-    let body = current.clone();
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let bytes = body.lock().expect("test packet").clone();
-            tokio::spawn(async move {
-                let mut request = [0; 4096];
-                let Ok(length) = stream.read(&mut request).await else {
-                    return;
-                };
-                if !request[..length].starts_with(b"GET /pkarr/") {
-                    return;
-                }
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                );
-                let _ = stream.write_all(header.as_bytes()).await;
-                let _ = stream.write_all(&bytes).await;
-            });
-        }
-    });
-    let resolver = pkarr::FreshResolver::new(url.parse()?)?;
-    pkarr::PkarrConfig {
-        publish: false,
-        resolve: true,
-        urls: vec![url],
-        publish_direct: false,
+    let ttl_ms = u64::from(record::DEFAULT_TTL_S) * 1000;
+    for (seq, case) in [
+        (now - ttl_ms - 1, "expired"),
+        (now + record::MAX_AHEAD_MS + 60_000, "ahead"),
+    ] {
+        let dated = sign(&MeshRecord {
+            seq,
+            ..current.clone()
+        })?;
+        ensure!(
+            dated.open("vibeface", now).is_err(),
+            "an {case} record opened"
+        );
     }
-    .validate()?;
-    resolver_case(&resolver, peer, true).await?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
-    for timestamp in [now - 1_800_000_000, now + 600_000_000] {
-        let dns = &original[72..];
-        let mut message = format!("3:seqi{timestamp}e1:v{}:", dns.len()).into_bytes();
-        message.extend_from_slice(dns);
-        let mut packet = key.sign(&message).to_bytes().to_vec();
-        packet.extend_from_slice(&timestamp.to_be_bytes());
-        packet.extend_from_slice(dns);
-        *current.lock().expect("test packet") = packet;
-        resolver_case(&resolver, peer, false).await?;
-    }
-    let mut bad = original;
-    bad[0] ^= 1;
-    *current.lock().expect("test packet") = bad;
-    resolver_case(&resolver, peer, false).await?;
-    *current.lock().expect("test packet") = vec![0; 1073];
-    resolver_case(&resolver, peer, false).await?;
-    server.abort();
+    let mut forged = valid.clone();
+    forged.signature = Identity::generate()?.sign(record::DOMAIN, forged.payload.as_bytes())?;
+    ensure!(
+        forged.open("vibeface", now).is_err(),
+        "a badly signed record opened"
+    );
+    let padded = format!("{}{}", " ".repeat(record::MAX_PAYLOAD), valid.payload);
+    let oversize = SignedMeshRecord {
+        signature: identity.sign(record::DOMAIN, padded.as_bytes())?,
+        payload: padded,
+    };
+    ensure!(
+        oversize.open("vibeface", now).is_err(),
+        "an oversize record opened"
+    );
+    ensure!(
+        valid.open("other", now).is_err(),
+        "a record of another network opened"
+    );
     Ok(
-        json!({"fresh":true,"expiredRejected":true,"futureRejected":true,"badSignatureRejected":true,"oversizeRejected":true,
-        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/apps/core/src/net/pkarr.rs"))))}),
+        json!({"valid":true,"expiredRejected":true,"aheadRejected":true,"badSignatureRejected":true,
+        "oversizeRejected":true,"wrongNetworkRejected":true,
+        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/apps/core/src/net/mesh/record.rs"))))}),
     )
 }
 #[tokio::main]
@@ -907,11 +883,14 @@ async fn main() -> Result<()> {
         }
         cases.push(json!({"peer":target.peer,"positiveService":true,"singleRequestClosed":true,"stalledHandshakeReleased":true,"privateAlpnsRejected":3,"foreignObjectsRejected":target.public_node}));
     }
-    let discovery = discovery_checks(&key).await?;
+    let mesh = mesh_checks()?;
     endpoint.close().await;
-    println!(
-        "{}",
-        json!({"passed":true,"targets":cases,"discovery":discovery})
-    );
+    println!("{}", json!({"passed":true,"targets":cases,"mesh":mesh}));
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn mesh_record_rules_hold_without_a_live_node() {
+    mesh_checks().unwrap();
 }

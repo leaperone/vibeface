@@ -15,7 +15,10 @@ pub const PROTOCOL: u32 = 1;
 /// Names the maintenance endpoint in the message a person reads.
 const LABEL: &str = "the maintenance socket";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub const MAX_PACKET: usize = 4 * 1024;
+/// A `Client` answer carries a whole RPC result, such as diagnostics or a bot list.
+pub const MAX_PACKET: usize = 1024 * 1024;
+/// Provider probes and webhook tests wait on the network.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 const DELIVERY_INFO_TIMEOUT_SECS: u64 = 30;
 const DELIVERY_PROVE_TIMEOUT_SECS: u64 = 7_200;
 const DELIVERY_VERIFY_TIMEOUT_SECS: u64 = 120;
@@ -96,6 +99,21 @@ pub enum MaintenanceCommand {
         intent_id: String,
         gas_cap: String,
     },
+    /// Edit the mesh bootstrap nodes in config.json and the running mesh.
+    MeshBootstrap {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    /// Set one config.json value; the running Node applies it when it restarts.
+    ConfigSet {
+        key: String,
+        value: Value,
+    },
+    /// Call a client method as the owner at this computer, with what a local page may do.
+    Client {
+        method: String,
+        params: Value,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -130,6 +148,8 @@ pub struct MaintenanceResponse {
     pub delivery: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
 }
 
 /// A successful Acquire response plus the still-open owner-only stream. Dropping it releases
@@ -143,16 +163,21 @@ pub struct Lease {
 async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<MaintenanceResponse> {
     let mut packet = Zeroizing::new(Vec::new());
     tokio::time::timeout(timeout, async {
-        let mut chunk = Zeroizing::new([0_u8; 256]);
+        let mut chunk = Zeroizing::new([0_u8; 8192]);
         loop {
             let count = stream.read(&mut chunk[..]).await?;
             ensure!(count != 0, "maintenance socket closed before response");
+            let start = packet.len();
             packet.extend_from_slice(&chunk[..count]);
             ensure!(
                 packet.len() <= MAX_PACKET,
                 "maintenance packet is too large"
             );
-            if let Some(end) = packet.iter().position(|byte| *byte == b'\n') {
+            if let Some(end) = chunk[..count]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|at| start + at)
+            {
                 ensure!(
                     end + 1 == packet.len(),
                     "unexpected maintenance packet data"
@@ -194,10 +219,10 @@ async fn exchange(
 ) -> Result<(Stream, MaintenanceResponse)> {
     let endpoint = Endpoint::from_path(socket)?;
     endpoint.ensure_private(LABEL)?;
-    let timeout = if matches!(&command, MaintenanceCommand::DeliveryKeyOperation { .. }) {
-        DELIVERY_KEY_OPERATION_TIMEOUT
-    } else {
-        REQUEST_TIMEOUT
+    let timeout = match &command {
+        MaintenanceCommand::DeliveryKeyOperation { .. } => DELIVERY_KEY_OPERATION_TIMEOUT,
+        MaintenanceCommand::Client { .. } => CLIENT_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
     };
     let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, Stream::connect(&endpoint))
         .await
@@ -229,6 +254,19 @@ pub async fn request(socket: &Path, command: MaintenanceCommand) -> Result<Maint
     );
     let (_, response) = exchange(socket, command).await?;
     Ok(response)
+}
+
+/// Call a client method on the running Node as its local operator and return its result.
+pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
+    let response = request(
+        socket,
+        MaintenanceCommand::Client {
+            method: method.to_owned(),
+            params,
+        },
+    )
+    .await?;
+    Ok(response.result.unwrap_or(Value::Null))
 }
 
 pub async fn acquire(socket: &Path) -> Result<Lease> {

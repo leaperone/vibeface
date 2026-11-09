@@ -4,7 +4,7 @@ import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import type { Platform } from '../lib/platform.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -146,6 +146,7 @@ test('delivery refresh keeps read-only history and file access without requestin
       switch (params.op) {
         case 'status': return nextStatus
         case 'list': return { orders: nextOrders }
+        case 'providers': return { providers: [] }
         case 'budgets': if (!managing) throw new Error('budget permission denied'); return { budgets: [budget] }
         case 'get': assert.equal(params.order_id, readable.order_id); return readable
         case 'read': assert.equal(params.order_id, readable.order_id); return { name: readable.name, bytes: content.length, content_base64: toBase64(content), sha256: digest }
@@ -164,7 +165,7 @@ test('delivery refresh keeps read-only history and file access without requestin
     const cleanups = hooks.effects.map(effect => effect())
     try {
       await new Promise(resolve => setImmediate(resolve))
-      assert.deepEqual(calls, managing ? [{ op: 'status' }, { op: 'list' }, { op: 'budgets' }] : [{ op: 'status' }, { op: 'list' }])
+      assert.deepEqual(calls, [{ op: 'status' }, { op: 'list' }, { op: 'providers' }, ...(managing ? [{ op: 'budgets' }] : [])])
       assert.deepEqual(hooks.updates.slice(-4), [nextStatus, nextOrders, managing ? [budget] : [], ''])
       const client = createDeliveryClient(transport, platform.storage)
       assert.deepEqual(await client.get(readable.order_id), readable)
@@ -382,4 +383,23 @@ test('the receiver authorizes both original orders together and groups only two 
   await assert.rejects(client.acceptBatch([a, a]), /同时接收/)
   await assert.rejects(client.acceptBatch([a, { ...b, phase: 'failed' }]), /同时接收/)
   assert.equal(requests, 1)
+})
+
+test('the provider field offers announced devices: paid delivery those that quote a price, free delivery all', async () => {
+  const offer = { settlement: { chain_id: 31337, escrow: `0x${'66'.repeat(20)}`, asset: `0x${'55'.repeat(20)}` }, price: '9007199254740993' }
+  const asked: unknown[] = []
+  const client = createDeliveryClient(connection(async (method, params) => {
+    asked.push([method, params])
+    return { providers: [
+      { device_id: provider, paid: true, offer, last_seen_ms: 5 },
+      { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 },
+      { device_id: 'not-a-device', paid: false, offer: null, last_seen_ms: 1 },
+      { device_id: source, paid: true, offer: { ...offer, price: '1.5' }, last_seen_ms: 2 },
+    ] }
+  }), { getItem: () => null, setItem: () => {} })
+  const providers = await client.providers()
+  assert.deepEqual(asked, [['delivery', { op: 'providers' }]])
+  assert.deepEqual(providers, [{ device_id: provider, paid: true, offer, last_seen_ms: 5 }, { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 }], 'a malformed record drops only itself')
+  assert.deepEqual(providerChoices(providers, 'paid').map(item => item.device_id), [provider])
+  assert.deepEqual(providerChoices(providers, 'charity').map(item => item.device_id), [provider, receiver])
 })

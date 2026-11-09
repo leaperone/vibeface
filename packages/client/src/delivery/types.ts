@@ -4,6 +4,12 @@ export type DeliveryPhase = 'prepared' | 'funding_pending' | 'proving' | 'funded
 export type DeliveryEvidence = 'none' | 'charity_receipt' | 'ciphertext_held' | 'recoverable' | 'decryption_proven'
 export type PaymentState = 'free' | 'prepared' | 'confirmed' | 'earned' | 'withdrawn' | 'refunded' | 'unknown' | 'failed'
 export type DeliverySettings = { enabled: boolean; charity_enabled: boolean; paid_enabled: boolean }
+/** What a paid provider asks, as it announces it; `price` is per window in the asset's smallest unit. */
+/** Where an offer settles: the delivery chain's ID, escrow and asset. */
+export type Settlement = { chain_id: number; escrow: string; asset: string }
+export type DeliveryOffer = { settlement: Settlement; price: string }
+/** A device outside this one that announces it relays deliveries; `offer` only with paid delivery on. */
+export type DeliveryProvider = { device_id: string; paid: boolean; offer: DeliveryOffer | null; last_seen_ms: number }
 export type DeliveryStatus = DeliverySettings & {
   node_peer: string
   wallet: { state: 'absent'; address: null } | { state: 'locked' | 'unlocked'; address: string } | { state: 'unavailable'; address: null; reason: string }

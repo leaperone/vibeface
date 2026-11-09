@@ -992,7 +992,7 @@ struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        if !self.reaped {
+        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
             self.tree.kill();
         }
         if let Some(stderr) = self.stderr.take() {
@@ -1130,7 +1130,8 @@ impl Process {
     async fn end(&mut self, processes: &Processes) {
         processes.remove_input(self.tree.token());
         self.stdin.lock().await.take();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
         if !self.reaped {
             self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
         }
@@ -1684,7 +1685,11 @@ async fn follow(
         node.claude.processes.remove_input(process.tree.token());
     }
     process.stdin.lock().await.take();
-    let _ = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tree::observe_exit(&mut process.child),
+    )
+    .await;
     let stopped = agent::terminate_process_tree(&mut process.child, &mut process.tree).await;
     process.reaped = stopped;
     let Some(node) = node.upgrade() else {
@@ -3095,6 +3100,74 @@ pub(super) mod tests {
             "a lost session goes on in a new one"
         );
         assert_eq!(fresh.output, "done: fresh full context");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn cooperative_cli(directory: &Path) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = directory.join("cooperative-cli");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env python3
+import os, pathlib, signal, sys, time
+home = pathlib.Path(os.environ['HOME'])
+if os.fork() == 0:
+    for fd in [0, 1, 2]:
+        os.close(fd)
+    def finish(*_):
+        time.sleep(0.05)
+        (home / 'member-completed').write_text('term-finished')
+        os._exit(0)
+    signal.signal(signal.SIGTERM, finish)
+    (home / 'member-ready').write_text('ready')
+    while True:
+        time.sleep(1)
+sys.stdin.read()
+time.sleep(0.05)
+(home / 'natural-close').write_text('persisted')
+"#,
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        Ok(bin)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_normal_end_preserves_eof_and_grace_for_a_cooperative_child() -> Result<()> {
+        let place = Place::new()?;
+        let bin = cooperative_cli(&place.dir)?;
+        let env = BTreeMap::from([("HOME".into(), place.dir.display().to_string())]);
+        let mut process = Launch {
+            bin: &bin,
+            cwd: &place.dir.join("work"),
+            session: "fixture",
+            resume: false,
+            model: "fixture",
+            effort: None,
+            guide: None,
+            env: &env,
+        }
+        .spawn()?;
+        let processes = Processes::new(place.dir.join(PIDFILE));
+        processes.track(process.tree.token(), &bin)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !place.dir.join("member-ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        process.end(&processes).await;
+        drop(process);
+        assert_eq!(
+            std::fs::read_to_string(place.dir.join("natural-close"))?,
+            "persisted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(place.dir.join("member-completed")).unwrap_or_default(),
+            "term-finished",
+            "a normal Claude end gives its live child TERM and time to finish"
+        );
         Ok(())
     }
 

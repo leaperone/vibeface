@@ -282,12 +282,12 @@ export function ticketDecode(text: string): string /*throws*/ {
     }
     }
 
-export function ticketEncode(entryId: string, secretHex: string): string /*throws*/ {
+export function ticketEncode(entry: string, secretHex: string): string /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_func_ticket_encode(
-        FfiConverterString.lower(entryId, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(entry, nativeModule().rustbuffer_alloc),
         FfiConverterString.lower(secretHex, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
@@ -1446,7 +1446,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_ticket_decode() !== 38948) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_ticket_decode");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_ticket_encode() !== 31142) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_ticket_encode() !== 39824) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_ticket_encode");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_verify() !== 20231) {

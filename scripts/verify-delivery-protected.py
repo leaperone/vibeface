@@ -421,7 +421,6 @@ class Experiment:
         self.nodes, self.passwords, self.proofs, self.orders, self.receipt_seen = [], {}, {}, {}, {}
         self.deployment = None
         self.budget = None
-        self.relay = None
         self.initial_resources = None
         self.started = time.monotonic()
         self.registration_channel = None
@@ -696,7 +695,7 @@ class Experiment:
         workspace.mkdir(mode=0o700)
         client = self.run / "client.mjs"
         durable(client, self.helpers["CLIENT_SOURCE"].replace("MODULE_URL", self.paths["crypto_module"].as_uri()).encode())
-        self.relay = self.helpers["PkarrRelay"]()
+        mesh = self.helpers["mesh_network"]()
         accounts = self.rpc("eth_accounts", [])
         need(len(accounts) == 4 and accounts[0].lower() == self.deployment["funder"].lower(), "fresh_testchain_funder_only")
         need(int(self.rpc("eth_chainId", []), 16) == 31337, "testchain_identity_required")
@@ -707,10 +706,20 @@ class Experiment:
             node = self.helpers["Node"](self.run, name, self.paths["binary"], workspace, client, init_args=args)
             self.nodes.append(node)
             self.helpers["isolate_delivery_node"](node)
-            node.configure_network(pkarr={"publish": True, "resolve": True, "urls": [self.relay.url], "publish_direct": True})
             need(not (node.directory / "delivery-settings.json").exists(), "fresh_delivery_settings_must_be_absent")
-            node.start()
-            if name != "P":
+        source, receiver, provider = self.nodes
+        provider.configure_mesh(mesh)
+        for node in (source, receiver):
+            node.configure_mesh(mesh, [provider.mesh_address])
+        for node in self.nodes:
+            need(json.loads((node.directory / "config.json").read_bytes())["network"]["mesh"] == {
+                "enabled": True, "network": mesh, "bootstrap": [] if node is provider else [provider.mesh_address],
+                "allow_private": True}, "private_mesh_uses_only_the_independent_provider_bootstrap")
+        provider.start()
+        for node in self.nodes:
+            name = node.name
+            if node is not provider:
+                node.start()
                 node.bootstrap()
                 status = self.call(node, "status")
                 need(status["enabled"] is False and status["paid_enabled"] is False and status["wallet"]["state"] == "absent", "default_disabled_api_and_absent_wallet_required")
@@ -1062,8 +1071,6 @@ class Experiment:
                 except subprocess.TimeoutExpired:
                     self.summary["status"] = "FAIL"
                     self.summary["failure_code"] = "deployment_child_cleanup_incomplete"
-            if self.relay is not None:
-                self.relay.close()
             if survivors:
                 self.summary["status"] = "FAIL"
                 self.summary["failure_code"] = "owned_child_cleanup_incomplete"
@@ -1227,7 +1234,8 @@ def self_test():
         raise AssertionError("no-process self-test attempted an external process or network")
     with patch.object(subprocess, "Popen", forbidden), patch.object(subprocess, "run", forbidden), patch.object(socket, "socket", forbidden):
         self_test_diagnostics()
-        Client = runpy.run_path(str(REPOSITORY / "scripts/verify-node.py"))["Client"]
+        node_helpers = runpy.run_path(str(REPOSITORY / "scripts/verify-node.py"))
+        Client = node_helpers["Client"]
         for identity in (None, Path("/artifact/client-identity.json")):
             stdin = io.StringIO()
             stdout = io.StringIO('{"ok":true,"result":{"device_id":"synthetic-client"}}\n'
@@ -1315,23 +1323,36 @@ def self_test():
         need(oom_delta({"memory.events": "oom 0\noom_kill 0\n"}, {"memory.events": "oom 1\noom_kill 0\n"})["oom"] == 1, "actual_oom_delta")
         for preconfigured in (False, True):
             with tempfile.TemporaryDirectory(prefix="protected-fresh-settings-selftest-", dir=ARTIFACTS) as temporary:
-                run = Path(temporary); directory = run / "S"; directory.mkdir()
-                save_json(directory / "config.json", {"network": {}})
-                if preconfigured: save_json(directory / "delivery-settings.json", {"enabled": False, "paid_enabled": False})
-                node = SimpleNamespace(directory=directory, configure_network=Mock(),
-                    start=Mock(side_effect=CheckFailure("synthetic_stop_before_real_node_start")))
+                run = Path(temporary)
+                nodes = []
+                for index, name in enumerate(("S", "R", "P")):
+                    node = object.__new__(node_helpers["Node"])
+                    node.name = name; node.directory = run / name; node.directory.mkdir()
+                    node.device_id = str(index + 1) * 64; node.quic_port = 27001 + index
+                    node.start = Mock(side_effect=CheckFailure("synthetic_stop_before_real_node_start"))
+                    save_json(node.directory / "config.json", {"network": {}})
+                    nodes.append(node)
+                if preconfigured: save_json(nodes[0].directory / "delivery-settings.json", {"enabled": False, "paid_enabled": False})
                 startup = object.__new__(Experiment)
                 startup.run = run; startup.paths = {name: Path(value) for name, value in sample["paths"].items()}
                 startup.nodes = []; startup.progress = Mock(); startup.deployment = {"funder":"0x" + "11" * 20}
                 startup.rpc = Mock(side_effect=[["0x" + value * 20 for value in ("11","22","33","44")],"0x7a69"])
-                startup.helpers = {"CLIENT_SOURCE":"MODULE_URL", "PkarrRelay":Mock(), "Node":Mock(return_value=node), "isolate_delivery_node":Mock()}
+                startup.helpers = {"CLIENT_SOURCE":"MODULE_URL", "mesh_network":Mock(return_value="t-123456789abc"),
+                    "public_node_args":Mock(return_value=["--relay-open"]), "Node":Mock(side_effect=nodes), "isolate_delivery_node":Mock()}
                 try: startup.setup_nodes()
                 except CheckFailure as error:
                     need(str(error) == ("fresh_delivery_settings_must_be_absent" if preconfigured else "synthetic_stop_before_real_node_start"),
                          "fresh_settings_use_independent_file_contract")
                 else: raise AssertionError("the settings selfcheck must stop before real Node startup")
-                need(node.start.call_count == (0 if preconfigured else 1), "only_absent_delivery_settings_reach_fresh_startup")
-                need(json.loads((directory / "config.json").read_bytes()) == {"network": {}}, "main_config_must_not_gain_delivery_fields")
+                startup.helpers["mesh_network"].assert_called_once_with()
+                need([node.start.call_count for node in nodes] == [0, 0, 0 if preconfigured else 1],
+                     "only_absent_delivery_settings_start_the_independent_provider_first")
+                for node in nodes:
+                    config = json.loads((node.directory / "config.json").read_bytes())
+                    need(set(config) == {"network"}, "main_config_must_not_gain_delivery_fields")
+                    need(config["network"] == ({} if preconfigured else {"mesh": {"enabled": True, "network": "t-123456789abc",
+                        "bootstrap": [] if node.name == "P" else [nodes[2].mesh_address], "allow_private": True}}),
+                        "private_mesh_has_only_s_r_p_loopback_links_and_no_public_bootstrap")
         for response in (b"R", b"X", b"", None):
             reader, writer = os.pipe()
             if response is not None:

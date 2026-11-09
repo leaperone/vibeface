@@ -1246,6 +1246,24 @@ test('unexpected closure reconnects the same target with fresh authentication an
   } finally { app.close() }
 })
 
+test('when its address stops answering, the Node is reached by its device ID through a public gateway it named', async () => {
+  const gateway = 'https://gateway.example'
+  const app = deviceHarness({ saved: true })
+  try {
+    const named = deferred(); named.resolve({ entrances: [], gateways: [{ device_id: remote, url: `${gateway}/` }, { device_id: remote, url: 'http://plain.example' }] })
+    app.holds.set('entrances', named)
+    app.render(); await settle(); app.render()
+    assert.deepEqual(JSON.parse(app.stored.get(`vibeface.gateways.${network}`) ?? 'null'), [{ device_id: remote, url: gateway }])
+    const down = deferred(); down.promise.catch(() => {}); down.reject(new Error('connection refused'))
+    app.holds.set(`open:${entry.address}`, down)
+    app.sockets[0].drop()
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    assert.deepEqual(plain(app.sockets.slice(1).map(socket => socket.entry)), [entry, { kind: 'gateway', address: gateway, device_id: target }])
+    assert.deepEqual(plain(app.render().ready?.entry), { kind: 'gateway', address: gateway, device_id: target })
+  } finally { app.close() }
+})
+
 test('a reload resumes the last network through its entrances even with several saved addresses', async () => {
   const other: ConnectionEntry = { kind: 'gateway', address: 'https://other.example', device_id: remote }
   const storage = new Map([['vibeface.connections', JSON.stringify([other, entry])], ['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])

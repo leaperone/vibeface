@@ -542,6 +542,66 @@ impl Delivery {
         );
         Ok(())
     }
+    /// The service this Node offers on the mesh: the paid terms its `Announce` gives when it can
+    /// quote, else charity without an offer.
+    pub(crate) fn mesh_role(&self) -> Option<crate::net::mesh::record::Role> {
+        use crate::net::mesh::record::{Offer, Role, ServiceKind};
+        let config = self.config();
+        let quotable = config.paid_enabled
+            && config
+                .publication_policy
+                .as_ref()
+                .is_some_and(|policy| policy.validate().is_ok())
+            && Amount::from_decimal_str(&config.provider_gas_cap)
+                .is_ok_and(|cap| cap != Amount::ZERO);
+        let offer = config
+            .chain
+            .as_ref()
+            .filter(|_| quotable)
+            .map(|chain| Offer {
+                settlement: chain.settlement(),
+                price: config.delivery_fee_per_window.clone(),
+            })
+            .filter(|offer| offer.check().is_ok());
+        (config.enabled && (offer.is_some() || config.charity_enabled)).then_some(Role::Service {
+            service: ServiceKind::Delivery,
+            offer,
+        })
+    }
+    /// Delivery services other Nodes offer on the mesh, most recently seen first.
+    fn providers(&self, node: &Runtime) -> Result<Value> {
+        use crate::net::mesh::record::{Role, ServiceKind};
+        let own = self.identity.device_id()?;
+        let mut providers: Vec<(u64, Value)> = match node.net().ok().and_then(|net| net.mesh()) {
+            Some(mesh) => mesh
+                .table()
+                .online(crate::runtime::now_ms() as u64)
+                .filter(|entry| entry.record.device_id != own)
+                .filter_map(|entry| {
+                    entry.record.roles.iter().find_map(|role| match role {
+                        Role::Service {
+                            service: ServiceKind::Delivery,
+                            offer,
+                        } => Some((
+                            entry.last_seen_ms,
+                            json!({"device_id":entry.record.device_id,"paid":offer.is_some(),
+                                "offer":offer,"last_seen_ms":entry.last_seen_ms}),
+                        )),
+                        _ => None,
+                    })
+                })
+                .collect(),
+            None => vec![],
+        };
+        providers.sort_by_key(|(seen, _)| std::cmp::Reverse(*seen));
+        // ponytail: the 256 most recent; paging if a picker ever needs more.
+        let providers: Vec<Value> = providers
+            .into_iter()
+            .take(256)
+            .map(|(_, provider)| provider)
+            .collect();
+        Ok(json!({"providers":providers}))
+    }
     async fn chain(&self) -> Result<chain::Chain> {
         chain::Chain::connect(
             self.config()
@@ -578,6 +638,7 @@ impl Delivery {
                 })
                 .await
             }
+            "providers" => self.providers(node),
             "find_intent" => {
                 let intent = text(&params, "intent_id")?;
                 uuid::Uuid::parse_str(intent)?;
@@ -1015,5 +1076,66 @@ fn paid_deadlines(at: u64, profile: &ProofProfile) -> Deadlines {
         open_deadline,
         retain_until: open_deadline + 86400,
         priority_deadline: quote_expires_at + 3600,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::mesh::record::{Offer, Role, ServiceKind};
+
+    #[test]
+    fn paid_mesh_offer_requires_an_explicit_valid_publication_policy() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("delivery-mesh-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        assert_eq!(delivery.mesh_role(), None);
+        let chain = chain::tests::config();
+        *delivery.settings.lock().unwrap() = DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(chain.clone()),
+            delivery_fee_per_window: "5".into(),
+            provider_gas_cap: "1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delivery.mesh_role(),
+            Some(Role::Service {
+                service: ServiceKind::Delivery,
+                offer: None,
+            })
+        );
+        delivery.settings.lock().unwrap().charity_enabled = false;
+        assert_eq!(delivery.mesh_role(), None);
+        let policy = budget::PublicationPolicy {
+            watchdog_seconds: 60,
+            inclusion_seconds: 60,
+            finality_seconds: 10,
+            clock_skew_seconds: 5,
+            max_fee_per_gas: "3000000000".into(),
+            priority_fee_per_gas: "1000000000".into(),
+        };
+        delivery.settings.lock().unwrap().publication_policy = Some(budget::PublicationPolicy {
+            watchdog_seconds: 0,
+            ..policy.clone()
+        });
+        assert_eq!(delivery.mesh_role(), None);
+        delivery.settings.lock().unwrap().publication_policy = Some(policy);
+        assert_eq!(
+            delivery.mesh_role(),
+            Some(Role::Service {
+                service: ServiceKind::Delivery,
+                offer: Some(Offer {
+                    settlement: chain.settlement(),
+                    price: "5".into(),
+                }),
+            })
+        );
+        drop(delivery);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }
