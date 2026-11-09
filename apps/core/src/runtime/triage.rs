@@ -2877,7 +2877,10 @@ impl Runtime {
         let forwarded = json!({"token":token,"decision":body});
         if input.device_id == self.identity.device_id()? {
             return self.local_decision(token, input).await;
-        } else {
+        }
+        // A public node forwards to any device it can reach; other Nodes only to their own
+        // network's Nodes. The target alone checks the token.
+        if !self.config.forwarding.any {
             let network = self.network_id().await?;
             self.store
                 .lock()
@@ -3071,6 +3074,14 @@ pub(super) mod tests {
         identity: LocalIdentity,
         network: crate::net::NetworkConfig,
     ) -> Result<(Arc<Runtime>, PathBuf)> {
+        node_with(identity, network, |_| {}).await
+    }
+
+    async fn node_with(
+        identity: LocalIdentity,
+        network: crate::net::NetworkConfig,
+        configure: impl FnOnce(&mut Config),
+    ) -> Result<(Arc<Runtime>, PathBuf)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("triage-{}", uuid::Uuid::new_v4()));
@@ -3091,6 +3102,7 @@ pub(super) mod tests {
         configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
+        configure(&mut configuration);
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -8250,6 +8262,83 @@ pub(super) mod tests {
         }
         .await;
         cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_public_node_forwards_decisions_to_any_device_and_the_target_checks_the_token()
+    -> Result<()> {
+        let (it, ip) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (target, public_id) = (it.device_id()?, ip.device_id()?);
+        // Two personal networks: the public node is no member of the target's.
+        let own = it.sign_network_fixture(1, vec![target.clone()])?;
+        let admin = it.fixture_admin();
+        let elsewhere = ip.sign_network_fixture(1, vec![public_id.clone()])?;
+        let networked = || crate::net::NetworkConfig {
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let (t, dir_t) = node_at(it, networked()).await?;
+        let (p, dir_p) = node_with(ip, networked(), |config| config.forwarding.any = true).await?;
+        let result = async {
+            t.install_membership(own).await?;
+            p.install_membership(elsewhere).await?;
+            with_agent(&t);
+            bot(&t, &admin, "c", "前端", &["s1"]).await?;
+            external_work_thread_fact(&t, &admin, "s1").await?;
+            let created = t.create_decision_token("grok").await?;
+            let token = created["token"].as_str().unwrap().to_owned();
+            let event = t.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            let raised = t
+                .triage_command(json!({"action":"raise","event_id":event["event_id"],
+                    "severity":"attention","question":"要修吗？","choices":["修","不修"]}))
+                .await?;
+            let question = raised["question_id"].as_str().unwrap().to_owned();
+            let decision = json!({"device_id":target,"question_id":question,"choice":0});
+            for node in [&t, &p] {
+                node.start_network().await?;
+            }
+            p.net()?.learn(&t.net()?.addr()).await;
+            // A member Node still forwards only within its own personal network.
+            let refused = t
+                .decision_http(
+                    &token,
+                    json!({"device_id":public_id,"question_id":question,"choice":0}),
+                )
+                .await
+                .unwrap_err();
+            let network = t.network_id().await?;
+            let expected = t
+                .store
+                .lock()
+                .await
+                .authorize_node(&network, &public_id)
+                .unwrap_err();
+            assert_eq!(refused.to_string(), expected.to_string());
+            // The public node dials the target without a membership check; the target alone
+            // judges the token, and `/api/decision` turns its refusal into 401.
+            let refused = p
+                .decision_http("vfd_wrong", decision.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("invalid decision token"),
+                "{refused:#}"
+            );
+            let answered = p.decision_http(&token, decision).await?;
+            assert_eq!(
+                answered,
+                json!({"question_id":question,"answer_id":format!("a-{question}"),
+                "status":"answered","text":"修"})
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&t, &p] {
+            node.stop_network().await;
+        }
+        cleanup(t, dir_t).await?;
+        cleanup(p, dir_p).await?;
         result
     }
 

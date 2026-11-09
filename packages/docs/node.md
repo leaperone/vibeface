@@ -305,7 +305,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    }
    ```
 
-   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端列在 `--trusted-proxy`（`forwarding.trusted_proxies`）里时读取单个 `X-Real-IP`，用它按浏览器地址限制连接数和 `/api/decision` 的预算，忽略 `Forwarded` 和 `X-Forwarded-For`。decision 预算是每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429；经反代而没设 `--trusted-proxy` 时，所有 decision 都记在回环这一个来源上。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上初始化 Node 时指向它的发现服务，然后启动：
 
@@ -377,7 +377,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准。
+浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准；`/api/decision` 的预算（同时 16 个、每分钟 256 个来源、每来源 12 次）按同一地址认定。
 
 `--tls`（顶层 `tls`）让 `listen` 只接受 TLS，要求 HTTPS 的 `public_url`。`init` 为 `public_url` 的主机名或 IP 生成自签占位证书 `tls-cert.pem` 和私钥 `tls-key.pem`；浏览器直连时把它们换成 CA 签发的证书链和私钥（例如 acme.sh `--install-cert`，见 [`deploy/README.md`](../../deploy/README.md)）。Node 在文件变化后的下一个连接重新加载，不需要重启；证书和私钥不配对或无法解析时继续用上一对，5 秒后再试。
 

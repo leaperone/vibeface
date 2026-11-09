@@ -737,10 +737,12 @@ class Node:
             require(result.returncode == 0, f"{self.name}: local access material is available: {result.stderr.decode(errors='replace')[-300:]}")
             self.access = json.loads(result.stdout)
             require(self.access["device_id"] == self.device_id, "local access pins the Node identity")
-            setup = self.client.request("/api/local/setup", {})
-            require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
-                    and not {"invitation", "local_launch", "capability"} & set(setup),
-                    "an anonymous local setup on the public listener reports only the Node's state")
+            # A `--tls` listener answers no plain HTTP (`pinned_info` covers it); the owner link below uses the loopback listener.
+            if not configuration.get("tls"):
+                setup = self.client.request("/api/local/setup", {})
+                require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
+                        and not {"invitation", "local_launch", "capability"} & set(setup),
+                        "an anonymous local setup on the public listener reports only the Node's state")
             if self.access.get("capability"):
                 link = subprocess.run([str(self.binary), "access", "--data-dir", str(self.directory)],
                                       capture_output=True, text=True, timeout=15)

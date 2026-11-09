@@ -139,6 +139,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `/api/info` | GET | `device_id` 和 `version`；允许入口可跨源读取 |
 | `/api/local/setup` | POST | 本机状态与所有者材料：所有者进程凭 `local-access.json` 的 bearer 读取一次性初始化邀请、当前入口和本机启动 token，匿名本机网页只得到状态；`forwarding.any` 的公共节点回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
+| `/api/decision` | POST | 决定令牌回答提问 `{device_id, question_id, choice \| text}`，`Authorization: Bearer <令牌>`；目标是本机时核验令牌并回答，`forwarding.any` 的公共节点不核对成员、经 `vibeface/decision/1` 转给目标，成员 Node 只转给当前成员 Node；每台 Node 同时最多 16 个、每分钟 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429，来源按 `forwarding.trusted_proxies` 认定 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的回环工具端口上提供；`vibeface tool` 发 `{toolName, args, agentId}`，回 `{result}`；按当前 attempt bearer 授权，`agentId` 不授予权限 |
 | `/mcp` | POST | 只在同一私有回环工具端口提供的无状态 Streamable HTTP MCP；initialize、tools/list、tools/call 均验证当前 attempt bearer，调用同一 Runtime.tool 与 call_ref 去重路径 |
 

@@ -138,6 +138,6 @@ Agent 侧（CLI → `/api/triage`）：
 Grok 侧：
 
 - webhook 事件 `{"type":"question", question_id, severity, text, choices[{index,label}], about, bot, answer:{url, device_id, question_id}}` 和 `{"type":"answered", question_id, text}`，`event_id` 分别为问题 ID 与 `answered-<问题 ID>-<回答事件哈希前 16 位>`。两端同时回答时 rank 小者胜，同步把输方本机的回答换成胜者；提问方 Node 按新的回答再发一次 `answered`，未送出的旧 `answered` 撤下。接收方以同一 `question_id` 最后收到的为准。
-- `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。公共入口把请求转给 `device_id`；成员 Node 处理自己的会话，其余只转给当前成员 Node，非成员目标拒绝，token 只由目标核验。回答落成消息后的私有回答控制与其他分诊轮共用 `daily_decision_limit`，每次领取占一次额度。
+- `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。`forwarding.any` 的公共节点不核对成员，把请求转给 `device_id`；成员 Node 处理自己的会话，其余只转给当前成员 Node，非成员目标拒绝，token 只由目标核验。每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429。回答落成消息后的私有回答控制与其他分诊轮共用 `daily_decision_limit`，每次领取占一次额度。
 
 Bot 一轮的输入：`trigger.event` 是回答消息，另附 `trigger.question`（问题全文、选项和 Subject），说明它回答哪个问题。提示要求 Bot 用回答消息的 `message_id` 作为 `vibeface codex send --id`。这次发送是这一轮的工作，同一轮重试只读回；回合结束后结果作为 `work_result` 轮回到 Bot。

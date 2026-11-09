@@ -83,6 +83,8 @@ impl Default for DecisionLimit {
 
 impl DecisionLimit {
     fn enter(&self, source: IpAddr, now_ms: i64) -> ApiResult<tokio::sync::OwnedSemaphorePermit> {
+        // Per client address as the relay and `listen` count them: an IPv6 /56, not each host.
+        let source = crate::net::client_address(source);
         let denied = || {
             ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1609,6 +1611,17 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         drop(limit.enter("203.0.113.2".parse()?, 120_000).unwrap());
+        // IPv6 sources count per /56, as the relay and `listen` do.
+        let block = |host: u16| -> IpAddr { format!("2001:db8:0:{host:x}::1").parse().unwrap() };
+        for _ in 0..DECISIONS_PER_MINUTE {
+            drop(limit.enter(block(0), 180_000).unwrap());
+        }
+        assert_eq!(
+            limit.enter(block(0xff), 180_000).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "another host of the same /56 shares its budget"
+        );
+        drop(limit.enter(block(0x100), 180_000).unwrap());
         Ok(())
     }
 
