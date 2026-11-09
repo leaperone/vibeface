@@ -26,7 +26,7 @@ export type DeliveryPayment = {
   refunded: string
   tx_hash: string | null
   budget_id: string | null
-  settlement: { earned: string; withdrawn: string; refunded: string; publication: { state: 'private_ready' | 'disclosed_outstanding' | 'final_earned' | 'expired_unrevealed'; total_amount: string; economic_cutoff: number; availability_risk: string | null } | null } | null
+  settlement: { earned: string; withdrawn: string; refunded: string; publication: { state: 'private_ready' | 'disclosed_outstanding' | 'final_earned' | 'final_settled' | 'expired_unrevealed'; total_amount: string; economic_cutoff: number; availability_risk: string | null } | null } | null
 }
 export type DeliveryBudget = {
   budget_id: string

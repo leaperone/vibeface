@@ -69,7 +69,9 @@ P 必须显式配置本机 `publication_policy`，未配置时不提供受保护
 
 W 是本机最多两个活动 claim 和一个历史复查槽的调度界；每槽有 10 秒执行截止，轮询间隔 1 秒。I/F/S 分别是配置明确承担的 canonical 执行、后续最终性和时钟误差边界。网络或主机不满足这些边界时必须报告可用性风险，配置数字本身不证明边界已经成立。
 
-publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变签名 attempt。四种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、ExpiredUnrevealed。签好 raw 仍是私密状态。
+publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变签名 attempt。五种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、FinalSettled、ExpiredUnrevealed。签好 raw 仍是私密状态。
+
+已赚取或已结束的 claim 仍按原 hash 只读对账每份 attempt，不用窗口收入推断某笔原交易成功。FinalSettled 表示本批原窗口和奖金权利已全部结束，款项可能部分赚取、其余退款，且恢复材料可能已公开。只有全部原 attempt 各自已 canonical confirmed 或 reverted、同 anchor 的逐窗费用及奖金与 earned/refunded 精确核对后，才记录候选终态；再经过原 F+S 的本机与 confirmed 链时间双重等待、重新验证原 anchor 和全部终态，才释放活动槽。未知、浅确认、重组、时钟异常或未结奖金会清除候选并继续占槽。claim、首次披露事实、原签名和累计 cap 不删除；历史复查发现反证或无法确认终态时恢复 Outstanding，阻止新增队列绕过不确定结果。
 
 产品 publication 路径禁止任何含 E 的 estimateGas、eth_call、simulation。公开固定材料的 `experiment-delivery.mjs` 故障对照会故意调用 `revealBatch.staticCall` 并绕过 Node gate；这些原始提前披露/回滚反例不构成产品 gate 通过，也不改写旧 FAIL。有限两窗 reveal 使用离线固定 800000 gas：没有 verifier 调用，每项固定 80 字节及有界 storage/事件；相关真实有限形状和合成账务用例检查该上界。runtime 改变时须重新核对，不能用真实 E 去估算。首次外发前检查原 cap、原生币余额、固定 fee 足额和无低 nonce 阻塞；raw、nonce、claim 关联原子落盘。紧邻首次可能含 E 的 RPC 再检查 `now + W + I + F + S < economic_cutoff`，耐久记录可能披露，之后才广播。RPC 超时或错误仍是 Outstanding，不能按失败另付。
 

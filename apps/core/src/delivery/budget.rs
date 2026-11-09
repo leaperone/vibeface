@@ -521,17 +521,59 @@ struct ClaimTerms {
     expected_earned: std::collections::BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettlementCandidate {
+    anchor: ChainPosition,
+    observed_at: u64,
+}
+impl SettlementCandidate {
+    fn matured(
+        &self,
+        now: u64,
+        position: &ChainPosition,
+        policy: &PublicationPolicy,
+    ) -> Result<bool> {
+        let wait = policy
+            .finality_seconds
+            .checked_add(policy.clock_skew_seconds)
+            .context("settlement finality margin overflow")?;
+        Ok(self
+            .observed_at
+            .checked_add(wait)
+            .is_some_and(|at| now >= at)
+            && self
+                .anchor
+                .timestamp
+                .checked_add(wait)
+                .is_some_and(|at| position.timestamp >= at))
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum ClaimState {
     PrivateReady,
-    DisclosedOutstanding { first_possible_at: u64 },
-    FinalEarned { first_possible_at: Option<u64> },
+    DisclosedOutstanding {
+        first_possible_at: u64,
+        settlement_candidate: Option<SettlementCandidate>,
+    },
+    FinalEarned {
+        first_possible_at: Option<u64>,
+    },
+    FinalSettled {
+        first_possible_at: u64,
+        evidence: SettlementCandidate,
+    },
     ExpiredUnrevealed,
 }
 impl ClaimState {
     fn first_possible_at(&self) -> Option<u64> {
         match self {
-            Self::DisclosedOutstanding { first_possible_at } => Some(*first_possible_at),
+            Self::DisclosedOutstanding {
+                first_possible_at, ..
+            }
+            | Self::FinalSettled {
+                first_possible_at, ..
+            } => Some(*first_possible_at),
             Self::FinalEarned { first_possible_at } => *first_possible_at,
             _ => None,
         }
@@ -541,9 +583,89 @@ impl ClaimState {
             Self::PrivateReady => "private_ready",
             Self::DisclosedOutstanding { .. } => "disclosed_outstanding",
             Self::FinalEarned { .. } => "final_earned",
+            Self::FinalSettled { .. } => "final_settled",
             Self::ExpiredUnrevealed => "expired_unrevealed",
         }
     }
+    fn take_settlement_candidate(&mut self) -> Option<SettlementCandidate> {
+        let (first_possible_at, candidate) = match self {
+            Self::DisclosedOutstanding {
+                first_possible_at,
+                settlement_candidate,
+            } => (*first_possible_at, settlement_candidate.take()),
+            Self::FinalSettled {
+                first_possible_at,
+                evidence,
+            } => (*first_possible_at, Some(evidence.clone())),
+            _ => return None,
+        };
+        *self = Self::DisclosedOutstanding {
+            first_possible_at,
+            settlement_candidate: None,
+        };
+        candidate
+    }
+}
+
+fn order_is_settled(state: &chain::OrderState, order: &Order) -> Result<bool> {
+    if state
+        .windows
+        .iter()
+        .any(|window| !matches!(window.phase, 3 | 4))
+    {
+        return Ok(false);
+    }
+    ensure!(
+        state.windows.len() == order.unsigned.windows.len(),
+        "settled order window count changed"
+    );
+    ensure!(
+        !(state.bonus_earned && state.bonus_refunded),
+        "settled bonus has conflicting outcomes"
+    );
+    let bonus = U256::from_be_bytes(order.unsigned.terms.whole_order_bonus.to_be_bytes());
+    if bonus != U256::ZERO && !state.bonus_earned && !state.bonus_refunded {
+        return Ok(false);
+    }
+    let mut earned = if state.bonus_earned {
+        bonus
+    } else {
+        U256::ZERO
+    };
+    let mut refunded = if state.bonus_refunded {
+        bonus
+    } else {
+        U256::ZERO
+    };
+    for (window, spec) in state.windows.iter().zip(&order.unsigned.windows) {
+        ensure!(
+            window.ciphertext_hash == spec.ciphertext_hash
+                && window.capsule_hash == spec.capsule_hash,
+            "settled window differs from its signed manifest"
+        );
+        let amount = U256::from_be_bytes(spec.delivery_fee.to_be_bytes())
+            .checked_add(U256::from_be_bytes(spec.reservation_fee.to_be_bytes()))
+            .context("settled window amount overflow")?;
+        if window.phase == 3 {
+            earned = earned
+                .checked_add(amount)
+                .context("settled earned amount overflow")?;
+        } else {
+            refunded = refunded
+                .checked_add(amount)
+                .context("settled refund amount overflow")?;
+        }
+    }
+    ensure!(
+        earned == chain::amount(&state.earned)?
+            && refunded == chain::amount(&state.refunded)?
+            && earned.checked_add(refunded)
+                == Some(U256::from_be_bytes(
+                    order.unsigned.terms.escrow_amount.to_be_bytes()
+                )),
+        "settled order accounting differs from its signed amounts"
+    );
+    Ok(true)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1148,7 +1270,8 @@ impl Delivery {
                 return Ok(());
             }
         }
-        self.queue_publication(id, &orders).await
+        let chain = self.chain().await?;
+        self.queue_publication(&chain, id, &orders).await
     }
     async fn authorize_budget_batch(&self, id: &str) -> Result<()> {
         let record = self.budget_record(id)?;
@@ -1203,7 +1326,12 @@ impl Delivery {
             )
         })
     }
-    async fn queue_publication(&self, id: &str, orders: &[StoredOrder]) -> Result<()> {
+    async fn queue_publication(
+        &self,
+        chain: &chain::Chain,
+        id: &str,
+        orders: &[StoredOrder],
+    ) -> Result<()> {
         let policy = self
             .config()
             .publication_policy
@@ -1216,7 +1344,6 @@ impl Delivery {
         if active >= MAX_ACTIVE_CLAIMS {
             return Ok(());
         }
-        let chain = self.chain().await?;
         let position = chain.confirmed_position().await?;
         let budget = chain.budget_at(&position, parse_word(id)?.into()).await?;
         let record = self.budget_record(id)?;
@@ -1357,16 +1484,22 @@ impl Delivery {
         for (_, mut claim) in claims.into_iter().take(MAX_ACTIVE_CLAIMS + 1) {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(PUBLICATION_STEP_SECONDS),
-                self.reconcile_publication(&mut claim, execute),
+                async {
+                    let chain = self.chain().await?;
+                    self.reconcile_publication(&chain, &mut claim, execute)
+                        .await
+                },
             )
             .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
+                    claim.state.take_settlement_candidate();
                     claim.risk = Some("publication reconciliation is unavailable; durable claim and attempts are preserved".into());
                     self.save_claim(&claim)?;
                 }
                 Err(_) => {
+                    claim.state.take_settlement_candidate();
                     claim.risk = Some("publication step exceeded its local scheduling bound; availability assumptions are not met".into());
                     self.save_claim(&claim)?;
                 }
@@ -1378,10 +1511,11 @@ impl Delivery {
     }
     async fn reconcile_publication(
         &self,
+        chain: &chain::Chain,
         claim: &mut PublicationClaim,
         execute: bool,
     ) -> Result<()> {
-        let chain = self.chain().await?;
+        let candidate = claim.state.take_settlement_candidate();
         let record = self.budget_record(&claim.terms.budget_id)?;
         ensure!(
             record.terms.payee == claim.terms.payee
@@ -1389,6 +1523,31 @@ impl Delivery {
             "durable publication authorization changed"
         );
         let position = chain.confirmed_position().await?;
+        let mut last = None;
+        let mut terminal_blocks = Vec::new();
+        for id in &claim.attempts {
+            let transaction = self.with_store(|s| s.transaction(id))?;
+            let observed = chain.observe(&transaction).await?;
+            self.with_store(|s| {
+                s.observe_transaction(
+                    id,
+                    &observed.phase,
+                    observed.block_number,
+                    observed.block_hash.as_deref(),
+                    observed.error.as_deref(),
+                )
+            })?;
+            if matches!(observed.phase.as_str(), "confirmed" | "reverted")
+                && observed.block_hash.is_some()
+            {
+                if let Some(number) = observed.block_number {
+                    terminal_blocks.push(number);
+                }
+            }
+            if observed.phase != "reverted" {
+                last = Some((transaction, observed));
+            }
+        }
         let budget = chain
             .budget_at(&position, parse_word(&claim.terms.budget_id)?.into())
             .await?;
@@ -1399,6 +1558,7 @@ impl Delivery {
         let mut earned = true;
         let mut all_windows_earned = true;
         let mut live_held = true;
+        let mut rights_ended = !claim.terms.items.is_empty();
         for item in &claim.terms.items {
             let id = parse_word(&item.window.order_id)?;
             ensure!(
@@ -1441,6 +1601,7 @@ impl Delivery {
                 .get(&item.window.order_id)
                 .context("claim has no immutable order amount")?;
             earned &= chain::amount(&state.earned)? >= chain::amount(expected)?;
+            rights_ended &= order_is_settled(&state, &stored.order)?;
         }
         chain.verify_position(&position).await?;
         let disclosed = claim.state.first_possible_at();
@@ -1451,34 +1612,62 @@ impl Delivery {
             claim.risk = None;
             return self.save_claim(claim);
         }
+        if matches!(claim.state, ClaimState::FinalEarned { .. }) {
+            claim.state = match disclosed {
+                Some(first_possible_at) => ClaimState::DisclosedOutstanding {
+                    first_possible_at,
+                    settlement_candidate: None,
+                },
+                None => ClaimState::PrivateReady,
+            };
+        }
+        let (chain_now, base_fee) = chain.publication_clock().await?;
+        let local_now = super::now();
+        if let Some(first_possible_at) = disclosed
+            && rights_ended
+            && !claim.attempts.is_empty()
+            && terminal_blocks.len() == claim.attempts.len()
+            && terminal_blocks
+                .iter()
+                .all(|number| *number <= position.block_number)
+            && local_now >= claim.terms.economic_cutoff
+            && position.timestamp >= claim.terms.economic_cutoff
+            && local_now.abs_diff(chain_now) <= claim.terms.policy.clock_skew_seconds
+        {
+            let evidence = if let Some(candidate) = candidate {
+                chain.verify_position(&candidate.anchor).await?;
+                ensure!(
+                    terminal_blocks
+                        .iter()
+                        .all(|number| *number <= candidate.anchor.block_number),
+                    "original receipt moved beyond its settlement candidate anchor"
+                );
+                candidate
+            } else {
+                SettlementCandidate {
+                    anchor: position.clone(),
+                    observed_at: local_now,
+                }
+            };
+            chain.verify_position(&position).await?;
+            claim.state = if evidence.matured(local_now, &position, &claim.terms.policy)? {
+                ClaimState::FinalSettled {
+                    first_possible_at,
+                    evidence,
+                }
+            } else {
+                ClaimState::DisclosedOutstanding {
+                    first_possible_at,
+                    settlement_candidate: Some(evidence),
+                }
+            };
+            claim.risk = Some("original windows and amounts ended in earned or refunded state; recovery material may remain disclosed".into());
+            return self.save_claim(claim);
+        }
         if all_windows_earned {
             claim.risk = Some("windows earned less than the authorized whole-order amount; original bonus conditions were missed".into());
             return self.save_claim(claim);
         }
-        if matches!(claim.state, ClaimState::FinalEarned { .. }) {
-            claim.state = match disclosed {
-                Some(first_possible_at) => ClaimState::DisclosedOutstanding { first_possible_at },
-                None => ClaimState::PrivateReady,
-            };
-        }
-        let mut last = None;
-        for id in &claim.attempts {
-            let transaction = self.with_store(|s| s.transaction(id))?;
-            let observed = chain.observe(&transaction).await?;
-            self.with_store(|s| {
-                s.observe_transaction(
-                    id,
-                    &observed.phase,
-                    observed.block_number,
-                    observed.block_hash.as_deref(),
-                    observed.error.as_deref(),
-                )
-            })?;
-            if observed.phase != "reverted" {
-                last = Some((transaction, observed));
-            }
-        }
-        let (chain_now, base_fee) = chain.publication_clock().await?;
         let now = super::now().max(chain_now);
         if now >= claim.terms.economic_cutoff {
             if disclosed.is_none() {
@@ -1660,6 +1849,7 @@ impl Delivery {
         if disclosed.is_none() {
             claim.state = ClaimState::DisclosedOutstanding {
                 first_possible_at: now,
+                settlement_candidate: None,
             };
         }
         claim.risk = Some("publication may be disclosed; awaiting canonical earned state".into());
@@ -1678,6 +1868,654 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[allow(dead_code)]
+    mod support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/delivery/examples/support/mod.rs"
+        ));
+    }
+
+    #[derive(Clone)]
+    struct Observation {
+        phases: [u8; 2],
+        receipt_status: u64,
+        missing: bool,
+        shallow: bool,
+        reorged: bool,
+        bonus_pending: bool,
+        refunded_bonus: bool,
+        clock_offset: u64,
+        anchor_age: u64,
+        moved_receipt: bool,
+        current_reorg: bool,
+        current_hash_changed: bool,
+        broken: bool,
+    }
+    struct PublicationFixture {
+        delivery: Delivery,
+        rpc: chain::tests::RpcFixture,
+        observation: Arc<Mutex<Observation>>,
+        claims: Vec<PublicationClaim>,
+        orders: Vec<StoredOrder>,
+        dir: std::path::PathBuf,
+        now: u64,
+    }
+    impl PublicationFixture {
+        async fn new(phases: [u8; 2]) -> Result<Self> {
+            let now = super::super::now();
+            let mut config = chain::tests::config();
+            config.escrow = format!("0x{}", "44".repeat(20));
+            config.asset = format!("0x{}", "33".repeat(20));
+            let mut orders = Vec::new();
+            let mut capsules = Vec::new();
+            for seed in [1, 2, 3] {
+                let fixture = support::fixture_with_profile(&[4, 4], config.profile.clone());
+                let mut terms = fixture.order.unsigned.terms;
+                terms.payer_order_nonce = [seed; 32];
+                if seed == 3 {
+                    terms.binding.valid_from = now;
+                    terms.binding.valid_until = now + 700;
+                    terms.quote_expires_at = now + 200;
+                    terms.hold_deadline = now + 300;
+                    terms.key_deadline = now + 400;
+                    terms.open_deadline = now + 500;
+                    terms.retain_until = now + 600;
+                    terms.priority_deadline = now + 350;
+                }
+                let fixture = support::fixture_from_terms(
+                    config.profile.clone(),
+                    terms,
+                    vec![
+                        vibeface_delivery::SecretBytes::new(vec![seed; 4]),
+                        vibeface_delivery::SecretBytes::new(vec![seed + 1; 4]),
+                    ],
+                    vibeface_delivery::Amount::from_u64(2),
+                    vibeface_delivery::Amount::from_u64(1),
+                );
+                let intent = uuid::Uuid::new_v4().to_string();
+                let mut view = super::super::orders::view(
+                    &intent,
+                    Role::Provider,
+                    Mode::Paid,
+                    &fixture.order,
+                    8,
+                )?;
+                view.payment.budget_id = Some(format!("{seed:02x}").repeat(32));
+                capsules.push(
+                    fixture
+                        .encrypted
+                        .iter()
+                        .map(|window| window.capsule.clone())
+                        .collect::<Vec<_>>(),
+                );
+                orders.push(StoredOrder {
+                    network_id: None,
+                    authorized_by: None,
+                    confirmed: true,
+                    resume_requested: false,
+                    request_hash: "88".repeat(32),
+                    view,
+                    order: fixture.order,
+                    wallet_signature: Vec::new(),
+                    source_seals: Vec::new(),
+                    grants: Vec::new(),
+                    accepted: true,
+                    notified: true,
+                    allocation_batch: Vec::new(),
+                });
+            }
+            let observation = Arc::new(Mutex::new(Observation {
+                phases,
+                receipt_status: 0,
+                missing: false,
+                shallow: false,
+                reorged: false,
+                bonus_pending: false,
+                refunded_bonus: false,
+                clock_offset: 0,
+                anchor_age: 7,
+                moved_receipt: false,
+                current_reorg: false,
+                current_hash_changed: false,
+                broken: false,
+            }));
+            let observed = observation.clone();
+            let rpc_orders = orders.clone();
+            let rpc_capsules = capsules.clone();
+            let rpc = chain::tests::rpc_fixture(config, move |request| {
+                let state = observed.lock().unwrap().clone();
+                match request["method"].as_str().unwrap() {
+                    "eth_blockNumber" => json!("0x15"),
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let (number, hash, timestamp) = match tag {
+                            "latest" => (21, 0x66, now + state.clock_offset),
+                            "0xa" => (10, if state.reorged { 0x56 } else { 0x55 }, now - state.anchor_age),
+                            "0x14" => (20, if state.current_hash_changed {0x67} else {0x66}, now),
+                            "0x9" => (9, 0x77, now - 8),
+                            "0x13" => (19, 0x77, now - 1),
+                            "0x15" => (21, 0x66, now),
+                            _ => panic!("unexpected block tag {tag}"),
+                        };
+                        json!({"number":format!("0x{number:x}"),"hash":format!("0x{}",format!("{hash:02x}").repeat(32)),"timestamp":format!("0x{timestamp:x}"),"baseFeePerGas":"0x1"})
+                    }
+                    "eth_getTransactionReceipt" => {
+                        if state.current_reorg { observed.lock().unwrap().current_hash_changed = !state.current_hash_changed; }
+                        if state.broken { return json!(false); }
+                        if state.missing { return Value::Null; }
+                        json!({"transactionHash":request["params"][0],"from":format!("0x{}","22".repeat(20)),"to":format!("0x{}","44".repeat(20)),
+                            "blockNumber":if state.shallow {"0x15"} else if state.moved_receipt {"0x13"} else {"0x9"},"blockHash":format!("0x{}",if state.shallow {"66"} else {"77"}.repeat(32)),
+                            "status":format!("0x{:x}",state.receipt_status)})
+                    }
+                    "eth_getTransactionByHash" => Value::Null,
+                    "eth_getTransactionCount" => json!("0x20"),
+                    "eth_call" => {
+                        let data = request["params"][0]["data"].as_str().unwrap();
+                        assert!(!data.starts_with(&format!("0x{}",hex::encode(abi::revealBatchCall::SELECTOR))));
+                        let encoded = |bytes: Vec<u8>| json!(format!("0x{}",hex::encode(bytes)));
+                        for (index, order) in rpc_orders.iter().enumerate() {
+                            let id = B256::from(order.order.unsigned.terms.order_id().unwrap());
+                            let budget_id = B256::repeat_byte((index + 1) as u8);
+                            let call = |bytes: Vec<u8>| data == format!("0x{}",hex::encode(bytes));
+                            if call(abi::orderBudgetCall { id }.abi_encode()) {
+                                return encoded(abi::orderBudgetCall::abi_encode_returns(&budget_id));
+                            }
+                            let phases = if index == 2 {[1, 1]} else {state.phases};
+                            let bonus_earned = phases == [3, 3] && !state.bonus_pending && !state.refunded_bonus;
+                            let bonus_refunded = (phases.contains(&4) || index < 2 && state.refunded_bonus) && !state.bonus_pending;
+                            let earned = phases.iter().filter(|phase| **phase == 3).count() * 3 + usize::from(bonus_earned);
+                            let refunded = phases.iter().filter(|phase| **phase == 4).count() * 3 + usize::from(bonus_refunded);
+                            if call(abi::getBudgetCall { id: budget_id }.abi_encode()) {
+                                return encoded(abi::getBudgetCall::abi_encode_returns(&abi::ChainBudget {
+                                    payer: Address::repeat_byte(0x11),payee:Address::repeat_byte(0x22),providerPeer:order.order.unsigned.terms.provider_peer.into(),
+                                    asset:Address::repeat_byte(0x33),deposit:U256::from(7),locked:U256::from(7-earned-refunded),earned:U256::from(earned),
+                                    withdrawn:U256::ZERO,refunded:U256::from(refunded),maxClaimUntil:order.order.unsigned.terms.key_deadline,
+                                    assetDecimals:6,state:if index == 2 {1} else if earned + refunded == 7 {3} else {2},
+                                }));
+                            }
+                            if call(abi::getOrderCall { id }.abi_encode()) {
+                                let terms = abi::DeliveryStatement::abi_decode(Statement::window(&order.order.unsigned,0,Relation::Source).unwrap().abi_bytes()).unwrap();
+                                return encoded(abi::getOrderCall::abi_encode_returns(&abi::ChainOrder {
+                                    terms,windows:order.order.unsigned.windows.iter().enumerate().map(|(window,spec)| abi::ChainWindow {
+                                        spec:abi::WindowSpec {index:spec.index,offset:spec.offset,plaintextBytes:spec.plaintext_bytes,ciphertextBytes:spec.ciphertext_bytes,
+                                            ciphertextHash:spec.ciphertext_hash.into(),capsuleHash:spec.capsule_hash.into(),plaintextCommitment:spec.plaintext_commitment.into(),
+                                            deliveryFee:U256::from(2),reservationFee:U256::from(1)},phase:phases[window],decryptionProven:false,
+                                        capsule:if phases[window] == 3 {rpc_capsules[index][window].clone().into()} else {Bytes::new()},
+                                    }).collect(),earned:U256::from(earned),withdrawn:U256::ZERO,refunded:U256::from(refunded),
+                                    earnedWindows:phases.iter().filter(|phase| **phase == 3).count() as u16,
+                                    refundedWindows:phases.iter().filter(|phase| **phase == 4).count() as u16,assetDecimals:6,bonusEarned:bonus_earned,bonusRefunded:bonus_refunded,
+                                }));
+                            }
+                            for window in 0..2 {
+                                if call(abi::publicValuesCall {id,index:window,relation:2}.abi_encode()) {
+                                    return encoded(abi::publicValuesCall::abi_encode_returns(&abi::DeliveryStatement::abi_decode(
+                                        Statement::window(&order.order.unsigned,window,Relation::Source).unwrap().abi_bytes()).unwrap()));
+                                }
+                            }
+                        }
+                        panic!("unexpected public getter {data}")
+                    }
+                    method => panic!("read-only reconciliation sent {method}"),
+                }
+            }).await?;
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.artifacts")
+                .join(format!(
+                    "publication-reconciliation-{}",
+                    uuid::Uuid::new_v4()
+                ));
+            crate::config::private_dir(&dir)?;
+            let delivery = Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
+            delivery.configure_local(super::super::DeliveryConfig {
+                enabled: true,
+                paid_enabled: true,
+                chain: Some(rpc.chain.config().clone()),
+                publication_policy: Some(policy()),
+                provider_gas_cap: "100000000000000000".into(),
+                ..Default::default()
+            })?;
+            let mut claims = Vec::new();
+            for (index, order) in orders.iter().enumerate() {
+                let budget_id = order.view.payment.budget_id.clone().unwrap();
+                delivery.with_store(|store| {
+                    store.save_order(order)?;
+                    store.put_value(
+                        &record_key(&budget_id),
+                        &serde_json::to_vec(&BudgetRecord {
+                            terms: BudgetTerms {
+                                budget_id: budget_id.clone(),
+                                chain_id: 31337,
+                                escrow: rpc.chain.config().escrow.clone(),
+                                payer: format!("0x{}", "11".repeat(20)),
+                                payee: format!("0x{}", "22".repeat(20)),
+                                provider_peer: hex::encode(
+                                    order.order.unsigned.terms.provider_peer,
+                                ),
+                                asset: rpc.chain.config().asset.clone(),
+                                deposit: "7".into(),
+                            },
+                            payer_gas_cap: "100000000000000000".into(),
+                            provider_gas_cap: "100000000000000000".into(),
+                            network_id: None,
+                            authorized_by: None,
+                        })?,
+                    )?;
+                    for (window, capsule) in capsules[index].iter().enumerate() {
+                        store.write_object(
+                            &order.view.order_id,
+                            window as u16,
+                            "capsule",
+                            capsule,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                if index == 2 {
+                    continue;
+                }
+                let items = (0..2)
+                    .map(|window| Reveal {
+                        window: WindowRef {
+                            order_id: order.view.order_id.clone(),
+                            index: window,
+                        },
+                        capsule: capsules[index][window as usize].clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let terms = ClaimTerms {
+                    budget_id: budget_id.clone(),
+                    payee: format!("0x{}", "22".repeat(20)),
+                    items,
+                    economic_cutoff: 350,
+                    total_amount: "7".into(),
+                    gas_cap: "100000000000000000".into(),
+                    policy: policy(),
+                    expected_earned: std::collections::BTreeMap::from([(
+                        order.view.order_id.clone(),
+                        "7".into(),
+                    )]),
+                };
+                let claim_id = hex::encode(hash(&serde_json::to_vec(&terms)?));
+                let attempt = format!("{}/reveal-{}-0", group(&budget_id), &claim_id[..16]);
+                let claim = PublicationClaim {
+                    id: claim_id,
+                    terms,
+                    state: ClaimState::DisclosedOutstanding {
+                        first_possible_at: now - 100,
+                        settlement_candidate: None,
+                    },
+                    attempts: vec![attempt.clone()],
+                    risk: None,
+                    checked_at_ms: 0,
+                };
+                let intent = rpc.chain.prepare_publication_intent(
+                    attempt.clone(),
+                    Address::repeat_byte(0x22),
+                    BudgetAction::Reveal {
+                        budget_id: parse_word(&budget_id)?,
+                        items: claim.terms.items.clone(),
+                    },
+                    claim.terms.gas_cap.clone(),
+                    &policy(),
+                )?;
+                delivery.with_store(|store| {
+                    store.reserve_budget_transaction(
+                        &intent,
+                        index as u64,
+                        &group(&budget_id),
+                        &claim.terms.gas_cap,
+                    )?;
+                    store.sign_transaction_with_claim(
+                        &attempt,
+                        "0x02",
+                        &format!("0x{}", format!("{:02x}", 0x99 + index).repeat(32)),
+                        Some((&claim.key(), &serde_json::to_vec(&claim)?)),
+                    )
+                })?;
+                claims.push(claim);
+            }
+            let mut settings = delivery.config();
+            settings.enabled = false;
+            settings.paid_enabled = false;
+            delivery.configure_local(settings)?;
+            Ok(Self {
+                delivery,
+                rpc,
+                observation,
+                claims,
+                orders,
+                dir,
+                now,
+            })
+        }
+        fn age_candidates(&mut self) -> Result<()> {
+            for claim in &mut self.claims {
+                claim.state = ClaimState::DisclosedOutstanding {
+                    first_possible_at: self.now - 100,
+                    settlement_candidate: Some(SettlementCandidate {
+                        anchor: ChainPosition {
+                            block_number: 10,
+                            block_hash: format!("0x{}", "55".repeat(32)),
+                            timestamp: self.now - 7,
+                        },
+                        observed_at: self.now - 7,
+                    }),
+                };
+                self.delivery.save_claim(claim)?;
+            }
+            Ok(())
+        }
+        fn original_transactions(&self) -> Result<Vec<super::super::store::SignedTransaction>> {
+            self.claims
+                .iter()
+                .map(|claim| {
+                    self.delivery
+                        .with_store(|store| store.transaction(&claim.attempts[0]))
+                })
+                .collect()
+        }
+        fn assert_read_only(
+            &self,
+            before: &[super::super::store::SignedTransaction],
+        ) -> Result<()> {
+            for (old, new) in before.iter().zip(self.original_transactions()?) {
+                assert_eq!(old.intent, new.intent);
+                assert_eq!(old.nonce, new.nonce);
+                assert_eq!(old.raw_tx, new.raw_tx);
+                assert_eq!(old.tx_hash, new.tx_hash);
+            }
+            let requests = self.rpc.requests.lock().unwrap();
+            assert!(requests.iter().all(|request| !matches!(
+                request["method"].as_str(),
+                Some("eth_sendRawTransaction" | "eth_estimateGas" | "debug_traceCall")
+            )));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn earned_windows_reconcile_original_attempts_without_inventing_keeper_transaction_success()
+    -> Result<()> {
+        for outcome in ["confirmed", "reverted", "unknown"] {
+            let mut fixture = PublicationFixture::new([3, 3]).await?;
+            {
+                let mut observed = fixture.observation.lock().unwrap();
+                observed.receipt_status = u64::from(outcome == "confirmed");
+                observed.missing = outcome == "unknown";
+            }
+            let before = fixture.original_transactions()?;
+            fixture
+                .delivery
+                .reconcile_publication(&fixture.rpc.chain, &mut fixture.claims[0], false)
+                .await?;
+            assert!(matches!(
+                fixture.claims[0].state,
+                ClaimState::FinalEarned { .. }
+            ));
+            let reopened =
+                super::super::store::ServiceStore::open(&fixture.dir, 64 * 1024 * 1024, 128)?;
+            assert_eq!(
+                reopened.transaction(&fixture.claims[0].attempts[0])?.phase,
+                outcome
+            );
+            assert!(
+                fixture
+                    .rpc
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "eth_getTransactionReceipt")
+            );
+            fixture.assert_read_only(&before)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_settlement_retires_refunded_and_mixed_claims_before_a_new_real_queue()
+    -> Result<()> {
+        for (phases, refunded_bonus, receipt_status) in
+            [([4, 4], false, 0), ([3, 4], false, 0), ([3, 3], true, 1)]
+        {
+            let mut fixture = PublicationFixture::new(phases).await?;
+            {
+                let mut observed = fixture.observation.lock().unwrap();
+                observed.refunded_bonus = refunded_bonus;
+                observed.receipt_status = receipt_status;
+            }
+            let before = fixture.original_transactions()?;
+            for claim in &mut fixture.claims {
+                fixture
+                    .delivery
+                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .await?;
+                assert!(claim.occupies_publication_window(fixture.now)?);
+            }
+            let id = fixture.orders[2].view.payment.budget_id.clone().unwrap();
+            fixture
+                .delivery
+                .queue_publication(&fixture.rpc.chain, &id, &fixture.orders[2..])
+                .await?;
+            assert_eq!(fixture.delivery.claims()?.len(), 2);
+            fixture.age_candidates()?;
+            for claim in &mut fixture.claims {
+                fixture
+                    .delivery
+                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .await?;
+            }
+            let mut settings = fixture.delivery.config();
+            settings.enabled = true;
+            settings.paid_enabled = true;
+            fixture.delivery.configure_local(settings)?;
+            fixture
+                .delivery
+                .queue_publication(&fixture.rpc.chain, &id, &fixture.orders[2..])
+                .await?;
+            let claims = fixture.delivery.claims()?;
+            assert_eq!(claims.len(), 3);
+            assert!(
+                fixture
+                    .claims
+                    .iter()
+                    .all(|claim| matches!(claim.state, ClaimState::FinalSettled { .. }))
+            );
+            let new = claims
+                .iter()
+                .find(|claim| claim.terms.budget_id == id)
+                .unwrap();
+            assert_eq!(new.terms.items.len(), 2);
+            for item in &new.terms.items {
+                assert_eq!(
+                    fixture
+                        .delivery
+                        .with_store(|store| store.value(&claim_window_key(&item.window)))?,
+                    Some(new.id.as_bytes().to_vec())
+                );
+            }
+            fixture.assert_read_only(&before)?;
+            let final_state = fixture.claims[0].state.clone();
+            for history in ["unknown", "reorg", "held"] {
+                fixture.claims[0].state = final_state.clone();
+                {
+                    let mut observed = fixture.observation.lock().unwrap();
+                    observed.missing = history == "unknown";
+                    observed.reorged = history == "reorg";
+                    observed.phases = if history == "held" { [1, 4] } else { phases };
+                }
+                let result = fixture
+                    .delivery
+                    .reconcile_publication(&fixture.rpc.chain, &mut fixture.claims[0], false)
+                    .await;
+                if history == "reorg" {
+                    assert!(result.is_err());
+                    fixture.delivery.save_claim(&fixture.claims[0])?;
+                } else {
+                    result?;
+                }
+                assert!(matches!(
+                    fixture.claims[0].state,
+                    ClaimState::DisclosedOutstanding {
+                        settlement_candidate: None,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    fixture.claims[0].state.first_possible_at(),
+                    Some(fixture.now - 100)
+                );
+                assert!(fixture.claims[0].occupies_publication_window(fixture.now)?);
+            }
+            fixture.assert_read_only(&before)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_or_live_rights_clear_settlement_candidates_and_keep_the_queue_bounded()
+    -> Result<()> {
+        for case in [
+            "unknown",
+            "shallow",
+            "reorg",
+            "held",
+            "bonus",
+            "clock",
+            "rpc",
+            "immature",
+            "chain_immature",
+            "timeout",
+            "timeout_final",
+            "moved_receipt",
+            "current_reorg",
+        ] {
+            let mut fixture = PublicationFixture::new([3, 4]).await?;
+            fixture.age_candidates()?;
+            {
+                let mut observed = fixture.observation.lock().unwrap();
+                match case {
+                    "unknown" => observed.missing = true,
+                    "shallow" => observed.shallow = true,
+                    "reorg" => observed.reorged = true,
+                    "held" => observed.phases = [1, 4],
+                    "bonus" => {
+                        observed.bonus_pending = true;
+                        observed.phases = [3, 3];
+                    }
+                    "clock" => observed.clock_offset = 100,
+                    "rpc" => observed.broken = true,
+                    "chain_immature" => observed.anchor_age = 6,
+                    "moved_receipt" => observed.moved_receipt = true,
+                    "current_reorg" => observed.current_reorg = true,
+                    "immature" | "timeout" | "timeout_final" => {}
+                    _ => unreachable!(),
+                }
+            }
+            if case == "immature" {
+                for claim in &mut fixture.claims {
+                    if let ClaimState::DisclosedOutstanding {
+                        settlement_candidate: Some(candidate),
+                        ..
+                    } = &mut claim.state
+                    {
+                        candidate.observed_at = fixture.now;
+                    }
+                }
+            }
+            let before = fixture.original_transactions()?;
+            for claim in &mut fixture.claims {
+                if case == "chain_immature" {
+                    if let ClaimState::DisclosedOutstanding {
+                        settlement_candidate: Some(candidate),
+                        ..
+                    } = &mut claim.state
+                    {
+                        candidate.anchor.timestamp = fixture.now - 6;
+                    }
+                }
+                if case == "timeout_final" {
+                    let evidence = claim.state.take_settlement_candidate().unwrap();
+                    claim.state = ClaimState::FinalSettled {
+                        first_possible_at: fixture.now - 100,
+                        evidence,
+                    };
+                }
+                if matches!(case, "timeout" | "timeout_final") {
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::ZERO,
+                            fixture.delivery.reconcile_publication(
+                                &fixture.rpc.chain,
+                                claim,
+                                false
+                            )
+                        )
+                        .await
+                        .is_err()
+                    );
+                    fixture.delivery.save_claim(claim)?;
+                    assert!(matches!(
+                        claim.state,
+                        ClaimState::DisclosedOutstanding {
+                            settlement_candidate: None,
+                            ..
+                        }
+                    ));
+                    continue;
+                }
+                let result = fixture
+                    .delivery
+                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .await;
+                if matches!(case, "rpc" | "reorg" | "moved_receipt" | "current_reorg") {
+                    assert!(result.is_err());
+                    fixture.delivery.save_claim(claim)?;
+                } else {
+                    result?;
+                }
+                assert!(claim.occupies_publication_window(fixture.now)?);
+                if !matches!(case, "immature" | "chain_immature") {
+                    assert!(matches!(
+                        claim.state,
+                        ClaimState::DisclosedOutstanding {
+                            settlement_candidate: None,
+                            ..
+                        }
+                    ));
+                }
+            }
+            fixture
+                .delivery
+                .queue_publication(
+                    &fixture.rpc.chain,
+                    fixture.orders[2].view.payment.budget_id.as_deref().unwrap(),
+                    &fixture.orders[2..],
+                )
+                .await?;
+            assert_eq!(fixture.delivery.claims()?.len(), 2);
+            fixture.assert_read_only(&before)?;
+        }
+        let candidate = SettlementCandidate {
+            anchor: ChainPosition {
+                block_number: 10,
+                block_hash: format!("0x{}", "55".repeat(32)),
+                timestamp: 100,
+            },
+            observed_at: 100,
+        };
+        let mut position = candidate.anchor.clone();
+        position.timestamp = 107;
+        assert!(!candidate.matured(106, &position, &policy())?);
+        position.timestamp = 106;
+        assert!(!candidate.matured(107, &position, &policy())?);
+        position.timestamp = 107;
+        assert!(candidate.matured(107, &position, &policy())?);
+        Ok(())
+    }
 
     pub(super) fn policy() -> PublicationPolicy {
         PublicationPolicy {
@@ -1700,6 +2538,7 @@ mod tests {
         assert!(!policy.disclosure_allowed(&private, 397, 400)?);
         let disclosed = ClaimState::DisclosedOutstanding {
             first_possible_at: 347,
+            settlement_candidate: None,
         };
         assert!(
             policy.disclosure_allowed(&disclosed, 397, 400)?,
@@ -1762,6 +2601,7 @@ mod tests {
         assert!(!restored.occupies_publication_window(until)?);
         restored.state = ClaimState::DisclosedOutstanding {
             first_possible_at: 347,
+            settlement_candidate: None,
         };
         assert!(restored.occupies_publication_window(until + 1)?);
         Ok(())

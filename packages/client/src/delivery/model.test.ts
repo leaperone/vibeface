@@ -77,6 +77,20 @@ test('a received file is saved only after exact content, length, name and digest
   assert.throws(() => fromBase64('Zh=='))
 })
 
+test('settled publication preserves partial earnings and refunds without claiming recovery material stayed private', () => {
+  for (const earned of ['0', '3']) {
+    const refunded = earned === '0' ? '10' : '7'
+    const settled = parseOrder({ ...paidOrder(), phase: 'refunded', payment: { ...paidOrder().payment,
+      state: 'refunded', delivery_fee: '10', total: '10', earned, refunded,
+      settlement: { earned, withdrawn: '0', refunded, publication: { state: 'final_settled', total_amount: '10', economic_cutoff: 30, availability_risk: null } } } })
+    assert.equal(settled.payment.earned, earned)
+    assert.equal(settled.payment.refunded, refunded)
+    assert.equal(publicationLabel(settled), '本批款项已赚取或退款，恢复材料可能已公开')
+    assert.throws(() => parseOrder({ ...settled, payment: { ...settled.payment, settlement: { ...settled.payment.settlement,
+      publication: { state: 'invented_terminal', total_amount: '10', economic_cutoff: 30, availability_risk: null } } } }))
+  }
+})
+
 test('file retrieval permits charity senders and accepted receivers but never paid senders or providers', () => {
   const charityReceived: DeliveryOrder = { ...order(), role: 'receiver', phase: 'recoverable', evidence: 'charity_receipt', windows: order().windows.map(window => ({ ...window, state: 'held', committed_bytes: window.bytes + 68 })) }
   const delivered: DeliveryOrder = { ...paidOrder(), phase: 'paid', evidence: 'recoverable', payment: { ...paidOrder().payment, state: 'earned', earned: paidOrder().payment.total }, windows: paidOrder().windows.map(window => ({ ...window, state: 'earned', committed_bytes: window.bytes + 68 })) }

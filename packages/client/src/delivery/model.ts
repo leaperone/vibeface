@@ -57,7 +57,7 @@ function payment(value: unknown): DeliveryPayment {
     earned: amount(v.earned), withdrawn: amount(v.withdrawn), refunded: amount(v.refunded),
     budget_id: nullable(v.budget_id, peer),
     settlement: settlement ? { earned: amount(settlement.earned), withdrawn: amount(settlement.withdrawn), refunded: amount(settlement.refunded),
-      publication: publication ? { state: member(publication.state, ['private_ready', 'disclosed_outstanding', 'final_earned', 'expired_unrevealed']), total_amount: amount(publication.total_amount),
+      publication: publication ? { state: member(publication.state, ['private_ready', 'disclosed_outstanding', 'final_earned', 'final_settled', 'expired_unrevealed']), total_amount: amount(publication.total_amount),
         economic_cutoff: integer(publication.economic_cutoff), availability_risk: nullable(publication.availability_risk, text) } : null } : null,
     tx_hash: nullable(v.tx_hash, value => {
       const hash = text(value)
@@ -207,6 +207,7 @@ export function publicationLabel(order: DeliveryOrder): string {
     case 'private_ready': return '恢复材料仍私密'
     case 'disclosed_outstanding': return '恢复材料可能已公开，正在确认收入'
     case 'final_earned': return '本批约定费用已赚取'
+    case 'final_settled': return '本批款项已赚取或退款，恢复材料可能已公开'
     case 'expired_unrevealed': return '已过期，尚未公开恢复材料'
   }
 }

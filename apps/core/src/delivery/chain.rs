@@ -1740,6 +1740,10 @@ pub(super) mod tests {
             receipt_observation(10, "hash".into(), false, 11, 2)?.phase,
             "reverted"
         );
+        assert_eq!(
+            receipt_observation(10, "hash".into(), false, 10, 2)?.phase,
+            "confirming"
+        );
         assert!(receipt_observation(10, "hash".into(), true, 9, 2).is_err());
         assert_eq!(observation("unknown", None, None, None).block_hash, None);
         Ok(())
