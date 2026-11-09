@@ -72,6 +72,8 @@ enum Action {
     Join(Join),
     /// Manage this Node's delivery wallet.
     Wallet(WalletOptions),
+    /// Inspect the public mesh or change the Nodes this one joins it through.
+    Mesh(MeshOptions),
     /// Manage the installed user service.
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
@@ -185,12 +187,6 @@ struct Init {
     /// File with the token a listed --relay asks of this Node. Repeat for each such relay.
     #[arg(long = "relay-token", value_name = "URL=FILE", value_parser = relay_token)]
     relay_tokens: Vec<(String, PathBuf)>,
-    /// Discovery URL. Repeat for multiple entries.
-    #[arg(long = "discovery", value_name = "URL")]
-    discovery: Vec<String>,
-    /// Answer other devices' discovery registrations and lookups on this Node's UDP port.
-    #[arg(long)]
-    serve_discovery: bool,
     /// Address for an embedded relay.
     #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
@@ -231,10 +227,17 @@ struct Init {
     /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
     #[arg(long = "trusted-proxy", value_name = "IP")]
     trusted_proxies: Vec<IpAddr>,
-    /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
-    /// a self-hosted `vibeface://` discovery URL.
-    #[arg(long, value_name = "MODE|URL")]
-    bootstrap: Option<String>,
+    /// Stay off the public mesh.
+    #[arg(long)]
+    no_mesh: bool,
+    /// Mesh to join instead of the public one; it starts without the default bootstrap node.
+    #[arg(long, value_name = "NAME")]
+    mesh_network: Option<String>,
+    /// A Node to join the mesh through first, itself an ordinary Node:
+    /// vibeface://<device-id>@<host>:<UDP-port>[?relay=<URL>]. Repeat for more; replaces the
+    /// default bootstrap node.
+    #[arg(long = "bootstrap", value_name = "URL")]
+    bootstrap: Vec<String>,
 }
 
 #[derive(Args)]
@@ -357,6 +360,64 @@ enum WalletAction {
         /// Destination backup file.
         output: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct MeshOptions {
+    /// Node data directory.
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
+    #[command(subcommand)]
+    command: MeshAction,
+}
+
+#[derive(Subcommand)]
+enum MeshAction {
+    /// Show whether the mesh is on, its records and neighbors, and this Node's record.
+    Status {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the records this Node holds, most recently seen first.
+    Records {
+        /// Only Nodes offering this role.
+        #[arg(long, value_enum)]
+        role: Option<MeshRole>,
+        /// Maximum number of records to show.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the Nodes this one joins the mesh through first.
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BootstrapAction {
+    /// Add bootstrap nodes: vibeface://<device-id>@<host>:<UDP-port>[?relay=<URL>].
+    Add {
+        #[arg(required = true, value_name = "URL")]
+        nodes: Vec<String>,
+    },
+    /// Remove bootstrap nodes by URL or device ID.
+    Remove {
+        #[arg(required = true, value_name = "URL|DEVICE_ID")]
+        nodes: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MeshRole {
+    Relay,
+    Gateway,
+    Service,
 }
 
 #[derive(Subcommand)]
@@ -643,16 +704,15 @@ async fn main() -> Result<()> {
             if let Some(open) = result["open"].as_str() {
                 println!("打开 {open}");
             }
-            if options.serve_discovery
-                && let Some(device_id) = result["device_id"].as_str()
-            {
-                println!("Discovery device ID: {device_id}");
-            }
-            match result["bootstrap"].as_str() {
-                Some("public") => println!("公共接入: 启用（--bootstrap off 可关闭）"),
-                Some("custom") => println!("公共接入: 自建 Discovery"),
-                Some("off") if !options.serve_discovery => println!("公共接入: 关闭"),
-                _ => {}
+            let mesh = &result["mesh"];
+            if mesh["enabled"] == true {
+                println!(
+                    "全网: 开启（{}，bootstrap 节点 {} 个；--no-mesh 可关闭）",
+                    mesh["network"].as_str().unwrap_or_default(),
+                    mesh["bootstrap"].as_array().map_or(0, Vec::len)
+                );
+            } else {
+                println!("全网: 关闭");
             }
             Ok(())
         }
@@ -661,6 +721,7 @@ async fn main() -> Result<()> {
         Some(Action::Access(options)) => access(options).await,
         Some(Action::Join(options)) => join(options).await,
         Some(Action::Wallet(options)) => wallet(options).await,
+        Some(Action::Mesh(options)) => mesh(options).await,
         Some(Action::Tool {
             name,
             json,
@@ -784,8 +845,8 @@ async fn status(options: Access) -> Result<()> {
         if let Some(write_state) = result["write_state"].as_str() {
             println!("Writes: {write_state}");
         }
-        if let Some(bootstrap) = result["bootstrap"].as_str() {
-            println!("Bootstrap: {bootstrap}");
+        if let Some(mesh) = terminal::mesh_summary(&result["mesh"]) {
+            println!("Mesh: {mesh}");
         }
         if let Some(peers) = result["peers"].as_array() {
             let now = now_ms();
@@ -815,6 +876,91 @@ async fn status(options: Access) -> Result<()> {
         result["status"] == "running",
         "node is not reachable through its private maintenance socket"
     );
+    Ok(())
+}
+
+async fn mesh(options: MeshOptions) -> Result<()> {
+    let operation = match &options.command {
+        MeshAction::Status { .. } => json!({"op":"status"}),
+        MeshAction::Records { role, limit, .. } => {
+            json!({"op":"records","role":role,"limit":limit})
+        }
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Add { nodes },
+        } => json!({"op":"bootstrap","add":nodes}),
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Remove { nodes },
+        } => json!({"op":"bootstrap","remove":nodes}),
+    };
+    let result = control(
+        &options.data_dir,
+        ControlRequest::Mesh {
+            data_dir: options.data_dir.clone(),
+            operation,
+        },
+    )
+    .await?;
+    match options.command {
+        MeshAction::Status { json: true } | MeshAction::Records { json: true, .. } => {
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        MeshAction::Status { json: false } => {
+            println!(
+                "Mesh: {} ({})",
+                if result["enabled"] == true {
+                    "on"
+                } else {
+                    "off"
+                },
+                result["network"].as_str().unwrap_or_default()
+            );
+            println!("Records: {}", result["records"]);
+            match result["neighbors"].as_u64() {
+                Some(neighbors) => println!("Neighbors: {neighbors}"),
+                None => println!("Neighbors: - (Node not running)"),
+            }
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("Bootstrap: {}", node.as_str().unwrap_or_default());
+            }
+            match result["own"].as_object() {
+                Some(_) => println!("Own record: {}", terminal::mesh_record(&result["own"])),
+                None => println!("Own record: none yet"),
+            }
+        }
+        MeshAction::Records { json: false, .. } => {
+            let now = now_ms();
+            for entry in result["records"].as_array().into_iter().flatten() {
+                let seen = now.saturating_sub(entry["last_seen_ms"].as_i64().unwrap_or(now)) / 1000;
+                println!(
+                    "{} {} seen {seen}s ago",
+                    terminal::mesh_record(&entry["record"]),
+                    if entry["online"] == true {
+                        "online"
+                    } else {
+                        "expired"
+                    },
+                );
+            }
+            let shown = result["records"].as_array().map_or(0, Vec::len);
+            if result["total"]
+                .as_u64()
+                .is_some_and(|total| total > shown as u64)
+            {
+                println!(
+                    "{shown} of {} records shown; use --limit for more",
+                    result["total"]
+                );
+            }
+        }
+        MeshAction::Bootstrap { .. } => {
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("{}", node.as_str().unwrap_or_default());
+            }
+            if result["running"] != true {
+                println!("Saved; the Node joins through these when it starts.");
+            }
+        }
+    }
     Ok(())
 }
 
