@@ -6778,6 +6778,98 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
 }
 
 #[test]
+fn colliding_question_events_keep_their_own_scope_in_history_and_notifications() -> Result<()> {
+    use crate::workspace::InputTarget;
+    for target in [
+        Some(InputTarget::Task {
+            task_id: "private-task".into(),
+        }),
+        Some(InputTarget::Work {
+            work_id: "private-work".into(),
+        }),
+        None,
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        isolated_task(&mut origin, &net, "private-work")?;
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "task",
+            workspace_task_command("private-task", None),
+            5,
+        )?;
+        let main = question(&origin, &net, "c", "q-collision", "public-thread")?;
+        origin.append_event(&net.a, &net.network, "c", main, vec![], 6)?;
+        let mut private = question(&origin, &net, "c", "q-collision", "private-thread")?;
+        if let EventBody::QuestionAsked {
+            target: destination,
+            text,
+            ..
+        } = &mut private
+        {
+            *destination = target.clone();
+            *text = "private question must stay outside Main".into();
+        }
+        origin.append_event(&net.a, &net.network, "c", private, vec![], 7)?;
+        origin.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            "after-collision",
+            "public input",
+            vec![],
+            true,
+            signature(&net, "after-collision", "public input")?,
+            8,
+        )?;
+        let job = origin
+            .scheduler_job("c", "message:after-collision")?
+            .context("Main job")?;
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        for node in [&origin, &replica] {
+            let events = node.context(&net.network, "c", None)?.events;
+            let questions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.event.body,
+                        EventBody::QuestionAsked { question_id, .. } if question_id == "q-collision"
+                    )
+                })
+                .collect();
+            assert_eq!(questions.len(), 2, "both signed events remain effective");
+            assert!(node.main_event_allowed(&net.network, "c", questions[0])?);
+            assert!(
+                !node.main_event_allowed(&net.network, "c", questions[1])?,
+                "{target:?}: a losing event cannot borrow the winner's Main target"
+            );
+            assert_eq!(
+                node.question(&net.network, "q-collision")?
+                    .context("winning card")?["text"],
+                "要继续吗？"
+            );
+            let history = node.turn_history(&net.network, "c", &job, None)?;
+            assert!(!history.recent.events.iter().any(|event| matches!(
+                &event.event.body,
+                EventBody::QuestionAsked { text, .. } if text == "private question must stay outside Main"
+            )), "{target:?}: Main never sees the losing event's private text");
+            let notes = node.pending_notifications(&net.network, "web")?;
+            let private = notes
+                .iter()
+                .find(|note| note.text == "private question must stay outside Main")
+                .context("private question notification")?;
+            assert_eq!(
+                private.target, target,
+                "a notification's target must describe its own text"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn targetless_questions_require_current_matching_session_attributions() -> Result<()> {
     for case in [
         "attributed",
