@@ -2615,9 +2615,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        a.stop_network().await;
-        std::fs::remove_dir_all(&dir)?;
-        result
+        finish_nodes(result, vec![(a, dir)]).await
     }
 
     #[tokio::test]
