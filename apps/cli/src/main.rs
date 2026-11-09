@@ -19,6 +19,7 @@ use vibeface_control::{
 };
 
 mod desktop_node;
+mod manage;
 mod service;
 mod terminal;
 mod triage;
@@ -74,6 +75,22 @@ enum Action {
     Wallet(WalletOptions),
     /// Inspect the public mesh or change the Nodes this one joins it through.
     Mesh(MeshOptions),
+    /// Call a client method on this Node as its local operator.
+    Call(manage::Call),
+    /// Change one config.json value after init.
+    Config(manage::ConfigOptions),
+    /// Show or change this Node's project roots, bot and write state.
+    Node(manage::NodeOptions),
+    /// Configure and check the AI providers on this Node.
+    Provider(manage::ProviderOptions),
+    /// List, create and manage bots, their schedules and memories.
+    Bots(manage::BotsOptions),
+    /// Inspect delivery orders and the Nodes that offer delivery.
+    Delivery(manage::DeliveryOptions),
+    /// Volunteer this Node's relay to the public mesh.
+    Relay(manage::RelayOptions),
+    /// Manage the personal network as an approved management client.
+    Client(manage::ClientOptions),
     /// Manage the installed user service.
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
@@ -560,6 +577,43 @@ enum TriageAction {
         #[arg(long)]
         event_id: String,
     },
+    /// Show the triage, webhook and decision token settings.
+    #[serde(skip)]
+    Settings,
+    /// Change triage settings with a JSON object; absent fields keep their value.
+    #[serde(skip)]
+    Configure { change: String },
+    /// Send a test message to the configured webhook.
+    #[serde(skip)]
+    TestWebhook,
+    /// Create a decision token; it is shown once.
+    #[serde(skip)]
+    CreateToken {
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Revoke a decision token.
+    #[serde(skip)]
+    RevokeToken { token_id: String },
+}
+
+impl TriageAction {
+    /// The settings actions run as the local operator; the rest go to the local triage API.
+    fn operator(&self) -> Result<Option<(&'static str, Value)>> {
+        Ok(Some(match self {
+            Self::Settings => ("triage_settings", json!({})),
+            Self::Configure { change } => (
+                "configure_triage",
+                serde_json::from_str(change).context("the change must be JSON")?,
+            ),
+            Self::TestWebhook => ("test_webhook", json!({})),
+            Self::CreateToken { label } => ("create_decision_token", json!({"label":label})),
+            Self::RevokeToken { token_id } => {
+                ("revoke_decision_token", json!({"token_id":token_id}))
+            }
+            _ => return Ok(None),
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
@@ -722,6 +776,14 @@ async fn main() -> Result<()> {
         Some(Action::Join(options)) => join(options).await,
         Some(Action::Wallet(options)) => wallet(options).await,
         Some(Action::Mesh(options)) => mesh(options).await,
+        Some(Action::Call(options)) => manage::call(options).await,
+        Some(Action::Config(options)) => manage::config(options).await,
+        Some(Action::Node(options)) => manage::node(options).await,
+        Some(Action::Provider(options)) => manage::provider(options).await,
+        Some(Action::Bots(options)) => manage::bots(options).await,
+        Some(Action::Delivery(options)) => manage::delivery(options).await,
+        Some(Action::Relay(options)) => manage::relay(options).await,
+        Some(Action::Client(options)) => manage::client(options).await,
         Some(Action::Tool {
             name,
             json,
@@ -735,9 +797,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Action::Hooks(options)) => hooks(options).await,
-        Some(Action::Triage(options)) => {
-            post_triage(&options.local, serde_json::to_value(options.action)?).await
-        }
+        Some(Action::Triage(options)) => match options.action.operator()? {
+            Some((method, params)) => {
+                let result = manage::operator(&options.local.data_dir, method, params).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
+            None => post_triage(&options.local, serde_json::to_value(options.action)?).await,
+        },
         Some(Action::Requests(local)) => post_triage(&local, json!({"action":"requests"})).await,
         Some(Action::Respond {
             request_id,
@@ -1331,12 +1398,37 @@ fn widely_readable_file(path: &Path) -> Result<PathBuf> {
 }
 
 fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
+    read_secret(
+        handed_over,
+        "Delivery wallet passphrase",
+        "wallet passphrase",
+        false,
+    )
+}
+
+/// A passphrase from a protected channel or the terminal; `confirm` asks twice for a new one.
+pub(crate) fn read_passphrase(
+    handed_over: Option<i64>,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
+    let mut prompt = label.to_owned();
+    prompt[..1].make_ascii_uppercase();
+    read_secret(handed_over, &prompt, label, confirm)
+}
+
+fn read_secret(
+    handed_over: Option<i64>,
+    prompt: &str,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
     use vibeface_bridge::platform::secret;
     use zeroize::Zeroizing;
     let mut bytes = Zeroizing::new(Vec::new());
     if let Some(reference) = handed_over {
         let channel = secret::handed_over(reference)
-            .context("read the wallet passphrase the caller handed over")?;
+            .with_context(|| format!("read the {label} the caller handed over"))?;
         channel.take(1026).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
@@ -1346,27 +1438,36 @@ fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
         }
     } else {
         let mut console = secret::Console::open()
-            .context("wallet passphrase requires a terminal or --passphrase-fd")?;
-        console.prompt("Delivery wallet passphrase: ")?;
-        loop {
-            let byte = console
-                .read_byte()?
-                .context("the terminal closed before a passphrase was entered")?;
-            if matches!(byte, b'\n' | b'\r') {
-                break;
+            .with_context(|| format!("{label} requires a terminal or --passphrase-fd"))?;
+        let mut read = |prompt: &str, bytes: &mut Vec<u8>| -> Result<()> {
+            console.prompt(prompt)?;
+            loop {
+                let byte = console
+                    .read_byte()?
+                    .context("the terminal closed before a passphrase was entered")?;
+                if matches!(byte, b'\n' | b'\r') {
+                    break;
+                }
+                ensure!(bytes.len() < 1024, "{label} exceeds its limit");
+                bytes.push(byte);
             }
-            ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
-            bytes.push(byte);
+            console.prompt("\n")?;
+            Ok(())
+        };
+        read(&format!("{prompt}: "), &mut bytes)?;
+        if confirm {
+            let mut again = Zeroizing::new(Vec::new());
+            read(&format!("{prompt} again: "), &mut again)?;
+            ensure!(*again == *bytes, "the two entries differ");
         }
-        console.prompt("\n")?;
     }
     ensure!(
         (12..=1024).contains(&bytes.len())
             && !bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-        "wallet passphrase must contain 12 to 1024 bytes on one line"
+        "{label} must contain 12 to 1024 bytes on one line"
     );
     Ok(SecretString::new(
-        String::from_utf8(bytes.to_vec()).context("wallet passphrase must be UTF-8")?,
+        String::from_utf8(bytes.to_vec()).with_context(|| format!("{label} must be UTF-8"))?,
     ))
 }
 
