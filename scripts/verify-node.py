@@ -332,7 +332,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const secret = invites.get(input.invite_hash);
         if (!secret) throw new Error('unknown invite');
         invites.delete(input.invite_hash);
-        result = ticketEncode(input.entry_id, hex(secret));
+        result = ticketEncode(input.entry, hex(secret));
         secret.fill(0);
         break;
       }
@@ -559,8 +559,8 @@ class Client:
         tampered = copy.deepcopy(made["record"])
         tampered["expires_at_ms"] += 1
         self.call("invite", {"record": tampered}, status=400)
-        self.call("invite", {"record": made["record"]})
-        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id)
+        registered = self.call("invite", {"record": made["record"]})
+        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry=registered["entry"])
         return f"vibeface://join/{ticket}"
 
     def directory_state(self):
@@ -685,7 +685,7 @@ class Node:
     @property
     def mesh_address(self):
         """This Node as a mesh bootstrap node."""
-        return f"vibeface://{self.device_id}@127.0.0.1:{self.quic_port}"
+        return f"vibeface://node/{self.device_id}?addr=127.0.0.1:{self.quic_port}"
 
     def configure_mesh(self, network, bootstrap=()):
         """Joins the loopback mesh `network` through `bootstrap`; loopback fixtures need private addresses."""
@@ -757,7 +757,7 @@ class Node:
         link = owner.invite()
         encoded = link.removeprefix("vibeface://join/vibeface1").upper()
         ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
-        require(len(ticket) == 65 and ticket[0] == 1, "CLI join ticket holds only the entry device ID and secret")
+        require(ticket[0] == 1 and len(ticket) > 65, "CLI join ticket carries the entry's node link and secret")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None

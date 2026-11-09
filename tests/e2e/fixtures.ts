@@ -156,7 +156,7 @@ function meshInfo(value: unknown): MeshInfo {
   assert.equal(mesh.enabled, true);
   assert.match(text(mesh.network), /^t-[0-9a-f]{12}$/, 'The fixture mesh has its own random name');
   assert(Array.isArray(mesh.bootstrap) && mesh.bootstrap.length === 1, 'The member has one bootstrap node');
-  assert.match(text(mesh.bootstrap[0]), new RegExp(`^vibeface://${gateway.peer}@127\\.0\\.0\\.1:[0-9]+$`),
+  assert.match(text(mesh.bootstrap[0]), new RegExp(`^vibeface://node/${gateway.peer}\\?addr=127\\.0\\.0\\.1:[0-9]+$`),
     'The member configures nothing but the page Node as its bootstrap node');
   assert.deepEqual(fields.relays, [], 'The member configures no relay');
   const announced = fields.announced_relays;
