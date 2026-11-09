@@ -1883,6 +1883,7 @@ mod tests {
         receipt_status: u64,
         missing: bool,
         shallow: bool,
+        shallow_tip: Option<u64>,
         reorged: bool,
         bonus_pending: bool,
         refunded_bonus: bool,
@@ -1892,6 +1893,51 @@ mod tests {
         current_reorg: bool,
         current_hash_changed: bool,
         broken: bool,
+    }
+    impl Observation {
+        fn tip(&mut self, elapsed: u64) -> u64 {
+            let tip = 21 + elapsed;
+            // Keep explicit shallow and immature faults from aging into confirmed evidence.
+            if self.shallow {
+                *self.shallow_tip.get_or_insert(tip)
+            } else if self.anchor_age < policy().finality_seconds + policy().clock_skew_seconds {
+                21
+            } else {
+                tip
+            }
+        }
+        fn block(&self, number: u64, now: u64) -> Value {
+            let repeated = |byte: u8| format!("0x{}", format!("{byte:02x}").repeat(32));
+            let (block_hash, timestamp) = match number {
+                9 => (repeated(0x77), now - 8),
+                10 => (
+                    repeated(if self.reorged { 0x56 } else { 0x55 }),
+                    now - self.anchor_age,
+                ),
+                19 => (repeated(0x77), now - 1),
+                20 => (
+                    repeated(if self.current_hash_changed {
+                        0x67
+                    } else {
+                        0x66
+                    }),
+                    now,
+                ),
+                number if number >= 21 => {
+                    let timestamp = now + number - 21 + self.clock_offset;
+                    let block_hash = format!(
+                        "0x{}",
+                        hex::encode(hash(
+                            format!("{number}:{timestamp}:{}", self.current_hash_changed)
+                                .as_bytes()
+                        ))
+                    );
+                    (block_hash, timestamp)
+                }
+                _ => panic!("unexpected block number {number}"),
+            };
+            json!({"number":format!("0x{number:x}"),"hash":block_hash,"timestamp":format!("0x{timestamp:x}"),"baseFeePerGas":"0x1"})
+        }
     }
     struct PublicationFixture {
         delivery: Delivery,
@@ -1908,6 +1954,7 @@ mod tests {
         }
         async fn with_claims(phases: [u8; 2], with_claims: bool) -> Result<Self> {
             let now = super::super::now();
+            let clock = std::time::Instant::now();
             let mut config = chain::tests::config();
             config.escrow = format!("0x{}", "44".repeat(20));
             config.asset = format!("0x{}", "33".repeat(20));
@@ -1974,6 +2021,7 @@ mod tests {
                 receipt_status: 0,
                 missing: false,
                 shallow: false,
+                shallow_tip: None,
                 reorged: false,
                 bonus_pending: false,
                 refunded_bonus: false,
@@ -1984,6 +2032,28 @@ mod tests {
                 current_hash_changed: false,
                 broken: false,
             }));
+            {
+                let mut probe = observation.lock().unwrap().clone();
+                let original_tip = probe.tip(0);
+                let original = probe.block(original_tip, now);
+                let tip = probe.tip(3);
+                assert_eq!(tip, 24);
+                assert_eq!(
+                    probe.block(tip, now)["timestamp"],
+                    format!("0x{:x}", now + 3)
+                );
+                assert_eq!(probe.block(21, now), original);
+                probe.shallow = true;
+                let shallow_tip = probe.tip(3);
+                assert_eq!(probe.tip(8), shallow_tip);
+                probe.shallow = false;
+                probe.anchor_age = 6;
+                assert_eq!(probe.tip(8), 21);
+                probe.anchor_age = 7;
+                let current = probe.block(28, now);
+                probe.current_hash_changed = true;
+                assert_ne!(probe.block(28, now)["hash"], current["hash"]);
+            }
             let observed = observation.clone();
             let rpc_orders = orders.clone();
             let rpc_capsules = capsules.clone();
@@ -1993,7 +2063,11 @@ mod tests {
                 "/../../contracts/delivery/trust.json"
             )))?;
             let rpc = chain::tests::rpc_fixture(config, move |request| {
-                let state = observed.lock().unwrap().clone();
+                let (state, tip) = {
+                    let mut state = observed.lock().unwrap();
+                    let tip = state.tip(clock.elapsed().as_secs());
+                    (state.clone(), tip)
+                };
                 match request["method"].as_str().unwrap() {
                     "eth_chainId" => json!("0x7a69"),
                     "eth_getCode" => {
@@ -2005,26 +2079,23 @@ mod tests {
                             else {panic!("unexpected runtime address {address}")};
                         trust["contracts"][name]["runtime"].clone()
                     }
-                    "eth_blockNumber" => json!("0x15"),
+                    "eth_blockNumber" => json!(format!("0x{tip:x}")),
                     "eth_getBlockByNumber" => {
                         let tag = request["params"][0].as_str().unwrap();
-                        let (number, hash, timestamp) = match tag {
-                            "latest" => (21, 0x66, now + state.clock_offset),
-                            "0xa" => (10, if state.reorged { 0x56 } else { 0x55 }, now - state.anchor_age),
-                            "0x14" => (20, if state.current_hash_changed {0x67} else {0x66}, now),
-                            "0x9" => (9, 0x77, now - 8),
-                            "0x13" => (19, 0x77, now - 1),
-                            "0x15" => (21, 0x66, now),
-                            _ => panic!("unexpected block tag {tag}"),
+                        let number = if tag == "latest" {
+                            tip
+                        } else {
+                            u64::from_str_radix(tag.strip_prefix("0x").unwrap(), 16).unwrap()
                         };
-                        json!({"number":format!("0x{number:x}"),"hash":format!("0x{}",format!("{hash:02x}").repeat(32)),"timestamp":format!("0x{timestamp:x}"),"baseFeePerGas":"0x1"})
+                        state.block(number, now)
                     }
                     "eth_getTransactionReceipt" => {
                         if state.current_reorg { observed.lock().unwrap().current_hash_changed = !state.current_hash_changed; }
                         if state.broken { return json!(false); }
                         if state.missing { return Value::Null; }
+                        let block = state.block(if state.shallow {tip} else if state.moved_receipt {19} else {9}, now);
                         json!({"transactionHash":request["params"][0],"from":format!("0x{}","22".repeat(20)),"to":format!("0x{}","44".repeat(20)),
-                            "blockNumber":if state.shallow {"0x15"} else if state.moved_receipt {"0x13"} else {"0x9"},"blockHash":format!("0x{}",if state.shallow {"66"} else {"77"}.repeat(32)),
+                            "blockNumber":block["number"],"blockHash":block["hash"],
                             "status":format!("0x{:x}",state.receipt_status)})
                     }
                     "eth_getTransactionByHash" => Value::Null,
@@ -2581,7 +2652,7 @@ mod tests {
                         ..
                     } = &mut claim.state
                     {
-                        candidate.observed_at = fixture.now;
+                        candidate.observed_at = super::super::now();
                     }
                 }
             }

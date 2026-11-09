@@ -28,8 +28,8 @@ fn scratch(name: &str) -> PathBuf {
 fn long_lived() -> Command {
     #[cfg(unix)]
     {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 120"]);
+        let mut command = Command::new("/bin/sleep");
+        command.arg("120");
         command
     }
     #[cfg(windows)]
