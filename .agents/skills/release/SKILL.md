@@ -5,6 +5,8 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 # Vibeface release
 
+本 skill 及引用文档只保留通用流程和占位变量。个人账号、设备名称或 UDID、证书身份或指纹、本机绝对路径、凭据和内部会话信息仅在运行时读取并按需留在私有本地证据中，不写入 skill 或公开 PR。
+
 ## 本机 iOS 构建与安装
 
 用户要求在本机编译 iOS 或安装到 iPhone 时，先读 [iOS 命令行构建](references/ios-local-build.md)。默认由独立 Aqua LaunchAgent 执行 Expo、CocoaPods 和 `xcodebuild`，复用本机已有开发签名身份，不依赖操作 Xcode 窗口。当前 Codex 后台 daemon 保持原样。
