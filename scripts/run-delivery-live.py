@@ -2495,12 +2495,12 @@ def supervise_protected(configuration, run, environment, log):
     return record, passed and not interrupted and not failed
 
 
-def self_test_observer_fixture(run, expected):
+def self_test_observer_fixture(run, expected, native_extra=None):
     configuration = run / "configuration.json"
     write_private(configuration,{"source_commit":expected,"sha256":{"prover":"b"*64}})
     terminal = run / "native/public/native-result.json"
     terminal.parent.mkdir(parents=True,exist_ok=True)
-    terminal.write_text(json.dumps({"status":"PASS","real_process_restart":{"receiver_history_read":True}}))
+    terminal.write_text(json.dumps({"status":"PASS","real_process_restart":{"receiver_history_read":True}, **(native_extra or {})}))
     bindings = observer_bindings(run,expected)
     statistics = {"rpc_counts":{"eth_sendRawTransaction":7},"other_logged_methods":0}
     accounts = {name:{"nonce":"0x1","pending_nonce":"0x1","private":"UNAPPROVED_PRIVATE_SENTINEL"} for name in ("S","R","P")}
@@ -2809,7 +2809,8 @@ def protected_public(run, expected, returncode):
         except Exception:
             failures.add("invalid_certified_proof")
             for target in pair: target.unlink(missing_ok=True)
-    allowed_files = {"before-source-offline.json","confirmed-chain.json","settlement.json","settlement-observation.json","native-result.json"}
+    allowed_files = {"before-source-offline.json","confirmed-chain.json","settlement.json","settlement-observation.json","native-result.json","registration-diagnostics.json"}
+    diagnostic_binding = None
     certified_files = progress.get("public_files",{}) if progress else {}
     if not isinstance(certified_files,dict):
         certified_files = {}; failures.add("invalid_public_file_manifest")
@@ -2818,10 +2819,21 @@ def protected_public(run, expected, returncode):
             failures.add("unapproved_public_material"); continue
         recognized.add(name)
         try:
-            data = regular(source / name,131072)
+            data = regular(source / name,65536 if name == "registration-diagnostics.json" else 131072)
             if not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum) or hashlib.sha256(data).hexdigest() != checksum:
                 raise ValueError("changed public report")
-            json.loads(data)
+            if name == "registration-diagnostics.json":
+                driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+                native_bytes = regular(source / "native-result.json",131072)
+                if hashlib.sha256(native_bytes).hexdigest() != certified_files.get("native-result.json"):
+                    raise ValueError("Unauthenticated registration diagnostic source")
+                native = json.loads(native_bytes)
+                if native.get("source_commit") != expected:
+                    raise ValueError("Registration diagnostic source differs")
+                projected = driver["project_registration_diagnostics"](driver["diagnostic_json"](data),expected,native["artifact_sha256"])
+                diagnostic_binding = projected["artifact_sha256"]
+            else:
+                json.loads(data)
             (output / name).write_bytes(data); (output / name).chmod(0o644)
             public_files[name] = checksum
         except Exception:
@@ -2847,6 +2859,15 @@ def protected_public(run, expected, returncode):
             wrappers[name] = value
         except Exception:
             failures.add("wrapper_report_unavailable")
+    if diagnostic_binding is not None:
+        try:
+            tested = wrappers["artifact-provenance.json"]["testedArtifactSha256"]
+            if diagnostic_binding != {key:tested[key] for key in ("prover","r0vm","profile")}:
+                raise ValueError("Registration diagnostic artifacts differ")
+        except (KeyError,TypeError,ValueError):
+            failures.add("invalid_registration_diagnostic_binding")
+            (output / "registration-diagnostics.json").unlink(missing_ok=True)
+            public_files.pop("registration-diagnostics.json",None)
     observer_summary = None
     try:
         manifest = wrappers["artifact-provenance.json"]["restartObserver"]
@@ -3255,6 +3276,65 @@ def self_test_protected(original):
             summary = json.loads((output/"summary.json").read_text())
             assert summary["status"] == "FAIL" and summary["genuineReceipts"] == (4 if mode == "partial" else 0)
             assert all(sentinel.encode() not in path.read_bytes() for path in output.iterdir())
+
+
+    self_test_registration_export(expected)
+
+
+def self_test_registration_export(expected):
+    from copy import deepcopy
+    from unittest.mock import patch
+    driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+    artifacts = {"prover":"b"*64,"r0vm":"c"*64,"profile":"d"*64}
+    records = driver["self_test_diagnostic_fixture"]()
+    data = b"".join((json.dumps(record,separators=(",",":"))+"\n").encode() for record in records)
+    diagnostic = driver["registration_diagnostics"](data,expected,artifacts,{"exit_code":0,"signal":None,"spawn_errno":None})
+    assert diagnostic["availability"]=="complete" and len(diagnostic["resource_deltas"])==8
+    def forbidden(*_args,**_kwargs): raise AssertionError("diagnostic export self-test started business work")
+    with tempfile.TemporaryDirectory(prefix="registration-diagnostic-export-selftest-",dir=ARTIFACTS) as temporary, \
+         patch("subprocess.Popen",forbidden),patch("subprocess.run",forbidden),patch("socket.socket",forbidden):
+        run=Path(temporary)
+        self_test_observer_fixture(run,expected,{"source_commit":expected,"artifact_sha256":artifacts})
+        public=run/"native/public"
+        observer,passed=write_observer_summary(run,expected,0,0)
+        assert passed
+        write_private(run/"artifact-provenance.json",{"sourceCommit":expected,"status":"PASS","testedArtifactSha256":artifacts,"restartObserver":observer})
+        write_private(run/"resources.json",{"status":"PASS"})
+        facts=[]
+        for relation,order in [(1,None),(2,"ab"*32),(3,"ab"*32),(2,"cd"*32),(3,"cd"*32)]:
+            name="key-binding" if relation==1 else f"order-{order}-relation-{relation}-window-0"
+            receipt=public/(name+".receipt");receipt.write_bytes(b"synthetic diagnostic-export control only: "+name.encode())
+            metadata=public/(name+".json");metadata.write_text(json.dumps({"journalHash":"a"*64}))
+            fact={"relation":relation,"public":metadata.name,"receipt":receipt.name,"receiptSha256":digest(receipt),"publicSha256":digest(metadata),
+                  "journalHash":"a"*64,"official_host_verified":True,"wrong_journal_receipt_comparison_rejected":True}
+            if order: fact.update(orderId="0x"+order,windowIndex=0)
+            facts.append(fact)
+        def export(value,code=0):
+            diagnostic_path=public/"registration-diagnostics.json"
+            diagnostic_path.write_text(json.dumps(value))
+            manifest={"source_commit":expected,"scope":"fresh-two-order-protected-native-only","status":"PASS","genuine_receipts":facts,
+                "public_files":{"native-result.json":digest(public/"native-result.json"),"registration-diagnostics.json":digest(diagnostic_path)}}
+            (public/"progress.json").write_text(json.dumps(manifest))
+            return protected_public(run,expected,code)
+        output,passed=export(diagnostic)
+        assert passed
+        projected=json.loads((output/"registration-diagnostics.json").read_bytes())
+        assert projected==diagnostic and len(projected["events"])==len(records) and len(projected["resource_deltas"])==8
+        sentinel="UNAPPROVED_PRIVATE_SENTINEL"
+        changes=[lambda value:value.update(private=sentinel),lambda value:value.update(source_commit="0"*40),
+            lambda value:value["artifact_sha256"].update(prover="0"*64),lambda value:value["events"][0].update(private=sentinel),
+            lambda value:value["events"][0].update(exit_code=True),lambda value:value["resource_deltas"].append(deepcopy(value["resource_deltas"][0]))]
+        for change in changes:
+            invalid=deepcopy(diagnostic);change(invalid)
+            output,passed=export(invalid)
+            assert not passed and not (output/"registration-diagnostics.json").exists()
+            assert all(sentinel.encode() not in item.read_bytes() for item in output.iterdir())
+        output,passed=export(diagnostic,1)
+        assert not passed and (output/"registration-diagnostics.json").exists()
+        unavailable=driver["registration_diagnostics"](b"",expected,artifacts,{"exit_code":None,"signal":9,"spawn_errno":None})
+        output,passed=export(unavailable,1)
+        assert not passed and json.loads((output/"registration-diagnostics.json").read_bytes())["availability"]=="unavailable"
+    print(f"Registration diagnostic export self-tests passed; full synthetic {len(records)}-event path, 8 resource groups, strict privacy negatives; no processes or proofs")
 
 
 if __name__ == "__main__":

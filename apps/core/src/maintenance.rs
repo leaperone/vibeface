@@ -560,15 +560,39 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             intent_id,
             gas_cap,
         } => {
-            let result = match runtime.maintenance.enter() {
+            let diagnostics = if matches!(action, crate::delivery::KeyAction::Register) {
+                crate::delivery::proof::Diagnostics::open(&runtime.data_dir, &intent_id)
+            } else {
+                None
+            };
+            let mut owner = crate::delivery::proof::DiagnosticStage::new(
+                diagnostics.as_ref(),
+                "owner_guard",
+                "key",
+            );
+            let admission = runtime.maintenance.enter();
+            if admission.is_ok() {
+                owner.ok();
+            }
+            drop(owner);
+            let result = match admission {
                 Ok(_guard) => {
                     runtime
                         .delivery
-                        .local_key_operation(action, &intent_id, &gas_cap)
+                        .local_key_operation(action, &intent_id, &gas_cap, diagnostics.as_ref())
                         .await
                 }
                 Err(error) => Err(error),
             };
+            let mut completion = crate::delivery::proof::DiagnosticStage::new(
+                diagnostics.as_ref(),
+                "owner_response",
+                "key",
+            );
+            if result.is_ok() {
+                completion.ok();
+            }
+            drop(completion);
             match result {
                 Ok(value) => response.delivery = Some(value),
                 Err(error) => {

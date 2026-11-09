@@ -449,7 +449,7 @@ impl Delivery {
             "proof job differs from the authorized window"
         );
         let receipt = self.with_store(|store| store.reserve_proof(&digest))?;
-        let seal = self.proofs.prove(config, &input, &receipt).await?;
+        let seal = self.proofs.prove(config, &input, &receipt, None).await?;
         self.with_store(|store| store.put_value(&id, &seal))?;
         Ok(seal)
     }

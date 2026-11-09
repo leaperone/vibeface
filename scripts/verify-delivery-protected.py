@@ -48,6 +48,180 @@ def need(value, code):
         raise CheckFailure(code)
 
 
+DIAGNOSTIC_PHASES = {
+    "core": ("owner_guard", "key_preproof", "proof_preflight", "proof_info", "proof_prove", "proof_verify", "key_proof_store", "register_tx", "registry_after", "owner_response"),
+    "host": ("host_input", "host_succinct", "host_succinct_verify", "host_groth16", "host_receipt_verify", "host_receipt_publish"),
+    "shim": ("shim_validate", "shim_lock", "shim_fifo", "generator_spawn", "prover_spawn", "shim_workers", "worker_wait", "shim_commit"),
+}
+DIAGNOSTIC_COUNTERS = ("pids_max", "memory_max", "oom", "oom_kill", "oom_group_kill")
+DIAGNOSTIC_RESOURCES = {("core", "key_preproof"), ("core", "proof_info"), ("core", "proof_prove"), ("core", "proof_verify"),
+                        ("core", "register_tx"), ("host", "host_succinct"), ("host", "host_groth16"), ("shim", "shim_workers")}
+DIAGNOSTIC_EVENT = {"writer", "command", "phase", "edge", "exit_code", "signal", "errno", "failure_class", "worker", "cleanup_requested"}
+DIAGNOSTIC_CLASSES = {"spawn", "io", "timeout", "output_limit", "result_decode", "receipt_check", "worker_exit", "worker_signal", "stage_error", "unknown"}
+
+
+def diagnostic_integer(value, maximum, *, minimum=0):
+    need(value is None or type(value) is int and minimum <= value <= maximum, "invalid_diagnostic_integer")
+
+
+def diagnostic_json(data):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value, "duplicate_diagnostic_json_key")
+            value[key] = item
+        return value
+    return json.loads(data, object_pairs_hook=unique)
+
+
+def diagnostic_events(events):
+    need(type(events) is list and len(events) <= 64, "invalid_diagnostic_event_count")
+    begun, ended, ranks, failed = {}, set(), {}, set()
+    for event in events:
+        exact(event, DIAGNOSTIC_EVENT, "invalid_diagnostic_event_fields")
+        writer, command, phase, edge = (event[key] for key in ("writer", "command", "phase", "edge"))
+        need(isinstance(writer, str) and writer in DIAGNOSTIC_PHASES and isinstance(phase, str)
+             and phase in DIAGNOSTIC_PHASES[writer] and command in ("key", "info", "prove", "verify")
+             and edge in ("begin", "ok", "error"), "invalid_diagnostic_stage")
+        expected = {"proof_info": "info", "proof_prove": "prove", "proof_verify": "verify"}.get(phase, "key")
+        need((writer == "core" and command == expected) or (writer == "host" and command == "prove")
+             or (writer == "host" and command == "verify" and phase == "host_receipt_verify")
+             or (writer == "shim" and command == "prove"), "invalid_diagnostic_command")
+        for key, maximum in (("exit_code", 255), ("signal", 64), ("errno", 4095)):
+            diagnostic_integer(event[key], maximum, minimum=1 if key in ("signal", "errno") else 0)
+        need(not (event["exit_code"] is not None and event["signal"] is not None)
+             and type(event["cleanup_requested"]) is bool, "invalid_diagnostic_termination")
+        need(event["failure_class"] is None or isinstance(event["failure_class"], str)
+             and event["failure_class"] in DIAGNOSTIC_CLASSES, "invalid_diagnostic_failure_class")
+        role = event["worker"]
+        need(role is None or role in ("generator", "prover"), "invalid_diagnostic_worker")
+        if phase in ("generator_spawn", "prover_spawn"):
+            need(role == phase.removesuffix("_spawn"), "invalid_diagnostic_spawn_worker")
+        elif phase == "worker_wait":
+            need(role in ("generator", "prover") and edge != "begin", "invalid_diagnostic_wait_worker")
+        else:
+            need(role is None and not event["cleanup_requested"], "unexpected_diagnostic_worker")
+        need(edge == "error" or event["failure_class"] is None and event["signal"] is None and event["errno"] is None
+             and event["exit_code"] in (None, 0), "invalid_diagnostic_success")
+        need(edge != "error" or event["failure_class"] is not None, "missing_diagnostic_failure_class")
+        key = (writer, command, phase, role)
+        if edge == "begin":
+            need((writer, command) not in failed or writer == "core" and phase == "owner_response", "diagnostics_continue_after_failure")
+            rank = DIAGNOSTIC_PHASES[writer].index(phase)
+            need(key not in begun and key not in ended and rank >= ranks.get((writer, command), -1), "duplicate_or_reordered_diagnostic_begin")
+            begun[key] = event
+            ranks[writer, command] = rank
+        else:
+            need(key not in ended and (key in begun or phase == "worker_wait"), "duplicate_or_unbegun_diagnostic_end")
+            ended.add(key)
+            if edge == "error": failed.add((writer, command))
+    return begun, ended
+
+
+def diagnostic_first_failure(events):
+    return next(({key: event[key] for key in ("phase", "worker", "exit_code", "signal", "errno")}
+                 for event in events if event["edge"] == "error" and event["worker"] is not None and not event["cleanup_requested"]), None)
+
+
+def diagnostic_phase(event):
+    return {key: event[key] for key in ("writer", "command", "phase")} if event is not None else None
+
+
+def diagnostic_coverage(events):
+    observed = {(event["writer"], event["command"], event["phase"], event["worker"], event["edge"]) for event in events}
+    required = set()
+    if ("core", "prove", "proof_prove", None, "ok") in observed:
+        required.update(("host", "prove", phase, None, "ok") for phase in DIAGNOSTIC_PHASES["host"])
+        required.update(("shim", "prove", phase, worker, "ok") for phase, worker in
+            [("shim_validate", None), ("shim_lock", None), ("shim_fifo", None), ("generator_spawn", "generator"),
+             ("prover_spawn", "prover"), ("shim_workers", None), ("worker_wait", "generator"), ("worker_wait", "prover"), ("shim_commit", None)])
+    if ("core", "verify", "proof_verify", None, "ok") in observed:
+        required.add(("host", "verify", "host_receipt_verify", None, "ok"))
+    need(required <= observed, "successful_proof_missing_diagnostic_coverage")
+
+
+def project_registration_diagnostics(value, source_commit, artifacts):
+    exact(value, {"schema_version", "source_commit", "operation", "artifact_sha256", "availability", "cli", "events", "resource_deltas", "first_observed_failure", "last_observed_phase", "first_observed_failed_phase"}, "invalid_registration_diagnostic_fields")
+    need(type(value["schema_version"]) is int and value["schema_version"] == 1 and value["source_commit"] == source_commit
+         and re.fullmatch(r"[0-9a-f]{40}", source_commit) and value["operation"] == "register_key", "invalid_registration_diagnostic_binding")
+    expected = {name: artifacts[name] for name in ("prover", "r0vm", "profile")}
+    need(value["artifact_sha256"] == expected and all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
+         for item in expected.values()), "invalid_registration_diagnostic_artifacts")
+    need(value["availability"] in ("complete", "partial", "unavailable"), "invalid_registration_diagnostic_availability")
+    exact(value["cli"], {"exit_code", "signal", "spawn_errno"}, "invalid_registration_cli_fields")
+    for key, maximum in (("exit_code", 255), ("signal", 64), ("spawn_errno", 4095)):
+        diagnostic_integer(value["cli"][key], maximum, minimum=0 if key == "exit_code" else 1)
+    need(sum(value["cli"][key] is not None for key in value["cli"]) <= 1, "contradictory_registration_cli_termination")
+    begun, ended = diagnostic_events(value["events"])
+    diagnostic_coverage(value["events"])
+    need(value["last_observed_phase"] == diagnostic_phase(value["events"][-1] if value["events"] else None)
+         and value["first_observed_failed_phase"] == diagnostic_phase(next((event for event in value["events"] if event["edge"] == "error"), None)),
+         "incorrect_diagnostic_observed_phase")
+    rows = value["resource_deltas"]
+    need(type(rows) is list and len(rows) <= 8, "invalid_diagnostic_resource_count")
+    seen = set()
+    for row in rows:
+        exact(row, {"writer", "command", "phase", *DIAGNOSTIC_COUNTERS}, "invalid_diagnostic_resource_fields")
+        key = (row["writer"], row["command"], row["phase"], None)
+        need(key in begun and (row["writer"], row["phase"]) in DIAGNOSTIC_RESOURCES and key not in seen, "invalid_diagnostic_resource_phase")
+        seen.add(key)
+        for name in DIAGNOSTIC_COUNTERS: diagnostic_integer(row[name], 2**63-1)
+        need(all(row[name] is None for name in DIAGNOSTIC_COUNTERS) or all(row[name] is not None for name in DIAGNOSTIC_COUNTERS), "partial_diagnostic_counter_set")
+    expected_rows = {key for key in begun if (key[0], key[2]) in DIAGNOSTIC_RESOURCES}
+    need(seen == expected_rows and value["first_observed_failure"] == diagnostic_first_failure(value["events"]), "incomplete_diagnostic_projection")
+    if value["availability"] == "unavailable":
+        need(not value["events"] and not rows and value["first_observed_failure"] is None, "unavailable_diagnostics_claim_events")
+    elif value["availability"] == "complete":
+        need(set(begun) <= ended and ("core", "key", "owner_response", None) in ended
+             and value["cli"]["exit_code"] is not None, "incomplete_diagnostics_claim_complete")
+    if value["cli"]["exit_code"] == 0:
+        need(not any(event["edge"] == "error" and event["writer"] == "core" for event in value["events"]), "successful_cli_claims_core_failure")
+    need(len(json.dumps(value, separators=(",", ":")).encode()) <= 65536, "oversized_registration_diagnostic_projection")
+    return copy.deepcopy(value)
+
+
+def registration_diagnostics(data, source_commit, artifacts, cli):
+    value = {"schema_version": 1, "source_commit": source_commit, "operation": "register_key",
+        "artifact_sha256": {name: artifacts[name] for name in ("prover", "r0vm", "profile")}, "availability": "unavailable",
+        "cli": cli, "events": [], "resource_deltas": [], "first_observed_failure": None, "last_observed_phase": None, "first_observed_failed_phase": None}
+    try:
+        need(isinstance(data, bytes) and 0 < len(data) <= 32768 and data.endswith(b"\n"), "invalid_diagnostic_bytes")
+        raw = []
+        for line in data.splitlines():
+            need(0 < len(line) + 1 <= 512, "invalid_diagnostic_line")
+            record = diagnostic_json(line)
+            exact(record, {"v", "counters", *DIAGNOSTIC_EVENT}, "invalid_private_diagnostic_fields")
+            need(type(record["v"]) is int and record["v"] == 1, "invalid_private_diagnostic_version")
+            counters = record["counters"]
+            if counters is not None:
+                exact(counters, DIAGNOSTIC_COUNTERS, "invalid_private_diagnostic_counters")
+                for item in counters.values():
+                    need(type(item) is int and 0 <= item <= 2**63-1, "invalid_private_diagnostic_counter")
+                need((record["writer"], record["phase"]) in DIAGNOSTIC_RESOURCES, "unexpected_private_diagnostic_counters")
+            raw.append(record)
+        events = [{key: record[key] for key in DIAGNOSTIC_EVENT} for record in raw]
+        begun, ended = diagnostic_events(events)
+        before, deltas = {}, []
+        for record in raw:
+            key = (record["writer"], record["command"], record["phase"], record["worker"])
+            if (record["writer"], record["phase"]) not in DIAGNOSTIC_RESOURCES: continue
+            if record["edge"] == "begin":
+                before[key] = record["counters"]
+                deltas.append({"writer": key[0], "command": key[1], "phase": key[2], **dict.fromkeys(DIAGNOSTIC_COUNTERS)})
+            elif key in before and before[key] is not None and record["counters"] is not None:
+                delta = {name: record["counters"][name] - before[key][name] for name in DIAGNOSTIC_COUNTERS}
+                need(all(item >= 0 for item in delta.values()), "decreased_diagnostic_counter")
+                next(row for row in deltas if (row["writer"], row["command"], row["phase"]) == key[:3]).update(delta)
+        value.update(events=events, resource_deltas=deltas, first_observed_failure=diagnostic_first_failure(events),
+            last_observed_phase=diagnostic_phase(events[-1] if events else None),
+            first_observed_failed_phase=diagnostic_phase(next((event for event in events if event["edge"] == "error"), None)),
+            availability="complete" if set(begun) <= ended and ("core", "key", "owner_response", None) in ended and cli["exit_code"] is not None else "partial")
+        return project_registration_diagnostics(value, source_commit, artifacts)
+    except (CheckFailure, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        value.update(availability="unavailable", events=[], resource_deltas=[], first_observed_failure=None, last_observed_phase=None, first_observed_failed_phase=None)
+        return project_registration_diagnostics(value, source_commit, artifacts)
+
+
 def wait_observer_ready():
     descriptor = os.environ.pop(OBSERVER_READY_FD, None)
     if descriptor is None:
@@ -243,6 +417,8 @@ class Experiment:
         self.relay = None
         self.initial_resources = None
         self.started = time.monotonic()
+        self.registration_channel = None
+        self.registration_cli = dict.fromkeys(("exit_code", "signal", "spawn_errno"))
         self.stage = "initializing"
         self.summary = {"schema_version": 1, "status": "RUNNING", "source_commit": config["source_commit"],
                         "run_id": self.run.name,
@@ -567,18 +743,81 @@ class Experiment:
                              "deployment": {field: self.deployment[field] for field in ("rpc_url", "chain_id", "escrow", "asset", "adapter", "verifier", "runtime_code_hashes", "baseline_block")}})
         save_json(self.run / "private-runtime.json", {"passwords": self.passwords, "nodes": {node.name: str(node.directory) for node in self.nodes}})
 
+    def prepare_registration_diagnostics(self, receiver, intent):
+        descriptor = None
+        try:
+            need(str(uuid.UUID(intent)) == intent, "canonical_diagnostic_intent_required")
+            root = receiver.directory
+            for path in (root, root / "delivery", root / "delivery/private"):
+                if not path.exists(): path.mkdir(mode=0o700)
+                info = path.lstat()
+                need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077,
+                     "owner_only_diagnostic_directory_required")
+            path = root / "delivery/private" / ("key-diagnostics-" + intent + ".jsonl")
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            info = os.fstat(descriptor)
+            self.registration_channel = {"fd": descriptor, "path": path, "identity": (info.st_dev, info.st_ino)}
+        except (OSError, CheckFailure, ValueError):
+            if descriptor is not None: os.close(descriptor)
+            self.registration_channel = None
+
+    def retire_registration_diagnostics(self):
+        channel = self.registration_channel
+        if channel is not None:
+            try:
+                info = channel["path"].lstat()
+                need((info.st_dev, info.st_ino) == channel["identity"], "diagnostic_channel_inode_changed")
+                channel["path"].rename(self.run / "registration-diagnostics-private.jsonl")
+            except (OSError, CheckFailure):
+                pass
+
+    def publish_registration_diagnostics(self):
+        data = b""
+        channel = self.registration_channel
+        if channel is not None:
+            descriptor = channel["fd"]
+            try:
+                info = os.fstat(descriptor)
+                need((info.st_dev, info.st_ino) == channel["identity"] and stat.S_ISREG(info.st_mode)
+                     and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600
+                     and 0 < info.st_size <= 32768, "invalid_bound_diagnostic_channel")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                candidate = os.read(descriptor, 32769)
+                after = os.fstat(descriptor)
+                need((info.st_size, info.st_mtime_ns) == (after.st_size, after.st_mtime_ns), "diagnostic_channel_still_changing")
+                data = candidate
+            except (OSError, CheckFailure):
+                pass
+            finally:
+                try: os.close(descriptor)
+                except OSError: pass
+                self.registration_channel = None
+        value = registration_diagnostics(data, self.config["source_commit"], self.config["sha256"], self.registration_cli)
+        try:
+            self.public_json("registration-diagnostics.json", value)
+        except (OSError, CheckFailure):
+            pass
+
     def register(self):
         receiver = self.nodes[1]
         intent = str(uuid.uuid4())
         arguments = ["register-key", "--intent-id", intent, "--gas-cap", CAP]
+        self.prepare_registration_diagnostics(receiver, intent)
         output = self.run / "register-key-output.json"
         errors = self.run / "register-key-private.log"
         with output.open("xb") as stdout, errors.open("xb") as stderr:
-            process = subprocess.Popen([str(self.paths["binary"]), "wallet", "--data-dir", str(receiver.directory), *arguments],
-                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+            try:
+                process = subprocess.Popen([str(self.paths["binary"]), "wallet", "--data-dir", str(receiver.directory), *arguments],
+                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+            except OSError as error:
+                self.registration_cli["spawn_errno"] = error.errno
+                raise
         def done():
             if process.poll() is None:
                 return None
+            self.registration_cli.update(exit_code=process.returncode if process.returncode >= 0 else None,
+                                         signal=-process.returncode if process.returncode < 0 else None)
+            self.retire_registration_diagnostics()
             need(process.returncode == 0, "genuine_register_key_failed_private_log_retained")
             return True
         self.wait("genuine-register-key-before-order-deadlines", done, timeout=7400)
@@ -833,6 +1072,7 @@ class Experiment:
                 except BaseException:
                     self.summary["status"] = "FAIL"
                     self.summary["failure_code"] = "final_resource_read_failed"
+            self.publish_registration_diagnostics()
             self.progress()
             self.public_json("native-result.json", self.summary)
             self.progress()
@@ -863,6 +1103,76 @@ def run_from_options(options, helpers):
     return run_experiment(config, helpers, run_directory)
 
 
+def self_test_diagnostic_fixture():
+    records = []
+    def event(writer, command, phase, edge, *, worker=None, code=None):
+        counters = None
+        if (writer, phase) in DIAGNOSTIC_RESOURCES:
+            counters = {"pids_max": 0, "memory_max": 0 if edge == "begin" else 2, "oom": 0, "oom_kill": 0, "oom_group_kill": 0}
+        records.append({"v": 1, "writer": writer, "command": command, "phase": phase, "edge": edge,
+            "exit_code": code, "signal": None, "errno": None, "failure_class": None,
+            "worker": worker, "cleanup_requested": False, "counters": counters})
+    def pair(writer, command, phase, **kwargs):
+        event(writer, command, phase, "begin", worker=kwargs.get("worker"))
+        event(writer, command, phase, "ok", **kwargs)
+    for phase in ("owner_guard", "key_preproof", "proof_preflight"): pair("core", "key", phase)
+    pair("core", "info", "proof_info", code=0)
+    event("core", "prove", "proof_prove", "begin")
+    for phase in ("host_input", "host_succinct", "host_succinct_verify"): pair("host", "prove", phase)
+    event("host", "prove", "host_groth16", "begin")
+    for phase in ("shim_validate", "shim_lock", "shim_fifo"): pair("shim", "prove", phase)
+    for worker in ("generator", "prover"): pair("shim", "prove", worker + "_spawn", worker=worker)
+    event("shim", "prove", "shim_workers", "begin")
+    for worker in ("generator", "prover"): event("shim", "prove", "worker_wait", "ok", worker=worker, code=0)
+    event("shim", "prove", "shim_workers", "ok")
+    pair("shim", "prove", "shim_commit")
+    event("host", "prove", "host_groth16", "ok")
+    for phase in ("host_receipt_verify", "host_receipt_publish"): pair("host", "prove", phase)
+    event("core", "prove", "proof_prove", "ok", code=0)
+    event("core", "verify", "proof_verify", "begin")
+    pair("host", "verify", "host_receipt_verify")
+    event("core", "verify", "proof_verify", "ok", code=0)
+    for phase in ("key_proof_store", "register_tx", "registry_after", "owner_response"): pair("core", "key", phase)
+    return records
+
+
+def self_test_diagnostics():
+    source, artifacts = "1" * 40, {name: "a" * 64 for name in ("prover", "r0vm", "profile")}
+    cli = {"exit_code": 0, "signal": None, "spawn_errno": None}
+    records = self_test_diagnostic_fixture()
+    encode = lambda items: b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in items)
+    full = encode(records)
+    positive = registration_diagnostics(full, source, artifacts, cli)
+    need(positive["availability"] == "complete" and len(positive["events"]) == len(records) <= 64
+         and len(positive["resource_deltas"]) == 8 and len(full) <= 32768, "complete_registration_diagnostic_path_fits_bounds")
+    need(all(row["memory_max"] == 2 and row["pids_max"] == 0 and row["oom"] == 0 for row in positive["resource_deltas"]),
+         "diagnostic_pressure_not_invented_oom_or_pid_failure")
+    bad = []
+    for key, item in (("exit_code", True), ("signal", 65), ("errno", 4096), ("phase", "UNAPPROVED_PRIVATE_SENTINEL"), ("private", "UNAPPROVED_PRIVATE_SENTINEL")):
+        changed = copy.deepcopy(records); changed[0][key] = item; bad.append(encode(changed))
+    changed = copy.deepcopy(records); changed[2]["counters"]["memory_max"] = 3; bad.append(encode(changed))
+    bad += [full + b"x" * 32769, encode(records + records), encode([records[1], records[0], *records[2:]]),
+            encode([records[0], records[0], *records[1:]]), b" " * 513 + b"\n", full.replace(b'"v":1', b'"v":1,"v":1', 1)]
+    bad.append(encode([record for record in records if record["writer"] != "host"]))
+    for data in bad:
+        value = registration_diagnostics(data, source, artifacts, cli)
+        need(value["availability"] == "unavailable" and not value["events"]
+             and "UNAPPROVED_PRIVATE_SENTINEL" not in json.dumps(value), "invalid_diagnostics_are_unavailable_without_private_text")
+    missing = copy.deepcopy(records)
+    for record in missing: record["counters"] = None
+    projected = registration_diagnostics(encode(missing), source, artifacts, cli)
+    need(all(all(row[name] is None for name in DIAGNOSTIC_COUNTERS) for row in projected["resource_deltas"]), "unobserved_counters_are_null")
+    boundary = next(index for index, record in enumerate(records) if record["phase"] == "worker_wait")
+    for signal_number, exit_code in ((9, None), (None, 137)):
+        failed = copy.deepcopy(records[:boundary + 1])
+        failed[-1].update(edge="error", signal=signal_number, exit_code=exit_code,
+                          failure_class="worker_signal" if signal_number else "worker_exit")
+        value = registration_diagnostics(encode(failed), source, artifacts, {**cli, "exit_code": 1})
+        need(value["availability"] == "partial" and value["first_observed_failure"]["signal"] == signal_number
+             and value["first_observed_failure"]["exit_code"] == exit_code, "worker_signal_not_inferred_from_137")
+    print(f"Registration diagnostic self-tests passed; full synthetic path {len(records)} events/8 resource groups; no processes or proofs")
+
+
 def self_test():
     from unittest.mock import Mock, patch
     from types import SimpleNamespace
@@ -871,11 +1181,36 @@ def self_test():
     def forbidden(*_args, **_kwargs):
         raise AssertionError("no-process self-test attempted an external process or network")
     with patch.object(subprocess, "Popen", forbidden), patch.object(subprocess, "run", forbidden), patch.object(socket, "socket", forbidden):
+        self_test_diagnostics()
         sample = {"schema_version": 1, "source_commit": "1" * 40,
             "paths": {"repository": str(REPOSITORY), "binary": "/artifact/vibeface", "core_binary": "/artifact/vibeface-core", "crypto_module": "/artifact/vibeface_secure.js", "prover": "/artifact/vibeface-delivery-prover", "r0vm": "/artifact/r0vm"},
             "sha256": {name: "a" * 64 for name in ("binary", "core_binary", "crypto_module", "crypto_wasm", "prover", "r0vm", "profile")},
             "elf_sha256": "b" * 64, "caps": {"deposit": "10", "max_service_amount": "5", "source_gas_cap_wei": CAP, "provider_gas_cap_wei": CAP, "register_key_gas_cap_wei": CAP, "native_funding_wei_each": str(10 ** 19)}, "publication_policy": POLICY}
         validate_config(sample)
+        for invalid_channel in (None, "mode", "inode", "overflow", "closed"):
+            with tempfile.TemporaryDirectory(prefix="protected-diagnostic-channel-selftest-", dir=ARTIFACTS) as temporary:
+                experiment = Experiment(sample, {}, Path(temporary) / "native")
+                receiver = SimpleNamespace(directory=experiment.run / "R")
+                receiver.directory.mkdir(mode=0o700)
+                intent = str(uuid.uuid4())
+                experiment.prepare_registration_diagnostics(receiver, intent)
+                channel = experiment.registration_channel
+                need(channel is not None and not os.get_inheritable(channel["fd"]), "native_diagnostic_descriptor_is_not_inherited")
+                data = b"".join((json.dumps(item, separators=(",", ":")) + "\n").encode() for item in self_test_diagnostic_fixture())
+                os.write(channel["fd"], data)
+                experiment.registration_cli["exit_code"] = 0
+                if invalid_channel == "mode": os.fchmod(channel["fd"], 0o644)
+                if invalid_channel == "inode": channel["identity"] = (0, 0)
+                if invalid_channel == "overflow": os.ftruncate(channel["fd"], 32769)
+                if invalid_channel == "closed": os.close(channel["fd"])
+                experiment.retire_registration_diagnostics()
+                experiment.publish_registration_diagnostics()
+                value = diagnostic_json((experiment.public / "registration-diagnostics.json").read_bytes())
+                need(value["availability"] == ("complete" if invalid_channel is None else "unavailable"), "bound_diagnostic_channel_validation")
+                need(experiment.summary["status"] == "RUNNING" and not experiment.summary["genuine_receipts"], "diagnostics_cannot_complete_business")
+                try: os.fstat(channel["fd"])
+                except OSError: pass
+                else: raise AssertionError("native diagnostic descriptor leaked")
         for change in (lambda item: item.update(source_commit="0" * 40), lambda item: item.update(private_key="forbidden"),
                        lambda item: item["paths"].update(binary="/unrelated/trash/vibeface"), lambda item: item["sha256"].update(prover="0" * 64),
                        lambda item: item["publication_policy"].update(clock_skew_seconds=0), lambda item: item["caps"].update(deposit="11")):

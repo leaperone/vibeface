@@ -14,6 +14,173 @@ pub const INFO_TIMEOUT_SECS: u64 = 30;
 pub const PROVE_TIMEOUT_SECS: u64 = 7200;
 pub const VERIFY_TIMEOUT_SECS: u64 = 120;
 
+#[cfg(unix)]
+pub(crate) const DIAGNOSTIC_FD: &str = "VIBEFACE_DELIVERY_DIAGNOSTIC_FD";
+const DIAGNOSTIC_LIMIT: u64 = 32 * 1024;
+
+pub(crate) struct Diagnostics(File);
+impl Diagnostics {
+    pub(crate) fn open(data_dir: &Path, intent: &str) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let intent_id = uuid::Uuid::parse_str(intent).ok()?;
+            if intent_id.to_string() != intent {
+                return None;
+            }
+            let private = data_dir.join("delivery/private");
+            for path in [
+                data_dir.to_owned(),
+                data_dir.join("delivery"),
+                private.clone(),
+            ] {
+                let metadata = std::fs::symlink_metadata(path).ok()?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o077 != 0
+                {
+                    return None;
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(private.join(format!("key-diagnostics-{intent}.jsonl")))
+                .ok()?;
+            let metadata = file.metadata().ok()?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o600
+                || metadata.len() != 0
+                || metadata.nlink() != 1
+            {
+                return None;
+            }
+            Some(Self(file))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (data_dir, intent);
+            None
+        }
+    }
+
+    fn write(&self, value: &serde_json::Value) {
+        use std::io::Write;
+        let Ok(mut bytes) = serde_json::to_vec(value) else {
+            return;
+        };
+        bytes.push(b'\n');
+        let Ok(metadata) = self.0.metadata() else {
+            return;
+        };
+        if bytes.len() > 512 || metadata.len().saturating_add(bytes.len() as u64) > DIAGNOSTIC_LIMIT
+        {
+            let _ = self.0.set_len(DIAGNOSTIC_LIMIT + 1);
+            return;
+        }
+        let _ = (&self.0).write(&bytes);
+    }
+}
+
+fn diagnostic_counters(phase: &str) -> Option<serde_json::Value> {
+    if !matches!(
+        phase,
+        "key_preproof" | "proof_info" | "proof_prove" | "proof_verify" | "register_tx"
+    ) {
+        return None;
+    }
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let cgroup = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    let read = |name: &str| -> Option<std::collections::HashMap<String, u64>> {
+        let mut result = std::collections::HashMap::new();
+        for line in std::fs::read_to_string(cgroup.join(name)).ok()?.lines() {
+            let (key, value) = line.split_once(' ')?;
+            let value = value.parse::<u64>().ok()?;
+            if value > i64::MAX as u64 || result.insert(key.to_owned(), value).is_some() {
+                return None;
+            }
+        }
+        Some(result)
+    };
+    let memory = read("memory.events")?;
+    let pids = read("pids.events")?;
+    Some(
+        serde_json::json!({"pids_max":pids.get("max")?, "memory_max":memory.get("max")?,
+        "oom":memory.get("oom")?, "oom_kill":memory.get("oom_kill")?, "oom_group_kill":memory.get("oom_group_kill")?}),
+    )
+}
+
+pub(crate) struct DiagnosticStage<'a> {
+    sink: Option<&'a Diagnostics>,
+    phase: &'static str,
+    command: &'static str,
+    success: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    errno: Option<i32>,
+    class: &'static str,
+}
+impl<'a> DiagnosticStage<'a> {
+    pub(crate) fn new(
+        sink: Option<&'a Diagnostics>,
+        phase: &'static str,
+        command: &'static str,
+    ) -> Self {
+        let stage = Self {
+            sink,
+            phase,
+            command,
+            success: false,
+            exit_code: None,
+            signal: None,
+            errno: None,
+            class: "stage_error",
+        };
+        stage.emit("begin");
+        stage
+    }
+    fn emit(&self, edge: &str) {
+        if let Some(sink) = self.sink {
+            sink.write(&serde_json::json!({"v":1,"writer":"core","command":self.command,"phase":self.phase,"edge":edge,
+                "exit_code":self.exit_code,"signal":self.signal,"errno":self.errno,
+                "failure_class":if edge == "error" { Some(self.class) } else { None },
+                "worker":null,"cleanup_requested":false,"counters":diagnostic_counters(self.phase)}));
+        }
+    }
+    pub(crate) fn ok(&mut self) {
+        self.success = true;
+    }
+    fn io_error(&mut self, error: &std::io::Error) {
+        self.errno = error.raw_os_error();
+    }
+}
+impl Drop for DiagnosticStage<'_> {
+    fn drop(&mut self) {
+        self.emit(if self.success { "ok" } else { "error" });
+    }
+}
+
+#[cfg(unix)]
+fn inherit_diagnostics(command: &mut tokio::process::Command, diagnostics: &Diagnostics) {
+    use std::os::fd::AsRawFd;
+    let fd = diagnostics.0.as_raw_fd();
+    command.env(DIAGNOSTIC_FD, fd.to_string());
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct Busy;
 impl std::fmt::Display for Busy {
@@ -252,7 +419,11 @@ impl Drop for ProcessGroup {
         let _ = self.0;
     }
 }
-fn command(config: &ProofConfig, lock: &File) -> Result<tokio::process::Command> {
+fn command(
+    config: &ProofConfig,
+    lock: &File,
+    diagnostics: Option<&Diagnostics>,
+) -> Result<tokio::process::Command> {
     // `check_memory_limit` refuses to authorize paid proving without a Linux cgroup memory
     // limit, so no prover is ever started anywhere else. Saying so here keeps the cgroup
     // membership and the inherited lock below on the one family that has them.
@@ -307,9 +478,12 @@ fn command(config: &ProofConfig, lock: &File) -> Result<tokio::process::Command>
     {
         command.process_group(0);
         inherit_lock(&mut command, lock);
+        if let Some(diagnostics) = diagnostics {
+            inherit_diagnostics(&mut command, diagnostics);
+        }
     }
     #[cfg(windows)]
-    let _ = lock;
+    let _ = (lock, diagnostics);
     Ok(command)
 }
 async fn bounded_run(
@@ -317,11 +491,19 @@ async fn bounded_run(
     input: &[u8],
     limit: usize,
     timeout: std::time::Duration,
+    mut diagnostic: Option<&mut DiagnosticStage<'_>>,
 ) -> Result<Vec<u8>> {
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().inspect_err(|error| {
+        if let Some(stage) = diagnostic.as_deref_mut() {
+            stage.class = "spawn";
+            stage.io_error(error);
+        }
+    })?;
     let _group = ProcessGroup(child.id().context("proof task has no process identity")?);
     let mut stdin = child.stdin.take().context("proof stdin unavailable")?;
     let mut stdout = child.stdout.take().context("proof stdout unavailable")?;
+    let mut class = "io";
+    let mut status = None;
     let run = async {
         let writer = async {
             stdin.write_all(input).await?;
@@ -335,27 +517,55 @@ async fn bounded_run(
                 .take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .await?;
+            if bytes.len() > limit {
+                class = "output_limit";
+            }
             ensure!(bytes.len() <= limit, "proof task output exceeds its bound");
             Ok::<_, anyhow::Error>(bytes)
         };
         let (_, output) = tokio::try_join!(writer, reader)?;
+        let observed = child.wait().await?;
+        status = Some(observed);
+        if !observed.success() {
+            class = "worker_exit";
+        }
         ensure!(
-            child.wait().await?.success(),
+            observed.success(),
             "proof task failed; order remains unresolved"
         );
         Ok::<_, anyhow::Error>(output)
     };
-    tokio::time::timeout(timeout, run)
-        .await
-        .context("proof task exceeded its execution deadline")?
+    let result = tokio::time::timeout(timeout, run).await;
+    if let Some(stage) = diagnostic {
+        stage.class = if result.is_err() { "timeout" } else { class };
+        if let Some(status) = status {
+            stage.exit_code = status.code();
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                stage.signal = status.signal();
+            }
+            if stage.signal.is_some() {
+                stage.class = "worker_signal";
+            }
+        }
+        if let Ok(Err(error)) = &result
+            && let Some(error) = error.downcast_ref::<std::io::Error>()
+        {
+            stage.io_error(error);
+        }
+    }
+    result.context("proof task exceeded its execution deadline")?
 }
 impl ProofRunner {
-    pub async fn prove(
+    pub(crate) async fn prove(
         &self,
         config: &ProofConfig,
         input: &ProofInput,
         receipt: &Path,
+        diagnostics: Option<&Diagnostics>,
     ) -> Result<Vec<u8>> {
+        let mut preflight = DiagnosticStage::new(diagnostics, "proof_preflight", "key");
         let _slot = self
             .slot
             .try_acquire()
@@ -374,15 +584,20 @@ impl ProofRunner {
             input.profile == config.profile,
             "proof request mismatches local profile"
         );
-        let mut identify = command(config, &lock)?;
+        preflight.ok();
+        drop(preflight);
+        let mut info_stage = DiagnosticStage::new(diagnostics, "proof_info", "info");
+        let mut identify = command(config, &lock, diagnostics)?;
         identify.arg("info");
         let info = bounded_run(
             identify,
             &[],
             4096,
             std::time::Duration::from_secs(INFO_TIMEOUT_SECS),
+            Some(&mut info_stage),
         )
         .await?;
+        info_stage.class = "result_decode";
         let info: ProverInfo =
             serde_json::from_slice(&info).context("invalid proof host identification")?;
         ensure!(
@@ -390,15 +605,18 @@ impl ProofRunner {
                 && info.schema_hash == hex::encode(input.profile.statement_schema_hash),
             "proof host image or schema mismatch"
         );
+        info_stage.ok();
+        drop(info_stage);
         if receipt.try_exists()? {
-            let seal = verified_seal(config, input, receipt, &lock).await?;
+            let seal = verified_seal(config, input, receipt, &lock, diagnostics).await?;
             ensure!(
                 config.oom_events()? == oom_before,
                 "proof memory limit was exceeded; receipt was not accepted"
             );
             return Ok(seal);
         }
-        let mut prove = command(config, &lock)?;
+        let mut prove_stage = DiagnosticStage::new(diagnostics, "proof_prove", "prove");
+        let mut prove = command(config, &lock, diagnostics)?;
         prove.arg("prove").arg(receipt);
         let private = Zeroizing::new(serde_json::to_vec(input)?);
         ensure!(
@@ -410,8 +628,10 @@ impl ProofRunner {
             &private,
             16_384,
             std::time::Duration::from_secs(PROVE_TIMEOUT_SECS),
+            Some(&mut prove_stage),
         )
         .await?;
+        prove_stage.class = "result_decode";
         let output: ProverOutput =
             serde_json::from_slice(&output).context("invalid proof host result")?;
         ensure!(
@@ -428,7 +648,9 @@ impl ProofRunner {
             seal.len() == 260 && seal[..4] == [0x73, 0xc4, 0x57, 0xba],
             "unrecognized proof seal"
         );
-        let verified = verified_seal(config, input, receipt, &lock).await?;
+        prove_stage.ok();
+        drop(prove_stage);
+        let verified = verified_seal(config, input, receipt, &lock, diagnostics).await?;
         ensure!(verified == seal, "receipt and emitted proof seal differ");
         ensure!(
             config.oom_events()? == oom_before,
@@ -443,7 +665,9 @@ async fn verified_seal(
     input: &ProofInput,
     receipt: &Path,
     lock: &File,
+    diagnostics: Option<&Diagnostics>,
 ) -> Result<Vec<u8>> {
+    let mut stage = DiagnosticStage::new(diagnostics, "proof_verify", "verify");
     let metadata = std::fs::symlink_metadata(receipt)?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -459,7 +683,7 @@ async fn verified_seal(
         bytes.len() <= 16_384,
         "proof receipt exceeds its reserved storage"
     );
-    let mut verify = command(config, lock)?;
+    let mut verify = command(config, lock, diagnostics)?;
     verify
         .arg("verify")
         .arg(hex::encode(input.statement.abi_bytes()));
@@ -468,8 +692,10 @@ async fn verified_seal(
         &bytes,
         4096,
         std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS),
+        Some(&mut stage),
     )
     .await?;
+    stage.class = "receipt_check";
     let result: serde_json::Value = serde_json::from_slice(&result)?;
     ensure!(
         result["verified"] == true
@@ -487,6 +713,7 @@ async fn verified_seal(
         seal.len() == 260 && seal[..4] == [0x73, 0xc4, 0x57, 0xba],
         "unrecognized verified proof seal"
     );
+    stage.ok();
     Ok(seal)
 }
 
@@ -705,6 +932,7 @@ mod tests {
             &vec![b'x'; 131_072],
             8,
             std::time::Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap();
@@ -721,7 +949,7 @@ mod tests {
             .kill_on_drop(true)
             .process_group(0);
         assert!(
-            bounded_run(command, &[], 3, std::time::Duration::from_secs(2))
+            bounded_run(command, &[], 3, std::time::Duration::from_secs(2), None)
                 .await
                 .is_err()
         );
@@ -743,9 +971,15 @@ mod tests {
             .kill_on_drop(true)
             .process_group(0);
         assert!(
-            bounded_run(command, &[], 64, std::time::Duration::from_millis(300))
-                .await
-                .is_err()
+            bounded_run(
+                command,
+                &[],
+                64,
+                std::time::Duration::from_millis(300),
+                None
+            )
+            .await
+            .is_err()
         );
         let pid: i32 = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         let mut terminated = false;
@@ -763,5 +997,120 @@ mod tests {
         }
         std::fs::remove_file(path).unwrap();
         assert!(terminated, "timed-out proof task left a live descendant");
+    }
+
+    fn diagnostic_fixture() -> (Diagnostics, PathBuf, String) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = lock_directory();
+        let private = root.join("delivery/private");
+        crate::config::private_dir(&root.join("delivery")).unwrap();
+        crate::config::private_dir(&private).unwrap();
+        let intent = uuid::Uuid::new_v4().to_string();
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(private.join(format!("key-diagnostics-{intent}.jsonl")))
+            .unwrap();
+        (Diagnostics::open(&root, &intent).unwrap(), root, intent)
+    }
+
+    #[test]
+    fn diagnostic_sink_only_opens_the_exact_owner_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (sink, root, intent) = diagnostic_fixture();
+        let path = root.join(format!("delivery/private/key-diagnostics-{intent}.jsonl"));
+        assert!(Diagnostics::open(&root, &uuid::Uuid::new_v4().to_string()).is_none());
+        assert!(Diagnostics::open(&root, "../different").is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Diagnostics::open(&root, &intent).is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let moved = path.with_extension("controlled");
+        std::fs::rename(&path, &moved).unwrap();
+        symlink(&moved, &path).unwrap();
+        assert!(Diagnostics::open(&root, &intent).is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Diagnostics::open(&root, &intent).is_none());
+        std::fs::remove_dir(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(Diagnostics::open(&root, &intent).is_none());
+        drop(sink);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_status_uses_real_spawn_errno_exit_and_signal() {
+        for (script, errno, code, signal) in [
+            ("exit 137", None, Some(137), None),
+            ("kill -KILL $$", None, None, Some(9)),
+            ("exit 0", Some(libc::EAGAIN), None, None),
+            ("exit 0", Some(libc::ENOMEM), None, None),
+        ] {
+            let (sink, root, intent) = diagnostic_fixture();
+            let mut stage = DiagnosticStage::new(Some(&sink), "proof_prove", "prove");
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0);
+            if let Some(errno) = errno {
+                unsafe {
+                    command.pre_exec(move || Err(std::io::Error::from_raw_os_error(errno)));
+                }
+            }
+            let error = bounded_run(
+                command,
+                &[],
+                64,
+                std::time::Duration::from_secs(2),
+                Some(&mut stage),
+            )
+            .await
+            .unwrap_err();
+            if errno.is_none() {
+                assert!(error.to_string().contains("proof task failed"));
+            }
+            drop(stage);
+            let path = root.join(format!("delivery/private/key-diagnostics-{intent}.jsonl"));
+            let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = events.last().unwrap();
+            assert_eq!(last["exit_code"], serde_json::json!(code));
+            assert_eq!(last["signal"], serde_json::json!(signal));
+            assert_eq!(last["errno"], serde_json::json!(errno));
+            assert_eq!(last["edge"], "error");
+            drop(sink);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_descriptor_survives_exec_without_changing_standard_streams() {
+        let (sink, root, _) = diagnostic_fixture();
+        let mut command = tokio::process::Command::new("/bin/bash");
+        command.args(["-c", "exec /usr/bin/python3 -c 'import fcntl,os,stat,sys; fd=int(os.environ[\"VIBEFACE_DELIVERY_DIAGNOSTIC_FD\"]); assert stat.S_ISREG(os.fstat(fd).st_mode); assert fcntl.fcntl(fd,fcntl.F_GETFL)&os.O_APPEND; assert sys.stdin.buffer.read()==b\"synthetic stdin\"; sys.stdout.buffer.write(b\"unchanged\")'"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .kill_on_drop(true).process_group(0);
+        inherit_diagnostics(&mut command, &sink);
+        let output = bounded_run(
+            command,
+            b"synthetic stdin",
+            64,
+            std::time::Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, b"unchanged");
+        drop(sink);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
