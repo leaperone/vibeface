@@ -9,6 +9,7 @@ import { ipcMain, protocol, type IpcMainEvent, type IpcMainInvokeEvent, type Web
 import { CLIENT_HOST, CLIENT_IPC, CLIENT_ORIGIN, CLIENT_SCHEME, CLIENT_URL, type ClientFrame, type ClientLocalEntry, type ClientLocalLaunch, type ClientLocalSetup } from '../shared/client-contract.js'
 import { businessUrl, parsePrivateOrigin } from './business-url.js'
 import type { Access, Inspect } from './control-types.js'
+import { runControl } from './control-client.js'
 import WebSocket from 'ws'
 
 export const CLIENT_SCHEME_DESCRIPTOR = {
@@ -22,7 +23,7 @@ export type ClientHostOptions = {
   runtimeRoot: string
   /** Already verified current-user selection. It may return null and must not initialize a Node. */
   resolveSelectedNode(): Promise<SelectedLocalNode | null>
-  /** Absolute bundled Core path, invoked only for one direct LAN client stream. */
+  /** Absolute bundled Core path for owner setup and direct LAN client streams. */
   clientBridgeProgram(): string
   /** The root owns window creation and supplies only its trusted client WebContents. */
   getClientContents(): WebContents | null
@@ -43,7 +44,7 @@ const MIME = new Map<string, string>([
   ['.ico', 'image/x-icon'], ['.woff', 'font/woff'], ['.woff2', 'font/woff2'], ['.ttf', 'font/ttf'], ['.otf', 'font/otf'],
 ])
 
-type LocalTarget = { nodeId: string; host: string; port: number; origin: string }
+type LocalTarget = { nodeId: string; dataDir: string; host: string; port: number; origin: string }
 type HttpReply = { status: number; headers: IncomingMessage['headers']; body: Buffer }
 type FrameCarrier = { send(bytes: Uint8Array): Promise<void>; receive(): Promise<ClientFrame | null>; close(): void }
 type LocalSocket = { nodeId: string; contents: WebContents; socket: FrameCarrier; receiving: boolean; sending: number }
@@ -79,8 +80,7 @@ function selectedTarget(value: SelectedLocalNode | null): LocalTarget | null {
     if (canonical.origin !== privateOrigin.origin) return null
   } catch { return null }
   // The native broker uses local_listen only; access URLs and their fragments never cross IPC.
-  const hostHeader = privateOrigin.host.includes(':') ? `[${privateOrigin.host.replace(/^\[|\]$/g, '')}]` : privateOrigin.host
-  return { nodeId: inspect.deviceId, host: privateOrigin.host.replace(/^\[|\]$/g, ''), port: privateOrigin.port, origin: privateOrigin.origin }
+  return { nodeId: inspect.deviceId, dataDir: inspect.dataDir, host: privateOrigin.host.replace(/^\[|\]$/g, ''), port: privateOrigin.port, origin: privateOrigin.origin }
 }
 
 function selectedGatewayAddress(address: string, target: LocalTarget, publicListen: string): boolean {
@@ -109,7 +109,7 @@ function readBoundedBody(response: IncomingMessage): Promise<Buffer> {
   })
 }
 
-async function localHttp(target: LocalTarget, request: { method: 'GET' | 'POST'; path: '/api/local/setup' | '/api/local/info' | '/api/local/exchange'; body?: unknown; cookie?: string; signal?: AbortSignal }): Promise<HttpReply> {
+async function localHttp(target: LocalTarget, request: { method: 'GET' | 'POST'; path: '/api/local/info' | '/api/local/exchange'; body?: unknown; cookie?: string; signal?: AbortSignal }): Promise<HttpReply> {
   if (request.signal?.aborted) throw new Error('Local request cancelled')
   const body = request.body === undefined ? undefined : Buffer.from(JSON.stringify(request.body), 'utf8')
   return new Promise((resolveReply, reject) => {
@@ -507,10 +507,9 @@ export function createClientHost(options: ClientHostOptions) {
   async function discover(signal: AbortSignal): Promise<ClientLocalSetup | null> {
     const target = await currentTarget()
     if (!target || signal.aborted) return null
-    const reply = await localHttp(target, { method: 'POST', path: '/api/local/setup', body: {}, signal })
-    if (reply.status === 404) return null
-    if (reply.status !== 200) throw new Error('Could not read local Node setup')
-    return parseSetup(jsonBody(reply), target)
+    const setup = await runControl({ command: options.clientBridgeProgram(), args: ['--control'] }, { command: 'local_setup', data_dir: target.dataDir })
+    if (signal.aborted) return null
+    return parseSetup(setup, target)
   }
 
   async function entry(contents: WebContents, deviceId: string, launch: ClientLocalLaunch | null): Promise<ClientLocalEntry | null> {

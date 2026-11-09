@@ -13,7 +13,10 @@ import type { Inspect } from '../src/main/control-types.js'
 const mocks = vi.hoisted(() => ({
   handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>(),
   protocolHandler: null as null | ((request: Request) => Promise<Response>),
+  runControl: vi.fn(),
 }))
+
+vi.mock('../src/main/control-client.js', () => ({ runControl: mocks.runControl }))
 
 vi.mock('electron', () => ({
   ipcMain: {
@@ -105,7 +108,7 @@ async function protocolHandler(runtimeRoot: string): Promise<(request: Request) 
   return handler
 }
 
-beforeEach(() => { mocks.handlers.clear(); mocks.protocolHandler = null })
+beforeEach(() => { mocks.handlers.clear(); mocks.protocolHandler = null; mocks.runControl.mockReset() })
 afterEach(async () => {
   for (const socket of upgradeSockets) socket.destroy()
   upgradeSockets.clear()
@@ -163,6 +166,7 @@ describe('Desktop client host', () => {
         json(response, 200, { enabled: true, has_session: true, device_id: clientId, entry: { address: fixture.origin, device_id: nodeId, local: true } })
       } else json(response, 404, {})
     })
+    mocks.runControl.mockResolvedValue({ kind: 'uninitialized', invitation: { url: fixture.origin, device_id: nodeId, capability } })
     const window = contents()
     const host = createClientHost({
       runtimeRoot: '/unused', getClientContents: () => window.value as never, resolveSelectedNode: async () => inspected(fixture.origin),
@@ -172,6 +176,7 @@ describe('Desktop client host', () => {
     const call = trustedEvent(window.value, window.frame)
     const setup = await invoke(CLIENT_IPC.localSetup, call) as { kind: string; entry: { address: string; kind: string }; capability: string }
     expect(setup).toEqual({ kind: 'uninitialized', entry: { kind: 'gateway', address: fixture.origin, device_id: nodeId }, capability })
+    expect(mocks.runControl).toHaveBeenCalledWith({ command: '/unused/core', args: ['--control'] }, { command: 'local_setup', data_dir: '/fixture/node' })
     expect(JSON.stringify(setup)).not.toContain(cookieValue)
     const launch = { token: localToken, deviceId: nodeId, rejoin: false }
     const exchanged = await invoke(CLIENT_IPC.localEntry, call, clientId, launch)
@@ -179,7 +184,7 @@ describe('Desktop client host', () => {
     expect(JSON.stringify(exchanged)).not.toContain(cookieValue)
     const resumed = await invoke(CLIENT_IPC.localEntry, call, clientId, null)
     expect(resumed).toEqual(exchanged)
-    expect(fixture.requests.map(item => item.path)).toEqual(['/api/local/setup', '/api/local/exchange', '/api/local/info'])
+    expect(fixture.requests.map(item => item.path)).toEqual(['/api/local/exchange', '/api/local/info'])
     host.dispose()
   })
 
@@ -189,6 +194,7 @@ describe('Desktop client host', () => {
       else if (request.path === '/api/local/exchange') json(response, 401, { error: 'expired' })
       else response.writeHead(302, { location: 'https://remote.example/' }).end()
     })
+    mocks.runControl.mockResolvedValue({ kind: 'uninitialized', invitation: { url: fixture.origin, device_id: '9'.repeat(64), capability } })
     const window = contents()
     const host = createClientHost({
       runtimeRoot: '/unused', getClientContents: () => window.value as never, resolveSelectedNode: async () => inspected(fixture.origin),

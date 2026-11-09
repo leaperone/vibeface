@@ -84,8 +84,8 @@ S 和 R 可以属于不同个人网络。P 可以是没有个人网络成员关�
 | `enabled` | `false`。服务总开关。 |
 | `charity_enabled` | `true`，仅在总开关打开后生效。 |
 | `paid_enabled` | `false`。 |
-| `storage_limit_bytes` | `67108864`。对象、私密材料和证明收据共享配额，允许范围为 131208 至 1073741824。 |
-| `max_orders` | `128`，允许范围为 1 至 128，历史终态订单也占用槽位。 |
+| `storage_limit_bytes` | `67108864`。对象、私密材料、证明收据、订单正文、交易账本和 gas 预算共享配额，允许范围为 131208 至 1073741824；数据库文件加对象文件的实际字节另受同一物理上限约束。 |
+| `max_orders` | `128`，允许范围为 1 至 128。槽位和字节按角色分三类计：本人授权的订单（本机发起的 S、本人已接受或已确认的 R）一类，未接受的外来 R 一类，外部 P 一类；后两类各最多占 `max_orders` 和 `storage_limit_bytes` 的四分之一，三类合计不超过总上限，外来记录填满自己那份后不再挤占本人容量。已完全结清、无待办的历史订单不再占槽位，记录和字节仍计入。把限额改小到放不下现有记录或外来承诺时拒绝修改。 |
 | `chain` | 默认 `null`。付费时必须指定 `rpc_url`、`chain_id`、`escrow`、`asset`、完整 `profile` 和 `confirmations`。 |
 | `prover` | 默认 `null`。证明端指定绝对路径 `program`、`r0vm`、`cgroup` 和完整 `profile`。 |
 | `delivery_fee_per_window` | `"10"`，测试代币最小单位。 |
@@ -95,7 +95,7 @@ S 和 R 可以属于不同个人网络。P 可以是没有个人网络成员关�
 
 网页只能更改三个服务开关，链部署、prover 路径和钱包由本机所有者配置。创建、解锁和锁定通过同用户维护 socket 完成。钱包口令由关闭回显的 TTY，或所有者私有文件、管道的 `--passphrase-fd` 输入，不放进参数、环境变量、网页或聊天。口令须为单行 UTF-8，长度 12 至 1024 字节。
 
-实验版没有订单归档接口。达到订单上限后拒绝新单，已有订单继续可查询和取回。订单账本和旧接收密钥必须随完整数据目录保留。
+实验版没有订单归档接口。达到本类上限后拒绝新单，已有订单继续可查询和取回；新的外来记录另受每分钟 16 条的进程内准入限制。Node 只回收能证明既无义务、也无任何引用的外来记录：未接受的外来 R 记录过了接受期限（公益为 `accept_until`，付费为 `hold_deadline`）且没有授权、私有恢复材料或交易引用时删除，过期后的重试和迟到 Offer 也被拒绝；公益 P 的承诺记录过了 `retain_until` 同样回收。付费过期 Quote 只有在链上一个时间晚于 `retain_until` 的已确认区间里查不到该订单的 `Funded` 事件、复核位置未遇到重组，且本地没有交易或私有引用时才删除；RPC 失败或结果未知不算证明，记录保留并显示 `expired quotation funding remains unknown`。已完全结清的历史付费 P 订单过了 `retain_until` 后只释放密文大对象，订单、capsule、交易、nonce、预算和密钥引用保留。本人的订单、意图、账本和旧接收密钥从不被回收，必须随完整数据目录保留。
 
 EVM 钱包独立于 Ed25519 设备身份和 X25519 接收密钥。钱包创建后保持锁定，每次 Node 重启也保持锁定。`absent` 表示未创建，`unavailable` 表示现有钱包无法读取，不能当作未创建并覆盖。锁定的钱包可以观察原交易，不能签新交易或重播原 raw transaction。
 
@@ -115,7 +115,7 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 
 `wallet backup` 只导出加密 EVM 钱包，不覆盖已存在的目标。它不包含接收私钥、订单、密文或续传和交易账本。个人根身份恢复文件也不含这些材料。停掉 Node 后备份完整数据目录，包括 `identity.json`、`delivery-settings.json`、`delivery-wallet.json` 和整个 `delivery/`。该目录含私钥及私密证明材料，须按凭证保管。
 
-恢复时保留原意图和交易账本，先对账。不要运行同一数据目录的两份副本，也不要只用旧钱包备份另起一个付款实例。缺少旧接收密钥时明确显示 `key_unavailable`，不能以新 key 冒充原订单解密成功。
+恢复时保留原意图和交易账本，先对账。不要运行同一数据目录的两份副本，也不要只用旧钱包备份另起一个付款实例。缺少旧接收密钥时，Node 以类型化错误 `receiving key is unavailable; restore the independent delivery backup` 中止该订单的推进、接受或读取，把订单阶段置为 `key_unavailable`、证据置回 `none`（网页显示「暂时打不开」），不以新 key 冒充原订单解密成功。这样的订单不算历史，也不再自动推进；从独立交付备份恢复密钥后，用「检查进度」或再次接受、读取才重新尝试。
 
 ## 重试、状态和文件取回
 
@@ -133,7 +133,7 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 | `recoverable` | 完整 C 与正确 E 已具备恢复条件。 |
 | `decryption_proven` | 合约已接受指定 R 实际解封、解密的证明。 |
 
-订单阶段、交付证据和资金状态分别展示。`included` 只表示入块，`confirmed` 按配置的确认深度观察，`earned` 为合约债权，`withdrawn` 才表示实际提款。浅确认不是绝对终局。检测到 reorg 或无法继续核实原交易时，Node 撤回暂定完成状态并进入 `reconciling` 或 `unknown`。
+订单阶段、交付证据和资金状态分别展示。资金交易达到配置的确认深度后订单才显示 `confirmed`；交易已入块但深度不够时，交易账本记为 `confirming`，订单保持 `reconciling`、付款 `unknown`。付款状态只有 `free`、`prepared`、`confirmed`、`earned`、`withdrawn`、`refunded`、`unknown` 和 `failed`：`earned` 为合约债权，`withdrawn` 才表示实际提款。浅确认不是绝对终局。完全结清且无待办的订单只做低频只读链观察，不占活跃槽位；检测到 reorg 或无法继续核实原交易时，Node 撤回暂定完成状态并进入 `reconciling` 或 `unknown`，订单重新进入活跃对账。
 
 接收端取回先在 Node 重组并核对文件，客户端再核对完整长度、文件名和 SHA-256。Web 的保存动作只确认已交给浏览器，不能声称用户磁盘已写入。Mobile 写入独立文档文件后再次核对，再提供分享副本。
 

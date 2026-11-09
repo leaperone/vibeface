@@ -630,7 +630,7 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
+    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None, local_port=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
@@ -638,7 +638,8 @@ class Node:
         require(0 < self.port < 65536, "Node listener uses a valid port")
         _assigned_ports.add(self.port)
         self.quic_port = available_port() if port is not None else self.port
-        self.local_port = available_port()
+        self.local_port = local_port if local_port is not None else available_port()
+        _assigned_ports.add(self.local_port)
         self.url = f"http://127.0.0.1:{self.port}"
         self.client = Client(self.url, helper, identity_file=self.directory / "client-identity.json")
         self.process = None
@@ -657,12 +658,12 @@ class Node:
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         self.configure_network(bind=f"127.0.0.1:{self.quic_port}")
-        result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
-                                capture_output=True, timeout=15)
-        require(result.returncode == 0, f"{name}: local access material is available")
-        self.access = json.loads(result.stdout)
-        require(self.access["device_id"], "local access pins the Node identity")
-        self.device_id = self.client.device_id = self.access["device_id"]
+        self.device_id = self.client.device_id = node_status(self)["device_id"]
+        require(self.device_id, "the initialized data directory pins the Node identity")
+        # The owner's access material exists only while the Node runs; `start` reads it once the listener publishes it.
+        self.access = None
+        # The owner's access link for a browser, read on the first web start while the Node is still uninitialized.
+        self.entry = None
 
     def configure(self, *, app_server=None, **values):
         path = self.directory / "config.json"
@@ -672,10 +673,7 @@ class Node:
             configuration["providers"]["codex_app_server"] = app_server
             configuration["providers"]["execution"] = ["codex"]
             if app_server["mode"] == "spawn":
-                env_path = self.directory / "provider-env.json"
-                providers = json.loads(env_path.read_text()) if env_path.exists() else {}
-                providers.setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
-                private_json(env_path, providers)
+                configuration.setdefault("provider_env", {}).setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
         private_json(path, configuration)
 
     def configure_network(self, **values):
@@ -702,14 +700,17 @@ class Node:
 
     def start(self, *, env=None, no_web=False, bare=False):
         require(self.process is None, f"{self.name}: process is stopped before start")
+        configuration = json.loads((self.directory / "config.json").read_text())
+        credential = self.directory / "local-access.json"
+        stale = credential.read_bytes() if credential.exists() else None
         self.log = (self.directory / "process.log").open("ab")
         self.process = subprocess.Popen(
             [str(self.binary), *([] if bare else ["serve"]), "--data-dir", str(self.directory),
              *(["--no-web"] if no_web else [])],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env or self.environment())
-        configuration = json.loads((self.directory / "config.json").read_text())
-        if no_web or not configuration["web_enabled"]:
+        web = not no_web and configuration["web_enabled"]
+        if not web:
             health = wait_for(f"{self.name} headless maintenance socket", lambda: (
                 value if (value := node_status(self))["status"] == "running" and value["web_enabled"] is False else None))
             require(health["device_id"] == self.device_id, f"{self.name}: maintenance pins its identity")
@@ -720,6 +721,36 @@ class Node:
                 return pinned_info(self) if configuration.get("tls") else self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)
             require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
+        def published():
+            if self.process.poll() is not None:
+                raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
+            return local_owner(self) if credential.read_bytes() != stale else None
+        # Every start publishes a fresh owner credential for the local listener; the last run's file does not count.
+        launcher = wait_for(f"{self.name} publishes its local owner credential", published)
+        require(launcher["origin"] == f"http://127.0.0.1:{self.local_port}" and launcher["node_id"] == self.device_id
+                and credential.stat().st_mode & 0o077 == 0,
+                f"{self.name}: the owner credential is private and names this Node's exact local origin")
+        # A public node forwards browsers to any device and answers no local setup, so it has no owner link to check.
+        if web and self.access is None and not configuration["forwarding"]["any"]:
+            result = subprocess.run([str(self.binary), "access", "--json", "--data-dir", str(self.directory)],
+                                    capture_output=True, timeout=15)
+            require(result.returncode == 0, f"{self.name}: local access material is available: {result.stderr.decode(errors='replace')[-300:]}")
+            self.access = json.loads(result.stdout)
+            require(self.access["device_id"] == self.device_id, "local access pins the Node identity")
+            # A `--tls` listener answers no plain HTTP (`pinned_info` covers it); the owner link below uses the loopback listener.
+            if not configuration.get("tls"):
+                setup = self.client.request("/api/local/setup", {})
+                require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
+                        and not {"invitation", "local_launch", "capability"} & set(setup),
+                        "an anonymous local setup on the public listener reports only the Node's state")
+            if self.access.get("capability"):
+                link = subprocess.run([str(self.binary), "access", "--data-dir", str(self.directory)],
+                                      capture_output=True, text=True, timeout=15)
+                require(self.access["url"] == launcher["origin"] and link.returncode == 0
+                        and bootstrap_entry(link.stdout.strip()) == {"url": launcher["origin"], "device_id": self.device_id,
+                                                                     "capability": self.access["capability"]},
+                        "the owner's access link carries the bootstrap entry a browser consumes")
+                self.entry = link.stdout.strip()
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -2293,11 +2324,32 @@ def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     return completed
 
 
-def local_post(node, path, body):
-    """A same-device caller on the Node's loopback-only listener, such as a hook."""
-    request = urllib.request.Request(f"http://127.0.0.1:{node.local_port}{path}", json.dumps(body).encode(),
-                                     {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+def local_owner(node):
+    """The credential the Node published for its local listener; only the owner's OS account can read it."""
+    return json.loads((node.directory / "local-access.json").read_text())
+
+
+def bootstrap_entry(url):
+    """What a browser reads from the owner's access link: the fragment, never a request of its own."""
+    fragment = urllib.parse.urlsplit(url).fragment
+    require(fragment.startswith("bootstrap="), "the access link carries its bootstrap entry in the fragment")
+    encoded = fragment[len("bootstrap="):]
+    return json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+
+
+def local_post(node, path, body, *, status=200, owner=True):
+    """A same-device owner process on the Node's local listener, such as a hook: the exact published origin and bearer."""
+    launcher = local_owner(node)
+    headers = {"Content-Type": "application/json"}
+    if owner:
+        headers["Authorization"] = "Bearer " + launcher["capability"]
+    request = urllib.request.Request(launcher["origin"] + path, json.dumps(body).encode(), headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        require(response.status == status, f"{path}: expected HTTP {status}, received {response.status}")
         return json.load(response)
 
 
@@ -2895,8 +2947,9 @@ def no_agent_checks(run, a, passed):
     a.start()
     a.client.connect()
     a.client.authenticate()
-    dropped = local_post(a, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end",
-                                           "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"})
+    event = {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"}
+    local_post(a, "/api/hooks", event, status=401, owner=False)
+    dropped = local_post(a, "/api/hooks", event)
     require(dropped["status"] == "dropped", "without an Agent an event is dropped, not queued")
     marker = run / "fixture-codex-global-request"
     marker.write_text(uuid.uuid4().hex[:8])
@@ -5912,7 +5965,7 @@ def phase5_acceptance(options):
         wait_for("removing A counts the branch B holds", lambda: original in listed() or None, timeout=30)
         passed("copied-data-directory-forks-and-removal-keeps-one-branch", conflicts=len(kept), refused=refused[:120])
 
-        secrets = [node.access["capability"] for node in (a, b)] + [a.backup_password]
+        secrets = [a.access["capability"], a.backup_password] + [local_owner(node)["capability"] for node in (a, b)]
         logs = [path for path in run.rglob("*.log*") if path.is_file()]
         require(all(path.stat().st_mode & 0o077 == 0 for path in logs if path.name.startswith("node.log")), "node.log is private")
         require(all(b"write state changed" in (node.directory / "node.log").read_bytes() for node in (a, b)),
@@ -6016,7 +6069,9 @@ def auto_route_acceptance(options):
         require(upgrade_status(target, "/api/client", "https://elsewhere.example") == 403,
                 "other origins cannot open /api/client")
         require(upgrade_status(target, "/api/local/ws", allowed) == 403, "other paths stay same-origin")
-        target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=403)
+        # /api/info is cross-origin for configured origins since the official App reaches its access Node from elsewhere.
+        target.client.request("/api/info", headers={"Origin": allowed}, origin=False)
+        target.client.request("/api/info", headers={"Origin": "https://elsewhere.example"}, origin=False, status=403)
         cross = fresh(target.url)
         cross.connect(target.device_id, origin=allowed)
         require(cross.call("info")["device_id"] == target.device_id, "a cross-origin page completes Noise to the target")
@@ -8794,8 +8849,10 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
         node.configure(bins=bins)
 
     def details():
+        # A browser lives on the origin of the owner's access link; a Node without one names its listener.
         return {"run": str(run), "nodes": {
-            role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
+            role: {"url": node.access["url"] if node.entry else node.url, "entry": node.entry,
+                   "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
@@ -8832,8 +8889,9 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             bootstrap_invitation = member.client.invite().removeprefix("vibeface://join/")
         for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
             args = public_node_args() if role == "provider" else []
+            # The e2e runner's port is the browser's origin: the source Node's local listener, where its owner link opens.
             node = Node(run, role, binary, workspace, helper, init_args=args,
-                        port=options.fixture_port if role == "source" else None)
+                        local_port=options.fixture_port if role == "source" else None)
             nodes[role] = node
             isolate_delivery_node(node)
             if relay:

@@ -6,7 +6,7 @@ import { expect, secrets } from 'e2e';
 
 test('chat keeps decisions and task records readable on desktop and phone', async ({ app, node, screen, browser }) => {
   await browser.setViewport({ width: 1280, height: 900 });
-  await app.open(node.url);
+  await app.open(node.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('交互验收设备');
   await screen.getByRole('button', '下一步').click();

@@ -27,8 +27,8 @@
 工作线程用 `approvalPolicy=never` 启动，正常不会收到审批。仍可能到达的请求（Node 订阅的线程上的，或不属于任何线程的）由 bridge 交给 Node，Node 不按方法自动回复：
 
 1. Node 给请求分配 `request_id`，挂起并记入 `node.log`（方法和线程，不含命令文本），然后作为 `needs_input` 事件（带 `request_id`）立即唤醒本机协调 Agent。事件只含方法、原因和问题，命令、补丁和路径不进事件。
-2. Agent 用 `vibeface requests` 查看挂起的请求（含完整参数），用 `vibeface respond <request_id> '<result-json>'` 回答。同一 `request_id` 只回答一次，重复调用返回第一次的结果。
-3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题> --choice 批准 --choice 拒绝` 在负责该线程的 Bot 聊天里提问。提问挂住请求直到有回答，不设超时；回答后该 Bot 有 120 秒用 `vibeface respond <ID> '<result-json>' --node <设备>` 应答。线程不属于任何 Bot 时立即兜底。
+2. Agent 用 `vibeface requests` 查看挂起的请求（含完整参数），用 `vibeface respond <request_id> '<result-json>'` 回答。只有仍在待处理队列、且没有已提问 `question_id` 的请求能这样回答；同一 `request_id` 只回答一次，重复调用返回第一次的结果。
+3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题> --choice 批准 --choice 拒绝` 在负责该线程的 Bot 聊天里提问。提问挂住请求直到有回答，不设超时。本人回答保存为签名消息后，持有原请求的 Node 领取一条独立的私有回答控制（占一次 `daily_decision_limit` 额度），在新的协调会话里核验原请求、传输代次、权限和响应 schema，只向仍活跃的原请求应答一次；它不进入 Bot 的 Main/Task 回合，Agent 不能用 `respond` 替本人回答已提问的请求，结果未知时不重放。线程不属于任何 Bot 时立即兜底。
 4. 没有配置协调 Agent、唤醒失败，或 Agent 120 秒内既没回答也没提问时，Node 按方法给出确定的拒绝并记录：
 
 | 请求 | 兜底回复 |
@@ -153,7 +153,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 | App Server | 本机 App Server 报告的所有线程的 `turn/completed`（完成、失败、中断） |
 | 会话扫描 | 默认关闭；显式启用后，每 5 分钟扫描 `triage.codex_sessions` 配置目录下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
 
-`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 头的 JSON 请求，浏览器跨站请求一律拒绝。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
+`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 和转发头、并带所有者 bearer 的 JSON 请求：`vibeface hook` 读取数据目录私有的 `local-access.json`，按其中记录的 origin 发请求并附 capability，浏览器跨站请求和读不到该目录的进程一律拒绝；同一 OS 账户的完整 Shell 不在此隔离之内。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
 
 统一事件格式（schema_version 1）：
 
@@ -176,7 +176,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
   - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --question <问题> [--choice <标签>]... [--request-id <ID>]`：需要本人看，在拥有该会话的 Bot 聊天里提问。`--choice` 可重复，最多 8 个，文字回答总是可用；`--request-id` 让提问挂住该请求。
   - `vibeface requests`、`vibeface respond <request_id> '<result-json>'`：查看和回答挂起的服务端请求（1.2），也走 `/api/triage`。
   - `vibeface triage dismiss --event-id <ID>`：静默处理。
-- 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`。
+- 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同（回环、无 `Origin`、所有者 bearer 与 origin 绑定）。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`，把本轮 attempt 放进 `VIBEFACE_TRIAGE_ATTEMPT`；私有回答控制只接受带该 attempt 的 `respond`。
 - 没有配置协调 Agent 时，事件直接丢弃，不排队也不过期；服务端请求立即按兜底回复。
 
 `raise` 和 `dismiss` 按 `event_id` 幂等，重复调用返回第一次的结果。同一 session 同一请求已有未回答的提问时，`raise` 返回原提问，这是确定性去重，不是判断。
@@ -208,7 +208,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，或用 `vibeface respond <请求> '<json>' --node <设备>` 应答挂起的请求，重试只回读。
 
-Grok Bot 用 HTTPS 调 webhook 正文里的 `answer.url`（即 `triage_settings` 的 `decision_url`）：`POST <answer.url>`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。公共节点不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备已向它的发现服务登记）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的转给目标。`answer.url` 是 `<public_url>/api/decision`；`public_url` 不是 HTTPS 而 `bootstrap` 为 `public` 时改用官方公共节点 `config/public-bootstrap.json` 里 `gateway_url` 的 `/api/decision`（`https://node.vibeface.dev:4792/api/decision`）。令牌错误返回 401。
+Grok Bot 用 HTTPS 调 webhook 正文里的 `answer.url`（即 `triage_settings` 的 `decision_url`）：`POST <answer.url>`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。`forwarding.any` 的公共节点不校验令牌也不核对成员，经 iroh 的 `vibeface/decision/1` 转给任一目标设备（目标设备已向它的发现服务登记）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的只转给当前成员 Node，非成员目标拒绝。`answer.url` 是 `<public_url>/api/decision`；`public_url` 不是 HTTPS 而 `bootstrap` 为 `public` 时改用官方公共节点 `config/public-bootstrap.json` 里 `gateway_url` 的 `/api/decision`（`https://node.vibeface.dev:4792/api/decision`）。令牌错误返回 401。每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429，来源按 [node.md](../node.md) 的 `--trusted-proxy` 规则认定。
 
 ## 6. 安装 hook
 

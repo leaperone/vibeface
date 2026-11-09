@@ -6,7 +6,7 @@ import { test, cursorTest } from './fixtures';
 import { expect, secrets } from 'e2e';
 
 cursorTest('automatically connects Cursor using only the official CLI subscription login', async ({ app, cursor, screen, browser }) => {
-  await app.open(cursor.node.url);
+  await app.open(cursor.node.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('Cursor subscription fixture');
   await screen.getByRole('button', '下一步').click();
@@ -41,7 +41,7 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
 });
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
-  await app.open(node.url);
+  await app.open(node.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();

@@ -241,8 +241,8 @@ pub(crate) fn apply(
             attestation,
             ..
         } => {
-            // Besides the target, only the user's signed settlement or the owner's record that a
-            // removed device's result is unknown counts; any result of the target outranks the latter.
+            // Ingestion checks the causal owner for a non-target's unsigned Unverified record.
+            // The target's result or the user's signed settlement outranks that unknown result.
             let target: Option<String> = connection
                 .query_row(
                     "SELECT target_node FROM works WHERE network_id=? AND work_id=?",

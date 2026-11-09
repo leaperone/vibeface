@@ -2,7 +2,7 @@ import * as Clipboard from 'expo-clipboard'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
 import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, QrCode, Shield, ShieldAlert, ShieldCheck, ShieldX, X, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Alert, Pressable, View } from 'react-native'
 import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
@@ -22,15 +22,30 @@ import { deviceIcon } from '@/features/devices/device-icon'
 import { Scanner } from '@/features/devices/scanner'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
+import { privateFiles } from '@/platform/files'
 
 type PickedFile = { name: string; file: RecoveryFile }
 
 /** Picks the recovery file from Files; the picked copy reads as the `RecoveryFile` the shared provider opens. */
 function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onPick(file: PickedFile): void; disabled?: boolean }) {
+  const live = useRef(true)
+  const picking = useRef(false)
+  useEffect(() => { live.current = true; return () => { live.current = false } }, [])
   const choose = async () => {
-    const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json', '*/*'], copyToCacheDirectory: true })
-    const asset = result.assets?.[0]
-    if (!result.canceled && asset) onPick({ name: asset.name, file: new File(asset.uri) })
+    if (picking.current || disabled) return
+    picking.current = true
+    try { await privateFiles.run(async (current) => {
+      const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json', '*/*'], copyToCacheDirectory: true })
+      const asset = result.assets?.[0]
+      if (result.canceled || !asset) return
+      try {
+        if (!live.current || !current()) return
+        const file = privateFiles.retain(asset.uri)
+        if (picked?.file instanceof File) privateFiles.release(picked.file.uri)
+        onPick({ name: asset.name, file })
+      } finally { privateFiles.releasePicker(asset.uri) }
+    }) } catch (cause) { if (live.current) Alert.alert('未能读取恢复文件', messageOf(cause)) }
+    finally { picking.current = false }
   }
   return <Button variant="outline" className="self-start" disabled={disabled} onPress={() => void choose()}>
     <Icon as={picked ? FileCheck : FileKey} className={picked ? 'text-success' : undefined} />
@@ -148,18 +163,19 @@ export function RecoveryReview() {
 
 /** Shared by waiting and recovered: the new file, saved through the share sheet, then the promise it is kept apart from its password. */
 function SaveRecoveryFile({ code, saved, onSaved, save }: { code: string; saved: boolean; onSaved(saved: boolean): void; save?: { done: boolean; run(): void } }) {
-  const done = !save || save.done
+  const done = saved || save?.done === true
   return <>
     {hint(LifeBuoy, recoveryCopy.why)}
     {hint(FileWarning, recoveryCopy.onlyCopy)}
     {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={CircleCheck} className="size-4 text-success" />
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
-      <Text accessibilityLabel={`已保存 ${recoveryFileStem(code)}`} numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 py-2 font-mono text-meta">
+      <Text accessibilityLabel={`已打开分享 ${recoveryFileStem(code)}`} numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 py-2 font-mono text-meta">
         <Text className="font-mono text-meta text-muted-foreground">{recoveryFileStem('')}</Text><Text className="font-mono text-meta font-medium tracking-wide">{code}</Text>
       </Text>
-      {save ? <Button variant="ghost" onPress={save.run}><Text>重新保存</Text></Button> : null}
-    </View> : <Button className="self-start" onPress={save.run}><Icon as={Download} /><Text>保存恢复文件</Text></Button>}
+      {save ? <Button variant="ghost" onPress={save.run}><Text>重新分享</Text></Button> : null}
+    </View> : save ? <Button className="self-start" onPress={save.run}><Icon as={Download} /><Text>另存恢复文件</Text></Button> : <ErrorText error="应用内恢复副本已丢失。请用你已另存的恢复文件重新打开，或连接管理设备后更换恢复文件。" />}
+    {save ? <Text className="text-meta text-muted-foreground">应用内保留密封副本。关闭分享不会自动另存，请确认已保存到应用外。</Text> : null}
     <View className="min-h-11 flex-row items-center justify-between gap-3">
       <Text className={`min-w-0 flex-1 ${done ? '' : 'text-muted-foreground'}`}>{recoveryCopy.keptApart}</Text>
       <Switch accessibilityLabel={recoveryCopy.keptApart} value={saved} disabled={!done} onValueChange={onSaved} />
@@ -179,12 +195,13 @@ function useSaveAgain() {
 function UnsavedRecoveryFile() {
   const { unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const { save, error } = useSaveAgain()
+  const [clearError, setClearError] = useState('')
   if (!unsavedRecovery || !save) return null
   return <View className="gap-3 border-t border-border pt-4">
     <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
     {hint(KeyRound, recoveryCopy.samePassword)}
-    <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
-    <ErrorText error={error} />
+    <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) { try { forgetUnsavedRecovery() } catch (cause) { setClearError(messageOf(cause)) } } }} save={save} />
+    <ErrorText error={error || clearError} />
   </View>
 }
 
@@ -275,14 +292,16 @@ export function RecoveryWaiting() {
 
 /** After a recovery took effect, before anything else: its new file gets confirmed as kept apart from its password. */
 export function RecoveredStep() {
-  const { directory, finishRecovered, forgetUnsavedRecovery } = useDevice()
+  const { directory, finishRecovered, forgetUnsavedRecovery, unsavedRecovery: file } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   const { save, error } = useSaveAgain()
   const [saved, setSaved] = useState(false)
+  const [clearError, setClearError] = useState('')
   return <Panel icon={FileKey} title={recoveryCopy.saveNew}>
     {hint(CircleCheck, recoveryCopy.recovered, 'text-success')}
-    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={(value) => { setSaved(value); if (value) forgetUnsavedRecovery() }} save={save} />
-    <ErrorText error={error} />
+    <SaveRecoveryFile code={file?.code ?? code ?? ''} saved={saved} onSaved={(value) => { try { if (value) forgetUnsavedRecovery(); setSaved(value) } catch (cause) { setClearError(messageOf(cause)) } }} save={save} />
+    {!file && !saved ? <ReplaceRecovery /> : null}
+    <ErrorText error={error || clearError} />
     <Button className="self-end" disabled={!saved} onPress={() => { forgetUnsavedRecovery(); finishRecovered() }}><Text>完成</Text></Button>
   </Panel>
 }

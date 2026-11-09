@@ -155,6 +155,11 @@ table "pending_events" {
     null = false
     type = text
   }
+  column "author" {
+    null    = false
+    type    = text
+    default = ""
+  }
   column "missing" {
     null = false
     type = text
@@ -164,6 +169,9 @@ table "pending_events" {
   }
   index "pending_events_missing" {
     columns = [column.network_id, column.missing]
+  }
+  index "pending_events_author" {
+    columns = [column.network_id, column.author]
   }
 }
 table "conversations" {
@@ -825,6 +833,30 @@ table "triage_queue" {
   primary_key {
     columns = [column.ts_ms, column.event_id]
   }
+  index "triage_queue_pending" {
+    columns = [column.ts_ms, column.event_id]
+    where   = "json_type(event,'$._triage') IS NULL"
+  }
+  index "triage_queue_claim" {
+    on {
+      expr = "json_extract(event,'$._triage.boot')"
+    }
+    on {
+      expr = "json_extract(event,'$._triage.attempt')"
+    }
+    on {
+      expr = "json_extract(event,'$._triage.state')"
+    }
+    on {
+      column = column.ts_ms
+    }
+    on {
+      column = column.event_id
+    }
+  }
+  index "triage_queue_event" {
+    columns = [column.event_id]
+  }
 }
 table "triage_handled" {
   schema = schema.main
@@ -868,6 +900,9 @@ table "triage_outbox" {
   }
   primary_key {
     columns = [column.event_id]
+  }
+  index "triage_outbox_due" {
+    columns = [column.state, column.next_ms, column.event_id]
   }
 }
 table "triage_scans" {
@@ -1065,18 +1100,18 @@ table "scheduler_sessions" {
     type = text
   }
   column "session_generation" {
-    null = false
-    type = integer
+    null    = false
+    type    = integer
     default = 0
   }
   column "handoff_revision" {
-    null = false
-    type = integer
+    null    = false
+    type    = integer
     default = 0
   }
   column "handoff_source" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = "{}"
   }
   primary_key {
@@ -1086,8 +1121,8 @@ table "scheduler_sessions" {
 table "scheduler_jobs" {
   schema = schema.main
   column "scope" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = "main"
   }
   column "conversation_id" {
@@ -1151,8 +1186,8 @@ table "scheduler_jobs" {
     type = integer
   }
   column "partial_text" {
-    null = false
-    type = text
+    null    = false
+    type    = text
     default = ""
   }
   primary_key {

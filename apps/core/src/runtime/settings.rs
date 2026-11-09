@@ -274,6 +274,10 @@ impl Runtime {
         settings: ManagerSettings,
         local: &providers::Local,
     ) -> Result<ManagerConfig> {
+        ensure!(
+            settings.workspace.is_absolute() && settings.workspace.is_dir(),
+            "manager workspace must be an existing absolute directory"
+        );
         let provider_env = local.launch_env(settings.provider);
         let sdk = match settings.provider {
             Provider::Cursor => Sdk::Cursor {
@@ -438,7 +442,20 @@ impl Runtime {
             .as_ref()
             .filter(|manager| manager.provider == provider)
             .map_or("", |manager| manager.model.as_str());
-        let readiness = probe.readiness(model);
+        let mut readiness = probe.readiness(model);
+        if let Some(manager) = settings
+            .manager
+            .as_ref()
+            .filter(|manager| manager.provider == provider && !manager.workspace.is_dir())
+        {
+            issues.push(json!({"code":"workspace_missing","path":manager.workspace}));
+            readiness = providers::ProviderProbeReadiness::NeedsSetup {
+                issue: providers::ProbeIssue::new(
+                    providers::ProbeStage::Launch,
+                    providers::ProbeCode::ConfigInvalid,
+                ),
+            };
+        }
         let execution_model = local
             .switches
             .execution_models
@@ -684,7 +701,9 @@ impl Runtime {
             manager: &mut manager,
             triage: &mut triage,
         })?;
-        if let Some(chosen) = &manager {
+        if previous_manager.is_none()
+            && let Some(chosen) = &manager
+        {
             self.ensure_default_workspace(&chosen.workspace)?;
         }
         triage.validate()?;
@@ -700,64 +719,55 @@ impl Runtime {
             &next,
         )
         .await?;
-        if manager_changed
-            || next.switches != previous.switches
-            || next.bins != previous.bins
-            || triage != previous_triage
-        {
-            let mut configuration = Config::load(&self.data_dir)?;
-            configuration.manager = manager.clone();
-            configuration.providers = next.switches.clone();
-            configuration.bins = next.bins.clone();
-            configuration.triage = triage.clone();
-            configuration.save(&self.data_dir)?;
-        }
-        if next.env != previous.env {
-            next.env.save(&self.data_dir)?;
-        }
-        let config_created = codex_config
-            .as_deref()
-            .map(|projected| roots.publish_codex_config(projected))
-            .transpose()?
-            .unwrap_or(false);
         let login_created = if requested == Some(Provider::Codex) {
             roots.prepare_login(Provider::Codex, &next, &self.host)?
         } else {
             false
         };
-        if !filled.is_empty() {
-            tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
-        }
-        self.settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .manager = manager;
-        *self
-            .providers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
-        if triage != previous_triage {
-            self.triage.set_config(triage);
-        }
-        if config_created || login_created && requested == Some(Provider::Codex) {
-            self.codex.configuration_changed();
-        }
-        if config_created
+        let launches_changed = codex_config.is_some()
             || login_created
             || manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
-            || next.env != previous.env
-        {
-            self.provider_probes
+            || next.env != previous.env;
+        if !launches_changed && triage == previous_triage {
+            return Ok(filled);
+        }
+        let mut configuration = Config::load(&self.data_dir)?;
+        configuration.manager = manager.clone();
+        configuration.providers = next.switches.clone();
+        configuration.bins = next.bins.clone();
+        configuration.triage = triage.clone();
+        configuration.provider_env = next.env.clone();
+        if let Some(projected) = &codex_config {
+            configuration.codex_config = Some(projected.clone());
+        }
+        configuration.save_and_publish(&self.data_dir, || {
+            if !filled.is_empty() {
+                tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
+            }
+            self.settings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-            self.pending_provider_launches
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+                .manager = manager;
+            *self.providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+            if triage != previous_triage {
+                self.triage.set_config(triage);
+            }
+            if codex_config.is_some() || login_created {
+                self.codex.configuration_changed();
+            }
+            if launches_changed {
+                self.provider_probes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                self.pending_provider_launches
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.schedule_wakeup.notify_one();
+        })?;
         drop(active);
-        self.schedule_wakeup.notify_one();
         Ok(filled)
     }
 
@@ -801,6 +811,12 @@ impl Runtime {
             self.pending_provider_launches.store(true, SeqCst);
             return Ok(false);
         }
+        drop(store);
+        if let Some(projected) = Config::load(&self.data_dir)?.codex_config
+            && ProviderRoots::new(&self.data_dir).publish_codex_config(&projected)?
+        {
+            self.codex.configuration_changed();
+        }
         let local = self.providers();
         let codex_agent = self
             .manager()
@@ -817,19 +833,25 @@ impl Runtime {
     /// Adds folders work may run in; the caller holds `config_save`.
     fn add_roots(&self, roots: &[PathBuf]) -> Result<()> {
         let mut next = self.settings_snapshot().roots;
-        next.extend(roots.iter().cloned());
+        for root in roots {
+            ensure!(
+                root.is_absolute() && root.is_dir(),
+                "project root must be an existing absolute directory"
+            );
+            next.push(root.canonicalize().context("project root does not exist")?);
+        }
         next.sort();
         next.dedup();
         ensure!(next.len() <= 128, "at most 128 project roots are allowed");
         let mut configuration = Config::load(&self.data_dir)?;
         configuration.roots = next.clone();
-        configuration.save(&self.data_dir)?;
-        self.settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .roots = next;
-        self.schedule_wakeup.notify_one();
-        Ok(())
+        configuration.save_and_publish(&self.data_dir, || {
+            self.settings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .roots = next;
+            self.schedule_wakeup.notify_one();
+        })
     }
 
     /// Saves the folders and the current bot's details. Whether the bot runs, and on
@@ -844,7 +866,8 @@ impl Runtime {
         let _work = self.maintenance.enter()?;
         self.authorize_settings_write(subject, local_cookie).await?;
         let directory = &self.data_dir;
-        let current = self.settings_snapshot().manager.map(|m| m.provider);
+        let previous = self.settings_snapshot();
+        let current = previous.manager.as_ref().map(|m| m.provider);
         ensure!(
             settings.manager.as_ref().map(|m| m.provider) == current,
             "choose the bot with configure_provider"
@@ -859,8 +882,10 @@ impl Runtime {
                 root.is_absolute(),
                 "project root must be an existing absolute directory"
             );
-            *root = root.canonicalize().context("project root does not exist")?;
-            ensure!(root.is_dir(), "project root must be a directory");
+            if !previous.roots.contains(root) {
+                *root = root.canonicalize().context("project root does not exist")?;
+                ensure!(root.is_dir(), "project root must be a directory");
+            }
         }
         settings.roots.sort();
         settings.roots.dedup();
@@ -883,34 +908,44 @@ impl Runtime {
                 "{} requires a model",
                 manager.provider.label()
             );
-            self.ensure_default_workspace(&manager.workspace)?;
-            manager.workspace = manager
-                .workspace
-                .canonicalize()
-                .context("manager workspace does not exist")?;
+            if previous
+                .manager
+                .as_ref()
+                .is_none_or(|saved| saved.workspace != manager.workspace)
+            {
+                manager.workspace = manager
+                    .workspace
+                    .canonicalize()
+                    .context("manager workspace does not exist")?;
+                ensure!(
+                    manager.workspace.is_dir(),
+                    "manager workspace must be a directory"
+                );
+            }
         }
         let active = self.manager_controls.lock().await;
-        let previous = self.settings_snapshot();
         let providers = self.providers();
         self.fence_revoked_permissions(&active, &previous, &settings, &providers, &providers)
             .await?;
         let mut configuration = Config::load(directory)?;
         configuration.manager = settings.manager.clone();
         configuration.roots = settings.roots.clone();
-        configuration.save(directory)?;
         let manager_changed = previous.manager != settings.manager;
-        *self
-            .settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
-        if manager_changed {
-            self.provider_probes
+        configuration.save_and_publish(directory, || {
+            *self
+                .settings
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-            self.pending_provider_launches
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
+            if manager_changed {
+                self.provider_probes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                self.pending_provider_launches
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.schedule_wakeup.notify_one();
+        })?;
         drop(active);
         drop(_work);
         drop(_save);
@@ -1293,7 +1328,8 @@ mod tests {
                         .map(|index| (format!("FIXTURE_{index}"), Some("synthetic-value".into())))
                         .collect(),
                 )?;
-                env.save(&dir)?;
+                config.provider_env = env;
+                config.save(&dir)?;
             }
             let mut node = Runtime::open(&dir).await?;
             let source = dir.join("source");
@@ -1312,8 +1348,7 @@ mod tests {
                 },
             );
             let previous = node.providers();
-            previous.env.save(&dir)?;
-            let saved_env = std::fs::read(dir.join(providers::ENV_FILE))?;
+            let saved_configuration = std::fs::read(dir.join("config.json"))?;
             let launch = previous.codex_target(false);
             assert!(!node.codex.configuration_pending(&launch));
             let target = ProviderRoots::new(&dir).codex_home.join("config.toml");
@@ -1337,7 +1372,7 @@ mod tests {
             );
             assert!(node.providers().env == previous.env);
             assert!(node.providers().codex_target(false) == launch);
-            assert_eq!(std::fs::read(dir.join(providers::ENV_FILE))?, saved_env);
+            assert_eq!(std::fs::read(dir.join("config.json"))?, saved_configuration);
             assert!(
                 !node
                     .pending_provider_launches
@@ -1360,7 +1395,7 @@ mod tests {
                 );
                 assert!(node.providers().env == previous.env);
                 assert!(node.providers().codex_target(false) == launch);
-                assert_eq!(std::fs::read(dir.join(providers::ENV_FILE))?, saved_env);
+                assert_eq!(std::fs::read(dir.join("config.json"))?, saved_configuration);
                 assert!(
                     !node
                         .pending_provider_launches
@@ -1387,7 +1422,8 @@ mod tests {
                 )
                 .await?;
             }
-            assert!(target.is_file());
+            assert!(!target.exists());
+            assert!(Config::load(&dir)?.codex_config.is_some());
             assert_eq!(
                 node.providers().env.get(Provider::Codex)["FIXTURE_CONNECT_KEY"],
                 "synthetic-key"
@@ -1396,6 +1432,8 @@ mod tests {
                 node.pending_provider_launches
                     .load(std::sync::atomic::Ordering::SeqCst)
             );
+            assert!(node.apply_provider_launches().await?);
+            assert!(target.is_file());
             drop(node);
             std::fs::remove_dir_all(dir)?;
         }
@@ -1438,11 +1476,17 @@ mod tests {
             )
             .await?;
         }
-        assert!(
-            ProviderRoots::new(&dir)
-                .codex_home
-                .join("config.toml")
-                .is_file()
+        let target = ProviderRoots::new(&dir).codex_home.join("config.toml");
+        assert!(!target.exists());
+        assert_eq!(
+            toml::from_str::<toml::Value>(
+                Config::load(&dir)?
+                    .codex_config
+                    .as_deref()
+                    .context("saved Codex configuration")?
+            )?["model"]
+                .as_str(),
+            Some("fixture-model")
         );
         let changed = node.provider_probe_snapshot(Provider::Codex).await;
         assert_ne!(initial.config_id, changed.config_id);
@@ -1453,6 +1497,7 @@ mod tests {
         );
         drop(active);
         assert!(node.apply_provider_launches().await?);
+        assert!(target.is_file());
         assert!(
             !node
                 .codex
@@ -1480,6 +1525,183 @@ mod tests {
             node.provider_probe_snapshot(Provider::Codex)
                 .await
                 .config_id
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_provider_settings_recover_after_projection_failure() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!(
+                "configuration-publication-{}",
+                uuid::Uuid::new_v4()
+            ));
+        crate::config::private_dir(&dir)?;
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.providers.execution.clear();
+        configuration.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        )?;
+        let mut node = Runtime::open(&dir).await?;
+        let source = dir.join("source");
+        crate::config::private_dir(&source)?;
+        std::fs::write(source.join("config.toml"), "model='fixture-model'\n")?;
+        node.host.codex_home = Some(source);
+        {
+            let _save = node.config_save.lock().await;
+            node.write_providers(
+                |target| {
+                    target
+                        .local
+                        .bins
+                        .insert(Provider::Codex, "/fixture/codex".into());
+                    target.local.env.apply(
+                        Provider::Codex,
+                        [("FIXTURE_API_KEY".into(), Some("synthetic-key".into()))].into(),
+                    )
+                },
+                Some(discovery::LocalConnect {
+                    provider: Provider::Codex,
+                    explicit_env_names: BTreeSet::new(),
+                }),
+            )
+            .await?;
+        }
+        let saved = Config::load(&dir)?;
+        let bytes = std::fs::read(dir.join("config.json"))?;
+        assert!(saved.provider_env == node.providers().env);
+        assert_eq!(saved.bins, node.providers().bins);
+        let roots = ProviderRoots::new(&dir);
+        let detached = dir.join("detached-codex-home");
+        std::fs::rename(&roots.codex_home, &detached)?;
+        std::fs::write(&roots.codex_home, "publication-blocker")?;
+        assert!(node.apply_provider_launches().await.is_err());
+        assert!(
+            node.pending_provider_launches
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(saved.provider_env == node.providers().env);
+        assert_eq!(std::fs::read(dir.join("config.json"))?, bytes);
+        std::fs::remove_file(&roots.codex_home)?;
+        std::fs::rename(detached, &roots.codex_home)?;
+        drop(node);
+        let restarted = Runtime::open(&dir).await?;
+        assert!(restarted.providers().env == saved.provider_env);
+        assert_eq!(restarted.providers().bins, saved.bins);
+        assert_eq!(
+            std::fs::read_to_string(roots.codex_home.join("config.toml"))?,
+            saved.codex_config.context("saved projection")?
+        );
+        assert_eq!(std::fs::read(dir.join("config.json"))?, bytes);
+        drop(restarted);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_directories_can_be_preserved_repaired_and_reattached() -> Result<()> {
+        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let owner = admin.device_id()?;
+        let root = dir.join("root");
+        crate::config::private_dir(&root)?;
+        let root = root.canonicalize()?;
+        std::fs::write(root.join("sentinel"), "user-data")?;
+        node.configure_provider(
+            serde_json::from_value(
+                json!({"provider":"cursor","bot":true,"bin":"/fixture/missing-cursor"}),
+            )?,
+            &owner,
+            None,
+        )
+        .await?;
+        let mut settings = node.settings_snapshot();
+        settings.roots = vec![root.clone()];
+        node.configure_node(settings.clone(), &owner, None).await?;
+        let workspace = settings
+            .manager
+            .as_ref()
+            .context("manager")?
+            .workspace
+            .clone();
+        std::fs::write(workspace.join("sentinel"), "workspace-data")?;
+        let detached_root = dir.join("detached-root");
+        let detached_workspace = dir.join("detached-workspace");
+        std::fs::rename(&root, &detached_root)?;
+        std::fs::rename(&workspace, &detached_workspace)?;
+        assert!(node.allowed_path(root.to_str().context("root")?).is_err());
+        assert!(
+            node.allowed_path(detached_root.to_str().context("detached root")?)
+                .is_err()
+        );
+        assert!(
+            node.manager_config(
+                settings.manager.clone().context("manager")?,
+                &node.providers()
+            )
+            .is_err()
+        );
+        assert_eq!(node.manager_state().await, Some(json!("needs_setup")));
+        let status = node.node_settings().await?;
+        assert_eq!(status["settings"], serde_json::to_value(&settings)?);
+        assert!(
+            status["providers"][1]["issues"]
+                .as_array()
+                .context("issues")?
+                .iter()
+                .any(|issue| issue["code"] == "workspace_missing")
+        );
+        node.configure_node(settings.clone(), &owner, None).await?;
+        {
+            let _save = node.config_save.lock().await;
+            node.write_providers(
+                |target| {
+                    target.local.env.apply(
+                        Provider::Cursor,
+                        [("FIXTURE_SETTING".into(), Some("fixture-value".into()))].into(),
+                    )
+                },
+                None,
+            )
+            .await?;
+        }
+        assert!(!root.exists() && !workspace.exists());
+        drop(node);
+        let node = Runtime::open(&dir).await?;
+        assert_eq!(
+            serde_json::to_value(node.settings_snapshot())?,
+            serde_json::to_value(&settings)?
+        );
+        assert!(!root.exists() && !workspace.exists());
+        let mut invalid = settings.clone();
+        invalid.roots.push(dir.join("new-missing-root"));
+        assert!(node.configure_node(invalid, &owner, None).await.is_err());
+        let mut invalid = settings.clone();
+        invalid.manager.as_mut().context("manager")?.workspace = dir.join("new-missing-workspace");
+        assert!(node.configure_node(invalid, &owner, None).await.is_err());
+        let mut removed = settings.clone();
+        removed.roots.clear();
+        node.configure_node(removed, &owner, None).await?;
+        std::fs::rename(&detached_root, &root)?;
+        std::fs::rename(&detached_workspace, &workspace)?;
+        node.configure_node(settings, &owner, None).await?;
+        assert_eq!(node.allowed_path(root.to_str().context("root")?)?, root);
+        assert_eq!(std::fs::read_to_string(root.join("sentinel"))?, "user-data");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("sentinel"))?,
+            "workspace-data"
+        );
+        assert!(
+            node.manager_config(node.manager().context("manager")?, &node.providers())
+                .is_ok()
         );
         drop(node);
         std::fs::remove_dir_all(dir)?;

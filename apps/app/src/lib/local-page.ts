@@ -4,6 +4,7 @@ import type { LocalPage } from '@vibeface/client/lib/platform.ts'
 import { localBrowserEntry } from './local-access'
 
 const invitationIn = () => location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.hash.slice(1) : ''
+let bootstrapSetup: LocalSetup | null = null
 
 /** Only a page on localhost may set up, launch or join the computer serving it. */
 export const localPage: LocalPage = {
@@ -12,6 +13,13 @@ export const localPage: LocalPage = {
   takeLaunch() {
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = invitationIn()
+    const bootstrap = fragment.get('bootstrap')
+    if (bootstrap && bootstrap.length <= 8192 && /^[A-Za-z0-9_-]+$/.test(bootstrap)) {
+      try {
+        const entry: unknown = JSON.parse(atob(bootstrap.replaceAll('-', '+').replaceAll('_', '/')))
+        bootstrapSetup = parseLocalSetup({ kind: 'uninitialized', invitation: entry }, location.origin)
+      } catch { bootstrapSetup = null }
+    }
     const localToken = fragment.get('local')
     const localLaunch = localToken ? { token: localToken, deviceId: fragment.get('node') ?? '', rejoin: fragment.get('rejoin') === '1' } : null
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
@@ -32,7 +40,13 @@ export const localPage: LocalPage = {
     catch (cause) { if (signal.aborted) throw cause; return null }
     if (response.status === 404) return null
     if (!response.ok) throw new Error('无法读取这台电脑的本机设置。检查本机地址并刷新页面。')
-    return parseLocalSetup(await response.json(), url.origin)
+    const value: unknown = await response.json()
+    if (value && typeof value === 'object' && 'kind' in value && value.kind === 'owner_required') {
+      if ('initialized' in value && value.initialized === false) return bootstrapSetup
+      bootstrapSetup = null
+      return null
+    }
+    return parseLocalSetup(value, url.origin)
   },
   localEntry: localBrowserEntry,
   open(href) {

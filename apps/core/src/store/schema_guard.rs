@@ -184,6 +184,8 @@ mod tests {
             db.execute_batch(
                 "ALTER TABLE messages ADD COLUMN target text NULL;
                  ALTER TABLE scheduler_jobs ADD COLUMN scope text NOT NULL DEFAULT 'main';
+                 ALTER TABLE pending_events ADD COLUMN author text NOT NULL DEFAULT '';
+                 CREATE INDEX pending_events_author ON pending_events (network_id, author);
                  CREATE TABLE workspace_projection (`network_id` text NOT NULL, `state` text NOT NULL, PRIMARY KEY (`network_id`));
                  CREATE INDEX messages_replies ON messages (network_id, conversation_id, in_reply_to) WHERE in_reply_to IS NOT NULL;
                  CREATE INDEX messages_steered ON messages (network_id, conversation_id, steered_into, rank) WHERE steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL;",

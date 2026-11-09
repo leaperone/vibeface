@@ -5,7 +5,7 @@ import { workspaceTest as test } from './fixtures';
 
 test('keeps personal Tasks, deferred inputs and directed Channel results in their own scopes', { tags: ['workspace'], timeout: 300000 }, async ({ app, workspace, screen, browser }) => {
   await browser.setViewport({ width: 1440, height: 1000 });
-  await app.open(workspace.source.url);
+  await app.open(workspace.source.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('Workspace E2E Node');
   await screen.getByRole('button', '下一步').click();

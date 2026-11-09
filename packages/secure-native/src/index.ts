@@ -176,8 +176,8 @@ export const secure: NativeSecure = {
   ticketEncode: (entryId, secretHex) => call(() => ffi.ticketEncode(entryId, secretHex)),
   verify: (deviceId, domain, payload, signature) =>
     call(() => ffi.verify(deviceId, domain, toBuffer(payload), signature)),
-  verifyMembership: (stateJson, expectedNetwork) =>
-    new Membership(call(() => ffi.verifyMembership(stateJson, expectedNetwork))),
+  verifyMembership: (stateJson, expectedNetwork, now) =>
+    new Membership(call(() => ffi.verifyMembership(stateJson, expectedNetwork, now ?? undefined))),
 }
 
 /** The app's way to Nodes on its LAN: one QUIC stream to a Node, and the tags Nodes advertise there. */

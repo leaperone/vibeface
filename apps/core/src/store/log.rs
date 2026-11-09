@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Shared hard limit; only verified authors with a write bound receive a fair share.
 pub const MAX_PENDING_EVENTS: i64 = 10_000;
 
 pub(crate) fn blob_path(dir: &Path, hash: &str) -> PathBuf {
@@ -102,6 +103,23 @@ pub(crate) struct Placed {
     pub stored: Vec<HashedEvent>,
 }
 
+fn attestation_authorized(view: &AuthorizationView, event: &Event) -> bool {
+    event
+        .body
+        .attestation()
+        .is_none_or(|attestation| view.attester(&attestation.device_id))
+}
+
+fn input_rejection(checked: Result<()>) -> Result<Option<String>> {
+    match checked {
+        Ok(()) => Ok(None),
+        Err(error) if error.is::<rusqlite::Error>() || error.is::<serde_json::Error>() => {
+            Err(error)
+        }
+        Err(error) => Ok(Some(error.to_string())),
+    }
+}
+
 /// Verifies once, then places; events waiting on this one are placed without re-verifying.
 pub(crate) fn ingest_from(
     connection: &Connection,
@@ -124,9 +142,7 @@ pub(crate) fn ingest_from(
     if view.write_bound(&event.author).is_none() {
         return Ok(IngestStatus::Rejected("unknown author".into()));
     }
-    if let Some(attestation) = event.body.attestation()
-        && !view.attester(&attestation.device_id)
-    {
+    if !attestation_authorized(view, &event) {
         return Ok(IngestStatus::Rejected(
             "attestation is not signed by a client of this network".into(),
         ));
@@ -151,18 +167,20 @@ fn cascade(
     let mut ready = vec![hash.to_owned()];
     while let Some(hash) = ready.pop() {
         let waiting: Vec<String> = connection
-            .prepare(
-                "DELETE FROM pending_events WHERE network_id=? AND missing=? RETURNING envelope",
-            )?
+            .prepare("SELECT envelope FROM pending_events WHERE network_id=? AND missing=?")?
             .query_map(params![view.network_id, hash], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for envelope in waiting {
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-            if matches!(
-                place(connection, view, &envelope, &event, seen_at_ms, placed)?,
-                IngestStatus::Accepted | IngestStatus::Conflict
-            ) {
+            let status = place(connection, view, &envelope, &event, seen_at_ms, placed)?;
+            if status != IngestStatus::Pending {
+                connection.execute(
+                    "DELETE FROM pending_events WHERE network_id=? AND hash=?",
+                    params![view.network_id, envelope.hash],
+                )?;
+            }
+            if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
                 ready.push(envelope.hash);
             }
         }
@@ -172,24 +190,47 @@ fn cascade(
 
 fn pending(
     connection: &Connection,
-    network: &str,
+    view: &AuthorizationView,
     envelope: &SignedEvent,
+    author: &str,
     missing: &str,
 ) -> Result<IngestStatus> {
-    let count: i64 = connection.query_row(
-        "SELECT count(*) FROM pending_events WHERE network_id=?",
-        [network],
-        |r| r.get(0),
+    let network = view.network_id.as_str();
+    if connection.execute(
+        "UPDATE pending_events SET missing=? WHERE network_id=? AND hash=?",
+        params![missing, network, envelope.hash],
+    )? > 0
+    {
+        return Ok(IngestStatus::Pending);
+    }
+    let authors: BTreeSet<_> = view
+        .members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .chain(
+            view.revoked
+                .iter()
+                .map(|revoked| revoked.device_id.as_str()),
+        )
+        .filter(|author| view.write_bound(author).is_some())
+        .collect();
+    let share = MAX_PENDING_EVENTS / authors.len().max(1) as i64;
+    let (total, count): (i64, i64) = connection.query_row(
+        "SELECT count(*),count(*) FILTER (WHERE author=?2) FROM pending_events WHERE network_id=?1",
+        params![network, author],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if count >= MAX_PENDING_EVENTS {
+    // New members can shrink shares; keep existing waits intact even if they now fill the total.
+    if total >= MAX_PENDING_EVENTS || count >= share {
         return Ok(IngestStatus::Rejected("too many pending events".into()));
     }
     connection.execute(
-        "INSERT INTO pending_events(network_id,hash,envelope,missing) VALUES(?,?,?,?)",
+        "INSERT INTO pending_events(network_id,hash,envelope,author,missing) VALUES(?,?,?,?,?)",
         params![
             network,
             envelope.hash,
             serde_json::to_string(envelope)?,
+            author,
             missing
         ],
     )?;
@@ -218,7 +259,7 @@ fn place(
             None if event.seq <= max + 1
                 || exists(connection, "pending_events", network, prev)? =>
             {
-                return pending(connection, network, envelope, prev);
+                return pending(connection, view, envelope, &event.author, prev);
             }
             None => {
                 return Ok(IngestStatus::Rejected(format!(
@@ -237,20 +278,15 @@ fn place(
     }
     for dep in &event.deps {
         if !exists(connection, "events", network, dep)? {
-            return pending(connection, network, envelope, dep);
+            return pending(connection, view, envelope, &event.author, dep);
         }
     }
-    if let Err(error) = super::workspace::authorize_event(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_memory(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_cause(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_owner(connection, network, event) {
-        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected a write only the conversation's scheduling Node makes");
+    let authorization = super::workspace::authorize_event(connection, network, event)
+        .and_then(|()| authorize_memory(connection, network, event))
+        .and_then(|()| authorize_cause(connection, view, event))
+        .and_then(|()| authorize_owner(connection, view, event));
+    if let Some(error) = input_rejection(authorization)? {
+        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
     let main = match &event.prev {
@@ -343,7 +379,8 @@ fn authorize_memory(connection: &Connection, network: &str, event: &Event) -> Re
 /// a bot change, or a bot it creates or deletes. One of the event's stored parents must be that
 /// signed user message. The one change without a cause is a new one-shot schedule: a reminder
 /// the bot sets itself.
-fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+fn authorize_cause(connection: &Connection, view: &AuthorizationView, event: &Event) -> Result<()> {
+    let network = view.network_id.as_str();
     let cause = match &event.body {
         EventBody::BotDeleted {
             cause: Some(cause), ..
@@ -378,6 +415,9 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         }
         | EventBody::ConversationOwner {
             cause: Some(cause), ..
+        }
+        | EventBody::WorkspaceCommanded {
+            cause: Some(cause), ..
         } => cause,
         _ => return Ok(()),
     };
@@ -397,13 +437,19 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         let Some(parent) = event_from(connection, network, parent)? else {
             continue;
         };
-        if parent.scope_id == cause.conversation_id
-            && matches!(&parent.body, EventBody::MessagePosted {
+        let signed_request = matches!(&parent.body, EventBody::MessagePosted {
                 message_id, role: Role::User, answers: None, attestation: Some(_), ..
             } | EventBody::InputPosted {
                 message_id, target: crate::workspace::InputTarget::BotMain { .. },
                 attestation: Some(_), ..
             } if *message_id == cause.message_id)
+            || matches!(&event.body, EventBody::WorkspaceCommanded { .. })
+                && matches!(&parent.body, EventBody::InputPosted {
+                    message_id, attestation: Some(_), ..
+                } if *message_id == cause.message_id);
+        if parent.scope_id == cause.conversation_id
+            && signed_request
+            && attestation_authorized(view, &parent)
         {
             return Ok(());
         }
@@ -411,13 +457,18 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
     bail!("a bot's write for the user must follow the user's own signed message")
 }
 
-/// The conversation whose scheduling Node alone makes this write: a checkpoint, a reminder its
-/// bot set itself, a schedule time it takes, or its bot's message to another bot.
+/// The conversation whose scheduling Node makes this write. A work target may also report its
+/// own unknown result; `authorize_owner` checks that exception against its earlier dispatch.
 fn owner_scope(event: &Event) -> Option<&str> {
     match &event.body {
         EventBody::ContextCheckpoint { .. }
         | EventBody::BotChanged { cause: None, .. }
-        | EventBody::ScheduleRunClaimed { .. } => Some(&event.scope_id),
+        | EventBody::ScheduleRunClaimed { .. }
+        | EventBody::WorkFinished {
+            outcome: WorkOutcome::Unverified,
+            attestation: None,
+            ..
+        } => Some(&event.scope_id),
         EventBody::BotMessaged { from, .. } => Some(&from.conversation_id),
         _ => None,
     }
@@ -428,10 +479,24 @@ fn owner_scope(event: &Event) -> Option<&str> {
 /// to that dependency), those of the highest epoch must name the author. An owner change the
 /// author had not seen yet does not count against it. A schedule claim names that epoch. The
 /// parents are stored before an event is placed, so every replica reads the same records.
-fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+fn authorize_owner(connection: &Connection, view: &AuthorizationView, event: &Event) -> Result<()> {
+    let network = view.network_id.as_str();
     let Some(scope) = owner_scope(event) else {
         return Ok(());
     };
+    if let EventBody::WorkFinished { work_id, .. } = &event.body
+        && connection
+            .query_row(
+                "SELECT 1 FROM events WHERE network_id=? AND scope_id=? AND kind='work_dispatched' AND subject=? AND author=? AND seq<? LIMIT 1",
+                params![network, scope, work_id, event.author, event.seq],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    {
+        // The target's own earlier dispatch authorizes its unknown result regardless of owner changes.
+        return Ok(());
+    }
     let mut seen = BTreeMap::from([(event.author.clone(), event.seq - 1)]);
     for dep in &event.deps {
         let (author, seq): (String, u64) = connection.query_row(
@@ -453,11 +518,17 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
             continue;
         }
         let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let owner: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if !attestation_authorized(view, &owner)
+            || input_rejection(authorize_cause(connection, view, &owner))?.is_some()
+        {
+            continue;
+        }
         let EventBody::ConversationOwner {
             scheduler_node,
             epoch,
             ..
-        } = serde_json::from_str::<Event>(&envelope.canonical_body)?.body
+        } = owner.body
         else {
             continue;
         };
@@ -504,6 +575,7 @@ fn insert_event(
     let network = view.network_id.as_str();
     let settled = main && !has_forks(connection, network, &event.author)?;
     let effective = settled
+        && attestation_authorized(view, event)
         && match view.write_bound(&event.author) {
             Some(WriteBound::Unlimited) => true,
             Some(WriteBound::Cutoff(revocation)) => event.seq <= revocation.cutoff_seq,
@@ -617,29 +689,41 @@ fn effective_set(
     Ok(wanted)
 }
 
-/// Brings every `effective` flag in line with `view` and the fork evidence. When one moves, the
-/// projections are rebuilt from the effective events in shared order; local ledgers are left
-/// alone. Returns whether the projections were rebuilt.
+/// Brings every `effective` flag in line with `view`, its attesters and the fork evidence. When
+/// one moves, projections are rebuilt in shared order; signed history and local ledgers remain.
+/// Returns whether the projections were rebuilt.
 pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Result<bool> {
     let network = view.network_id.as_str();
     let mut logs: BTreeMap<String, Vec<(u64, String, bool, bool)>> = BTreeMap::new();
+    let mut unauthorized = BTreeSet::new();
     {
-        let mut statement = connection
-            .prepare("SELECT author,seq,hash,main,effective FROM events WHERE network_id=?")?;
+        let mut statement = connection.prepare(
+            "SELECT author,seq,hash,main,effective,envelope FROM events WHERE network_id=?",
+        )?;
         let rows = statement.query_map([network], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+                r.get::<_, String>(5)?,
             ))
         })?;
         for row in rows {
-            let (author, row) = row?;
+            let (author, row, envelope) = row?;
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            if !attestation_authorized(view, &event)
+                || input_rejection(authorize_cause(connection, view, &event))?.is_some()
+                || input_rejection(authorize_owner(connection, view, &event))?.is_some()
+            {
+                unauthorized.insert(envelope.hash);
+            }
             logs.entry(author).or_default().push(row);
         }
     }
     let mut flips = Vec::new();
     for (author, rows) in &logs {
-        let wanted = effective_set(connection, view, author, rows)?;
+        let mut wanted = effective_set(connection, view, author, rows)?;
+        wanted.retain(|hash| !unauthorized.contains(hash));
         for (_, hash, _, effective) in rows {
             if *effective != wanted.contains(hash) {
                 flips.push((hash, !effective));
@@ -787,8 +871,8 @@ pub(crate) fn append_from(
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     super::workspace::authorize_event(connection, network, &event)?;
     authorize_memory(connection, network, &event)?;
-    authorize_cause(connection, network, &event)?;
-    authorize_owner(connection, network, &event)?;
+    authorize_cause(connection, &view, &event)?;
+    authorize_owner(connection, &view, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, created_at_ms, true)?,
         "this Node's log has forked and it no longer writes"

@@ -618,17 +618,24 @@ fn load_request(conn: &Connection, column: &str, value: &str) -> Result<Option<R
 }
 
 fn load_state(conn: &Connection) -> Result<NetworkState> {
-    let encoded: String = conn
-        .query_row("SELECT bundle FROM networks LIMIT 1", [], |r| r.get(0))
-        .optional()?
-        .context("personal network is not installed")?;
-    Ok(serde_json::from_str(&encoded)?)
+    let network = crate::store::network_from(conn)?.context("personal network is not installed")?;
+    let encoded: String = conn.query_row(
+        "SELECT bundle FROM networks WHERE network_id=?",
+        [&network],
+        |r| r.get(0),
+    )?;
+    let state: NetworkState = serde_json::from_str(&encoded)?;
+    ensure!(
+        state.genesis.network_id == network,
+        "stored membership network mismatch"
+    );
+    Ok(state)
 }
 fn save_state(conn: &Connection, state: &NetworkState) -> Result<bool> {
     crate::store::install_trust_bundle_in(conn, &state.genesis.network_id, state)
 }
 fn has_network_in(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM networks", [], |r| r.get::<_, i64>(0))? > 0)
+    Ok(crate::store::network_from(conn)?.is_some())
 }
 fn verify_bootstrap_in(conn: &Connection, capability: &str) -> Result<()> {
     super::validate_hash(capability)?;

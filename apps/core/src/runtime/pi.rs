@@ -2,7 +2,7 @@
 //! process idles between turns, and each turn starts with its own environment and instructions.
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
-use super::claude::Processes;
+use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
@@ -41,7 +41,7 @@ const STEER_LEAD: &str =
 
 /// The pi turns of this Node: where each session is written, and the turns running now.
 pub struct Pi {
-    /// Per session: its pointer (`<session>.json`) and the bot's instructions (`<session>.md`).
+    /// Session pointers and private guides whose processes still read them.
     dir: PathBuf,
     sessions: PathBuf,
     processes: Arc<Processes>,
@@ -92,6 +92,24 @@ struct Live {
     stopping: Arc<AtomicBool>,
 }
 
+struct LiveTurn<'a> {
+    owner: &'a Pi,
+    session: String,
+    turn: String,
+}
+
+impl Drop for LiveTurn<'_> {
+    fn drop(&mut self) {
+        let mut live = lock(&self.owner.live);
+        if live
+            .get(&self.session)
+            .is_some_and(|live| live.turn == self.turn)
+        {
+            live.remove(&self.session);
+        }
+    }
+}
+
 /// Where pi writes a session, kept before a prompt is sent into it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Pointer {
@@ -137,17 +155,31 @@ struct Launch {
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     args: Vec<String>,
+    guide: Option<Arc<Guide>>,
 }
 
 struct Process {
     child: Child,
     tree: tree::Tree,
+    reaped: bool,
     _tracked: Tracked,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: mpsc::UnboundedReceiver<Value>,
     /// The end of what pi wrote to stderr, once it closed it.
-    stderr: tokio::task::JoinHandle<String>,
+    stderr: Option<tokio::task::JoinHandle<String>>,
+    _guide: Option<Arc<Guide>>,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.tree.kill();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
 }
 
 /// How a prompt went in.
@@ -517,6 +549,9 @@ impl Process {
                 format!("could not start pi at {}: {error:#}", launch.bin.display()),
             )
         })?;
+        if let Some(guide) = &launch.guide {
+            guide.started(tree.token());
+        }
         processes
             .track(tree.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
@@ -545,10 +580,12 @@ impl Process {
         Ok(Self {
             child,
             tree,
+            reaped: false,
             _tracked: tracked,
             rpc,
             events,
-            stderr,
+            stderr: Some(stderr),
+            _guide: launch.guide.clone(),
         })
     }
 
@@ -556,14 +593,12 @@ impl Process {
     /// ended with its tree. Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
-        let exited = matches!(
-            tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await,
-            Ok(Ok(_))
-        );
-        if !exited {
-            agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        }
-        match tokio::time::timeout(Duration::from_secs(1), self.stderr).await {
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        let Some(stderr) = self.stderr.take() else {
+            return String::new();
+        };
+        match tokio::time::timeout(Duration::from_secs(1), stderr).await {
             Ok(Ok(tail)) => tail,
             _ => String::new(),
         }
@@ -719,11 +754,11 @@ impl Pi {
     }
 
     /// Ends the pi processes an earlier Node run left, so their turns are read back as they are.
-    pub(crate) fn new(data_dir: &Path) -> Self {
+    pub(crate) async fn new(data_dir: &Path) -> Self {
         Self {
             dir: data_dir.join("pi"),
             sessions: ProviderRoots::new(data_dir).pi_sessions,
-            processes: Arc::new(Processes::open(data_dir.join(PIDFILE))),
+            processes: Arc::new(Processes::open(data_dir.join(PIDFILE)).await),
             live: Default::default(),
             preparing: Default::default(),
             resuming: Default::default(),
@@ -1012,14 +1047,17 @@ impl Pi {
             &config.custom_tools,
             &config.instructions,
         );
-        if !guide.is_empty() {
-            let path = self.dir.join(format!("{session}.md"));
-            config::private_dir(&self.dir)
+        let guide = if guide.is_empty() {
+            None
+        } else {
+            let guide = Guide::write(&self.dir.join("guides"), &guide)
                 .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
-            config::private_write(&path, guide.as_bytes())
-                .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
-            args.extend(["--append-system-prompt".into(), path.display().to_string()]);
-        }
+            args.extend([
+                "--append-system-prompt".into(),
+                guide.path.display().to_string(),
+            ]);
+            Some(guide)
+        };
         if !config.model.is_empty() {
             args.extend(["--model".into(), config.model.clone()]);
         }
@@ -1036,6 +1074,7 @@ impl Pi {
             cwd: config.workspace.clone(),
             env,
             args,
+            guide,
         };
         if *cancel.borrow() {
             return Err(stopped(previous));
@@ -1134,6 +1173,11 @@ impl Pi {
                 stopping: Default::default(),
             },
         );
+        let live = LiveTurn {
+            owner: self,
+            session: session.clone(),
+            turn: turn.clone(),
+        };
         stage.enter(ProviderStage::Record);
         let recorded = match &config.codex_turn {
             Some(record) => {
@@ -1212,7 +1256,7 @@ impl Pi {
                 }
             }
         };
-        lock(&self.live).remove(&session);
+        drop(live);
         process.end().await;
         Ok(AgentResult {
             session_id: Some(session),
@@ -1270,6 +1314,11 @@ impl Pi {
                 stopping: stopping.clone(),
             },
         );
+        let live = LiveTurn {
+            owner: &self,
+            session: session.clone(),
+            turn: turn.clone(),
+        };
         send(Report::Signal(Signal::TurnStarted {
             turn_id: turn.clone(),
             epoch: 0,
@@ -1311,7 +1360,7 @@ impl Pi {
                 break true;
             }
         };
-        lock(&self.live).remove(&session);
+        drop(live);
         process.end().await;
         if !settled {
             return send(Report::Probe);
@@ -1498,6 +1547,7 @@ impl Executor for Pi {
                 },
                 env: node.provider_env(Provider::Pi),
                 args: launch_args,
+                guide: None,
             };
             let (sender, mut reports) = mpsc::unbounded_channel();
             let (stop, cancel) = watch::channel(false);
@@ -1912,6 +1962,7 @@ mod tests {
             cwd: dir.to_owned(),
             env: env(dir, mode),
             args: vec!["--session-id".into(), session.into()],
+            guide: None,
         }
     }
 
@@ -2028,7 +2079,7 @@ mod tests {
         std::fs::create_dir(&user)?;
         for name in ["node-a", "node-b"] {
             let data = dir.join(name);
-            let pi = Arc::new(Pi::new(&data));
+            let pi = Arc::new(Pi::new(&data).await);
             let mut launch = launch(&dir, "reply", name);
             launch.env.insert(
                 "PI_CODING_AGENT_SESSION_DIR".into(),
@@ -2068,7 +2119,7 @@ mod tests {
     #[tokio::test]
     async fn bot_readback_uses_its_frozen_input_and_requires_an_ending() -> Result<()> {
         let dir = scratch("bot-readback");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir).await;
         let file = dir.join("session.jsonl");
         std::fs::write(&file, "")?;
         pi.keep("s-1", &file, &dir, "")?;
@@ -2136,7 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn a_bot_turn_streams_its_reply_and_the_next_turn_goes_on_in_its_session() -> Result<()> {
         let dir = scratch("bot");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let mut config = bot(&dir, &pi, "reply", None);
         config.reasoning_effort = Some("high".into());
         let shown = std::sync::Mutex::new(Vec::new());
@@ -2196,7 +2247,12 @@ mod tests {
             .position(|a| a == "--append-system-prompt")
             .context("guide")?
             + 1];
-        assert_eq!(std::fs::read_to_string(guide)?, "Answer briefly.");
+        assert_eq!(starts[0]["guide"], "Answer briefly.");
+        assert_eq!(starts[0]["guide_private"], true);
+        assert!(
+            !Path::new(guide).exists(),
+            "an ended process releases its guide"
+        );
         assert_eq!(second[3], "--session");
         assert!(second[4].ends_with(&format!("_{session}.jsonl")));
         assert_eq!(starts[0]["run"], "1");
@@ -2207,7 +2263,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_steered_into_the_running_reply_is_answered_in_it() -> Result<()> {
         let dir = scratch("steer");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let turns = Turns::default();
         let mut config = bot(&dir, &pi, "wait", Some(&turns));
         let native_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2306,7 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_a_bot_turn_aborts_it_in_pi() -> Result<()> {
         let dir = scratch("stop");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let turns = Turns::default();
         let config = bot(&dir, &pi, "wait", Some(&turns));
         let (stop, cancel) = watch::channel(false);
@@ -2343,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn sixteen_pi_turns_overlap_and_keep_their_outputs() -> Result<()> {
         let dir = scratch("concurrent");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let tasks = concurrent_pi_turns(&dir, &pi, (0..16).map(|_| String::from("reply")));
         wait_for_gate(&dir).await?;
         release(&dir);
@@ -2359,9 +2415,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_a_bot_future_clears_only_its_live_turn() -> Result<()> {
+        let dir = scratch("future-abort");
+        let pi = Arc::new(Pi::new(&dir).await);
+        let mut tasks = Vec::new();
+        let mut turns = Vec::new();
+        let mut stops = Vec::new();
+        for index in 0..2 {
+            let recorded = Turns::default();
+            let mut config = bot(&dir, &pi, "wait", Some(&recorded));
+            config.codex_turn.as_mut().unwrap().client_id = format!("client-{index}");
+            let (stop, cancel) = watch::channel(false);
+            stops.push(stop);
+            turns.push(recorded);
+            tasks.push(tokio::spawn(async move {
+                run_manager(
+                    &config,
+                    "wait",
+                    None,
+                    |_| async { anyhow::Ok(()) },
+                    cancel,
+                    |_| async { anyhow::Ok(()) },
+                )
+                .await
+            }));
+        }
+        let first = started(&turns[0]).await;
+        let second = started(&turns[1]).await;
+        assert!(pi.live_turn(&first.0, &first.1).is_some());
+        assert_eq!(std::fs::read_dir(pi.dir.join("guides"))?.count(), 2);
+        drop(LiveTurn {
+            owner: &pi,
+            session: second.0.clone(),
+            turn: "superseded-turn".into(),
+        });
+        assert!(pi.live_turn(&second.0, &second.1).is_some());
+        let aborted = tasks.remove(0);
+        aborted.abort();
+        assert!(aborted.await.err().context("aborted task")?.is_cancelled());
+        assert!(pi.live_turn(&first.0, &first.1).is_none());
+        assert!(pi.live_turn(&second.0, &second.1).is_some());
+        assert_eq!(
+            pi.probe_reply(&first.0, Some(&first.1), "client-0").await?,
+            Probe::Missing
+        );
+        stops[1].send(true)?;
+        assert!(tasks.remove(0).await?.is_err());
+        assert!(lock(&pi.live).is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelling_one_of_sixteen_pi_turns_leaves_the_others_running() -> Result<()> {
         let dir = scratch("concurrent-cancel");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let mut tasks = Vec::with_capacity(16);
         let mut stops = Vec::with_capacity(16);
         for index in 0..16 {
@@ -2413,7 +2521,7 @@ mod tests {
     #[tokio::test]
     async fn one_failed_pi_turn_does_not_stop_the_other_fifteen() -> Result<()> {
         let dir = scratch("concurrent-failure");
-        let pi = Arc::new(Pi::new(&dir));
+        let pi = Arc::new(Pi::new(&dir).await);
         let modes = (0..16).map(|index| {
             if index == 0 {
                 String::from("fail")
@@ -2546,7 +2654,7 @@ mod tests {
     async fn a_cancelled_prompt_never_wins_a_ready_or_queued_stdin_write() -> Result<()> {
         for queued in [false, true] {
             let dir = scratch("cancel-before-write");
-            let pi = Pi::new(&dir);
+            let pi = Pi::new(&dir).await;
             let (stop, mut cancel) = watch::channel(false);
             let (mut process, after) = pi
                 .open(&launch(&dir, "reply", "s-1"), "s-1", &mut cancel)
@@ -2593,7 +2701,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_after_the_prompt_write_keeps_an_unknown_outcome() -> Result<()> {
         let dir = scratch("cancel-after-write");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir).await;
         let (stop, mut cancel) = watch::channel(false);
         let (mut process, after) = pi
             .open(&launch(&dir, "prompt-pending", "s-1"), "s-1", &mut cancel)
@@ -2861,9 +2969,12 @@ mod tests {
         let mut recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();
         recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
         std::fs::write(&pidfile, recorded)?;
-        let restarted = Pi::new(&data);
+        let restarted = Pi::new(&data).await;
         assert!(ended(&left).await, "the restart ended the pi it left");
-        assert!(!pidfile.exists());
+        assert!(
+            std::fs::read_to_string(&pidfile)?.contains(&format!("{} ", stranger.id())),
+            "an unconfirmed record is retained"
+        );
         assert!(
             stranger.try_wait()?.is_none(),
             "a process the Node did not start is left alone"
@@ -2902,7 +3013,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_without_the_prompt_reads_as_not_started() -> Result<()> {
         let dir = scratch("unsent");
-        let pi = Pi::new(&dir);
+        let pi = Pi::new(&dir).await;
         let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
         crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);
@@ -2944,7 +3055,7 @@ mod tests {
             ("pointer-error", NotStarted, FailureKind::Unknown, 0, 1),
         ] {
             let dir = scratch(mode);
-            let pi = Arc::new(Pi::new(&dir));
+            let pi = Arc::new(Pi::new(&dir).await);
             let mut config = bot(&dir, &pi, mode, None);
             let previous = match mode {
                 "instructions-error" => {
@@ -2955,7 +3066,7 @@ mod tests {
                     let file = dir.join("session.jsonl");
                     std::fs::write(&file, "")?;
                     pi.keep("s-1", &file, &dir, "")?;
-                    std::fs::create_dir(pi.dir.join("s-1.md"))?;
+                    std::fs::write(pi.dir.join("guides"), "not a directory")?;
                     Some("s-1")
                 }
                 "pointer-error" => {
@@ -3013,6 +3124,9 @@ mod tests {
             if pending == 1 {
                 if mode == "instructions-error" {
                     std::fs::remove_file(&pi.dir)?;
+                }
+                if mode == "instructions-write-error" {
+                    std::fs::remove_file(pi.dir.join("guides"))?;
                 }
                 config.provider_env = env(&dir, "reply");
                 let TriageAdmission::Claimed(retry) =
