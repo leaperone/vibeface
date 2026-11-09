@@ -91,22 +91,24 @@ def local_process_modes(paths, full):
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
 
-def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, delivery_live=False):
     scopes = set()
     for path in paths:
         scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
-    plan = scope_plan(scopes, event, ref_type, channel)
+    plan = scope_plan(scopes, event, ref_type, channel, delivery_live=delivery_live)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
-def scope_plan(scopes, event, ref_type, channel):
+def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
     if (
         scopes - {"full", "docs", "web", "www", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
+        or type(delivery_live) is not bool
+        or delivery_live and event != "workflow_dispatch"
     ):
         raise ValueError("Invalid CI scopes or scenario")
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
@@ -124,13 +126,14 @@ def scope_plan(scopes, event, ref_type, channel):
     www = full or "www" in scopes
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
-    platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
+    platforms = PLATFORMS if "node" in affected and extended and not delivery_live else PLATFORMS[:1]
     plan = {
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
         "docs_only": not web and not packages,
         "event": event,
+        "delivery_live": delivery_live,
         "ref_type": ref_type,
         "channel": channel,
         "scopes": sorted(scopes),
@@ -142,7 +145,7 @@ def scope_plan(scopes, event, ref_type, channel):
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
-        "npm": channel == "nightly" and "node" in affected and extended,
+        "npm": channel == "nightly" and "node" in affected and extended and not delivery_live,
     }
     required = {"quick-check"}
     if web:
@@ -211,6 +214,27 @@ def successful_push_base(head):
     return None
 
 
+def delivery_live_selected(event, payload):
+    if event != "workflow_dispatch":
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("inputs", {}), dict):
+        raise ValueError("Invalid workflow_dispatch inputs")
+    inputs = payload.get("inputs", {})
+    flags = {}
+    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
+        value = inputs.get(name, False)
+        if type(value) is bool:
+            flags[name] = value
+        elif isinstance(value, str) and value in ("true", "false"):
+            flags[name] = value == "true"
+        else:
+            raise ValueError(f"Invalid workflow_dispatch boolean: {name}")
+    mobile = inputs.get("mobile_apps", "none")
+    if not isinstance(mobile, str) or mobile not in ("none", "ios", "android", "both"):
+        raise ValueError("Invalid mobile application selection")
+    return flags["delivery_live"] and not any(flags[name] for name in ("delivery_small", "windows_only", "desktop_only")) and mobile == "none"
+
+
 def event_plan(args):
     event = args.event or os.environ.get("GITHUB_EVENT_NAME", "pull_request")
     ref_type = os.environ.get("GITHUB_REF_TYPE", "branch")
@@ -243,7 +267,7 @@ def event_plan(args):
         base = git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    plan = make_plan(paths, event, ref_type, metadata["channel"])
+    plan = make_plan(paths, event, ref_type, metadata["channel"], delivery_live=delivery_live_selected(event, payload))
     plan.update(metadata)
     plan.update(coverage_base=base, coverage_head=head, coverage_reason=reason, baseline_run_id=baseline_run)
     return plan
@@ -279,6 +303,7 @@ def write_plan(plan, output=None):
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
+            "delivery_live": str(plan["delivery_live"]).lower(),
             "package": str("package" in plan["required_jobs"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
@@ -303,6 +328,8 @@ def write_plan(plan, output=None):
                 f"- Rust packages: {', '.join(plan['rust_packages']) or 'none'}\n"
                 f"- Test tiers: {', '.join(plan['test_tiers']) or 'none'}\n"
                 f"- Package acceptance: {plan['package_mode'] if plan['web'] else 'none'}\n"
+                f"- Package targets: {', '.join(row['target'] for row in plan['package_matrix']['include']) or 'none'}\n"
+                f"- Native delivery experiment: {'native-only; non-Linux, npm and desktop not selected; delivery_live takes precedence over additive desktop' if plan['delivery_live'] else 'not selected'}\n"
                 f"- Required jobs: {', '.join(plan['required_jobs'])}\n"
                 "\nLocal process checks to run separately, using current CLI/Core and JS/WASM paths:\n\n"
             )
@@ -343,7 +370,9 @@ def frozen_plan(plan):
         paths = changed_paths(base, head, plan["event"])
     if automatic_main_push(plan["event"]) and reason not in {"successful-main-push", "no-trusted-main-push"}:
         raise ValueError("Main push coverage requires a successful ancestor or full fallback")
-    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"])
+    payload_path = os.environ.get("GITHUB_EVENT_PATH")
+    payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
+    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live_selected(plan["event"], payload))
 
 
 def gate(needs, plan=None, delivery_live=False, desktop=False):
@@ -357,9 +386,13 @@ def gate(needs, plan=None, delivery_live=False, desktop=False):
         except (KeyError, TypeError, subprocess.CalledProcessError) as error:
             raise ValueError("Invalid frozen CI coverage") from error
     else:
-        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
+        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live)
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
+    if plan["delivery_live"] is not delivery_live:
+        raise ValueError("Live delivery selection differs from the frozen plan")
+    if delivery_live and desktop:
+        raise ValueError("Native-only delivery does not select desktop acceptance")
     if delivery_live and plan["event"] != "workflow_dispatch":
         raise ValueError("Live delivery proofs require explicit workflow_dispatch")
     if desktop and plan["event"] != "workflow_dispatch":
@@ -565,11 +598,30 @@ def self_test():
         expect_failure(lambda: gate(incomplete))
     expect_failure(lambda: gate(complete, delivery_live=True))
     complete["delivery-live"] = {"result": "success"}
-    gate(complete, delivery_live=True)
+    expect_failure(lambda: gate(complete, delivery_live=True))
+    native = make_plan([], "workflow_dispatch", delivery_live=True)
+    assert native["package_matrix"]["include"] == list(PLATFORMS[:1]) and native["package_mode"] == "node"
+    assert not native["npm"] and native["test_tiers"] == ready["test_tiers"] and native["check_msrv"]
+    assert native["required_jobs"] == [job for job in ready["required_jobs"] if job not in ("npm-package", "npm-smoke")]
+    native_needs = {job: {"result": "success" if job in native["required_jobs"] else "skipped"} for job in JOBS}
+    native_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(native)}}
+    native_needs["delivery-live"] = {"result": "success"}
+    gate(native_needs, delivery_live=True)
+    expect_failure(lambda: gate(native_needs))
+    expect_failure(lambda: gate(native_needs, delivery_live=True, desktop=True))
     for result in ("failure", "cancelled", "skipped", "missing"):
-        broken = json.loads(json.dumps(complete))
-        broken["delivery-live"] = {"result": result}
-        expect_failure(lambda: gate(broken, delivery_live=True))
+        for job in ("plan", "package", "crypto-web", "web", "delivery-live"):
+            broken = json.loads(json.dumps(native_needs))
+            if result == "missing":
+                del broken[job]
+            else:
+                broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, delivery_live=True))
+    for job in ("npm-package", "npm-smoke", *DESKTOP_JOBS):
+        for result in ("failure", "cancelled"):
+            broken = json.loads(json.dumps(native_needs))
+            broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, delivery_live=True))
     expect_failure(lambda: gate(needs, delivery_live=True))
     expect_failure(lambda: gate(complete, desktop=True))
     for job in DESKTOP_JOBS:
@@ -606,6 +658,7 @@ def self_test():
     expect_failure(lambda: package_args(["vibeface", "vibeface"]))
     scratch = Path(__file__).resolve().parent.parent / ".artifacts/ci-self-test"
     scratch.mkdir(parents=True, exist_ok=True)
+    native_delivery_self_test(scratch)
     with tempfile.TemporaryDirectory(prefix="git-", dir=scratch) as directory:
         git("init", "--quiet", cwd=directory)
         source = Path(directory) / "apps/core/src/old.rs"
@@ -688,6 +741,17 @@ def self_test():
     live = re.search(r"(?ms)^  delivery-live:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert "github.event_name == 'workflow_dispatch' && inputs.delivery_live" in live
     assert "needs: [plan, package, crypto-web, web]" in live
+    live_condition = re.search(r"^    if: (.+)$", live, re.M)[1]
+    assert "!cancelled()" in live_condition and "always()" not in live_condition
+    assert all(f"needs.{job}.result == 'success'" in live_condition for job in ("plan", "package", "crypto-web", "web"))
+    assert "needs.plan.outputs.delivery_live == 'true'" in live_condition
+    assert "!inputs.delivery_small" in live_condition and all(f"inputs.{name}" in live_condition for name in ("desktop_only", "windows_only", "mobile_apps"))
+    assert "delivery_live: ${{ steps.select.outputs.delivery_live }}" in workflow
+    gate_command = workflow.split("run: python3 scripts/ci.py gate --needs-env CI_NEEDS", 1)[1].split("\n", 1)[0]
+    assert "needs.plan.outputs.delivery_live == 'true' && '--delivery-live'" in gate_command
+    assert "inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop'" in gate_command
+    small = re.search(r"(?ms)^  delivery-small-prepare:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert 'run: test "$DELIVERY_LIVE" = false' in small
     assert "runs-on: ubuntu-24.04" in live and "timeout-minutes: 360" in live
     assert 'test "$(uname -s)" = Linux' in live and 'test "$(uname -m)" = x86_64' in live
     assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live
@@ -703,6 +767,72 @@ def self_test():
     release_privacy_test(root, scratch)
     gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def native_delivery_self_test(scratch):
+    from unittest.mock import patch
+    for event in ("pull_request", "push", "schedule", "merge_group"):
+        assert not delivery_live_selected(event, {"inputs": {"delivery_live": True}})
+        expect_failure(lambda: make_plan([], event, delivery_live=True))
+    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
+        for invalid in (0, 1, None, "", "True", "yes", [], {}):
+            expect_failure(lambda: delivery_live_selected("workflow_dispatch", {"inputs": {name: invalid}}))
+    for invalid in (None, [], {"inputs": []}, {"inputs": {"mobile_apps": "unknown"}}):
+        expect_failure(lambda: delivery_live_selected("workflow_dispatch", invalid))
+    for invalid in (0, 1, "true"):
+        expect_failure(lambda: make_plan([], "workflow_dispatch", delivery_live=invalid))
+    with tempfile.TemporaryDirectory(prefix="native-event-", dir=scratch) as directory:
+        directory = Path(directory)
+        event_file = directory / "event.json"
+        head = "1" * 40
+        environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF_TYPE": "branch",
+                       "GITHUB_EVENT_PATH": str(event_file), "GITHUB_SHA": head}
+        arguments = argparse.Namespace(event=None, base=None, head=None)
+        metadata = {"channel": "nightly", "version": "1.2.3-nightly.20261109.1", "msrv": "1.91", "prerelease": True}
+        def needs_for(selected):
+            needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
+            needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(selected)}}
+            if selected["delivery_live"]:
+                needs["delivery-live"] = {"result": "success"}
+            return needs
+        with patch.dict(os.environ, environment), patch(f"{__name__}.git", return_value=(head + "\n").encode()), \
+             patch(f"{__name__}.release_metadata", return_value=metadata):
+            for value in (False, "false", True, "true"):
+                event_file.write_text(json.dumps({"inputs": {"delivery_live": value}}))
+                selected = event_plan(arguments)
+                live = value is True or value == "true"
+                assert selected["delivery_live"] is live
+                gate(needs_for(selected), delivery_live=live)
+                expect_failure(lambda: gate(needs_for(selected), delivery_live=not live))
+                opposite = dict(make_plan([], "workflow_dispatch", delivery_live=not live), **metadata)
+                opposite.update({key: selected[key] for key in ("coverage_base", "coverage_head", "coverage_reason", "baseline_run_id")})
+                expect_failure(lambda: gate(needs_for(opposite), delivery_live=not live))
+                for key in ("delivery_live", "package_matrix", "npm", "required_jobs"):
+                    changed = dict(selected, **{key: opposite[key]})
+                    expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
+                changed = dict(selected, delivery_live=int(live))
+                expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
+                if value is True:
+                    output, summary = directory / "output", directory / "summary"
+                    with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                        write_plan(selected, output)
+                    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    assert outputs["delivery_live"] == "true" and json.loads(outputs["plan"]) == selected
+                    assert "native-only; non-Linux, npm and desktop not selected" in summary.read_text()
+                    assert "delivery_live takes precedence over additive desktop" in summary.read_text()
+            for extra, expected in (({"desktop": True}, True), ({"delivery_small": True}, False),
+                                    ({"windows_only": True}, False), ({"desktop_only": True}, False),
+                                    *[({"mobile_apps": mobile}, False) for mobile in ("ios", "android", "both")]):
+                event_file.write_text(json.dumps({"inputs": {"delivery_live": "true", **extra}}))
+                selected = event_plan(arguments)
+                assert selected["delivery_live"] is expected
+                if expected:
+                    gate(needs_for(selected), delivery_live=True)
+                else:
+                    expect_failure(lambda: gate(needs_for(selected), delivery_live=True))
+            event_file.write_text(json.dumps({"inputs": {"delivery_live": "yes"}}))
+            expect_failure(lambda: event_plan(arguments))
+    print("Native-only CI controls passed; actual event, plan and gate agree; ordinary platforms, selector precedence and rejection cases covered")
 
 
 def coverage_self_test(directory, base, nonancestor):

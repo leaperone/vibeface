@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       delivery_live:
-        description: 'Run five fresh protected native delivery proofs and budget settlement in the bounded Linux sandbox'
+        description: 'Run five fresh Linux x86_64 native-only proofs and budget settlement; non-Linux, npm and desktop checks are not selected'
         type: boolean
         default: false
       delivery_small:
@@ -64,6 +64,7 @@ jobs:
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
       delivery: ${{ steps.select.outputs.delivery }}
+      delivery_live: ${{ steps.select.outputs.delivery_live }}
       package: ${{ steps.select.outputs.package }}
       package_matrix: ${{ steps.select.outputs.package_matrix }}
       package_mode: ${{ steps.select.outputs.package_mode }}
@@ -734,7 +735,7 @@ jobs:
           retention-days: 14
 
   delivery-live:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.package.result == 'success' && needs.crypto-web.result == 'success' && needs.web.result == 'success' && needs.plan.outputs.delivery_live == 'true' && (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
     needs: [plan, package, crypto-web, web]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -1062,7 +1063,7 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && '--desktop' || '' }}
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.delivery_live == 'true' && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop' || '' }}
 
   daily-nightly:
     needs: ci-gate
