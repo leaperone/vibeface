@@ -1581,7 +1581,8 @@ test('native chat glass follows accessibility events without replacing its input
 })
 
 test('opening AI settings connects only Cursor and retains focus until it can recheck CLI login', async (t) => {
-  for (const outcome of ['returned', 'read-back', 'unreadable', 'connection-changed', 'recheck-failed']) await t.test(outcome, async () => {
+  for (const outcome of ['returned', 'read-back', 'unreadable', 'connection-changed', 'recheck-failed', 'same-device-reconnected']) await t.test(outcome, async () => {
+    const unreadable = outcome === 'unreadable' || outcome === 'same-device-reconnected'
     const provider: ProviderStatus = {
       provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
       execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
@@ -1589,20 +1590,22 @@ test('opening AI settings connects only Cursor and retains focus until it can re
       probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
     }
-    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [provider], display_paths: {}, suggested_roots: [] }
+    const otherProvider: ProviderStatus = { ...provider, provider: 'codex', authentication_source: 'private_login', roles: ['execution'], probe: { ...provider.probe, provider: 'codex' } }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [provider, otherProvider], display_paths: {}, suggested_roots: [] }
     const signedOut: NodeSettingsResponse = { ...initial, providers: [{ ...provider, bin: '/fixture/agent', installed: true,
-      setup: { directory: null, command: "'/fixture/agent' login" }, probe: { ...provider.probe, checked_at_ms: 1, authentication: 'sign_in_required' } }] }
-    const signedIn: NodeSettingsResponse = { ...signedOut, providers: signedOut.providers.map((item) => ({ ...item, probe: { ...item.probe, checked_at_ms: 2, authentication: 'authenticated' } })) }
-    const first = pendingResult(), second = pendingResult(), readback = pendingResult(), calls: { method: string; params: unknown }[] = []
+      setup: { directory: null, command: "'/fixture/agent' login" }, probe: { ...provider.probe, checked_at_ms: 1, authentication: 'sign_in_required' } }, otherProvider] }
+    const signedIn: NodeSettingsResponse = { ...signedOut, providers: signedOut.providers.map((item) => item.provider === 'cursor' ? { ...item, probe: { ...item.probe, checked_at_ms: 2, authentication: 'authenticated' } } : item) }
+    const first = pendingResult(), second = pendingResult(), readback = pendingResult(), replacementRead = pendingResult(), calls: { method: string; params: unknown }[] = []
     let current = true, reads = 0
-    const connection = { isCurrent: () => current, request: async (method: string, params?: unknown) => {
+    const connection = { entry: { device_id: 'fixture-node' }, isCurrent: () => current, request: async (method: string, params?: unknown) => {
       calls.push({ method, params })
-      if (method === 'node_settings') return ++reads === 2 && outcome === 'unreadable' ? readback.promise : signedOut
+      if (method === 'node_settings') return ++reads === 2 && unreadable ? readback.promise : signedOut
       return calls.filter((call) => call.method === 'configure_provider').length === 1 ? first.promise : second.promise
     } }
     const replacementCalls: { method: string; params: unknown }[] = []
-    const replacement = { isCurrent: () => !current, request: async (method: string, params?: unknown) => {
+    const replacement = { entry: connection.entry, isCurrent: () => !current, request: async (method: string, params?: unknown) => {
       replacementCalls.push({ method, params })
+      if (method === 'node_settings' && outcome === 'same-device-reconnected') return replacementRead.promise
       return signedIn
     } }
     let ready = connection
@@ -1637,10 +1640,10 @@ test('opening AI settings connects only Cursor and retains focus until it can re
         assert.equal(nodeSettings.parseProvider(render().find(({ props }) => props.item !== undefined)?.props.item).probe.authentication, 'authenticated')
         return
       }
-      if (outcome === 'read-back' || outcome === 'unreadable') first.reject(new Error('client response timed out; outcome may be unknown'))
+      if (outcome === 'read-back' || unreadable) first.reject(new Error('client response timed out; outcome may be unknown'))
       else first.resolve(signedOut)
       await settleComponent(); render()
-      if (outcome === 'unreadable') {
+      if (unreadable) {
         assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown connection write is read back before any retry')
         readback.reject(new Error('device read failed'))
         await settleComponent(); render()
@@ -1649,6 +1652,25 @@ test('opening AI settings connects only Cursor and retains focus until it can re
         assert.equal(writes().length, 1, 'focus cannot resend an unknown write before it is reconciled')
         const elements = render()
         assert.equal(elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')?.props.disabled, true)
+        if (outcome === 'same-device-reconnected') {
+          const oldCalls = JSON.parse(JSON.stringify(calls))
+          current = false; ready = replacement
+          assert.equal(ready.entry.device_id, connection.entry.device_id, 'the component stays mounted for the same device')
+          render(); await settleComponent(); render()
+          assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [{ method: 'node_settings' }], 'the new connection waits for its own settings read')
+          replacementRead.resolve(signedOut)
+          for (let turn = 0; turn < 4; turn++) { await settleComponent(); render() }
+          assert.deepEqual(JSON.parse(JSON.stringify(replacementCalls)), [
+            { method: 'node_settings' }, { method: 'configure_provider', params: { provider: 'cursor', connect_local: true } },
+          ], 'a successful read on the new connection automatically connects Cursor exactly once')
+          assert.deepEqual(JSON.parse(JSON.stringify(calls)), oldCalls, 'reconnection never replays the unknown write on the old connection')
+          const statuses = render().filter(({ props }) => props.item !== undefined).map(({ props }) => nodeSettings.parseProvider(props.item))
+          assert.equal(statuses.find((item) => item.provider === 'cursor')?.probe.authentication, 'authenticated')
+          assert.deepEqual(statuses.map((item) => ({ provider: item.provider, roles: item.roles })), [
+            { provider: 'cursor', roles: [] }, { provider: 'codex', roles: ['execution'] },
+          ], 'reconnection preserves provider roles')
+          return
+        }
         const retry: unknown = elements.find(({ type }) => type === 'InlineError')?.props.action
         assert.ok(retry && typeof retry === 'object' && 'label' in retry && retry.label === '重新读取' && 'onClick' in retry && typeof retry.onClick === 'function')
         retry.onClick()

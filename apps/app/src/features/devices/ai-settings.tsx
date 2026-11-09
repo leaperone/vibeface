@@ -216,10 +216,10 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   }
   useEffect(() => { pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
   useEffect(() => {
-    if (!ready || busy || !response?.providers.some((item) => item.provider === "cursor") || automaticallyConnected.current === ready) return
+    if (!ready || busy || needsRead || !response?.providers.some((item) => item.provider === "cursor") || automaticallyConnected.current === ready) return
     automaticallyConnected.current = ready
     void connectLocal(["cursor"])
-  }, [ready, response, busy])
+  }, [ready, response, busy, needsRead])
   // CLI installation and login can change outside this page; read them again on return.
   useEffect(() => {
     if (ready && pendingFocus.current === ready) void connectLocal(["cursor"])
