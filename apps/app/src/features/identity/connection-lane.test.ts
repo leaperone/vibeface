@@ -583,7 +583,7 @@ test('the official page joins through the public node, or the access address thi
   const app = deviceHarness({ origin: 'https://app.vibeface.dev', storage })
   try {
     app.render(); await settle()
-    assert.equal(publicNode, 'https://8.217.72.118:4792')
+    assert.equal(publicNode, 'https://node.vibeface.dev:4792')
     assert.equal(app.render().gateway, publicNode)
     assert.equal(app.render().defaultGateway, publicNode)
     await app.render().join('vibeface://join/vibeface1ticket', 'browser')

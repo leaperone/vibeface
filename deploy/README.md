@@ -44,35 +44,41 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 | app | 静态 App，bridge network；浏览器直连公共节点，App 主机不转发任何接口 | 通用字段，另加 `nginx_config`、`server_name` |
 | www | 静态 WWW，bridge network | 通用字段，另加 `nginx_config`、`server_name`，tag 使用 `www-v` 前缀 |
 
-通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，公共节点没有域名，网页接口的 TCP 端口只讲 TLS，同号 UDP 端口对外提供发现服务。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。网页直接从浏览器连接公共节点的 `gateway_url`，App 主机不反代任何接口：其余非静态 location（包括 `/api/client`、`/api/info`、`/api/decision`）只能是 `return 404`，旧的反代规则、`/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除或改成 `return 404`，未知规则会拒绝激活。
+通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，网页接口的 TCP 端口直接对公网只讲 TLS，前面没有代理，同号 UDP 端口对外提供发现服务。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。网页直接从浏览器连接公共节点的 `gateway_url`，App 主机不反代任何接口：其余非静态 location（包括 `/api/client`、`/api/info`、`/api/decision`）只能是 `return 404`，旧的反代规则、`/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除或改成 `return 404`，未知规则会拒绝激活。
 
 公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.serve_discovery` 开启；`relay_listen` 已设、`relay_open` 开启且没有 `relay_operator_token`，`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 已设；`forwarding.any` 开启，设了 `forwarding.rate` 和 `forwarding.per_ip`，没有 `forwarding.trusted_proxies`（浏览器直连，限额按真实对端地址计）；网页和 `tls` 开启，数据目录有 `tls-cert.pem` 和 `tls-key.pem`，`public_url` 等于镜像里 `public-bootstrap.json` 的 `gateway_url`，`allowed_origins` 包含 `https://app.vibeface.dev`；没有 `manager` 和项目根目录；设备编号等于镜像里 `public-bootstrap.json` 的 `issuer`。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 64 KiB/s、最多 512 个连接、同一地址最多 16 个，同时转发 32 个浏览器会话、另有 192 个排队、同一浏览器地址最多 8 个连接、每会话 256 KiB/s。数据目录在首次激活前按下面初始化：
 
 ```sh
 vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --tls \
-  --public-url https://8.217.72.118:4792 --allowed-origin https://app.vibeface.dev \
-  --serve-discovery --relay-listen 0.0.0.0:3340 --relay-url http://8.217.72.118:3340 \
+  --public-url https://node.vibeface.dev:4792 --allowed-origin https://app.vibeface.dev \
+  --serve-discovery --relay-listen 0.0.0.0:3340 --relay-url http://node.vibeface.dev:3340 \
   --relay-open --relay-rate 65536 --relay-max-clients 512 --relay-max-clients-per-ip 16 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
 
-`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP 和上面的端口，`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
+`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`gateway_url` 是上面的 `public_url`，也是网页默认的接入地址。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和发现服务都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
 
-`init --tls` 写的是自签占位证书，浏览器不信任它。公共节点没有域名，由宿主 root 的 acme.sh（要写 0700 的数据目录并改属主） 向 Let's Encrypt 申请 IP 证书（`shortlived` profile，约 6 天有效，acme.sh 按 ARI 大约每 3 天续期），HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot：
+`init --tls` 写的是自签占位证书，浏览器不信任它。真实证书由宿主 root 的 acme.sh（要写 0700 的数据目录并改属主）向 Let's Encrypt 申请，HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot。官方节点用域名，申请普通域名证书（90 天有效，acme.sh 自动续期）：
 
 ```sh
-acme.sh --issue --server letsencrypt -d 8.217.72.118 --certificate-profile shortlived -w /var/www/acme
-acme.sh --install-cert -d 8.217.72.118 \
+acme.sh --issue --server letsencrypt -d node.vibeface.dev -w /var/www/acme
+acme.sh --install-cert -d node.vibeface.dev \
   --fullchain-file /opt/apps/vibeface-node/state/tls-cert.pem \
   --key-file /opt/apps/vibeface-node/state/tls-key.pem \
   --reloadcmd "chown 1001:1001 /opt/apps/vibeface-node/state/tls-cert.pem /opt/apps/vibeface-node/state/tls-key.pem && chmod 0600 /opt/apps/vibeface-node/state/tls-key.pem"
 ```
 
+自建节点没有域名时，用纯 IP 直连 `https://<IP>:4792`，申请 Let's Encrypt 的 IP 证书（`shortlived` profile，约 6 天有效，acme.sh 按 ARI 大约每 3 天续期），`--install-cert` 同上，只把 `-d` 换成该 IP：
+
+```sh
+acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w /var/www/acme
+```
+
 `tls-cert.pem` 是完整证书链，`tls-key.pem` 归 1001、权限 0600。Core 每次接受连接时检查这两个文件，内容变化后重新加载，不需要重启容器；证书与私钥暂时不配对（例如只写完一个）时继续用旧证书，5 秒后再试。
 
-**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（发现服务）和 TCP 3340（relay）对公网开放；acme.sh 验证另需 TCP 80。脚本不改安全组，首次激活前在控制台配好并核对。
+**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（发现服务）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分三种情况：
 
