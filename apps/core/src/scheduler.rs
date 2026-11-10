@@ -1812,7 +1812,6 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
                 let speaker = if *role == Role::User { "用户" } else { "Bot" };
                 lines.push(format!("{speaker}：{}", prefix(text, 280)));
                 match answers {
-                    None if *role == Role::User => requests.push(prefix(text, 300).to_owned()),
                     Some(question_id) => {
                         let asked = events.iter().find_map(|event| match &event.event.body {
                             EventBody::QuestionAsked {
