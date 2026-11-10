@@ -36,6 +36,8 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、main 归属、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
 
+激活前同时核对传输归档的 SHA256 和导入后的 image ID。归档中的镜像必须与调用方指定的 `--image` 一致；摘要正确不能替代镜像身份校验。
+
 ## 配置部署目标
 
 为每个目标创建 GitHub Environment `vibeface-node`、`vibeface-app`、`vibeface-www`。按需设置 Environment 的 main 分支限制和人工审核。仅验证使用不含生产凭证的 `vibeface-validation`。
