@@ -878,10 +878,6 @@ impl Provider {
         self.descriptor().prompt_mode
     }
 
-    pub fn native_compaction(self) -> bool {
-        matches!(self, Provider::Codex | Provider::Claude | Provider::Pi)
-    }
-
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
     fn reserved_env(self) -> &'static [&'static str] {
         match self {

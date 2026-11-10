@@ -2464,6 +2464,7 @@ pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::manager_settings;
     use crate::tools::Effect;
 
     fn context_fixture() -> (TurnHistory, SchedulerJob) {
@@ -3129,13 +3130,8 @@ mod tests {
     #[test]
     fn the_session_key_follows_what_the_native_session_holds() -> Result<()> {
         use crate::providers::Provider;
-        let settings = |provider, model: &str| crate::config::ManagerSettings {
-            provider,
-            workspace: "/w".into(),
-            model: model.into(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        };
+        let settings =
+            |provider, model: &str| manager_settings(provider, "/w".into(), model.into());
         let codex_a = selection_identity(&settings(Provider::Codex, "a"), "guide", None)?;
         let codex_b = selection_identity(&settings(Provider::Codex, "b"), "guide", None)?;
         assert_ne!(codex_a.stable_fingerprint, codex_b.stable_fingerprint);

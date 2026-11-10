@@ -2123,7 +2123,7 @@ pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::identity::{Genesis, Member, NetworkState};
+    use crate::runtime::test_support::{join_network, manager_settings, open_node, provider_work};
     use crate::work::WorkState;
 
     fn fixture() -> PathBuf {
@@ -3362,7 +3362,6 @@ time.sleep(0.05)
 
     async fn node(place: &Place) -> Result<(Arc<Runtime>, LocalIdentity, String)> {
         let dir = place.dir.join("node");
-        config::private_dir(&dir)?;
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
@@ -3379,10 +3378,6 @@ time.sleep(0.05)
         configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [Provider::Claude].into();
         configuration.bins.insert(Provider::Claude, fixture());
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let mut env = crate::providers::ProviderEnv::default();
         env.apply(
             Provider::Claude,
@@ -3392,18 +3387,9 @@ time.sleep(0.05)
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
-        let mut configuration = Config::load(&dir)?;
         configuration.provider_env = env;
-        configuration.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        node.install_membership(state).await?;
-        let network = node.membership_state().await?.genesis.network_id;
+        let node = open_node(&dir, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         conversation(&node, &admin, &network, "c", "m").await?;
         Ok((node, admin, network))
     }
@@ -3492,23 +3478,9 @@ time.sleep(0.05)
         let local = node.identity.device_id()?;
         Ok(WorkSpec {
             work_id: WorkSpec::id("c", "message:m", call_ref),
-            conversation: "c".into(),
             trigger: "message:m".into(),
-            target: local.clone(),
-            dispatcher: local,
             call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Claude),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Claude,
-                model: None,
-            },
-            cwd: place.dir.join("work").display().to_string(),
-            title: "t".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Claude, &local, &place.dir.join("work"), prompt)
         })
     }
 
@@ -3923,13 +3895,11 @@ time.sleep(0.05)
     async fn a_permission_request_waits_for_the_bot_and_gets_its_answer() -> Result<()> {
         let place = Place::new()?;
         let (node, _, _) = node(&place).await?;
-        node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-            provider: Provider::Claude,
-            workspace: place.dir.join("work"),
-            model: String::new(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        });
+        node.settings.lock().unwrap().manager = Some(manager_settings(
+            Provider::Claude,
+            place.dir.join("work"),
+            String::new(),
+        ));
         let input = asks(
             "Bash",
             json!({"command":"rm -rf build","description":"Clean the build"}),

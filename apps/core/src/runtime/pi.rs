@@ -4,6 +4,7 @@
 //! reads the turn back from that file and never sends it again.
 use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -214,13 +215,6 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn bounded(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
-        .take(limit)
-        .collect()
 }
 
 /// pi's own wording first, then what the model provider said.
@@ -1772,9 +1766,8 @@ impl Executor for Pi {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, Member, NetworkState};
     use crate::manager::{CodexTurn, Sdk, run_manager};
+    use crate::runtime::test_support::{join_network, open_node, provider_work};
     use crate::work::WorkState;
 
     type Turns = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -1963,45 +1956,18 @@ mod tests {
     fn spec(work_id: &str, target: &str, cwd: &Path) -> WorkSpec {
         WorkSpec {
             work_id: work_id.into(),
-            conversation: "c".into(),
-            trigger: "message:m1".into(),
-            target: target.into(),
-            dispatcher: target.into(),
             call_ref: work_id.into(),
-            kind: WorkKind::Agent(Provider::Pi),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Pi,
-                model: None,
-            },
-            cwd: cwd.display().to_string(),
-            title: "t".into(),
-            prompt: "do it".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Pi, target, cwd, "do it")
         }
     }
 
     /// A Node in a network of its own whose pi is the fake, and that network.
     async fn node(dir: &Path, mode: &str) -> Result<(Arc<Runtime>, String)> {
         let data = dir.join("node");
-        config::private_dir(&data)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![dir.to_owned()], false);
         configuration.providers.execution = [Provider::Pi].into();
-        configuration.save(&data)?;
-        config::private_write(&data.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&data.join("identity.json"), &serde_json::to_vec(&identity)?)?;
-        let node = Arc::new(Runtime::open(&data).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        let network = state.genesis.network_id.clone();
-        node.install_membership(state).await?;
+        let node = open_node(&data, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         let mut local = node.providers.lock().unwrap();
         local.bins.insert(Provider::Pi, fake());

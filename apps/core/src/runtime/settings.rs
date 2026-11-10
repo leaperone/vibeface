@@ -1297,6 +1297,7 @@ impl Runtime {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::initialize_node;
     use std::os::unix::fs::PermissionsExt as _;
 
     #[tokio::test]
@@ -1313,15 +1314,7 @@ mod tests {
             config.providers.execution = [Provider::Codex].into();
             config.bins.insert(Provider::Codex, bin.clone());
             config.bins.insert(Provider::Cursor, bin);
-            config.save(&dir)?;
-            crate::config::private_write(
-                &dir.join("data-epoch.json"),
-                &crate::config::data_epoch_marker(),
-            )?;
-            crate::config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
-            )?;
+            initialize_node(&dir, &config, &crate::crypto::LocalIdentity::generate())?;
             if full_environment {
                 let mut env = providers::ProviderEnv::default();
                 env.apply(
@@ -1451,15 +1444,7 @@ mod tests {
         crate::config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.execution.clear();
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &crate::crypto::LocalIdentity::generate())?;
         let mut node = Runtime::open(&dir).await?;
         let source = dir.join("source");
         std::fs::create_dir_all(&source)?;
@@ -1544,14 +1529,10 @@ mod tests {
         crate::config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.providers.execution.clear();
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        initialize_node(
+            &dir,
+            &configuration,
+            &crate::crypto::LocalIdentity::generate(),
         )?;
         let mut node = Runtime::open(&dir).await?;
         let source = dir.join("source");

@@ -1318,6 +1318,7 @@ fn attachment_mime(name: &str, bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, manager_settings};
 
     #[tokio::test]
     async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {
@@ -1332,10 +1333,7 @@ mod tests {
                 {
                     let mut settings = node.settings.lock().unwrap();
                     settings.roots = vec![directory.clone()];
-                    settings.manager = Some(crate::config::ManagerSettings {
-                        provider: Provider::Pi, workspace: directory.clone(), model: "fixture".into(),
-                        reasoning_effort: None, backup: Default::default(),
-                    });
+                    settings.manager = Some(manager_settings(Provider::Pi, directory.clone(), "fixture".into()));
                     let mut providers = node.providers.lock().unwrap();
                     providers.switches.execution = [Provider::Pi].into();
                     let binary = if case == "needs_setup" { directory.join("missing-pi") } else {
@@ -1370,8 +1368,7 @@ mod tests {
                 }
                 let (running_node, running_network, running_id) = (node.clone(), network.clone(), work_id.clone());
                 let running = tokio::spawn(async move {
-                    crate::scheduler::run(running_node, Access { network_id: running_network, human: false,
-                        conversation_id: Some("c".into()), manager: None }, "c".into(),
+                    crate::scheduler::run(running_node, test_access(running_network, false, Some("c".into())), "c".into(),
                         crate::scheduling::SessionScope::Task { work_id: running_id }).await
                 });
                 if case == "registration" {
@@ -1418,10 +1415,7 @@ mod tests {
         for case in ["runtime", "runtime_and_finish", "failure_record"] {
             let (node, admin, directory) = node().await?;
             let result = async {
-                node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-                    provider: Provider::Codex, workspace: directory.clone(), model: "fixture".into(),
-                    reasoning_effort: None, backup: Default::default(),
-                });
+                node.settings.lock().unwrap().manager = Some(manager_settings(Provider::Codex, directory.clone(), "fixture".into()));
                 node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
                 bot(&node, &admin, "c", "Preparation", &[]).await?;
                 let network = node.network_id().await?;
@@ -1454,8 +1448,7 @@ mod tests {
                     }
                 }
                 let invocation = tokio::time::timeout(Duration::from_secs(5), crate::scheduler::run(
-                    node.clone(), Access { network_id: network.clone(), human: false,
-                        conversation_id: Some("c".into()), manager: None },
+                    node.clone(), test_access(network.clone(), false, Some("c".into())),
                     "c".into(), crate::scheduling::SessionScope::Main,
                 )).await?;
                 if case == "runtime" {
@@ -1851,7 +1844,7 @@ mod tests {
                 assert!(!store.steer_host_active("c", &attempt)?);
                 pending
             };
-            node.cancel_manager(&Access { network_id:network.clone(), human:true, conversation_id:Some("c".into()), manager:None },
+            node.cancel_manager(&test_access(network.clone(), true, Some("c".into())),
                 &json!({"conversation_id":"c","trigger":trigger})).await?;
             let mut requests = scripted_app_server(&node, |request| {
                 if request["method"] == "thread/read" {

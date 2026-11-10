@@ -2279,6 +2279,7 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
 
     /// A ticket entry known only by device ID, found on the mesh or through relays.
     fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
@@ -2465,12 +2466,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
             assert!(!node.has_membership().await?);
@@ -2562,12 +2558,7 @@ mod tests {
             let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
             configuration.network = network;
             configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-            configuration.save(dir)?;
-            config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&LocalIdentity::generate())?,
-            )?;
+            initialize_node(dir, &configuration, &LocalIdentity::generate())?;
             Ok(Arc::new(Runtime::open(dir).await?))
         }
 
@@ -2922,15 +2913,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member, local) = (
             LocalIdentity::generate(),
@@ -3060,15 +3043,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member) = (
             LocalIdentity::generate(),
@@ -3141,7 +3116,7 @@ mod tests {
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
     -> Result<()> {
-        use crate::config::{self, Config, ManagerSettings};
+        use crate::config::{self, Config};
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
@@ -3149,15 +3124,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -3259,13 +3226,11 @@ mod tests {
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
             roots: vec![project.clone(), project.join(".")],
-            manager: Some(ManagerSettings {
-                provider: crate::providers::Provider::Cursor,
-                workspace: workspace.clone(),
-                model: "auto".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            }),
+            manager: Some(manager_settings(
+                crate::providers::Provider::Cursor,
+                workspace.clone(),
+                "auto".into(),
+            )),
         };
         let refused = dispatch(
             &node,
@@ -3344,15 +3309,7 @@ mod tests {
         );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(
             nodes["nodes"][0]["capabilities"]["roots"],
@@ -3443,15 +3400,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -3763,15 +3712,7 @@ mod tests {
                 .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
         );
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
         let moved = dispatch(
@@ -3868,15 +3809,7 @@ mod tests {
         crate::config::private_dir(&dir)?;
         let mut config = crate::config::Config::local("127.0.0.1:4791".parse()?, vec![], false);
         config.local_listen = "127.0.0.1:4792".parse()?;
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
             let (root, admin, browser) = (
@@ -3959,15 +3892,7 @@ mod tests {
             url: "http://127.0.0.1:9".into(),
             token: None,
         }];
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
@@ -4375,15 +4300,7 @@ operator: false,
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
 
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, manager) = (LocalIdentity::generate(), LocalIdentity::generate());

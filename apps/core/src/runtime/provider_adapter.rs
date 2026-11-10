@@ -5,6 +5,21 @@
 
 use std::process::ExitStatus;
 
+/// At most `limit` characters, without control characters but line breaks and tabs.
+pub(super) fn bounded(text: &str, limit: usize) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
+        .take(limit)
+        .collect()
+}
+
+pub(super) fn safe_model_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && !crate::model::looks_secret(value)
+}
+
 const STDERR_TAIL_LIMIT: usize = 512;
 const STDERR_CAPTURE_LIMIT: usize = STDERR_TAIL_LIMIT * 8;
 

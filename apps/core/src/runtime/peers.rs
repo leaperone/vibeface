@@ -2445,6 +2445,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
 
     use crate::{config, crypto::LocalIdentity};
 
@@ -2468,12 +2469,7 @@ mod tests {
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.network = network;
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
+        initialize_node(&dir, &configuration, identity)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
@@ -2515,8 +2511,7 @@ mod tests {
             b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms())?;
             a.sync_peer(&network, &target_id).await?;
             ready_member_rpc(&a, &network, &target_id).await?;
-            let access = Access { network_id: network.clone(), human: true,
-                conversation_id: Some("c".into()), manager: None };
+            let access = test_access(network.clone(), true, Some("c".into()));
             let choice = |work_id: &str| -> Result<Value> {
                 let signed = entry.fixture_admin().attest(&network, "c", EventBody::WorkFinished {
                     work_id: work_id.into(), outcome: WorkOutcome::Completed, result_text: "checked".into(),
@@ -3239,13 +3234,11 @@ mod tests {
                 .events_from(&network, &owner_id, 1, 20)?;
             a.store.lock().await.ingest_events(&network, &execution)?;
             a.settings.lock().unwrap().roots = vec![dir_a.clone()];
-            a.settings.lock().unwrap().manager = Some(config::ManagerSettings {
-                provider: crate::providers::Provider::Claude,
-                workspace: dir_a.clone(),
-                model: "test-model".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            a.settings.lock().unwrap().manager = Some(manager_settings(
+                crate::providers::Provider::Claude,
+                dir_a.clone(),
+                "test-model".into(),
+            ));
             let work = crate::work::WorkRequest {
                 work_id: crate::work::WorkSpec::id("c", "assignment:assignment", "assigned-work"),
                 conversation: "c".into(),
@@ -3448,13 +3441,11 @@ mod tests {
         let result = async {
             node.install_membership(state).await?;
             node.settings.lock().unwrap().roots = vec![dir.clone()];
-            node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
-                provider: crate::providers::Provider::Claude,
-                workspace: dir.clone(),
-                model: "test-model".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            node.settings.lock().unwrap().manager = Some(manager_settings(
+                crate::providers::Provider::Claude,
+                dir.clone(),
+                "test-model".into(),
+            ));
             {
                 let mut store = node.store.lock().await;
                 let grant = sender.owner_fixture(&network, "c", &sender_id)?;
@@ -4654,21 +4645,14 @@ mod tests {
                 node.install_membership(state.clone()).await?;
                 node.start_network().await?;
             }
-            b.settings.lock().expect("settings").manager = Some(config::ManagerSettings {
-                provider: crate::providers::Provider::Cursor,
-                workspace: dir_b.join("manager-workspace"),
-                model: String::new(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            b.settings.lock().expect("settings").manager = Some(manager_settings(
+                crate::providers::Provider::Cursor,
+                dir_b.join("manager-workspace"),
+                String::new(),
+            ));
             a.net()?.learn(&b.net()?.addr()).await;
             let peer = ib.device_id()?;
-            let access = Access {
-                network_id: network.clone(),
-                human: true,
-                conversation_id: None,
-                manager: None,
-            };
+            let access = test_access(network.clone(), true, None);
             let listed = |nodes: Value| {
                 nodes["nodes"]
                     .as_array()
@@ -4827,12 +4811,7 @@ mod tests {
         let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
         let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
         let peer = ib.device_id()?;
-        let access = Access {
-            network_id: ia.fixture_network_id()?,
-            human: true,
-            conversation_id: None,
-            manager: None,
-        };
+        let access = test_access(ia.fixture_network_id()?, true, None);
         let listed = |nodes: Value| {
             nodes["nodes"]
                 .as_array()
@@ -4847,13 +4826,11 @@ mod tests {
                 node.install_membership(state.clone()).await?;
                 node.start_network().await?;
             }
-            b.settings.lock().expect("settings").manager = Some(config::ManagerSettings {
-                provider: crate::providers::Provider::Cursor,
-                workspace: dir_b.join("manager-workspace"),
-                model: String::new(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            b.settings.lock().expect("settings").manager = Some(manager_settings(
+                crate::providers::Provider::Cursor,
+                dir_b.join("manager-workspace"),
+                String::new(),
+            ));
             a.net()?.learn(&b.net()?.addr()).await;
             first_sync(&a, &peer).await?;
             listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)
@@ -5750,13 +5727,7 @@ mod tests {
         let (node, dir) = node(&target).await?;
         node.install_membership(state).await?;
         node.settings.lock().unwrap().roots = vec![dir.clone()];
-        let initial = config::ManagerSettings {
-            provider: Provider::Claude,
-            workspace: dir.clone(),
-            model: "first-model".into(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        };
+        let initial = manager_settings(Provider::Claude, dir.clone(), "first-model".into());
         node.settings.lock().unwrap().manager = Some(initial.clone());
         {
             let mut store = node.store.lock().await;

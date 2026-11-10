@@ -3,7 +3,7 @@ use super::{
     codex_server::Link,
     provider_adapter::{
         PendingDisconnectClassification, ScrubbedStderrTail, TerminationEvidence,
-        classify_pending_disconnect,
+        classify_pending_disconnect, safe_model_text,
     },
 };
 use crate::config::ManagerSettings;
@@ -698,13 +698,6 @@ fn pi_model_catalog(data: &Value) -> Option<ModelCatalog> {
     })
 }
 
-fn safe_model_text(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= 256
-        && !value.chars().any(char::is_control)
-        && !crate::model::looks_secret(value)
-}
-
 fn unchecked(provider: Provider) -> ProviderProbe {
     ProviderProbe {
         provider,
@@ -753,6 +746,7 @@ fn prerequisites(provider: Provider, local: &providers::Local) -> Option<ProbeIs
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::initialize_node;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use vibeface_bridge::agent::{CursorAuthentication, CursorModel};
@@ -773,14 +767,10 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../crates/bridge/tests/fixtures/fake-cursor-agent"),
         );
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        initialize_node(
+            &dir,
+            &configuration,
+            &crate::crypto::LocalIdentity::generate(),
         )?;
         let mut variables = providers::ProviderEnv::default();
         variables.apply(

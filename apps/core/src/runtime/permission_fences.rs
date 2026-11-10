@@ -150,8 +150,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, manager_settings};
     use crate::{
-        config::ManagerSettings,
         crypto::LocalIdentity,
         model::ResolvedModel,
         runtime::{
@@ -201,13 +201,11 @@ mod tests {
         {
             let mut settings = node.settings.lock().unwrap();
             settings.roots = vec![directory.clone()];
-            settings.manager = Some(ManagerSettings {
-                provider: Provider::Codex,
-                workspace: directory,
-                model: "fixture".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            settings.manager = Some(manager_settings(
+                Provider::Codex,
+                directory,
+                "fixture".into(),
+            ));
         }
         {
             let mut providers = node.providers.lock().unwrap();
@@ -222,12 +220,7 @@ mod tests {
         let cancel = node
             .register_manager_attempt_fixture(
                 "permission-token".into(),
-                Access {
-                    network_id: network,
-                    human: false,
-                    conversation_id: Some("c".into()),
-                    manager: None,
-                },
+                test_access(network, false, Some("c".into())),
                 &attempt,
                 &trigger,
                 Provider::Codex,

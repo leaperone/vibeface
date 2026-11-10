@@ -1489,6 +1489,7 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::access as test_access;
     use crate::runtime::triage::tests::{bot, claim_reply, node, start_reply};
 
     async fn post(
@@ -1548,27 +1549,10 @@ mod tests {
         }
         let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "tools-history".into(),
-            idle,
-            &attempt,
-            &trigger,
-            Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let access = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("tools-history")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture("tools-history", idle, &attempt, &trigger, Provider::Codex)
+            .await?;
         post(&node, &admin, &network, "c", "late", "needle-late").await?;
         let mut before = Value::Null;
         let mut ids = Vec::new();
@@ -1659,27 +1643,16 @@ mod tests {
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.store.lock().await.network()?.context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "tools-replay".into(),
-            idle.clone(),
-            &attempt,
-            &trigger,
-            Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let access = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("tools-replay")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture(
+                "tools-replay",
+                idle.clone(),
+                &attempt,
+                &trigger,
+                Provider::Codex,
+            )
+            .await?;
         assert!(
             node.tool(
                 idle,
@@ -1760,12 +1733,7 @@ mod tests {
                 .execution,
             TurnExecution::NotStarted
         );
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let mut runtime = TurnRuntime {
             provider: Provider::Codex,
             model: Some("primary".into()),

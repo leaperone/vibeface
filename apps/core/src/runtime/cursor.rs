@@ -872,20 +872,18 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{
+        access as test_access, initialize_node, join_network, manager_settings, open_node,
+        provider_work,
+    };
     use crate::{
         config::{self, Config},
         crypto::LocalIdentity,
-        identity::{Genesis, Member, NetworkState},
     };
     use std::time::Instant;
 
     fn access(conversation: &str) -> Access {
-        Access {
-            network_id: "network".into(),
-            human: false,
-            conversation_id: Some(conversation.into()),
-            manager: None,
-        }
+        test_access("network".into(), false, Some(conversation.into()))
     }
 
     #[tokio::test]
@@ -894,12 +892,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let node = Runtime::open(&dir).await?;
         for (token, conversation) in [
             ("attempt-a", "conversation-a"),
@@ -1033,13 +1026,11 @@ mod tests {
         );
         let new_workspace = dir.join("new-workspace");
         config::private_dir(&new_workspace)?;
-        node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
-            provider: Provider::Cursor,
-            workspace: new_workspace,
-            model: "different-model".into(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        });
+        node.settings.lock().unwrap().manager = Some(manager_settings(
+            Provider::Cursor,
+            new_workspace,
+            "different-model".into(),
+        ));
         assert_eq!(
             node.cursor_executor.native_directory(&agent).await?,
             workspace
@@ -1167,13 +1158,7 @@ mod tests {
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![workspace.clone()], false);
         configuration.providers.execution = [Provider::Cursor].into();
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        let node = Arc::new(Runtime::open(&dir).await?);
+        let node = open_node(&dir, &configuration).await?;
         {
             let mut local = node.providers.lock().unwrap();
             local.bins.insert(Provider::Cursor, fake_bridge());
@@ -1189,14 +1174,7 @@ mod tests {
             )?;
         }
         node.tools_ready("http://127.0.0.1:1".into())?;
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        let network = state.genesis.network_id.clone();
-        node.install_membership(state).await?;
+        let (admin, network) = join_network(&node).await?;
         super::super::claude::tests::conversation(
             &node,
             &admin,
@@ -1214,21 +1192,13 @@ mod tests {
             work_id: WorkSpec::id("conversation", "message:prompt", call_ref),
             conversation: "conversation".into(),
             trigger: "message:prompt".into(),
-            target: device.clone(),
-            dispatcher: device,
             call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Cursor),
-            model: None,
             resolved: crate::model::ResolvedModel {
                 provider: Provider::Cursor,
                 model: Some("fixture-model".into()),
             },
-            cwd: workspace.display().to_string(),
             title: "cursor work".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Cursor, &device, workspace, prompt)
         })
     }
 
@@ -1369,13 +1339,7 @@ mod tests {
         }
         let (node, dir, network, workspace, admin) = cursor_node_with_admin().await?;
         let result = async {
-            let settings = crate::config::ManagerSettings {
-                provider: Provider::Cursor,
-                workspace,
-                model: "fixture-model".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            };
+            let settings = manager_settings(Provider::Cursor, workspace, "fixture-model".into());
             node.settings.lock().unwrap().manager = Some(settings.clone());
             crate::runtime::triage::tests::bot(&node, &admin, "start-state", "Bot", &[]).await?;
             let key = SessionKey {
