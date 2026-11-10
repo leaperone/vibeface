@@ -860,8 +860,8 @@ def mesh_network():
 
 
 def local_bootstrap(run, binary, workspace, helper, cleanup, name="BOOT"):
-    """A started Node that is the bootstrap node of a fresh loopback mesh, with no relay. Invites carry only
-    the entry's device ID, so a CLI join finds its entry through this mesh: call
+    """A started Node that is the bootstrap node of a fresh loopback mesh, with no relay. Invites carry the
+    entry's NodeLink; the CLI can also look up the entry through this mesh: call
     `configure_mesh(boot.mesh_network, [boot.mesh_address])` on the joiner and the entry before they start."""
     node = Node(run, name, binary, workspace, helper)
     cleanup.append(node)

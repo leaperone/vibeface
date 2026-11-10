@@ -29,7 +29,7 @@ pub struct MeshRecord {
     /// Milliseconds since the Unix epoch when signed; a device's later record has a larger one.
     pub seq: u64,
     pub ttl_s: u32,
-    /// Public addresses first, then local ones; never another device's.
+    /// Explicitly advertised addresses first, then this Node's detected public and local addresses.
     pub addrs: Vec<SocketAddr>,
     /// The device's home relay.
     pub relay_url: Option<String>,
