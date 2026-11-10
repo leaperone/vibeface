@@ -99,7 +99,7 @@ jobs:
       # same inputs, Xcode image and Rust toolchain instead of spending its build again.
       - name: Key the simulator app by its inputs
         id: app
-        run: echo "key=ios-simulator-app-$ImageOS-$ImageVersion-$(rustc -V | shasum -a 256 | cut -c1-16)-${{ hashFiles('apps/mobile/**', 'packages/**', '!packages/docs/**', 'crates/**', 'Cargo.toml', 'Cargo.lock', 'pnpm-lock.yaml', 'scripts/build-mobile-secure.sh', '!**/node_modules/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=ios-simulator-app-$ImageOS-$ImageVersion-$( (rustc -V; node -v) | shasum -a 256 | cut -c1-16)-${{ hashFiles('apps/mobile/**', 'packages/**', '!packages/docs/**', 'crates/**', 'config/**', 'package.json', 'pnpm-workspace.yaml', 'Cargo.toml', 'Cargo.lock', 'pnpm-lock.yaml', 'scripts/build-mobile-secure.sh', '!**/node_modules/**') }}" >> "$GITHUB_OUTPUT"
       - name: Restore the simulator app built from the same inputs
         id: app_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
@@ -117,6 +117,8 @@ jobs:
           xcodebuild -workspace ios/Vibeface.xcworkspace -scheme Vibeface -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
             -derivedDataPath ../../.artifacts/native/ios-build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build
+          # Only an app built from the committed sources, including the regenerated bindings, may be cached.
+          test -z "$(git status --porcelain --untracked-files=normal)"
       - name: Save the simulator app for the same inputs
         if: steps.app_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
@@ -139,7 +141,7 @@ jobs:
       # instead of the UI run. The runner's own Spotlight indexing only adds load.
       - name: Sample runner load until the job ends
         run: |
-          sudo mdutil -a -i off > /dev/null
+          sudo mdutil -a -i off > /dev/null || true
           nohup scripts/ci-runner-load.sh > .artifacts/native/runner-load.log 2>&1 &
       - name: Install simslim
         run: |
@@ -181,7 +183,7 @@ jobs:
                                  "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("apps/app/dist/client/vibeface_secure.js").resolve())}.items():
                   output.write(key + "=" + value + "\n")
           # Boots once, turns off the widget, search and other daemons the app does not use, then boots slim.
-          # Keeps photos, push, keychain, links, files and assets that the app or its tests rely on.
+          # Keeps photos, push, keychain, links, connectivity and assets that the app or its tests rely on.
           subprocess.run([os.environ["SIMSLIM"], "on", simulator, "--except", "photos,store,icloud,web,connectivity,other,mdm"], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
