@@ -135,30 +135,27 @@ jobs:
           name: vibeface-ios-simulator-${{ github.sha }}
           path: .artifacts/native/vibeface-ios-simulator.zip
           if-no-files-found: error
-      - name: Build the same-source host Node and browser cryptography
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
+      # Booting the simulator before the host build overlaps its remaining startup work with the build
+      # instead of the UI run. The runner's own Spotlight indexing only adds load.
+      - name: Sample runner load until the job ends
         run: |
-          umask 077
-          mkdir -p .artifacts/native/private
-          chmod 700 .artifacts/native .artifacts/native/private
-          printf '%s\n' host-source > .artifacts/native/private/stage.txt
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          test -z "$(git status --porcelain --untracked-files=normal)"
-          test "$(uname -m)" = arm64
-          printf '%s\n' host-build > .artifacts/native/private/stage.txt
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
-          bash scripts/build-web-crypto.sh
-          bash scripts/build-web.sh
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
-          .artifacts/native/target/release/vibeface --version
-          .artifacts/native/target/release/vibeface-core --version
+          sudo mdutil -a -i off > /dev/null
+          nohup scripts/ci-runner-load.sh > .artifacts/native/runner-load.log 2>&1 &
+      - name: Install simslim
+        env:
+          GOTOOLCHAIN: auto
+          GOBIN: ${{ github.workspace }}/.artifacts/native/simslim
+        run: |
+          go install github.com/mobai-app/simslim/cmd/simslim@v0.14.0
+          echo "SIMSLIM=$GOBIN/simslim" >> "$GITHUB_ENV"
       - name: Create the dedicated iOS Provider simulator
         env:
+          SIMSLIM_BOOT_TIMEOUT: 15m
+          SIMSLIM_SPAWN_TIMEOUT: 5m
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           umask 077
+          mkdir -p .artifacts/native/private
           python3 - <<'PY'
           import json, os, pathlib, platform, re, subprocess
           pathlib.Path(".artifacts/native/private/stage.txt").write_text("simulator-create\n")
@@ -182,11 +179,30 @@ jobs:
                                  "VIBEFACE_E2E_APP_DIR": str(pathlib.Path("apps/app/dist/client").resolve()),
                                  "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("apps/app/dist/client/vibeface_secure.js").resolve())}.items():
                   output.write(key + "=" + value + "\n")
-          subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
+          # Boots once, turns off the widget, search and other daemons the app does not use, then boots slim.
+          # Keeps photos, push, keychain, links, files and assets that the app or its tests rely on.
+          subprocess.run([os.environ["SIMSLIM"], "on", simulator, "--except", "photos,store,icloud,web,connectivity,other,mdm"], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
-      - name: Sample runner load until the job ends
-        run: nohup scripts/ci-runner-load.sh > .artifacts/native/runner-load.log 2>&1 &
+      - name: Build the same-source host Node and browser cryptography
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
+        run: |
+          umask 077
+          mkdir -p .artifacts/native/private
+          chmod 700 .artifacts/native .artifacts/native/private
+          printf '%s\n' host-source > .artifacts/native/private/stage.txt
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(uname -m)" = arm64
+          printf '%s\n' host-build > .artifacts/native/private/stage.txt
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          bash scripts/build-web-crypto.sh
+          bash scripts/build-web.sh
+          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
+          .artifacts/native/target/release/vibeface --version
+          .artifacts/native/target/release/vibeface-core --version
       - name: Prepare the task simulator's XCTest runner
         env:
           AGENT_DEVICE_HOME: ${{ github.workspace }}/.artifacts/native/agent-device
