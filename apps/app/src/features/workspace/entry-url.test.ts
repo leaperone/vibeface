@@ -2441,6 +2441,30 @@ test('closing task detail restores a connected opener or the persistent workspac
   } finally { app.close() }
 })
 
+const taskOverviewUi = {
+  '@vibeface/client/lib/errors.ts': errors,
+  '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+  '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+}
+function taskOverviewHarness(
+  platform: string, shared: ReturnType<typeof parityShared>, dependencies: Record<string, unknown>,
+  inbox: () => unknown[] = () => [],
+) {
+  const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: inbox },
+    '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+    './inbox': { useInbox: inbox }, './workspace-shell': { useCreateBot: () => () => {} },
+    ...dependencies,
+  })
+  return {
+    app,
+    render: () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen'),
+    cardName: platform === 'web' ? 'TaskOverviewCard' : 'TaskRow',
+    mastheadName: platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead',
+  }
+}
+
 test('both task overviews preserve known records, show their coverage and only navigate cross-Bot program checks', () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
@@ -2450,19 +2474,9 @@ test('both task overviews preserve known records, show their coverage and only n
       tasks: shared.openWorks.slice(0, 256), truncated: true, consistency: 'partial', checks: [{ check_id: 'other-process', conversation_id: 'other-chat', trigger: 'message:remote' }],
       coverage: { source: 'workspace_overview', truncated: true, omitted_tasks: 1, omitted_questions: 2, remote_owners: [{ owner: 'remote', reason: 'remote_scheduler_not_queried' }] },
     })
-    const dependencies = {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
-      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
-      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
-      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
-    }
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', dependencies)
-    const screen = platform === 'web' ? 'TasksOverview' : 'TasksScreen'
-    const cardName = platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'
-    const mastheadName = platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'
+    const { app, render, cardName, mastheadName } = taskOverviewHarness(platform, shared, taskOverviewUi)
     try {
-      let elements = app.render(screen)
+      let elements = render()
       const cards = elements.filter(({ type }) => typeof type === 'function' && type.name === cardName)
       assert.equal(cards.length, 257, `${platform} keeps the row outside the bounded overview`)
       assert.equal((cards[256].props.work as WorkRecord).prompt, '完整请求 256')
@@ -2475,26 +2489,26 @@ test('both task overviews preserve known records, show their coverage and only n
       assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
       assert.equal(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
       shared.nodes = [{ ...parityNode, online: false }]
-      elements = app.render(screen)
+      elements = render()
       assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention, 258)
       const offlineCard = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
       assert.ok(offlineCard && typeof offlineCard.type === 'function')
       assert.match(componentText(offlineCard.type(offlineCard.props)), /待确认/)
       shared.nodes = [parityNode]
       shared.connectionOnline = false
-      elements = app.render(screen)
+      elements = render()
       const staleCard = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
       assert.ok(staleCard && typeof staleCard.type === 'function')
       assert.match(componentText(staleCard.type(staleCard.props)), /状态未知/)
       shared.synced = false
       shared.openWorks = []
       shared.overview = workspaceModel.parseWorkspaceOverview({})
-      elements = app.render(screen)
+      elements = render()
       assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, null)
       assert.doesNotMatch(componentText(elements), /没有未完成的任务/)
       shared.synced = true
       shared.connectionOnline = true
-      elements = app.render(screen)
+      elements = render()
       assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, 0)
       const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
       assert.ok(empty && typeof empty.type === 'function')
@@ -2511,13 +2525,9 @@ test('both task overviews recover bounded Bot identities only from the current c
   for (const platform of ['web', 'native']) {
     const bots = Array.from({ length: 257 }, (_, index) => ({ ...parityBot, bot_id: `bot-${index + 1}`, conversation_id: `chat-${index + 1}`, name: `项目 Bot ${index + 1}` }))
     const shared = { ...parityShared(), conversationId: 'chat-1', bots, openWorks: [], overview: workspaceModel.parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: 'only-check', conversation_id: 'chat-257', trigger: 'message:one' }], truncated: true }) }
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
-      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
-      './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} }, '@/components/kit': { providerIcons: {} },
+    const { app, render } = taskOverviewHarness(platform, shared, {
+      '@/components/kit': { providerIcons: {} },
     })
-    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
     const opens = (elements: ReturnType<typeof render>, botId = 'bot-257') => nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === botId : props.href === `/b/${botId}`))
     try {
       let elements = render()
@@ -2551,40 +2561,34 @@ test('both task overviews recover bounded Bot identities only from the current c
 test('both task overviews retain failure outcomes and causes across unordered snapshots', () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
-      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
-      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
-      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
-    })
+    const { app, render, cardName, mastheadName } = taskOverviewHarness(platform, shared, taskOverviewUi)
     try {
       for (const observedFailure of [true, false]) {
         const running = { ...parityWork({ summary: '', result_text: '完整输出', failure_reason: '旧快照记录的说明' }), conversation_id: 'chat' }
         const failed = { ...parityWork({ ...running, state: 'finished', outcome: 'failed', failure_reason: '这次执行失败，已保留改动' }), conversation_id: running.conversation_id }
         shared.openWorks = [observedFailure ? running : failed]
         shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...(observedFailure ? failed : running), kind: 'work' }] })
-        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
-        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        const elements = render()
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
         assert.ok(card && typeof card.type === 'function')
         const text = componentText(card.type(card.props))
         assert.match(text, /失败/, `${platform} uses the outcome rather than treating finished as success`)
         assert.match(text, /这次执行失败，已保留改动/)
         assert.doesNotMatch(text, /旧快照记录的说明/)
         assert.doesNotMatch(text, /已完成/)
-        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention, 1)
         assert.equal((card.props.work as WorkRecord).result_text, '完整输出')
       }
       for (const [known, observed] of [['completed', 'unverified'], ['unverified', 'completed'], ['completed', 'failed'], ['failed', 'completed']] as const) {
         shared.openWorks = [{ ...parityWork({ state: known === 'unverified' ? 'unverified' : 'finished', outcome: known, summary: '' }), conversation_id: 'chat' }]
         shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...parityWork({ state: observed === 'unverified' ? 'unverified' : 'finished', outcome: observed }), conversation_id: 'chat', kind: 'work' }] })
-        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
-        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        const elements = render()
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
         assert.ok(card && typeof card.type === 'function')
         const text = componentText(card.type(card.props))
         assert.match(text, /待确认|状态未知/)
         assert.doesNotMatch(text, /已完成/)
-        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention, 1)
       }
     } finally { app.close() }
   }
@@ -2596,15 +2600,8 @@ test('both task overviews reconcile raw confirmations and only fold task process
     shared.conversationId = 'other-chat'
     const entry = { ...parityNode, device_id: 'entry', local: true }
     const inbox = () => inboxItems({ device: { ready: null, joins: [], pendingRecovery: null, rotateHint: false }, workspace: shared })
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: inbox },
-      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
-      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: inbox }, './workspace-shell': { useCreateBot: () => () => {} },
-      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
-    })
-    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
-    const count = (elements: ReturnType<typeof render>) => elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention
+    const { app, render, cardName, mastheadName } = taskOverviewHarness(platform, shared, taskOverviewUi, inbox)
+    const count = (elements: ReturnType<typeof render>) => elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention
     try {
       for (const unreachable of ['offline', 'disconnected']) {
         shared.nodes = [entry, { ...parityNode, online: unreachable !== 'offline', capabilities: { ...parityNode.capabilities, codex_connected: unreachable !== 'disconnected' } }]
@@ -2612,7 +2609,7 @@ test('both task overviews reconcile raw confirmations and only fold task process
         shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...shared.openWorks[0], kind: 'work', state: 'finished', outcome: 'failed', failure_reason: '总览记录的失败原因' }] })
         const elements = render()
         assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, `${platform} cannot offer settlement for an already failed work`)
-        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
         assert.ok(card && typeof card.type === 'function')
         assert.match(componentText(card.type(card.props)), /失败.*总览记录的失败原因/)
         assert.equal(count(elements), 1)
@@ -3784,6 +3781,22 @@ test('native chat folds runtime diagnostics and retains result checks without pr
   } finally { extras.close(); details.close() }
 })
 
+function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
+  return componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+    'expo-router/react-navigation': { useHeaderHeight: () => 96 },
+    'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+    'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
+    'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
+    'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
+    'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+    '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+    '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
+    '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
+    '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+    ...dependencies,
+  })
+}
+
 test('native composer adds photos and files without replacing current attachments or drafts', async (t) => {
   type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
   type NativeButton = { text: string; onPress?: () => void; style?: string }
@@ -3908,18 +3921,9 @@ test('native attachment results cannot cross a draft scope or survive its disabl
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: true } } }
     let botId = 'bot', sending = false, calls = 0, selected: (() => void) | undefined
     const result = pendingResult()
-    const screen = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
-      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId }) }, 'expo-router/react-navigation': { useHeaderHeight: () => 96 },
-      'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
-      'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
-      'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
-      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
-      'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+    const screen = nativeChatHarness(os, {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId }) },
       '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
-      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
-      '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
-      '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-      '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
     })
     const composer = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
       'react-native': {
@@ -4000,18 +4004,10 @@ test('native composer preserves local input and visible blockers with compact ch
     }
     const workspace = { bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: true } }, retryNow: () => { retried++ } }
-    const screen = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
-      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, 'expo-router/react-navigation': { useHeaderHeight: () => 96 },
-      'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
-      'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
-      'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
-      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
-      'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+    const screen = nativeChatHarness(os, {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) },
       '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
-      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
-      '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
-      '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-      '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/features/chat/chrome': { useChatChrome: () => ({ kind: 'solid' }) }, '@/lib/layout': { useWide: () => false },
+      '@/features/chat/chrome': { useChatChrome: () => ({ kind: 'solid' }) },
     })
     const composer = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', { 'react-native': { Platform: { OS: os }, TextInput: 'TextInput', View: 'View' } })
     const offline = componentHarness('../../../../../apps/mobile/src/components/connection-pill.tsx', {

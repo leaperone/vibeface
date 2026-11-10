@@ -210,14 +210,19 @@ function approvedDirectory(app: ReturnType<typeof recoveryApprovalHarness>, chan
   app.directory.view = { ...app.directory.view, epoch: 3, pending: null, ...change }
   return app.receipt()
 }
+async function pendingRecoveryApproval(app: ReturnType<typeof recoveryApprovalHarness>) {
+  const reply = deferred()
+  app.holds.set('approve_recovery', reply)
+  const approval = app.render().approveRecovery(recoveryCheckpoint)
+  await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+  return { reply, approval }
+}
 
 for (const detached of [false, true]) test(`recovery approval verifies its signed receipt${detached ? ' even after this manager is removed' : ''}`, async () => {
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app, detached ? { members: [] } : {})
     if (detached) {
       const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('this manager was removed'))
@@ -239,9 +244,7 @@ for (const landed of [true, false]) test(`a lost recovery approval reply ${lande
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     if (landed) approvedDirectory(app)
     const cause = new Error('approval reply lost')
     reply.reject(cause)
@@ -274,9 +277,7 @@ for (const principal of [null, { network_id: network }]) test(`a lost recovery a
   try {
     app.render(); await settle(); app.render()
     const authentications = app.calls.filter(call => call === 'authenticate').length
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const read = deferred(), auth = deferred(); read.promise.catch(() => {}); read.reject(new Error('directory unavailable')); auth.resolve({ principal })
     app.holds.set('directory', read); app.holds.set('authenticate', auth)
     const cause = new Error('approval reply lost'); reply.reject(cause)
@@ -293,9 +294,7 @@ for (const lost of [false, true]) test(`a ${lost ? 'lost' : 'successful'} recove
     const before = app.directory.state, verify = app.secure.verifyState
     app.secure.verifyState = (state = app.directory.state) => { if (state !== before) throw new Error('invalid signed state'); return verify(state) }
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app), cause = new Error('approval reply lost')
     if (lost) reply.reject(cause)
     else reply.resolve(answer)
@@ -321,9 +320,7 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     let answer: unknown = app.receipt()
     if (outcome === 'unsigned-state') answer = { principal: null, view: { ...app.directory.view, epoch: 3, pending: null } }
     else if (outcome === 'unsigned-view') answer = { ...app.receipt(), view: { ...app.directory.view, epoch: 3, pending: null } }
