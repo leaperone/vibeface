@@ -405,12 +405,7 @@ async fn access(data_dir: &Path) -> Result<Value> {
         return Ok(json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true}));
     }
     let mut url = if capability.is_some() {
-        let launcher = Launcher::read(data_dir)?;
-        ensure!(
-            launcher.node_id == device_id,
-            "local launcher does not match this node"
-        );
-        config::http_origin(&launcher.origin)?
+        config::http_origin(&format!("http://{}", configuration.local_listen))?
     } else {
         config::http_origin(&configuration.public_url)?
     };

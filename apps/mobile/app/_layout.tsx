@@ -3,7 +3,7 @@ import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
 import { Link, Stack, router, usePathname } from 'expo-router'
-import { Inbox, ListChecks, MessageSquare, X } from 'lucide-react-native'
+import { Inbox, ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
 import { useEffect } from 'react'
@@ -113,10 +113,11 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
-        {ready && !wide && ['/', '/tasks', '/inbox'].includes(pathname) ? <View className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
+        {ready && !wide && ['/', '/tasks', '/inbox', '/settings'].includes(pathname) ? <View className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
           <Link href="/" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="消息" accessibilityState={{ selected: pathname === '/' }}><Icon as={MessageSquare} /><Text className="text-meta">消息</Text></Button></Link>
           <Link href="/tasks" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="任务" accessibilityState={{ selected: pathname === '/tasks' }}><Icon as={ListChecks} /><Text className="text-meta">任务</Text></Button></Link>
           <Link href="/inbox" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="待处理" accessibilityState={{ selected: pathname === '/inbox' }}><Icon as={Inbox} /><Text className="text-meta">待处理</Text></Button></Link>
+          <Link href="/settings" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="设置" accessibilityState={{ selected: pathname === '/settings' }}><Icon as={Settings} /><Text className="text-meta">设置</Text></Button></Link>
         </View> : null}
       </View>
     </View>

@@ -8,19 +8,14 @@ import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
-import { useInbox } from "./inbox"
-import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
-import { terms } from "@/lib/glossary"
 import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
 import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { ConnectionCapsule, MoodTag, useCreateBot } from "./workspace-shell"
 
-/** The phone's home: 待处理 first, then every bot by its newest message. */
+/** The phone's home: channels, then every bot by its newest message; 任务 and 待处理 are tabs. */
 export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
-  const open = waitingItems(useInbox())
-  const taskAttention = (workspace.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state))
   const notifications = workspace.notifications.filter((item) => { const target = item.target; return target?.kind === 'bot_main' && workspace.bots.some((bot) => bot.bot_id === target.bot_id && bot.conversation_id === item.conversation_id) && !workspace.ignoredNotifications.has(item.notification_id) })
   const unread = unreadCounts(notifications, workspace.questions.filter((item) => item.target?.kind === 'bot_main' && workspace.bots.some((bot) => item.target?.kind === 'bot_main' && bot.bot_id === item.target.bot_id && bot.conversation_id === item.conversation_id) && awaitsAnswer(item, workspace.answered)))
   const now = Date.now()
@@ -39,20 +34,15 @@ export function ConversationList() {
   else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length + taskAttention.length} preview={taskAttention[0]?.title ?? open[0]?.title ?? ""} />
-    <Row to="/tasks" icon={terms.task.icon} name={terms.task.label} unread={0} preview="" />
     <Row to="/channels" icon={MessagesSquare} name="频道" unread={0} preview={`${workspace.workspaceState?.channels.length ?? 0} 个频道`} />
     {(workspace.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} to="/channels/$channelId" params={{ channelId: channel.channel_id }} className="flex min-h-14 items-center gap-3 rounded-xl px-3 py-2 interactive-row"><MessagesSquare aria-hidden="true" className="size-5 text-muted-foreground" /><span className="min-w-0 truncate font-medium">{channel.title}</span></Link>)}
-    <div className="flex items-center justify-between px-3">
-      <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
-      <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
-    </div>
+    <h2 className="mt-2 px-3 text-meta font-medium text-muted-foreground">Bot</h2>
     {list}
     <footer className="relative mt-6 grid gap-1 px-1 pt-2 before:absolute before:inset-x-3 before:top-0 before:border-t before:border-border md:hidden"><AiOffHint /><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
   </div>
 }
 
-type RowProps = { icon: LucideIcon; avatar?: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string } & ({ to: "/inbox" | "/tasks" | "/channels"; params?: never } | { to: "/b/$botId"; params: { botId: string } })
+type RowProps = { icon: LucideIcon; avatar?: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string } & ({ to: "/channels"; params?: never } | { to: "/b/$botId"; params: { botId: string } })
 
 function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }: RowProps) {
   return <Link {...link} className="flex min-h-16 items-center gap-3 interactive-row rounded-xl px-3 py-2.5">

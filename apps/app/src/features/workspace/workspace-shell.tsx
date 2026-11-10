@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, MessagesSquare, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, MessageSquare, MessagesSquare, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -22,11 +22,11 @@ import {
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { BotPanelButton, openBotContext } from "./bot-panel"
+import { BotPanelButton, openBotPanel } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
-import { backTo } from "@vibeface/client/workspace/home.ts"
+import { backTo, tabs } from "@vibeface/client/workspace/home.ts"
 import { addressName, entryLabel, hostOf, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { unreachableText } from "@vibeface/client/lib/transport.ts"
@@ -93,9 +93,9 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
-  // The phone's home lists 待处理 itself; every other page keeps the Bell in the header.
-  const phoneHome = isMobile && pathname === "/"
-  const inboxInHeader = pathname !== "/inbox"
+  // On a phone the tabs carry 待处理 and 设置, so a tab's header keeps only its own actions; a chat's header opens the bot's settings.
+  const phoneTab = isMobile && tabs.includes(pathname)
+  const inboxInHeader = !phoneTab && !botTitle && pathname !== "/inbox"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
   const latest = useRef(workspace)
   latest.current = workspace
@@ -175,8 +175,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <SecondDeviceHint />
           <ConnectionCapsule />
           <SidebarMenu>
-            <NavItem to="/devices" icon={terms.myDevices.icon} label={terms.myDevices.label} active={pathname.startsWith("/devices")} dot={devicesAttention} />
-            <NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings")} />
+            <NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings") || pathname.startsWith("/devices")} dot={devicesAttention} />
           </SidebarMenu>
         </SidebarFooter>
       </Sidebar>
@@ -193,26 +192,13 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
               <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-title font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
-              {botTitle ? <Button type="button" variant="ghost" size="sm" onClick={openBotContext}>上下文和历史</Button> : null}
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
-          {phoneHome ? <div className="-me-3 flex">
-            <Button asChild variant="ghost" size="icon" className="relative">
-              <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
-                <Bell aria-hidden="true" />
-                {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out" /> : null}
-              </Link>
-            </Button>
-            <Button asChild variant="ghost" size="icon" className="relative">
-              <Link to="/devices" aria-label={devicesAttention ? `${terms.myDevices.label}，需要留意` : terms.myDevices.label} title={terms.myDevices.label}>
-                <terms.myDevices.icon aria-hidden="true" />
-                {devicesAttention ? <CircleAlert aria-hidden="true" className="absolute top-1 right-1 size-3! rounded-full bg-background text-warning" /> : null}
-              </Link>
-            </Button>
-            <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
-          </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
+          {isMobile && pathname === "/" ? <Button type="button" variant="ghost" size="icon" className="-me-3" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus aria-hidden="true" /></Button>
+          : botTitle ? <Button type="button" variant="ghost" size="icon" className="-me-3" aria-label={`${workspace.selectedBot?.name ?? "Bot"} 设置`} title={terms.settings.label} disabled={!workspace.data?.bot_settings} onClick={openBotPanel}><terms.settings.icon aria-hidden="true" /></Button>
+          : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
             <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
               <Bell aria-hidden="true" />
               {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger md:-top-0.5 md:-right-0.5" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
@@ -229,6 +215,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           {chatRoute ? children : null}
         </div>
         {chatRoute ? null : <div className={scopedChat ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden' : 'workspace-screen'}>{children}</div>}
+        {phoneTab ? <TabBar pathname={pathname} waiting={waiting} recovering={recovering} attention={devicesAttention} /> : null}
       </SidebarInset>
       <BotForm open={creatingBot} onOpenChange={setCreatingBot} restoreFocus={() => {
         const target = creatorTrigger.current
@@ -237,6 +224,29 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
       }} />
     </PageActionsSlot.Provider></CreateBot.Provider>
   )
+}
+
+const tabItems = [
+  { to: "/", icon: MessageSquare, label: "消息" },
+  { to: "/tasks", icon: terms.task.icon, label: terms.task.label },
+  { to: "/inbox", icon: terms.inbox.icon, label: terms.inbox.label },
+  { to: "/settings", icon: terms.settings.icon, label: terms.settings.label },
+] as const
+
+/** The phone's bottom tabs; the count on 待处理 and the mark on 设置 stand in for what a wide screen shows in the sidebar. */
+function TabBar({ pathname, waiting, recovering, attention }: { pathname: string; waiting: number; recovering: boolean; attention: boolean }) {
+  return <nav aria-label="标签栏" className="flex shrink-0 border-t bg-background ps-[env(safe-area-inset-left)] pe-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)]">
+    {tabItems.map(({ to, icon: Icon, label }) => {
+      const active = pathname === to
+      const mark = to === "/inbox" ? recovering ? <ShieldAlert aria-hidden="true" className="absolute -top-1 -right-2 size-4 rounded-full bg-background text-danger" /> : waiting ? <CountBadge count={waiting} className="absolute -top-1.5 -right-3 h-4 min-w-4 px-1 ring-2 ring-background" /> : null
+        : to === "/settings" && attention ? <CircleAlert aria-hidden="true" className="absolute -top-1 -right-1.5 size-3 rounded-full bg-background text-warning" /> : null
+      const name = to === "/inbox" && recovering ? `${label}，有人在找回` : to === "/inbox" && waiting ? `${label} ${waiting}` : to === "/settings" && attention ? `${label}，需要留意` : label
+      return <Link key={to} to={to} replace aria-label={name} aria-current={active ? "page" : undefined} className={cn("flex min-h-14 flex-1 flex-col items-center justify-center gap-1 text-meta outline-none transition-colors focus-visible:bg-muted active:bg-muted", active ? "text-foreground" : "text-muted-foreground")}>
+        <span className="relative"><Icon aria-hidden="true" className="size-5" />{mark}</span>
+        <span className={cn(active && "font-medium")}>{label}</span>
+      </Link>
+    })}
+  </nav>
 }
 
 function NavItem({ to, icon: Icon, label, active, badge, dot, alert }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean; alert?: boolean }) {

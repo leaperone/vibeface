@@ -1,10 +1,10 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, Laptop, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
+import { Bell, BellOff, Check, ChevronRight, CircleAlert, CircleCheck, Crown, Download, FlaskConical, Laptop, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
 import { isDesktopHost } from '@/lib/desktop-node-bridge'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
-import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
+import { BusyIcon, CountBadge, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -12,6 +12,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { onlyManagerText, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
+import { useOpenJoins } from '@/features/devices/join'
 import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
@@ -39,7 +40,17 @@ function SettingsPage() {
   // A local session only disconnects, so only a member browser can be the one manager left.
   const sole = principal?.source !== 'local_session' && soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
+  const joins = useOpenJoins()
+  const offline = workspace.nodes.some((node) => !node.revoked && !node.online)
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
+    <SettingsGroup>
+      <Link to="/devices" className="interactive-row block">
+        <SettingsRow icon={terms.myDevices.icon} label={terms.myDevices.label}>
+          {joins.length ? <CountBadge count={joins.length} label={`${joins.length} 个加入请求`} /> : offline ? <CircleAlert role="img" aria-label="有设备离线" className="size-4 text-warning" /> : <span className="tabular-nums">{device.directory?.members.length ?? ''}</span>}
+          <ChevronRight aria-hidden="true" className="size-4" />
+        </SettingsRow>
+      </Link>
+    </SettingsGroup>
     <SettingsGroup title={waitingCopy.title}>
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
         <NotificationValue />

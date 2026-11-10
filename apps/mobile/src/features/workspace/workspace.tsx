@@ -1,6 +1,6 @@
 import { File } from 'expo-file-system'
 import { Link, Stack, router, useFocusEffect } from 'expo-router'
-import { BrainCircuit, ChevronDown, ChevronRight, CircleQuestionMark, ListChecks, MessagesSquare, Plus, Reply, Settings, X } from 'lucide-react-native'
+import { BrainCircuit, ChevronRight, CircleQuestionMark, Clock, ListChecks, ListPlus, MessagesSquare, Plus, Reply, Settings, SlidersHorizontal, X } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useReducedMotion } from 'react-native-reanimated'
 import { Modal, Pressable, ScrollView, View } from 'react-native'
@@ -187,7 +187,11 @@ export function InputOptions({ label, options, selected, onSelect, intent, onInt
   const insets = useSafeAreaInsets()
   const reducedMotion = useReducedMotion()
   const intents: { value: InputIntent; label: string }[] = [{ value: 'continue', label: '补充当前工作' }, { value: 'new_task', label: '新任务' }, { value: 'defer', label: '稍后处理' }]
-  return <><Pressable accessibilityRole="button" accessibilityLabel={`输入目标 ${label}，${intents.find((item) => item.value === intent)?.label}，打开目标和队列`} onPress={() => setOpen(true)} className="min-h-11 flex-row items-center gap-2 rounded-xl bg-muted px-3 py-2"><Text numberOfLines={2} className="min-w-0 flex-1 text-meta">{label}{pending.length ? ` · ${pending.length} 条待确认` : ''}</Text><Icon as={ChevronDown} className="size-4 text-muted-foreground" /></Pressable>
+  const shown = intent === 'new_task' ? ListPlus : intent === 'defer' ? Clock : SlidersHorizontal
+  return <><Button variant="ghost" size="icon" className={cn('rounded-full', intent !== 'continue' && 'bg-muted')} accessibilityLabel={`输入目标 ${label}，${intents.find((item) => item.value === intent)?.label}${pending.length ? `，${pending.length} 条待确认` : ''}，打开目标和队列`} onPress={() => setOpen(true)}>
+    <Icon as={shown} className={intent === 'continue' ? 'text-muted-foreground' : 'text-foreground'} />
+    {pending.length ? <View className="absolute end-1 top-1 size-2 rounded-full bg-warning" /> : null}
+  </Button>
     <Modal transparent visible={open} animationType={reducedMotion ? 'none' : 'slide'} onRequestClose={() => setOpen(false)}><KeyboardAvoidingView behavior="height" automaticOffset style={{ flex: 1 }}><View className="flex-1 justify-end bg-black/30"><Pressable className="flex-1" onPress={() => setOpen(false)} accessibilityRole="button" accessibilityLabel="关闭目标和队列" /><View testID="input-options-sheet" accessibilityViewIsModal className="max-h-[80%] rounded-t-2xl bg-background px-4 pt-4" style={{ paddingBottom: insets.bottom + 16 }}><View className="mb-3 flex-row items-center"><Text role="heading" className="flex-1 text-heading font-semibold">目标和队列</Text><Button variant="ghost" size="icon" accessibilityLabel="关闭目标和队列" onPress={() => setOpen(false)}><Icon as={X} /></Button></View><KeyboardAwareScrollView bottomOffset={16} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 pb-4"><View className="gap-2"><Text className="text-meta font-medium">发送给</Text>{options.map((option) => <Button key={option.key} variant={selected === option.key ? 'default' : 'outline'} accessibilityState={{ selected: selected === option.key }} onPress={() => onSelect(option)}><Text className="shrink">{option.label}</Text></Button>)}</View><View className="gap-2"><Text className="text-meta font-medium">发送方式</Text>{intents.map((item) => <Button key={item.value} variant={intent === item.value ? 'default' : 'outline'} accessibilityState={{ selected: intent === item.value }} onPress={() => { onIntent(item.value); setOpen(false) }}><Text>{item.label}</Text></Button>)}</View><Button variant="outline" disabled={!shared || contextBusy} onPress={() => {
       const option = options.find((item) => item.key === selected)
       if (!option || !shared) return
