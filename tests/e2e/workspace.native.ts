@@ -406,7 +406,12 @@ test('native workspace routes preserve Task input, queue controls and directed C
     const keyboardTop = await keyboard.count() === 0 ? Infinity : (await keyboard.boundingBox())?.y;
     assert(saveBounds && scrollBounds && keyboardTop !== undefined, 'Queue Save and its visible area expose bounds');
     const reachable = saveBounds.y >= scrollBounds.y && saveBounds.y + saveBounds.height <= Math.min(scrollBounds.y + scrollBounds.height, keyboardTop);
-    if (!reachable) await queueScroll.swipe({ direction: saveBounds.y < scrollBounds.y ? 'up' : 'down', momentum: 'slow' });
+    // A path inside the visible part: on iOS 27 a direction swipe on this sheet's scroll area does not move it.
+    if (!reachable) {
+      const top = scrollBounds.y, bottom = Math.min(scrollBounds.y + scrollBounds.height, keyboardTop), x = scrollBounds.x + scrollBounds.width / 2;
+      const high = { x, y: top + (bottom - top) * 0.25 }, low = { x, y: top + (bottom - top) * 0.75 };
+      await screen.swipe(saveBounds.y < scrollBounds.y ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
+    }
     return reachable;
   }, { timeout: 5000 }).toBe(true);
   await app.screenshot('workspace-native-queue-edit-keyboard');
@@ -443,7 +448,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(targetSheet).toHaveCount(1);
   await expect(queued).toHaveCount(0);
   // Swiped down from its title, the sheet closes like the button does.
-  const sheetTop = await targetSheet.getByRole('heading', '目标和队列', { exact: true }).boundingBox();
+  const sheetTop = await targetSheet.getByText('目标和队列', { exact: true }).boundingBox();
   assert(sheetTop, 'The sheet title exposes bounds');
   await screen.swipe({ from: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y }, to: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y + 600 } });
   await expect(targetSheet).toHaveCount(0);
