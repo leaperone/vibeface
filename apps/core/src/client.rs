@@ -42,6 +42,9 @@ use vibeface_secure::{
     join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
 };
 
+mod concurrency;
+use concurrency::Calls;
+
 pub const PROLOGUE: &[u8] = b"vibeface:client:v1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -230,7 +233,7 @@ struct Session {
     operator: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct Principal {
     source: &'static str,
     network_id: String,
@@ -349,7 +352,8 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if !node.config.forwarding.any {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
-            node.store.lock().await.authorize_node(&network, &target)
+            { let network = network.clone(); let target = target.clone();
+                node.store.call("gateway_authorize", move |store| store.authorize_node(&network, &target)).await }
         };
         if let Err(error) = member.await {
             return refuse(&mut socket, "target_not_member", error).await;
@@ -562,8 +566,17 @@ pub async fn serve_local(node: Arc<Runtime>, socket: ClientSocket, cookie: Strin
 
 async fn serve_session(
     node: Arc<Runtime>,
+    socket: ClientSocket,
+    cookie: Option<String>,
+) -> Result<()> {
+    serve_session_with_heartbeat(node, socket, cookie, HEARTBEAT).await
+}
+
+async fn serve_session_with_heartbeat(
+    node: Arc<Runtime>,
     mut socket: ClientSocket,
     cookie: Option<String>,
+    heartbeat_period: Duration,
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
     let (mut channel, device_id) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -613,11 +626,13 @@ async fn serve_session(
     };
     let mut membership = node.membership.subscribe();
     let mut events = node.events.subscribe();
-    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut received = Instant::now();
     let mut partial_started: Option<Instant> = None;
+    let mut calls = Calls::default();
     loop {
+        calls.start_ordered(&node, &session).await?;
         tokio::select! {
             frame = socket.next() => {
                 received = Instant::now();
@@ -627,26 +642,19 @@ async fn serve_session(
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            let local = is_local_only(&node, &session).await?;
-                            let result = if local && request.method != "local_access" {
-                                tokio::select! {
-                                    result = dispatch(&node, &mut session, &request.method, request.params) => result,
-                                    _ = local_changes.changed() => bail!("local browser access was revoked"),
-                                }
-                            } else {
-                                dispatch(&node, &mut session, &request.method, request.params).await
-                            };
-                            let response = match result {
-                                Ok(result) => Response { id: request.id, result, error: None, code: None },
-                                Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
-                            };
-                            send_value(&mut socket, &mut channel, &response).await?;
-                            received = Instant::now();
+                            if let Some(response) = calls.accept(&node, &session, request).await? {
+                                send_value(&mut socket, &mut channel, &response).await?;
+                            }
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
                     Message::Ping(_) | Message::Pong(_) => {},
                     _ => bail!("client channel accepts only encrypted binary frames"),
                 }
+            }
+            completed = calls.next(), if !calls.is_empty() => {
+                let response = calls.finish(&node, &mut session, completed?).await?;
+                send_value(&mut socket, &mut channel, &response).await?;
+                received = Instant::now();
             }
             event = events.recv(), if session.subscribed.is_some() => {
                 let principal = principal(&node, &session).await?;
@@ -659,6 +667,7 @@ async fn serve_session(
                         } else {
                             pushed(&node, &principal.network_id, &session.device_id, event.payload).await
                         };
+                        ensure!(self::principal(&node, &session).await? == principal, "this device's permission changed before a push");
                         send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":{"type":"resync"}})).await?,
@@ -667,7 +676,9 @@ async fn serve_session(
                 }
             }
             _ = heartbeat.tick() => {
-                ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
+                // A live call may legitimately outlast the idle interval. Completion starts a
+                // fresh interval, but a half-sent encrypted message still has its own deadline.
+                ensure!(!calls.is_empty() || received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
                 if session.subscribed.is_some() || session.observation.is_some() { principal(&node, &session).await?; }
                 if guest.is_some() {
@@ -679,6 +690,7 @@ async fn serve_session(
             }
             changed = membership.changed() => {
                 changed.context("membership state closed")?;
+                calls.check_authority(&node, &session).await?;
                 // A removed device loses its subscription at once, not at the next heartbeat; one
                 // whose management permission changed reconnects to pick up the new principal.
                 if session.subscribed.is_some() || session.observation.is_some() {
@@ -831,7 +843,7 @@ async fn dispatch(
             let principal = principal(node, session).await?;
             let read_only = matches!(
                 params["op"].as_str(),
-                Some("status" | "list" | "get" | "find_intent" | "read" | "providers")
+                Some("receipt" | "status" | "list" | "get" | "find_intent" | "read" | "providers")
             );
             ensure!(
                 read_only || (principal.source == "membership" && principal.can_manage),
@@ -922,11 +934,8 @@ async fn dispatch(
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.
             let principal = principal(node, session).await?;
             session.subscribed = Some(principal.can_manage);
-            let vector: std::collections::BTreeMap<String, u64> = node
-                .store
-                .lock()
-                .await
-                .heads(&principal.network_id)?
+            let vector: std::collections::BTreeMap<String, u64> = { let network = principal.network_id.clone();
+                node.store.call("subscribe_heads", move |store| store.heads(&network)).await }?
                 .into_iter()
                 .map(|(author, (seq, _))| (author, seq))
                 .collect();
@@ -987,11 +996,8 @@ async fn dispatch(
         "invite" => {
             manager_view(node, session).await?;
             let record: InviteRecord = from_field(&params, "record")?;
-            let join_id = node
-                .store
-                .lock()
-                .await
-                .register_invite(&record, &session.device_id)?;
+            let join_id = { let device = session.device_id.clone();
+                node.store.call("register_invite", move |store| store.register_invite(&record, &device)).await }?;
             Ok(json!({"join_id":join_id,"entry":node.share_link()?.to_string()}))
         }
         "entrances" => {
@@ -1002,11 +1008,8 @@ async fn dispatch(
             )
         }
         "join_check" => {
-            let state = node
-                .store
-                .lock()
-                .await
-                .invite_state(text(&params, "secret")?, &session.device_id)?;
+            let state = { let secret = text(&params, "secret")?.to_owned(); let device = session.device_id.clone();
+                node.store.call("invite_state", move |store| store.invite_state(&secret, &device)).await }?;
             Ok(json!({"invite":state}))
         }
         "join" => {
@@ -1015,7 +1018,8 @@ async fn dispatch(
                 join.public_key == session.device_id,
                 "join key differs from this channel's device"
             );
-            let request = node.store.lock().await.join(&join, &session.device_id)?;
+            let request = { let device = session.device_id.clone();
+                node.store.call("join", move |store| store.join(&join, &device)).await }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
@@ -1023,7 +1027,8 @@ async fn dispatch(
             let Some(join_id) = params.get("join_id") else {
                 manager_view(node, session).await?;
                 let mut pending = serde_json::to_value(
-                    node.store.lock().await.pending_joins(&session.device_id)?,
+                    { let device = session.device_id.clone();
+                    node.store.call("pending_joins", move |store| store.pending_joins(&device)).await }?,
                 )?;
                 // A join waits on the Node whose invite it used; managers see it from any entry.
                 if let Some(local) = pending.as_array_mut() {
@@ -1041,10 +1046,9 @@ async fn dispatch(
             let join_id = join_id.as_str().context("join_id must be a string")?;
             let reveal = params.get("reveal").and_then(Value::as_str);
             let request =
-                node.store
-                    .lock()
-                    .await
-                    .join_status(join_id, &session.device_id, reveal)?;
+                { let join_id = join_id.to_owned(); let device = session.device_id.clone();
+                    let reveal = reveal.map(str::to_owned);
+                    node.store.call("join_status", move |store| store.join_status(&join_id, &device, reveal.as_deref())).await }?;
             if reveal.is_some() {
                 node.join_changed(&request.network_id);
             }
@@ -1058,24 +1062,22 @@ async fn dispatch(
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
                 state.project()?.member(&session.device_id)?;
-                result["addresses"] = json!(node.store.lock().await.address_book()?);
+                result["addresses"] = json!(node.store.call("address_book", |store| store.address_book()).await?);
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
         }
         "join_withdraw" => {
-            let request = node
-                .store
-                .lock()
-                .await
-                .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
+            let request = { let join_id = text(&params, "join_id")?.to_owned(); let device = session.device_id.clone();
+                node.store.call("withdraw_join", move |store| store.withdraw_join(&join_id, &device)).await }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
             manager_view(node, session).await?;
             let join_id = text(&params, "join_id")?;
-            if node.store.lock().await.holds_join(join_id)? {
+            if { let join_id = join_id.to_owned();
+                node.store.call("holds_join", move |store| store.holds_join(&join_id)).await }? {
                 approve_join(node, &session.device_id, &params).await
             } else {
                 node.forward_join_approval(&session.device_id, &params)
@@ -1248,7 +1250,8 @@ async fn dispatch(
                 })
                 .context("recovery key does not own this personal network")?;
             state.check_root(key, now as u64, false)?;
-            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
+            let heads = { let network = state.genesis.network_id.clone();
+                node.store.call("heads", move |store| store.heads(&network)).await }?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1341,11 +1344,9 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
             incoming.recover_at(next, now)?;
         }
         stays(&incoming.project_at(now)?, &node_id)?;
-        node.store.lock().await.bootstrap_network(
-            incoming.clone(),
-            text(params, "capability")?,
-            &session.device_id,
-        )?;
+        { let incoming = incoming.clone(); let capability = text(params, "capability")?.to_owned();
+            let device = session.device_id.clone();
+            node.store.call("bootstrap_network", move |store| store.bootstrap_network(incoming, &capability, &device)).await }?;
         node.install_membership(incoming).await?;
         return Ok(());
     }
@@ -1418,20 +1419,16 @@ pub(crate) async fn approve_join(
 ) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
-        node.store.lock().await.reject_join(join_id, admin)?
+        { let join_id = join_id.to_owned(); let admin = admin.to_owned();
+            node.store.call("reject_join", move |store| store.reject_join(&join_id, &admin)).await }?
     } else if let Some(nonce) = params.get("admin_nonce") {
         let nonce = nonce.as_str().context("admin_nonce must be a string")?;
-        node.store
-            .lock()
-            .await
-            .approve_nonce(join_id, admin, nonce)?
+        { let join_id = join_id.to_owned(); let admin = admin.to_owned(); let nonce = nonce.to_owned();
+            node.store.call("approve_nonce", move |store| store.approve_nonce(&join_id, &admin, &nonce)).await }?
     } else {
         let event: GovernanceEvent = from_field(params, "event")?;
-        let (request, state) = node
-            .store
-            .lock()
-            .await
-            .approve_grant(join_id, admin, event)?;
+        let (request, state) = { let join_id = join_id.to_owned(); let admin = admin.to_owned();
+            node.store.call("approve_grant", move |store| store.approve_grant(&join_id, &admin, event)).await }?;
         node.install_membership(state.clone()).await?;
         request
     };
@@ -1674,7 +1671,7 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     }
     if matches!(
         input["method"].as_str(),
-        Some("message" | "presence" | "notifications" | "ack")
+        Some("message" | "presence" | "notifications" | "ack" | "workspace_command_receipt" | "signed_receipt")
     ) {
         input
             .as_object_mut()
@@ -1865,10 +1862,8 @@ async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Resul
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    node.store
-        .lock()
-        .await
-        .verify_bootstrap_capability(text(params, "capability")?)?;
+    { let capability = text(params, "capability")?.to_owned();
+        node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
     let ticket = parse_join_link(text(params, "link")?)?;
     let link = JoinLink::open(node, &ticket).await?;
     let reply = link
@@ -1926,10 +1921,8 @@ pub(crate) async fn start_node_join(
         "this Node already belongs to a personal network"
     );
     if let JoinOwner::Page(capability) = &owner {
-        node.store
-            .lock()
-            .await
-            .verify_bootstrap_capability(capability)?;
+        { let capability = capability.clone();
+            node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
     }
     let mut slot = node
         .node_join
@@ -2681,11 +2674,7 @@ mod tests {
             signature: String::new(),
         };
         record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
-        target
-            .store
-            .lock()
-            .await
-            .register_invite(&record, &record.issuer)?;
+        target.store.call("fixture_invite", move |store| store.register_invite(&record, &record.issuer)).await?;
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,
@@ -4612,7 +4601,7 @@ mod tests {
             assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
-            assert!(vibeface_control::client::Connection::open(&origin, &vibeface_secure::Identity::from_secret_hex(&admin.secret_key_hex)?, &LocalIdentity::generate().device_id()?).await.is_err());
+            assert!(vibeface_client::Connection::open(&origin, &vibeface_secure::Identity::from_secret_hex(&admin.secret_key_hex)?, &LocalIdentity::generate().device_id()?).await.is_err());
 
             let ws = |page: &str| -> Result<_> {
                 let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;

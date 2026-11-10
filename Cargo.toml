@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/bridge", "crates/control", "apps/core", "apps/cli", "crates/secure", "crates/secure-ffi", "crates/delivery"]
+members = ["crates/protocol", "crates/bridge", "crates/control", "crates/client", "apps/core", "apps/cli", "apps/desktop", "crates/secure", "crates/secure-ffi", "crates/delivery"]
 exclude = ["crates/delivery/proof"]
 resolver = "3"
 
@@ -36,3 +36,4 @@ uuid = { version = "1", features = ["v4"] }
 vibeface-protocol = { path = "crates/protocol" }
 vibeface-bridge = { path = "crates/bridge" }
 vibeface-control = { path = "crates/control" }
+vibeface-client = { path = "crates/client" }

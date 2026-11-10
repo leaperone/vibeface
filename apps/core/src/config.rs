@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "3a010aaa0a9b67d159e42314ed1ab29c34bbb25374de7fbd1a0e31bddebe9401";
+    "80f37085394dc2cbb1f2d3f9eae4e3590393fe2acc5b22affaa594266f1fae7d";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub use vibeface_control::UPDATE_PROTOCOL;
 pub fn data_epoch_marker() -> Vec<u8> {

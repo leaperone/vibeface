@@ -1,0 +1,262 @@
+use anyhow::{Context, Result, bail, ensure};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
+use vibeface_secure::{Channel, Handshake, Identity};
+use vibeface_secure_ffi::lan::{LanStream, lan_connect};
+use crate::identity::{Entry, PROLOGUE};
+
+const LIMIT: usize = 64;
+const MAX_REQUEST: usize = 1024 * 1024;
+const TIMEOUT: Duration = Duration::from_secs(60);
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Clone, Debug)]
+pub enum Endpoint {
+    Gateway(Entry),
+    Local(Entry),
+    Lan { node_id: String, addresses: Vec<String> },
+}
+impl Endpoint {
+    pub fn node_id(&self) -> &str {
+        match self { Self::Gateway(e) | Self::Local(e) => &e.node_id, Self::Lan { node_id, .. } => node_id }
+    }
+}
+
+/// An explicit Node refusal, distinct from a transport failure with an unknown outcome.
+#[derive(Debug)]
+pub struct Refused(pub String);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for Refused {}
+
+struct Request { id: String, bytes: Vec<u8>, reply: oneshot::Sender<Result<Value>> }
+struct Pending { reply: oneshot::Sender<Result<Value>>, deadline: tokio::time::Instant }
+
+/// A bounded multiplexed Noise connection. Dropping a caller never cancels the stream reader.
+#[derive(Clone)]
+pub struct Connection { requests: mpsc::Sender<Request>, pushes: broadcast::Sender<Value> }
+impl Connection {
+    pub async fn open(origin: &str, identity: &Identity, target: &str) -> Result<Self> {
+        Self::open_endpoint(&Endpoint::Gateway(Entry { origin: origin.into(), node_id: target.into() }), identity).await
+    }
+    pub async fn open_endpoint(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
+        tokio::time::timeout(Duration::from_secs(20), Self::handshake(endpoint, identity)).await.context("client handshake timed out")?
+    }
+    async fn handshake(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
+        let mut transport = match endpoint {
+            Endpoint::Gateway(entry) | Endpoint::Local(entry) => {
+                if matches!(endpoint, Endpoint::Local(_)) {
+                    let url = reqwest::Url::parse(&entry.origin)?;
+                    ensure!(matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "local endpoint must be loopback");
+                }
+                let (mut socket, _) = tokio_tungstenite::connect_async(client_url(&entry.origin)?).await?;
+                socket.send(Message::Text(json!({"type":"connect","target":entry.node_id}).to_string().into())).await?;
+                Transport::Web(socket)
+            }
+            Endpoint::Lan { node_id, addresses } => Transport::Lan(lan_connect(node_id.clone(), addresses.clone(), 10_000).await?),
+        };
+        let mut handshake = Handshake::signed(true, identity, Some(endpoint.node_id().into()), PROLOGUE)?;
+        transport.send(handshake.write(&[])?).await?;
+        loop {
+            match transport.recv().await? {
+                Message::Binary(bytes) => { ensure!(handshake.read(&bytes)?.is_empty(), "unexpected handshake payload"); break; }
+                Message::Text(text) => ensure!(serde_json::from_str::<Value>(&text)?["type"] == "queued", "entry refused connection"),
+                Message::Close(_) => bail!("entry closed connection"),
+                _ => {}
+            }
+        }
+        transport.send(handshake.write(&[])?).await?;
+        ensure!(handshake.remote_id().as_deref() == Some(endpoint.node_id()), "Node device key mismatch");
+        Ok(Self::spawn(transport, handshake.finish()?))
+    }
+    fn spawn(transport: Transport, channel: Channel) -> Self {
+        let (requests, incoming) = mpsc::channel(LIMIT);
+        let (pushes, _) = broadcast::channel(128);
+        let (frames_tx, frames) = mpsc::channel(16);
+        let (writer, reader) = transport.split();
+        let reader_task = tokio::spawn(async move { reader.run(frames_tx).await; });
+        let events = pushes.clone();
+        tokio::spawn(async move {
+            run(incoming, frames, writer, channel, events).await;
+            reader_task.abort();
+        });
+        Self { requests, pushes }
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<Value> { self.pushes.subscribe() }
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_bytes(serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"method":method,"params":params}))?).await
+    }
+    /// Sends the original persisted envelope, without regenerating its ID or signature.
+    pub async fn call_bytes(&self, bytes: Vec<u8>) -> Result<Value> {
+        ensure!(bytes.len() <= MAX_REQUEST, "request exceeds limit");
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let id = value["id"].as_str().context("request ID missing")?.to_owned();
+        let (reply, response) = oneshot::channel();
+        self.requests.send(Request { id, bytes, reply }).await.context("connection closed; outcome unknown")?;
+        response.await.context("connection closed; outcome unknown")?
+    }
+}
+
+async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<Result<Message>>, mut writer: Writer, mut channel: Channel, pushes: broadcast::Sender<Value>) {
+    let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                request = requests.recv(), if pending.len() < LIMIT => {
+                    let Some(request) = request else { return Ok(()); };
+                    if request.reply.is_closed() { continue; }
+                    if pending.contains_key(&request.id) {
+                        let _ = request.reply.send(Err(anyhow::anyhow!("request already in flight"))); continue;
+                    }
+                    let records = channel.seal_message(&request.bytes)?;
+                    pending.insert(request.id, Pending { reply: request.reply, deadline: tokio::time::Instant::now() + TIMEOUT });
+                    for record in records { tokio::time::timeout(Duration::from_secs(10), writer.send(record)).await.context("write timed out; outcome unknown")??; }
+                }
+                frame = frames.recv() => {
+                    let frame = frame.context("connection ended; outcome unknown")??;
+                    match frame {
+                        Message::Binary(bytes) => {
+                            let Some(plain) = channel.open_record(&bytes)? else { continue; };
+                            ensure!(plain.len() <= 4 * MAX_REQUEST, "response exceeds limit");
+                            let mut value: Value = serde_json::from_slice(&plain)?;
+                            if let Some(id) = value["id"].as_str() {
+                                if let Some(request) = pending.remove(id) {
+                                    let answer = match value["error"].as_str() { Some(error) => Err(Refused(error.into()).into()), None => Ok(value["result"].take()) };
+                                    let _ = request.reply.send(answer);
+                                }
+                            } else { let _ = pushes.send(value); }
+                        }
+                        Message::Close(_) => bail!("connection closed; outcome unknown"),
+                        _ => {}
+                    }
+                }
+                _ = tick.tick() => {
+                    let expired: Vec<_> = pending.iter().filter(|(_,p)| p.deadline <= tokio::time::Instant::now()).map(|(id,_)| id.clone()).collect();
+                    for id in expired { if let Some(p) = pending.remove(&id) { let _ = p.reply.send(Err(anyhow::anyhow!("request timed out; outcome unknown"))); } }
+                }
+            }
+        }
+    }.await;
+    let error = result.err().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
+    for (_, p) in pending { let _ = p.reply.send(Err(anyhow::anyhow!(error.clone()))); }
+    let _ = pushes.send(json!({"type":"disconnected"}));
+    writer.close().await;
+}
+
+enum Transport { Web(Socket), Lan(Arc<LanStream>) }
+impl Transport {
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => Ok(s.send(bytes)?) } }
+    async fn recv(&mut self) -> Result<Message> { match self { Self::Web(s) => s.next().await.context("connection ended")?.map_err(Into::into), Self::Lan(s) => lan_frame(s).await } }
+    fn split(self) -> (Writer, Reader) { match self { Self::Web(s) => { let (w,r)=s.split(); (Writer::Web(w),Reader::Web(r)) }, Self::Lan(s) => (Writer::Lan(s.clone()), Reader::Lan(s)) } }
+}
+enum Writer { Web(futures_util::stream::SplitSink<Socket, Message>), Lan(Arc<LanStream>) }
+impl Writer {
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => Ok(s.send(bytes)?) } }
+    async fn close(&mut self) { match self { Self::Web(s) => { let _ = s.close().await; }, Self::Lan(s) => s.close() } }
+}
+enum Reader { Web(futures_util::stream::SplitStream<Socket>), Lan(Arc<LanStream>) }
+impl Reader {
+    async fn run(mut self, tx: mpsc::Sender<Result<Message>>) {
+        loop {
+            let frame = match &mut self { Self::Web(s) => match s.next().await { Some(f) => f.map_err(Into::into), None => return }, Self::Lan(s) => lan_frame(s).await };
+            let ended = frame.is_err() || matches!(&frame, Ok(Message::Close(_)));
+            if tx.send(frame).await.is_err() || ended { return; }
+        }
+    }
+}
+async fn lan_frame(stream: &Arc<LanStream>) -> Result<Message> {
+    let frame = stream.clone().recv().await?.context("LAN connection closed")?;
+    Ok(if frame.text { Message::Text(String::from_utf8(frame.data)?.into()) } else { Message::Binary(frame.data.into()) })
+}
+pub(crate) fn client_url(origin: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(origin)?;
+    ensure!(url.username().is_empty() && url.password().is_none() && url.fragment().is_none(), "invalid entry URL");
+    let scheme = match url.scheme() { "http" => "ws", "https" => "wss", _ => bail!("entry must use http or https") };
+    url.set_scheme(scheme).map_err(|()| anyhow::anyhow!("invalid entry URL"))?;
+    url.set_path("/api/client"); url.set_query(None); Ok(url.to_string())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    type ServerSocket=tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+    pub(crate) async fn server(listener: tokio::net::TcpListener, identity: &Identity) -> Result<(ServerSocket,Channel)> {
+        let (tcp,_)=listener.accept().await?;
+        let mut socket=tokio_tungstenite::accept_async(tcp).await?;
+        let connect=socket.next().await.context("connect frame")??;
+        ensure!(matches!(connect,Message::Text(_)),"connect frame missing");
+        let mut handshake=Handshake::signed(false,identity,None,PROLOGUE)?;
+        let Message::Binary(first)=socket.next().await.context("first handshake")?? else {bail!("expected Noise")};
+        handshake.read(&first)?;
+        socket.send(Message::Binary(handshake.write(&[])?.into())).await?;
+        let Message::Binary(last)=socket.next().await.context("last handshake")?? else {bail!("expected Noise")};
+        handshake.read(&last)?;
+        Ok((socket,handshake.finish()?))
+    }
+    pub(crate) async fn receive(socket: &mut ServerSocket,channel: &mut Channel)->Result<Value> {
+        loop { let Message::Binary(bytes)=socket.next().await.context("frame")?? else {continue};
+            if let Some(bytes)=channel.open_record(&bytes)? {return Ok(serde_json::from_slice(&bytes)?)}
+        }
+    }
+    pub(crate) async fn send(socket: &mut ServerSocket,channel: &mut Channel,value: Value)->Result<()> {
+        for bytes in channel.seal_message(&serde_json::to_vec(&value)?)? {socket.send(Message::Binary(bytes.into())).await?;} Ok(())
+    }
+    #[tokio::test]
+    async fn noise_multiplexes_out_of_order_responses_and_keeps_pushes() -> Result<()> {
+        let node=Identity::generate()?;let client=Identity::generate()?;
+        let target=node.device_id();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin=format!("http://{}",listener.local_addr()?);
+        let node_task=tokio::spawn(async move {
+            let (mut socket,mut channel)=server(listener,&node).await?;
+            let one=receive(&mut socket,&mut channel).await?;
+            let two=receive(&mut socket,&mut channel).await?;
+            send(&mut socket,&mut channel,json!({"type":"changed","scope":"chat"})).await?;
+            send(&mut socket,&mut channel,json!({"id":two["id"],"result":two["params"]})).await?;
+            send(&mut socket,&mut channel,json!({"id":one["id"],"result":one["params"]})).await?;
+            Ok::<_,anyhow::Error>(())
+        });
+        let connection=Connection::open(&origin,&client,&target).await?;
+        let mut events=connection.subscribe();
+        let (one,two)=tokio::join!(connection.call("one",json!({"answer":1})),connection.call("two",json!({"answer":2})));
+        assert_eq!(one?,json!({"answer":1}));assert_eq!(two?,json!({"answer":2}));
+        assert_eq!(events.recv().await?,json!({"type":"changed","scope":"chat"}));
+        node_task.await??;Ok(())
+    }
+    #[tokio::test]
+    async fn cancelling_one_request_does_not_corrupt_the_next_noise_record() -> Result<()> {
+        let node=Identity::generate()?;let client=Identity::generate()?;let target=node.device_id();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin=format!("http://{}",listener.local_addr()?);
+        let (seen_tx,seen_rx)=oneshot::channel();let (continue_tx,continue_rx)=oneshot::channel();
+        let server_task=tokio::spawn(async move {
+            let (mut socket,mut channel)=server(listener,&node).await?;
+            let first=receive(&mut socket,&mut channel).await?;let _=seen_tx.send(());
+            continue_rx.await?;
+            send(&mut socket,&mut channel,json!({"id":first["id"],"result":{"cancelled_caller":true}})).await?;
+            let second=receive(&mut socket,&mut channel).await?;
+            send(&mut socket,&mut channel,json!({"id":second["id"],"result":{"alive":true}})).await?;
+            Ok::<_,anyhow::Error>(())
+        });
+        let connection=Connection::open(&origin,&client,&target).await?;
+        let first=connection.clone();let caller=tokio::spawn(async move {first.call("one",json!({})).await});
+        seen_rx.await?;caller.abort();let _=continue_tx.send(());
+        assert_eq!(connection.call("two",json!({})).await?,json!({"alive":true}));
+        server_task.await??;Ok(())
+    }
+    #[tokio::test]
+    async fn wrong_noise_device_key_is_rejected() -> Result<()> {
+        let node=Identity::generate()?;let client=Identity::generate()?;
+        let wrong=Identity::generate()?.device_id();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin=format!("http://{}",listener.local_addr()?);
+        let server_task=tokio::spawn(async move {server(listener,&node).await});
+        assert!(Connection::open(&origin,&client,&wrong).await.is_err());
+        server_task.abort();Ok(())
+    }
+}

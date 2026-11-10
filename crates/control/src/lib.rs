@@ -303,7 +303,6 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 }
 
 pub mod agent;
-pub mod client;
 pub mod maintenance;
 pub mod observation;
 

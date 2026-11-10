@@ -29,6 +29,8 @@ import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
 import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
+import { notificationOpenings } from '../../../../../apps/mobile/src/platform/notification-opens.ts'
+import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
@@ -4512,43 +4514,50 @@ test('a missing native or web recovery copy never enables external-save confirma
   }
 })
 
-test('native notification callbacks replace tags, open once, stay bounded and clear on erase', async () => {
+test('native system notification events keep typed destinations and clear navigation on erase', async () => {
   const fixture = nativeFileFixture()
   const owned = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
   const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
-  let response: ((value: { notification: { request: { content: { data: { tag: string } } } } }) => void) | undefined
-  let calls = 0, dismissed = 0, forgotten = 0
+  type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
+  let response: ((value: Response) => void) | undefined
+  let dismissed = 0, forgotten = 0
+  const storage = new Map<string, string>()
+  const scheduled: unknown[] = []
   const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
     'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
     'expo-file-system': fixture.native,
     'expo-notifications': {
       setNotificationHandler() {}, AndroidImportance: { HIGH: 1 }, setNotificationChannelAsync: async () => {},
-      addNotificationResponseReceivedListener(listener: typeof response) { response = listener },
-      scheduleNotificationAsync: async () => 'scheduled', dismissAllNotificationsAsync: async () => { dismissed++ },
+      addNotificationResponseReceivedListener(listener: typeof response) { response = listener; return { remove() { response = undefined } } },
+      getLastNotificationResponseAsync: async () => null, clearLastNotificationResponseAsync: async () => {},
+      scheduleNotificationAsync: async (value: unknown) => { scheduled.push(value); return 'scheduled' },
+      dismissAllNotificationsAsync: async () => { dismissed++ },
     },
-    'react-native-mmkv': { createMMKV: () => ({ getString() {}, set() {}, clearAll() {}, getAllKeys: () => [] }) },
+    'react-native-mmkv': { createMMKV: () => ({ getString: (key: string) => storage.get(key), set: (key: string, value: string) => storage.set(key, value), clearAll: () => storage.clear(), getAllKeys: () => [...storage.keys()] }) },
     '@vibeface/secure-native': { lan: {}, secure: {} },
     '@vibeface/client/lib/transport.ts': { createTransport: () => ({ forgetClient: async () => { forgotten++ } }) },
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
-  }, {}, 'opens')
-  const { mobilePlatform, opens } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts') & { opens: Map<string, () => void> }
-  const show = (tag: string, open = () => { calls++ }) => mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag }, open)
-  const click = (tag: string) => response?.({ notification: { request: { content: { data: { tag } } } } })
-  show('same', () => { calls += 10 }); show('same')
-  assert.equal(opens.size, 1)
-  click('same'); click('same')
-  assert.equal(calls, 1)
-  assert.equal(opens.size, 0)
-  for (let index = 0; index < 1100; index++) show(String(index))
-  assert.equal(opens.size, 1000)
-  click('0'); assert.equal(calls, 1)
-  click('1099'); assert.equal(calls, 2)
+    './notification-opens': { notificationOpenings },
+  })
+  const { mobilePlatform } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts')
+  const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
+  const opened: NotificationDestination[] = []
+  const unwatch = mobilePlatform.notifier.watchOpen?.(async value => { opened.push(value); return true })
+  mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
+  await privateFiles.run(async () => {})
+  const event: Response = { notification: { date: 1, request: { identifier: 'same', content: { data: { destination } } } }, actionIdentifier: 'open' }
+  response?.(event); response?.(event)
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.deepEqual(opened, [destination])
+  assert.deepEqual(JSON.parse(JSON.stringify(scheduled)), [{ identifier: 'same', content: { title: 'fixture', body: 'fixture', data: { destination } }, trigger: { channelId: 'vibeface' } }])
   await mobilePlatform.erase?.()
-  assert.equal(opens.size, 0)
+  response?.({ ...event, notification: { ...event.notification, date: 2 } })
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.deepEqual(opened, [destination], 'erase removes the navigation consumer')
   assert.equal(dismissed, 1)
   assert.equal(forgotten, 1)
-  click('1000'); assert.equal(calls, 2)
+  unwatch?.()
 })
 
 test('the native switch confirmation fixes the decoded entry and never erases for a changed link or cancellation', async () => {

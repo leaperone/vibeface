@@ -19,10 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with: {version: 11.9.0}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+        with: {node-version: '24'}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: '3.12'}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -40,12 +38,10 @@ jobs:
         with:
           name: web-${{ inputs.source_sha }}
           path: apps/app/dist/client
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-        if: inputs.package_artifact == ''
+      - uses: ./.github/actions/native-desktop
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        if: inputs.package_artifact == ''
         with:
-          key: desktop-native-${{ inputs.target }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
+          key: gpui-native-${{ inputs.target }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: ./.github/actions/msvc-environment
@@ -91,12 +87,8 @@ jobs:
         run: |
           node scripts/private-control.mjs --self-test
           "$PY" -B scripts/verify-windows-node.py --package "$PACKAGE" --artifacts .artifacts/ci-windows-node
-      - name: Build the desktop host from this source
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --dir apps/desktop typecheck
-          pnpm --dir apps/desktop test
-          pnpm --dir apps/desktop build
+      - name: Test the native desktop features
+        run: cargo test -p vibeface-desktop --locked
       - name: Build the desktop application around the verified runtime
         env:
           TARGET: ${{ inputs.target }}
@@ -143,18 +135,6 @@ jobs:
           fi
           test -e "$application"
           printf 'path=%s\n' "$application" >> "$GITHUB_OUTPUT"
-      - name: Prepare the Linux GUI and sandbox helper
-        if: runner.os == 'Linux'
-        run: |
-          command -v xvfb-run
-          # Hosted images omit CJK fonts; the real Chinese UI must remain readable in captures.
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
-          test -f .artifacts/desktop-app/squashfs-root/chrome-sandbox
-          # A disposable hosted runner installs the extracted Chromium helper with its required
-          # ownership; the application keeps its Chromium sandbox enabled throughout the test.
-          sudo chown root:root .artifacts/desktop-app/squashfs-root/chrome-sandbox
-          sudo chmod 4755 .artifacts/desktop-app/squashfs-root/chrome-sandbox
       - name: Prepare the hosted Linux current-user service session
         if: runner.os == 'Linux'
         run: |
@@ -169,18 +149,26 @@ jobs:
           test -S "$XDG_RUNTIME_DIR/bus"
           systemctl --user show-environment >/dev/null
           printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
-      - name: Drive the real desktop window end to end
+      - name: Drive the packaged native GPUI window
         env:
-          VIBEFACE_E2E_DESKTOP_APP: ${{ steps.application.outputs.path }}
-          VIBEFACE_E2E_DESKTOP_RUNTIME: ${{ steps.runtime.outputs.dir }}
-          E2E_TELEMETRY_DISABLED: '1'
+          APPLICATION: ${{ steps.application.outputs.path }}
+          RUNTIME: ${{ steps.runtime.outputs.dir }}
         run: |
-          pnpm test:e2e:check
+          arguments=(--app "$APPLICATION" --runtime "$RUNTIME" --output .artifacts/native-desktop-acceptance)
           if [[ "$RUNNER_OS" == Linux ]]; then
-            xvfb-run --auto-servernum --server-args='-screen 0 1440x1000x24' pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
+            xvfb-run --auto-servernum --server-args='-screen 0 1440x1000x24' node scripts/e2e-desktop.mjs "${arguments[@]}"
           else
-            pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
+            node scripts/e2e-desktop.mjs "${arguments[@]}"
           fi
+      - name: Verify the real per-user Windows installer and installed application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUNTIME: ${{ steps.runtime.outputs.dir }}
+        run: |
+          $installer = @(Get-ChildItem .artifacts/desktop/*.exe)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one native installer' }
+          ./scripts/native-desktop/installer.ps1 -Installer $installer[0].FullName -Runtime $env:RUNTIME -PortableApp "$PWD/.artifacts/desktop-app/Vibeface.exe" -Output "$PWD/.artifacts/native-desktop-installer"
       - name: Keep compact desktop failure evidence independently
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() }}
@@ -188,9 +176,8 @@ jobs:
           name: desktop-diagnostics-${{ inputs.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
           path: |
             .artifacts/ci-windows-node
-            .artifacts/e2e/desktop/*.log
-            tests/e2e/.artifacts/desktop
-            !tests/e2e/.artifacts/desktop/**/downloads/**
+            .artifacts/native-desktop-acceptance
+            .artifacts/native-desktop-installer
           if-no-files-found: warn
           retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -200,8 +187,7 @@ jobs:
           path: |
             .artifacts/desktop/*
             .artifacts/ci-windows-node
-            .artifacts/e2e/desktop/*.log
-            tests/e2e/.artifacts/desktop
-            !tests/e2e/.artifacts/desktop/**/downloads/**
+            .artifacts/native-desktop-acceptance
+            .artifacts/native-desktop-installer
           if-no-files-found: warn
           retention-days: 14

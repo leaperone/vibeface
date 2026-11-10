@@ -1367,6 +1367,9 @@ table "work_runs" {
   index "work_runs_thread" {
     columns = [column.thread_id]
   }
+  index "work_runs_reconcile" {
+    columns = [column.state, column.send_by_ms, column.work_id]
+  }
 }
 table "work_dispatches" {
   schema = schema.main

@@ -1477,17 +1477,43 @@ fn graph_at(
         }
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let basis = ancestors(connection, network, &event)?.values().fold(
+        let basis = projection_basis(connection, network, &event)?;
+        graph.record(&hash, &event, &super::rank(lamport, created, &hash), basis)?;
+    }
+    Ok(graph)
+}
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AUTHORIZATION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn projection_ancestor_walks() -> usize { PROJECTION_ANCESTORS.with(std::cell::Cell::get) }
+#[cfg(test)]
+pub(crate) fn reset_projection_ancestor_walks() {
+    PROJECTION_ANCESTORS.with(|count| count.set(0));
+    AUTHORIZATION_ANCESTORS.with(|count| count.set(0));
+}
+#[cfg(test)]
+pub(crate) fn authorization_ancestor_walks() -> usize { AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get) }
+
+fn projection_basis(connection: &Connection, network: &str, event: &Event) -> Result<VersionVector> {
+    let needs_basis = matches!(&event.body, EventBody::WorkspaceCommanded { .. });
+    #[cfg(test)]
+    let needs_basis = needs_basis || log::test_metrics::legacy();
+    if !needs_basis {
+        return Ok(VersionVector::new());
+    }
+    #[cfg(test)]
+    PROJECTION_ANCESTORS.with(|count| count.set(count.get() + 1));
+    Ok(ancestors(connection, network, event)?.values().fold(
             VersionVector::new(),
             |mut vector, event| {
                 let seq = vector.entry(event.author.clone()).or_default();
                 *seq = (*seq).max(event.seq);
                 vector
             },
-        );
-        graph.record(&hash, &event, &super::rank(lamport, created, &hash), basis)?;
-    }
-    Ok(graph)
+        ))
 }
 pub(crate) fn apply_projection(
     connection: &Connection,
@@ -1500,14 +1526,7 @@ pub(crate) fn apply_projection(
     if rank < graph.last_rank.as_str() {
         graph = graph_at(connection, network, None)?;
     } else {
-        let basis = ancestors(connection, network, event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        );
+        let basis = projection_basis(connection, network, event)?;
         graph.record(hash, event, rank, basis)?;
     }
     graph.save(connection, network)?;
@@ -1687,6 +1706,8 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
     ) {
         return Ok(());
     }
+    #[cfg(test)]
+    AUTHORIZATION_ANCESTORS.with(|count| count.set(count.get() + 1));
     let known = ancestors(connection, network, event)?;
     let mut graph = graph_at(connection, network, Some(&known))?;
     let projected = Graph::read(connection, network)?;

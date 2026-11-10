@@ -398,13 +398,7 @@ pub struct RuntimeSelection {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnExecution {
-    NotStarted,
-    Started,
-    Unknown,
-}
+
 
 /// Safe submitted configuration and execution evidence. Native identifiers and credentials stay local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -822,3 +816,5 @@ mod lane_tests {
         assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
     }
 }
+
+pub use vibeface_protocol::workspace::{TurnExecution};

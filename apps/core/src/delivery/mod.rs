@@ -101,6 +101,53 @@ impl DeliveryConfig {
         Ok(())
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeliveryAvailability {
+    Disabled,
+    Ready,
+    Unavailable { reason: String },
+}
+
+struct DeliverySettings {
+    config: Option<DeliveryConfig>,
+    availability: DeliveryAvailability,
+}
+impl DeliverySettings {
+    fn load(path: &Path) -> Self {
+        let loaded = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeliveryConfig::default()),
+            Err(error) => Err(error.into()),
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                Err(anyhow::anyhow!("delivery settings must be a regular private file"))
+            }
+            Ok(_) => vibeface_bridge::platform::privatefs::read_private_bounded(
+                path, 64 * 1024, "delivery settings",
+            ).and_then(|bytes| {
+                serde_json::from_slice::<DeliveryConfig>(&bytes).map_err(|error| {
+                    anyhow::anyhow!("incompatible settings JSON at line {} column {}", error.line(), error.column())
+                })
+            }),
+        };
+        match loaded {
+            Ok(config) => {
+                let availability = if !config.enabled {
+                    DeliveryAvailability::Disabled
+                } else if let Err(error) = config.validate() {
+                    DeliveryAvailability::Unavailable { reason: format!("delivery settings are invalid: {error}. Preserve delivery-settings.json and repair it locally, then restart the Node") }
+                } else {
+                    DeliveryAvailability::Ready
+                };
+                Self { config: Some(config), availability }
+            }
+            Err(error) => Self {
+                config: None,
+                availability: DeliveryAvailability::Unavailable { reason: format!("delivery settings could not be loaded: {error}. Preserve delivery-settings.json and repair its contents or access locally, then restart the Node") },
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ReceivingMaterial {
     binding: SignedKeyBinding,
@@ -110,7 +157,7 @@ struct ReceivingMaterial {
 pub struct Delivery {
     data_dir: PathBuf,
     identity: LocalIdentity,
-    settings: Mutex<DeliveryConfig>,
+    settings: Mutex<DeliverySettings>,
     store: Mutex<Option<ServiceStore>>,
     pub(crate) wallet: Mutex<wallet::Wallet>,
     proofs: proof::ProofRunner,
@@ -125,19 +172,21 @@ pub struct Delivery {
 }
 impl Delivery {
     pub fn open(dir: &Path, identity: LocalIdentity) -> Result<Self> {
-        let settings = dir.join("delivery-settings.json");
-        let config = if settings.try_exists()? {
-            serde_json::from_slice(&std::fs::read(settings)?)?
+        identity.device_id().context("invalid Node identity for delivery")?;
+        let settings = DeliverySettings::load(&dir.join("delivery-settings.json"));
+        let paid = settings.availability == DeliveryAvailability::Ready
+            && settings.config.as_ref().is_some_and(|config| config.paid_enabled);
+        let wallet = if paid {
+            wallet::Wallet::open(dir.join("delivery-wallet.json"))?
         } else {
-            DeliveryConfig::default()
+            wallet::Wallet::deferred(dir.join("delivery-wallet.json"))
         };
-        config.validate()?;
         Ok(Self {
             data_dir: dir.to_owned(),
             identity,
-            settings: Mutex::new(config),
+            settings: Mutex::new(settings),
             store: Mutex::new(None),
-            wallet: Mutex::new(wallet::Wallet::open(dir.join("delivery-wallet.json"))?),
+            wallet: Mutex::new(wallet),
             proofs: Default::default(),
             service_slots: tokio::sync::Semaphore::new(16),
             peer_slots: Mutex::new(HashMap::new()),
@@ -150,22 +199,56 @@ impl Delivery {
         })
     }
     pub fn config(&self) -> DeliveryConfig {
-        self.settings.lock().expect("delivery settings").clone()
+        let settings = self.settings.lock().expect("delivery settings");
+        let mut config = settings.config.clone().unwrap_or_default();
+        // An unavailable capability never authorizes work. The original settings stay on disk.
+        if matches!(settings.availability, DeliveryAvailability::Unavailable { .. }) {
+            config.enabled = false;
+        }
+        config
+    }
+    pub fn availability(&self) -> DeliveryAvailability {
+        self.settings.lock().expect("delivery settings").availability.clone()
+    }
+    fn ensure_available(&self) -> Result<()> {
+        if let DeliveryAvailability::Unavailable { reason } = self.availability() {
+            bail!("{reason}");
+        }
+        Ok(())
     }
     pub(crate) fn attach(&self, runtime: Weak<Runtime>) -> Result<()> {
         ensure!(
             self.runtime.set(runtime).is_ok(),
             "delivery runtime already attached"
         );
-        let runtime = self
-            .runtime
-            .get()
-            .context("delivery runtime is not attached")?
-            .clone();
+        self.start_executor();
+        Ok(())
+    }
+    fn start_executor(&self) {
+        if self.availability() != DeliveryAvailability::Ready {
+            return;
+        }
+        let Some(runtime) = self.runtime.get().cloned() else {
+            return;
+        };
+        let mut executor_slot = self.executor.lock().expect("delivery executor");
+        if executor_slot.is_some() {
+            return;
+        }
         let wakeup = self.wakeup.clone();
         let executor = tokio::spawn(async move {
             loop {
-                tokio::select! {_=wakeup.notified()=>{},_=tokio::time::sleep(std::time::Duration::from_secs(5))=>{}}
+                let Some(node) = runtime.upgrade() else {
+                    break;
+                };
+                let ready = node.delivery.availability() == DeliveryAvailability::Ready;
+                drop(node);
+                if ready {
+                    tokio::select! {_=wakeup.notified()=>{},_=tokio::time::sleep(std::time::Duration::from_secs(5))=>{}}
+                } else {
+                    // A previously enabled service sleeps until explicit configuration changes.
+                    wakeup.notified().await;
+                }
                 let Some(node) = runtime.upgrade() else {
                     break;
                 };
@@ -180,9 +263,8 @@ impl Delivery {
                 }
             }
         });
-        *self.executor.lock().expect("delivery executor") = Some(executor);
+        *executor_slot = Some(executor);
         self.wakeup.notify_one();
-        Ok(())
     }
     async fn run_authorized(&self, node: &Runtime) -> Result<()> {
         if !self.config().enabled {
@@ -366,6 +448,7 @@ impl Delivery {
         Ok(())
     }
     pub fn with_store<T>(&self, run: impl FnOnce(&mut ServiceStore) -> Result<T>) -> Result<T> {
+        self.ensure_available()?;
         let config = self.config();
         let mut store = self.store.lock().expect("delivery store");
         if store.is_none() {
@@ -382,22 +465,37 @@ impl Delivery {
         run(store.as_mut().context("delivery store unavailable")?)
     }
     pub fn configure_local(&self, config: DeliveryConfig) -> Result<()> {
-        config.validate()?;
+        self.ensure_available()?;
+        if config.enabled {
+            config.validate()?;
+        }
+        // Enabling paid delivery loads its independent wallet, never a replacement wallet.
+        let mut wallet = self.wallet.lock().expect("delivery wallet");
+        if config.enabled && config.paid_enabled && wallet.is_deferred() {
+            *wallet = wallet::Wallet::open(self.data_dir.join("delivery-wallet.json"))?;
+        }
+        if !config.enabled || !config.paid_enabled {
+            wallet.lock();
+        }
+        drop(wallet);
         let mut store = self.store.lock().expect("delivery store");
-        if let Some(store) = store.as_ref() {
+        if config.enabled && let Some(store) = store.as_ref() {
             store.check_limits(config.storage_limit_bytes, config.max_orders)?;
         }
         crate::config::private_write(
             &self.data_dir.join("delivery-settings.json"),
             &serde_json::to_vec_pretty(&config)?,
         )?;
-        if let Some(store) = store.as_mut() {
+        if config.enabled && let Some(store) = store.as_mut() {
             store.set_limits(config.storage_limit_bytes, config.max_orders);
         }
-        *self.settings.lock().expect("delivery settings") = config;
+        let availability = if config.enabled { DeliveryAvailability::Ready } else { DeliveryAvailability::Disabled };
+        *self.settings.lock().expect("delivery settings") = DeliverySettings { config: Some(config), availability };
+        drop(store);
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         self.wakeup.notify_one();
+        self.start_executor();
         Ok(())
     }
     pub fn status(&self) -> Result<Value> {
@@ -420,7 +518,8 @@ impl Delivery {
             wallet["address"] = Value::Null;
         }
         Ok(
-            json!({"enabled":config.enabled,"charity_enabled":config.charity_enabled,"paid_enabled":config.paid_enabled,
+            json!({"availability":self.availability(),"settings_path":self.data_dir.join("delivery-settings.json"),
+            "enabled":config.enabled,"charity_enabled":config.charity_enabled,"paid_enabled":config.paid_enabled,
             "node_peer":self.identity.device_id()?,"wallet":wallet,
             "max_file_bytes":MAX_FILE_BYTES,"receiver_key":key}),
         )
@@ -436,6 +535,11 @@ impl Delivery {
             if let Some(bytes) = store.value(&label)? {
                 let bytes = Zeroizing::new(bytes);
                 let material: ReceivingMaterial = serde_json::from_slice(&bytes)?;
+                material.binding.verify()?;
+                ensure!(
+                    material.binding.binding.receiver_peer == parse_word(&self.identity.device_id()?)?,
+                    "paid receiving key belongs to another Node; restore the original Node identity and delivery backup"
+                );
                 return Ok(material.binding);
             }
             let material = self.new_receiving_material(1, BindingAction::Active)?;
@@ -464,6 +568,7 @@ impl Delivery {
             .ok_or_else(|| ReceivingKeyUnavailable.into())
     }
     fn ensure_mode(&self, mode: Mode) -> Result<()> {
+        self.ensure_available()?;
         let config = self.config();
         ensure!(config.enabled, "object delivery is disabled");
         ensure!(
@@ -547,6 +652,28 @@ impl Delivery {
         );
         Ok(order)
     }
+
+    fn client_order_receipt(&self, network: &str, id: &str) -> Result<Value> {
+        if !self.data_dir.join("delivery/service.sqlite3").exists() {
+            return Ok(json!({"order":null,"receipt":null}));
+        }
+        if self.with_store(|store| store.charity_order(id))?.is_some() {
+            return self.charity_client_receipt(network, id);
+        }
+        let order = self.scoped_order(network, id)?;
+        Ok(json!({
+            "receipt": {
+                "network_id": network,
+                "node_id": self.identity.device_id()?,
+                "order_id": order.view.order_id,
+                "intent_id": order.view.intent_id,
+                "authorized_by": order.authorized_by,
+                "confirmed": order.confirmed,
+                "accepted": order.accepted,
+            },
+            "order": order.view,
+        }))
+    }
     pub(crate) async fn client_request(
         &self,
         node: &Runtime,
@@ -560,6 +687,7 @@ impl Delivery {
         match op {
             "status" => self.status(),
             "providers" => self.providers(node),
+            "receipt" => self.client_order_receipt(network, text(&params, "order_id")?),
             "find_intent" => {
                 let intent = text(&params, "intent_id")?;
                 uuid::Uuid::parse_str(intent)?;
@@ -821,5 +949,235 @@ fn paid_deadlines(at: u64, profile: &ProofProfile) -> Deadlines {
         open_deadline,
         retain_until: open_deadline + 86400,
         priority_deadline: quote_expires_at + 3600,
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use vibeface_control::maintenance::{SecretString, WalletCommand};
+
+    fn test_dir() -> Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("vibeface-delivery-isolation-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn order_receipts_read_durable_authorization_without_replaying_delivery() -> Result<()> {
+        let dir = test_dir()?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        let absent = delivery.client_order_receipt("personal-network", "missing-order")?;
+        assert_eq!(absent, json!({"order":null,"receipt":null}));
+        assert!(!dir.join("delivery").exists());
+        delivery.configure_local(DeliveryConfig { enabled: true, ..Default::default() })?;
+        let mut order = store::tests::paid_order(Role::Sender);
+        order.network_id = Some("personal-network".into());
+        order.authorized_by = Some("managing-client".into());
+        order.confirmed = false;
+        order.accepted = false;
+        delivery.with_store(|store| store.save_order(&order))?;
+        let id = order.view.order_id.clone();
+        let first = delivery.client_order_receipt("personal-network", &id)?;
+        assert_eq!(first["receipt"]["confirmed"], false);
+        assert_eq!(first["receipt"]["accepted"], false);
+        assert_eq!(first["receipt"]["authorized_by"], "managing-client");
+        order.confirmed = true;
+        order.accepted = true;
+        delivery.with_store(|store| store.save_order(&order))?;
+        let path = dir.join("delivery/service.sqlite3");
+        let before = std::fs::read(&path)?;
+        let confirmed = delivery.client_order_receipt("personal-network", &id)?;
+        assert_eq!(confirmed["receipt"]["confirmed"], true);
+        assert_eq!(confirmed["receipt"]["accepted"], true);
+        assert_eq!(confirmed["order"]["order_id"], id);
+        assert_eq!(confirmed["receipt"]["node_id"], delivery.identity.device_id()?);
+        assert!(delivery.client_order_receipt("another-network", &id).is_err());
+        assert_eq!(std::fs::read(&path)?, before);
+        assert!(!dir.join("delivery-wallet.json").exists());
+        drop(delivery);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_delivery_attaches_without_an_executor_or_loading_wallet_files() -> Result<()> {
+        let dir = test_dir()?;
+        // A directory cannot be a valid wallet. A disabled capability must never read it.
+        std::fs::create_dir(dir.join("delivery-wallet.json"))?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        assert_eq!(delivery.availability(), DeliveryAvailability::Disabled);
+        assert!(delivery.wallet.lock().unwrap().is_deferred());
+        // Running without a Tokio runtime also proves attach did not try to spawn a task.
+        delivery.attach(Weak::new())?;
+        let status = delivery.status()?;
+        assert_eq!(status["availability"]["state"], "disabled");
+        assert_eq!(status["enabled"], false);
+        assert!(!dir.join("delivery").exists());
+        assert!(!dir.join("delivery-settings.json").exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_stale_experimental_values_do_not_block_node_startup() -> Result<()> {
+        let dir = test_dir()?;
+        let path = dir.join("delivery-settings.json");
+        let bytes = serde_json::to_vec(&DeliveryConfig {
+            enabled: false, paid_enabled: true, max_orders: 0,
+            delivery_fee_per_window: "obsolete-value".into(),
+            ..Default::default()
+        })?;
+        crate::config::private_write(&path, &bytes)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.attach(Weak::new())?;
+        assert_eq!(delivery.availability(), DeliveryAvailability::Disabled);
+        assert!(delivery.ensure_mode(Mode::Paid).is_err());
+        let mut enabled = delivery.config();
+        enabled.enabled = true;
+        assert!(delivery.configure_local(enabled).is_err());
+        assert_eq!(std::fs::read(&path)?, bytes);
+        assert!(!dir.join("delivery").exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broken_optional_settings_preserve_originals_and_refuse_spending_and_reset() -> Result<()> {
+        for bytes in [
+            b"{broken experimental settings".to_vec(),
+            br#"{"enabled":true,"paid_enabled":true}"#.to_vec(),
+            br#"{"enabled":false,"removed_setting":"keep for repair"}"#.to_vec(),
+        ] {
+            let dir = test_dir()?;
+            let path = dir.join("delivery-settings.json");
+            crate::config::private_write(&path, &bytes)?;
+            crate::config::private_dir(&dir.join("delivery"))?;
+            let recovery = dir.join("delivery/service.sqlite3");
+            let recovery_bytes = b"synthetic original recovery record";
+            crate::config::private_write(&recovery, recovery_bytes)?;
+            let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+            delivery.attach(Weak::new())?;
+            assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+            assert_eq!(delivery.status()?["availability"]["state"], "unavailable");
+            assert!(!delivery.config().enabled);
+            let error = delivery.configure_local(DeliveryConfig::default()).unwrap_err();
+            assert!(error.to_string().contains("repair"));
+            assert!(delivery.authorize_spend("synthetic/approval").await.is_err());
+            assert!(delivery.local_wallet(WalletCommand::Create {
+                passphrase: SecretString::new("synthetic test passphrase".into()),
+            }).await.is_err());
+            assert_eq!(std::fs::read(&path)?, bytes);
+            assert_eq!(std::fs::read(&recovery)?, recovery_bytes);
+            assert!(!dir.join("delivery-wallet.json").exists());
+            // An explicit local repair is recognized on restart, without deleting recovery data.
+            crate::config::private_write(&path, &serde_json::to_vec(&DeliveryConfig::default())?)?;
+            let repaired = Delivery::open(&dir, LocalIdentity::generate())?;
+            assert_eq!(repaired.availability(), DeliveryAvailability::Disabled);
+            assert_eq!(std::fs::read(&recovery)?, recovery_bytes);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_node_identity_cannot_replace_existing_receiving_keys() -> Result<()> {
+        for mode in [Mode::Charity, Mode::Paid] {
+            let dir = test_dir()?;
+            let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+            delivery.configure_local(DeliveryConfig {
+                enabled: true,
+                charity_enabled: mode == Mode::Charity,
+                paid_enabled: mode == Mode::Paid,
+                chain: (mode == Mode::Paid).then(chain::tests::config),
+                ..Default::default()
+            })?;
+            delivery.status()?;
+            let label = if mode == Mode::Charity {
+                "charity-receiving-current".to_owned()
+            } else {
+                keys::current_key_label(&delivery.config())?
+            };
+            let original = delivery.with_store(|store| store.value(&label))?.unwrap();
+            drop(delivery);
+            let wrong = Delivery::open(&dir, LocalIdentity::generate())?;
+            let error = wrong.status().unwrap_err().to_string();
+            assert!(error.contains("belongs to another Node"), "{error}");
+            assert_eq!(wrong.with_store(|store| store.value(&label))?.unwrap(), original);
+            drop(wrong);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_identity_is_not_hidden_by_optional_settings_failure() -> Result<()> {
+        let dir = test_dir()?;
+        let bytes = b"synthetic broken settings";
+        let path = dir.join("delivery-settings.json");
+        crate::config::private_write(&path, bytes)?;
+        let result = Delivery::open(&dir, LocalIdentity { secret_key_hex: "invalid synthetic key".into() });
+        let error = match result {
+            Ok(_) => panic!("invalid identity must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid Node identity"));
+        assert_eq!(std::fs::read(&path)?, bytes);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_settings_symlink_is_not_treated_as_a_missing_default() -> Result<()> {
+        let dir = test_dir()?;
+        let path = dir.join("delivery-settings.json");
+        let target = dir.join("missing-original-settings.json");
+        std::os::unix::fs::symlink(&target, &path)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+        assert!(delivery.configure_local(DeliveryConfig::default()).is_err());
+        assert_eq!(std::fs::read_link(&path)?, target);
+        assert!(!target.exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn settings_io_errors_are_unavailable_instead_of_defaults() -> Result<()> {
+        let dir = test_dir()?;
+        let path = dir.join("delivery-settings.json");
+        std::fs::create_dir(&path)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.attach(Weak::new())?;
+        assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+        assert!(delivery.configure_local(DeliveryConfig::default()).is_err());
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enabling_paid_delivery_loads_original_wallet_without_replacing_it() -> Result<()> {
+        let dir = test_dir()?;
+        let path = dir.join("delivery-wallet.json");
+        let bytes = b"unreadable encrypted backup fixture";
+        crate::config::private_write(&path, bytes)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.attach(Weak::new())?;
+        delivery.configure_local(DeliveryConfig { enabled: true, ..Default::default() })?;
+        assert!(delivery.wallet.lock().unwrap().is_deferred());
+        delivery.configure_local(DeliveryConfig {
+            enabled: true, paid_enabled: true, chain: Some(chain::tests::config()),
+            ..Default::default()
+        })?;
+        assert!(matches!(delivery.local_wallet(WalletCommand::Status).await?, wallet::WalletStatus::Unavailable { .. }));
+        assert!(delivery.local_wallet(WalletCommand::Create {
+            passphrase: SecretString::new("synthetic test passphrase".into()),
+        }).await.is_err());
+        assert_eq!(std::fs::read(&path)?, bytes);
+        delivery.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

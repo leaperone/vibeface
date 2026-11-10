@@ -45,6 +45,14 @@ function retain(uri: string) {
   catch (cause) { if (file.exists) file.delete(); throw cause }
 }
 
+async function retainAsync(uri: string) {
+  available()
+  selections.create({ idempotent: true, intermediates: true })
+  const file = new File(selections, crypto.randomUUID())
+  try { await new File(uri).copy(file); return file }
+  catch (cause) { if (file.exists) file.delete(); throw cause }
+}
+
 function release(uri: string) {
   if (!uri.startsWith(selectionPrefix)) return
   const file = new File(uri)
@@ -111,4 +119,4 @@ async function erase(clear: () => Promise<void>) {
   } finally { erasing = false }
 }
 
-export const privateFiles = { run, retain, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+export const privateFiles = { run, retain, retainAsync, release, releasePicker, recoveryStorage, erase, recovery, transfers }

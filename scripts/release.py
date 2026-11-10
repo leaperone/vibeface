@@ -31,7 +31,8 @@ WINDOWS_TARGETS = ('x86_64-pc-windows-msvc',)
 DESKTOP_TARGETS = TARGETS
 DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': 'exe',
                       'x86_64-unknown-linux-gnu': 'AppImage', 'aarch64-unknown-linux-gnu': 'AppImage'}
-ELECTRON_VERSION = '45.2.3'
+NATIVE_UI = {'ui': 'gpui', 'gpui_kit': '0.9.1', 'gpui': '0.3.12'}
+DESKTOP_SCHEMA = 2
 SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums')
 VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
 COMMIT = r'[a-f0-9]{40}'
@@ -88,7 +89,7 @@ def read_version(app, root=None):
     root = root or ROOT
     require(app in APPS, 'unknown app')
     directory = root / 'apps' / app
-    if app in ('core', 'cli'):
+    if app in ('core', 'cli', 'desktop'):
         text = (directory / 'Cargo.toml').read_text(encoding='utf-8')
         match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
         require(match, f'{app} must own its package version')
@@ -406,10 +407,11 @@ def compose_offline(target, native_dir, app_archive, output):
         installer = service_installer(target)
         require(installer.is_file(), f'missing user service installer for {target}: scripts/{installer.name}')
         shutil.copy2(installer, directory / 'scripts' / installer.name)
-        shutil.copy2(ROOT / 'README.md', directory / 'README.md')
-        (directory / 'docs').mkdir()
-        for name in ('node.md', 'releasing.md'):
-            shutil.copy2(ROOT / 'packages/docs' / name, directory / 'docs' / name)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('offline_docs', ROOT / 'scripts/offline-docs.py')
+        offline_docs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(offline_docs)
+        offline_docs.assemble(directory)
         (directory / 'RUNTIME-REQUIREMENTS.md').write_text('Requires separately configured Agent programs and credentials.\n')
         os.environ['PACKAGE_TARGET'] = target
         seal_bundle(directory)
@@ -470,13 +472,14 @@ def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
     require(path.is_file(), 'missing desktop provenance receipt')
     info = json.loads(path.read_text(encoding='utf-8'))
     require(set(info) == {'schema', 'app', 'target', 'version', 'tag', 'channel', 'source_commit',
-                          'electron', 'signed', 'signing', 'runtime', 'artifacts'},
+                          'ui', 'gpui_kit', 'gpui', 'signed', 'signing', 'runtime', 'artifacts'},
             'unsupported desktop receipt fields')
-    require(type(info['schema']) is int and info['schema'] == SCHEMA_VERSION, 'invalid desktop receipt schema')
+    require(type(info['schema']) is int and info['schema'] == DESKTOP_SCHEMA, 'invalid desktop receipt schema')
     require(info['app'] == 'desktop' and info['target'] == target, 'desktop receipt is not this platform')
     require(all(info[key] == value for key, value in pins.items()), 'desktop receipt cohort mismatch')
     require(re.fullmatch(COMMIT, info['source_commit']), 'invalid desktop source commit')
-    require(info['electron'] == ELECTRON_VERSION, 'desktop receipt must name the pinned Electron version')
+    require(all(info.get(key) == value for key, value in NATIVE_UI.items()),
+            'desktop receipt must name the pinned native GPUI version')
     require(type(info['signed']) is bool and info['signing'] in SIGNING_STATES, 'invalid desktop signing status')
     require(info['signed'] == (info['signing'] in ('developer-id-notarized', 'authenticode')),
             'desktop signing status and signed flag disagree')
@@ -1398,7 +1401,7 @@ def self_test():
             runtime_digest = digest(collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz')
             info = accepts(lambda produced=produced, target=target, runtime_digest=runtime_digest:
                            verify_desktop_receipt(produced, target, desktop_pins, runtime_digest))
-            require(info['electron'] == ELECTRON_VERSION and len(info['artifacts']) == 2, 'desktop receipt payloads')
+            require(all(info[key] == value for key, value in NATIVE_UI.items()) and len(info['artifacts']) == 2, 'desktop receipt payloads')
             accepts(lambda produced=produced: manifest('product', produced))
             require({p.name for p in produced.iterdir()}
                     == desktop_asset_names(product_version, target) | {'release.json'}, 'desktop producer output set')
@@ -1429,10 +1432,10 @@ def self_test():
                     desktop_variant('stable-unsigned', windows_target, channel='stable'), windows_target,
                     dict(desktop_pins, channel='stable')),
                 'stable desktop distribution requires a signed application')
-        rejects('a desktop receipt claiming another Electron version',
-                lambda: verify_desktop_receipt(desktop_variant('other-electron', mac_target, electron='34.5.8'),
+        rejects('a desktop receipt claiming another native GPUI version',
+                lambda: verify_desktop_receipt(desktop_variant('other-gpui', mac_target, gpui='0.2.2'),
                                                mac_target, desktop_pins),
-                'pinned Electron version')
+                'pinned native GPUI version')
         rejects('a signed flag without a signing kind',
                 lambda: verify_desktop_receipt(
                     desktop_variant('claimed-signed', windows_target, signed=True), windows_target, desktop_pins),

@@ -13,9 +13,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use vibeface_client::{self as client, ClientKey, Enrollment, Entry, Progress};
 use vibeface_control::{
     ControlRequest,
-    client::{self, ClientKey, Enrollment, Entry, Progress},
     maintenance,
 };
 

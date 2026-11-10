@@ -14,21 +14,23 @@ import tempfile
 import urllib.request
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
-    "protocol": ("bridge", "control"),
-    "bridge": ("control",),
-    "secure": ("node", "secure-ffi"),
+    "protocol": ("bridge", "control", "client"),
+    "bridge": ("control", "client"),
+    "secure": ("node", "secure-ffi", "client"),
     "node": (),
     "control": ("node", "cli"),
     "cli": (),
-    "secure-ffi": (),
+    "secure-ffi": ("client",),
+    "client": ("cli",),
     "delivery": ("node",),
 }
 CRATES = {
     "protocol": "vibeface-protocol",
     "bridge": "vibeface-bridge",
     "secure": "vibeface-secure",
+    "client": "vibeface-client",
     "node": "vibeface-core",
     "control": "vibeface-control",
     "cli": "vibeface",
@@ -46,6 +48,7 @@ PATH_RULES = (
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
+    ("client", ("crates/client/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py",
@@ -104,8 +107,6 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly")
             scopes.add("mobile")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
             scopes.add("desktop")
-        if path.startswith("apps/desktop/src/shared/"):
-            scopes.add("web")
     plan = scope_plan(scopes, event, ref_type, channel)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
@@ -133,7 +134,7 @@ def scope_plan(scopes, event, ref_type, channel):
     web = full or bool(scopes & {"web", "mobile"}) or bool(affected & {"node", "cli", "control"})
     www = full or "www" in scopes
     mobile = full or "mobile" in scopes
-    desktop = full or "desktop" in scopes
+    desktop = full or "desktop" in scopes or bool(affected & {"client"})
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
     platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
@@ -459,16 +460,12 @@ def self_test():
     assert www["required_jobs"] == ["quick-check", "www"]
     assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["desktop", "mobile", "web", "www"]
     assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["mobile", "web", "www"]
-    for path in ("apps/desktop/src/main/bounded-read.ts", "apps/desktop/tests/bounded-read.test.ts"):
+    for path in ("apps/desktop/src/host/lifecycle.rs", "apps/desktop/tests/native_host.rs"):
         desktop = make_plan([path], "push")
         assert desktop["scopes"] == ["desktop"] and not desktop["full"]
         assert desktop["required_jobs"] == ["quick-check", "desktop-check"]
         assert not desktop["rust_packages"] and not desktop["web"] and not desktop["delivery"]
         assert not desktop["docs_only"] and not desktop["local_process_modes"]
-    for name in ("contract.ts", "client-contract.ts", "node-view.ts"):
-        shared = make_plan(["apps/desktop/src/shared/" + name])
-        assert shared["scopes"] == ["desktop", "web"]
-        assert shared["required_jobs"] == ["quick-check", "crypto-web", "web", "desktop-check", "package"]
     for path in ("apps/mobile/app/_layout.tsx", "packages/secure-native/src/index.ts"):
         mobile = make_plan([path])
         assert mobile["scopes"] == ["mobile"] and mobile["web"]
@@ -476,14 +473,14 @@ def self_test():
         assert not mobile["rust_packages"] and not mobile["docs_only"]
     for path in ("packages/client/src/lib/transport.ts", "packages/client/src/avatar/face.ts", "packages/client/src/avatar/derived-faces.json", "packages/theme/theme.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"):
         assert make_plan([path])["mobile"], path
-    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
+    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-client", "vibeface", "vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py",
-                 "apps/desktop/electron-builder.cjs", "scripts/build-desktop.mjs"):
+                 "apps/desktop/build/installer.nsi", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
@@ -511,9 +508,10 @@ def self_test():
     assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
     expected = {
         "node": ["vibeface-core"],
-        "bridge": ["vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
-        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface-core", "vibeface-secure-ffi"],
+        "bridge": ["vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
+        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
+        "secure": ["vibeface-secure", "vibeface-client", "vibeface-core", "vibeface", "vibeface-secure-ffi"],
+        "client": ["vibeface-client", "vibeface"],
         "control": ["vibeface-core", "vibeface-control", "vibeface"],
         "cli": ["vibeface"],
         "delivery": ["vibeface-core", "vibeface-delivery"],
@@ -562,7 +560,7 @@ def self_test():
         assert extended["package_matrix"]["include"] == list(PLATFORMS)
         assert extended["package_mode"] == "node"
     needs = {job: {"result": "success" if job in web["required_jobs"] else "skipped"} for job in JOBS}
-    for source, check in (("apps/desktop/src/main/bounded-read.ts", "desktop-check"), ("apps/mobile/app/_layout.tsx", "mobile-check")):
+    for source, check in (("apps/desktop/src/host/lifecycle.rs", "desktop-check"), ("apps/mobile/app/_layout.tsx", "mobile-check")):
         selected = make_plan([source])
         selected_needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
         selected_needs["plan"] = {"result": "success"}
@@ -896,7 +894,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/package.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ("scripts/release.py", "scripts/offline-docs.py", "scripts/offline-docs.json", "README.zh-CN.md", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/Cargo.toml", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)

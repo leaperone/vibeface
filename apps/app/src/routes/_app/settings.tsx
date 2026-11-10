@@ -1,7 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Bell, BellOff, Check, ChevronRight, CircleAlert, CircleCheck, Crown, Download, FlaskConical, Laptop, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
-import { isDesktopHost } from '@/lib/desktop-node-bridge'
+import { Bell, BellOff, Check, ChevronRight, CircleAlert, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
 import { BusyIcon, CountBadge, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
@@ -68,9 +67,6 @@ function SettingsPage() {
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : null : null}
     <SettingsGroup title="高级">
       <ConnectionSettings />
-      {isDesktopHost() ? <Link to="/settings/desktop-node" className="interactive-row block">
-        <SettingsRow icon={Laptop} label="本机节点" description="发现、连接和管理这台电脑上的节点"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
-      </Link> : null}
       <Link to="/settings/lab" className="interactive-row block">
         <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>

@@ -1,0 +1,4 @@
+{
+  "files": {"README.md": "README.md", "README.zh-CN.md": "README.zh-CN.md"},
+  "trees": {"packages/docs": "docs"}
+}

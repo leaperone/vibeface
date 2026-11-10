@@ -27,5 +27,6 @@ tracing.workspace = true
 uuid.workspace = true
 vibeface-bridge.workspace = true
 vibeface-control.workspace = true
+vibeface-client.workspace = true
 vibeface-protocol.workspace = true
 zeroize = { version = "1", features = ["derive"] }

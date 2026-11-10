@@ -41,16 +41,16 @@ impl Runtime {
         let scope = id(input, "conversation_id")?;
         let work_id = id(input, "work_id")?;
         self.require_scope(access, &scope).await?;
-        let store = self.store.lock().await;
-        let work = store
-            .work(&access.network_id, &work_id)?
-            .context("work not found")?;
-        ensure!(
-            work.conversation_id == scope,
-            "work belongs to another conversation"
-        );
-        let target = store.work_input_target(&access.network_id, &scope, &work_id)?;
-        let sources = store.work_source_events(&access.network_id, &scope, &work_id)?;
+        let (work, target, sources) = {
+            let network = access.network_id.clone();
+            self.store.call("chat_controls.work_detail", move |store| {
+                let work = store.work(&network, &work_id)?.context("work not found")?;
+                ensure!(work.conversation_id == scope, "work belongs to another conversation");
+                let target = store.work_input_target(&network, &scope, &work_id)?;
+                let sources = store.work_source_events(&network, &scope, &work_id)?;
+                Ok((work, target, sources))
+            }).await?
+        };
         let mut value = serde_json::to_value(&work)?;
         value["target"] = json!(target);
         value["source_events"] = json!(sources);
@@ -65,24 +65,24 @@ impl Runtime {
         if input["binary"] == true {
             use base64::Engine as _;
             let offset = input["offset"].as_u64().unwrap_or(0);
-            let (size, bytes) = self.store.lock().await.read_blob_range(
-                &access.network_id,
-                scope,
-                hash,
-                offset,
-                BINARY_PAGE,
-            )?;
+            let (size, bytes) = {
+                let network_id = access.network_id.to_owned();
+                let scope = scope.to_owned();
+                let hash = hash.to_owned();
+                self.store.read("chat_controls.read_blob_range", move |store| store.read_blob_range(&network_id, &scope, &hash, offset, BINARY_PAGE)).await
+            }?;
             let start = offset.min(size);
             let end = start + bytes.len() as u64;
             return Ok(json!({"blob_hash":hash,"offset":start,"size":size,
                 "next_offset":(end < size).then_some(end),
                 "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}));
         }
-        let (_, bytes) = self
-            .store
-            .lock()
-            .await
-            .read_blob(&access.network_id, scope, hash)?;
+        let (_, bytes) = {
+            let network_id = access.network_id.to_owned();
+            let scope = scope.to_owned();
+            let hash = hash.to_owned();
+            self.store.read("chat_controls.read_blob", move |store| store.read_blob(&network_id, &scope, &hash)).await
+        }?;
         artifact_page(
             hash,
             &bytes,
@@ -110,12 +110,10 @@ impl Runtime {
         let _upload = self.blob_fetch.lock().await;
         self.require_scope(access, scope).await?;
         let (part, target, committed) = {
-            let store = self.store.lock().await;
-            (
-                store.partial_blob_file(&blob.hash)?,
-                store.blob_file(&blob.hash)?,
-                store.committed_offset(&blob.hash)?,
-            )
+            let hash = blob.hash.clone();
+            self.store.call("chat_controls.upload_paths", move |store| Ok((
+                store.partial_blob_file(&hash)?, store.blob_file(&hash)?, store.committed_offset(&hash)?,
+            ))).await?
         };
         if tokio::fs::metadata(&target)
             .await
@@ -153,10 +151,11 @@ impl Runtime {
         file.write_all(&data).await?;
         file.sync_data().await?;
         let offset = committed + data.len() as u64;
-        self.store
-            .lock()
-            .await
-            .commit_offset(&blob.hash, Some(offset))?;
+        {
+            let hash = blob.hash.to_owned();
+            let committed_offset = Some(offset);
+            self.store.call("chat_controls.commit_offset", move |store| store.commit_offset(&hash, committed_offset)).await
+        }?;
         if offset < blob.size {
             return Ok(json!({"offset":offset,"complete":false}));
         }
@@ -171,12 +170,18 @@ impl Runtime {
         .await??;
         if hash != blob.hash {
             let _ = tokio::fs::remove_file(&part).await;
-            self.store.lock().await.commit_offset(&blob.hash, None)?;
+            {
+                let hash = blob.hash.to_owned();
+                self.store.call("chat_controls.commit_offset", move |store| store.commit_offset(&hash, None)).await
+            }?;
             bail!("attachment failed its hash check; send it again");
         }
         tokio::fs::create_dir_all(target.parent().context("blob directory")?).await?;
         tokio::fs::rename(&part, &target).await?;
-        self.store.lock().await.commit_offset(&blob.hash, None)?;
+        {
+            let hash = blob.hash.to_owned();
+            self.store.call("chat_controls.commit_offset", move |store| store.commit_offset(&hash, None)).await
+        }?;
         Ok(json!({"offset":offset,"complete":true}))
     }
 
@@ -192,56 +197,67 @@ impl Runtime {
         let mut scope_jobs = self.scheduler_scope_jobs(network, scope).await?;
         let owner = self.merge_owner_jobs(network, scope, &mut jobs).await?;
         let local = self.identity.device_id()?;
-        let store = self.store.lock().await;
-        let works = main_works(&store, network, scope)?;
-        let task_jobs = task_observations(&store, scope)?;
+        let (works, task_jobs, checks, deliveries, conversation, targets, bot, messages, changes, overwritten, omitted_sent, questions, sessions, skills, schedules, now, memory, memory_sync_conflicts, memory_staged_count, memory_conflicts, unanswered) = {
+            let (network, scope, local) = (network.clone(), scope.to_owned(), local.clone());
+            self.store.call("chat_controls.conversation_snapshot", move |store| {
+                let (network, scope) = (network.as_str(), scope.as_str());
+
+                let works = main_works(&store, network, scope)?;
+                let task_jobs = task_observations(&store, scope)?;
+                let checks = main_checks(&store, network, scope, checks, &works)?;
+                let deliveries = deliveries(&store, network, scope)?;
+                let conversation = store.conversation(network, scope)?;
+                // Devices whose live progress this conversation shows: its owner and those running its open works.
+                let mut targets = Vec::new();
+                let sources = conversation.iter().filter_map(|c| c.owner.as_ref()).chain(
+                    works
+                        .iter()
+                        .filter(|work| work.outcome.is_none())
+                        .map(|work| &work.target_node),
+                );
+                for source in sources {
+                    if source != &local
+                        && !targets.contains(source)
+                        && targets.len() < MAX_OBSERVED
+                        && store.authorize_node(network, source).is_ok()
+                    {
+                        targets.push(source.clone());
+                    }
+                }
+                let bot = store.bot_for_conversation(network, scope)?;
+                let messages = store.main_messages(network, scope)?;
+                let changes = main_changes(&store, network, scope)?;
+                let change_ids: BTreeSet<_> = changes.iter().map(|change| &change.change_id).collect();
+                let overwritten: Vec<_> = store
+                    .overwritten(network, scope)?
+                    .into_iter()
+                    .filter(|change| change_ids.contains(&change.change_id))
+                    .collect();
+                let omitted_sent = store.sent_bot_messages(network, scope)?.len();
+                let questions = main_questions(&store, network, scope)?;
+                let sessions = store.attributed_sessions(network, scope)?;
+                let skills = store.skills(network)?;
+                let schedules = store.schedules(network, scope)?;
+                let now = now_ms();
+                let memory = memory_view(&store, network, scope)?;
+                let memory_sync_conflicts = store.memory_sync_conflicts(network, scope)?;
+                let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
+                let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
+                let unanswered = store.unanswered_messages(network, &local, scope)?;
+
+                Ok((works, task_jobs, checks, deliveries, conversation, targets, bot, messages, changes, overwritten, omitted_sent, questions, sessions, skills, schedules, now, memory, memory_sync_conflicts, memory_staged_count, memory_conflicts, unanswered))
+            }).await?
+        };
         let work_values = works
             .iter()
             .map(|work| work_view(work, &task_jobs))
             .collect::<Result<Vec<_>>>()?;
-        let checks = main_checks(&store, network, scope, checks, &works)?;
-        let deliveries = deliveries(&store, network, scope)?;
-        let conversation = store.conversation(network, scope)?;
-        // Devices whose live progress this conversation shows: its owner and those running its open works.
-        let mut targets = Vec::new();
-        let sources = conversation.iter().filter_map(|c| c.owner.as_ref()).chain(
-            works
-                .iter()
-                .filter(|work| work.outcome.is_none())
-                .map(|work| &work.target_node),
-        );
-        for source in sources {
-            if source != &local
-                && !targets.contains(source)
-                && targets.len() < MAX_OBSERVED
-                && store.authorize_node(network, source).is_ok()
-            {
-                targets.push(source.clone());
-            }
-        }
-        let bot = store.bot_for_conversation(network, scope)?;
-        let messages = store.main_messages(network, scope)?;
-        let changes = main_changes(&store, network, scope)?;
-        let change_ids: BTreeSet<_> = changes.iter().map(|change| &change.change_id).collect();
-        let overwritten: Vec<_> = store
-            .overwritten(network, scope)?
-            .into_iter()
-            .filter(|change| change_ids.contains(&change.change_id))
-            .collect();
-        let omitted_sent = store.sent_bot_messages(network, scope)?.len();
-        let questions = main_questions(&store, network, scope)?;
-        let sessions = store.attributed_sessions(network, scope)?;
-        let now = now_ms();
         let enabled = bot.as_ref().and_then(|bot| bot.skills.as_ref());
-        let skills: Vec<_> = store
-            .skills(network)?
-            .into_iter()
+        let skills: Vec<_> = skills.into_iter()
             .filter(|entry| enabled.is_none_or(|set| set.contains(&entry.skill_id)))
             .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name,"description":entry.skill.description}))
             .collect();
-        let schedules: Vec<_> = store
-            .schedules(network, scope)?
-            .into_iter()
+        let schedules: Vec<_> = schedules.into_iter()
             .filter(|entry| crate::scheduling::ahead(&entry.schedule, now))
             .map(|entry| {
                 let mut value = json!(entry.schedule);
@@ -250,12 +266,6 @@ impl Runtime {
                 value
             })
             .collect();
-        let memory = memory_view(&store, network, scope)?;
-        let memory_sync_conflicts = store.memory_sync_conflicts(network, scope)?;
-        let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
-        let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
-        let unanswered = store.unanswered_messages(network, &local, scope)?;
-        drop(store);
         let local_context = self
             .scheduler_context_observation(
                 network,
@@ -329,65 +339,87 @@ impl Runtime {
                 },
             )
             .await?;
-        let store = self.store.lock().await;
-        let mut message_id = None;
-        let mut work_id = change["work_id"].as_str().map(str::to_owned);
-        if let Some(hash) = change["event_hash"].as_str() {
-            let Some(event) = store.event(network, hash)? else {
-                return Ok(None);
-            };
-            let event: Event = serde_json::from_str(&event.canonical_body)?;
-            match &event.body {
-                EventBody::MessagePosted { message_id: id, .. }
-                | EventBody::InputPosted { message_id: id, .. }
-                | EventBody::BotMessaged { message_id: id, .. } => message_id = Some(id.clone()),
-                EventBody::QuestionAsked { .. }
-                | EventBody::QuestionClosed { .. }
-                | EventBody::SessionAttributed { .. }
-                | EventBody::NotificationAcked { .. } => {}
-                body => match body.work_id() {
-                    Some(id) => work_id = Some(id.into()),
-                    None => return Ok(None),
-                },
-            }
-        } else if let Some(trigger) = change["trigger"].as_str() {
-            message_id = store
-                .scheduler_job(scope, trigger)?
-                .map(|job| job.message_id);
-        } else if work_id.is_none() {
-            return Ok(None);
-        }
-        let message = match message_id {
-            Some(id)
-                if scope_projection::message_is_main_from(
-                    &store.connection,
-                    network,
-                    scope,
-                    &id,
-                )? =>
-            {
-                store.message(network, scope, &id)?
-            }
-            None => None,
-            Some(_) => None,
+        let snapshot = {
+            let (network, scope, client, local) = (network.to_owned(), scope.to_owned(), client.to_owned(), self.identity.device_id()?);
+            let event_hash = change["event_hash"].as_str().map(str::to_owned);
+            let trigger = change["trigger"].as_str().map(str::to_owned);
+            let mut work_id = change["work_id"].as_str().map(str::to_owned);
+            self.store.read("chat_controls.changed_records", move |store| {
+                let (network, scope, client) = (network.as_str(), scope.as_str(), client.as_str());
+
+                let mut message_id = None;
+
+                if let Some(hash) = event_hash.as_deref() {
+                    let Some(event) = store.event(network, hash)? else {
+                        return Ok(None);
+                    };
+                    let event: Event = serde_json::from_str(&event.canonical_body)?;
+                    match &event.body {
+                        EventBody::MessagePosted { message_id: id, .. }
+                        | EventBody::InputPosted { message_id: id, .. }
+                        | EventBody::BotMessaged { message_id: id, .. } => message_id = Some(id.clone()),
+                        EventBody::QuestionAsked { .. }
+                        | EventBody::QuestionClosed { .. }
+                        | EventBody::SessionAttributed { .. }
+                        | EventBody::NotificationAcked { .. } => {}
+                        body => match body.work_id() {
+                            Some(id) => work_id = Some(id.into()),
+                            None => return Ok(None),
+                        },
+                    }
+                } else if let Some(trigger) = trigger.as_deref() {
+                    message_id = store
+                        .scheduler_job(scope, trigger)?
+                        .map(|job| job.message_id);
+                } else if work_id.is_none() {
+                    return Ok(None);
+                }
+                let message = match message_id {
+                    Some(id)
+                        if scope_projection::message_is_main_from(
+                            &store.connection,
+                            network,
+                            scope,
+                            &id,
+                        )? =>
+                    {
+                        store.message(network, scope, &id)?
+                    }
+                    None => None,
+                    Some(_) => None,
+                };
+                let last_message = match message {
+                    Some(_) => store.last_messages(network)?.remove(scope),
+                    None => None,
+                };
+
+                let works = main_works(&store, network, scope)?;
+                let task_jobs = task_observations(&store, scope)?;
+                let notifications: Vec<_> = store.pending_notifications(network, client)?.into_iter()
+                    .filter(|notification| notification.conversation_id == scope).collect();
+                let omitted_sent = store.sent_bot_messages(network, scope)?.len();
+                let busy = store.busy_conversations()?.remove(scope);
+                let questions = store.conversation_questions(network, scope)?;
+                let open_works = open_works(store, network, Some(scope))?;
+                let deliveries = deliveries(store, network, scope)?;
+                let checks = main_checks(store, network, scope, checks, &works)?;
+                let memory = memory_view(store, network, scope)?;
+                let memory_sync_conflicts = store.memory_sync_conflicts(network, scope)?;
+                let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
+                let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
+                let unanswered = store.unanswered_messages(network, &local, scope)?;
+                Ok(Some((message, last_message, works, task_jobs, notifications, omitted_sent, busy, questions, open_works, deliveries, checks, memory, memory_sync_conflicts, memory_staged_count, memory_conflicts, unanswered, work_id)))
+            }).await?
         };
-        let last_message = match message {
-            Some(_) => store.last_messages(network)?.remove(scope),
-            None => None,
+        let Some((message, last_message, works, task_jobs, notifications, omitted_sent, busy, questions, open_works, deliveries, checks, memory, memory_sync_conflicts, memory_staged_count, memory_conflicts, unanswered, work_id)) = snapshot else {
+            return Ok(None);
         };
         let messages = message.map(|message| json!(message));
-        let works = main_works(&store, network, scope)?;
-        let task_jobs = task_observations(&store, scope)?;
         let changed: Vec<_> = works
             .iter()
             .filter(|work| work_id.as_deref() == Some(work.work_id.as_str()))
             .map(|work| work_view(work, &task_jobs))
             .collect::<Result<_>>()?;
-        let notifications: Vec<_> = store
-            .pending_notifications(network, client)?
-            .into_iter()
-            .filter(|notification| notification.conversation_id == scope)
-            .collect();
         let remote = owner.map(|(remote, _)| remote).unwrap_or(Value::Null);
         merge_scope_jobs(&mut scope_jobs, &remote);
         let context = if remote.is_null() {
@@ -395,31 +427,29 @@ impl Runtime {
         } else {
             remote["context"].clone()
         };
-        let omitted_sent = store.sent_bot_messages(network, scope)?.len();
         let value = json!({
             "type":"records",
             "conversation_id":scope,
             "messages":messages.into_iter().collect::<Vec<_>>(),
             "works":changed,
             "last_message":last_message,
-            "busy":store.busy_conversations()?.remove(scope),
-            "questions":store.conversation_questions(network, scope)?,
+            "busy":busy,
+            "questions":questions,
             "sent":[],
             "sent_coverage":{"scope":"main","omitted_unknown":omitted_sent},
-            "open_works":open_works(&store, network, Some(scope))?,
+            "open_works":open_works,
             "notifications":notifications,
-            "deliveries":deliveries(&store, network, scope)?,
-            "checks":main_checks(&store, network, scope, checks, &works)?,
+            "deliveries":deliveries,
+            "checks":checks,
             "jobs":jobs,
             "scope_jobs":scope_jobs,
             "context":context,
-            "memory":memory_view(&store, network, scope)?,
-            "memory_sync_conflicts":store.memory_sync_conflicts(network, scope)?,
-            "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
-            "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
-            "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
+            "memory":memory,
+            "memory_sync_conflicts":memory_sync_conflicts,
+            "memory_staged_count":memory_staged_count,
+            "memory_conflicts":memory_conflicts,
+            "unanswered":unanswered,
         });
-        drop(store);
         Ok(Some(value))
     }
 }

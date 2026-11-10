@@ -1,4 +1,4 @@
-// Authenticode boundaries shared by the native release, Electron signing hook and verifier.
+// Authenticode boundaries shared by the native release, desktop packager and verifier.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';

@@ -36,3 +36,7 @@ If dependencies are missing, install the repository's frozen dependencies using 
 - Keep credentials in e2e's declared secrets. Store large runner outputs and downloads in an ignored directory inside the task worktree; preserve compact evidence in the task planning directory.
 - Browser, native mobile and real Provider results prove different things. Follow the repository's iOS runtime and task-owned simulator requirements before native acceptance.
 - Reporting a runner problem to an external issue tracker requires explicit authorization. A failing application test is not automatically a runner bug.
+
+## Native GPUI desktop
+
+Desktop uses `cargo test -p vibeface-desktop --locked` for native feature tests and `scripts/e2e-desktop.mjs` for packaged-window acceptance. Follow the native desktop section of `packages/docs/e2e.md`. The driver binds OS keyboard events and a window-only screenshot to its owned PID, then reads actual GPUI input/action state. Web and Mobile retain the e2e runner configurations above. Do not replace the native Desktop with browser automation.

@@ -9,6 +9,10 @@ on:
     - cron: '23 */4 * * *'
   workflow_dispatch:
     inputs:
+      native_prepare:
+        description: 'Prepare the native workspace lockfile and rustfmt patch, then compile without publishing'
+        type: boolean
+        default: false
       delivery_live:
         description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
         type: boolean
@@ -48,7 +52,7 @@ permissions:
 
 jobs:
   plan:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.delivery_small || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (!(github.event_name == 'workflow_dispatch' && (inputs.delivery_small || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -83,7 +87,7 @@ jobs:
         run: python3 scripts/ci.py plan --github-output "$GITHUB_OUTPUT"
 
   quick-check:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (!(github.event_name == 'workflow_dispatch' && inputs.desktop_only)) }}
     needs: plan
     runs-on: ubuntu-24.04
     steps:
@@ -130,16 +134,16 @@ jobs:
           node --check scripts/build-desktop.mjs
           node --check scripts/verify-desktop.mjs
           node --check scripts/e2e-desktop.mjs
-          node --check apps/desktop/electron-builder.cjs
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
+          python3 -B scripts/offline-docs.py --self-test
           node scripts/build-desktop.mjs --self-test
           node scripts/verify-desktop.mjs --self-test
       - run: cargo fmt --all -- --check
 
   www:
     needs: plan
-    if: ${{ (needs.plan.outputs.www == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.www == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -170,7 +174,7 @@ jobs:
 
   crypto-web:
     needs: plan
-    if: needs.plan.outputs.web == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (needs.plan.outputs.web == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -207,7 +211,7 @@ jobs:
 
   web:
     needs: [plan, crypto-web]
-    if: needs.plan.outputs.web == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (needs.plan.outputs.web == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -237,7 +241,7 @@ jobs:
 
   mobile-check:
     needs: plan
-    if: ${{ needs.plan.outputs.mobile == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (needs.plan.outputs.mobile == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.desktop_only)) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -260,32 +264,23 @@ jobs:
 
   desktop-check:
     needs: plan
-    if: needs.plan.outputs.desktop == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (needs.plan.outputs.desktop == 'true') }}
     runs-on: ubuntu-24.04
-    env:
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter 'vibeface-desktop...'
-      - name: Check and bundle the desktop host without platform packaging
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/native-desktop
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with: {key: gpui-feature-check}
+      - name: Check and test the native desktop host
         run: |
-          pnpm --dir apps/desktop typecheck
-          pnpm --dir apps/desktop test
-          pnpm --dir apps/desktop build
+          cargo fmt --all -- --check
+          cargo test -p vibeface-desktop --locked
+          cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings
 
   rust-check:
     needs: [plan, quick-check]
-    if: ${{ (needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -306,7 +301,7 @@ jobs:
 
   rust-fast:
     needs: plan
-    if: ${{ (needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
@@ -329,7 +324,7 @@ jobs:
 
   rust-slow:
     needs: plan
-    if: ${{ (needs.plan.outputs.slow == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.slow == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
@@ -352,7 +347,7 @@ jobs:
 
   delivery:
     needs: plan
-    if: ${{ (needs.plan.outputs.delivery == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.delivery == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     env:
       RISC0_HOME: /risc0
@@ -405,7 +400,7 @@ jobs:
 
   package:
     needs: [plan, crypto-web, web]
-    if: ${{ (needs.plan.outputs.package == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.package == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -679,7 +674,7 @@ jobs:
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
   delivery-small-prepare:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -715,7 +710,7 @@ jobs:
 
   delivery-small-proofs:
     needs: delivery-small-prepare
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -750,7 +745,7 @@ jobs:
 
   delivery-small-accept:
     needs: [delivery-small-prepare, delivery-small-proofs]
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -779,13 +774,13 @@ jobs:
           retention-days: 14
 
   delivery-android:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     uses: ./.github/workflows/mobile.yml
     with:
       android_only: true
 
   delivery-live:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     needs: [plan, package, crypto-web, web, delivery-android]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -916,7 +911,7 @@ jobs:
 
   npm-package:
     needs: [plan, package]
-    if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -943,7 +938,7 @@ jobs:
 
   npm-smoke:
     needs: [plan, npm-package]
-    if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -997,7 +992,7 @@ jobs:
 
   windows-native:
     needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc')) }}
     uses: ./.github/workflows/ci-windows-native.yml
     permissions:
       contents: read
@@ -1008,7 +1003,7 @@ jobs:
 
   desktop-macos:
     needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'aarch64-apple-darwin') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'aarch64-apple-darwin')) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1018,7 +1013,7 @@ jobs:
 
   desktop-windows:
     needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc')) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1028,7 +1023,7 @@ jobs:
 
   desktop-only-macos:
     needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1037,7 +1032,7 @@ jobs:
 
   desktop-only-windows:
     needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1046,7 +1041,7 @@ jobs:
 
   desktop-only-linux-x64:
     needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1055,7 +1050,7 @@ jobs:
 
   desktop-only-linux-arm64:
     needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
     uses: ./.github/workflows/ci-desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1063,7 +1058,7 @@ jobs:
       target: aarch64-unknown-linux-gnu
 
   mobile-plan:
-    if: github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none') }}
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.value }}
@@ -1082,7 +1077,7 @@ jobs:
 
   ios-device:
     needs: [mobile-plan]
-    if: github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'ios' || inputs.mobile_apps == 'both')
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'ios' || inputs.mobile_apps == 'both')) }}
     uses: ./.github/workflows/release-ios.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1094,7 +1089,7 @@ jobs:
 
   android-app:
     needs: [mobile-plan]
-    if: github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'android' || inputs.mobile_apps == 'both')
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'android' || inputs.mobile_apps == 'both')) }}
     uses: ./.github/workflows/release-apps.yml
     with:
       source_sha: ${{ github.sha }}
@@ -1102,7 +1097,7 @@ jobs:
       tag: ''
 
   mobile-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (always() && github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none') }}
     needs: [mobile-plan, ios-device, android-app]
     runs-on: ubuntu-24.04
     steps:
@@ -1123,7 +1118,7 @@ jobs:
           PYTHON
 
   windows-platform:
-    if: github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only)) }}
     uses: ./.github/workflows/ci-windows-native.yml
     permissions:
       contents: read
@@ -1132,7 +1127,7 @@ jobs:
       source_sha: ${{ github.sha }}
 
   windows-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.windows_only }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (always() && github.event_name == 'workflow_dispatch' && inputs.windows_only) }}
     needs: windows-platform
     runs-on: ubuntu-24.04
     steps:
@@ -1143,7 +1138,7 @@ jobs:
           test "$RESULT" = success
 
   desktop-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.desktop_only }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (always() && github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
     needs: [plan, crypto-web, web, desktop-only-macos, desktop-only-windows, desktop-only-linux-x64, desktop-only-linux-arm64, windows-platform]
     runs-on: ubuntu-24.04
     steps:
@@ -1162,7 +1157,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    if: ${{ (always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small)) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && ((always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small)) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none'))) }}
     needs: [plan, quick-check, crypto-web, web, mobile-check, desktop-check, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke, windows-native, desktop-macos, desktop-windows]
     runs-on: ubuntu-24.04
     steps:
@@ -1177,7 +1172,7 @@ jobs:
 
   daily-nightly:
     needs: ci-gate
-    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (!cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     concurrency:
@@ -1205,3 +1200,60 @@ jobs:
         run: |
           gh auth setup-git
           python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"
+
+  native-prepare:
+    name: Prepare native lockfile, formatting and compiler evidence
+    if: github.event_name == 'workflow_dispatch' && inputs.native_prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/native-desktop
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: gpui-native-prepare
+          cache-on-failure: true
+      - name: Resolve workspace additions while preserving locked third-party packages
+        id: lockfile
+        run: |
+          mkdir -p .artifacts/native-prepare
+          cargo update --workspace 2>&1 | tee .artifacts/native-prepare/lockfile.log
+      - name: Format the native workspace and keep a reviewable patch
+        id: formatting
+        run: cargo fmt --all 2>&1 | tee .artifacts/native-prepare/rustfmt.log
+      - name: Compile all native callers and test targets
+        id: compile
+        run: cargo check --all-targets -p vibeface-client -p vibeface-desktop -p vibeface -p vibeface-core 2>&1 | tee .artifacts/native-prepare/compiler.log
+      - name: Record exact preparation outcomes even when the compiler rejects the source
+        if: always()
+        env:
+          LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
+          FORMATTING_OUTCOME: ${{ steps.formatting.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+        run: |
+          mkdir -p .artifacts/native-prepare
+          cp Cargo.lock .artifacts/native-prepare/Cargo.lock
+          git diff --binary > .artifacts/native-prepare/format-and-lock.patch
+          rustc -vV > .artifacts/native-prepare/rustc.txt
+          python3 - <<'PYMETA'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path('.artifacts/native-prepare')
+          data = {'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                  'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                  'lockfile': os.environ['LOCKFILE_OUTCOME'], 'formatting': os.environ['FORMATTING_OUTCOME'],
+                  'compile': os.environ['COMPILE_OUTCOME'], 'publishing': False}
+          (root / 'outcomes.json').write_text(json.dumps(data, indent=2) + '\n')
+          PYMETA
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-prepare-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/native-prepare/*
+          if-no-files-found: error
+          retention-days: 7

@@ -47,3 +47,5 @@ mod tests {
         assert_eq!(serde_json::to_value(text).unwrap(), json!("7"));
     }
 }
+
+pub mod workspace;

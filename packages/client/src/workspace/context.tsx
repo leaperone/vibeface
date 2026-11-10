@@ -4,7 +4,7 @@ import { messageOf } from "../lib/node.ts"
 import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
 import { enqueue, settle, type OutboxItem, type OutboxStore } from "../lib/outbox.ts"
 import { requestKey } from "../lib/secure.ts"
-import type { Platform } from "../lib/platform.ts"
+import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
 import { inputEventBody, inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
@@ -308,7 +308,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       seen.add(item.notification_id)
       if (viewRef.current === "chat" && notificationForMain(item, activeId.current) && platform.foreground()) continue
       try {
-        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
+        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
           if (!current()) return
           if (isSessionNotification(item)) {
             void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target) }, () => {})
@@ -320,6 +320,20 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
   }
+  useEffect(() => notifier.watchOpen?.(async (destination) => {
+    try {
+      const result = await notificationForOpening({ destination, connection, current, read: async () => parseNotifications(await connection.rpc("notifications")) })
+      if (result.kind === 'deferred') return false
+      if (result.kind === 'invalid') return true
+      const item = result.notification
+      if (isSessionNotification(item) && platform.sessionNotifications === false) return true
+      if (isSessionNotification(item)) await ackNotificationRef.current(item)
+      if (!current()) return false
+      openConversation(item.conversation_id, item.target)
+      return true
+    } catch { return false }
+  }), [connection])
+  useEffect(() => { notifier.replayOpen?.() }, [notifications])
   /** A device starts with the history it found read: what waited on its first full read never counts as unread here. */
   const unreadSince = (items: NotificationRecord[], first = false) => {
     const key = networkKey(`read-before.${clientId}`, networkId)

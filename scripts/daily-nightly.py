@@ -22,7 +22,7 @@ REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
 RELEASE = '.github/workflows/release.yml'
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/package.json')
+         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/Cargo.toml')
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
 PRODUCER = 'collect'
@@ -144,9 +144,9 @@ def package_version(text, value):
 def versions_at(commit):
     values = {}
     for app in release.APPS:
-        path = f'apps/{app}/' + ('Cargo.toml' if app in ('core', 'cli') else 'app.json' if app == 'mobile' else 'package.json')
+        path = f'apps/{app}/' + ('Cargo.toml' if app in ('core', 'cli', 'desktop') else 'app.json' if app == 'mobile' else 'package.json')
         text = blob(commit, path).decode()
-        if app in ('core', 'cli'):
+        if app in ('core', 'cli', 'desktop'):
             match = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
             require(match, 'missing Cargo package')
             values[app] = re.search(r'(?m)^version\s*=\s*"([^"]+)"', match[1])[1]
@@ -223,23 +223,23 @@ def generated(plan):
         if old[app].startswith(prefix):
             require(int(value[len(prefix):]) > int(old[app][len(prefix):]), 'daily version did not advance')
     result = {path: blob(plan.base, path).decode() for path in PATHS}
-    for app in ('www', 'app', 'desktop'):
+    for app in ('www', 'app'):
         path = f'apps/{app}/package.json'
         result[path] = json_value(result[path], ('version',), plan.versions[app])
-    for app in ('core', 'cli'):
+    for app in ('core', 'cli', 'desktop'):
         path = f'apps/{app}/Cargo.toml'
         result[path] = package_version(result[path], plan.versions[app])
     blocks = result['Cargo.lock'].split('[[package]]')
     found = set()
     for index, block in enumerate(blocks):
-        match = re.search(r'(?m)^name = "(vibeface|vibeface-core)"$', block)
+        match = re.search(r'(?m)^name = "(vibeface|vibeface-core|vibeface-desktop)"$', block)
         if match:
-            app = 'cli' if match[1] == 'vibeface' else 'core'
+            app = {'vibeface': 'cli', 'vibeface-core': 'core', 'vibeface-desktop': 'desktop'}[match[1]]
             require(app not in found and f'version = "{old[app]}"' in block, 'Cargo.lock local package mismatch')
             blocks[index], count = re.subn(r'(?m)^version = "[^"]+"$', 'version = "' + plan.versions[app] + '"', block)
             require(count == 1, 'ambiguous local lock version')
             found.add(app)
-    require(found == {'core', 'cli'}, 'Cargo.lock is missing local packages')
+    require(found == {'core', 'cli', 'desktop'}, 'Cargo.lock is missing local packages')
     result['Cargo.lock'] = '[[package]]'.join(blocks)
     mobile_path = 'apps/mobile/app.json'
     expo = json.loads(result[mobile_path])['expo']
@@ -654,9 +654,9 @@ def self_test():
         root = Path(temporary) / 'repo'; root.mkdir()
         for app in release.APPS:
             directory = root / 'apps' / app; directory.mkdir(parents=True)
-            if app in ('core', 'cli'):
+            if app in ('core', 'cli', 'desktop'):
                 (directory / 'src').mkdir(); (directory / 'src/main.rs').write_text('fn main() {}\n')
-                (directory / 'Cargo.toml').write_text('[package]\nname = "' + ('vibeface' if app == 'cli' else 'vibeface-core')
+                (directory / 'Cargo.toml').write_text('[package]\nname = "' + {'cli': 'vibeface', 'core': 'vibeface-core', 'desktop': 'vibeface-desktop'}[app]
                                                      + '"\nversion = "0.0.1-nightly.20261105.2"\nedition = "2021"\n')
             else:
                 value = {'version': '0.0.1'} if app == 'www' else {'version': '0.0.1-nightly.20261105.2', 'private': True}
@@ -665,8 +665,8 @@ def self_test():
                         'android': {'package': 'one.leaper.vibeface', 'versionCode': 250001},
                         'extra': {'releaseVersion': '0.0.1-nightly.20261105.2'}}}
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
-        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
-        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
+        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli", "apps/desktop"]\nresolver = "2"\n')
+        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-desktop"\nversion = "0.0.1-nightly.20261105.2"\n')
         git('init', '--initial-branch=main', root=root)
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
@@ -705,8 +705,8 @@ def self_test():
             mobile_generated = json.loads(contents['apps/mobile/app.json'])['expo']
             assert mobile_generated['ios']['buildNumber'] == '4'
             assert mobile_generated['ios']['supportsTablet'] is True
-            assert json.loads(contents['apps/desktop/package.json'])['version'] == plan.versions['cli']
-            assert contents['Cargo.lock'].count(b'[[package]]') == 2
+            assert re.search(rb'version = "([^"]+)"', contents['apps/desktop/Cargo.toml'])[1].decode() == plan.versions['cli']
+            assert contents['Cargo.lock'].count(b'[[package]]') == 3
 
             def commit_files(changes):
                 git('checkout', '--detach', '-q', base)
@@ -724,7 +724,7 @@ def self_test():
             metadata(root, plan)
             for path, content in (
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
-                ('apps/desktop/package.json', contents['apps/desktop/package.json'].replace(b'"private": true', b'"private": false')),
+                ('apps/desktop/Cargo.toml', contents['apps/desktop/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),

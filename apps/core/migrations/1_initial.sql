@@ -61,6 +61,7 @@ CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` in
 CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `server` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
 CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
 CREATE INDEX `work_runs_thread` ON `work_runs` (`thread_id`);
+CREATE INDEX `work_runs_reconcile` ON `work_runs` (`state`, `send_by_ms`, `work_id`);
 CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `spec` text NOT NULL, `state` text NOT NULL, `reason` text NULL, `failure` text NULL, PRIMARY KEY (`work_id`));
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
 CREATE TABLE `workspace_projection` (`network_id` text NOT NULL, `state` text NOT NULL, PRIMARY KEY (`network_id`));

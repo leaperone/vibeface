@@ -7,7 +7,7 @@ use crate::{
     scheduling::{AdmissionReceipt, TriggerKind, task_trigger},
     work::{
         Dispatch, DispatchState, Handle, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
-        WorkRecord, WorkRequest, WorkSpec, WorkState, accept, transition,
+        WorkRecord, WorkRequest, WorkSpec, WorkState, RECONCILE_GRACE_MS, accept, transition,
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -85,30 +85,27 @@ fn query_runs(
     filter: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<WorkRecord>> {
-    let mut statement = connection.prepare(&format!(
+    query_runs_sql(connection, &format!(
         "SELECT {RUN_COLUMNS} FROM work_runs WHERE {filter} ORDER BY work_id"
-    ))?;
-    let rows = statement
-        .query_map(params, |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
-                r.get(12)?,
-                r.get(13)?,
-            ))
-        })?
+    ), params)
+}
+
+fn query_runs_sql(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<WorkRecord>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params, run_row)?
         .collect::<rusqlite::Result<Vec<RunRow>>>()?;
     rows.into_iter().map(record_from).collect()
+}
+
+fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+        r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
+    ))
 }
 
 fn load_run(connection: &Connection, work_id: &str) -> Result<Option<WorkRecord>> {
@@ -517,6 +514,18 @@ impl Store {
     pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "1", [])
     }
+    /// Only runs whose next reconciliation can do work, excluding coordination tasks.
+    pub fn reconcile_work_records(&self, at: i64, read_live: bool) -> Result<Vec<WorkRecord>> {
+        let filter = if read_live {
+            "kind<>?1 AND ((state IN ('accepted','starting') AND send_by_ms<=?2)
+                OR state='running' OR (state='unverified' AND probe=1))"
+        } else {
+            "kind<>?1 AND state IN ('accepted','starting') AND send_by_ms<=?2"
+        };
+        query_runs(&self.connection, filter,
+            params![enum_text(&WorkKind::Task), at - RECONCILE_GRACE_MS])
+    }
+
     /// The runs on one App Server thread, by index: a streamed event reads only these.
     pub fn work_records_on_thread(&self, thread: &str) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "thread_id=?", [thread])
@@ -570,17 +579,19 @@ impl Store {
 /// A run that has not started stays unstarted once the user settled it; a running one keeps
 /// going and its late result stays on record without reporting again.
 fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
-    for mut record in query_runs(
-        connection,
-        "state IN ('unverified','accepted','starting')",
-        [],
-    )? {
-        let outcome =
-            reduce::work_from(connection, network, &record.work_id)?.and_then(|work| work.outcome);
-        if let Some(outcome) = outcome.filter(|outcome| *outcome != WorkOutcome::Unverified) {
-            transition(&mut record, Signal::Settled(outcome));
-            save_run(connection, &record)?;
-        }
+    let columns = RUN_COLUMNS.split(',').map(|column| format!("r.{column}"))
+        .collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT {columns},json_extract(w.finish,'$.outcome') FROM work_runs r CROSS JOIN works w
+        WHERE w.network_id=?1 AND w.work_id=r.work_id AND r.state IN ('unverified','accepted','starting')
+            AND w.dispatch IS NOT NULL AND w.finish IS NOT NULL
+            AND json_extract(w.finish,'$.outcome')<>?2 ORDER BY r.work_id");
+    let rows = connection.prepare(&sql)?.query_map(params![network, enum_text(&WorkOutcome::Unverified)],
+        |row| Ok((run_row(row)?, row.get::<_, String>(14)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (row, outcome) in rows {
+        let mut record = record_from(row)?;
+        transition(&mut record, Signal::Settled(enum_from(&outcome)?));
+        save_run(connection, &record)?;
     }
     Ok(())
 }
@@ -700,6 +711,17 @@ impl Store {
         query_dispatches(&self.connection, "1", [])
     }
 
+    /// Scoped UI projection; accepted rows remain visible until shared sync arrives.
+    pub fn dispatches_for_scopes(&self, scopes: &[String]) -> Result<Vec<Dispatch>> {
+        query_dispatches(&self.connection,
+            "json_extract(spec,'$.conversation') IN (SELECT value FROM json_each(?))",
+            [serde_json::to_string(scopes)?])
+    }
+
+    pub fn pending_dispatches(&self) -> Result<Vec<Dispatch>> {
+        query_dispatches(&self.connection, "state='pending'", [])
+    }
+
     /// Whether the user closed this failed work or refused dispatch in 待处理.
     pub fn closed_in_inbox(&self, network: &str, work_id: &str) -> Result<bool> {
         Ok(self.connection.query_row(
@@ -766,17 +788,32 @@ impl Store {
     /// This conversation's dispatches the DAG does not name yet: waiting for their device,
     /// refused, unknown, or accepted but not synced back.
     pub fn undelivered_dispatches(&self, network: &str, scope: &str) -> Result<Vec<Dispatch>> {
-        let works = reduce::works_from(&self.connection, network, scope)?;
-        Ok(self
-            .dispatches()?
-            .into_iter()
-            .filter(|dispatch| {
-                dispatch.spec.conversation == scope
-                    && !works
-                        .iter()
-                        .any(|work| work.work_id == dispatch.spec.work_id)
-            })
-            .collect())
+        query_dispatches(
+            &self.connection,
+            "json_extract(spec,'$.conversation')=?2 AND NOT EXISTS(
+                SELECT 1 FROM works w WHERE w.network_id=?1
+                    AND w.conversation_id=?2 AND w.work_id=work_dispatches.work_id
+                    AND w.dispatch IS NOT NULL)",
+            params![network, scope],
+        )
+    }
+
+    /// Holds the first request unchanged, including its target and original deadline.
+    pub fn hold_stop_request(&mut self, request: &StopRequest) -> Result<bool> {
+        Ok(self.connection.execute(
+            "INSERT INTO work_stops(work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out)
+             VALUES(?,?,?,?,?,?) ON CONFLICT(work_id) DO NOTHING",
+            params![request.work_id, request.conversation, request.target,
+                request.requested_at_ms, request.deadline_ms, request.timed_out],
+        )? != 0)
+    }
+
+    pub fn stop_request(&self, work_id: &str) -> Result<Option<StopRequest>> {
+        Ok(query_stops(&self.connection, "work_id=?", [work_id])?.pop())
+    }
+
+    pub fn stop_requests_for_target(&self, target: &str) -> Result<Vec<StopRequest>> {
+        query_stops(&self.connection, "target_node=?", [target])
     }
 
     pub fn save_stop_request(&mut self, request: &StopRequest) -> Result<()> {
@@ -795,21 +832,7 @@ impl Store {
     }
 
     pub fn stop_requests(&self) -> Result<Vec<StopRequest>> {
-        let mut statement = self.connection.prepare(
-            "SELECT work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out FROM work_stops ORDER BY work_id",
-        )?;
-        Ok(statement
-            .query_map([], |r| {
-                Ok(StopRequest {
-                    work_id: r.get(0)?,
-                    conversation: r.get(1)?,
-                    target: r.get(2)?,
-                    requested_at_ms: r.get(3)?,
-                    deadline_ms: r.get(4)?,
-                    timed_out: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?)
+        query_stops(&self.connection, "1", [])
     }
 
     pub fn forget_stop_request(&mut self, work_id: &str) -> Result<()> {
@@ -844,4 +867,19 @@ impl Store {
         }
         Ok(woken)
     }
+}
+
+fn query_stops(
+    connection: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<StopRequest>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out
+         FROM work_stops WHERE {filter} ORDER BY work_id"
+    ))?;
+    Ok(statement.query_map(params, |row| Ok(StopRequest {
+        work_id: row.get(0)?, conversation: row.get(1)?, target: row.get(2)?,
+        requested_at_ms: row.get(3)?, deadline_ms: row.get(4)?, timed_out: row.get(5)?,
+    }))?.collect::<rusqlite::Result<_>>()?)
 }

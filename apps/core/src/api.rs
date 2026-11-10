@@ -1008,11 +1008,8 @@ async fn local_setup(
             "the bootstrap capability",
         )?;
         let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
-        app.node
-            .store
-            .lock()
-            .await
-            .verify_bootstrap_capability(&capability.capability)?;
+        let verified_capability = capability.capability.clone();
+        app.node.store.call("local_bootstrap_capability", move |store| store.verify_bootstrap_capability(&verified_capability)).await?;
         Ok::<_, anyhow::Error>(capability)
     }
     .await
@@ -1492,7 +1489,7 @@ mod tests {
         use crate::runtime::{test_bot as bot, test_node as node, test_start_reply as start_reply};
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
-        let network = node.store.lock().await.network()?.context("network")?;
+        let network = node.store.call("fixture_network", |store| store.network()).await?.context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
         node.register_manager_attempt_fixture(
             "mcp-current-attempt".into(),
@@ -1521,13 +1518,13 @@ mod tests {
             let request=json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool_call","arguments":{"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"}}});
             let first:Value=call(request.clone()).await?.json().await?;
             assert_eq!(first["result"]["isError"],false);
-            let basis=node.store.lock().await.version_vector(&network)?;
+            let basis={ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? };
             let replay:Value=call(request).await?.json().await?;
             assert_eq!(first,replay);
-            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            assert_eq!(basis,{ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? });
             let missing_ref:Value=call(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_bot","arguments":{"name":"Duplicate"}}})).await?.json().await?;
             assert_eq!(missing_ref["result"]["isError"],true);
-            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            assert_eq!(basis,{ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? });
             let mut wrong=node.agent_tokens.lock().await.get("mcp-current-attempt").cloned().context("token")?;
             wrong.network_id="another-personal-network".into();
             node.agent_tokens.lock().await.insert("wrong-network".into(),wrong);
@@ -1835,12 +1832,14 @@ mod tests {
                 Member::client(&admin, "browser", true)?,
                 Member::node(&node.identity, "node")?,
             )?)?;
-            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
+            let bootstrap_capability = capability.capability.clone();
+            let admin = admin.device_id()?;
+            node.store.call("fixture_bootstrap", move |store| store.bootstrap_network(state, &bootstrap_capability, &admin)).await?;
             node.local_access.set_enabled(false)?;
             let initialized: Value = request().send().await?.json().await?;
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));
             assert!(!initialized.to_string().contains(&capability.capability));
-            assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
+            assert!({ let capability = capability.capability.clone(); node.store.call("fixture_consumed_capability", move |store| store.verify_bootstrap_capability(&capability)).await.is_err() });
             let local_origin = &origin;
             node.local_access.set_enabled(true)?;
             let launched: Value = request().send().await?.json().await?;

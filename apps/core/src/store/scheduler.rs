@@ -140,8 +140,16 @@ fn query_jobs(
     filter: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<SchedulerJob>> {
+    query_jobs_ordered(connection, filter, params, "sequence")
+}
+fn query_jobs_ordered(
+    connection: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+    order: &str,
+) -> Result<Vec<SchedulerJob>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {JOB_COLUMNS},EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) FROM scheduler_jobs WHERE {filter} ORDER BY sequence"
+        "SELECT {JOB_COLUMNS},EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) FROM scheduler_jobs WHERE {filter} ORDER BY {order}"
     ))?;
     let rows = statement
         .query_map(params, |r| {
@@ -4068,6 +4076,18 @@ impl Store {
     /// All local scheduler rows for bounded, read-only workspace projections.
     pub fn scheduler_jobs_all(&self) -> Result<Vec<SchedulerJob>> {
         query_jobs(&self.connection, "1", [])
+    }
+
+    /// Scoped overview rows in the same global sequence order as `scheduler_jobs_all`.
+    pub fn scheduler_jobs_for_scopes(&self, scopes: &[String], include_finished: bool) -> Result<Vec<SchedulerJob>> {
+        let filter = if include_finished {
+            "conversation_id IN (SELECT value FROM json_each(?))"
+        } else {
+            "state IN ('queued','steering','claimed','running','cancelling','reconciling')
+                AND conversation_id IN (SELECT value FROM json_each(?))"
+        };
+        // The previous all-row scan retained insertion order for equal sequences.
+        query_jobs_ordered(&self.connection, filter, [serde_json::to_string(scopes)?], "sequence,rowid")
     }
 
     /// Each busy conversation on this device; a reply running outranks messages still waiting.

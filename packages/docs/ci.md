@@ -31,8 +31,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
-| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的桌面类型检查、单测和 main/preload 打包，不构建 Rust 或运行网页制品验收 |
-| `apps/desktop/src/shared/` | 桌面源码检查，以及直接导入这些文件的 Web 检查和网页制品验收 |
+| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的原生 GPUI Rust 测试与 Clippy；真实窗口留在显式平台验收 |
 | `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
 | `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
 | 根 JS package、pnpm workspace 或 lockfile | Web、Mobile、桌面源码和门户检查 |
@@ -45,7 +44,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的超出待补依赖上限的 4 万事件追平测试。
 
-`desktop-check` 在 Linux 上运行桌面 `typecheck`、`test` 和 `build`，不下载 Electron 程序、不启动窗口，也不替代手动平台验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
+`desktop-check` 在 Linux 上运行原生 Desktop 的 Cargo 测试与 Clippy，使用固定图形工具链和 hosted runner 系统库，不替代手动平台窗口验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
 
 `mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
@@ -309,7 +308,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 ## 桌面专项验收
 
-在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
+在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 GPUI 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App。最终 `desktop-gate` 要求所有这些任务成功。
 
 ```sh
 	gh workflow run ci.yml --repo leaperone/vibeface --ref <branch> -f desktop_only=true
@@ -317,7 +316,18 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 只定位 Windows Rust 问题时，使用 `windows_only=true`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
 
-桌面测试使用打包应用自身的 DevTools 页面，核对真实 Electron 版本、窗口隔离、内置包来源、自有 Core、退出和重启。测试预先用包内 CLI 建立不入全网（`--no-mesh`）的独立 Node，随后由真实启动器启动并持有 Core；首次初始化逻辑另由桌面会话测试覆盖。Windows 另外核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程回收和当前用户服务。Unix shell、Unix 权限位及 Linux 证明宿主夹具保留在 Unix 测试中；协调器的协议测试在两端使用各自的私有 IPC。所有 Provider 均为受控夹具，不调用真实模型。
+桌面测试使用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
 
+离线文档使用 `scripts/offline-docs.json` 作为唯一清单；`offline-docs.py` 由 compose、POSIX 和 Windows 组包入口共同调用，复制所有已跟踪公开文档并改写相对链接。测试检查最终组装目录中的本地链接闭包，源码引用固定到本次完整提交。
 
-原生移动端构建可使用 `ci.yml` 的 `mobile_apps=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；现有 `mobile.yml` 保留模拟器界面测试。手动移动端验收按运行编号隔离并行，避免新提交取消尚在验证的专用模拟器任务。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
+## 准备原生依赖锁与格式补丁
+
+新增原生 workspace 成员时，可在明确源码分支手动派发一次 `native_prepare=true`。这个开发入口只运行原生准备任务，不运行发布、部署或普通 CI 门禁。
+
+```sh
+gh workflow run ci.yml --ref <branch> -f native_prepare=true
+```
+
+受控 hosted runner 使用固定图形工具链执行 `cargo update --workspace`，尽量保留已有第三方锁，再运行 `cargo fmt --all` 和 Client、Desktop、CLI、Core 的 all-targets 编译。只有这个显式准备入口允许解析锁变更。无论编译成功或失败，都上传完整源码 SHA、各步骤 outcome、Cargo.lock、格式与锁补丁、工具链版本和编译日志。上传成功不表示编译成功。
+
+维护者核对原始 SHA，审核并应用 artifact 补丁，再提交最终锁和源码。随后必须使用普通 CI 的 `--locked` 检查和真实平台验收。准备任务不提交、推送、创建 Tag、发布或部署，也不读取真实 Provider 认证。

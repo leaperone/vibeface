@@ -393,6 +393,10 @@ impl Delivery {
             if let Some(material) = &previous {
                 material.key.verify()?;
                 ensure!(
+                    material.key.receiver_peer == self.identity.device_id()?,
+                    "charity receiving key belongs to another Node; restore the original Node identity and delivery backup"
+                );
+                ensure!(
                     receiving_public(&material.secret)? == parse_word(&material.key.public_key)?,
                     "stored charity receiving material is inconsistent"
                 );
@@ -485,6 +489,22 @@ impl Delivery {
 
     pub(super) fn charity_get(&self, network: &str, id: &str) -> Result<DeliveryOrder> {
         Ok(self.charity_scoped(network, id)?.view)
+    }
+
+    pub(super) fn charity_client_receipt(&self, network: &str, id: &str) -> Result<Value> {
+        let stored = self.charity_scoped(network, id)?;
+        Ok(json!({
+            "receipt": {
+                "network_id": network,
+                "node_id": self.identity.device_id()?,
+                "order_id": stored.view.order_id,
+                "intent_id": stored.view.intent_id,
+                "authorized_by": stored.authorized_by,
+                "confirmed": stored.confirmed,
+                "accepted": stored.accepted,
+            },
+            "order": stored.view,
+        }))
     }
 
     pub(super) fn charity_find_intent(

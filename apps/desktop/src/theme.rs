@@ -1,0 +1,8 @@
+use gpui_kit::*;
+#[derive(Clone,Copy)]
+pub struct Palette{pub background:Hsla,pub sidebar:Hsla,pub foreground:Hsla,pub muted:Hsla,pub border:Hsla,pub accent:Hsla,pub selected:Hsla,pub danger:Hsla}
+impl Palette{
+ pub fn light()->Self{Self{background:rgb(0xffffff).into(),sidebar:rgb(0xf8f8fb).into(),foreground:rgb(0x252431).into(),muted:rgb(0x686575).into(),border:rgb(0xe5e4ec).into(),accent:rgb(0x7051c5).into(),selected:rgb(0xf0ebfb).into(),danger:rgb(0xb32f36).into()}}
+ pub fn dark()->Self{Self{background:rgb(0x19191e).into(),sidebar:rgb(0x15151a).into(),foreground:rgb(0xf1f0f6).into(),muted:rgb(0xb8b4c4).into(),border:rgb(0x45424f).into(),accent:rgb(0xb29bee).into(),selected:rgb(0x30283f).into(),danger:rgb(0xf49a9e).into()}}
+}
+pub fn apply(dark:bool,window:&mut Window,cx:&mut App){use gpui_kit::component::{Theme,ThemeMode};Theme::change(if dark{ThemeMode::Dark}else{ThemeMode::Light},Some(window),cx);let palette=if dark{Palette::dark()}else{Palette::light()};Theme::update(cx,|theme|{theme.colors.background=palette.background;theme.colors.foreground=palette.foreground;theme.colors.border=palette.border;theme.colors.primary=palette.accent;theme.colors.primary_hover=palette.accent;theme.colors.primary_active=palette.accent;theme.colors.primary_foreground=palette.background;theme.colors.button_primary=palette.accent;theme.colors.button_primary_hover=palette.accent;theme.colors.button_primary_active=palette.accent;theme.colors.button_primary_foreground=palette.background;theme.colors.ring=palette.accent;theme.colors.accent=palette.selected;theme.colors.accent_foreground=palette.foreground;});}

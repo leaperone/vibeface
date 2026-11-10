@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build the Vibeface desktop application around an already released runtime bundle.
+// Build the Vibeface desktop application around an already sealed runtime bundle.
 // Build only: this script never publishes and never rebuilds or re-signs the bundled CLI and Core.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -7,14 +7,12 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hash, relativeFiles, readSealedRuntime, verifySealedRuntime } from './sealed-runtime.mjs';
-import { createRequire } from 'node:module';
-import { requireAuthenticode } from './windows-signing.mjs';
-import { prefetchElectronArchive } from '../apps/desktop/scripts/prefetch-electron.mjs';
+import { requireAuthenticode, signNative } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const desktop = path.join(repo, 'apps/desktop');
-const ELECTRON_VERSION = '45.2.3';
-const SCHEMA_VERSION = 1;
+const NATIVE_UI = { ui: 'gpui', gpui_kit: '0.9.1', gpui: '0.3.12' };
+const SCHEMA_VERSION = 2;
 const PLATFORMS = {
   'aarch64-apple-darwin': { platform: 'darwin', flag: '--mac', installer: 'dmg', exe: '', signing: 'developer-id-notarized' },
   'x86_64-pc-windows-msvc': { platform: 'win32', flag: '--win', installer: 'exe', exe: '.exe', signing: 'authenticode' },
@@ -23,7 +21,6 @@ const PLATFORMS = {
 };
 const BUILD_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
-const HOST_OUTPUTS = ['dist/main/index.cjs', 'dist/preload/client.cjs'];
 
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
@@ -63,17 +60,9 @@ function readRuntime(directory, target, version, sourceCommit) {
 }
 
 function readDesktopPackage(version) {
-  const metadata = JSON.parse(fs.readFileSync(path.join(desktop, 'package.json'), 'utf8'));
-  assert.equal(metadata.version, version, 'the desktop package joins the canonical product version');
-  assert.equal(metadata.main, 'dist/main/index.cjs', 'the desktop package must point at the compiled main entry');
-  assert.equal((metadata.devDependencies ?? {}).electron, ELECTRON_VERSION, `the desktop package must pin electron ${ELECTRON_VERSION}`);
-  for (const script of ['preinstall', 'install', 'postinstall', 'prepare']) {
-    assert(!(metadata.scripts ?? {})[script], 'the desktop package must not run install lifecycle scripts');
-  }
-  for (const output of HOST_OUTPUTS) {
-    assert(fs.statSync(path.join(desktop, output)).size > 0, `missing desktop build output: ${output}; run pnpm --dir apps/desktop build`);
-  }
-  return metadata;
+  const manifest = fs.readFileSync(path.join(desktop, 'Cargo.toml'), 'utf8');
+  assert(manifest.includes(`version = "${version}"`), 'desktop must join the canonical product version');
+  assert(manifest.includes('gpui-kit = "=0.9.1"'), 'desktop must pin the verified GPUI kit');
 }
 
 /** Signing identity resolution: real credentials or an explicitly recorded unsigned preview. */
@@ -93,7 +82,7 @@ function signingState(target, requested) {
   return { signed: true, signing: PLATFORMS[target].signing };
 }
 
-/** The App Store Connect key electron-builder notarizes with, from the existing release secrets. */
+/** The App Store Connect key used for native notarization, from the existing release secrets. */
 function notaryEnvironment(target, signed) {
   if (!signed || target !== 'aarch64-apple-darwin') return {};
   return {
@@ -109,16 +98,24 @@ function copyRuntime(source, destination) {
   fs.cpSync(source, destination, { recursive: true, preserveTimestamps: true, dereference: false, verbatimSymlinks: true });
 }
 
-/** The sealed runtime inside the packaged application, read back after signing. */
-function packagedRuntime(outputRoot, target) {
-  const candidates = target === 'aarch64-apple-darwin'
-    ? [path.join(outputRoot, 'mac-arm64/Vibeface.app/Contents/Resources/runtime')]
-    : target === 'x86_64-pc-windows-msvc'
-      ? [path.join(outputRoot, 'win-unpacked/resources/runtime')]
-      : [path.join(outputRoot, target.startsWith('aarch64-') ? 'linux-arm64-unpacked' : 'linux-unpacked', 'resources/runtime')];
-  const found = candidates.find(candidate => fs.existsSync(candidate));
-  assert(found, `cannot find the packaged runtime under ${outputRoot}`);
-  return found;
+function signMac(application) {
+  const executable = path.join(application, 'Contents/MacOS/Vibeface');
+  // The sealed runtime was already signed by its producer; never recurse or re-sign it.
+  run('codesign', ['--force', '--timestamp', '--options', 'runtime', '--sign', process.env.VIBEFACE_CODESIGN_IDENTITY, executable]);
+  run('codesign', ['--force', '--timestamp', '--options', 'runtime', '--entitlements', path.join(desktop, 'build/entitlements.mac.plist'), '--sign', process.env.VIBEFACE_CODESIGN_IDENTITY, application]);
+}
+
+function notarize(file) {
+  const output = run('xcrun', ['notarytool', 'submit', file, '--key', process.env.VIBEFACE_NOTARY_KEY,
+    '--key-id', process.env.VIBEFACE_NOTARY_KEY_ID, '--issuer', process.env.VIBEFACE_NOTARY_ISSUER,
+    '--wait', '--timeout', '30m', '--output-format', 'json']);
+  assert.equal(JSON.parse(output).status, 'Accepted', 'native desktop notarization was not accepted');
+}
+
+function zip(source, destination, mac) {
+  if (mac) run('ditto', ['-c', '-k', '--keepParent', source, destination]);
+  else run(process.env.PY || (process.platform === 'win32' ? 'python' : 'python3'),
+    [path.join(repo, 'scripts/zip-directory.py'), source, destination]);
 }
 
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
@@ -143,59 +140,77 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
     for (const program of ['vibeface.exe', 'vibeface-core.exe']) requireAuthenticode(path.join(runtimeDir, program));
   }
 
-  const stage = path.join(desktop, '.build');
+  const stage = path.join(repo, '.artifacts', 'native-desktop-build', target);
   fs.rmSync(stage, { recursive: true, force: true });
-  const runtimeStage = path.join(stage, 'runtime');
-  const electronOut = path.join(stage, 'out');
-  const electronCache = path.join(stage, 'cache', 'electron');
-  fs.mkdirSync(electronCache, { recursive: true });
-  copyRuntime(runtimeDir, runtimeStage);
-  verifySealedRuntime(runtimeStage, sealed);
-
-  await prefetchElectronArchive({
-    target,
-    cacheRoot: electronCache,
-    tempDirectory: path.join(stage, 'cache', 'tmp'),
-  });
-
-  const builderCli = createRequire(path.join(desktop, 'package.json')).resolve('electron-builder/cli.js');
-  run(process.execPath, [builderCli, '--config', path.join(desktop, 'electron-builder.cjs'),
-    platform.flag, '--publish', 'never'], {
-    cwd: desktop,
-    stdio: 'inherit',
-    env: {
-      ...process.env,
-      VIBEFACE_DESKTOP_TARGET: target,
-      VIBEFACE_DESKTOP_RUNTIME_STAGE: runtimeStage,
-      VIBEFACE_DESKTOP_OUT: electronOut,
-      VIBEFACE_DESKTOP_ELECTRON_CACHE: electronCache,
-      VIBEFACE_DESKTOP_SIGN: signed ? '1' : '',
-      CSC_IDENTITY_AUTO_DISCOVERY: signed ? 'true' : 'false',
-      ...notaryEnvironment(target, signed),
-    },
-  });
-  verifySealedRuntime(packagedRuntime(electronOut, target), sealed);
-
+  const mac = platform.platform === 'darwin';
+  const windows = platform.platform === 'win32';
+  const appRoot = path.join(stage, mac ? 'Vibeface.app' : 'application');
+  const resources = path.join(appRoot, mac ? 'Contents/Resources' : 'resources');
+  const executable = path.join(appRoot, mac ? 'Contents/MacOS/Vibeface' : windows ? 'Vibeface.exe' : 'vibeface');
+  let rustflags = run(process.env.PY || (windows ? 'python' : 'python3'), [path.join(repo, 'scripts/release-rustflags.py')]).trim();
+  if (windows) rustflags += '\x1f-C\x1ftarget-feature=+crt-static';
+  run('cargo', ['build', '--release', '--locked', '--target', target, '-p', 'vibeface-desktop'],
+    { cwd: repo, stdio: 'inherit', env: { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags } });
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  const targetDirectory = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.join(repo, 'target');
+  fs.copyFileSync(path.join(targetDirectory, target, 'release', `vibeface-desktop${platform.exe}`), executable);
+  fs.chmodSync(executable, 0o755);
+  copyRuntime(runtimeDir, path.join(resources, 'runtime'));
   const base = `vibeface-desktop-${version}-${target}`;
+  const produced = path.join(stage, 'out');
+  fs.mkdirSync(produced, { recursive: true });
+  if (mac) {
+    const plist = fs.readFileSync(path.join(desktop, 'build/Info.plist'), 'utf8')
+      .replaceAll('@VERSION@', version).replaceAll('@MARKETING_VERSION@', version.split('-')[0])
+      .replaceAll('@BUILD_VERSION@', version.includes('-') ? `1.0.${version.split('.').at(-1)}` : version);
+    fs.writeFileSync(path.join(appRoot, 'Contents/Info.plist'), plist);
+    fs.copyFileSync(path.join(desktop, 'build/icon.icns'), path.join(resources, 'icon.icns'));
+    if (signed) {
+      signMac(appRoot);
+      const submission = path.join(stage, 'notarize.zip');
+      zip(appRoot, submission, true);
+      notarize(submission);
+      run('xcrun', ['stapler', 'staple', appRoot]);
+    }
+    const dmgRoot = path.join(stage, 'dmg-root');
+    fs.mkdirSync(dmgRoot);
+    run('ditto', [appRoot, path.join(dmgRoot, 'Vibeface.app')]);
+    fs.symlinkSync('/Applications', path.join(dmgRoot, 'Applications'));
+    run('hdiutil', ['create', '-volname', 'Vibeface', '-srcfolder', dmgRoot, '-format', 'UDZO', path.join(produced, `${base}.dmg`)]);
+    if (signed) {
+      run('codesign', ['--timestamp', '--sign', process.env.VIBEFACE_CODESIGN_IDENTITY, path.join(produced, `${base}.dmg`)]);
+      notarize(path.join(produced, `${base}.dmg`));
+      run('xcrun', ['stapler', 'staple', path.join(produced, `${base}.dmg`)]);
+    }
+  } else if (windows) {
+    if (signed) await signNative([executable]);
+    run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
+      [`/DAPP_DIR=${appRoot}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+    if (signed) await signNative([path.join(produced, `${base}.exe`)]);
+  } else {
+    fs.copyFileSync(path.join(desktop, 'build/icon.png'), path.join(appRoot, 'vibeface.png'));
+    fs.copyFileSync(path.join(desktop, 'build/vibeface.desktop'), path.join(appRoot, 'vibeface.desktop'));
+    fs.writeFileSync(path.join(appRoot, 'AppRun'), '#!/bin/sh\ncd "$(dirname "$0")"\nexec ./vibeface "$@"\n', { mode: 0o755 });
+    assert(process.env.APPIMAGETOOL, 'APPIMAGETOOL must name the verified native appimagetool');
+    run(process.env.APPIMAGETOOL, [appRoot, path.join(produced, `${base}.AppImage`)],
+      { env: { ...process.env, ARCH: target.startsWith('aarch64-') ? 'aarch64' : 'x86_64', APPIMAGE_EXTRACT_AND_RUN: '1' }, stdio: 'inherit' });
+  }
+  zip(appRoot, path.join(produced, `${base}.zip`), mac);
+  verifySealedRuntime(path.join(resources, 'runtime'), sealed);
   const payloads = [`${base}.${platform.installer}`, `${base}.zip`];
   fs.mkdirSync(output, { recursive: true });
   const artifacts = {};
   for (const name of payloads) {
-    const produced = path.join(electronOut, name);
-    assert(fs.statSync(produced).size > 0, `electron-builder did not produce ${name}`);
     const destination = path.join(output, name);
     assert(!fs.existsSync(destination), `${name} already exists; use a fresh --output directory`);
-    fs.copyFileSync(produced, destination);
+    fs.copyFileSync(path.join(produced, name), destination);
+    assert(fs.statSync(destination).size > 0, `empty native desktop artifact ${name}`);
     artifacts[name] = hash(destination);
     fs.writeFileSync(`${destination}.sha256`, `${artifacts[name]}  ${name}\n`);
   }
-  if (signed && target === 'x86_64-pc-windows-msvc') {
-    requireAuthenticode(path.join(electronOut, 'win-unpacked/Vibeface.exe'));
-    requireAuthenticode(path.join(output, `${base}.exe`));
-  }
   const receipt = {
     schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel,
-    source_commit: sourceCommit, electron: ELECTRON_VERSION, signed, signing,
+    source_commit: sourceCommit, ...NATIVE_UI, signed, signing,
     runtime: { archive: path.basename(archive), sha256: hash(archive) }, artifacts,
   };
   writeJson(path.join(output, `${base}.provenance.json`), receipt);

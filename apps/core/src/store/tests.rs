@@ -5543,6 +5543,7 @@ fn replay(net: &Net, pieces: &[Piece], order: &[usize]) -> Result<Store> {
                 replica.ingest_events(&net.network, events)?;
             }
         }
+        performance_tests::assert_full_recompute_oracle(&replica, &net.network)?;
     }
     Ok(replica)
 }
@@ -18239,3 +18240,6 @@ fn an_owner_rechecks_new_input_revisions_without_rewriting_existing_receipts() -
     );
     Ok(())
 }
+
+#[path = "performance_tests.rs"]
+mod performance_tests;

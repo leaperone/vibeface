@@ -16,9 +16,12 @@ use std::{
 };
 use vibeface_bridge::platform::privatefs;
 
+pub(crate) mod actor;
+pub use actor::StoreActor;
 pub(crate) mod admission;
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
+mod client_receipts;
 mod log;
 pub(crate) mod mailbox;
 pub(crate) mod questions;

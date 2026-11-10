@@ -1577,7 +1577,7 @@ mod tests {
             agent.human = false;
             assert!(node.resolve_check(&agent, &input).await.is_err());
             assert!(node.resolve_check(&access, &input).await.is_err());
-            assert_eq!(node.store.lock().await.pending_checks()?.len(), 1);
+            assert_eq!(node.store.call("codex_server.pending_checks", move |store| store.pending_checks()).await?.len(), 1);
             assert!(
                 node.codex
                     .inner
@@ -1593,7 +1593,7 @@ mod tests {
                 Value::Null
             };
             assert_eq!(node.resolve_check(&access, &input).await?["resolved"], true);
-            assert!(node.store.lock().await.pending_checks()?.is_empty());
+            assert!(node.store.call("codex_server.pending_checks", move |store| store.pending_checks()).await?.is_empty());
             assert!(node.codex.inner.target.lock().unwrap().leases.is_empty());
             node.codex.release_manager(&check.attempt_id);
             node.shutdown().await;

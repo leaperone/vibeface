@@ -27,7 +27,7 @@ Node 可以连接已有 Codex App Server 的指定 socket，也可以用本机 `
 
 ### Claude Code
 
-Node 启动本机 `claude` CLI，并使用 `<data-dir>/providers/claude` 作为私有 `CLAUDE_CONFIG_DIR`，或使用为该服务配置的认证变量。按设备 **AI** 设置中的命令为此目录登录，不自动复制用户原有登录。续接原生 session 需要那台电脑保留对应的本机 transcript，不能只靠同步 Bot 聊天完成。
+Node 启动本机 `claude` CLI，并使用 `<data-dir>/providers/claude` 作为私有 `CLAUDE_CONFIG_DIR`，或使用为该服务配置的认证变量。按设备 **AI** 设置中的命令为此目录登录，私有登录未建立时可读取已有本机 CLI 的访问令牌快照，保留原 CLI 的刷新权。续接原生 session 需要那台电脑保留对应的本机 transcript，不能只靠同步 Bot 聊天完成。
 
 同一台电脑上，本人另外打开的交互会话也不自动成为 Vibeface 的任务会话。准备方式和会话限制见 [使用 Claude Code、pi 或 opencode](node.md#使用-claude-codepi-或-opencode)。
 

@@ -14,32 +14,12 @@ pub const WIRE_VERSION: u32 = 1;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct BlobRef {
-    pub hash: String,
-    pub size: u64,
-}
+
 
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 
 /// A file the user attached to a message. The name belongs to the message, not the content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct Attachment {
-    pub hash: String,
-    pub size: u64,
-    pub name: String,
-}
 
-impl Attachment {
-    pub fn blob(&self) -> BlobRef {
-        BlobRef {
-            hash: self.hash.clone(),
-            size: self.size,
-        }
-    }
-}
 
 /// A file name as the web signs it: no path separators or control characters, at most
 /// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
@@ -421,13 +401,7 @@ fn is_zero(value: &u8) -> bool {
 }
 
 /// What the user's web client does to a schedule; it never creates or edits one.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleAction {
-    Pause,
-    Resume,
-    Delete,
-}
+
 
 /// The user's own signed message that started the turn a write stands on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1514,3 +1488,5 @@ pub enum IngestStatus {
     Conflict,
     Rejected(String),
 }
+
+pub use vibeface_protocol::workspace::{BlobRef, Attachment, ScheduleAction};

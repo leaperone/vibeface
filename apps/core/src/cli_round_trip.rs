@@ -5,7 +5,7 @@ use crate::{crypto::LocalIdentity, runtime::Runtime};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{path::Path, sync::Arc, time::Duration};
-use vibeface_control::client::{self, ClientKey, Enrollment, Entry, Progress};
+use vibeface_client::{self, ClientKey, Enrollment, Entry, Progress};
 
 const PASSPHRASE: &str = "synthetic client passphrase";
 const PASSWORD: &str = "synthetic recovery password";

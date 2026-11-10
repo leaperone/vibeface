@@ -47,6 +47,29 @@ enum LaunchIdentity<'a> {
     },
 }
 
+pub(super) fn generation_for(
+    identity: &crate::crypto::LocalIdentity,
+    provider: Provider,
+    local: &providers::Local,
+) -> anyhow::Result<String> {
+    let server = &local.switches.codex_app_server;
+    let env = local.launch_env(provider);
+    let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
+        LaunchIdentity::System {
+            socket: server.socket.as_deref(),
+        }
+    } else {
+        LaunchIdentity::Process {
+            bin: local.bin(provider),
+            env: &env,
+            authentication: (provider == Provider::Codex)
+                .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
+                .flatten(),
+        }
+    };
+    identity.provider_fingerprint(&serde_json::to_vec(&(provider, launch))?)
+}
+
 pub(super) struct CachedProviderProbe {
     input: ProbeInput,
     probe: ProviderProbe,
@@ -165,23 +188,7 @@ impl Runtime {
         provider: Provider,
         local: &providers::Local,
     ) -> anyhow::Result<String> {
-        let server = &local.switches.codex_app_server;
-        let env = local.launch_env(provider);
-        let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
-            LaunchIdentity::System {
-                socket: server.socket.as_deref(),
-            }
-        } else {
-            LaunchIdentity::Process {
-                bin: local.bin(provider),
-                env: &env,
-                authentication: (provider == Provider::Codex)
-                    .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
-                    .flatten(),
-            }
-        };
-        self.identity
-            .provider_fingerprint(&serde_json::to_vec(&(provider, launch))?)
+        generation_for(&self.identity, provider, local)
     }
 
     pub(crate) async fn provider_probe_snapshot(&self, provider: Provider) -> ProviderProbe {

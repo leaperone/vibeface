@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Windows%20x64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
 
 </div>
 
@@ -31,7 +31,7 @@
 ## 可以做什么
 
 - **在聊天里提需求。** 给 Bot 设置名称和职责，在同一段对话里安排工作、查看结果。
-- **选择执行的电脑。** 使用自己 Mac 或 Linux 上的 Codex、Claude Code、pi、opencode 或 Cursor 完成任务。
+- **选择执行的电脑。** 使用自己 Mac、Windows 或 Linux 上的 Codex、Claude Code、pi、opencode 或 Cursor 完成任务。
 - **换台电脑继续。** 已授权的电脑会同步聊天、任务进展和保存的结果。在另一台已同步的电脑打开对话，选择由它继续处理。
 - **用手机查看。** 通过浏览器或原生 iOS、Android 应用连接自己的设备。
 
@@ -39,7 +39,7 @@ Vibeface 负责协调工作。每台电脑上的 Agent、登录、模型服务�
 
 ## 快速开始
 
-准备一台 Apple Silicon Mac、Linux x64 或 Linux ARM64（glibc）电脑，并在上面配置一个支持的 Agent。
+准备一台 Apple Silicon Mac、Windows x64、Linux x64 或 Linux ARM64（glibc）电脑，并在上面配置一个支持的 Agent。
 
 1. 安装 Nightly。安装器自动选择并校验本机平台的完整包：
 
@@ -117,7 +117,7 @@ vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3
 
 ## 从源码构建
 
-需要 Rust 1.91+、Node.js 22.12+、pnpm 11.9.0 和 `wasm-bindgen-cli` 0.2.129。
+Core/CLI 构建需要 Python 3.12+、Rust 1.91+、Node.js 24、pnpm 11.9.0 和 `wasm-bindgen-cli` 0.2.129。
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -136,6 +136,7 @@ bash scripts/package-node.sh
 │   ├── app/         # 网页应用
 │   ├── cli/         # 命令行
 │   ├── core/        # Node 本机服务
+│   ├── desktop/     # GPUI 原生桌面 App
 │   ├── mobile/      # iOS 和 Android 应用
 │   └── www/         # 公共网站
 ├── crates/          # 共享 Rust 库
@@ -158,3 +159,5 @@ bash scripts/package-node.sh
 ## 许可证
 
 仓库目前没有 `LICENSE` 文件。在协议发布前，代码默认保留所有权利。
+
+原生 GPUI Desktop 使用 `.github/actions/native-desktop/action.yml` 中单独固定的工具链与平台库。仓库有 Web、CLI、Core、Desktop、Mobile 与独立官网六个应用，不能用 Core 最低 Rust 版本代替 Desktop 编译证明。

@@ -252,3 +252,14 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../../.agents/skills/e2e/SKILL.md)。
 
 当前未选择 AI 模型。需要 `agent.act` 时，先选择订阅、API 或本地模型，再按 `pnpm exec e2e guide setup` 配置 provider。ChatGPT 订阅的登录命令为 `pnpm exec e2e login openai`，完成登录后再运行模型测试。不要把凭证写入仓库；CI 保持不调用真实模型。
+
+## 验证原生桌面窗口
+
+Desktop 使用 GPUI。浏览器和手机 e2e 保留各自的配置，不把网页通过当作 Desktop 验收。
+
+```sh
+cargo test -p vibeface-desktop --locked
+node scripts/e2e-desktop.mjs --app <packaged-executable-or-mac-app> --runtime <sealed-runtime-directory> --output <fresh-evidence-directory>
+```
+
+Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。窗口驱动只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。

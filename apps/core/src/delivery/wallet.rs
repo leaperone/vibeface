@@ -61,9 +61,23 @@ pub struct Wallet {
     address: Option<Address>,
     key: Option<SigningKey>,
     load_error: Option<String>,
+    deferred: bool,
 }
 
 impl Wallet {
+    pub(super) fn deferred(path: PathBuf) -> Self {
+        Self {
+            path,
+            address: None,
+            key: None,
+            load_error: Some("delivery wallet is inactive until paid delivery is enabled".into()),
+            deferred: true,
+        }
+    }
+    pub(super) fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
         let loaded = match read_keystore(&path) {
             Ok(store) => Ok(Some(chain::address(&store.address)?)),
@@ -85,6 +99,7 @@ impl Wallet {
             address,
             key: None,
             load_error,
+            deferred: false,
         })
     }
 
@@ -305,7 +320,7 @@ impl super::Delivery {
             WalletCommand::Create { .. } | WalletCommand::Unlock { .. }
         ) {
             ensure!(
-                self.config().enabled,
+                self.availability() == super::DeliveryAvailability::Ready,
                 "enable the experimental delivery service before creating or unlocking its wallet"
             );
         }
@@ -313,6 +328,11 @@ impl super::Delivery {
             .wallet
             .lock()
             .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
+        if matches!(command, WalletCommand::Create { .. } | WalletCommand::Unlock { .. })
+            && wallet.is_deferred()
+        {
+            *wallet = Wallet::open(self.data_dir.join("delivery-wallet.json"))?;
+        }
         match command {
             WalletCommand::Status => Ok(wallet.status()),
             WalletCommand::Create { passphrase } => wallet.create(&passphrase),
@@ -372,6 +392,7 @@ mod tests {
             address: Some(Address::from_public_key(key.verifying_key())),
             key: Some(key),
             load_error: None,
+            deferred: false,
         };
         let config = chain::tests::config();
         let digest = chain::quote_wallet_digest(&config, [2; 32], [3; 32])?;
@@ -401,6 +422,7 @@ mod tests {
             address: Some(Address::from_public_key(key.verifying_key())),
             key: Some(key),
             load_error: None,
+            deferred: false,
         };
         let intent = chain::tests::approval_intent(wallet.address()?)?;
         let config = chain::tests::config();

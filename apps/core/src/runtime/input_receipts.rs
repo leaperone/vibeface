@@ -56,11 +56,11 @@ impl Runtime {
         self.require_scope(access, &conversation).await?;
         let target: InputTarget =
             serde_json::from_value(input["target"].clone()).context("invalid input target")?;
-        let resolved = self
-            .store
-            .lock()
-            .await
-            .resolve_input_target(network, &target)?;
+        let resolved = {
+            let network = network.to_owned();
+            let target = target.to_owned();
+            self.store.call("input_receipts.resolve_input_target", move |store| store.resolve_input_target(&network, &target)).await
+        }?;
         ensure!(
             resolved.conversation_id == conversation,
             "context target belongs to another conversation"
@@ -108,15 +108,17 @@ impl Runtime {
         let target: InputTarget =
             serde_json::from_value(input["target"].clone()).context("invalid input target")?;
         let resolved = {
-            let store = self.store.lock().await;
-            let original = store
-                .workspace_input(network, &message_id)?
-                .context("input not found")?;
-            ensure!(
-                original.conversation_id == conversation && original.input.route.target == target,
-                "input target does not match the saved message"
-            );
-            store.resolve_input_target(network, &target)?
+            let (network, message_id, conversation, target) = (network.to_owned(), message_id.clone(), conversation.clone(), target.clone());
+            self.store.call("input_receipts.resolve", move |store| {
+                let original = store
+                    .workspace_input(&network, &message_id)?
+                    .context("input not found")?;
+                ensure!(
+                    original.conversation_id == conversation && original.input.route.target == target,
+                    "input target does not match the saved message"
+                );
+                store.resolve_input_target(&network, &target)
+            }).await?
         };
         let local = self.identity.device_id()?;
         let value = if resolved.owner_node == local {
