@@ -438,7 +438,7 @@ fn main() -> Result<()> {
     );
     let mut builder = ExecutorEnv::builder();
     builder
-        .segment_limit_po2(20)
+        .segment_limit_po2(19)
         .session_limit(Some(input.profile.max_guest_cycles))
         .write(&input)?;
     let env = builder.build()?;
