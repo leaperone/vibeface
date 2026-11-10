@@ -32,7 +32,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 ## 每 4 小时自动 Nightly
 
-`ci.yml` 的 main schedule 使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起扩展检查，在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。启用须已明确授权未来每四小时机械版本 PR 的自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。实现合并与本 skill 变化均不代表配置或启用完成。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
+`ci.yml` 的 main schedule 使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起扩展检查，在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。每四小时机械版本 PR 的自动 squash 已授权并默认开启，需配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
 
 协调器将原 run 的 `created_at` 转为 UTC，向下取整到 00、04、08、12、16、20 时的批次，用 `bot/daily-nightly/YYYYMMDDHH` 恢复该批次唯一 PR、版本和真实 squash SHA。发布版本日期仍取原 run 的 `YYYYMMDD`，不同批次独立创建 PR 并递增同日序号、Android versionCode 与 iOS buildNumber。即使业务源码未变化，每个批次仍递增产品组和官网 Nightly；各产品组件使用同一版本，保留 marketing version 和依赖解析结果，Android versionCode 与 iOS buildNumber 各递增一次。协调器保持全局串行。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本，以及这两个原生构建号。iOS 递增 CFBundleVersion 的末段数字，超出 Apple 分段上限时停止，不重置或自动进位。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
 

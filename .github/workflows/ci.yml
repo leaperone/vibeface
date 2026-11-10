@@ -1171,6 +1171,10 @@ jobs:
       actions: write
       pull-requests: read
     steps:
+      - name: Require the Nightly release token
+        env:
+          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
+        run: test -n "$NIGHTLY_RELEASE_TOKEN" || { echo '::error::NIGHTLY_RELEASE_TOKEN is missing'; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
