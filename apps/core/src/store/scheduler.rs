@@ -3330,20 +3330,6 @@ fn report_origin_from(
                             })
                         }
                         (
-                            Some(input),
-                            EventBody::MessagePosted {
-                                message_id,
-                                role: Role::User,
-                                answers: None,
-                                attestation: Some(_),
-                                report_results,
-                                ..
-                            },
-                        ) if input == message_id => Some(ReportOrigin {
-                            reply_to: assignment.assignment_id,
-                            report_results: report_results.unwrap_or(true),
-                        }),
-                        (
                             None,
                             EventBody::WorkspaceCommanded {
                                 command:
@@ -3895,87 +3881,6 @@ fn recover_session(
 }
 
 impl Store {
-    /// Stores the user's message once per `message_id` and queues it on the owner.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a user message and its admission"
-    )]
-    pub fn accept_message(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        conversation: &str,
-        message_id: &str,
-        text: &str,
-        attachments: Vec<Attachment>,
-        report_results: bool,
-        attestation: Attestation,
-        created_at_ms: i64,
-    ) -> Result<(Message, AdmissionReceipt)> {
-        let local = identity.device_id()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &local)?;
-        ensure!(
-            !super::bots::bot_deleted_from(&tx, network, conversation)?,
-            "this bot was deleted"
-        );
-        let owner = conversation_from(&tx, network, conversation)?
-            .context("conversation not found")?
-            .owner
-            .context("conversation has no scheduling Node")?;
-        if let Some(existing) = message_from(&tx, network, conversation, message_id)? {
-            ensure!(
-                existing.role == Role::User
-                    && existing.answers.is_none()
-                    && existing.text == text
-                    && existing.attachments == attachments
-                    && existing.report_results == Some(report_results),
-                "message ID reused with different content"
-            );
-        } else {
-            log::append_from(
-                &tx,
-                &self.blob_dir,
-                identity,
-                network,
-                conversation,
-                EventBody::MessagePosted {
-                    message_id: message_id.into(),
-                    role: Role::User,
-                    text: text.into(),
-                    attachments: attachments.clone(),
-                    report_results: Some(report_results),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: Some(attestation),
-                    failure: None,
-                },
-                attachments.iter().map(Attachment::blob).collect(),
-                created_at_ms,
-            )?;
-        }
-        let trigger = message_trigger(message_id);
-        let receipt = if owner == local {
-            admit_from(
-                &tx,
-                network,
-                conversation,
-                &trigger,
-                TriggerKind::Human,
-                message_id,
-            )?
-        } else {
-            queue_delivery_from(&tx, network, conversation, &trigger)?
-        };
-        let message =
-            message_from(&tx, network, conversation, message_id)?.context("message missing")?;
-        tx.commit()?;
-        Ok((message, receipt))
-    }
-
     pub fn admit_due_schedules(
         &mut self,
         identity: &LocalIdentity,
@@ -4011,26 +3916,6 @@ impl Store {
             provider,
             limits,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scheduler_queue_hold(
-        &self,
-        network: &str,
-        local: &str,
-        conversation: &str,
-        state: &JobState,
-    ) -> Result<Option<QueueHoldReason>> {
-        let session = load_session(&self.connection, conversation)?;
-        let steering = conversation_from(&self.connection, network, conversation)?
-            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
-            && !query_jobs(
-                &self.connection,
-                "conversation_id=? AND state='steering'",
-                [conversation],
-            )?
-            .is_empty();
-        Ok(queue_hold_reason(state, session.active.is_some(), steering))
     }
 
     pub(crate) fn scheduler_job_context_projection(

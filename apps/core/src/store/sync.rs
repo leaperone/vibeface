@@ -324,10 +324,6 @@ impl Store {
                     message.role == Role::User,
                     "only user messages are delivered"
                 );
-                let kind = match message.answers {
-                    Some(_) => TriggerKind::Answer,
-                    None => TriggerKind::Human,
-                };
                 if held_input.is_some() {
                     let Some(receipt) = super::triage::held_answer_receipt_from(
                         &tx,
@@ -342,7 +338,24 @@ impl Store {
                 } else if typed_input.is_some() {
                     super::scheduler::admit_workspace_input_from(&tx, network, local, message_id)?
                 } else {
-                    admit_from(&tx, network, conversation, trigger, kind, message_id)?
+                    let question = message
+                        .answers
+                        .as_deref()
+                        .context("delivery is not a typed input or question answer")?;
+                    let question = super::questions::question_from(&tx, network, question)?
+                        .context("answer question has not arrived")?;
+                    ensure!(
+                        question["conversation_id"] == conversation,
+                        "answer belongs to another conversation"
+                    );
+                    admit_from(
+                        &tx,
+                        network,
+                        conversation,
+                        trigger,
+                        TriggerKind::Answer,
+                        message_id,
+                    )?
                 }
             }
             Some(("work", work_id)) => {

@@ -1916,13 +1916,6 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                                     message_id,
                                     attestation: Some(_),
                                     ..
-                                }
-                                | EventBody::MessagePosted {
-                                    message_id,
-                                    role: Role::User,
-                                    answers: None,
-                                    attestation: Some(_),
-                                    ..
                                 } => message_id == &cause.message_id,
                                 _ => false,
                             }
