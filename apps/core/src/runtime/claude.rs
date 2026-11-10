@@ -1181,21 +1181,7 @@ where
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
     let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
-    let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-        ManagerError {
-            stage: stage.current(),
-            outcome,
-            start: *start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            session_id: session.map(str::to_owned),
-            failure: ExecFailure {
-                detail: manager::redact_string(failure.detail, &secrets),
-                ..failure
-            },
-        }
-        .into()
-    };
+    let error = ManagerError::reporter(&stage, &start, &secrets);
     // Faults of this Node's own bookkeeping, not of Claude Code.
     let own = |detail: &str| ExecFailure::new(FailureKind::Unknown, detail);
     let stopped = |session: Option<&str>| {

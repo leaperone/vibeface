@@ -9,7 +9,7 @@ use std::{
 use vibeface_bridge::platform::privatefs;
 use zeroize::Zeroizing;
 
-/// Bumped whenever stored data stops being readable by the previous build.
+/// Fixed at 1 before the first stable release; schema changes update the fingerprint below.
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =

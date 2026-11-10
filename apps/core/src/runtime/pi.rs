@@ -980,21 +980,7 @@ impl Pi {
         let secrets = crate::manager::secret_values(config);
         let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
         let stage = vibeface_bridge::failure::ProviderTrace::new("pi", ProviderStage::SessionStart);
-        let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-            ManagerError {
-                stage: stage.current(),
-                outcome,
-                start: *start
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                session_id: session.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: crate::manager::redact_string(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-            .into()
-        };
+        let error = ManagerError::reporter(&stage, &start, &secrets);
         let own = |detail: String| ExecFailure::new(FailureKind::Unknown, detail);
         let stopped = |session: Option<&str>| {
             error(

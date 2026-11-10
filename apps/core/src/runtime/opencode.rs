@@ -1051,21 +1051,7 @@ impl Opencode {
         let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
         let stage =
             vibeface_bridge::failure::ProviderTrace::new("opencode", ProviderStage::Validate);
-        let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-            ManagerError {
-                stage: stage.current(),
-                outcome,
-                start: *start
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                session_id: session.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: manager::redact_string(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-            .into()
-        };
+        let error = ManagerError::reporter(&stage, &start, &secrets);
         let failed =
             |session: Option<&str>, failure| error(ManagerFailure::Failed, session, failure);
         // Faults of this Node's own bookkeeping, not of opencode.
