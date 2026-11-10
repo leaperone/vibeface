@@ -10,11 +10,65 @@ $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibef
 $machineRegistration = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface'
 if ((Test-Path $registration) -or (Test-Path $machineRegistration)) { throw 'A pre-existing product registration cannot be changed by this fixture' }
 $destination = Join-Path $env:RUNNER_TEMP ('Vibeface native 安装 ' + [guid]::NewGuid().ToString('N'))
+$unowned = Join-Path $env:RUNNER_TEMP ('Vibeface unowned ' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory $unowned | Out-Null
+$beforeSentinel = Join-Path $unowned 'user-before.txt'
+$beforeProgram = Join-Path $unowned 'Vibeface.exe'
+[System.IO.File]::WriteAllText($beforeSentinel, 'keep-before-install')
+[System.IO.File]::WriteAllText($beforeProgram, 'existing-user-program')
+$refused = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $unowned) -Wait -PassThru
+if ($refused.ExitCode -eq 0) { throw 'Installer accepted a nonempty unowned directory' }
+if ([System.IO.File]::ReadAllText($beforeSentinel) -ne 'keep-before-install' -or [System.IO.File]::ReadAllText($beforeProgram) -ne 'existing-user-program') { throw 'Refused installation changed existing user files' }
+if (@(Get-ChildItem -Force $unowned).Count -ne 2 -or (Test-Path $registration)) { throw 'Refused installation copied files or created registration' }
+$userAfter = Join-Path $destination 'user-after.txt'
+$userNested = Join-Path $destination 'user-files\keep.txt'
+$ownedPaths = @()
 $installed = $false
 try {
   $process = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw 'The per-user installer failed' }
   $installed = $true
+  $manifest = Get-Content -Raw (Join-Path $destination '.vibeface-installed-files.json') | ConvertFrom-Json
+  if ($manifest.schema -ne 1 -or $manifest.app -ne 'vibeface-native-desktop' -or $manifest.files.Count -lt 2) { throw 'Installed ownership manifest is invalid' }
+  $ownedPaths = @($manifest.files)
+  foreach ($relative in $ownedPaths) {
+    if ($relative -notmatch '^[a-zA-Z0-9._/-]+$' -or $relative.Split('/') -contains '..') { throw 'Installed ownership manifest has an unsafe path' }
+  }
+  [System.IO.File]::WriteAllText($userAfter, 'keep-after-install')
+  New-Item -ItemType Directory (Split-Path $userNested) | Out-Null
+  [System.IO.File]::WriteAllText($userNested, 'keep-nested-user-file')
+  $copiedRoot = Join-Path $env:RUNNER_TEMP ('Vibeface copied uninstaller ' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory $copiedRoot | Out-Null
+  $copiedSentinel = Join-Path $copiedRoot 'Vibeface.exe'
+  [System.IO.File]::WriteAllText($copiedSentinel, 'unowned-copy-sentinel')
+  $copiedUninstaller = Join-Path $copiedRoot 'Uninstall.exe'
+  Copy-Item (Join-Path $destination 'Uninstall.exe') $copiedUninstaller
+  $refused = Start-Process -FilePath $copiedUninstaller -ArgumentList ('/S _?=' + $copiedRoot) -Wait -PassThru
+  if ($refused.ExitCode -eq 0 -or [System.IO.File]::ReadAllText($copiedSentinel) -ne 'unowned-copy-sentinel') { throw 'A copied uninstaller touched an unowned directory' }
+  if (-not (Test-Path (Join-Path $destination 'Vibeface.exe'))) { throw 'A copied uninstaller modified the real installation' }
+  $runtimeDirectory = Join-Path $destination 'resources\runtime'
+  $heldRuntime = Join-Path $env:RUNNER_TEMP ('Vibeface held runtime ' + [guid]::NewGuid().ToString('N'))
+  $outside = Join-Path $env:RUNNER_TEMP ('Vibeface junction target ' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory $outside | Out-Null
+  $outsideSentinel = Join-Path $outside 'outside-user-file.txt'
+  [System.IO.File]::WriteAllText($outsideSentinel, 'never-traverse-junction')
+  Move-Item $runtimeDirectory $heldRuntime
+  $junctionCreated = $false
+  try {
+    New-Item -ItemType Junction -Path $runtimeDirectory -Target $outside | Out-Null
+    $junctionCreated = $true
+    $refused = Start-Process -FilePath (Join-Path $destination 'Uninstall.exe') -ArgumentList ('/S _?=' + $destination) -Wait -PassThru
+    if ($refused.ExitCode -eq 0) { throw 'Uninstaller accepted a reparse point in an owned payload path' }
+    $refused = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
+    if ($refused.ExitCode -eq 0) { throw 'Installer accepted a reparse point in an owned payload path' }
+    if ([System.IO.File]::ReadAllText($outsideSentinel) -ne 'never-traverse-junction' -or -not (Test-Path (Join-Path $destination 'Vibeface.exe'))) { throw 'Refused junction traversal changed user or installed files' }
+  } finally {
+    if ($junctionCreated) { [System.IO.Directory]::Delete($runtimeDirectory) }
+    Move-Item $heldRuntime $runtimeDirectory
+  }
+  $upgraded = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
+  if ($upgraded.ExitCode -ne 0) { throw 'An owned upgrade failed' }
+  if ([System.IO.File]::ReadAllText($userAfter) -ne 'keep-after-install' -or [System.IO.File]::ReadAllText($userNested) -ne 'keep-nested-user-file') { throw 'Owned upgrade changed extra user files' }
   if (Test-Path $machineRegistration) { throw 'Installer unexpectedly wrote machine-wide registration' }
   $receipt = Get-ItemProperty $registration
   if (-not $receipt.UninstallString.Contains($destination)) { throw 'Uninstall registration is not bound to the task-owned installation' }
@@ -65,6 +119,11 @@ try {
     $removed = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
     if ($removed.ExitCode -ne 0) { throw 'Task-owned uninstaller failed' }
     if (Test-Path $registration) { throw 'Task-owned per-user registration survived uninstall' }
+    foreach ($relative in $ownedPaths) {
+      if (Test-Path (Join-Path $destination $relative)) { throw 'An owned payload file survived uninstall' }
+    }
+    if ([System.IO.File]::ReadAllText($userAfter) -ne 'keep-after-install' -or [System.IO.File]::ReadAllText($userNested) -ne 'keep-nested-user-file') { throw 'Uninstall changed extra user files' }
+    if (Test-Path (Join-Path $destination '.vibeface-install-owned')) { throw 'Ownership marker survived uninstall' }
   }
 }
-Write-Output 'Current-user install, sealed runtime, native window and uninstall checks passed'
+Write-Output 'Current-user install, unowned-root refusal, copied-uninstaller refusal, junction refusal, owned upgrade, sealed runtime, native window and user-file-preserving uninstall checks passed'

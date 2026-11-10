@@ -118,6 +118,44 @@ function zip(source, destination, mac) {
     [path.join(repo, 'scripts/zip-directory.py'), source, destination]);
 }
 
+function windowsInstallerManifest(application, includeFile) {
+  const files = relativeFiles(application);
+  const manifest = '.vibeface-installed-files.json';
+  assert(!files.includes(manifest), 'the installer ownership manifest must be generated once');
+  const known = new Set();
+  const directories = new Set();
+  for (const name of files) {
+    assert(/^[a-zA-Z0-9._/-]+$/.test(name), `unsafe Windows installer payload path: ${name}`);
+    assert(!fs.lstatSync(path.join(application, name)).isSymbolicLink(), 'Windows installer payload must not contain links');
+    for (const part of name.split('/')) {
+      assert(part && part !== '.' && part !== '..' && !part.endsWith('.') && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part), `unsafe Windows path component: ${part}`);
+    }
+    assert(!known.has(name.toLowerCase()), 'Windows payload paths must be case-insensitively unique');
+    known.add(name.toLowerCase());
+    for (let parent = path.posix.dirname(name); parent !== '.'; parent = path.posix.dirname(parent)) directories.add(parent);
+  }
+  assert(!known.has('uninstall.exe') && !known.has('.vibeface-install-owned') && !known.has(manifest), 'installer control files are reserved');
+  files.push(manifest);
+  files.sort();
+  const folders = [...directories].sort((a, b) => b.split('/').length - a.split('/').length || a.localeCompare(b));
+  writeJson(path.join(application, manifest), { schema: 1, app: 'vibeface-native-desktop', files, directories: folders });
+  const windowsPath = name => name.replaceAll('/', '\\');
+  const check = (prefix, name, kind) => `  !insertmacro CheckPath "${prefix}" "$INSTDIR${name ? `\\${windowsPath(name)}` : ''}" "${kind}"`;
+  const output = [
+    '!macro ValidateOwnedPaths PREFIX', check('${PREFIX}', '', 'dir'),
+    ...folders.map(name => check('${PREFIX}', name, 'dir')),
+    ...files.map(name => check('${PREFIX}', name, 'file')), '!macroend',
+    '!macro AssertNewPayloadVacant',
+    ...files.flatMap((name, index) => [`  IfFileExists "$INSTDIR\\${windowsPath(name)}" 0 vacant_${index}`, '  Push "A new package file conflicts with an unowned file. Nothing will be overwritten."', '  Call Refuse', `vacant_${index}:`]), '!macroend',
+    '!macro DeleteOwnedPayload',
+    ...files.flatMap((name, index) => [check('un.', name, 'file'), `  IfFileExists "$INSTDIR\\${windowsPath(name)}" 0 removed_${index}`, '  ClearErrors', `  Delete "$INSTDIR\\${windowsPath(name)}"`, `  IfErrors 0 removed_${index}`, '  Push "An owned program file could not be removed. Close Vibeface and retry."', '  Call un.Refuse', `removed_${index}:`]), '!macroend',
+    '!macro RemoveOwnedDirectories',
+    ...folders.flatMap(name => [check('un.', name, 'dir'), `  RMDir "$INSTDIR\\${windowsPath(name)}"`]), '!macroend', '',
+  ].join('\n');
+  fs.writeFileSync(includeFile, output);
+  return { files, directories: folders, include: output };
+}
+
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const platform = PLATFORMS[target];
   assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
@@ -185,8 +223,10 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
     }
   } else if (windows) {
     if (signed) await signNative([executable]);
+    const installerFiles = path.join(stage, 'installer-files.nsh');
+    windowsInstallerManifest(appRoot, installerFiles);
     run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
-      [`/DAPP_DIR=${appRoot}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+      [`/DAPP_DIR=${appRoot}`, `/DFILE_MANIFEST=${installerFiles}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
     if (signed) await signNative([path.join(produced, `${base}.exe`)]);
   } else {
     run(process.env.PY || 'python3', [path.join(repo, 'scripts/native-desktop/dependencies.py'), '--executable', executable, '--target', target, '--output', path.join(appRoot, 'native-dependencies.json')]);
@@ -310,7 +350,33 @@ function selfTest() {
         process.env = restore;
       }
     }
-    console.log('desktop build self-test passed: sealed runtime verification, cohort identity, packaging immutability and honest signing status.');
+    const windowsPayload = path.join(scratch, 'windows-payload');
+    fs.mkdirSync(path.join(windowsPayload, 'resources/runtime/web/assets'), { recursive: true });
+    fs.writeFileSync(path.join(windowsPayload, 'Vibeface.exe'), 'native fixture');
+    fs.writeFileSync(path.join(windowsPayload, 'resources/runtime/web/assets/hash-old.js'), 'asset fixture');
+    const includeFile = path.join(scratch, 'installer-files.nsh');
+    const ownership = windowsInstallerManifest(windowsPayload, includeFile);
+    assert.deepEqual(ownership.files, ['.vibeface-installed-files.json', 'Vibeface.exe', 'resources/runtime/web/assets/hash-old.js']);
+    assert.deepEqual(ownership.directories, ['resources/runtime/web/assets', 'resources/runtime/web', 'resources/runtime', 'resources']);
+    assert(ownership.include.includes('Delete "$INSTDIR\\resources\\runtime\\web\\assets\\hash-old.js"'));
+    assert(!ownership.include.includes('RMDir /r') && !ownership.include.includes('Delete "$INSTDIR\\*'));
+    assert.equal((ownership.include.match(/  Delete /g) ?? []).length, ownership.files.length);
+    assert.equal((ownership.include.match(/  RMDir /g) ?? []).length, ownership.directories.length);
+    const installerSource = fs.readFileSync(path.join(desktop, 'build/installer.nsi'), 'utf8');
+    assert(!/RMDir\s+\/r\b/i.test(installerSource), 'uninstall must never recursively remove the selected root');
+    assert(installerSource.includes('!define MUI_PAGE_CUSTOMFUNCTION_LEAVE ValidateInstallRoot'));
+    assert(installerSource.includes('Call ValidateInstallRoot\n  IfFileExists'), 'silent install validates ownership before copying');
+    assert(installerSource.includes('/UPGRADE=1 _?=$INSTDIR'), 'owned upgrade uses the previous compiled exact deletion list');
+    assert(installerSource.includes('IntOp $4 $2 & 0x400'), 'installation checks reparse attributes');
+    const invalidPayload = path.join(scratch, 'invalid-windows-payload');
+    fs.mkdirSync(invalidPayload);
+    fs.writeFileSync(path.join(invalidPayload, 'CON.txt'), 'reserved device');
+    assert.throws(() => windowsInstallerManifest(invalidPayload, includeFile), /unsafe Windows path component/);
+    const linkedPayload = path.join(scratch, 'linked-windows-payload');
+    fs.mkdirSync(linkedPayload);
+    fs.symlinkSync(path.join(windowsPayload, 'Vibeface.exe'), path.join(linkedPayload, 'Vibeface.exe'));
+    assert.throws(() => windowsInstallerManifest(linkedPayload, includeFile), /must not contain links/);
+    console.log('desktop build self-test passed: sealed runtime verification, cohort identity, packaging immutability, exact installer ownership and honest signing status.');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
