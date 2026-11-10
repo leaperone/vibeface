@@ -119,7 +119,7 @@ BotMessaged {
 |---|---|---|---|---|---|---|---|---|
 | 读 | `workspace_state` `workspace_history` `tool_search` `tool_describe` `tool_call` `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` `list_sessions` `history_search` `history_read` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 工作 | `workspace_command` `dispatch_work` `interrupt_work` `hand_over_session` `propose_provider_config` `apply_provider_config` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | | |
 | 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | | |
 
 提供给模型的工具表由 `Effect::offered` 决定；Node 执行工具时再按这一轮任务的类型核对一次，CLI 直接调用也绕不过。

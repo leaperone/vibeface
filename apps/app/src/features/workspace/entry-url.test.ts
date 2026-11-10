@@ -1172,6 +1172,7 @@ test("workspace preserves bot and message requests while routing native decision
           assert.equal(options.headerBlurEffect, blur)
           assert.equal(JSON.stringify(options.headerStyle), JSON.stringify({ backgroundColor: background }))
           assert.ok(typeof options.headerTitle === 'function'); options.headerTitle()
+          assert.equal(elements.some(({ type }) => type === 'ChatMaterial'), false, 'the native bar owns the title material')
         }
       } finally {
         for (const read of fileReads.values()) read.resolve(new Uint8Array([0]).buffer)
