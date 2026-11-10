@@ -839,19 +839,30 @@ pub async fn create_network(
     drop(session);
     let created = match reply {
         Ok(created) => created,
-        // The reply may be lost after the Node installed the network: ask it before failing.
+        Err(error) if error.is::<Refused>() => return Err(error),
+        // The outcome is unknown: the Node may still be installing the network or have lost the
+        // reply. Ask it for a while before failing, never sending `recover` again.
         Err(error) => {
-            match async {
-                key.connect(Some(&entry))
-                    .await?
-                    .call("authenticate", json!({}))
-                    .await
+            let mut created = None;
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let reply = async {
+                    key.connect(Some(&entry))
+                        .await?
+                        .call("authenticate", json!({}))
+                        .await
+                }
+                .await;
+                match reply {
+                    Ok(reply) if reply["network_id"] == network.as_str() => {
+                        created = Some(reply);
+                        break;
+                    }
+                    Ok(reply) if reply["initialized"] == true => break,
+                    _ => {}
+                }
             }
-            .await
-            {
-                Ok(created) if created["network_id"] == network.as_str() => created,
-                _ => return Err(error),
-            }
+            created.ok_or(error)?
         }
     };
     ensure!(

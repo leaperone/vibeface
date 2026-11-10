@@ -53,6 +53,9 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const ANSWERING: usize = 16;
 /// Of those, the ones answered at once for one device, so a single neighbor cannot hold all.
 const ANSWERING_PER_PEER: usize = 4;
+/// Below this many neighbors a Node joins the bootstrap nodes it lacks again. A join displaces
+/// one of the bootstrap node's at most 5 neighbors, so well-connected Nodes leave it alone.
+const FEW_NEIGHBORS: usize = 3;
 const LOOKUP_BUDGET: Duration = Duration::from_secs(8);
 const LOOKUP_NEIGHBORS: usize = 3;
 /// Remembered Nodes tried when joining again, besides the bootstrap nodes.
@@ -1222,8 +1225,8 @@ impl Mesh {
     }
 
     /// Joins again through the remembered and bootstrap Nodes while this Node has no neighbor,
-    /// backing off from 30 s to 5 minutes. With neighbors, it joins the bootstrap nodes that are
-    /// not among them every 5 minutes, so one that restarted is a neighbor again.
+    /// backing off from 30 s to 5 minutes. With fewer than 3 neighbors, it joins the bootstrap
+    /// nodes that are not among them every 5 minutes, so one that restarted is a neighbor again.
     async fn rejoin(self: Arc<Self>) {
         let mut wait = JOIN_RETRY;
         let mut bootstrap_at = Instant::now();
@@ -1238,7 +1241,7 @@ impl Mesh {
                 bootstrap_at = Instant::now();
             } else {
                 wait = JOIN_RETRY;
-                if bootstrap_at.elapsed() >= JOIN_RETRY_MAX {
+                if neighbors.len() < FEW_NEIGHBORS && bootstrap_at.elapsed() >= JOIN_RETRY_MAX {
                     bootstrap_at = Instant::now();
                     let peers = absent(self.bootstrap_peers().await, &neighbors);
                     tracing::debug!(event = "mesh.rejoin_bootstrap", peers = peers.len());
@@ -1330,6 +1333,11 @@ impl Mesh {
             Request::Digest { have } => {
                 self.admit(remote, true)?;
                 let (records, more) = self.page(&have)?;
+                // Only pages that carry records cost this Node bandwidth.
+                ensure!(
+                    records.is_empty() || self.pages.lock().expect("mesh pages").take(),
+                    "this Node is answering too many mesh digests; ask again later"
+                );
                 if let Some(limit) = self.limits.lock().expect("mesh limits").get_mut(&remote) {
                     limit.more = more;
                 }
@@ -1387,10 +1395,6 @@ impl Mesh {
                         .digest_at
                         .is_none_or(|at| at.elapsed() >= DIGEST_EVERY),
                 "a device asks for a mesh digest at most every 10 seconds"
-            );
-            ensure!(
-                self.pages.lock().expect("mesh pages").take(),
-                "this Node is answering too many mesh digests; ask again later"
             );
             limit.digest_at = Some(Instant::now());
             limit.more = false;

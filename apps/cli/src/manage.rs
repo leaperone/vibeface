@@ -46,9 +46,13 @@ fn arg_or_stdin(text: String) -> Result<String> {
     }
     let mut input = String::new();
     std::io::stdin()
-        .take(1 << 20)
+        .take((1 << 20) + 1)
         .read_to_string(&mut input)
         .context("read standard input")?;
+    ensure!(
+        input.len() <= 1 << 20,
+        "standard input holds more than 1 MiB"
+    );
     Ok(input.trim_end_matches(['\r', '\n']).to_owned())
 }
 
@@ -592,6 +596,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             Ok(())
         }
         ClientAction::Enroll { link, name } => {
+            ensure!(
+                link != "-" || access.passphrase_fd != Some(0),
+                "the invite link and the passphrase cannot both come from standard input"
+            );
             let link = arg_or_stdin(link)?;
             let origin = match &access.url {
                 Some(url) => url.clone(),
