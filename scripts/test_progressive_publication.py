@@ -294,6 +294,14 @@ def main():
                 rel.publish_part('desktop', collected / 'desktop' / desktop, target=desktop)
                 require(any(name.startswith('vibeface-desktop-') for name in state.assets), 'desktop part uploaded')
 
+                rel.fail_product()
+                require(rel.FAILED_MARKER in state.body and rel.BUILDING_MARKER not in state.body, 'failed release')
+                edits = len(state.edits)
+                rel.fail_product()
+                require(len(state.edits) == edits, 'marking an already failed release is a no-op')
+                rel.begin_product()
+                require(rel.BUILDING_MARKER in state.body, 'a rerun reopens the failed release')
+
     staged = part.parent / 'finalize-product'
     staged.mkdir()
     shutil.copy2(collected / 'app' / 'release.json', staged / 'release.json')
@@ -312,6 +320,10 @@ def main():
         with patch.object(rel, 'require_product_publishing', side_effect=publishing_patch):
             with patch.object(rel, 'identity', side_effect=identity_patch):
                 rejects('partial manifest on public release', rel.begin_product, 'immutable complete release')
+                edits = len(state.edits)
+                rel.fail_product()
+                require(len(state.edits) == edits and rel.BUILDING_MARKER in state.body,
+                        'a release with its manifest is never marked failed')
 
     state.immutable = True
     state.assets.pop('release.json')
@@ -319,6 +331,7 @@ def main():
         with patch.object(rel, 'require_product_publishing', side_effect=publishing_patch):
             with patch.object(rel, 'identity', side_effect=identity_patch):
                 rejects('immutable release', rel.begin_product, 'immutable')
+                rejects('immutable failed release', rel.fail_product, 'immutable')
 
     rejects('duplicate remote asset names', lambda: rel.remote_assets_by_name([
         dict(name='a.bin', size=1, digest='sha256:' + '0' * 64),

@@ -37,7 +37,7 @@ PART_PUBLISHERS = (
     'publish-desktop-aarch64-unknown-linux-gnu',
     'publish-desktop-x86_64-pc-windows-msvc',
     'publish-android', 'publish-ios')
-PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'publish', 'npm')
+PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'release-failed', 'publish', 'npm')
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 require = release.require
 
@@ -80,7 +80,7 @@ def blob(commit, path):
 def api(path, method='GET', data=None, pat=False, missing=False):
     environment = dict(os.environ)
     if pat:
-        require(environment.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is required; daily Nightly is not configured')
+        require(environment.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is missing')
         environment['GH_TOKEN'] = environment['NIGHTLY_RELEASE_TOKEN']
     args = ['gh', 'api', '--method', method, 'repos/' + REPO + '/' + path]
     if path == '/user':
@@ -591,7 +591,7 @@ def publish_daily(source, deadline):
 
 
 def run_daily(run_id):
-    require(os.environ.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is missing; daily Nightly has not been enabled')
+    require(os.environ.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is missing')
     require(os.environ.get('GH_TOKEN'), 'GITHUB_TOKEN must be supplied as GH_TOKEN for branch/tag/dispatch writes')
     require(os.environ.get('GITHUB_REPOSITORY') == REPO and os.environ.get('GITHUB_EVENT_NAME') == 'schedule'
             and os.environ.get('GITHUB_REF') == 'refs/heads/main' and str(run_id) == os.environ.get('GITHUB_RUN_ID'),

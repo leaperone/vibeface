@@ -557,6 +557,10 @@ Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数�
 
 管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于工作结果等后续轮次，同一 Bot 的主聊天一次只运行一个管理轮。独立 Agent task 各有本机 session 和 Memory staging writer，定时 routine 每次使用独立临时 session，不复用主聊天的 token、Context 或原生历史。管理轮派发工作后即结束，不等待工作；工作结束时它的结果作为新的一轮入队，Agent 汇报并可继续派发。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
 
+`vibeface tool` 供正在运行的 Bot 轮次调用。Node 为该轮注入工具地址和 `VIBEFACE_TOOL_TOKEN`，并在轮次结束后撤销权限。普通终端不会继承这份令牌。不要从其他会话读取或复制令牌，也不要把已登录网页的凭据用于工具入口。
+
+要交办新工作，请用已加入个人网络、持有成员签名身份的浏览器打开 Bot 聊天，发送包含目标、项目目录和范围的新任务，让 Bot 在新一轮调用 `dispatch_work`。浏览器尚未加入时，先按[添加自己的设备](#添加自己的设备)完成客户端加入和批准。普通终端可读取状态、配置本机，例如 `vibeface node settings`、`vibeface node configure`；本机操作者权限和本机管理 cookie 都不能代替成员签名派发。
+
 需要停止时，区分以下动作：
 
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
@@ -564,7 +568,7 @@ Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数�
 
 Codex、Claude Code、pi 和 OpenCode 的活动输入走各自原生补充路径。每条输入区分设备保存、执行设备接纳、服务接受、实际回合归属和结果未知，不能仅凭提交成功显示 Bot 已读。完整附件按同目标顺序交付。当前 Cursor ACP 适配器未提供原生 steer，活动补充仍有缺口。Codex 线程创建时把本轮工具令牌和本机工具地址写进 Shell 环境，续接同一线程沿用该令牌；每次使用仍核验当前 attempt 和权限围栏。Node 重启沿用上次的工具端口，端口变化时开新线程。Codex 以 App Server 回合结束确认停止。Claude Code、pi 和 OpenCode 以 Provider 终态或受管进程退出确认，Cursor 须 Provider 终态。无法确认时进入待确认并保留部分回复。停止回复与停止已派发工作分别操作。
 
-Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
+Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行。即使启用了多个执行产品，也可省略 `agent`：新工作优先使用当前 Bot 的产品，未启用该产品执行时选第一个已启用的产品；带 `thread` 或 `continues` 时沿用原工作的产品。Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
 协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。Node 发送前读取并规范化线程的真实目录，核对它位于本机 `roots` 内。给出 `cwd` 时还须与真实目录一致。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks`、`/api/triage` 相同：回环来源、无 `Origin`、无转发头，并带数据目录 `local-access.json` 里的所有者 bearer，命令按该文件记录的 origin 发请求；同一 OS 账户的完整 Shell 本就能读这个文件，所以这不是进程沙箱隔离）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
