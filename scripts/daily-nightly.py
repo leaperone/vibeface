@@ -300,6 +300,8 @@ def trusted_nightlies(tags, batch):
             continue
         source = git('rev-parse', tag + '^{commit}')
         try:
+            require(set(git('ls-tree', '-r', '--name-only', source, '--', *PATHS).splitlines()) == set(PATHS),
+                    'Nightly candidate predates the current release layout')
             context = release.validate_source(source, app)
             if app == 'www' and not context['ci_run_id']:
                 continue
@@ -464,6 +466,15 @@ def self_test():
         (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
         (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
         git('init', '--initial-branch=main', root=root)
+        legacy_blob = git('hash-object', '-w', '--stdin', root=root, data=(root / 'Cargo.lock').read_bytes())
+        legacy_tree = git('mktree', root=root, data=f'100644 blob {legacy_blob}\tCargo.lock\n'.encode())
+        legacy = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                     'commit-tree', legacy_tree, '-m', 'old release layout fixture', root=root)
+        legacy_batch = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                           'commit-tree', legacy_tree, '-p', legacy, '-m', 'chore(release): nightly 2026110600', root=root)
+        git('update-ref', 'refs/heads/main', legacy_batch, root=root)
+        git('tag', 'v0.0.1-nightly.20261016.1', legacy, root=root)
+        git('tag', 'v0.0.1-nightly.20261016.2', legacy_batch, root=root)
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
         with patch('release.ROOT', root), patch(f'{__name__}.time.sleep'):
@@ -546,6 +557,29 @@ def self_test():
             next_head = commit_files({}, next_plan)
             assert release.validate_source(next_head, 'product')['ci_source_commit'] == advanced
             assert recovered_plan(next_head).previous == head
+            legacy_tag = 'v0.0.1-nightly.20261016.1'
+            current_tag = 'v' + plan.versions['cli']
+            git('merge-base', '--is-ancestor', legacy, 'origin/main')
+            for tags in ([legacy_tag, current_tag], [current_tag, legacy_tag]):
+                assert [source for _, source, _ in trusted_nightlies(tags, plan.batch)] == [head]
+            rejected(lambda: trusted_nightlies(['v0.0.1-nightly.20261016.2'], plan.batch), 'invalid immutable source')
+            with patch('release.validate_source', side_effect=subprocess.CalledProcessError(1, ['cargo', 'metadata'])):
+                try:
+                    trusted_nightlies([current_tag], plan.batch)
+                except subprocess.CalledProcessError as error:
+                    assert error.cmd == ['cargo', 'metadata']
+                else:
+                    raise AssertionError('candidate filtering swallowed a metadata environment failure')
+            rollback_plan = plan_versions('2026110608', base, ['v' + next_plan.versions['cli']], '44', next_head)
+            rollback = commit_files({}, rollback_plan)
+            for _ in range(2):
+                rejected(lambda: release.validate_source(rollback, 'product'), 'previous Nightly main source must be an ancestor')
+            nested_plan = plan_versions('2026110612', advanced, ['v' + rollback_plan.versions['cli']], '45', rollback)
+            nested = commit_files({}, nested_plan)
+            rejected(lambda: release.validate_source(nested, 'product'), 'previous Nightly main source must be an ancestor')
+            future_main_plan = plan_versions('2026110608', base, [current_tag], '44', advanced)
+            future_main = commit_files({}, future_main_plan)
+            rejected(lambda: release.validate_source(future_main, 'product'), 'previous Nightly main source must be an ancestor')
             # Numeric CFBundleVersion ordering must select 3.1.10 rather than 3.1.9.
             with patch('nightly_source.blob', side_effect=lambda commit, path: json.dumps({'expo': {
                     'android': {'versionCode': 9 if commit == base else 10},

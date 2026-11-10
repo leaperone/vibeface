@@ -241,6 +241,7 @@ def source_context(source, release_app):
     repository = str((release.ROOT / git('rev-parse', '--git-common-dir')).resolve())
     main = git('rev-parse', 'origin/main')
     pending = []
+    previous_links = []
     seen = set()
     while True:
         key = (repository, main, source, release_app)
@@ -266,6 +267,7 @@ def source_context(source, release_app):
         if plan.previous:
             require(nightly_order(versions_at(plan.previous)['cli']) < nightly_order(values['cli']),
                     'previous Nightly must precede this product version')
+            previous_links.append((plan.previous, plan.base))
         verify_tree(plan, source)
         with checkout(source) as clean:
             metadata(clean, plan)
@@ -277,5 +279,11 @@ def source_context(source, release_app):
             break
         source = plan.previous
         release_app = 'product'
+    resolved = _verified_sources | dict(pending)
+    for previous, parent in previous_links:
+        previous_context = resolved[(repository, main, previous, 'product')]
+        require(subprocess.run(['git', 'merge-base', '--is-ancestor', previous_context['ci_source_commit'], parent],
+                               cwd=release.ROOT, capture_output=True).returncode == 0,
+                'previous Nightly main source must be an ancestor of the current parent')
     _verified_sources.update(pending)
     return context
