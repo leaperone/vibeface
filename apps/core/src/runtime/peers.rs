@@ -4148,7 +4148,7 @@ mod tests {
     async fn a_recovery_undone_by_a_late_veto_adds_nothing_to_the_shared_log() -> Result<()> {
         use crate::{
             identity::{GovernanceEvent, Revocation},
-            model::{EventBody, WorkKind, WorkOutcome},
+            model::{WorkKind, WorkOutcome},
             work::WorkSpec,
         };
         let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());

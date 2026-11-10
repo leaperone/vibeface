@@ -1113,7 +1113,7 @@ mod tests {
                 EventBody::InputPosted {
                     message_id: "m-1".into(),
                     target: crate::workspace::InputTarget::BotMain {
-                        bot: "conversation".into(),
+                        bot_id: "conversation".into(),
                     },
                     intent: crate::workspace::InputIntent::Continue,
                     sequence: 1,
@@ -1183,7 +1183,7 @@ mod tests {
         let input = || EventBody::InputPosted {
             message_id: "m-1".into(),
             target: crate::workspace::InputTarget::BotMain {
-                bot: "conversation".into(),
+                bot_id: "conversation".into(),
             },
             intent: crate::workspace::InputIntent::Continue,
             sequence: 1,
