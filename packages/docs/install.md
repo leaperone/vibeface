@@ -208,9 +208,13 @@ Stable 不存在时不会切换 Nightly，更新器也不自动降级。每次 `
 
 ## 安装桌面应用
 
-从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。两端也提供 `.zip`，以及校验摘要和来源收据。
+从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。各平台也提供 `.zip`，以及校验摘要和来源收据。
 
-桌面应用内含同版本、同源码的 CLI、Core 和 Web 资源。关闭窗口后继续在托盘运行。选择退出时，应用停止自己启动的 Core；连接既有服务时，退出保留该服务。首次点击“在这台电脑开始使用”后，应用在自己的配置目录下保存数据。选择已有数据时，所选目录决定这台电脑的数据位置。
+桌面界面使用 GPUI，随包带有同版本、同源码的 CLI、Core 和独立 Web 资源。纯控制端打开窗口、扫描和选择节点不会初始化或启动 Node。只有明确启动本机节点或安装后台服务时，才创建 App 自有节点数据。退出只停止 App 自己启动的 Core；连接既有服务时保留该服务。
+
+原生客户端有自己的身份。旧桌面页面的浏览器私钥不可导出，需要通过本人管理设备邀请或显式恢复加入；不静默导出身份、删除旧 profile 或改签未确认写入。已有 Node 数据保留。
+
+Linux 需要 glibc、X11 或 Wayland 桌面会话与可用的 Vulkan 驱动。包内 `native-dependencies.json` 记录实际链接库和最低 glibc 符号要求；AppImage 不安装系统库或显卡驱动。`vibeface.desktop` 包含深链声明，实际注册由桌面集成或明确的用户安装完成。
 
 Windows 安装器只安装到当前账户，不需要管理员、WSL、Git Bash 或开发者模式。未配置签名证书的 Nightly 明确标记为未签名开发预览。正式版必须通过签名验证。已有独立 CLI 服务可以继续运行；桌面应用只连接它，不接管启停。
 

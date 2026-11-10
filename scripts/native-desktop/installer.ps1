@@ -18,6 +18,9 @@ try {
   if (Test-Path $machineRegistration) { throw 'Installer unexpectedly wrote machine-wide registration' }
   $receipt = Get-ItemProperty $registration
   if (-not $receipt.UninstallString.Contains($destination)) { throw 'Uninstall registration is not bound to the task-owned installation' }
+  $activation = (Get-ItemProperty 'HKCU:\Software\Classes\vibeface\shell\open\command').'(default)'
+  $expectedActivation = '"' + (Join-Path $destination 'Vibeface.exe') + '" "%1"'
+  if ($activation -ne $expectedActivation) { throw 'Per-user deep-link registration does not forward the URL to this installation' }
   foreach ($program in @('vibeface.exe', 'vibeface-core.exe')) {
     $original = Get-FileHash -Algorithm SHA256 (Join-Path $Runtime $program)
     $copy = Get-FileHash -Algorithm SHA256 (Join-Path $destination ('resources\runtime\' + $program))

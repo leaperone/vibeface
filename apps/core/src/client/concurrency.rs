@@ -10,6 +10,133 @@ const ORDERED_QUEUE: usize = 16;
 // new connection rather than evicting IDs and accidentally executing a retried write again.
 const REQUEST_IDS: usize = 4096;
 
+struct LocalAuthority {
+    generation: u64,
+    session: crate::local_access::LocalSession,
+}
+
+/// This cache only fences transport delivery. Dispatch tasks still authenticate against the
+/// writer before mutation admission; a WAL reader or this cache never grants a write.
+pub(super) struct Authority {
+    local: Option<LocalAuthority>,
+    local_changes: tokio::sync::watch::Receiver<u64>,
+}
+
+impl Authority {
+    pub(super) fn new(
+        node: &Runtime,
+        session: &Session,
+        local_changes: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<Self> {
+        // Before the transport pump starts, validate a cookie once under LocalAccess's lock.
+        // Afterwards use its immutable expiry and revocation generation without that lock.
+        let (_, state) = node.client_membership();
+        let local = if let (Some(cookie), Some(state)) = (&session.cookie, state) {
+            let view = state.project()?;
+            let generation = *local_changes.borrow();
+            match node.local_access.session(cookie, &node.identity.device_id()?, &view.network_id) {
+                Ok(local) if local.device_id == session.device_id && *local_changes.borrow() == generation => {
+                    Some(LocalAuthority { generation, session: local })
+                }
+                Ok(_) if view.client(&session.device_id).is_ok() => None,
+                Ok(_) => bail!("local browser cookie is bound to another device or was revoked"),
+                Err(error) if view.client(&session.device_id).is_err() => return Err(error),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        Ok(Self { local, local_changes })
+    }
+
+    pub(super) fn principal(&self, node: &Runtime, session: &Session) -> Result<Principal> {
+        let (generation, state) = node.client_membership();
+        let view = state.context("personal network is not initialized")?.project()?;
+        let node_id = node.identity.device_id()?;
+        let principal = if let Some(member) = member_principal(&view, &node_id, session)? {
+            member
+        } else {
+            view.node(&node_id)?;
+            let local = self.local.as_ref().context("this device is not a member of the personal network")?;
+            ensure!(
+                *self.local_changes.borrow() == local.generation
+                    && local.session.expires_at_ms() > crate::runtime::now_ms()
+                    && local.session.device_id == session.device_id
+                    && local.session.network_id == view.network_id,
+                "local browser access was revoked"
+            );
+            Principal {
+                source: "local_session",
+                network_id: local.session.network_id.clone(),
+                device_id: local.session.device_id.clone(),
+                epoch: view.epoch,
+                can_manage: false,
+            }
+        };
+        ensure!(node.client_membership().0 == generation, "membership changed during client authorization");
+        if principal.source == "local_session" {
+            ensure!(self.local.as_ref().is_some_and(|local| *self.local_changes.borrow() == local.generation), "local browser access was revoked");
+        }
+        Ok(principal)
+    }
+
+    fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
+        ensure!(self.principal(node, session)? == *was, "this device's permission changed during a client request");
+        Ok(())
+    }
+}
+
+pub(super) struct PreparedPush {
+    authority: Principal,
+    payload: Value,
+}
+
+#[derive(Default)]
+pub(super) struct Pushes {
+    tasks: JoinSet<Result<PreparedPush>>,
+}
+
+impl Pushes {
+    pub(super) fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    pub(super) fn start(
+        &mut self,
+        node: &Arc<Runtime>,
+        session: &Session,
+        expected: Principal,
+        payload: Value,
+    ) {
+        debug_assert!(self.is_empty());
+        let snapshot = Snapshot::from(session);
+        let node = node.clone();
+        self.tasks.spawn(async move {
+            let session = snapshot.session();
+            let authority = principal(&node, &session).await?;
+            ensure!(authority == expected, "this device's permission changed before a push");
+            let payload = pushed(&node, &authority.network_id, &session.device_id, payload).await;
+            Ok(PreparedPush { authority, payload })
+        });
+    }
+
+    pub(super) async fn next(&mut self) -> Result<PreparedPush> {
+        self.tasks.join_next().await.context("client push task missing")?
+            .context("client push task failed")?
+    }
+
+    pub(super) fn finish(
+        &self,
+        node: &Runtime,
+        session: &Session,
+        authority: &Authority,
+        prepared: PreparedPush,
+    ) -> Result<Value> {
+        authority.check(node, session, &prepared.authority)?;
+        Ok(json!({"type":"changed","payload":prepared.payload}))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Long,
@@ -92,6 +219,8 @@ pub(super) struct Completed {
     id: String,
     result: Result<Value>,
     effect: Option<Effect>,
+    authority: Option<Principal>,
+    method: String,
 }
 
 struct Active {
@@ -116,10 +245,11 @@ impl Calls {
         self.active.values().filter(|call| call.lane == lane).count()
     }
 
-    pub(super) async fn accept(
+    pub(super) fn accept(
         &mut self,
         node: &Arc<Runtime>,
         session: &Session,
+        authority: &Authority,
         request: Request,
     ) -> Result<Option<Response>> {
         ensure!(
@@ -138,7 +268,7 @@ impl Calls {
                 return Ok(None);
             }
         } else if self.count(lane) < lane.capacity() {
-            self.start(node, session, request, lane).await?;
+            self.start(node, session, authority, request, lane);
             return Ok(None);
         }
         Ok(Some(Response {
@@ -149,47 +279,48 @@ impl Calls {
         }))
     }
 
-    pub(super) async fn start_ordered(
+    pub(super) fn start_ordered(
         &mut self,
         node: &Arc<Runtime>,
         session: &Session,
-    ) -> Result<()> {
+        authority: &Authority,
+    ) {
         if self.count(Lane::Ordered) == 0
             && let Some(request) = self.waiting.pop_front()
         {
-            self.start(node, session, request, Lane::Ordered).await?;
+            self.start(node, session, authority, request, Lane::Ordered);
         }
-        Ok(())
     }
 
-    async fn start(
+    fn start(
         &mut self,
         node: &Arc<Runtime>,
         session: &Session,
+        authority: &Authority,
         request: Request,
         lane: Lane,
-    ) -> Result<()> {
+    ) {
         // Guest and signed governance methods deliberately remain usable after authority
         // changes, including self-revoke/recovery replies. All independent work and the two
         // connection-state operations are fenced by the principal that started them.
         let guest_method = GUEST_METHODS.contains(&request.method.as_str());
         let fenced = lane != Lane::Ordered
             || (!guest_method && !SIGNED_METHODS.contains(&request.method.as_str()));
-        let (authority, denied) = if fenced {
-            match principal(node, session).await {
-                Ok(authority) => (Some(authority), None),
-                Err(_) if guest_method => (None, None),
-                Err(error) => (None, Some(error)),
-            }
-        } else {
-            (None, None)
-        };
         self.active
-            .insert(request.id.clone(), Active { lane, authority });
+            .insert(request.id.clone(), Active { lane, authority: fenced.then(|| authority.principal(node, session).ok()).flatten() });
         let snapshot = Snapshot::from(session);
         let node = node.clone();
         self.tasks.spawn(async move {
             let mut request_session = snapshot.session();
+            let (authority, denied) = if fenced {
+                match principal(&node, &request_session).await {
+                    Ok(authority) => (Some(authority), None),
+                    Err(_) if guest_method => (None, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
             let observing = request.method == "rpc" && request.params["method"] == "conversation";
             let result = match denied {
                 Some(error) => Err(error),
@@ -212,9 +343,10 @@ impl Calls {
                 id: request.id,
                 result,
                 effect,
+                authority,
+                method: request.method,
             }
         });
-        Ok(())
     }
 
     pub(super) async fn next(&mut self) -> Result<Completed> {
@@ -225,13 +357,14 @@ impl Calls {
             .context("client request task failed; outcome may be unknown")
     }
 
-    pub(super) async fn check_authority(
+    pub(super) fn check_authority(
         &self,
         node: &Runtime,
         session: &Session,
+        authority: &Authority,
     ) -> Result<()> {
         if self.active.values().any(|call| call.authority.is_some()) {
-            let now = principal(node, session).await?;
+            let now = authority.principal(node, session)?;
             ensure!(
                 self.active
                     .values()
@@ -242,10 +375,11 @@ impl Calls {
         Ok(())
     }
 
-    pub(super) async fn finish(
+    pub(super) fn finish(
         &mut self,
         node: &Runtime,
         session: &mut Session,
+        authority: &Authority,
         completed: Completed,
     ) -> Result<Response> {
         // Check even if membership/local-access notifications have not won select yet. A
@@ -253,9 +387,24 @@ impl Calls {
         let active = self.active.remove(&completed.id).context("unknown client result")?;
         if let Some(was) = active.authority {
             ensure!(
-                principal(node, session).await? == was,
+                authority.principal(node, session)? == was,
                 "this device's permission changed during a client request"
             );
+        }
+        if let Some(was) = completed.authority.as_ref() {
+            authority.check(node, session, was)?;
+        }
+        if let Ok(result) = &completed.result {
+            if completed.method == "info" && result["network_id"].is_string() {
+                ensure!(result["network_id"] == authority.principal(node, session)?.network_id,
+                    "this device's permission changed before client information was delivered");
+            }
+            if matches!(completed.method.as_str(), "authenticate" | "recover" | "revoke" | "grant" | "veto")
+                && result["principal"].is_object()
+            {
+                ensure!(result["principal"] == serde_json::to_value(authority.principal(node, session)?)?,
+                    "this device's permission changed before authentication was delivered");
+            }
         }
         match completed.effect {
             Some(Effect::Subscribe(subscribed)) => session.subscribed = subscribed,

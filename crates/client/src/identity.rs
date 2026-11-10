@@ -5,7 +5,9 @@
 //! manager's signed grant. It then signs exactly what those clients sign. The Node never signs
 //! governance for it.
 
-use crate::connection::{Connection, Refused};
+use crate::connection::Connection;
+mod plan;
+pub use plan::{IdentityPlan, IdentityOperationState};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    time::Duration,
 };
 use vibeface_bridge::platform::privatefs;
 use vibeface_secure::{
@@ -634,19 +635,14 @@ struct RecoveryMaterial {
     events: Vec<GovernanceEvent>,
 }
 
-fn write_recovery_file(path: &Path, material: &RecoveryMaterial, password: &str) -> Result<()> {
-    let payload = Zeroizing::new(serde_json::to_vec(material)?);
-    let envelope = recovery_seal(&payload, password)?;
-    let file = RecoveryFile {
-        version: 1,
-        network_id: material.network_id.clone(),
-        envelope: serde_json::from_slice(&envelope)?,
-    };
-    let mut handle = privatefs::create_new(path)
-        .with_context(|| format!("{} already exists; choose a new file", path.display()))?;
-    std::io::Write::write_all(&mut handle, &serde_json::to_vec_pretty(&file)?)?;
-    handle.sync_all()?;
-    Ok(())
+fn recovery_file_bytes(material:&RecoveryMaterial,password:&str)->Result<Vec<u8>> {
+    let payload=Zeroizing::new(serde_json::to_vec(material)?);
+    let envelope=recovery_seal(&payload,password)?;
+    Ok(serde_json::to_vec_pretty(&RecoveryFile {version:1,network_id:material.network_id.clone(),envelope:serde_json::from_slice(&envelope)?})?)
+}
+#[cfg(test)]
+fn write_recovery_file(path:&Path,material:&RecoveryMaterial,password:&str)->Result<()> {
+    privatefs::create_durable(path,&recovery_file_bytes(material,password)?)
 }
 
 fn read_recovery_file(path: &Path, password: &str) -> Result<RecoveryMaterial> {
@@ -666,15 +662,15 @@ fn read_recovery_file(path: &Path, password: &str) -> Result<RecoveryMaterial> {
 
 /// Creates a personal network on an empty Node: this client is its first manager and
 /// `recovery_file` (written before the Node hears of it) holds the new recovery key.
-pub async fn create_network(
-    key: &mut ClientKey,
+pub async fn prepare_create(
+    key: &ClientKey,
     entry: Entry,
     capability: &str,
     name: &str,
     node_name: Option<&str>,
     recovery_file: &Path,
     password: &str,
-) -> Result<Value> {
+) -> Result<IdentityPlan> {
     let mut session = key.connect(Some(&entry)).await?;
     let info = session.call("info", json!({})).await?;
     ensure!(
@@ -692,75 +688,26 @@ pub async fn create_network(
         Member::client(&session.key.identity, name, true)?,
         Member::new(&entry.node_id, IdentityKind::Node, node_name, false)?,
     )?;
-    write_recovery_file(
-        recovery_file,
-        &RecoveryMaterial {
-            version: 1,
-            network_id: genesis.network_id.clone(),
-            root_secret_key: Zeroizing::new(root.secret_hex()),
-            genesis: genesis.clone(),
-            checkpoints: vec![],
-            events: vec![],
-        },
-        password,
-    )?;
-    let network = genesis.network_id.clone();
-    let reply = session
-        .call(
-            "recover",
-            json!({"genesis":genesis,"capability":capability}),
-        )
-        .await;
-    drop(session);
-    let created = match reply {
-        Ok(created) => created,
-        Err(error) if error.is::<Refused>() => return Err(error),
-        // The outcome is unknown: the Node may still be installing the network or have lost the
-        // reply. Ask it for a while before failing, never sending `recover` again.
-        Err(error) => {
-            let mut created = None;
-            for _ in 0..12 {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let reply = async {
-                    key.connect(Some(&entry))
-                        .await?
-                        .call("authenticate", json!({}))
-                        .await
-                }
-                .await;
-                match reply {
-                    Ok(reply) if reply["network_id"] == network.as_str() => {
-                        created = Some(reply);
-                        break;
-                    }
-                    Ok(reply) if reply["initialized"] == true => break,
-                    _ => {}
-                }
-            }
-            created.ok_or(error)?
-        }
+    let material=RecoveryMaterial {
+        version:1,network_id:genesis.network_id.clone(),root_secret_key:Zeroizing::new(root.secret_hex()),genesis:genesis.clone(),checkpoints:vec![],events:vec![],
     };
-    ensure!(
-        created["principal"]["can_manage"] == true,
-        "the Node did not make this client a manager"
-    );
-    key.remember(&network, entry)?;
-    Ok(created)
+    drop(session);
+    IdentityPlan::prepare(key,entry,recovery_file,&material,password,json!({"genesis":genesis,"capability":capability}))
 }
 
 /// Starts a recovery with `recovery_file`: every current member stays, this client joins as a
 /// manager, and `new_file` (written before the Node hears of it) takes over the recovery key.
 /// It takes effect after the recovery wait unless a manager stops it. An empty Node needs its
 /// one-time `capability`.
-pub async fn recover(
-    key: &mut ClientKey,
+pub async fn prepare_recovery(
+    key: &ClientKey,
     entry: Entry,
     recovery_file: &Path,
     password: &str,
     new_file: &Path,
     name: &str,
     capability: Option<&str>,
-) -> Result<Value> {
+) -> Result<IdentityPlan> {
     let material = read_recovery_file(recovery_file, password)?;
     let root = Identity::from_secret_hex(&material.root_secret_key)?;
     let me = key.device_id().to_owned();
@@ -828,27 +775,13 @@ pub async fn recover(
     state.clone().recover_at(checkpoint.clone(), now)?;
     let mut checkpoints = state.checkpoints.clone();
     checkpoints.push(checkpoint);
-    write_recovery_file(
-        new_file,
-        &RecoveryMaterial {
-            version: 1,
-            network_id: material.network_id.clone(),
-            root_secret_key: Zeroizing::new(next.secret_hex()),
-            genesis: state.genesis.clone(),
-            checkpoints: checkpoints.clone(),
-            events: state.events.clone(),
-        },
-        password,
-    )?;
-    let mut params =
-        json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
-    if fresh {
-        params["capability"] = json!(capability.context("an empty Node needs its capability")?);
-    }
-    let result = session.call("recover", params).await?;
+    let backup=RecoveryMaterial {
+        version:1,network_id:material.network_id.clone(),root_secret_key:Zeroizing::new(next.secret_hex()),genesis:state.genesis.clone(),checkpoints:checkpoints.clone(),events:state.events.clone(),
+    };
+    let mut params=json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
+    if fresh {params["capability"]=json!(capability.context("an empty Node needs its capability")?);}
     drop(session);
-    key.remember(&material.network_id, entry)?;
-    Ok(result)
+    IdentityPlan::prepare(key,entry,new_file,&backup,password,params)
 }
 
 fn text<'v>(value: &'v Value, key: &str) -> Result<&'v str> {

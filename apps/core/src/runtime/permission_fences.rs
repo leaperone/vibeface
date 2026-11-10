@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use rusqlite::{OptionalExtension as _, params};
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -19,16 +20,43 @@ impl Runtime {
         let Some(network) = store.network()? else {
             return Ok(Vec::new());
         };
+        let membership = store
+            .trust_bundle(&network)?
+            .context("execution fence membership")?
+            .project()?;
+        if membership.write_bound(local).is_none() {
+            return Ok(Vec::new());
+        }
+        // A fork can remove the effective dispatch before this fence runs. The local
+        // acceptance journal and its original signed dispatch survive that reduction.
+        // WorkDispatched's author is its target Node; never infer ownership from a
+        // thread ID or a journal row alone, nor from an incoming conflicting branch.
+        let mut dispatches = store.connection.prepare(
+            "SELECT envelope FROM events WHERE network_id=?1 AND scope_id=?2 \
+             AND kind='work_dispatched' AND subject=?3 AND author=?4 AND main=1 \
+             ORDER BY seq LIMIT 1",
+        )?;
         let mut owned = Vec::new();
         for record in store.work_records()? {
             if record.state.finished() || !matches!(record.kind, WorkKind::Agent(_)) {
                 continue;
             }
-            if store.work(&network, &record.work_id)?.is_some_and(|work| {
-                work.target_node == local
-                    && work.conversation_id == record.conversation
-                    && work.kind == record.kind
-            }) {
+            let envelope: Option<String> = dispatches
+                .query_row(
+                    params![network, record.conversation, record.work_id, local],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(envelope) = envelope else {
+                continue;
+            };
+            let signed: crate::model::SignedEvent = serde_json::from_str(&envelope)?;
+            let event = crate::crypto::check_event(&network, &signed)?;
+            crate::crypto::verify_event_signature(&signed, local)?;
+            if event.author == local && event.scope_id == record.conversation
+                && matches!(&event.body, crate::model::EventBody::WorkDispatched { work_id, kind, .. }
+                    if work_id == &record.work_id && kind == &record.kind)
+            {
                 owned.push(record);
             }
         }
@@ -526,11 +554,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forked_scheduler_interrupts_owned_turn_then_only_reads_without_replay() -> Result<()> {
+    async fn fork_before_dispatch_removes_projection_but_stops_owned_turn_without_replay() -> Result<()> {
         let (node, admin, directory) = node().await?;
         let (_, _, access, cancel) = active_turn(&node, &admin, &directory).await?;
         let network = &access.network_id;
+        let identity = node.identity.clone();
+        let fixture_network = network.clone();
+        let fork = node.store.call("fixture_pre_dispatch_fork", move |store| {
+            let local = identity.device_id()?;
+            let (_, hash) = store.heads(&fixture_network)?.remove(&local).context("local head")?;
+            let original = store.event(&fixture_network, &hash)?.context("pre-dispatch event")?;
+            let mut event = crate::crypto::check_event(&fixture_network, &original)?;
+            event.created_at_ms += 1;
+            identity.sign_event(event)
+        }).await?;
         running_work(&node, network, &directory, "owned", Provider::Codex).await?;
+        let remote = LocalIdentity::generate();
+        let mut membership = node.membership_state().await?;
+        membership.append(crate::identity::GovernanceEvent::grant(
+            &admin, &membership.project()?, crate::identity::Member::node(&remote, "remote")?,
+        )?)?;
+        node.install_membership(membership).await?;
+        let remote_spec = WorkSpec {
+            work_id: "remote".into(), call_ref: "remote".into(),
+            thread: Some("thread-remote".into()),
+            ..provider_work(Provider::Codex, &remote.device_id()?, &directory, "remote")
+        };
+        let fixture_network = network.clone();
+        node.store.call("fixture_unowned_journals", move |store| {
+            // Even an accidentally retained remote acceptance row must not grant local stop authority.
+            store.accept_work_fixture(&remote, &fixture_network, remote_spec, now_ms())?;
+            // A native handle without any signed acceptance is not Node-owned work.
+            store.connection.execute(
+                "INSERT INTO work_runs(work_id,conversation_id,kind,state,thread_id,turn_id,\
+                 codex_epoch,result_text,send_by_ms,progress,progress_at_ms) \
+                 SELECT 'unowned',conversation_id,kind,state,'thread-unowned','turn-unowned',\
+                 codex_epoch,result_text,send_by_ms,progress,progress_at_ms FROM work_runs WHERE work_id='owned'",
+                [],
+            )?;
+            Ok(())
+        }).await?;
         let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let calls = requests.clone();
@@ -565,9 +628,21 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await?;
-        let before = { let network = network.clone(); node.store.call("fixture_vector", move |store| store.version_vector(&network)).await? };
-        assert!(node.set_write_state(network, &[crate::store::WriteState::Writable],
-            crate::store::WriteState::Forked).await);
+        let fixture_network = network.clone();
+        let before = node.store.call("fixture_ingest_pre_dispatch_fork", move |store| {
+            assert!(store.work(&fixture_network, "owned")?.is_some());
+            let ingested = store.ingest_events(&fixture_network, &[fork])?;
+            store.settle_local_works(&fixture_network)?;
+            assert_eq!(ingested.statuses, vec![crate::model::IngestStatus::Conflict]);
+            assert!(store.work(&fixture_network, "owned")?.is_none(),
+                "fork reduction must remove the later shared dispatch before fencing");
+            assert!(matches!(store.work_record("owned")?.context("local journal")?.state,
+                WorkState::Running { .. }));
+            assert!(store.work_native_submission_reserved("owned")?);
+            store.version_vector(&fixture_network)
+        }).await?;
+        assert!(!node.align_on_start().await?);
+        assert_eq!(*node.write_state.borrow(), crate::store::WriteState::Forked);
         assert!(*cancel.borrow());
         node.schedule_tick().await?;
         assert!(stopped.load(Ordering::Acquire));
@@ -579,7 +654,12 @@ mod tests {
         assert_eq!(store.version_vector(&query_network)?, before);
         assert!(matches!(store.work_record("owned")?.context("work")?.state, WorkState::Running { .. }),
             "readback must not fabricate a shared completion after writes close");
-        assert_eq!(store.stop_requests()?.len(), 1);
+        assert_eq!(store.stop_requests()?.iter().map(|stop| stop.work_id.as_str())
+            .collect::<Vec<_>>(), vec!["owned"]);
+        assert!(matches!(store.work_record("remote")?.context("remote journal")?.state,
+            WorkState::Starting { .. }));
+        assert!(matches!(store.work_record("unowned")?.context("unowned journal")?.state,
+            WorkState::Running { .. }));
         Ok(())
         }).await?;
         drop(node);

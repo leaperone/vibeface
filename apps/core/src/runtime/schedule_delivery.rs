@@ -52,7 +52,8 @@ impl SchedulerProjection {
         if job.state != JobState::Queued {
             return Ok(None);
         }
-        let mut provider = self.manager
+        let mut provider = self
+            .manager
             .or_else(|| job.runtime.as_ref().map(|runtime| runtime.provider));
         if provider.is_none()
             && let crate::scheduling::SessionScope::Task { work_id } = &job.scope
@@ -66,15 +67,10 @@ impl SchedulerProjection {
                 crate::scheduling::QueueHoldReason::BackendConfigPending,
             ));
         };
-        let hold = store.scheduler_job_hold(
-            network,
-            &self.local,
-            job,
-            provider,
-            &self.limits,
-        )?;
+        let hold = store.scheduler_job_hold(network, &self.local, job, provider, &self.limits)?;
         Ok(hold.or_else(|| {
-            self.pending.contains(&provider)
+            self.pending
+                .contains(&provider)
                 .then_some(crate::scheduling::QueueHoldReason::BackendConfigPending)
         }))
     }
@@ -119,33 +115,40 @@ impl SchedulerProjection {
         }
         Ok(value)
     }
-
 }
 
 impl Runtime {
     async fn prepare_scope_input(&self, network: &str, key: &SessionKey) -> Result<bool> {
         let input = {
-            let network = network.to_owned(); let key = key.clone();
-            self.store.call("prepare_scope_input", move |store| {
-            let mut jobs = store
-                .scheduler_jobs(&key.conversation_id)?
-                .into_iter()
-                .filter(|job| job.session_key() == key && job.state == JobState::Queued)
-                .collect::<Vec<_>>();
-            jobs.sort_by(|left, right| left.priority().cmp(&right.priority()));
-            Ok(jobs.first()
-                .map(|job| store.queued_workspace_input(&network, &job.reply_to))
-                .transpose()?
-                .flatten())
-            }).await?
+            let network = network.to_owned();
+            let key = key.clone();
+            self.store
+                .call("prepare_scope_input", move |store| {
+                    let mut jobs = store
+                        .scheduler_jobs(&key.conversation_id)?
+                        .into_iter()
+                        .filter(|job| job.session_key() == key && job.state == JobState::Queued)
+                        .collect::<Vec<_>>();
+                    jobs.sort_by(|left, right| left.priority().cmp(&right.priority()));
+                    Ok(jobs
+                        .first()
+                        .map(|job| store.queued_workspace_input(&network, &job.reply_to))
+                        .transpose()?
+                        .flatten())
+                })
+                .await?
         };
         let Some(input) = input else {
             return Ok(true);
         };
         let events = self
-            .store.call("input_attachment_events", { let network = network.to_owned();
+            .store
+            .call("input_attachment_events", {
+                let network = network.to_owned();
                 let message_id = input.input.message_id.to_owned();
-                move |store| store.input_attachment_events(&network, &message_id) }).await?;
+                move |store| store.input_attachment_events(&network, &message_id)
+            })
+            .await?;
         if !self
             .fetch_turn_attachments(network, events.iter())
             .await
@@ -153,14 +156,16 @@ impl Runtime {
         {
             return Ok(false);
         }
-        self.store.call("scope_input_blobs", move |store| {
-        for attachment in &input.input.attachments {
-            if !store.has_blob(&attachment.blob())? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-        }).await
+        self.store
+            .call("scope_input_blobs", move |store| {
+                for attachment in &input.input.attachments {
+                    if !store.has_blob(&attachment.blob())? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })
+            .await
     }
 
     async fn workspace_execution_roots(&self) -> Result<Vec<String>> {
@@ -183,16 +188,29 @@ impl Runtime {
     }
 
     async fn reconcile_workspace_jobs(self: &Arc<Self>, network: &str) -> Result<()> {
-        let before = self.store.call("version_vector", { let network = network.to_owned();
-                move |store| store.version_vector(&network) }).await?;
-        let jobs = self.store.call("scheduler_jobs_all", |store| store.scheduler_jobs_all()).await?;
+        let before = self
+            .store
+            .call("version_vector", {
+                let network = network.to_owned();
+                move |store| store.version_vector(&network)
+            })
+            .await?;
+        let jobs = self
+            .store
+            .call("scheduler_jobs_all", |store| store.scheduler_jobs_all())
+            .await?;
         for job in jobs {
             let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope else {
                 continue;
             };
-            let task = self.store.call("workspace_task", { let network = network.to_owned();
-                let task_id = task_id.to_owned();
-                move |store| store.workspace_task(&network, &task_id) }).await?;
+            let task = self
+                .store
+                .call("workspace_task", {
+                    let network = network.to_owned();
+                    let task_id = task_id.to_owned();
+                    move |store| store.workspace_task(&network, &task_id)
+                })
+                .await?;
             let Some(task) = task else {
                 continue;
             };
@@ -200,9 +218,13 @@ impl Runtime {
                 job.state,
                 JobState::Claimed { .. } | JobState::Running { .. } | JobState::Steering { .. }
             ) && !self
-                .store.call("workspace_task_input_allowed", { let network = network.to_owned();
-                let task_id = task_id.to_owned();
-                move |store| store.workspace_task_input_allowed(&network, &task_id) }).await?;
+                .store
+                .call("workspace_task_input_allowed", {
+                    let network = network.to_owned();
+                    let task_id = task_id.to_owned();
+                    move |store| store.workspace_task_input_allowed(&network, &task_id)
+                })
+                .await?;
             if active_fenced
                 || (task.action != crate::workspace::TaskAction::Continue
                     && matches!(
@@ -213,11 +235,23 @@ impl Runtime {
                             | JobState::Steering { .. }
                     ))
             {
-                let stopped = self.store.call("request_manager_cancel", { let identity = self.identity.to_owned();
-                let network = network.to_owned();
-                let conversation_id = job.conversation_id.to_owned();
-                let trigger = job.trigger.to_owned();
-                move |store| store.request_manager_cancel(&identity, &network, &conversation_id, &trigger) }).await?;
+                let stopped = self
+                    .store
+                    .call("request_manager_cancel", {
+                        let identity = self.identity.to_owned();
+                        let network = network.to_owned();
+                        let conversation_id = job.conversation_id.to_owned();
+                        let trigger = job.trigger.to_owned();
+                        move |store| {
+                            store.request_manager_cancel(
+                                &identity,
+                                &network,
+                                &conversation_id,
+                                &trigger,
+                            )
+                        }
+                    })
+                    .await?;
                 if let Some(JobState::Cancelling { attempt }) = stopped.map(|job| job.state) {
                     let node = self.clone();
                     self.background_tasks.spawn(async move {
@@ -227,15 +261,24 @@ impl Runtime {
                     })?;
                 }
                 let works = self
-                    .store.call("works", { let network = network.to_owned();
-                let conversation_id = job.conversation_id.to_owned();
-                move |store| store.works(&network, &conversation_id) }).await?;
+                    .store
+                    .call("works", {
+                        let network = network.to_owned();
+                        let conversation_id = job.conversation_id.to_owned();
+                        move |store| store.works(&network, &conversation_id)
+                    })
+                    .await?;
                 for work in works {
                     if work.outcome.is_none()
-                        && self.store.call("scheduler_work_in_scope", { let network = network.to_owned();
-                let job = job.to_owned();
-                let work_id = work.work_id.to_owned();
-                move |store| store.scheduler_work_in_scope(&network, &job, &work_id) }).await?
+                        && self
+                            .store
+                            .call("scheduler_work_in_scope", {
+                                let network = network.to_owned();
+                                let job = job.to_owned();
+                                let work_id = work.work_id.to_owned();
+                                move |store| store.scheduler_work_in_scope(&network, &job, &work_id)
+                            })
+                            .await?
                     {
                         let node = self.clone();
                         let network = network.to_owned();
@@ -252,39 +295,63 @@ impl Runtime {
             if !matches!(
                 job.state,
                 JobState::Steering { .. } | JobState::Steered { .. }
-            ) && let Err(error) = self.store.call("settle_workspace_assignment", { let identity = self.identity.to_owned();
-                let network = network.to_owned();
-                let job = job.to_owned();
-                move |store| store.settle_workspace_assignment(&identity, &network, &job, now_ms()) }).await {
+            ) && let Err(error) = self
+                .store
+                .call("settle_workspace_assignment", {
+                    let identity = self.identity.to_owned();
+                    let network = network.to_owned();
+                    let job = job.to_owned();
+                    move |store| {
+                        store.settle_workspace_assignment(&identity, &network, &job, now_ms())
+                    }
+                })
+                .await
+            {
                 tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment lifecycle remains pending");
             }
         }
         let assignments = self
-            .store.call("workspace_active_assignments", { let network = network.to_owned();
-                move |store| store.workspace_active_assignments(&network) }).await?;
+            .store
+            .call("workspace_active_assignments", {
+                let network = network.to_owned();
+                move |store| store.workspace_active_assignments(&network)
+            })
+            .await?;
         for assignment in assignments {
             if assignment.execution_node != self.identity.device_id()? {
                 continue;
             }
             if let Some(work_id) = &assignment.work_id {
                 let task = self
-                    .store.call("workspace_task", { let network = network.to_owned();
-                let task_id = assignment.task_id.to_owned();
-                move |store| store.workspace_task(&network, &task_id) }).await?
+                    .store
+                    .call("workspace_task", {
+                        let network = network.to_owned();
+                        let task_id = assignment.task_id.to_owned();
+                        move |store| store.workspace_task(&network, &task_id)
+                    })
+                    .await?
                     .context("assignment task missing")?;
                 if task.action != crate::workspace::TaskAction::Continue
                     || !self
-                        .store.call("workspace_task_input_allowed", { let network = network.to_owned();
-                let task_id = assignment.task_id.to_owned();
-                move |store| store.workspace_task_input_allowed(&network, &task_id) }).await?
+                        .store
+                        .call("workspace_task_input_allowed", {
+                            let network = network.to_owned();
+                            let task_id = assignment.task_id.to_owned();
+                            move |store| store.workspace_task_input_allowed(&network, &task_id)
+                        })
+                        .await?
                 {
                     let node = self.clone();
                     let network = network.to_owned();
                     let work_id = work_id.clone();
                     let conversation = self
-                        .store.call("work", { let network = network.as_str().to_owned();
-                let work_id = work_id.to_owned();
-                move |store| store.work(&network, &work_id) }).await?
+                        .store
+                        .call("work", {
+                            let network = network.as_str().to_owned();
+                            let work_id = work_id.to_owned();
+                            move |store| store.work(&network, &work_id)
+                        })
+                        .await?
                         .map(|work| work.conversation_id);
                     if let Some(conversation) = conversation {
                         self.background_tasks.spawn(async move {
@@ -294,14 +361,32 @@ impl Runtime {
                         })?;
                     }
                 }
-                self.store.call("settle_workspace_work_assignment", { let identity = self.identity.to_owned();
-                let network = network.to_owned();
-                let assignment = assignment.to_owned();
-                move |store| store.settle_workspace_work_assignment(&identity, &network, &assignment, now_ms()) }).await?;
+                self.store
+                    .call("settle_workspace_work_assignment", {
+                        let identity = self.identity.to_owned();
+                        let network = network.to_owned();
+                        let assignment = assignment.to_owned();
+                        move |store| {
+                            store.settle_workspace_work_assignment(
+                                &identity,
+                                &network,
+                                &assignment,
+                                now_ms(),
+                            )
+                        }
+                    })
+                    .await?;
             }
         }
-        if self.store.call("version_vector", { let network = network.to_owned();
-                move |store| store.version_vector(&network) }).await? != before {
+        if self
+            .store
+            .call("version_vector", {
+                let network = network.to_owned();
+                move |store| store.version_vector(&network)
+            })
+            .await?
+            != before
+        {
             self.publish_changed(network, crate::workspace::WORKSPACE_SCOPE, Changed::Reload);
             self.schedule_wakeup.notify_one();
         }
@@ -316,16 +401,18 @@ impl Runtime {
             .await
             .ok();
         let key = key.clone();
-        self.store.read("scheduler_context_observation", move |store| {
-        let mut context = store.scheduler_scoped_context_projection(&key)?;
-        if let Some(context) = &mut context {
-            context.session_status = desired
-                .as_ref()
-                .map(|config| store.scheduler_session_status(&key, Some(config)))
-                .transpose()?;
-        }
-        Ok(context)
-        }).await
+        self.store
+            .read("scheduler_context_observation", move |store| {
+                let mut context = store.scheduler_scoped_context_projection(&key)?;
+                if let Some(context) = &mut context {
+                    context.session_status = desired
+                        .as_ref()
+                        .map(|config| store.scheduler_session_status(&key, Some(config)))
+                        .transpose()?;
+                }
+                Ok(context)
+            })
+            .await
     }
 
     pub(super) fn scheduler_projection(&self) -> Result<SchedulerProjection> {
@@ -334,7 +421,8 @@ impl Runtime {
             local: self.identity.device_id()?,
             manager: self.manager().map(|manager| manager.provider),
             limits: self.config.scheduling.clone(),
-            pending: Provider::ALL.into_iter()
+            pending: Provider::ALL
+                .into_iter()
                 .filter(|provider| self.provider_configuration_pending(*provider, &providers))
                 .collect(),
         })
@@ -400,10 +488,14 @@ impl Runtime {
         let Some(network) = self.store.call("network", |store| store.network()).await? else {
             return Ok(());
         };
-        let admitted =
-            self.store.call("admit_due_schedules", { let identity = self.identity.to_owned();
+        let admitted = self
+            .store
+            .call("admit_due_schedules", {
+                let identity = self.identity.to_owned();
                 let network = network.to_owned();
-                move |store| store.admit_due_schedules(&identity, &network, now_ms()) }).await?;
+                move |store| store.admit_due_schedules(&identity, &network, now_ms())
+            })
+            .await?;
         for (scope, trigger) in admitted {
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
             self.schedule_wakeup.notify_one();
@@ -424,9 +516,13 @@ impl Runtime {
         // A conversation that moved to a newer owner stops its turn here; a cancel the SDK does
         // not confirm ends as interrupted and waits for reconciliation like any other.
         let moved = self
-            .store.call("fence_moved_turns", { let network = network.to_owned();
+            .store
+            .call("fence_moved_turns", {
+                let network = network.to_owned();
                 let local_id = self.identity.device_id()?.to_owned();
-                move |store| store.fence_moved_turns(&network, &local_id) }).await?;
+                move |store| store.fence_moved_turns(&network, &local_id)
+            })
+            .await?;
         for (scope, trigger, attempt) in moved {
             tracing::info!(
                 event = "agent.turn.fenced",
@@ -441,39 +537,58 @@ impl Runtime {
         let workers = self.schedule_workers.lock().await.clone();
         // A consumer that ended without a terminal outcome leaves its job claimed; settle it.
         let abandoned = {
-            let identity = self.identity.clone(); let network = network.clone();
-            self.store.call("recover_scheduler_jobs", move |store| {
-            store.recover_scheduler_jobs(&identity, &network, crate::scheduler::boot_id())?;
-            let mut abandoned = Vec::new();
-            for key in store.pending_scheduler_sessions()? {
-                if workers.contains(&(network.clone(), key.clone())) {
-                    continue;
-                }
-                for job in store.scheduler_jobs(&key.conversation_id)? {
-                    if job.session_key() != key {
-                        continue;
+            let identity = self.identity.clone();
+            let network = network.clone();
+            self.store
+                .call("recover_scheduler_jobs", move |store| {
+                    store.recover_scheduler_jobs(
+                        &identity,
+                        &network,
+                        crate::scheduler::boot_id(),
+                    )?;
+                    let mut abandoned = Vec::new();
+                    for key in store.pending_scheduler_sessions()? {
+                        if workers.contains(&(network.clone(), key.clone())) {
+                            continue;
+                        }
+                        for job in store.scheduler_jobs(&key.conversation_id)? {
+                            if job.session_key() != key {
+                                continue;
+                            }
+                            if let JobState::Claimed { attempt }
+                            | JobState::Running { attempt }
+                            | JobState::Cancelling { attempt } = &job.state
+                            {
+                                abandoned.push((
+                                    key.conversation_id.clone(),
+                                    job.trigger.clone(),
+                                    attempt.id.clone(),
+                                ));
+                            }
+                        }
                     }
-                    if let JobState::Claimed { attempt }
-                    | JobState::Running { attempt }
-                    | JobState::Cancelling { attempt } = &job.state
-                    {
-                        abandoned.push((
-                            key.conversation_id.clone(),
-                            job.trigger.clone(),
-                            attempt.id.clone(),
-                        ));
-                    }
-                }
-            }
-            Ok(abandoned)
-            }).await?
+                    Ok(abandoned)
+                })
+                .await?
         };
         for (scope, trigger, attempt) in abandoned {
             self.fence_manager_attempt(&attempt).await?;
-            let requeued = self.store.call("requeue_abandoned_scheduler_claim", { let scope = scope.to_owned();
-                let trigger = trigger.to_owned();
-                let attempt = attempt.to_owned();
-                move |store| store.requeue_abandoned_scheduler_claim(&scope, &trigger, &attempt, crate::scheduler::boot_id()) }).await?;
+            let requeued = self
+                .store
+                .call("requeue_abandoned_scheduler_claim", {
+                    let scope = scope.to_owned();
+                    let trigger = trigger.to_owned();
+                    let attempt = attempt.to_owned();
+                    move |store| {
+                        store.requeue_abandoned_scheduler_claim(
+                            &scope,
+                            &trigger,
+                            &attempt,
+                            crate::scheduler::boot_id(),
+                        )
+                    }
+                })
+                .await?;
             if !requeued {
                 self.store.call("finish_job", { let identity = self.identity.to_owned();
                 let network = network.to_owned();
@@ -494,7 +609,12 @@ impl Runtime {
         // After recovery, so a reply left running by an earlier process is never a target.
         self.steer_messages(&network).await?;
         if self.manager().is_some() {
-            let sessions = self.store.call("pending_scheduler_sessions", |store| store.pending_scheduler_sessions()).await?;
+            let sessions = self
+                .store
+                .call("pending_scheduler_sessions", |store| {
+                    store.pending_scheduler_sessions()
+                })
+                .await?;
             for key in sessions {
                 self.start_schedule_consumer(network.clone(), key).await;
             }
@@ -544,11 +664,23 @@ impl Runtime {
             if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &key.scope {
                 let roots = self.workspace_execution_roots().await?;
                 if self
-                    .store.call("ensure_workspace_assignment", { let identity = self.identity.to_owned();
-                let network = network.to_owned();
-                let task_id = task_id.to_owned();
-                let roots = roots.to_owned();
-                move |store| store.ensure_workspace_assignment(&identity, &network, &task_id, &roots, now_ms()) }).await?
+                    .store
+                    .call("ensure_workspace_assignment", {
+                        let identity = self.identity.to_owned();
+                        let network = network.to_owned();
+                        let task_id = task_id.to_owned();
+                        let roots = roots.to_owned();
+                        move |store| {
+                            store.ensure_workspace_assignment(
+                                &identity,
+                                &network,
+                                &task_id,
+                                &roots,
+                                now_ms(),
+                            )
+                        }
+                    })
+                    .await?
                     .is_none()
                 {
                     return Ok(ran);
@@ -577,7 +709,11 @@ impl Runtime {
     }
 
     async fn steer_messages(self: &Arc<Self>, network: &str) -> Result<()> {
-        for job in self.store.call("steering_jobs", |store| store.steering_jobs()).await? {
+        for job in self
+            .store
+            .call("steering_jobs", |store| store.steering_jobs())
+            .await?
+        {
             let key = (
                 network.to_owned(),
                 job.conversation_id.clone(),
@@ -588,20 +724,27 @@ impl Runtime {
             }
             let node = self.clone();
             let network = network.to_owned();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let _slot = node.steer_read_slots.clone().acquire_owned().await;
                 if let Err(error) = node.settle_steer(&network, &job).await {
                     tracing::warn!(event="agent.turn.steer_read_pending", %error, "input receipt query remains pending");
                 }
                 node.steer_read_workers.lock().await.remove(&key);
-            });
+            })?;
         }
         if !self.writable() {
             return Ok(());
         }
-        let candidates = self.store.call("steer_candidates", { let network = network.to_owned();
+        let candidates = self
+            .store
+            .call("steer_candidates", {
+                let network = network.to_owned();
                 let local_id = self.identity.device_id()?.to_owned();
-                move |store| store.steer_candidates(&network, &local_id, crate::scheduler::boot_id()) }).await?;
+                move |store| {
+                    store.steer_candidates(&network, &local_id, crate::scheduler::boot_id())
+                }
+            })
+            .await?;
         for candidate in candidates {
             let session = SessionKey {
                 conversation_id: candidate.conversation_id,
@@ -613,7 +756,7 @@ impl Runtime {
             }
             let node = self.clone();
             let network = network.to_owned();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let result = std::panic::AssertUnwindSafe(node.drain_steer(&network, &session))
                     .catch_unwind()
                     .await;
@@ -632,7 +775,7 @@ impl Runtime {
                 if progressed {
                     node.schedule_wakeup.notify_one();
                 }
-            });
+            })?;
         }
         Ok(())
     }
@@ -646,30 +789,38 @@ impl Runtime {
                 return Ok(submitted);
             }
             let candidate = {
-                let network = network.to_owned(); let key = key.clone(); let local = local.clone();
-                self.store.call("steer_candidate", move |store| {
-                if store.steering_jobs()?.iter().any(|job| {
-                    job.session_key() == key
-                        && matches!(job.state, JobState::Steering { receipt: None, .. })
-                }) {
-                    return Ok(None);
-                }
-                Ok(store
-                    .steer_candidates(&network, &local, boot)?
-                    .into_iter()
-                    .find(|candidate| {
-                        candidate.conversation_id == key.conversation_id
-                            && candidate.scope == key.scope
-                    }))
-                }).await?
+                let network = network.to_owned();
+                let key = key.clone();
+                let local = local.clone();
+                self.store
+                    .call("steer_candidate", move |store| {
+                        if store.steering_jobs()?.iter().any(|job| {
+                            job.session_key() == key
+                                && matches!(job.state, JobState::Steering { receipt: None, .. })
+                        }) {
+                            return Ok(None);
+                        }
+                        Ok(store
+                            .steer_candidates(&network, &local, boot)?
+                            .into_iter()
+                            .find(|candidate| {
+                                candidate.conversation_id == key.conversation_id
+                                    && candidate.scope == key.scope
+                            }))
+                    })
+                    .await?
             };
             let Some(candidate) = candidate else {
                 return Ok(submitted);
             };
             let mut attachment_events = self
-                .store.call("input_attachment_events", { let network = network.to_owned();
-                let message_id = candidate.message_id.to_owned();
-                move |store| store.input_attachment_events(&network, &message_id) }).await?;
+                .store
+                .call("input_attachment_events", {
+                    let network = network.to_owned();
+                    let message_id = candidate.message_id.to_owned();
+                    move |store| store.input_attachment_events(&network, &message_id)
+                })
+                .await?;
             if attachment_events.is_empty() {
                 attachment_events.push(candidate.source_event.clone());
             }
@@ -684,25 +835,27 @@ impl Runtime {
                 let conversation = candidate.conversation_id.clone();
                 let message = candidate.message_id.clone();
                 let attachments = candidate.attachments.clone();
-                self.store.call("steer_input_files", move |store| {
-                attachments
-                    .iter()
-                    .map(|attachment| {
-                        let (local_path, bytes) = store.verified_input_attachment(
-                            &network,
-                            &conversation,
-                            &message,
-                            attachment,
-                        )?;
-                        Ok(executor::PreparedAttachment {
-                            attachment: attachment.clone(),
-                            local_path,
-                            mime_type: attachment_mime(&attachment.name, &bytes).into(),
-                            bytes,
-                        })
+                self.store
+                    .call("steer_input_files", move |store| {
+                        attachments
+                            .iter()
+                            .map(|attachment| {
+                                let (local_path, bytes) = store.verified_input_attachment(
+                                    &network,
+                                    &conversation,
+                                    &message,
+                                    attachment,
+                                )?;
+                                Ok(executor::PreparedAttachment {
+                                    attachment: attachment.clone(),
+                                    local_path,
+                                    mime_type: attachment_mime(&attachment.name, &bytes).into(),
+                                    bytes,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })
-                    .collect::<Result<Vec<_>>>()
-                }).await?
+                    .await?
             };
             let input = executor::SteerInput {
                 text: candidate.text,
@@ -715,14 +868,29 @@ impl Runtime {
                 self.manager_input_lease(&candidate.into.attempt_id, candidate.into.provider)
                     .await?
             };
-            if !self.store.call("begin_steer", { let network = network.to_owned();
-                let local = local.to_owned();
-                let boot = boot.to_owned();
-                let conversation_id = candidate.conversation_id.to_owned();
-                let trigger = candidate.trigger.to_owned();
-                let target = candidate.into.to_owned();
-                let event_hash = candidate.source_event.hash.to_owned();
-                move |store| store.begin_steer(&network, &local, &boot, (&conversation_id, &trigger), &target, Some(&event_hash)) }).await? {
+            if !self
+                .store
+                .call("begin_steer", {
+                    let network = network.to_owned();
+                    let local = local.to_owned();
+                    let boot = boot.to_owned();
+                    let conversation_id = candidate.conversation_id.to_owned();
+                    let trigger = candidate.trigger.to_owned();
+                    let target = candidate.into.to_owned();
+                    let event_hash = candidate.source_event.hash.to_owned();
+                    move |store| {
+                        store.begin_steer(
+                            &network,
+                            &local,
+                            &boot,
+                            (&conversation_id, &trigger),
+                            &target,
+                            Some(&event_hash),
+                        )
+                    }
+                })
+                .await?
+            {
                 continue;
             }
             self.publish_changed(
@@ -739,11 +907,24 @@ impl Runtime {
             .await
             .unwrap_or(SteerAck::Unknown);
             match ack {
-                SteerAck::Accepted { turn_id } => self.store.call("record_steer_submission", { let conversation_id = candidate.conversation_id.to_owned();
-                let trigger = candidate.trigger.to_owned();
-                let target = candidate.into.to_owned();
-                let turn_id = turn_id.to_owned();
-                move |store| store.record_steer_submission(&conversation_id, &trigger, &target, Some(turn_id)) }).await?,
+                SteerAck::Accepted { turn_id } => {
+                    self.store
+                        .call("record_steer_submission", {
+                            let conversation_id = candidate.conversation_id.to_owned();
+                            let trigger = candidate.trigger.to_owned();
+                            let target = candidate.into.to_owned();
+                            let turn_id = turn_id.to_owned();
+                            move |store| {
+                                store.record_steer_submission(
+                                    &conversation_id,
+                                    &trigger,
+                                    &target,
+                                    Some(turn_id),
+                                )
+                            }
+                        })
+                        .await?
+                }
                 SteerAck::Refused(error) => {
                     tracing::info!(
                         event = "agent.turn.steer_refused",
@@ -752,19 +933,42 @@ impl Runtime {
                         error,
                         "native input was refused before delivery"
                     );
-                    self.store.call("settle_steer", { let identity = self.identity.to_owned();
-                let network = network.to_owned();
-                let conversation_id = candidate.conversation_id.to_owned();
-                let trigger = candidate.trigger.to_owned();
-                move |store| store.settle_steer(&identity, &network, &conversation_id, &trigger, JobState::Queued) }).await?;
+                    self.store
+                        .call("settle_steer", {
+                            let identity = self.identity.to_owned();
+                            let network = network.to_owned();
+                            let conversation_id = candidate.conversation_id.to_owned();
+                            let trigger = candidate.trigger.to_owned();
+                            move |store| {
+                                store.settle_steer(
+                                    &identity,
+                                    &network,
+                                    &conversation_id,
+                                    &trigger,
+                                    JobState::Queued,
+                                )
+                            }
+                        })
+                        .await?;
                     self.schedule_wakeup.notify_one();
                     return Ok(submitted);
                 }
                 SteerAck::Unknown => {
-                    self.store.call("record_steer_submission", { let conversation_id = candidate.conversation_id.to_owned();
-                let trigger = candidate.trigger.to_owned();
-                let target = candidate.into.to_owned();
-                move |store| store.record_steer_submission(&conversation_id, &trigger, &target, None) }).await?;
+                    self.store
+                        .call("record_steer_submission", {
+                            let conversation_id = candidate.conversation_id.to_owned();
+                            let trigger = candidate.trigger.to_owned();
+                            let target = candidate.into.to_owned();
+                            move |store| {
+                                store.record_steer_submission(
+                                    &conversation_id,
+                                    &trigger,
+                                    &target,
+                                    None,
+                                )
+                            }
+                        })
+                        .await?;
                     self.publish_changed(
                         network,
                         &candidate.conversation_id,
@@ -793,9 +997,13 @@ impl Runtime {
             return Ok(());
         };
         let active = self
-            .store.call("steer_host_active", { let conversation_id = job.conversation_id.to_owned();
+            .store
+            .call("steer_host_active", {
+                let conversation_id = job.conversation_id.to_owned();
                 let attempt_id = into.attempt_id.to_owned();
-                move |store| store.steer_host_active(&conversation_id, &attempt_id) }).await?;
+                move |store| store.steer_host_active(&conversation_id, &attempt_id)
+            })
+            .await?;
         if active && receipt.is_some() {
             return Ok(());
         }
@@ -820,12 +1028,18 @@ impl Runtime {
         ) else {
             return Ok(());
         };
-        self.store.call("settle_steer", { let identity = self.identity.to_owned();
+        self.store
+            .call("settle_steer", {
+                let identity = self.identity.to_owned();
                 let network = network.to_owned();
                 let conversation_id = job.conversation_id.to_owned();
                 let trigger = job.trigger.to_owned();
                 let next = next.to_owned();
-                move |store| store.settle_steer(&identity, &network, &conversation_id, &trigger, next) }).await?;
+                move |store| {
+                    store.settle_steer(&identity, &network, &conversation_id, &trigger, next)
+                }
+            })
+            .await?;
         self.schedule_wakeup.notify_one();
         self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
         Ok(())
@@ -852,9 +1066,13 @@ impl Runtime {
             Err(error) => {
                 let message_id = id(input, "message_id")?;
                 let stored = self
-                    .store.call("workspace_input", { let network_id = access.network_id.to_owned();
-                let message_id = message_id.to_owned();
-                move |store| store.workspace_input(&network_id, &message_id) }).await?
+                    .store
+                    .call("workspace_input", {
+                        let network_id = access.network_id.to_owned();
+                        let message_id = message_id.to_owned();
+                        move |store| store.workspace_input(&network_id, &message_id)
+                    })
+                    .await?
                     .is_some();
                 Ok(
                     json!({"accepted":false,"code":if stored { "input_conflict" } else { "input_not_saved" },
@@ -891,8 +1109,11 @@ impl Runtime {
         let local = self.identity.device_id()?;
         let roots = self.workspace_execution_roots().await?;
         let (message, receipt) = {
-            let identity = self.identity.clone(); let network = network.clone(); let scope = scope.clone();
-            let message_id = message_id.clone(); let attestation = attestation(input)?;
+            let identity = self.identity.clone();
+            let network = network.clone();
+            let scope = scope.clone();
+            let message_id = message_id.clone();
+            let attestation = attestation(input)?;
             self.store.call("accept_chat_message", move |store| {
             let resolved = store.resolve_input_target(&network, &request.route.target)?;
             ensure!(
@@ -975,24 +1196,28 @@ impl Runtime {
         let conversation = id(input, "conversation_id")?;
         let target: crate::workspace::InputTarget =
             serde_json::from_value(input["target"].clone())?;
-        let network = network.to_owned(); let local = self.identity.device_id()?;
-        self.store.call("read_input_receipt", move |store| {
-        let original = store
-            .workspace_input(&network, &message_id)?
-            .context("input not found")?;
-        ensure!(
-            original.conversation_id == conversation && original.input.route.target == target,
-            "input receipt identity mismatch"
-        );
-        let resolved = store.resolve_input_target(&network, &target)?;
-        ensure!(
-            resolved.owner_node == local,
-            "this Node is not the input owner"
-        );
-        store
-            .input_receipt(&network, &local, &message_id)?
-            .context("input not found")
-        }).await
+        let network = network.to_owned();
+        let local = self.identity.device_id()?;
+        self.store
+            .call("read_input_receipt", move |store| {
+                let original = store
+                    .workspace_input(&network, &message_id)?
+                    .context("input not found")?;
+                ensure!(
+                    original.conversation_id == conversation
+                        && original.input.route.target == target,
+                    "input receipt identity mismatch"
+                );
+                let resolved = store.resolve_input_target(&network, &target)?;
+                ensure!(
+                    resolved.owner_node == local,
+                    "this Node is not the input owner"
+                );
+                store
+                    .input_receipt(&network, &local, &message_id)?
+                    .context("input not found")
+            })
+            .await
     }
 
     pub(super) async fn read_scope_context(&self, network: &str, input: &Value) -> Result<Value> {
@@ -1000,20 +1225,23 @@ impl Runtime {
         let target: crate::workspace::InputTarget =
             serde_json::from_value(input["target"].clone())?;
         let key = {
-            let network = network.to_owned(); let conversation = conversation.clone(); let target = target.clone();
+            let network = network.to_owned();
+            let conversation = conversation.clone();
+            let target = target.clone();
             let local = self.identity.device_id()?;
-            self.store.call("scope_context_target", move |store| {
-            let resolved = store.resolve_input_target(&network, &target)?;
-            ensure!(
-                resolved.conversation_id == conversation
-                    && resolved.owner_node == local,
-                "context target is not owned by this Node"
-            );
-            Ok(SessionKey {
-                conversation_id: conversation.clone(),
-                scope: resolved.scope,
-            })
-            }).await?
+            self.store
+                .call("scope_context_target", move |store| {
+                    let resolved = store.resolve_input_target(&network, &target)?;
+                    ensure!(
+                        resolved.conversation_id == conversation && resolved.owner_node == local,
+                        "context target is not owned by this Node"
+                    );
+                    Ok(SessionKey {
+                        conversation_id: conversation.clone(),
+                        scope: resolved.scope,
+                    })
+                })
+                .await?
         };
         let context = self.scheduler_context_observation(network, &key).await?;
         Ok(
@@ -1038,14 +1266,18 @@ impl Runtime {
         let message_ids: Vec<String> = serde_json::from_value(input["message_ids"].clone())
             .context("message_ids must be a list of message IDs")?;
         let local = self.identity.device_id()?;
-        let query_network = network.clone(); let query_scope = scope.clone();
-        let receipts = self.store.call("settle_unanswered", move |store| {
-            if dismiss {
-                store.dismiss_unanswered(&query_network, &local, &query_scope, &message_ids)
-            } else {
-                store.reply_unanswered(&query_network, &local, &query_scope, &message_ids)
-            }
-        }).await?;
+        let query_network = network.clone();
+        let query_scope = scope.clone();
+        let receipts = self
+            .store
+            .call("settle_unanswered", move |store| {
+                if dismiss {
+                    store.dismiss_unanswered(&query_network, &local, &query_scope, &message_ids)
+                } else {
+                    store.reply_unanswered(&query_network, &local, &query_scope, &message_ids)
+                }
+            })
+            .await?;
         for receipt in &receipts {
             self.publish_changed(network, &scope, Changed::Job(&receipt.trigger));
         }
@@ -1061,12 +1293,17 @@ impl Runtime {
         conversation: &str,
     ) -> Result<Vec<Value>> {
         let projection = self.scheduler_projection()?;
-        let network = network.to_owned(); let conversation = conversation.to_owned();
-        self.store.read("scheduler_scope_jobs", move |store| {
-            let jobs = store.scheduler_jobs(&conversation)?;
-            jobs[jobs.len().saturating_sub(MAX_OWNER_JOBS)..].iter()
-                .map(|job| projection.scope_job(store, &network, job)).collect()
-        }).await
+        let network = network.to_owned();
+        let conversation = conversation.to_owned();
+        self.store
+            .read("scheduler_scope_jobs", move |store| {
+                let jobs = store.scheduler_jobs(&conversation)?;
+                jobs[jobs.len().saturating_sub(MAX_OWNER_JOBS)..]
+                    .iter()
+                    .map(|job| projection.scope_job(store, &network, job))
+                    .collect()
+            })
+            .await
     }
 
     pub(super) async fn owner_jobs(&self, network: &str, scope: &str) -> Result<Value> {
@@ -1088,20 +1325,34 @@ impl Runtime {
             )
             .await?;
         let projection = self.scheduler_projection()?;
-        let query_network = network.to_owned(); let query_scope = scope.to_owned();
-        let (jobs, staged, conflicts) = self.store.read("owner_jobs", move |store| {
-            let checks = store.pending_checks()?;
-            let all = chat_jobs(store.scheduler_jobs(&query_scope)?);
-            let mut jobs = Vec::new();
-            for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
-                let mut value = projection.job(store, &query_network, job, &checks)?;
-                value["replied"] = json!(store.message(&query_network, &query_scope, &job.message_id)?.is_some());
-                jobs.push(value);
-            }
-            Ok((jobs, store.scheduler_memory_staged_count(&query_scope)?, store.scheduler_memory_conflicts(&query_scope)?))
-        }).await?;
-        Ok(json!({"jobs":jobs,"scope_jobs":scope_jobs,"manager":self.scheduler_manager_metadata(),
-            "context":context,"memory_staged_count":staged,"memory_conflicts":conflicts}))
+        let query_network = network.to_owned();
+        let query_scope = scope.to_owned();
+        let (jobs, staged, conflicts) = self
+            .store
+            .read("owner_jobs", move |store| {
+                let checks = store.pending_checks()?;
+                let all = chat_jobs(store.scheduler_jobs(&query_scope)?);
+                let mut jobs = Vec::new();
+                for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
+                    let mut value = projection.job(store, &query_network, job, &checks)?;
+                    value["replied"] = json!(
+                        store
+                            .message(&query_network, &query_scope, &job.message_id)?
+                            .is_some()
+                    );
+                    jobs.push(value);
+                }
+                Ok((
+                    jobs,
+                    store.scheduler_memory_staged_count(&query_scope)?,
+                    store.scheduler_memory_conflicts(&query_scope)?,
+                ))
+            })
+            .await?;
+        Ok(
+            json!({"jobs":jobs,"scope_jobs":scope_jobs,"manager":self.scheduler_manager_metadata(),
+            "context":context,"memory_staged_count":staged,"memory_conflicts":conflicts}),
+        )
     }
 
     /// When another device schedules the conversation, its jobs join `jobs` for display only,
@@ -1115,9 +1366,13 @@ impl Runtime {
     ) -> Result<Option<(Value, Value)>> {
         let local = self.identity.device_id()?;
         let Some(owner) = self
-            .store.call("conversation", { let network = network.to_owned();
+            .store
+            .call("conversation", {
+                let network = network.to_owned();
                 let scope = scope.to_owned();
-                move |store| store.conversation(&network, &scope) }).await?
+                move |store| store.conversation(&network, &scope)
+            })
+            .await?
             .and_then(|conversation| conversation.owner)
             .filter(|owner| owner != &local)
         else {
@@ -1142,27 +1397,36 @@ impl Runtime {
             }
         };
         let remote = reply["jobs"].as_array().cloned().unwrap_or_default();
-        let query_network = network.to_owned(); let query_scope = scope.to_owned(); let query_owner = owner.clone();
-        let remote = self.store.read("merge_owner_jobs", move |store| {
-        let mut result = Vec::new();
-        for mut job in remote.into_iter().take(MAX_OWNER_JOBS) {
-            let Some(trigger) = job["trigger"].as_str().map(str::to_owned) else {
-                continue;
-            };
-            // Written there, not synced here yet: the reply is on its way, not lost.
-            if job["replied"] == true
-                && let Some(reply) = job["reply_message_id"].as_str()
-                && store.message(&query_network, &query_scope, reply)?.is_none()
-            {
-                job["state"] = json!("publishing");
-            }
-            job["source_node"] = json!(query_owner);
-            result.push((trigger, job));
-        }
-        Ok(result)
-        }).await?;
+        let query_network = network.to_owned();
+        let query_scope = scope.to_owned();
+        let query_owner = owner.clone();
+        let remote = self
+            .store
+            .read("merge_owner_jobs", move |store| {
+                let mut result = Vec::new();
+                for mut job in remote.into_iter().take(MAX_OWNER_JOBS) {
+                    let Some(trigger) = job["trigger"].as_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    // Written there, not synced here yet: the reply is on its way, not lost.
+                    if job["replied"] == true
+                        && let Some(reply) = job["reply_message_id"].as_str()
+                        && store
+                            .message(&query_network, &query_scope, reply)?
+                            .is_none()
+                    {
+                        job["state"] = json!("publishing");
+                    }
+                    job["source_node"] = json!(query_owner);
+                    result.push((trigger, job));
+                }
+                Ok(result)
+            })
+            .await?;
         for (trigger, job) in remote {
-            jobs.retain(|known| known["trigger"] != trigger.as_str() || known["state"] != "pending_delivery");
+            jobs.retain(|known| {
+                known["trigger"] != trigger.as_str() || known["state"] != "pending_delivery"
+            });
             jobs.push(job);
         }
         Ok(Some((
@@ -1181,34 +1445,37 @@ impl Runtime {
     ) -> Result<(Vec<Value>, Vec<PendingCheck>)> {
         let projection = self.scheduler_projection()?;
         let manager = self.scheduler_manager_metadata();
-        let network = network.to_owned(); let scope = scope.to_owned();
-        self.store.read("scheduler_snapshot_jobs", move |store| {
-        let checks = store
-            .pending_checks()?
-            .into_iter()
-            .filter(|check| check.conversation_id == scope)
-            .collect::<Vec<_>>();
-        let owner = store
-            .conversation(&network, &scope)?
-            .and_then(|conversation| conversation.owner);
-        let mut jobs = Vec::new();
-        for job in chat_jobs(store.scheduler_jobs(&scope)?) {
-            let mut value = projection.job(store, &network, &job, &checks)?;
-            value["manager"] = manager.clone();
-            jobs.push(value);
-        }
-        for entry in store
-            .scheduler_outbox()?
-            .into_iter()
-            .filter(|entry| entry.conversation_id == scope)
-        {
-            jobs.push(
-                json!({"trigger":entry.trigger,"owner":owner,"conversation_id":scope,
+        let network = network.to_owned();
+        let scope = scope.to_owned();
+        self.store
+            .read("scheduler_snapshot_jobs", move |store| {
+                let checks = store
+                    .pending_checks()?
+                    .into_iter()
+                    .filter(|check| check.conversation_id == scope)
+                    .collect::<Vec<_>>();
+                let owner = store
+                    .conversation(&network, &scope)?
+                    .and_then(|conversation| conversation.owner);
+                let mut jobs = Vec::new();
+                for job in chat_jobs(store.scheduler_jobs(&scope)?) {
+                    let mut value = projection.job(store, &network, &job, &checks)?;
+                    value["manager"] = manager.clone();
+                    jobs.push(value);
+                }
+                for entry in store
+                    .scheduler_outbox()?
+                    .into_iter()
+                    .filter(|entry| entry.conversation_id == scope)
+                {
+                    jobs.push(
+                        json!({"trigger":entry.trigger,"owner":owner,"conversation_id":scope,
                 "state":"pending_delivery","message_id":entry.trigger.strip_prefix("message:")}),
-            );
-        }
-        Ok((jobs, checks))
-        }).await
+                    );
+                }
+                Ok((jobs, checks))
+            })
+            .await
     }
 }
 

@@ -1229,7 +1229,17 @@ jobs:
         run: cargo fmt --all 2>&1 | tee .artifacts/native-prepare/rustfmt.log
       - name: Compile all native callers and test targets
         id: compile
-        run: cargo check --all-targets -p vibeface-client -p vibeface-desktop -p vibeface -p vibeface-core --features vibeface-desktop/native-ui-tests 2>&1 | tee .artifacts/native-prepare/compiler.log
+        run: |
+          result=0
+          for package in vibeface-client vibeface-core vibeface vibeface-desktop; do
+            options=()
+            if [[ "$package" == vibeface-desktop ]]; then options+=(--features native-ui-tests); fi
+            printf '\nChecking %s\n' "$package" | tee -a .artifacts/native-prepare/compiler.log
+            if ! cargo check --all-targets -p "$package" "${options[@]}" 2>&1 | tee -a .artifacts/native-prepare/compiler.log; then
+              result=1
+            fi
+          done
+          exit "$result"
       - name: Record exact preparation outcomes even when the compiler rejects the source
         if: always()
         env:

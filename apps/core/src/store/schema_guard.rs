@@ -114,7 +114,10 @@ fn sql_tokens(sql: &str) -> Vec<String> {
                 i += 1;
             }
             tokens.push(
-                chars[start..i].iter().collect::<String>().to_ascii_lowercase(),
+                chars[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
             );
         } else {
             tokens.push(c.to_string());
@@ -214,11 +217,15 @@ fn application_shape(connection: &Connection) -> Result<ApplicationShape> {
         let mut foreign_keys: Vec<_> = foreign_keys.into_values().collect();
         foreign_keys.sort();
         let mut indexes = BTreeMap::new();
-        let mut stmt = connection.prepare(
-            "SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)",
-        )?;
+        let mut stmt = connection
+            .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")?;
         let rows = stmt.query_map([&table], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
         })?;
         for row in rows {
             let (name, unique, origin, partial) = row?;
@@ -226,15 +233,17 @@ fn application_shape(connection: &Connection) -> Result<ApplicationShape> {
                 "SELECT CASE WHEN cid >= 0 THEN 0 ELSE cid END, name, desc, coll, key
                  FROM pragma_index_xinfo(?1) ORDER BY seqno",
             )?;
-            let columns = detail.query_map([&name], |row| {
-                Ok(IndexColumn {
-                    kind: row.get(0)?,
-                    name: row.get(1)?,
-                    descending: row.get(2)?,
-                    collation: row.get(3)?,
-                    key: row.get(4)?,
-                })
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let columns = detail
+                .query_map([&name], |row| {
+                    Ok(IndexColumn {
+                        kind: row.get(0)?,
+                        name: row.get(1)?,
+                        descending: row.get(2)?,
+                        collation: row.get(3)?,
+                        key: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql: Option<String> = connection.query_row(
                 "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
                 [&name],
@@ -243,20 +252,33 @@ fn application_shape(connection: &Connection) -> Result<ApplicationShape> {
             let definition = sql.map(|sql| {
                 let tokens = sql_tokens(&sql);
                 // The index name is not part of its expressions or partial predicate.
-                tokens.iter().position(|token| token == "on")
-                    .map(|offset| tokens[offset + 1..].to_vec()).unwrap_or(tokens)
+                tokens
+                    .iter()
+                    .position(|token| token == "on")
+                    .map(|offset| tokens[offset + 1..].to_vec())
+                    .unwrap_or(tokens)
             });
-            indexes.insert(name, IndexShape {
-                unique, origin, partial, columns, definition,
-            });
+            indexes.insert(
+                name,
+                IndexShape {
+                    unique,
+                    origin,
+                    partial,
+                    columns,
+                    definition,
+                },
+            );
         }
-        shape.insert(table, TableShape {
-            columns,
-            indexes,
-            foreign_keys,
-            checks,
-            deferred_foreign_keys: tokens.iter().any(|token| token == "deferrable"),
-        });
+        shape.insert(
+            table,
+            TableShape {
+                columns,
+                indexes,
+                foreign_keys,
+                checks,
+                deferred_foreign_keys: tokens.iter().any(|token| token == "deferrable"),
+            },
+        );
     }
     Ok(shape)
 }
@@ -313,19 +335,25 @@ fn validate_schema(connection: &Connection, allow_missing_derived: bool) -> Resu
             continue;
         };
         for (index, expected_index) in &expected_table.indexes {
-            if allow_missing_derived && table == "work_runs" && index == "work_runs_reconcile"
+            if allow_missing_derived
+                && table == "work_runs"
+                && index == "work_runs_reconcile"
                 && !actual_table.indexes.contains_key(index)
             {
                 continue;
             }
             if actual_table.indexes.get(index) != Some(expected_index) {
-                mismatches.push(format!("{table}.{index}: required index metadata does not match this Core"));
+                mismatches.push(format!(
+                    "{table}.{index}: required index metadata does not match this Core"
+                ));
             }
         }
         if actual_table.foreign_keys != expected_table.foreign_keys
             || actual_table.deferred_foreign_keys != expected_table.deferred_foreign_keys
         {
-            mismatches.push(format!("{table}: foreign key constraints do not match this Core"));
+            mismatches.push(format!(
+                "{table}: foreign key constraints do not match this Core"
+            ));
         }
         if actual_table.checks != expected_table.checks {
             mismatches.push(format!("{table}: CHECK constraints do not match this Core"));
@@ -397,17 +425,26 @@ mod tests {
     }
 
     fn assert_schema_refused(schema: &str, expected_diagnostic: &str) -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("vibeface-schema-integrity-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-schema-integrity-{}",
+            uuid::Uuid::new_v4()
+        ));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
             let db = Connection::open(&path)?;
             db.execute_batch(schema)?;
             db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            db.execute("INSERT INTO identity_meta(key,value) VALUES('device','preserved-device')", [])?;
+            db.execute(
+                "INSERT INTO identity_meta(key,value) VALUES('device','preserved-device')",
+                [],
+            )?;
             let actual = application_shape(&db)?;
             for (table, shape) in expected_application_shape()? {
-                assert_eq!(actual[table].columns, shape.columns, "{table} columns must be unchanged in the fixture");
+                assert_eq!(
+                    actual[table].columns, shape.columns,
+                    "{table} columns must be unchanged in the fixture"
+                );
             }
         }
         let before = std::fs::read(&path)?;
@@ -417,7 +454,10 @@ mod tests {
         };
         assert!(error.contains("data_schema_mismatch"), "{error}");
         assert!(error.contains(expected_diagnostic), "{error}");
-        assert!(error.contains("backup") && error.contains("offline repair"), "{error}");
+        assert!(
+            error.contains("backup") && error.contains("offline repair"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(&path)?, before);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -436,21 +476,45 @@ mod tests {
             "DROP INDEX triage_queue_claim; CREATE INDEX triage_queue_claim ON triage_queue(json_extract(event,'$.wrong'),json_extract(event,'$._triage.attempt'),json_extract(event,'$._triage.state'),ts_ms,event_id);",
         ] {
             let schema = format!("{INITIAL_SCHEMA}\n{statement}");
-            let index = if statement.contains("invites_invite_hash") { "invites_invite_hash" }
-                else if statement.contains("triage_queue_claim") { "triage_queue_claim" } else { "events_main" };
+            let index = if statement.contains("invites_invite_hash") {
+                "invites_invite_hash"
+            } else if statement.contains("triage_queue_claim") {
+                "triage_queue_claim"
+            } else {
+                "events_main"
+            };
             assert_schema_refused(&schema, index)?;
         }
         Ok(())
     }
 
     #[test]
-    fn foreign_key_and_check_changes_with_identical_columns_are_refused_without_writes() -> Result<()> {
+    fn foreign_key_and_check_changes_with_identical_columns_are_refused_without_writes()
+    -> Result<()> {
         let foreign_key = ", CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION";
         assert!(INITIAL_SCHEMA.contains(foreign_key));
-        assert_schema_refused(&INITIAL_SCHEMA.replace(foreign_key, ""), "events: foreign key")?;
-        assert_schema_refused(&INITIAL_SCHEMA.replace("ON DELETE NO ACTION", "ON DELETE CASCADE"), "events: foreign key")?;
-        assert_schema_refused(&INITIAL_SCHEMA.replace("ON DELETE NO ACTION", "ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED"), "events: foreign key")?;
-        assert_schema_refused(&INITIAL_SCHEMA.replace("`main` integer NOT NULL", "`main` integer NOT NULL CHECK(main IN (0,1))"), "events: CHECK")?;
+        assert_schema_refused(
+            &INITIAL_SCHEMA.replace(foreign_key, ""),
+            "events: foreign key",
+        )?;
+        assert_schema_refused(
+            &INITIAL_SCHEMA.replace("ON DELETE NO ACTION", "ON DELETE CASCADE"),
+            "events: foreign key",
+        )?;
+        assert_schema_refused(
+            &INITIAL_SCHEMA.replace(
+                "ON DELETE NO ACTION",
+                "ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED",
+            ),
+            "events: foreign key",
+        )?;
+        assert_schema_refused(
+            &INITIAL_SCHEMA.replace(
+                "`main` integer NOT NULL",
+                "`main` integer NOT NULL CHECK(main IN (0,1))",
+            ),
+            "events: CHECK",
+        )?;
         Ok(())
     }
 
@@ -464,21 +528,27 @@ mod tests {
 
     #[test]
     fn only_missing_derived_index_is_installed_without_changing_existing_rows() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("vibeface-derived-index-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-derived-index-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
             let db = Connection::open(&path)?;
             init_current_db(&db)?;
             db.execute_batch("DROP INDEX work_runs_reconcile;")?;
-            db.execute("INSERT INTO identity_meta(key,value) VALUES('device','original-device')", [])?;
+            db.execute(
+                "INSERT INTO identity_meta(key,value) VALUES('device','original-device')",
+                [],
+            )?;
         }
         let before = std::fs::read(&path)?;
         drop(Store::open_readonly(&path)?);
         assert_eq!(std::fs::read(&path)?, before);
         let store = Store::open(&path)?;
         let value: String = store.connection.query_row(
-            "SELECT value FROM identity_meta WHERE key='device'", [], |row| row.get(0),
+            "SELECT value FROM identity_meta WHERE key='device'",
+            [],
+            |row| row.get(0),
         )?;
         assert_eq!(value, "original-device");
         validate_application_schema(&store.connection)?;
@@ -495,7 +565,9 @@ mod tests {
             "events_main",
         )?;
         assert_schema_refused(
-            &format!("{INITIAL_SCHEMA}\nDROP INDEX work_runs_reconcile; CREATE INDEX work_runs_reconcile ON work_runs(work_id);"),
+            &format!(
+                "{INITIAL_SCHEMA}\nDROP INDEX work_runs_reconcile; CREATE INDEX work_runs_reconcile ON work_runs(work_id);"
+            ),
             "work_runs_reconcile",
         )
     }

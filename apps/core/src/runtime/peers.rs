@@ -279,7 +279,11 @@ impl Runtime {
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
             let view = self.membership_state().await?.project()?;
-            for signed in self.store.call("peers.address_book", move |store| store.address_book()).await? {
+            for signed in self
+                .store
+                .call("peers.address_book", move |store| store.address_book())
+                .await?
+            {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
                 {
@@ -342,9 +346,13 @@ impl Runtime {
                     .is_some_and(|operator| net::same_token(&token, operator))
                     || {
                         let arg0 = (token).to_owned();
-                        self.store.call("peers.relay_token_open", move |store| store.relay_token_open(&arg0)).await
+                        self.store
+                            .call("peers.relay_token_open", move |store| {
+                                store.relay_token_open(&arg0)
+                            })
+                            .await
                     }
-                        .unwrap_or(false)
+                    .unwrap_or(false)
             }
             None => false,
         };
@@ -385,7 +393,11 @@ impl Runtime {
         {
             let arg0 = (network).to_owned();
             let arg1 = (device).to_owned();
-            self.store.call("peers.authorize_node", move |store| store.authorize_node(&arg0, &arg1)).await
+            self.store
+                .call("peers.authorize_node", move |store| {
+                    store.authorize_node(&arg0, &arg1)
+                })
+                .await
         }?;
         Ok(network)
     }
@@ -484,7 +496,11 @@ impl Runtime {
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (remote).to_owned();
-                    node.store.call("peers.authorize_node", move |store| store.authorize_node(&arg0, &arg1)).await
+                    node.store
+                        .call("peers.authorize_node", move |store| {
+                            store.authorize_node(&arg0, &arg1)
+                        })
+                        .await
                 }?;
                 if alpn == net::SYNC {
                     node.handle_sync(&network, &remote, &request).await
@@ -545,12 +561,14 @@ impl Runtime {
             let network = network.to_owned();
             let local = local.clone();
             let target = target.to_owned();
-            self.store.call("peers.peer_authorization", move |store| {
-            store.authorize_node(&network, &local)?;
-            store.authorize_node(&network, &target)?;
+            self.store
+                .call("peers.peer_authorization", move |store| {
+                    store.authorize_node(&network, &local)?;
+                    store.authorize_node(&network, &target)?;
 
-                Ok(())
-            }).await?
+                    Ok(())
+                })
+                .await?
         }
         payload["network_id"] = json!(network);
         self.net()?
@@ -593,7 +611,9 @@ impl Runtime {
                 let records: Vec<SignedAddress> =
                     serde_json::from_value(input["records"].clone()).unwrap_or_default();
                 self.merge_addresses(network, records).await?;
-                Ok(json!({"records":self.store.call("peers.address_book", move |store| store.address_book()).await?}))
+                Ok(
+                    json!({"records":self.store.call("peers.address_book", move |store| store.address_book()).await?}),
+                )
             }
             "deliver" => self.accept_delivery(network, origin, input).await,
             "scheduler_jobs" => {
@@ -612,7 +632,7 @@ impl Runtime {
                 Ok(json!({}))
             }
             "pending_joins" => Ok(
-                json!({"requests":{ let admin = field(input, "admin")?.to_owned(); self.store.call("peers.pending_joins", move |store| store.pending_joins(&admin)).await }?}),
+                json!({"requests":({ let admin = field(input, "admin")?.to_owned(); self.store.call("peers.pending_joins", move |store| store.pending_joins(&admin)).await }?)}),
             ),
             "approve_join" => {
                 crate::client::approve_join(self, field(input, "admin")?, &input["params"]).await
@@ -668,9 +688,11 @@ impl Runtime {
         let state = self.membership_state().await?;
         let (heads, forks) = {
             let network = network.to_owned();
-            self.store.call("peers.hello", move |store| {
-                Ok((store.heads(&network)?, store.fork_digest(&network)?))
-            }).await?
+            self.store
+                .call("peers.hello", move |store| {
+                    Ok((store.heads(&network)?, store.fork_digest(&network)?))
+                })
+                .await?
         };
         Ok(
             json!({"type":"hello","network_id":network,"vector":heads,"boot":self.boot,
@@ -721,11 +743,13 @@ impl Runtime {
                 // A head we lack is either further along or on another branch of that log.
                 let behind = {
                     let network = network.to_owned();
-                    self.store.call("peers.behind", move |store| {
-                    theirs.values().try_fold(false, |behind, (_, hash)| {
-                        anyhow::Ok(behind || store.event(&network, hash)?.is_none())
-                    })
-                    }).await?
+                    self.store
+                        .call("peers.behind", move |store| {
+                            theirs.values().try_fold(false, |behind, (_, hash)| {
+                                anyhow::Ok(behind || store.event(&network, hash)?.is_none())
+                            })
+                        })
+                        .await?
                 };
                 let forks = input["forks"] != ours["forks"]
                     && self.note_forks(origin, &input["forks"], &ours["forks"]);
@@ -748,7 +772,14 @@ impl Runtime {
                 let after: Option<(String, u64, String)> =
                     serde_json::from_value(input["after"].clone())
                         .context("invalid fork cursor")?;
-                let events = { let network = network.to_owned(); self.store.call("peers.fork_events", move |store| store.fork_events(&network, after.as_ref())).await }?;
+                let events = {
+                    let network = network.to_owned();
+                    self.store
+                        .call("peers.fork_events", move |store| {
+                            store.fork_events(&network, after.as_ref())
+                        })
+                        .await
+                }?;
                 Ok(json!({"events":events}))
             }
             "pull" => {
@@ -758,14 +789,17 @@ impl Runtime {
                     .as_u64()
                     .unwrap_or(crate::store::MAX_PULL_EVENTS as u64)
                     as usize;
-                let events =
-                    {
-                        let arg0 = (network).to_owned();
-                        let arg1 = (author).to_owned();
-                        let arg2 = from.max(1);
-                        let arg3 = limit;
-                        self.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
-                    }?;
+                let events = {
+                    let arg0 = (network).to_owned();
+                    let arg1 = (author).to_owned();
+                    let arg2 = from.max(1);
+                    let arg3 = limit;
+                    self.store
+                        .call("peers.events_from", move |store| {
+                            store.events_from(&arg0, &arg1, arg2, arg3)
+                        })
+                        .await
+                }?;
                 Ok(json!({"author":author,"events":events}))
             }
             "have" => {
@@ -773,7 +807,9 @@ impl Runtime {
                 let seq = input["seq"].as_u64().context("seq is required")?;
                 let local = {
                     let arg0 = (network).to_owned();
-                    self.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                    self.store
+                        .call("peers.heads", move |store| store.heads(&arg0))
+                        .await
                 }?;
                 if local.get(author).map(|head| head.0).unwrap_or(0) < seq {
                     self.wake_sync(origin);
@@ -977,7 +1013,9 @@ impl Runtime {
             serde_json::from_value(theirs["vector"].clone()).context("invalid peer vector")?;
         let before = {
             let arg0 = (network).to_owned();
-            self.store.call("peers.heads", move |store| store.heads(&arg0)).await
+            self.store
+                .call("peers.heads", move |store| store.heads(&arg0))
+                .await
         }?;
         for _pass in 0..4 {
             let mut progressed = false;
@@ -1015,24 +1053,34 @@ impl Runtime {
             reconcile_log(
                 our_max,
                 (head.0, &head.1),
-                |hash| async move { Ok({
-                    let arg0 = (network).to_owned();
-                    let arg1 = (hash).to_owned();
-                    self.store.call("peers.event", move |store| store.event(&arg0, &arg1)).await
-                }?.is_some()) },
+                |hash| async move {
+                    Ok({
+                        let arg0 = (network).to_owned();
+                        let arg1 = (hash).to_owned();
+                        self.store
+                            .call("peers.event", move |store| store.event(&arg0, &arg1))
+                            .await
+                    }?
+                    .is_some())
+                },
                 |from, limit| self.pull(network, peer, author, from, limit),
                 |events| async move { self.ingest(network, &events).await },
             )
             .await?;
         }
-        let forks_left = theirs["forks"] != json!({
-            let arg0 = (network).to_owned();
-            self.store.call("peers.fork_digest", move |store| store.fork_digest(&arg0)).await
-        }?)
+        let forks_left = theirs["forks"]
+            != json!({
+                let arg0 = (network).to_owned();
+                self.store
+                    .call("peers.fork_digest", move |store| store.fork_digest(&arg0))
+                    .await
+            }?)
             && self.pull_forks(network, peer).await?;
         let heads = {
             let arg0 = (network).to_owned();
-            self.store.call("peers.heads", move |store| store.heads(&arg0)).await
+            self.store
+                .call("peers.heads", move |store| store.heads(&arg0))
+                .await
         }?;
         let behind = vector
             .iter()
@@ -1099,11 +1147,15 @@ impl Runtime {
             }
             return {
                 let arg0 = (peer).to_owned();
-                self.store.call("peers.peer_capabilities", move |store| store.peer_capabilities(&arg0)).await
+                self.store
+                    .call("peers.peer_capabilities", move |store| {
+                        store.peer_capabilities(&arg0)
+                    })
+                    .await
             }
-                .ok()
-                .flatten()
-                .unwrap_or(Value::Null);
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
         };
         let changed = {
             let mut states = self.sync_peers.lock().expect("sync peers");
@@ -1116,7 +1168,11 @@ impl Runtime {
             && let Err(error) = {
                 let arg0 = (peer).to_owned();
                 let arg1 = (answer).to_owned();
-                self.store.call("peers.keep_peer_capabilities", move |store| store.keep_peer_capabilities(&arg0, &arg1)).await
+                self.store
+                    .call("peers.keep_peer_capabilities", move |store| {
+                        store.keep_peer_capabilities(&arg0, &arg1)
+                    })
+                    .await
             }
         {
             tracing::debug!(%error, "peer capabilities kept in memory only");
@@ -1161,19 +1217,25 @@ impl Runtime {
     /// restored backup) waits to learn from the others that it holds every event it wrote.
     pub(super) async fn align_on_start(&self) -> Result<bool> {
         if !self.has_membership().await? {
-            self.store.call("peers.record_write_file", move |store| store.record_write_file()).await?;
+            self.store
+                .call("peers.record_write_file", move |store| {
+                    store.record_write_file()
+                })
+                .await?;
             return Ok(true);
         }
         let (network, peers) = self.member_peers().await?;
         let (forked, same_file) = {
             let network = network.clone();
             let local = self.identity.device_id()?;
-            self.store.call("peers.alignment", move |store| {
-                Ok((
-                store.has_conflicts_by(&network, &local)?,
-                store.wrote_from_this_file()?,
-            ))
-            }).await?
+            self.store
+                .call("peers.alignment", move |store| {
+                    Ok((
+                        store.has_conflicts_by(&network, &local)?,
+                        store.wrote_from_this_file()?,
+                    ))
+                })
+                .await?
         };
         let state = match (forked, same_file || peers.is_empty()) {
             (true, _) => WriteState::Forked,
@@ -1181,7 +1243,11 @@ impl Runtime {
             (false, false) => WriteState::Aligning,
         };
         if state == WriteState::Writable {
-            self.store.call("peers.record_write_file", move |store| store.record_write_file()).await?;
+            self.store
+                .call("peers.record_write_file", move |store| {
+                    store.record_write_file()
+                })
+                .await?;
         }
         let from = [
             WriteState::Writable,
@@ -1206,21 +1272,28 @@ impl Runtime {
         let confirmed = match vector.get(&own) {
             None => true,
             Some((seq, hash)) => {
-                *seq <= local
-                    && {
-                        let arg0 = (network).to_owned();
-                        let arg1 = (own).to_owned();
-                        let arg2 = *seq;
-                        self.store.call("peers.hash_at", move |store| store.hash_at(&arg0, &arg1, arg2)).await
-                    }?
-                        .as_ref()
-                        == Some(hash)
+                *seq <= local && {
+                    let arg0 = (network).to_owned();
+                    let arg1 = (own).to_owned();
+                    let arg2 = *seq;
+                    self.store
+                        .call("peers.hash_at", move |store| {
+                            store.hash_at(&arg0, &arg1, arg2)
+                        })
+                        .await
+                }?
+                .as_ref()
+                    == Some(hash)
             }
         };
         if {
             let arg0 = (network).to_owned();
             let arg1 = (own).to_owned();
-            self.store.call("peers.has_conflicts_by", move |store| store.has_conflicts_by(&arg0, &arg1)).await
+            self.store
+                .call("peers.has_conflicts_by", move |store| {
+                    store.has_conflicts_by(&arg0, &arg1)
+                })
+                .await
         }? {
             let from = [
                 WriteState::Aligning,
@@ -1301,7 +1374,7 @@ impl Runtime {
         }).await;
         drop(controls);
         match changed {
-            Ok(true) => {},
+            Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
                 tracing::warn!(event = "sync.write_state_pending", %error, "write state change pending");
@@ -1364,8 +1437,11 @@ impl Runtime {
     ) -> Result<Value> {
         let conflicts = {
             let arg0 = (network).to_owned();
-            self.store.read("peers.conflicts", move |store| store.conflicts(&arg0)).await
-        }?.len();
+            self.store
+                .read("peers.conflicts", move |store| store.conflicts(&arg0))
+                .await
+        }?
+        .len();
         let until_ms = until_ms.unwrap_or_else(now_ms);
         let since_ms = since_ms.unwrap_or(until_ms - 86_400_000);
         let filter = crate::logging::Filter {
@@ -1411,7 +1487,9 @@ impl Runtime {
         let state = *self.write_state.borrow();
         let conflicts = {
             let arg0 = (network).to_owned();
-            self.store.read("peers.conflicts", move |store| store.conflicts(&arg0)).await
+            self.store
+                .read("peers.conflicts", move |store| store.conflicts(&arg0))
+                .await
         }?;
         Ok(json!({"state":state,"conflicts":conflicts}))
     }
@@ -1448,22 +1526,26 @@ impl Runtime {
     async fn local_seq(&self, network: &str, author: &str) -> Result<u64> {
         Ok({
             let arg0 = (network).to_owned();
-            self.store.call("peers.heads", move |store| store.heads(&arg0)).await
+            self.store
+                .call("peers.heads", move |store| store.heads(&arg0))
+                .await
         }?
-            .get(author)
-            .map(|head| head.0)
-            .unwrap_or(0))
+        .get(author)
+        .map(|head| head.0)
+        .unwrap_or(0))
     }
 
     async fn ingest(self: &Arc<Self>, network: &str, events: &[SignedEvent]) -> Result<()> {
         let ingested = {
             let network = network.to_owned();
             let events = events.to_vec();
-            self.store.call("peers.ingest", move |store| {
-            let ingested = store.ingest_events(&network, &events)?;
-            store.settle_local_works(&network)?;
-                Ok(ingested)
-            }).await?
+            self.store
+                .call("peers.ingest", move |store| {
+                    let ingested = store.ingest_events(&network, &events)?;
+                    store.settle_local_works(&network)?;
+                    Ok(ingested)
+                })
+                .await?
         };
         if ingested.rebuilt {
             self.publish_reread(network);
@@ -1511,10 +1593,12 @@ impl Runtime {
             };
             let head = {
                 let arg0 = (view.network_id).to_owned();
-                self.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                self.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }
-                .ok()
-                .and_then(|heads| heads.get(&local).cloned());
+            .ok()
+            .and_then(|heads| heads.get(&local).cloned());
             let Some((seq, hash)) = head else { continue };
             if seq == announced {
                 continue;
@@ -1655,7 +1739,11 @@ impl Runtime {
             }
             let _ = {
                 let arg0 = (revoked.device_id).to_owned();
-                self.store.call("peers.forget_address", move |store| store.forget_address(&arg0)).await
+                self.store
+                    .call("peers.forget_address", move |store| {
+                        store.forget_address(&arg0)
+                    })
+                    .await
             };
         }
         self.unverify_revoked_works(&view.network_id).await;
@@ -1682,7 +1770,11 @@ impl Runtime {
             let arg0 = (self.identity).to_owned();
             let arg1 = (network).to_owned();
             let arg2 = (removed).to_owned();
-            self.store.call("peers.unverify_removed_works", move |store| store.unverify_removed_works(&arg0, &arg1, &arg2, now_ms())).await
+            self.store
+                .call("peers.unverify_removed_works", move |store| {
+                    store.unverify_removed_works(&arg0, &arg1, &arg2, now_ms())
+                })
+                .await
         };
         match result {
             Ok(unverified) => {
@@ -1704,9 +1796,12 @@ impl Runtime {
             let arg0 = (network).to_owned();
             let arg1 = (local).to_owned();
             let arg2 = (removed).to_owned();
-            self.store.call("peers.drop_requests_to", move |store| store.drop_requests_to(&arg0, &arg1, &arg2)).await
-        }
-        {
+            self.store
+                .call("peers.drop_requests_to", move |store| {
+                    store.drop_requests_to(&arg0, &arg1, &arg2)
+                })
+                .await
+        } {
             Ok(0) => {}
             Ok(_) => self.schedule_wakeup.notify_one(),
             Err(error) => {
@@ -1769,44 +1864,48 @@ impl Runtime {
         let relay = self.relay_config().own_relay()?.map(|url| url.to_string());
         let network = network.to_owned();
         let identity = self.identity.clone();
-        self.store.call("peers.refresh_address", move |store| {
-        let previous = store
-            .address_book()?
-            .into_iter()
-            .filter_map(|signed| signed.open(&network).ok())
-            .find(|record| record.device_id == device_id);
-        if previous.as_ref().is_some_and(|record| {
-            record.endpoint == endpoint
-                && record.gateway_url == gateway_url
-                && record.relay == relay
-        }) {
-            return Ok(false);
-        }
-        let record = AddressRecord {
-            version: 1,
-            network_id: network,
-            device_id,
-            seq: previous
-                .map(|record| record.seq + 1)
-                .unwrap_or(0)
-                .max(now_ms() as u64),
-            endpoint,
-            gateway_url,
-            relay,
-        };
-        let payload = serde_json::to_string(&record)?;
-        let signed = SignedAddress {
-            signature: identity
-                .sign_payload(net::ADDRESS_DOMAIN, payload.as_bytes())?,
-            payload,
-        };
-        store.save_address(&record.network_id, &record, &signed)?;
-        Ok(true)
-            }).await
+        self.store
+            .call("peers.refresh_address", move |store| {
+                let previous = store
+                    .address_book()?
+                    .into_iter()
+                    .filter_map(|signed| signed.open(&network).ok())
+                    .find(|record| record.device_id == device_id);
+                if previous.as_ref().is_some_and(|record| {
+                    record.endpoint == endpoint
+                        && record.gateway_url == gateway_url
+                        && record.relay == relay
+                }) {
+                    return Ok(false);
+                }
+                let record = AddressRecord {
+                    version: 1,
+                    network_id: network,
+                    device_id,
+                    seq: previous
+                        .map(|record| record.seq + 1)
+                        .unwrap_or(0)
+                        .max(now_ms() as u64),
+                    endpoint,
+                    gateway_url,
+                    relay,
+                };
+                let payload = serde_json::to_string(&record)?;
+                let signed = SignedAddress {
+                    signature: identity.sign_payload(net::ADDRESS_DOMAIN, payload.as_bytes())?,
+                    payload,
+                };
+                store.save_address(&record.network_id, &record, &signed)?;
+                Ok(true)
+            })
+            .await
     }
 
     async fn exchange_addresses(&self, network: &str, peer: &str) -> Result<()> {
-        let records = self.store.call("peers.address_book", move |store| store.address_book()).await?;
+        let records = self
+            .store
+            .call("peers.address_book", move |store| store.address_book())
+            .await?;
         let reply = self
             .net()?
             .request(
@@ -1840,7 +1939,11 @@ impl Runtime {
                 let arg0 = (network).to_owned();
                 let arg1 = (record).to_owned();
                 let arg2 = (signed).to_owned();
-                self.store.call("peers.save_address", move |store| store.save_address(&arg0, &arg1, &arg2)).await
+                self.store
+                    .call("peers.save_address", move |store| {
+                        store.save_address(&arg0, &arg1, &arg2)
+                    })
+                    .await
             }?;
             if changed && let Ok(net) = self.net() {
                 net.learn_member(&record).await;
@@ -1856,7 +1959,10 @@ impl Runtime {
     /// Includes signed withdrawals so browsers can discard previously cached web entries.
     pub(crate) async fn entrances(&self, network: &str) -> Result<Vec<SignedAddress>> {
         let view = self.membership_state().await?.project()?;
-        Ok(self.store.call("peers.address_book", move |store| store.address_book()).await?
+        Ok(self
+            .store
+            .call("peers.address_book", move |store| store.address_book())
+            .await?
             .into_iter()
             .filter(|signed| {
                 signed
@@ -1980,7 +2086,9 @@ impl Runtime {
             }
             Ok(Some((network, lanes)))
                 }).await?;
-        let Some((network, lanes)) = snapshot else { return Ok(()); };
+        let Some((network, lanes)) = snapshot else {
+            return Ok(());
+        };
         for (lane, mut entries) in lanes {
             let Some(guard) = self
                 .peer_delivery_locks
@@ -2019,23 +2127,35 @@ impl Runtime {
         let command = {
             let network = network.to_owned();
             let entry = entry.clone();
-            self.store.call("peers.delivery_attempt", move |store| {
-            if !store.mailbox_before_attempt(
-                &network,
-                &entry.conversation_id,
-                &entry.trigger,
-                now_ms(),
-            )? {
-                ensure!(
-                    store.peer_delivery_saved(&network, &entry.conversation_id, &entry.trigger)?,
-                    "target waits for earlier delivery reconciliation"
-                );
-                return Ok(None);
-            }
-            Ok(Some(store.peer_delivery_command(&network, &entry.conversation_id, &entry.trigger)?))
-                    }).await?
+            self.store
+                .call("peers.delivery_attempt", move |store| {
+                    if !store.mailbox_before_attempt(
+                        &network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        now_ms(),
+                    )? {
+                        ensure!(
+                            store.peer_delivery_saved(
+                                &network,
+                                &entry.conversation_id,
+                                &entry.trigger
+                            )?,
+                            "target waits for earlier delivery reconciliation"
+                        );
+                        return Ok(None);
+                    }
+                    Ok(Some(store.peer_delivery_command(
+                        &network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                    )?))
+                })
+                .await?
         };
-        let Some(command) = command else { return Ok(false); };
+        let Some(command) = command else {
+            return Ok(false);
+        };
         let command_id = command.envelope.command_id.clone();
         let local = self.identity.device_id()?;
         let delivered = if command.target_node == local {
@@ -2051,13 +2171,15 @@ impl Runtime {
         };
         let receipt_matches = match &delivered {
             Ok(reply) if reply["admission"]["state"] == "owner_accepted" => {
-                {
-                    let arg0 = (network).to_owned();
-                    let arg1 = (entry.conversation_id).to_owned();
-                    let arg2 = (entry.trigger).to_owned();
-                    let arg3 = (reply["receipt"]["trigger"].as_str().unwrap_or_default()).to_owned();
-                    self.store.call("peers.peer_delivery_receipt_matches", move |store| store.peer_delivery_receipt_matches(&arg0, &arg1, &arg2, &arg3)).await
-                }
+                let arg0 = (network).to_owned();
+                let arg1 = (entry.conversation_id).to_owned();
+                let arg2 = (entry.trigger).to_owned();
+                let arg3 = (reply["receipt"]["trigger"].as_str().unwrap_or_default()).to_owned();
+                self.store
+                    .call("peers.peer_delivery_receipt_matches", move |store| {
+                        store.peer_delivery_receipt_matches(&arg0, &arg1, &arg2, &arg3)
+                    })
+                    .await
             }
             _ => Ok(true),
         };
@@ -2093,7 +2215,11 @@ impl Runtime {
                     let arg0 = (network).to_owned();
                     let arg1 = (entry.conversation_id).to_owned();
                     let arg2 = (entry.trigger).to_owned();
-                    self.store.call("peers.mailbox_delivered", move |store| store.mailbox_delivered(&arg0, &arg1, &arg2, now_ms())).await
+                    self.store
+                        .call("peers.mailbox_delivered", move |store| {
+                            store.mailbox_delivered(&arg0, &arg1, &arg2, now_ms())
+                        })
+                        .await
                 }?;
                 self.publish_changed(
                     network,
@@ -2113,7 +2239,11 @@ impl Runtime {
                         let arg1 = (entry.conversation_id).to_owned();
                         let arg2 = (entry.trigger).to_owned();
                         let arg3 = (detail).to_owned();
-                        self.store.call("peers.mailbox_rejected", move |store| store.mailbox_rejected(&arg0, &arg1, &arg2, &arg3, now_ms())).await
+                        self.store
+                            .call("peers.mailbox_rejected", move |store| {
+                                store.mailbox_rejected(&arg0, &arg1, &arg2, &arg3, now_ms())
+                            })
+                            .await
                     }?;
                     return Ok(true);
                 }
@@ -2123,7 +2253,11 @@ impl Runtime {
                     let arg2 = (entry.trigger).to_owned();
                     let arg3 = false;
                     let arg4 = (detail).to_owned();
-                    self.store.call("peers.mailbox_failed", move |store| store.mailbox_failed(&arg0, &arg1, &arg2, arg3, &arg4, now_ms())).await
+                    self.store
+                        .call("peers.mailbox_failed", move |store| {
+                            store.mailbox_failed(&arg0, &arg1, &arg2, arg3, &arg4, now_ms())
+                        })
+                        .await
                 }?;
                 ensure!(
                     matches!(state, "saved" | "waiting_dependencies"),
@@ -2132,7 +2266,11 @@ impl Runtime {
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (command_id).to_owned();
-                    self.store.call("peers.mark_peer_saved", move |store| store.mark_peer_saved(&arg0, &arg1)).await
+                    self.store
+                        .call("peers.mark_peer_saved", move |store| {
+                            store.mark_peer_saved(&arg0, &arg1)
+                        })
+                        .await
                 }?;
                 Ok(true)
             }
@@ -2143,7 +2281,11 @@ impl Runtime {
                     let arg2 = (entry.trigger).to_owned();
                     let arg3 = net::Unanswered::is(&error);
                     let arg4 = (error.to_string()).to_owned();
-                    self.store.call("peers.mailbox_failed", move |store| store.mailbox_failed(&arg0, &arg1, &arg2, arg3, &arg4, now_ms())).await
+                    self.store
+                        .call("peers.mailbox_failed", move |store| {
+                            store.mailbox_failed(&arg0, &arg1, &arg2, arg3, &arg4, now_ms())
+                        })
+                        .await
                 }?;
                 Err(error)
             }
@@ -2185,13 +2327,16 @@ impl Runtime {
         envelope: PeerEnvelope,
     ) -> Result<Value> {
         envelope.validate(network, origin, &self.identity.device_id()?)?;
-        let admission =
-            {
-                let arg0 = (network).to_owned();
-                let arg1 = (origin).to_owned();
-                let arg2 = (envelope).to_owned();
-                self.store.call("peers.save_peer_command", move |store| store.save_peer_command(&arg0, &arg1, &arg2, now_ms())).await
-            }?;
+        let admission = {
+            let arg0 = (network).to_owned();
+            let arg1 = (origin).to_owned();
+            let arg2 = (envelope).to_owned();
+            self.store
+                .call("peers.save_peer_command", move |store| {
+                    store.save_peer_command(&arg0, &arg1, &arg2, now_ms())
+                })
+                .await
+        }?;
         self.drive_peer_commands(network).await?;
         Ok(admission.reply())
     }
@@ -2199,7 +2344,11 @@ impl Runtime {
     async fn drive_peer_commands(self: &Arc<Self>, network: &str) -> Result<()> {
         let pending = {
             let arg0 = (network).to_owned();
-            self.store.call("peers.pending_peer_commands", move |store| store.pending_peer_commands(&arg0)).await
+            self.store
+                .call("peers.pending_peer_commands", move |store| {
+                    store.pending_peer_commands(&arg0)
+                })
+                .await
         }?;
         let mut lanes = BTreeSet::new();
         for command in pending {
@@ -2337,7 +2486,11 @@ impl Runtime {
             let arg1 = (envelope.command_id).to_owned();
             let arg2 = state;
             let arg3 = response;
-            self.store.call("peers.finish_peer_command", move |store| store.finish_peer_command(&arg0, &arg1, arg2, arg3)).await
+            self.store
+                .call("peers.finish_peer_command", move |store| {
+                    store.finish_peer_command(&arg0, &arg1, arg2, arg3)
+                })
+                .await
         }?;
         Ok(state != PeerAdmissionState::WaitingDependencies)
     }
@@ -2382,17 +2535,19 @@ impl Runtime {
             let remote = remote.to_owned();
             let hash = hash.to_owned();
             let request = request.clone();
-            self.store.call("peers.send_blob", move |store| {
-            store.authorize_node(&network, &remote)?;
-            let size = store
-                .referenced_blob(&network, &hash)?
-                .context("no stored event references this attachment")?;
-            ensure!(
-                request["size"].as_u64() == Some(size) && offset <= size,
-                "attachment size mismatch"
-            );
-            store.blob_file(&hash)
-                    }).await?
+            self.store
+                .call("peers.send_blob", move |store| {
+                    store.authorize_node(&network, &remote)?;
+                    let size = store
+                        .referenced_blob(&network, &hash)?
+                        .context("no stored event references this attachment")?;
+                    ensure!(
+                        request["size"].as_u64() == Some(size) && offset <= size,
+                        "attachment size mismatch"
+                    );
+                    store.blob_file(&hash)
+                })
+                .await?
         };
         let mut file = tokio::fs::File::open(&path)
             .await
@@ -2430,19 +2585,34 @@ impl Runtime {
         }
         let wanted = {
             let candidates = candidates.clone();
-            self.store.call("peers.turn_missing_blobs", move |store| {
-                Ok(candidates.into_iter().filter(|(_, blob)| !store.has_blob(blob).unwrap_or(false)).collect::<Vec<_>>())
-            }).await
-        }.unwrap_or(candidates);
-        if wanted.is_empty() { return Default::default(); }
+            self.store
+                .call("peers.turn_missing_blobs", move |store| {
+                    Ok(candidates
+                        .into_iter()
+                        .filter(|(_, blob)| !store.has_blob(blob).unwrap_or(false))
+                        .collect::<Vec<_>>())
+                })
+                .await
+        }
+        .unwrap_or(candidates);
+        if wanted.is_empty() {
+            return Default::default();
+        }
         let fetch = async {
             for (author, blob) in &wanted {
-                if local.as_ref() == Some(author) { continue; }
+                if local.as_ref() == Some(author) {
+                    continue;
+                }
                 let present = {
                     let blob = blob.clone();
-                    self.store.call("peers.has_blob", move |store| store.has_blob(&blob)).await.unwrap_or(false)
+                    self.store
+                        .call("peers.has_blob", move |store| store.has_blob(&blob))
+                        .await
+                        .unwrap_or(false)
                 };
-                if present { continue; }
+                if present {
+                    continue;
+                }
                 if let Err(error) = self.fetch_blob(network, author, blob).await {
                     tracing::debug!(%error, blob = blob.hash, "attachment for a turn is still pending");
                 }
@@ -2450,9 +2620,16 @@ impl Runtime {
         };
         let _ = tokio::time::timeout(ATTACHMENT_WAIT, fetch).await;
         let pending = wanted.iter().map(|(_, blob)| blob.hash.clone()).collect();
-        self.store.call("peers.turn_pending_blobs", move |store| {
-            Ok(wanted.into_iter().filter(|(_, blob)| !store.has_blob(blob).unwrap_or(false)).map(|(_, blob)| blob.hash).collect())
-        }).await.unwrap_or(pending)
+        self.store
+            .call("peers.turn_pending_blobs", move |store| {
+                Ok(wanted
+                    .into_iter()
+                    .filter(|(_, blob)| !store.has_blob(blob).unwrap_or(false))
+                    .map(|(_, blob)| blob.hash)
+                    .collect())
+            })
+            .await
+            .unwrap_or(pending)
     }
 
     /// Downloads from `peer` every attachment stored events reference that is not here yet. Each
@@ -2460,7 +2637,11 @@ impl Runtime {
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
         let missing = {
             let arg0 = (network).to_owned();
-            self.store.call("peers.missing_blobs", move |store| store.missing_blobs(&arg0)).await
+            self.store
+                .call("peers.missing_blobs", move |store| {
+                    store.missing_blobs(&arg0)
+                })
+                .await
         }?;
         let mut failed = 0;
         for blob in &missing {
@@ -2481,13 +2662,15 @@ impl Runtime {
         let _download = self.blob_fetch.lock().await;
         let (part, target, committed) = {
             let blob = blob.clone();
-            self.store.call("peers.blob_resume", move |store| { Ok(
-            (
-                store.partial_blob_file(&blob.hash)?,
-                store.blob_file(&blob.hash)?,
-                store.committed_offset(&blob.hash)?,
-            )
-        ) }).await?
+            self.store
+                .call("peers.blob_resume", move |store| {
+                    Ok((
+                        store.partial_blob_file(&blob.hash)?,
+                        store.blob_file(&blob.hash)?,
+                        store.committed_offset(&blob.hash)?,
+                    ))
+                })
+                .await?
         };
         if tokio::fs::metadata(&target)
             .await
@@ -2543,7 +2726,11 @@ impl Runtime {
                 {
                     let arg0 = (blob.hash).to_owned();
                     let arg1 = Some(offset);
-                    self.store.call("peers.commit_offset", move |store| store.commit_offset(&arg0, arg1)).await
+                    self.store
+                        .call("peers.commit_offset", move |store| {
+                            store.commit_offset(&arg0, arg1)
+                        })
+                        .await
                 }?;
                 unsynced = 0;
             }
@@ -2552,7 +2739,11 @@ impl Runtime {
         {
             let arg0 = (blob.hash).to_owned();
             let arg1 = Some(offset);
-            self.store.call("peers.commit_offset", move |store| store.commit_offset(&arg0, arg1)).await
+            self.store
+                .call("peers.commit_offset", move |store| {
+                    store.commit_offset(&arg0, arg1)
+                })
+                .await
         }?;
         ensure!(offset == blob.size, "attachment stream ended early");
         drop(file);
@@ -2566,7 +2757,11 @@ impl Runtime {
             {
                 let arg0 = (blob.hash).to_owned();
                 let arg1 = None;
-                self.store.call("peers.commit_offset", move |store| store.commit_offset(&arg0, arg1)).await
+                self.store
+                    .call("peers.commit_offset", move |store| {
+                        store.commit_offset(&arg0, arg1)
+                    })
+                    .await
             }?;
             bail!("downloaded attachment failed its hash check");
         }
@@ -2575,7 +2770,11 @@ impl Runtime {
         {
             let arg0 = (blob.hash).to_owned();
             let arg1 = None;
-            self.store.call("peers.commit_offset", move |store| store.commit_offset(&arg0, arg1)).await
+            self.store
+                .call("peers.commit_offset", move |store| {
+                    store.commit_offset(&arg0, arg1)
+                })
+                .await
         }?;
         Ok(())
     }
@@ -2916,55 +3115,67 @@ mod tests {
                 let network = network.clone();
                 let owner_id = owner_id.clone();
                 let sender_id = sender_id.clone();
-                node.store.call("peers.fixture", move |store| {
-                let grant = sender.owner_fixture(&network, "c", &owner_id)?;
-                store.create_conversation(
-                    &sender,
-                    &network,
-                    "c",
-                    "peer shutdown",
-                    grant,
-                    now_ms(),
-                )?;
-                create_input_bot(
-                    store,
-                    &sender,
-                    &sender.fixture_admin(),
-                    &network,
-                    "c",
-                    now_ms(),
-                )?;
-                store.append_event(
-                    &sender,
-                    &network,
-                    "c",
-                    posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
-                    vec![],
-                    now_ms(),
-                )?;
-                store.post_input_fixture(
-                    &sender,
-                    &network,
-                    posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
-                    now_ms(),
-                )?;
-                let command =
-                    store.peer_delivery_command(&network, "c", "message:peer-shutdown-input")?;
-                store.save_peer_command(&network, &sender_id, &command.envelope, now_ms())?;
+                node.store
+                    .call("peers.fixture", move |store| {
+                        let grant = sender.owner_fixture(&network, "c", &owner_id)?;
+                        store.create_conversation(
+                            &sender,
+                            &network,
+                            "c",
+                            "peer shutdown",
+                            grant,
+                            now_ms(),
+                        )?;
+                        create_input_bot(
+                            store,
+                            &sender,
+                            &sender.fixture_admin(),
+                            &network,
+                            "c",
+                            now_ms(),
+                        )?;
+                        store.append_event(
+                            &sender,
+                            &network,
+                            "c",
+                            posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
+                            vec![],
+                            now_ms(),
+                        )?;
+                        store.post_input_fixture(
+                            &sender,
+                            &network,
+                            posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
+                            now_ms(),
+                        )?;
+                        let command = store.peer_delivery_command(
+                            &network,
+                            "c",
+                            "message:peer-shutdown-input",
+                        )?;
+                        store.save_peer_command(
+                            &network,
+                            &sender_id,
+                            &command.envelope,
+                            now_ms(),
+                        )?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let owners_before = Arc::strong_count(&node);
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let actor = node.store.clone();
             let blocked = tokio::spawn(async move {
-                actor.call("peers.shutdown_barrier", move |_store| {
-                    let _ = entered_tx.send(());
-                    release_rx.recv().context("release peer shutdown barrier")?;
-                    Ok(())
-                }).await
+                actor
+                    .call("peers.shutdown_barrier", move |_store| {
+                        let _ = entered_tx.send(());
+                        release_rx.recv().context("release peer shutdown barrier")?;
+                        Ok(())
+                    })
+                    .await
             });
             entered_rx.await?;
             let queued = node.clone();
@@ -2982,7 +3193,9 @@ mod tests {
             let stopping = node.clone();
             let shutdown = tokio::spawn(async move { stopping.shutdown().await });
             tokio::task::yield_now().await;
-            release_tx.send(()).context("release StoreActor for shutdown")?;
+            release_tx
+                .send(())
+                .context("release StoreActor for shutdown")?;
             blocked.await??;
             shutdown.await?;
             anyhow::Ok(())
@@ -3078,40 +3291,61 @@ mod tests {
                 let sender = sender.clone();
                 let network = network.clone();
                 let owner_id = owner_id.clone();
-                a.store.call("peers.fixture", move |store| {
-                for scope in ["slow", "active"] {
-                    let grant = sender.owner_fixture(&network, scope, &owner_id)?;
-                    store.create_conversation(&sender, &network, scope, scope, grant, now_ms())?;
-                    create_input_bot(
-                        store,
-                        &sender,
-                        &sender.fixture_admin(),
-                        &network,
-                        scope,
-                        now_ms(),
-                    )?;
-                }
+                a.store
+                    .call("peers.fixture", move |store| {
+                        for scope in ["slow", "active"] {
+                            let grant = sender.owner_fixture(&network, scope, &owner_id)?;
+                            store.create_conversation(
+                                &sender,
+                                &network,
+                                scope,
+                                scope,
+                                grant,
+                                now_ms(),
+                            )?;
+                            create_input_bot(
+                                store,
+                                &sender,
+                                &sender.fixture_admin(),
+                                &network,
+                                scope,
+                                now_ms(),
+                            )?;
+                        }
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let initial = {
                 let arg0 = (network).to_owned();
                 let arg1 = (sender_id).to_owned();
                 let arg2 = 1;
                 let arg3 = 10;
-                a.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
+                a.store
+                    .call("peers.events_from", move |store| {
+                        store.events_from(&arg0, &arg1, arg2, arg3)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (initial).to_owned();
-                r.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                r.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (sender).to_owned();
                 let arg1 = (network).to_owned();
                 let arg2 = posted(&sender, &network, "slow", "slow-input", 1)?;
-                a.store.call("peers.post_input_fixture", move |store| store.post_input_fixture(&arg0, &arg1, arg2, now_ms())).await
+                a.store
+                    .call("peers.post_input_fixture", move |store| {
+                        store.post_input_fixture(&arg0, &arg1, arg2, now_ms())
+                    })
+                    .await
             }?;
             let active = {
                 let arg0 = (owner).to_owned();
@@ -3119,23 +3353,42 @@ mod tests {
                 let arg2 = ("active").to_owned();
                 let arg3 = posted(&sender, &network, "active", "active-input", 1)?;
                 let arg4 = vec![];
-                r.store.call("peers.append_event", move |store| store.append_event(&arg0, &arg1, &arg2, arg3, arg4, now_ms())).await
+                r.store
+                    .call("peers.append_event", move |store| {
+                        store.append_event(&arg0, &arg1, &arg2, arg3, arg4, now_ms())
+                    })
+                    .await
             }?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = ([active]).to_owned();
-                a.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                a.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (sender).to_owned();
                 let arg1 = (network).to_owned();
                 let arg2 = posted(&sender, &network, "active", "active-input", 1)?;
-                a.store.call("peers.post_input_fixture", move |store| store.post_input_fixture(&arg0, &arg1, arg2, now_ms())).await
+                a.store
+                    .call("peers.post_input_fixture", move |store| {
+                        store.post_input_fixture(&arg0, &arg1, arg2, now_ms())
+                    })
+                    .await
             }?;
-            assert!({
-                let arg0 = ("active").to_owned();
-                r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-            }?.is_empty());
+            assert!(
+                {
+                    let arg0 = ("active").to_owned();
+                    r.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .is_empty()
+            );
             for (node, peer) in [(&a, &owner_id), (&r, &sender_id)] {
                 node.sync_peers
                     .lock()
@@ -3151,7 +3404,11 @@ mod tests {
                 let arg0 = (network).to_owned();
                 let arg1 = ("slow").to_owned();
                 let arg2 = ("message:slow-input").to_owned();
-                a.store.call("peers.peer_delivery_command", move |store| store.peer_delivery_command(&arg0, &arg1, &arg2)).await
+                a.store
+                    .call("peers.peer_delivery_command", move |store| {
+                        store.peer_delivery_command(&arg0, &arg1, &arg2)
+                    })
+                    .await
             }?;
             let receipt = a
                 .peer_request(
@@ -3173,9 +3430,13 @@ mod tests {
                 while {
                     let arg0 = ("active").to_owned();
                     let arg1 = ("message:active-input").to_owned();
-                    r.store.call("peers.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+                    r.store
+                        .call("peers.scheduler_job", move |store| {
+                            store.scheduler_job(&arg0, &arg1)
+                        })
+                        .await
                 }?
-                    .is_none()
+                .is_none()
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -3190,23 +3451,38 @@ mod tests {
                     let arg0 = (network).to_owned();
                     let arg1 = ("slow").to_owned();
                     let arg2 = ("slow-input").to_owned();
-                    r.store.call("peers.message", move |store| store.message(&arg0, &arg1, &arg2)).await
+                    r.store
+                        .call("peers.message", move |store| {
+                            store.message(&arg0, &arg1, &arg2)
+                        })
+                        .await
                 }?
-                    .is_none()
+                .is_none()
             );
-            assert!({
-                let arg0 = ("slow").to_owned();
-                r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-            }?.is_empty());
+            assert!(
+                {
+                    let arg0 = ("slow").to_owned();
+                    r.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .is_empty()
+            );
             assert_ne!(
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = ("slow").to_owned();
                     let arg2 = ("message:slow-input").to_owned();
-                    a.store.call("peers.mailbox_for_test", move |store| store.mailbox_for_test(&arg0, &arg1, &arg2)).await
+                    a.store
+                        .call("peers.mailbox_for_test", move |store| {
+                            store.mailbox_for_test(&arg0, &arg1, &arg2)
+                        })
+                        .await
                 }?
-                    .context("slow mailbox")?
-                    .state,
+                .context("slow mailbox")?
+                .state,
                 crate::store::mailbox::MailboxState::Delivered
             );
             let mut changed = slow.envelope.clone();
@@ -3225,7 +3501,11 @@ mod tests {
                 let arg0 = (network).to_owned();
                 let arg1 = ("active").to_owned();
                 let arg2 = ("message:active-input").to_owned();
-                a.store.call("peers.peer_delivery_command", move |store| store.peer_delivery_command(&arg0, &arg1, &arg2)).await
+                a.store
+                    .call("peers.peer_delivery_command", move |store| {
+                        store.peer_delivery_command(&arg0, &arg1, &arg2)
+                    })
+                    .await
             }?;
             let read = a
                 .peer_request(
@@ -3235,10 +3515,18 @@ mod tests {
                 )
                 .await?;
             assert_eq!(read["admission"]["state"], "owner_accepted");
-            assert_eq!({
-                let arg0 = ("active").to_owned();
-                r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-            }?.len(), 1);
+            assert_eq!(
+                {
+                    let arg0 = ("active").to_owned();
+                    r.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .len(),
+                1
+            );
             anyhow::Ok(())
         }
         .await;
@@ -3430,113 +3718,140 @@ mod tests {
                 let sender = sender.clone();
                 let network = network.clone();
                 let owner_id = owner_id.clone();
-                a.store.call("peers.fixture", move |store| {
-                let grant = sender.owner_fixture(&network, "c", &owner_id)?;
-                store.create_conversation(
-                    &sender,
-                    &network,
-                    "c",
-                    "assigned Bot",
-                    grant,
-                    now_ms(),
-                )?;
-                let bot = sender.fixture_admin().attest(
-                    &network,
-                    "c",
-                    EventBody::BotCreated {
-                        bot_id: "bot".into(),
-                        name: "assigned Bot".into(),
-                        instructions: "run the assigned task".into(),
-                        project: None,
-                        attestation: None,
-                        cause: None,
-                    },
-                )?;
-                store.append_event(&sender, &network, "c", bot, vec![], now_ms())?;
-                let epoch = store
-                    .conversation(&network, "c")?
-                    .context("Bot conversation")?
-                    .owner_epoch;
-                for (command_id, command) in [
-                    (
-                        "create-task",
-                        WorkspaceCommand::CreateTask {
-                            task_id: "task".into(),
-                            channel_id: None,
-                            parent_task_id: None,
-                            owner_bot: "bot".into(),
-                            title: "assigned task".into(),
-                            request: "perform the assigned task".into(),
-                            expected_result: "verified result".into(),
-                            source_events: vec![],
-                            dependencies: vec![],
-                            reply_only: false,
-                        },
-                    ),
-                    (
-                        "assign-task",
-                        WorkspaceCommand::AssignTask {
-                            task_id: "task".into(),
-                            expected_revision: 1,
-                            assignment_id: "assignment".into(),
-                            bot_id: "bot".into(),
-                            execution_node: owner_id.clone(),
-                            bot_owner_epoch: epoch,
-                            channel_owner_epoch: None,
-                            work_id: None,
-                            resource_roots: vec![],
-                            automatic: false,
-                        },
-                    ),
-                ] {
-                    apply(&sender, store, &network, command_id, command)?;
-                }
-                assert!(
-                    store
-                        .scheduler_outbox()?
-                        .iter()
-                        .any(|entry| entry.trigger == "assignment:assignment")
-                );
+                a.store
+                    .call("peers.fixture", move |store| {
+                        let grant = sender.owner_fixture(&network, "c", &owner_id)?;
+                        store.create_conversation(
+                            &sender,
+                            &network,
+                            "c",
+                            "assigned Bot",
+                            grant,
+                            now_ms(),
+                        )?;
+                        let bot = sender.fixture_admin().attest(
+                            &network,
+                            "c",
+                            EventBody::BotCreated {
+                                bot_id: "bot".into(),
+                                name: "assigned Bot".into(),
+                                instructions: "run the assigned task".into(),
+                                project: None,
+                                attestation: None,
+                                cause: None,
+                            },
+                        )?;
+                        store.append_event(&sender, &network, "c", bot, vec![], now_ms())?;
+                        let epoch = store
+                            .conversation(&network, "c")?
+                            .context("Bot conversation")?
+                            .owner_epoch;
+                        for (command_id, command) in [
+                            (
+                                "create-task",
+                                WorkspaceCommand::CreateTask {
+                                    task_id: "task".into(),
+                                    channel_id: None,
+                                    parent_task_id: None,
+                                    owner_bot: "bot".into(),
+                                    title: "assigned task".into(),
+                                    request: "perform the assigned task".into(),
+                                    expected_result: "verified result".into(),
+                                    source_events: vec![],
+                                    dependencies: vec![],
+                                    reply_only: false,
+                                },
+                            ),
+                            (
+                                "assign-task",
+                                WorkspaceCommand::AssignTask {
+                                    task_id: "task".into(),
+                                    expected_revision: 1,
+                                    assignment_id: "assignment".into(),
+                                    bot_id: "bot".into(),
+                                    execution_node: owner_id.clone(),
+                                    bot_owner_epoch: epoch,
+                                    channel_owner_epoch: None,
+                                    work_id: None,
+                                    resource_roots: vec![],
+                                    automatic: false,
+                                },
+                            ),
+                        ] {
+                            apply(&sender, store, &network, command_id, command)?;
+                        }
+                        assert!(
+                            store
+                                .scheduler_outbox()?
+                                .iter()
+                                .any(|entry| entry.trigger == "assignment:assignment")
+                        );
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let history = {
                 let arg0 = (network).to_owned();
                 let arg1 = (sender_id).to_owned();
                 let arg2 = 1;
                 let arg3 = 20;
-                a.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
+                a.store
+                    .call("peers.events_from", move |store| {
+                        store.events_from(&arg0, &arg1, arg2, arg3)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (history).to_owned();
-                r.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                r.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             assert!(
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = ("assignment").to_owned();
-                    r.store.call("peers.workspace_assignment", move |store| store.workspace_assignment(&arg0, &arg1)).await
+                    r.store
+                        .call("peers.workspace_assignment", move |store| {
+                            store.workspace_assignment(&arg0, &arg1)
+                        })
+                        .await
                 }?
-                    .is_some()
+                .is_some()
             );
             assert!(
                 {
                     let arg0 = ("c").to_owned();
-                    r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-                }?.is_empty(),
+                    r.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .is_empty(),
                 "sync stores assignment intent without scheduling it"
             );
             assert!(
-                r.store.call("peers.scheduler_outbox", move |store| store.scheduler_outbox()).await?.is_empty(),
+                r.store
+                    .call("peers.scheduler_outbox", move |store| store
+                        .scheduler_outbox())
+                    .await?
+                    .is_empty(),
                 "sync never creates a new delivery"
             );
             let command = {
                 let arg0 = (network).to_owned();
                 let arg1 = ("c").to_owned();
                 let arg2 = ("assignment:assignment").to_owned();
-                a.store.call("peers.peer_delivery_command", move |store| store.peer_delivery_command(&arg0, &arg1, &arg2)).await
+                a.store
+                    .call("peers.peer_delivery_command", move |store| {
+                        store.peer_delivery_command(&arg0, &arg1, &arg2)
+                    })
+                    .await
             }?;
             assert_eq!(command.target_node, owner_id);
             assert_eq!(command.envelope.target, "workspace_task:task");
@@ -3547,19 +3862,26 @@ mod tests {
                 let sender_id = sender_id.clone();
                 let command = command.clone();
                 let owner_id = owner_id.clone();
-                r.store.call("peers.fixture", move |store| {
-                store.save_peer_command(&network, &sender_id, &command.envelope, now_ms())?;
-                let receipt = store
-                    .admit_delivery(&owner_id, &network, "c", "assignment:assignment")?
-                    .context("owner persisted admission")?;
-                assert_eq!(receipt.trigger, "assignment:assignment");
-                assert_eq!(
-                    store.pending_peer_commands(&network)?[0].state,
-                    PeerAdmissionState::Saved
-                );
+                r.store
+                    .call("peers.fixture", move |store| {
+                        store.save_peer_command(
+                            &network,
+                            &sender_id,
+                            &command.envelope,
+                            now_ms(),
+                        )?;
+                        let receipt = store
+                            .admit_delivery(&owner_id, &network, "c", "assignment:assignment")?
+                            .context("owner persisted admission")?;
+                        assert_eq!(receipt.trigger, "assignment:assignment");
+                        assert_eq!(
+                            store.pending_peer_commands(&network)?[0].state,
+                            PeerAdmissionState::Saved
+                        );
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             {
                 let arg0 = (owner).to_owned();
@@ -3577,19 +3899,40 @@ mod tests {
                 let arg4 = None;
                 let arg5 = None;
                 let arg6 = None;
-                r.store.call("peers.apply_workspace_command", move |store| store.apply_workspace_command(&arg0, &arg1, &arg2, arg3, arg4, arg5, arg6, now_ms())).await
+                r.store
+                    .call("peers.apply_workspace_command", move |store| {
+                        store.apply_workspace_command(
+                            &arg0,
+                            &arg1,
+                            &arg2,
+                            arg3,
+                            arg4,
+                            arg5,
+                            arg6,
+                            now_ms(),
+                        )
+                    })
+                    .await
             }?;
             let execution = {
                 let arg0 = (network).to_owned();
                 let arg1 = (owner_id).to_owned();
                 let arg2 = 1;
                 let arg3 = 20;
-                r.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
+                r.store
+                    .call("peers.events_from", move |store| {
+                        store.events_from(&arg0, &arg1, arg2, arg3)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (execution).to_owned();
-                a.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                a.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             a.settings.lock().unwrap().roots = vec![dir_a.clone()];
             a.settings.lock().unwrap().manager = Some(manager_settings(
@@ -3616,9 +3959,13 @@ mod tests {
             let work_command = {
                 let arg0 = (network).to_owned();
                 let arg1 = (work).to_owned();
-                r.store.call("peers.peer_dispatch_command", move |store| store.peer_dispatch_command(&arg0, &arg1)).await
+                r.store
+                    .call("peers.peer_dispatch_command", move |store| {
+                        store.peer_dispatch_command(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .envelope;
+            .envelope;
             assert_eq!(work_command.revision, Some(1));
             assert!(
                 work_command
@@ -3630,7 +3977,11 @@ mod tests {
                 let arg0 = (network).to_owned();
                 let arg1 = (owner_id).to_owned();
                 let arg2 = (work_command).to_owned();
-                a.store.call("peers.save_peer_command", move |store| store.save_peer_command(&arg0, &arg1, &arg2, now_ms())).await
+                a.store
+                    .call("peers.save_peer_command", move |store| {
+                        store.save_peer_command(&arg0, &arg1, &arg2, now_ms())
+                    })
+                    .await
             }?;
             assert!(
                 a.accept_dispatch(&network, work.clone(), &Value::Null)
@@ -3660,79 +4011,108 @@ mod tests {
                 let network = network.clone();
                 let owner_id = owner_id.clone();
                 let command = command.clone();
-                a.store.call("peers.fixture", move |store| {
-                apply(
-                    &sender,
-                    store,
-                    &network,
-                    "revise-after-admission",
-                    WorkspaceCommand::ReviseTask {
-                        task_id: "task".into(),
-                        expected_revision: 1,
-                        request: "new revision after original admission".into(),
-                        expected_result: "new verified result".into(),
-                        dependencies: vec![],
-                    },
-                )?;
-                let changed_owner = sender.fixture_admin().attest(
-                    &network,
-                    "c",
-                    EventBody::ConversationOwner {
-                        scheduler_node: owner_id.clone(),
-                        epoch: command.envelope.owner_epoch + 1,
-                        attestation: None,
-                        cause: None,
-                    },
-                )?;
-                store.append_event(&sender, &network, "c", changed_owner, vec![], now_ms())?;
+                a.store
+                    .call("peers.fixture", move |store| {
+                        apply(
+                            &sender,
+                            store,
+                            &network,
+                            "revise-after-admission",
+                            WorkspaceCommand::ReviseTask {
+                                task_id: "task".into(),
+                                expected_revision: 1,
+                                request: "new revision after original admission".into(),
+                                expected_result: "new verified result".into(),
+                                dependencies: vec![],
+                            },
+                        )?;
+                        let changed_owner = sender.fixture_admin().attest(
+                            &network,
+                            "c",
+                            EventBody::ConversationOwner {
+                                scheduler_node: owner_id.clone(),
+                                epoch: command.envelope.owner_epoch + 1,
+                                attestation: None,
+                                cause: None,
+                            },
+                        )?;
+                        store.append_event(
+                            &sender,
+                            &network,
+                            "c",
+                            changed_owner,
+                            vec![],
+                            now_ms(),
+                        )?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let changed = {
                 let arg0 = (network).to_owned();
                 let arg1 = (sender_id).to_owned();
                 let arg2 = 1;
                 let arg3 = 30;
-                a.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
+                a.store
+                    .call("peers.events_from", move |store| {
+                        store.events_from(&arg0, &arg1, arg2, arg3)
+                    })
+                    .await
             }?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (changed).to_owned();
-                r.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                r.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             {
                 let network = network.clone();
                 let owner_id = owner_id.clone();
-                r.store.call("peers.fixture", move |store| {
-                assert_eq!(
-                    store
-                        .workspace_task(&network, "task")?
-                        .context("revised task")?
-                        .revision,
-                    2
-                );
-                assert!(
-                    store
-                        .admit_delivery(&owner_id, &network, "c", "assignment:assignment")
-                        .is_err(),
-                    "a fresh stale assignment must fail its current fences"
-                );
+                r.store
+                    .call("peers.fixture", move |store| {
+                        assert_eq!(
+                            store
+                                .workspace_task(&network, "task")?
+                                .context("revised task")?
+                                .revision,
+                            2
+                        );
+                        assert!(
+                            store
+                                .admit_delivery(&owner_id, &network, "c", "assignment:assignment")
+                                .is_err(),
+                            "a fresh stale assignment must fail its current fences"
+                        );
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             assert!(
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (sender_id).to_owned();
                     let arg2 = (work_command).to_owned();
-                    a.store.call("peers.peer_owner_proof", move |store| store.peer_owner_proof(&arg0, &arg1, &arg2)).await
+                    a.store
+                        .call("peers.peer_owner_proof", move |store| {
+                            store.peer_owner_proof(&arg0, &arg1, &arg2)
+                        })
+                        .await
                 }?
-                    .is_some(),
+                .is_some(),
                 "a later revision does not reinterpret the original admitted Work source frame"
             );
-            assert_eq!(a.store.call("peers.work_records", move |store| store.work_records()).await?.len(), 1);
+            assert_eq!(
+                a.store
+                    .call("peers.work_records", move |store| store.work_records())
+                    .await?
+                    .len(),
+                1
+            );
             let reloaded = Store::open_readonly(dir_r.join("node.sqlite3"))?;
             assert_eq!(
                 reloaded.pending_peer_commands(&network)?[0].state,
@@ -3779,11 +4159,19 @@ mod tests {
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (changed).to_owned();
-                r.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                r.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             let jobs = {
                 let arg0 = ("c").to_owned();
-                r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
+                r.store
+                    .call("peers.scheduler_jobs", move |store| {
+                        store.scheduler_jobs(&arg0)
+                    })
+                    .await
             }?;
             assert_eq!(
                 jobs.len(),
@@ -3837,28 +4225,37 @@ mod tests {
                 let sender = sender.clone();
                 let network = network.clone();
                 let sender_id = sender_id.clone();
-                node.store.call("peers.fixture", move |store| {
-                let grant = sender.owner_fixture(&network, "c", &sender_id)?;
-                store.create_conversation(&sender, &network, "c", "Task", grant, now_ms())?;
-                create_input_bot(
-                    store,
-                    &sender,
-                    &sender.fixture_admin(),
-                    &network,
-                    "c",
-                    now_ms(),
-                )?;
-                store.append_event(
-                    &sender,
-                    &network,
-                    "c",
-                    posted(&sender, &network, "c", "m1", 1)?,
-                    vec![],
-                    now_ms(),
-                )?;
+                node.store
+                    .call("peers.fixture", move |store| {
+                        let grant = sender.owner_fixture(&network, "c", &sender_id)?;
+                        store.create_conversation(
+                            &sender,
+                            &network,
+                            "c",
+                            "Task",
+                            grant,
+                            now_ms(),
+                        )?;
+                        create_input_bot(
+                            store,
+                            &sender,
+                            &sender.fixture_admin(),
+                            &network,
+                            "c",
+                            now_ms(),
+                        )?;
+                        store.append_event(
+                            &sender,
+                            &network,
+                            "c",
+                            posted(&sender, &network, "c", "m1", 1)?,
+                            vec![],
+                            now_ms(),
+                        )?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let spec = WorkRequest {
                 work_id: WorkSpec::id("c", "message:m1", "delayed"),
@@ -3879,9 +4276,13 @@ mod tests {
             let dispatch = {
                 let arg0 = (network).to_owned();
                 let arg1 = (spec).to_owned();
-                node.store.call("peers.peer_dispatch_command", move |store| store.peer_dispatch_command(&arg0, &arg1)).await
+                node.store
+                    .call("peers.peer_dispatch_command", move |store| {
+                        store.peer_dispatch_command(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .envelope;
+            .envelope;
             let stop_payload = PeerCommand::Stop {
                 conversation_id: "c".into(),
                 work_id: spec.work_id.clone(),
@@ -3900,14 +4301,16 @@ mod tests {
             .context("saving a cancel does not wait for an in-flight Provider read guard")??;
             assert_eq!(saved["admission"]["state"], "saved");
             assert!(!saved["confirmed"].as_bool().unwrap_or(true));
-            assert!(
-                {
-                    let arg0 = (network).to_owned();
-                    let arg1 = ("c").to_owned();
-                    let arg2 = (spec.work_id).to_owned();
-                    node.store.call("peers.peer_cancelled", move |store| store.peer_cancelled(&arg0, &arg1, &arg2)).await
-                }?
-            );
+            assert!({
+                let arg0 = (network).to_owned();
+                let arg1 = ("c").to_owned();
+                let arg2 = (spec.work_id).to_owned();
+                node.store
+                    .call("peers.peer_cancelled", move |store| {
+                        store.peer_cancelled(&arg0, &arg1, &arg2)
+                    })
+                    .await
+            }?);
             let reopened = Store::open_readonly(dir.join("node.sqlite3"))?;
             assert!(
                 reopened.peer_cancelled(&network, "c", &spec.work_id)?,
@@ -3938,28 +4341,45 @@ mod tests {
             assert!(
                 {
                     let arg0 = (spec.work_id).to_owned();
-                    node.store.call("peers.work_record", move |store| store.work_record(&arg0)).await
+                    node.store
+                        .call("peers.work_record", move |store| store.work_record(&arg0))
+                        .await
                 }?
-                    .is_none()
+                .is_none()
             );
-            assert!({
-                let arg0 = ("c").to_owned();
-                node.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-            }?.is_empty());
+            assert!(
+                {
+                    let arg0 = ("c").to_owned();
+                    node.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .is_empty()
+            );
             let mut allowed = spec.clone();
             allowed.call_ref = "allowed".into();
             allowed.work_id = WorkSpec::id("c", "message:m1", "allowed");
             let allowed_command = {
                 let arg0 = (network).to_owned();
                 let arg1 = (allowed).to_owned();
-                node.store.call("peers.peer_dispatch_command", move |store| store.peer_dispatch_command(&arg0, &arg1)).await
+                node.store
+                    .call("peers.peer_dispatch_command", move |store| {
+                        store.peer_dispatch_command(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .envelope;
+            .envelope;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (sender_id).to_owned();
                 let arg2 = (allowed_command).to_owned();
-                node.store.call("peers.save_peer_command", move |store| store.save_peer_command(&arg0, &arg1, &arg2, now_ms())).await
+                node.store
+                    .call("peers.save_peer_command", move |store| {
+                        store.save_peer_command(&arg0, &arg1, &arg2, now_ms())
+                    })
+                    .await
             }?;
             assert!(
                 node.accept_dispatch(&network, allowed.clone(), &Value::Null)
@@ -3970,9 +4390,11 @@ mod tests {
             assert!(
                 {
                     let arg0 = (allowed.work_id).to_owned();
-                    node.store.call("peers.work_record", move |store| store.work_record(&arg0)).await
+                    node.store
+                        .call("peers.work_record", move |store| store.work_record(&arg0))
+                        .await
                 }?
-                    .is_some()
+                .is_some()
             );
             let stop_payload = PeerCommand::Stop {
                 conversation_id: "c".into(),
@@ -3987,7 +4409,11 @@ mod tests {
                 let arg0 = (network).to_owned();
                 let arg1 = (sender_id).to_owned();
                 let arg2 = (held_stop).to_owned();
-                node.store.call("peers.save_peer_command", move |store| store.save_peer_command(&arg0, &arg1, &arg2, now_ms())).await
+                node.store
+                    .call("peers.save_peer_command", move |store| {
+                        store.save_peer_command(&arg0, &arg1, &arg2, now_ms())
+                    })
+                    .await
             }?;
             node.interrupt_work(&network, &allowed.work_id).await?;
             let owner_change = sender.fixture_admin().attest(
@@ -4006,17 +4432,25 @@ mod tests {
                 let arg2 = ("c").to_owned();
                 let arg3 = owner_change;
                 let arg4 = vec![];
-                node.store.call("peers.append_event", move |store| store.append_event(&arg0, &arg1, &arg2, arg3, arg4, now_ms())).await
+                node.store
+                    .call("peers.append_event", move |store| {
+                        store.append_event(&arg0, &arg1, &arg2, arg3, arg4, now_ms())
+                    })
+                    .await
             }?;
             node.settings.lock().unwrap().manager = None;
             for command_id in [&allowed_command.command_id, &held_stop.command_id] {
                 let pending = {
                     let arg0 = (network).to_owned();
-                    node.store.call("peers.pending_peer_commands", move |store| store.pending_peer_commands(&arg0)).await
+                    node.store
+                        .call("peers.pending_peer_commands", move |store| {
+                            store.pending_peer_commands(&arg0)
+                        })
+                        .await
                 }?
-                    .into_iter()
-                    .find(|pending| pending.envelope.command_id == *command_id)
-                    .context("unwritten peer receipt")?;
+                .into_iter()
+                .find(|pending| pending.envelope.command_id == *command_id)
+                .context("unwritten peer receipt")?;
                 assert!(node.process_peer_command(&network, &pending).await?);
                 let proof = node
                     .accept_peer_envelope(&network, &sender_id, pending.envelope)
@@ -4026,17 +4460,35 @@ mod tests {
                     "persisted Work and stop facts precede the newer epoch fence"
                 );
             }
-            assert_eq!(node.store.call("peers.work_records", move |store| store.work_records()).await?.len(), 1);
-            assert_eq!({
-                let arg0 = ("c").to_owned();
-                node.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs(&arg0)).await
-            }?.len(), 1);
+            assert_eq!(
+                node.store
+                    .call("peers.work_records", move |store| store.work_records())
+                    .await?
+                    .len(),
+                1
+            );
+            assert_eq!(
+                {
+                    let arg0 = ("c").to_owned();
+                    node.store
+                        .call("peers.scheduler_jobs", move |store| {
+                            store.scheduler_jobs(&arg0)
+                        })
+                        .await
+                }?
+                .len(),
+                1
+            );
             assert!(
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = ("c").to_owned();
                     let arg2 = (spec.work_id).to_owned();
-                    node.store.call("peers.peer_cancelled", move |store| store.peer_cancelled(&arg0, &arg1, &arg2)).await
+                    node.store
+                        .call("peers.peer_cancelled", move |store| {
+                            store.peer_cancelled(&arg0, &arg1, &arg2)
+                        })
+                        .await
                 }?,
                 "an accepted cancel does not revive the same Work after an epoch change"
             );
@@ -4322,7 +4774,11 @@ mod tests {
                 let arg3 = ("t").to_owned();
                 let arg4 = owner;
                 let arg5 = 1;
-                b.store.call("peers.create_conversation", move |store| store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, arg5)).await
+                b.store
+                    .call("peers.create_conversation", move |store| {
+                        store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, arg5)
+                    })
+                    .await
             }?;
             for node in [&a, &b] {
                 node.start_network().await?;
@@ -4335,7 +4791,15 @@ mod tests {
             assert!(view.client(&attacker.device_id()?).is_err());
             assert_eq!(a.membership_state().await?, b.membership_state().await?);
             assert!(
-                { let network = network.clone(); a.store.call("peers.conversation", move |store| store.conversation(&network, "c")).await }?.is_some(),
+                {
+                    let network = network.clone();
+                    a.store
+                        .call("peers.conversation", move |store| {
+                            store.conversation(&network, "c")
+                        })
+                        .await
+                }?
+                .is_some(),
                 "the data log synced too"
             );
             anyhow::Ok(())
@@ -4433,7 +4897,9 @@ mod tests {
                 .collect();
             let retired = view.retire(&kept, &{
                 let arg0 = (network).to_owned();
-                a.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                a.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?)?;
             let issued = overdue();
             let (waiting, checkpoint, _) = recovery_on(&ia, &state, kept, retired, issued)?;
@@ -4526,7 +4992,9 @@ mod tests {
                 .collect();
             let retired = view.retire(&kept, &{
                 let arg0 = (network).to_owned();
-                a.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                a.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?)?;
             let issued = now_ms() as u64 + 1_000 - crate::identity::RECOVERY_DELAY_MS;
             let (waiting, _, next) = recovery_on(&ia, &state, kept, retired, issued)?;
@@ -4578,38 +5046,50 @@ mod tests {
                 let ib = ib.clone();
                 let network = network.clone();
                 let work = work.clone();
-                a.store.call("peers.fixture", move |store| {
-                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
-                store.create_conversation(&ia, &network, "c", "t", owner, 1)?;
-                create_input_bot(store, &ia, &ia.fixture_admin(), &network, "c", 1)?;
-                store.post_input_fixture(
-                    &ia,
-                    &network,
-                    signed_main_input(&ia.fixture_admin(), &network, "c", "m1", "go", vec![], 1)?,
-                    2,
-                )?;
-                store.accept_work_fixture(&ib, &network, work.clone(), 3)?;
+                a.store
+                    .call("peers.fixture", move |store| {
+                        let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                        store.create_conversation(&ia, &network, "c", "t", owner, 1)?;
+                        create_input_bot(store, &ia, &ia.fixture_admin(), &network, "c", 1)?;
+                        store.post_input_fixture(
+                            &ia,
+                            &network,
+                            signed_main_input(
+                                &ia.fixture_admin(),
+                                &network,
+                                "c",
+                                "m1",
+                                "go",
+                                vec![],
+                                1,
+                            )?,
+                            2,
+                        )?;
+                        store.accept_work_fixture(&ib, &network, work.clone(), 3)?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let shared = async || -> Result<(i64, Option<WorkOutcome>)> {
                 let network = network.clone();
                 let work = work.clone();
-                a.store.call("peers.shared_work_snapshot", move |store| {
-                let count = store.connection.query_row(
-                    "SELECT count(*) FROM events WHERE network_id=?",
-                    [&network],
-                    |r| r.get(0),
-                )?;
-                let outcome = store
-                    .works(&network, "c")?
-                    .into_iter()
-                    .find(|w| w.work_id == work.work_id)
-                    .context("work")?
-                    .outcome;
-                Ok((count, outcome))
-            }).await
+                a.store
+                    .call("peers.shared_work_snapshot", move |store| {
+                        let count = store.connection.query_row(
+                            "SELECT count(*) FROM events WHERE network_id=?",
+                            [&network],
+                            |r| r.get(0),
+                        )?;
+                        let outcome = store
+                            .works(&network, "c")?
+                            .into_iter()
+                            .find(|w| w.work_id == work.work_id)
+                            .context("work")?
+                            .outcome;
+                        Ok((count, outcome))
+                    })
+                    .await
             };
             let before = shared().await?;
             assert_eq!(before.1, None);
@@ -4623,7 +5103,9 @@ mod tests {
                 .collect();
             let retired = view.retire(&kept, &{
                 let arg0 = (network).to_owned();
-                a.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                a.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?)?;
             let issued = overdue();
             let (waiting, checkpoint, _) = recovery_on(&ia, &state, kept, retired, issued)?;
@@ -4641,7 +5123,9 @@ mod tests {
 
             let heads = {
                 let arg0 = (network).to_owned();
-                a.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                a.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?;
             let (seq, hash) = &heads[&work.target];
             let removal = GovernanceEvent::revoke(
@@ -4737,10 +5221,12 @@ mod tests {
             let copy = dir.canonicalize()?.join("copy.sqlite3");
             {
                 let copy = copy.to_str().context("path")?.to_owned();
-                a.store.call("peers.copy_fixture", move |store| {
-                    store.connection.execute("VACUUM INTO ?", [copy])?;
-                    Ok(())
-                }).await?;
+                a.store
+                    .call("peers.copy_fixture", move |store| {
+                        store.connection.execute("VACUUM INTO ?", [copy])?;
+                        Ok(())
+                    })
+                    .await?;
             }
             assert!(
                 !Store::open(&copy)?.wrote_from_this_file()?,
@@ -4899,48 +5385,54 @@ mod tests {
                 let blob = blob.clone();
                 let content = content.clone();
                 let attached = attached.clone();
-                a.store.call("peers.fixture", move |store| {
-                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
-                store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
-                create_input_bot(
-                    store,
-                    &ia,
-                    &ia.fixture_admin(),
-                    &network,
-                    "c",
-                    now_ms(),
-                )?;
-                store.put_blob(&blob, &content)?;
-                store.post_input_fixture(
-                    &ia,
-                    &network,
-                    signed_main_input(
-                        &ia.fixture_admin(),
-                        &network,
-                        "c",
-                        "m1",
-                        "m1",
-                        vec![attached],
-                        1,
-                    )?,
-                    now_ms(),
-                )?;
+                a.store
+                    .call("peers.fixture", move |store| {
+                        let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                        store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
+                        create_input_bot(store, &ia, &ia.fixture_admin(), &network, "c", now_ms())?;
+                        store.put_blob(&blob, &content)?;
+                        store.post_input_fixture(
+                            &ia,
+                            &network,
+                            signed_main_input(
+                                &ia.fixture_admin(),
+                                &network,
+                                "c",
+                                "m1",
+                                "m1",
+                                vec![attached],
+                                1,
+                            )?,
+                            now_ms(),
+                        )?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
             b.sync_peer(&network, &ia.device_id()?).await?;
             let events = {
                 let network = network.clone();
-                b.store.call("peers.attachment_context", move |store| {
-                    Ok(crate::store::context_after(&store.connection, &network, "c", None, &VersionVector::new())?.events)
-                }).await?
+                b.store
+                    .call("peers.attachment_context", move |store| {
+                        Ok(crate::store::context_after(
+                            &store.connection,
+                            &network,
+                            "c",
+                            None,
+                            &VersionVector::new(),
+                        )?
+                        .events)
+                    })
+                    .await?
             };
             let file = {
                 let arg0 = (blob.hash).to_owned();
-                b.store.call("peers.blob_file", move |store| store.blob_file(&arg0)).await
+                b.store
+                    .call("peers.blob_file", move |store| store.blob_file(&arg0))
+                    .await
             }?;
             std::fs::remove_file(&file)?;
             assert!(
@@ -4951,7 +5443,9 @@ mod tests {
             assert!(
                 {
                     let arg0 = (blob).to_owned();
-                    b.store.call("peers.has_blob", move |store| store.has_blob(&arg0)).await
+                    b.store
+                        .call("peers.has_blob", move |store| store.has_blob(&arg0))
+                        .await
                 }?,
                 "fetched from the message's author"
             );
@@ -5013,30 +5507,33 @@ mod tests {
                 let files = files.clone();
                 let attached = attached.clone();
                 let lacked = (*lacked).clone();
-                a.store.call("peers.fixture", move |store| {
-                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
-                store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
-                create_input_bot(
-                    store,
-                    &ia,
-                    &ia.fixture_admin(),
-                    &network,
-                    "c",
-                    now_ms(),
-                )?;
-                for (content, blob) in &files {
-                    store.put_blob(blob, content)?;
-                }
-                store.post_input_fixture(
-                    &ia,
-                    &network,
-                    signed_main_input(&ia.fixture_admin(), &network, "c", "m1", "m1", attached, 1)?,
-                    now_ms(),
-                )?;
-                std::fs::remove_file(store.blob_file(&lacked.1.hash)?)?;
+                a.store
+                    .call("peers.fixture", move |store| {
+                        let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                        store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
+                        create_input_bot(store, &ia, &ia.fixture_admin(), &network, "c", now_ms())?;
+                        for (content, blob) in &files {
+                            store.put_blob(blob, content)?;
+                        }
+                        store.post_input_fixture(
+                            &ia,
+                            &network,
+                            signed_main_input(
+                                &ia.fixture_admin(),
+                                &network,
+                                "c",
+                                "m1",
+                                "m1",
+                                attached,
+                                1,
+                            )?,
+                            now_ms(),
+                        )?;
+                        std::fs::remove_file(store.blob_file(&lacked.1.hash)?)?;
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
@@ -5044,28 +5541,41 @@ mod tests {
             assert!(
                 {
                     let arg0 = (held.1).to_owned();
-                    b.store.call("peers.has_blob", move |store| store.has_blob(&arg0)).await
+                    b.store
+                        .call("peers.has_blob", move |store| store.has_blob(&arg0))
+                        .await
                 }?,
                 "an attachment the peer lacks does not hold back the next"
             );
             assert_eq!(
                 {
                     let arg0 = (network).to_owned();
-                    b.store.call("peers.missing_blobs", move |store| store.missing_blobs(&arg0)).await
+                    b.store
+                        .call("peers.missing_blobs", move |store| {
+                            store.missing_blobs(&arg0)
+                        })
+                        .await
                 }?,
                 std::slice::from_ref(&lacked.1)
             );
             {
                 let arg0 = (lacked.1).to_owned();
                 let arg1 = (lacked.0).to_owned();
-                a.store.call("peers.put_blob", move |store| store.put_blob(&arg0, &arg1)).await
+                a.store
+                    .call("peers.put_blob", move |store| store.put_blob(&arg0, &arg1))
+                    .await
             }?;
             b.sync_peer(&network, &ia.device_id()?).await?;
             assert!(
                 {
                     let arg0 = (network).to_owned();
-                    b.store.call("peers.missing_blobs", move |store| store.missing_blobs(&arg0)).await
-                }?.is_empty(),
+                    b.store
+                        .call("peers.missing_blobs", move |store| {
+                            store.missing_blobs(&arg0)
+                        })
+                        .await
+                }?
+                .is_empty(),
                 "the next sync round fetches what was pending"
             );
             Ok::<_, anyhow::Error>(())
@@ -5219,7 +5729,14 @@ mod tests {
                 signature: String::new(),
             };
             record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
-            let join_id = { let manager = manager.clone(); b.store.call("peers.register_invite", move |store| store.register_invite(&record, &manager)).await }?;
+            let join_id = {
+                let manager = manager.clone();
+                b.store
+                    .call("peers.register_invite", move |store| {
+                        store.register_invite(&record, &manager)
+                    })
+                    .await
+            }?;
             let phone = LocalIdentity::generate().device_id()?;
             {
                 let join = Join {
@@ -5230,7 +5747,9 @@ mod tests {
                     commit: join_commit(&phone, &"11".repeat(32))?,
                 };
                 let phone = phone.clone();
-                b.store.call("peers.join", move |store| store.join(&join, &phone)).await
+                b.store
+                    .call("peers.join", move |store| store.join(&join, &phone))
+                    .await
             }?;
             let listed = a.remote_joins(&manager).await;
             assert_eq!(listed.len(), 1);
@@ -5575,49 +6094,57 @@ mod tests {
                 let ic = ic.clone();
                 let admin = admin.clone();
                 let network = network.clone();
-                c.store.call("peers.fixture", move |store| {
-                let owner = il.owner_fixture(&network, "bot", &device(&ic))?;
-                store.create_conversation(&ic, &network, "bot", "Bot", owner, now_ms())?;
-                let bot = admin.attest(
-                    &network,
-                    "bot",
-                    EventBody::BotCreated {
-                        bot_id: "bot".into(),
-                        name: "Bot".into(),
-                        instructions: String::new(),
-                        project: None,
-                        attestation: None,
-                        cause: None,
-                    },
-                )?;
-                store.append_event(&ic, &network, "bot", bot, vec![], now_ms())?;
-                store.post_input_fixture(
-                    &ic,
-                    &network,
-                    posted(&il, &network, "bot", "m1", 1)?,
-                    now_ms(),
-                )?;
-                let claimed = store
-                    .claim_next_fixture(&ic, &network, "bot", "boot", "cfg")?
-                    .context("job")?;
-                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-                store.mark_started("bot", &claimed.job.trigger, &attempt)?;
-                    Ok(claimed.job.trigger)
-                }).await?
+                c.store
+                    .call("peers.fixture", move |store| {
+                        let owner = il.owner_fixture(&network, "bot", &device(&ic))?;
+                        store.create_conversation(&ic, &network, "bot", "Bot", owner, now_ms())?;
+                        let bot = admin.attest(
+                            &network,
+                            "bot",
+                            EventBody::BotCreated {
+                                bot_id: "bot".into(),
+                                name: "Bot".into(),
+                                instructions: String::new(),
+                                project: None,
+                                attestation: None,
+                                cause: None,
+                            },
+                        )?;
+                        store.append_event(&ic, &network, "bot", bot, vec![], now_ms())?;
+                        store.post_input_fixture(
+                            &ic,
+                            &network,
+                            posted(&il, &network, "bot", "m1", 1)?,
+                            now_ms(),
+                        )?;
+                        let claimed = store
+                            .claim_next_fixture(&ic, &network, "bot", "boot", "cfg")?
+                            .context("job")?;
+                        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                        store.mark_started("bot", &claimed.job.trigger, &attempt)?;
+                        Ok(claimed.job.trigger)
+                    })
+                    .await?
             };
             let log_of = async |node: &Runtime, id: &LocalIdentity| {
-                {
-                    let arg0 = (network).to_owned();
-                    let arg1 = (device(id)).to_owned();
-                    let arg2 = 1;
-                    let arg3 = 1024;
-                    node.store.call("peers.events_from", move |store| store.events_from(&arg0, &arg1, arg2, arg3)).await
-                }
+                let arg0 = (network).to_owned();
+                let arg1 = (device(id)).to_owned();
+                let arg2 = 1;
+                let arg3 = 1024;
+                node.store
+                    .call("peers.events_from", move |store| {
+                        store.events_from(&arg0, &arg1, arg2, arg3)
+                    })
+                    .await
             };
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (log_of(&c, &ic).await?).to_owned();
-                l.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                l.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             let owner = il.owner_fixture(&network, "s", &device(&il))?;
             {
@@ -5626,19 +6153,31 @@ mod tests {
                 let arg2 = ("s").to_owned();
                 let arg3 = ("S").to_owned();
                 let arg4 = owner;
-                h.store.call("peers.create_conversation", move |store| store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())).await
+                h.store
+                    .call("peers.create_conversation", move |store| {
+                        store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())
+                    })
+                    .await
             }?;
             {
                 let ih = ih.clone();
                 let admin = admin.clone();
                 let network = network.clone();
-                h.store.call("peers.create_input_bot", move |store| create_input_bot(store, &ih, &admin, &network, "s", now_ms())).await?;
+                h.store
+                    .call("peers.create_input_bot", move |store| {
+                        create_input_bot(store, &ih, &admin, &network, "s", now_ms())
+                    })
+                    .await?;
             }
             let from_h = log_of(&h, &ih).await?;
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (from_h).to_owned();
-                l.store.call("peers.ingest_events", move |store| store.ingest_events(&arg0, &arg1)).await
+                l.store
+                    .call("peers.ingest_events", move |store| {
+                        store.ingest_events(&arg0, &arg1)
+                    })
+                    .await
             }?;
             let deleted = admin
                 .attest(
@@ -5656,18 +6195,20 @@ mod tests {
                 let il = il.clone();
                 let network = network.clone();
                 let deleted = deleted.clone();
-                l.store.call("peers.fixture", move |store| {
-                let (posted, _) = store.post_input_fixture(
-                    &il,
-                    &network,
-                    posted(&il, &network, "s", "l1", 1)?,
-                    now_ms(),
-                )?;
-                let deletion = store
-                    .delete_bot(&il, &network, "bot", deleted, now_ms())?
-                    .context("deleted")?;
-                    Ok((posted.event_hash, deletion.hash))
-                }).await?
+                l.store
+                    .call("peers.fixture", move |store| {
+                        let (posted, _) = store.post_input_fixture(
+                            &il,
+                            &network,
+                            posted(&il, &network, "s", "l1", 1)?,
+                            now_ms(),
+                        )?;
+                        let deletion = store
+                            .delete_bot(&il, &network, "bot", deleted, now_ms())?
+                            .context("deleted")?;
+                        Ok((posted.event_hash, deletion.hash))
+                    })
+                    .await?
             };
 
             let mut updates = c.events.subscribe();
@@ -5686,7 +6227,9 @@ mod tests {
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (posted).to_owned();
-                    c.store.call("peers.event", move |store| store.event(&arg0, &arg1)).await
+                    c.store
+                        .call("peers.event", move |store| store.event(&arg0, &arg1))
+                        .await
                 }?,
                 None,
                 "L's events wait for H's"
@@ -5711,9 +6254,13 @@ mod tests {
                     let job = {
                         let arg0 = ("bot").to_owned();
                         let arg1 = (trigger).to_owned();
-                        c.store.call("peers.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+                        c.store
+                            .call("peers.scheduler_job", move |store| {
+                                store.scheduler_job(&arg0, &arg1)
+                            })
+                            .await
                     }?
-                        .context("job")?;
+                    .context("job")?;
                     if !matches!(job.state, crate::scheduling::JobState::Running { .. }) {
                         return Ok::<_, anyhow::Error>(job.state);
                     }
@@ -5759,7 +6306,11 @@ mod tests {
                 let arg2 = ("c").to_owned();
                 let arg3 = ("C").to_owned();
                 let arg4 = owner;
-                node.store.call("peers.create_conversation", move |store| store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())).await
+                node.store
+                    .call("peers.create_conversation", move |store| {
+                        store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())
+                    })
+                    .await
             }?;
             tokio::time::timeout(Duration::from_secs(1), woken)
                 .await
@@ -5834,7 +6385,11 @@ mod tests {
                 let arg2 = ("c").to_owned();
                 let arg3 = ("Relayed").to_owned();
                 let arg4 = ids[0].owner_fixture(&network, "c", &ids[1].device_id()?)?;
-                a.store.call("peers.create_conversation", move |store| store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())).await
+                a.store
+                    .call("peers.create_conversation", move |store| {
+                        store.create_conversation(&arg0, &arg1, &arg2, &arg3, arg4, now_ms())
+                    })
+                    .await
             }?;
             let addr = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -5854,11 +6409,15 @@ mod tests {
             assert_eq!(
                 {
                     let arg0 = (network).to_owned();
-                    b.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                    b.store
+                        .call("peers.heads", move |store| store.heads(&arg0))
+                        .await
                 }?,
                 {
                     let arg0 = (network).to_owned();
-                    a.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                    a.store
+                        .call("peers.heads", move |store| store.heads(&arg0))
+                        .await
                 }?
             );
             Ok::<_, anyhow::Error>(())
@@ -5903,40 +6462,51 @@ mod tests {
                 let ix = ix.clone();
                 let ib = ib.clone();
                 let network = network.clone();
-                a.store.call("peers.fixture", move |store| {
-                for (scope, owner) in [("a1", &ix), ("a2", &ix), ("c", &ib)] {
-                    let owner = ia.owner_fixture(&network, scope, &device(owner))?;
-                    store.create_conversation(&ia, &network, scope, scope, owner, now_ms())?;
-                    create_input_bot(
-                        store,
-                        &ia,
-                        &ia.fixture_admin(),
-                        &network,
-                        scope,
-                        now_ms(),
-                    )?;
-                }
+                a.store
+                    .call("peers.fixture", move |store| {
+                        for (scope, owner) in [("a1", &ix), ("a2", &ix), ("c", &ib)] {
+                            let owner = ia.owner_fixture(&network, scope, &device(owner))?;
+                            store.create_conversation(
+                                &ia,
+                                &network,
+                                scope,
+                                scope,
+                                owner,
+                                now_ms(),
+                            )?;
+                            create_input_bot(
+                                store,
+                                &ia,
+                                &ia.fixture_admin(),
+                                &network,
+                                scope,
+                                now_ms(),
+                            )?;
+                        }
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             first_sync(&b, &device(&ia)).await?;
             {
                 let ia = ia.clone();
                 let network = network.clone();
-                a.store.call("peers.fixture", move |store| {
-                for (scope, id) in [("a1", "x1"), ("a2", "x2"), ("c", "b1")] {
-                    store.post_input_fixture(
-                        &ia,
-                        &network,
-                        posted(&ia, &network, scope, id, 1)?,
-                        now_ms(),
-                    )?;
-                }
-                assert_eq!(store.scheduler_outbox()?.len(), 3);
+                a.store
+                    .call("peers.fixture", move |store| {
+                        for (scope, id) in [("a1", "x1"), ("a2", "x2"), ("c", "b1")] {
+                            store.post_input_fixture(
+                                &ia,
+                                &network,
+                                posted(&ia, &network, scope, id, 1)?,
+                                now_ms(),
+                            )?;
+                        }
+                        assert_eq!(store.scheduler_outbox()?.len(), 3);
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             a.outbox_wakeup.notify_one();
             let trigger = crate::scheduling::message_trigger("b1");
@@ -5945,9 +6515,20 @@ mod tests {
                 while {
                     let arg0 = ("c").to_owned();
                     let arg1 = (trigger).to_owned();
-                    b.store.call("peers.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
-                }?.is_none()
-                    || a.store.call("peers.scheduler_outbox", move |store| store.scheduler_outbox()).await?.len() != 2
+                    b.store
+                        .call("peers.scheduler_job", move |store| {
+                            store.scheduler_job(&arg0, &arg1)
+                        })
+                        .await
+                }?
+                .is_none()
+                    || a.store
+                        .call("peers.scheduler_outbox", move |store| {
+                            store.scheduler_outbox()
+                        })
+                        .await?
+                        .len()
+                        != 2
                 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -6092,54 +6673,60 @@ mod tests {
                 let f1 = f1.clone();
                 let f2 = f2.clone();
                 let network = network.clone();
-                l.store.call("peers.fixture", move |store| {
-                store.create_conversation(
-                    &il,
-                    &network,
-                    "c",
-                    "Fork",
-                    il.owner_fixture(&network, "c", &device(&il))?,
-                    0,
-                )?;
-                create_input_bot(store, &il, &il.fixture_admin(), &network, "c", 0)?;
-                other
-                    .ingest_events(&network, &store.events_from(&network, &device(&il), 1, 10)?)?;
-                for i in 0..long {
-                    let id = format!("f{i}");
-                    // Only the first event needs an input graph; the rest fill fork pages.
-                    let body = if i == 0 {
-                        posted(&il, &network, "c", &id, 1)?
-                    } else {
-                        pagination_reply(id)
-                    };
-                    store.append_event(&f1, &network, "c", body, vec![], i as i64)?;
-                }
-                store.append_event(
-                    &f2,
-                    &network,
-                    "c",
-                    posted(&il, &network, "c", "g", 1)?,
-                    vec![],
-                    0,
-                )?;
-                for (author, id) in [(&f1, "f-other"), (&f2, "g-other")] {
-                    let branch = other.append_event(
-                        author,
-                        &network,
-                        "c",
-                        posted(&il, &network, "c", id, 1)?,
-                        vec![],
-                        0,
-                    )?;
-                    store.ingest_events(&network, &[branch])?;
-                }
+                l.store
+                    .call("peers.fixture", move |store| {
+                        store.create_conversation(
+                            &il,
+                            &network,
+                            "c",
+                            "Fork",
+                            il.owner_fixture(&network, "c", &device(&il))?,
+                            0,
+                        )?;
+                        create_input_bot(store, &il, &il.fixture_admin(), &network, "c", 0)?;
+                        other.ingest_events(
+                            &network,
+                            &store.events_from(&network, &device(&il), 1, 10)?,
+                        )?;
+                        for i in 0..long {
+                            let id = format!("f{i}");
+                            // Only the first event needs an input graph; the rest fill fork pages.
+                            let body = if i == 0 {
+                                posted(&il, &network, "c", &id, 1)?
+                            } else {
+                                pagination_reply(id)
+                            };
+                            store.append_event(&f1, &network, "c", body, vec![], i as i64)?;
+                        }
+                        store.append_event(
+                            &f2,
+                            &network,
+                            "c",
+                            posted(&il, &network, "c", "g", 1)?,
+                            vec![],
+                            0,
+                        )?;
+                        for (author, id) in [(&f1, "f-other"), (&f2, "g-other")] {
+                            let branch = other.append_event(
+                                author,
+                                &network,
+                                "c",
+                                posted(&il, &network, "c", id, 1)?,
+                                vec![],
+                                0,
+                            )?;
+                            store.ingest_events(&network, &[branch])?;
+                        }
 
-                    Ok(())
-                }).await?
+                        Ok(())
+                    })
+                    .await?
             }
             let digest = {
                 let arg0 = (network).to_owned();
-                l.store.call("peers.fork_digest", move |store| store.fork_digest(&arg0)).await
+                l.store
+                    .call("peers.fork_digest", move |store| store.fork_digest(&arg0))
+                    .await
             }?;
             assert!(!digest.is_empty(), "L holds both forks");
             for node in [&l, &c] {
@@ -6150,8 +6737,11 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(240), async {
                 while {
                     let arg0 = (network).to_owned();
-                    c.store.call("peers.fork_digest", move |store| store.fork_digest(&arg0)).await
-                }? != digest {
+                    c.store
+                        .call("peers.fork_digest", move |store| store.fork_digest(&arg0))
+                        .await
+                }? != digest
+                {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 anyhow::Ok(())
@@ -6225,32 +6815,40 @@ mod tests {
                 node.install_membership(state.clone()).await?;
             }
             {
-                let il = il.clone(); let ih = ih.clone(); let ij = ij.clone(); let network = network.clone();
-                l.store.call("peers.catch_up_fixture", move |store| {
-                store.create_conversation(
-                    &il,
-                    &network,
-                    "c",
-                    "Catch up",
-                    il.owner_fixture(&network, "c", &device(&il))?,
-                    0,
-                )?;
-                create_input_bot(store, &il, &il.fixture_admin(), &network, "c", 0)?;
-                for i in 0..40_000 {
-                    let author = if i % 2 == 0 { &ih } else { &ij };
-                    let id = format!("m{i}");
-                    let body = if i < 2 {
-                        posted(&il, &network, "c", &id, 1)?
-                    } else {
-                        pagination_reply(id)
-                    };
-                    store.append_event(author, &network, "c", body, vec![], i)?;
-                }
-            Ok(()) }).await?
+                let il = il.clone();
+                let ih = ih.clone();
+                let ij = ij.clone();
+                let network = network.clone();
+                l.store
+                    .call("peers.catch_up_fixture", move |store| {
+                        store.create_conversation(
+                            &il,
+                            &network,
+                            "c",
+                            "Catch up",
+                            il.owner_fixture(&network, "c", &device(&il))?,
+                            0,
+                        )?;
+                        create_input_bot(store, &il, &il.fixture_admin(), &network, "c", 0)?;
+                        for i in 0..40_000 {
+                            let author = if i % 2 == 0 { &ih } else { &ij };
+                            let id = format!("m{i}");
+                            let body = if i < 2 {
+                                posted(&il, &network, "c", &id, 1)?
+                            } else {
+                                pagination_reply(id)
+                            };
+                            store.append_event(author, &network, "c", body, vec![], i)?;
+                        }
+                        Ok(())
+                    })
+                    .await?
             }
             let target = {
                 let arg0 = (network).to_owned();
-                l.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                l.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?;
             let peer = device(&il);
             // Anything that wakes C during its round would also start the next one at once: L's
@@ -6272,7 +6870,10 @@ mod tests {
             }
             c.net()?.learn(&l.net()?.addr()).await;
             let book = async |node: &Runtime| -> Result<Vec<(String, u64)>> {
-                Ok(node.store.call("peers.address_book", move |store| store.address_book()).await?
+                Ok(node
+                    .store
+                    .call("peers.address_book", move |store| store.address_book())
+                    .await?
                     .iter()
                     .filter_map(|signed| signed.open(&network).ok())
                     .map(|record| (record.device_id, record.seq))
@@ -6287,7 +6888,10 @@ mod tests {
                 settled = now;
                 tokio::time::sleep(Duration::from_secs(6)).await;
             }
-            let records = l.store.call("peers.address_book", move |store| store.address_book()).await?;
+            let records = l
+                .store
+                .call("peers.address_book", move |store| store.address_book())
+                .await?;
             c.merge_addresses(&network, records).await?;
             c.sync_peers
                 .lock()
@@ -6312,14 +6916,19 @@ mod tests {
             .context("the first round ends")?;
             let first = {
                 let arg0 = (network).to_owned();
-                c.store.call("peers.heads", move |store| store.heads(&arg0)).await
+                c.store
+                    .call("peers.heads", move |store| store.heads(&arg0))
+                    .await
             }?;
             assert_ne!(first, target, "one round stops at the pending limit");
             tokio::time::timeout(Duration::from_secs(10), async {
                 while {
                     let arg0 = (network).to_owned();
-                    c.store.call("peers.heads", move |store| store.heads(&arg0)).await
-                }? == first {
+                    c.store
+                        .call("peers.heads", move |store| store.heads(&arg0))
+                        .await
+                }? == first
+                {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 anyhow::Ok(())
@@ -6329,8 +6938,11 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(300), async {
                 while {
                     let arg0 = (network).to_owned();
-                    c.store.call("peers.heads", move |store| store.heads(&arg0)).await
-                }? != target {
+                    c.store
+                        .call("peers.heads", move |store| store.heads(&arg0))
+                        .await
+                }? != target
+                {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 anyhow::Ok(())
@@ -6363,26 +6975,28 @@ mod tests {
         {
             let sender = sender.clone();
             let network = network.clone();
-            node.store.call("peers.fixture", move |store| {
-            let owner = sender.owner_fixture(&network, "c", &sender.device_id()?)?;
-            store.create_conversation(&sender, &network, "c", "Task", owner, now_ms())?;
-            create_input_bot(
-                store,
-                &sender,
-                &sender.fixture_admin(),
-                &network,
-                "c",
-                now_ms(),
-            )?;
-            store.post_input_fixture(
-                &sender,
-                &network,
-                posted(&sender, &network, "c", "m1", 1)?,
-                now_ms(),
-            )?;
+            node.store
+                .call("peers.fixture", move |store| {
+                    let owner = sender.owner_fixture(&network, "c", &sender.device_id()?)?;
+                    store.create_conversation(&sender, &network, "c", "Task", owner, now_ms())?;
+                    create_input_bot(
+                        store,
+                        &sender,
+                        &sender.fixture_admin(),
+                        &network,
+                        "c",
+                        now_ms(),
+                    )?;
+                    store.post_input_fixture(
+                        &sender,
+                        &network,
+                        posted(&sender, &network, "c", "m1", 1)?,
+                        now_ms(),
+                    )?;
 
-                Ok(())
-            }).await?
+                    Ok(())
+                })
+                .await?
         }
         let spec = WorkRequest {
             work_id: WorkSpec::id("c", "message:m1", "same"),
@@ -6447,28 +7061,30 @@ mod tests {
         );
         {
             let network = network.clone();
-            node.store.call("peers.fixture", move |store| {
-            let works = store.works(&network, "c")?;
-            assert_eq!(works.len(), 1);
-            assert_eq!(works[0].model, None);
-            assert_eq!(
-                works[0].resolved,
-                ResolvedModel {
-                    provider: Provider::Claude,
-                    model: Some("first-model".into())
-                }
-            );
-            assert_eq!(
-                store
-                    .scheduler_jobs("c")?
-                    .iter()
-                    .filter(|job| job.kind == crate::scheduling::TriggerKind::AgentTask)
-                    .count(),
-                1
-            );
+            node.store
+                .call("peers.fixture", move |store| {
+                    let works = store.works(&network, "c")?;
+                    assert_eq!(works.len(), 1);
+                    assert_eq!(works[0].model, None);
+                    assert_eq!(
+                        works[0].resolved,
+                        ResolvedModel {
+                            provider: Provider::Claude,
+                            model: Some("first-model".into())
+                        }
+                    );
+                    assert_eq!(
+                        store
+                            .scheduler_jobs("c")?
+                            .iter()
+                            .filter(|job| job.kind == crate::scheduling::TriggerKind::AgentTask)
+                            .count(),
+                        1
+                    );
 
-                Ok(())
-            }).await?
+                    Ok(())
+                })
+                .await?
         }
         drop(node);
         let node = Arc::new(Runtime::reopen(&dir).await?);

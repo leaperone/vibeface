@@ -94,7 +94,15 @@ function verifyApplication(root, target, receipt) {
     const info = fs.readFileSync(path.join(application, 'Contents/Info.plist'), 'utf8');
     assert(info.includes('<string>one.leaper.vibeface.desktop</string>'), 'unexpected macOS bundle identifier');
     assert(info.includes(`<string>${receipt.version}</string>`), 'the macOS bundle does not carry the product version');
+    assert(/CFBundleURLSchemes[\s\S]*?<string>vibeface<\/string>/.test(info), 'the macOS bundle does not declare the native deep-link scheme');
 
+  }
+  if (target.endsWith('-unknown-linux-gnu')) {
+    const entry = fs.readFileSync(path.join(application, 'vibeface.desktop'), 'utf8');
+    assert(/^Exec=vibeface %u$/m.test(entry) && /^MimeType=x-scheme-handler\/vibeface;$/m.test(entry), 'Linux desktop entry must forward the native deep-link URL');
+    const dependencies = JSON.parse(fs.readFileSync(path.join(application, 'native-dependencies.json'), 'utf8'));
+    assert.equal(dependencies.target, target);
+    assert(Array.isArray(dependencies.libraries) && dependencies.libraries.length > 0 && dependencies.minimum_glibc, 'Linux package has no actual native dependency report');
   }
   const runtime = path.join(resources, 'runtime');
   const sealed = readSealedRuntime(runtime);
@@ -233,8 +241,12 @@ function selfTest() {
       if (mac) {
         write(path.join(application, 'Contents/Info.plist'),
           `<plist><dict><key>CFBundleIdentifier</key><string>one.leaper.vibeface.desktop</string>`
-          + `<key>CFBundleShortVersionString</key><string>${version}</string></dict></plist>`);
+          + `<key>CFBundleShortVersionString</key><string>${version}</string><key>CFBundleURLSchemes</key><array><string>vibeface</string></array></dict></plist>`);
 
+      }
+      if (target.endsWith('-unknown-linux-gnu')) {
+        write(path.join(application, 'vibeface.desktop'), 'Exec=vibeface %u\nMimeType=x-scheme-handler/vibeface;\n');
+        write(path.join(application, 'native-dependencies.json'), JSON.stringify({ target, libraries: ['libc.so.6'], minimum_glibc: '2.17' }));
       }
       const runtime = path.join(resources, 'runtime');
       const entries = {

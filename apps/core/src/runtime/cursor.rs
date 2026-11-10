@@ -399,7 +399,11 @@ impl CursorExecutor {
         let projections = {
             let network = network.to_owned();
             let conversation = work.conversation.to_owned();
-            node.store.call("cursor.works", move |store| store.works(&network, &conversation)).await
+            node.store
+                .call("cursor.works", move |store| {
+                    store.works(&network, &conversation)
+                })
+                .await
         }?;
         let mut by_id: HashMap<_, _> = projections
             .into_iter()
@@ -451,7 +455,11 @@ impl CursorExecutor {
     ) {
         let record = match {
             let work_id = work_id.to_owned();
-            node.store.call("cursor.work_record", move |store| store.work_record(&work_id)).await
+            node.store
+                .call("cursor.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
         } {
             Ok(Some(record)) => record,
             Ok(None) => return,
@@ -540,7 +548,10 @@ impl CursorExecutor {
                 let node = persist_node
                     .upgrade()
                     .context("Node closed while recording Cursor agent")?;
-                let stopped = node.store.call("cursor.stop_requests", move |store| store.stop_requests()).await?
+                let stopped = node
+                    .store
+                    .call("cursor.stop_requests", move |store| store.stop_requests())
+                    .await?
                     .into_iter()
                     .any(|request| request.work_id == persist_work);
                 ensure!(!stopped, "Cursor work was stopped before Send");
@@ -638,10 +649,10 @@ impl CursorExecutor {
                 let target_node = node.identity.device_id()?;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":{
+                    json!({"type":"native_progress","conversation_id":({
                         let work_id = work_id.to_owned();
                         node.store.call("cursor.work_record", move |store| store.work_record(&work_id)).await
-                    }?.map(|r| r.conversation).unwrap_or_default(),"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
+                    }?.map(|r| r.conversation).unwrap_or_default()),"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
                 );
                 Ok(())
             }
@@ -1213,9 +1224,13 @@ mod tests {
         loop {
             let record = {
                 let work_id = work_id.to_owned();
-                node.store.call("cursor.work_record", move |store| store.work_record(&work_id)).await
+                node.store
+                    .call("cursor.work_record", move |store| {
+                        store.work_record(&work_id)
+                    })
+                    .await
             }?
-                .context("Cursor work record")?;
+            .context("Cursor work record")?;
             if record.state.finished() || Instant::now() >= deadline {
                 return Ok(record);
             }
@@ -1240,84 +1255,104 @@ mod tests {
             Arc<std::sync::Mutex<Shown>>,
         )> {
             let (identity, admin, network, id, configuration, scheduling, generation) = (
-                node.identity.clone(), admin.clone(), network.to_owned(), id.to_owned(), configuration.clone(),
-                node.config.scheduling.clone(), node.provider_generation(Provider::Cursor, &node.providers())?,
+                node.identity.clone(),
+                admin.clone(),
+                network.to_owned(),
+                id.to_owned(),
+                configuration.clone(),
+                node.config.scheduling.clone(),
+                node.provider_generation(Provider::Cursor, &node.providers())?,
             );
-            node.store.call("cursor.claim_fixture", move |store| {
-                let sequence = match store.workspace_input(&network, &id)? {
-                    Some(existing) => existing.input.route.sequence,
-                    None => store.messages(&network, "start-state")?.len() as u64 + 1,
-                };
-                store.post_input_fixture(
-                    &identity,
-                    &network,
-                    signed_main_input(&admin, &network, "start-state", &id, &id, vec![], sequence)?,
-                    now_ms(),
-                )?;
-                let key = SessionKey {
-                    conversation_id: "start-state".into(),
-                    scope: SessionScope::Main,
-                };
-                let claimed = store
-                    .claim_next_in_session(
+            node.store
+                .call("cursor.claim_fixture", move |store| {
+                    let sequence = match store.workspace_input(&network, &id)? {
+                        Some(existing) => existing.input.route.sequence,
+                        None => store.messages(&network, "start-state")?.len() as u64 + 1,
+                    };
+                    store.post_input_fixture(
                         &identity,
                         &network,
-                        &key,
-                        crate::scheduler::boot_id(),
-                        &configuration,
-                        &scheduling,
-                    )?
-                    .context("claimed Cursor turn")?;
-                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-                let job = store.record_turn_runtime(
-                    "start-state",
-                    &claimed.job.trigger,
-                    &attempt,
-                    &TurnRuntime {
+                        signed_main_input(
+                            &admin,
+                            &network,
+                            "start-state",
+                            &id,
+                            &id,
+                            vec![],
+                            sequence,
+                        )?,
+                        now_ms(),
+                    )?;
+                    let key = SessionKey {
+                        conversation_id: "start-state".into(),
+                        scope: SessionScope::Main,
+                    };
+                    let claimed = store
+                        .claim_next_in_session(
+                            &identity,
+                            &network,
+                            &key,
+                            crate::scheduler::boot_id(),
+                            &configuration,
+                            &scheduling,
+                        )?
+                        .context("claimed Cursor turn")?;
+                    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                    let job = store.record_turn_runtime(
+                        "start-state",
+                        &claimed.job.trigger,
+                        &attempt,
+                        &TurnRuntime {
+                            provider: Provider::Cursor,
+                            model: Some("fixture-model".into()),
+                            reasoning_effort: None,
+                            generation,
+                            session_generation: claimed.session_generation,
+                            delivery_id: attempt.clone(),
+                            stage: vibeface_bridge::failure::ProviderStage::Validate,
+                            execution: TurnExecution::NotStarted,
+                            attempted_at_ms: now_ms(),
+                            switched_from: None,
+                            switch_reason: None,
+                        },
+                    )?;
+                    let context = ContextProjection {
+                        network_id: network.clone(),
+                        scope: SessionScope::Main,
+                        attempt_id: attempt.clone(),
                         provider: Provider::Cursor,
-                        model: Some("fixture-model".into()),
-                        reasoning_effort: None,
-                        generation,
+                        stable_fingerprint: configuration.stable_fingerprint.clone(),
+                        dynamic_fingerprint: format!("context-{id}"),
                         session_generation: claimed.session_generation,
-                        delivery_id: attempt.clone(),
-                        stage: vibeface_bridge::failure::ProviderStage::Validate,
-                        execution: TurnExecution::NotStarted,
-                        attempted_at_ms: now_ms(),
-                        switched_from: None,
-                        switch_reason: None,
-                    },
-                )?;
-                let context = ContextProjection {
-                    network_id: network.clone(),
-                    scope: SessionScope::Main,
-                    attempt_id: attempt.clone(),
-                    provider: Provider::Cursor,
-                    stable_fingerprint: configuration.stable_fingerprint.clone(),
-                    dynamic_fingerprint: format!("context-{id}"),
-                    session_generation: claimed.session_generation,
-                    coverage: Default::default(),
-                    stable_bytes: 1,
-                    dynamic_bytes: 1,
-                    invalidation_reason: None,
-                    stage: ContextStage::Compiled,
-                    session_status: None,
-                    sources: Vec::new(),
-                    sources_omitted: 0,
-                    inputs: Vec::new(),
-                    inputs_omitted: 0,
-                };
-                store.record_compiled_context("start-state", &job.trigger, &attempt, &context)?;
-                store.mark_started("start-state", &job.trigger, &attempt)?;
-                Ok((
-                    job,
-                    Arc::new(std::sync::Mutex::new(Shown {
-                        session_generation: claimed.session_generation,
-                        dynamic: Some(format!("delivered-{id}")),
-                        context: Some(context),
-                        ..Shown::default()
-                    })),
-                ))
-            }).await
+                        coverage: Default::default(),
+                        stable_bytes: 1,
+                        dynamic_bytes: 1,
+                        invalidation_reason: None,
+                        stage: ContextStage::Compiled,
+                        session_status: None,
+                        sources: Vec::new(),
+                        sources_omitted: 0,
+                        inputs: Vec::new(),
+                        inputs_omitted: 0,
+                    };
+                    store.record_compiled_context(
+                        "start-state",
+                        &job.trigger,
+                        &attempt,
+                        &context,
+                    )?;
+                    store.mark_started("start-state", &job.trigger, &attempt)?;
+                    Ok((
+                        job,
+                        Arc::new(std::sync::Mutex::new(Shown {
+                            session_generation: claimed.session_generation,
+                            dynamic: Some(format!("delivered-{id}")),
+                            context: Some(context),
+                            ..Shown::default()
+                        })),
+                    ))
+                })
+                .await
         }
         async fn seen(node: &Runtime) -> Result<(crate::model::VersionVector, Shown)> {
             node.store.call("cursor.seen_fixture", move |store| {
@@ -1593,7 +1628,11 @@ mod tests {
                 let identity = node.identity.to_owned();
                 let network = network.to_owned();
                 let spec = spec.clone();
-                node.store.call("cursor.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+                node.store
+                    .call("cursor.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
             }?;
             node.signal_work(
                 &network,
@@ -1620,9 +1659,13 @@ mod tests {
                 .await;
             let record = {
                 let work_id = spec.work_id.to_owned();
-                node.store.call("cursor.work_record", move |store| store.work_record(&work_id)).await
+                node.store
+                    .call("cursor.work_record", move |store| {
+                        store.work_record(&work_id)
+                    })
+                    .await
             }?
-                .context("finished Cursor classification")?;
+            .context("finished Cursor classification")?;
             if start == StartEvidence::NotStarted {
                 assert_eq!(
                     record.state,
@@ -1651,7 +1694,11 @@ mod tests {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("cursor.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         assert!(
             !node
@@ -1685,7 +1732,11 @@ mod tests {
         let (_, created) = {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
-            node.store.call("cursor.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         assert!(
             !created,
@@ -1711,7 +1762,11 @@ mod tests {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("cursor.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         node.start_work(
             node.executor(Provider::Cursor)?,
@@ -1725,9 +1780,13 @@ mod tests {
             loop {
                 let record = {
                     let work_id = spec.work_id.to_owned();
-                    node.store.call("cursor.work_record", move |store| store.work_record(&work_id)).await
+                    node.store
+                        .call("cursor.work_record", move |store| {
+                            store.work_record(&work_id)
+                        })
+                        .await
                 }?
-                    .context("running Cursor work")?;
+                .context("running Cursor work")?;
                 if matches!(record.state, WorkState::Running { .. }) {
                     break Ok::<_, anyhow::Error>(record);
                 }

@@ -11,6 +11,42 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::
 
 const DEADLINE: Duration = Duration::from_secs(2);
 
+struct HeldWriter {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl HeldWriter {
+    async fn new(node: &Arc<Runtime>) -> Result<Self> {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let node = node.clone();
+        let task = tokio::spawn(async move {
+            node.store.call("fixture_held_writer", move |_| {
+                let _ = entered.send(());
+                wait.recv().context("writer barrier was abandoned")?;
+                Ok(())
+            }).await
+        });
+        let held = Self { release: Some(release), task: Some(task) };
+        tokio::time::timeout(DEADLINE, ready).await??;
+        Ok(held)
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        if let Some(release) = self.release.take() { let _ = release.send(()); }
+        tokio::time::timeout(DEADLINE, self.task.take().context("writer task missing")?).await???;
+        Ok(())
+    }
+}
+
+impl Drop for HeldWriter {
+    fn drop(&mut self) {
+        // An assertion failure must not leave the dedicated writer thread parked forever.
+        if let Some(release) = self.release.take() { let _ = release.send(()); }
+    }
+}
+
 struct Fixture {
     dir: PathBuf,
     node: Arc<Runtime>,
@@ -169,6 +205,104 @@ async fn close(client: &mut FrameClient, serving: tokio::task::JoinHandle<Result
     client.socket.send(Message::Close(None)).await?;
     let _ = tokio::time::timeout(DEADLINE, serving).await??;
     Ok(())
+}
+
+async fn ping_and_heartbeat(client: &mut FrameClient) -> Result<()> {
+    client.socket.send(Message::Ping(b"writer-held".to_vec().into())).await?;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            match client.socket.next().await.context("channel closed")?? {
+                Message::Pong(bytes) if bytes.as_ref() == b"writer-held" => break,
+                Message::Ping(_) => {},
+                frame => bail!("unexpected frame before the held-writer pong: {frame:?}"),
+            }
+        }
+        loop {
+            match client.socket.next().await.context("channel closed")?? {
+                Message::Ping(_) => return Ok::<_, anyhow::Error>(()),
+                Message::Pong(_) => {},
+                frame => bail!("unexpected frame before the held-writer heartbeat: {frame:?}"),
+            }
+        }
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or_completed_result() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture.accepted_work().await?;
+    let (mut client, serving) = fixture.connect(&fixture.admin, None).await?;
+    client.call("subscribe", json!({})).await?;
+    send(&mut client, "complete-under-writer", "provider_probe", json!({"provider":"pi"})).await?;
+    let mut probe = fixture.probe_started().await?;
+    let writer = HeldWriter::new(&fixture.node).await?;
+    let result = async {
+        for index in 0..CONTROL_CALLS {
+            send(&mut client, &format!("stop-under-writer-{index}"), "rpc", json!({
+                "method":"interrupt_work", "conversation_id":"scope", "work_id":"held-work",
+            })).await?;
+        }
+        send(&mut client, "control-intake-barrier", "rpc", json!({
+            "method":"interrupt_work", "conversation_id":"scope", "work_id":"held-work",
+        })).await?;
+        let overload = response(&mut client, "control-intake-barrier").await?;
+        assert_eq!(overload["code"], "client_overloaded",
+            "the encrypted stop frames must be admitted before the writer is released");
+        send(&mut client, "read-under-writer", "rpc", json!({"method":"conversations"})).await?;
+        fixture.node.publish_reread(&fixture.state.genesis.network_id);
+        // Both request authentication and subscribed push preparation now wait on the writer.
+        ping_and_heartbeat(&mut client).await?;
+        probe.write_all(b"G").await?;
+        let completed = response(&mut client, "complete-under-writer").await?;
+        assert!(completed["error"].is_null(), "{completed}");
+        assert_eq!(completed["result"]["probe"]["catalog"]["models"][0]["id"], "fixture/held-model");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    writer.finish().await?;
+    if result.is_ok() {
+        let mut returned = BTreeSet::new();
+        while returned.len() < CONTROL_CALLS + 1 {
+            let value = receive(&mut client).await?;
+            if value["type"] == "changed" { continue; }
+            assert!(value["error"].is_null(), "{value}");
+            returned.insert(value["id"].as_str().context("response ID")?.to_owned());
+        }
+        assert!(returned.contains("read-under-writer"));
+        for index in 0..CONTROL_CALLS { assert!(returned.contains(&format!("stop-under-writer-{index}"))); }
+        assert_eq!(fixture.node.store.call("fixture_stopped_under_writer", |store| store.stop_requests()).await?[0].work_id, "held-work");
+    }
+    close(&mut client, serving).await?;
+    fixture.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn a_cancelled_membership_installer_fences_socket_results_while_the_next_writer_is_held() -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let (mut client, serving) = fixture.connect(&fixture.admin, None).await?;
+    send(&mut client, "held-before-revoke", "provider_probe", json!({"provider":"pi"})).await?;
+    let mut probe = fixture.probe_started().await?;
+    let writer = HeldWriter::new(&fixture.node).await?;
+    fixture.state.append(GovernanceEvent::revoke(&fixture.backup, &fixture.state.project()?,
+        Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
+    let state = fixture.state.clone();
+    // Poll through admission into the empty writer queue, then cancel the installer. The
+    // accepted commit must publish its authority fence without a caller continuation.
+    let mut installer = Box::pin(fixture.node.store.call("fixture_cancelled_installer", move |store| {
+        store.install_state(state)?;
+        Ok(())
+    }));
+    assert!(futures_util::poll!(installer.as_mut()).is_pending());
+    drop(installer);
+    writer.finish().await?;
+    let next_writer = HeldWriter::new(&fixture.node).await?;
+    let closed = tokio::time::timeout(DEADLINE, serving).await??;
+    assert!(closed.is_err(), "revocation must fence the pending response while a writer remains occupied");
+    probe_exited(&mut probe).await?;
+    assert!(receive(&mut client).await.is_err(), "a revoked probe result reached the socket");
+    next_writer.finish().await?;
+    fixture.cleanup().await
 }
 
 #[tokio::test]
@@ -361,11 +495,13 @@ async fn local_cookie_revocation_aborts_the_held_process() -> Result<()> {
     let (mut client, serving) = fixture.connect(&browser, Some(cookie)).await?;
     send(&mut client, "held", "provider_probe", json!({"provider":"pi"})).await?;
     let mut control = fixture.probe_started().await?;
+    let writer = HeldWriter::new(&fixture.node).await?;
     fixture.node.local_access.set_enabled(false)?;
     let error = tokio::time::timeout(DEADLINE, serving).await??.unwrap_err();
     assert!(error.to_string().contains("local browser access was revoked"), "{error}");
     probe_exited(&mut control).await?;
     assert!(receive(&mut client).await.is_err());
+    writer.finish().await?;
     fixture.cleanup().await
 }
 
@@ -373,15 +509,23 @@ async fn local_cookie_revocation_aborts_the_held_process() -> Result<()> {
 async fn a_completed_result_is_rechecked_even_before_membership_watch_is_polled() -> Result<()> {
     let mut fixture = Fixture::new().await?;
     let mut session = Snapshot { device_id: fixture.admin.device_id()?, cookie: None, operator: false }.session();
+    let authority = Authority::new(&fixture.node, &session, fixture.node.local_access.subscribe())?;
     let mut calls = Calls::default();
-    calls.accept(&fixture.node, &session, Request {
+    calls.accept(&fixture.node, &session, &authority, Request {
         id: "completed".into(), method: "provider_models".into(), params: json!({"provider":"pi"}),
-    }).await?;
+    })?;
     let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
+    let prepared = PreparedPush {
+        authority: authority.principal(&fixture.node, &session)?,
+        payload: json!({"type":"private-fixture-records"}),
+    };
     fixture.state.append(GovernanceEvent::revoke(&fixture.backup, &fixture.state.project()?,
         Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
     fixture.node.install_membership(fixture.state.clone()).await?;
-    assert!(calls.finish(&fixture.node, &mut session, completed).await.is_err());
+    let writer = HeldWriter::new(&fixture.node).await?;
+    assert!(calls.finish(&fixture.node, &mut session, &authority, completed).is_err());
+    assert!(Pushes::default().finish(&fixture.node, &session, &authority, prepared).is_err());
     drop(calls);
+    writer.finish().await?;
     fixture.cleanup().await
 }

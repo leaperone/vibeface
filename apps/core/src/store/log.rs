@@ -33,24 +33,39 @@ pub(crate) mod test_metrics {
         pub(super) static METRICS: RefCell<Metrics> = RefCell::new(Metrics::default());
         static LEGACY: Cell<bool> = const { Cell::new(false) };
     }
-    pub(crate) fn reset() { METRICS.with(|metrics| *metrics.borrow_mut() = Metrics::default()); }
-    pub(crate) fn snapshot() -> Metrics { METRICS.with(|metrics| metrics.borrow().clone()) }
-    pub(crate) fn legacy() -> bool { LEGACY.with(Cell::get) }
+    pub(crate) fn reset() {
+        METRICS.with(|metrics| *metrics.borrow_mut() = Metrics::default());
+    }
+    pub(crate) fn snapshot() -> Metrics {
+        METRICS.with(|metrics| metrics.borrow().clone())
+    }
+    pub(crate) fn legacy() -> bool {
+        LEGACY.with(Cell::get)
+    }
     pub(crate) fn with_legacy<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
         struct Restore(bool);
         impl Drop for Restore {
-            fn drop(&mut self) { LEGACY.with(|value| value.set(self.0)); }
+            fn drop(&mut self) {
+                LEGACY.with(|value| value.set(self.0));
+            }
         }
         let _restore = Restore(LEGACY.with(|value| value.replace(enabled)));
         f()
     }
     pub(super) struct IngestTimer(std::time::Instant);
     impl IngestTimer {
-        pub(super) fn start() -> Self { Self(std::time::Instant::now()) }
+        pub(super) fn start() -> Self {
+            Self(std::time::Instant::now())
+        }
     }
     impl Drop for IngestTimer {
         fn drop(&mut self) {
-            METRICS.with(|metrics| metrics.borrow_mut().ingest_ns.push(self.0.elapsed().as_nanos()));
+            METRICS.with(|metrics| {
+                metrics
+                    .borrow_mut()
+                    .ingest_ns
+                    .push(self.0.elapsed().as_nanos())
+            });
         }
     }
 }
@@ -194,7 +209,12 @@ pub(crate) fn ingest_from(
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
     #[cfg(test)]
-    test_metrics::METRICS.with(|metrics| metrics.borrow_mut().validation_ns.push(validation_started.elapsed().as_nanos()));
+    test_metrics::METRICS.with(|metrics| {
+        metrics
+            .borrow_mut()
+            .validation_ns
+            .push(validation_started.elapsed().as_nanos())
+    });
     let status = place(connection, view, envelope, &event, seen_at_ms, placed)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
         cascade(connection, view, &envelope.hash, seen_at_ms, placed)?;
@@ -597,7 +617,8 @@ fn authorize_owner(connection: &Connection, view: &AuthorizationView, event: &Ev
 fn first_fork(connection: &Connection, network: &str, author: &str) -> Result<Option<u64>> {
     Ok(connection.query_row(
         "SELECT min(seq) FROM events WHERE network_id=? AND author=? AND main=0",
-        params![network, author], |row| row.get(0),
+        params![network, author],
+        |row| row.get(0),
     )?)
 }
 
@@ -616,9 +637,16 @@ fn insert_event(
     let settled = main && fork.is_none();
     // An existing unlimited fork makes this exact tail ineffective. Assistant messages
     // supply neither owner nor dispatch evidence, and cannot move the earliest fork.
-    let ineffective_assistant_tail = matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
-        && fork.is_some_and(|seq| event.seq >= seq)
-        && matches!(&event.body, EventBody::MessagePosted { role: Role::Assistant, .. });
+    let ineffective_assistant_tail =
+        matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && fork.is_some_and(|seq| event.seq >= seq)
+            && matches!(
+                &event.body,
+                EventBody::MessagePosted {
+                    role: Role::Assistant,
+                    ..
+                }
+            );
     #[cfg(test)]
     let ineffective_assistant_tail = ineffective_assistant_tail && !test_metrics::legacy();
     #[cfg(test)]
@@ -787,7 +815,12 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
     }
     if flips.is_empty() {
         #[cfg(test)]
-        test_metrics::METRICS.with(|metrics| metrics.borrow_mut().recompute_ns.push(recompute_started.elapsed().as_nanos()));
+        test_metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .recompute_ns
+                .push(recompute_started.elapsed().as_nanos())
+        });
         return Ok(false);
     }
     #[cfg(test)]
@@ -822,8 +855,12 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
     test_metrics::METRICS.with(|metrics| {
         let mut metrics = metrics.borrow_mut();
         metrics.rebuilds += 1;
-        metrics.rebuild_ns.push(rebuild_started.elapsed().as_nanos());
-        metrics.recompute_ns.push(recompute_started.elapsed().as_nanos());
+        metrics
+            .rebuild_ns
+            .push(rebuild_started.elapsed().as_nanos());
+        metrics
+            .recompute_ns
+            .push(recompute_started.elapsed().as_nanos());
     });
     Ok(true)
 }

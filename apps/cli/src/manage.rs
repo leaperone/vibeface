@@ -14,10 +14,7 @@ use std::{
     time::Duration,
 };
 use vibeface_client::{self as client, ClientKey, Enrollment, Entry, Progress};
-use vibeface_control::{
-    ControlRequest,
-    maintenance,
-};
+use vibeface_control::{ControlRequest, maintenance};
 
 #[derive(Args)]
 pub struct NodeDir {
@@ -575,8 +572,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             let capability = zeroize::Zeroizing::new(access.capability()?);
             let mut key = access.unlock_or_create()?;
             let password = read_passphrase(recovery_password_fd, "recovery password", true)?;
-            let created = client::create_network(
-                &mut key,
+            let mut pending = if client::IdentityPlan::exists(&key) {
+                client::IdentityPlan::load(&key,password.as_str())?
+            } else { client::prepare_create(
+                &key,
                 entry,
                 &capability,
                 &name,
@@ -584,7 +583,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 &recovery_file,
                 password.as_str(),
             )
-            .await?;
+            .await? };
+            eprintln!("Recovery backup saved and verified: {} (SHA-256 {})",pending.backup_path().display(),pending.backup_sha256());
+            let created=pending.submit(&mut key).await?;
             println!(
                 "Personal network {} created; this client manages it.",
                 created["network_id"].as_str().unwrap_or_default()
@@ -640,8 +641,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             let capability = access.capability().ok().map(zeroize::Zeroizing::new);
             let mut key = access.unlock_or_create()?;
             let password = read_passphrase(recovery_password_fd, "recovery password", false)?;
-            let result = client::recover(
-                &mut key,
+            let mut pending = if client::IdentityPlan::exists(&key) {
+                client::IdentityPlan::load(&key,password.as_str())?
+            } else { client::prepare_recovery(
+                &key,
                 entry,
                 &recovery_file,
                 password.as_str(),
@@ -649,7 +652,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 &name,
                 capability.as_deref().map(String::as_str),
             )
-            .await?;
+            .await? };
+            eprintln!("Recovery backup saved and verified: {} (SHA-256 {})",pending.backup_path().display(),pending.backup_sha256());
+            let result=pending.submit(&mut key).await?;
             println!(
                 "Recovery sent; {} now holds the recovery key.",
                 new_recovery_file.display()

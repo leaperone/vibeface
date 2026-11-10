@@ -43,7 +43,7 @@ use vibeface_secure::{
 };
 
 mod concurrency;
-use concurrency::Calls;
+use concurrency::{Authority, Calls, Pushes};
 
 pub const PROLOGUE: &[u8] = b"vibeface:client:v1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -352,8 +352,15 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if !node.config.forwarding.any {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
-            { let network = network.clone(); let target = target.clone();
-                node.store.call("gateway_authorize", move |store| store.authorize_node(&network, &target)).await }
+            {
+                let network = network.clone();
+                let target = target.clone();
+                node.store
+                    .call("gateway_authorize", move |store| {
+                        store.authorize_node(&network, &target)
+                    })
+                    .await
+            }
         };
         if let Err(error) = member.await {
             return refuse(&mut socket, "target_not_member", error).await;
@@ -595,18 +602,6 @@ async fn serve_session_with_heartbeat(
     })
     .await
     .context("client handshake timed out")??;
-    if let Some(cookie) = &cookie {
-        let view = node.membership_state().await?.project()?;
-        if view.client(&device_id).is_err() {
-            let local =
-                node.local_access
-                    .session(cookie, &node.identity.device_id()?, &view.network_id)?;
-            ensure!(
-                local.device_id == device_id,
-                "local browser cookie is bound to another device"
-            );
-        }
-    }
     let mut session = Session {
         device_id,
         cookie,
@@ -614,8 +609,9 @@ async fn serve_session_with_heartbeat(
         observation: None,
         operator: false,
     };
+    let authority = Authority::new(&node, &session, local_changes.clone())?;
     let opened = Instant::now();
-    let mut guest = if session.cookie.is_none() && principal(&node, &session).await.is_err() {
+    let mut guest = if session.cookie.is_none() && authority.principal(&node, &session).is_err() {
         Some(
             GUESTS
                 .try_acquire()
@@ -631,8 +627,9 @@ async fn serve_session_with_heartbeat(
     let mut received = Instant::now();
     let mut partial_started: Option<Instant> = None;
     let mut calls = Calls::default();
+    let mut pushes = Pushes::default();
     loop {
-        calls.start_ordered(&node, &session).await?;
+        calls.start_ordered(&node, &session, &authority);
         tokio::select! {
             frame = socket.next() => {
                 received = Instant::now();
@@ -642,7 +639,7 @@ async fn serve_session_with_heartbeat(
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            if let Some(response) = calls.accept(&node, &session, request).await? {
+                            if let Some(response) = calls.accept(&node, &session, &authority, request)? {
                                 send_value(&mut socket, &mut channel, &response).await?;
                             }
                         } else { partial_started.get_or_insert_with(Instant::now); }
@@ -652,12 +649,16 @@ async fn serve_session_with_heartbeat(
                 }
             }
             completed = calls.next(), if !calls.is_empty() => {
-                let response = calls.finish(&node, &mut session, completed?).await?;
+                let response = calls.finish(&node, &mut session, &authority, completed?)?;
                 send_value(&mut socket, &mut channel, &response).await?;
                 received = Instant::now();
             }
-            event = events.recv(), if session.subscribed.is_some() => {
-                let principal = principal(&node, &session).await?;
+            prepared = pushes.next(), if !pushes.is_empty() => {
+                let push = pushes.finish(&node, &session, &authority, prepared?)?;
+                send_value(&mut socket, &mut channel, &push).await?;
+            }
+            event = events.recv(), if session.subscribed.is_some() && pushes.is_empty() => {
+                let principal = authority.principal(&node, &session)?;
                 match event {
                     Ok(event) if event.network_id == principal.network_id => {
                         // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
@@ -665,10 +666,9 @@ async fn serve_session_with_heartbeat(
                             while events.try_recv().is_ok() {}
                             json!({"type":"resync"})
                         } else {
-                            pushed(&node, &principal.network_id, &session.device_id, event.payload).await
+                            event.payload
                         };
-                        ensure!(self::principal(&node, &session).await? == principal, "this device's permission changed before a push");
-                        send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
+                        pushes.start(&node, &session, principal, payload);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":{"type":"resync"}})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -680,9 +680,9 @@ async fn serve_session_with_heartbeat(
                 // fresh interval, but a half-sent encrypted message still has its own deadline.
                 ensure!(!calls.is_empty() || received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed.is_some() || session.observation.is_some() { principal(&node, &session).await?; }
+                if session.subscribed.is_some() || session.observation.is_some() { authority.principal(&node, &session)?; }
                 if guest.is_some() {
-                    if principal(&node, &session).await.is_ok() { guest = None; }
+                    if authority.principal(&node, &session).is_ok() { guest = None; }
                     else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
                 }
                 if let Some(observation) = &session.observation { observation.refresh(); }
@@ -690,17 +690,17 @@ async fn serve_session_with_heartbeat(
             }
             changed = membership.changed() => {
                 changed.context("membership state closed")?;
-                calls.check_authority(&node, &session).await?;
+                calls.check_authority(&node, &session, &authority)?;
                 // A removed device loses its subscription at once, not at the next heartbeat; one
                 // whose management permission changed reconnects to pick up the new principal.
                 if session.subscribed.is_some() || session.observation.is_some() {
-                    let now = principal(&node, &session).await?.can_manage;
+                    let now = authority.principal(&node, &session)?.can_manage;
                     ensure!(session.subscribed.is_none_or(|was| was == now), "this device's management permission changed");
                 }
             }
             changed = local_changes.changed(), if session.cookie.is_some() => {
                 changed.context("local access state closed")?;
-                if is_local_only(&node, &session).await? {
+                if authority.principal(&node, &session).is_err() {
                     bail!("local browser access was revoked");
                 }
             }
@@ -934,11 +934,15 @@ async fn dispatch(
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.
             let principal = principal(node, session).await?;
             session.subscribed = Some(principal.can_manage);
-            let vector: std::collections::BTreeMap<String, u64> = { let network = principal.network_id.clone();
-                node.store.call("subscribe_heads", move |store| store.heads(&network)).await }?
-                .into_iter()
-                .map(|(author, (seq, _))| (author, seq))
-                .collect();
+            let vector: std::collections::BTreeMap<String, u64> = {
+                let network = principal.network_id.clone();
+                node.store
+                    .call("subscribe_heads", move |store| store.heads(&network))
+                    .await
+            }?
+            .into_iter()
+            .map(|(author, (seq, _))| (author, seq))
+            .collect();
             let behind = params["vector"].as_object().is_some_and(|seen| {
                 seen.iter().any(|(author, seq)| {
                     seq.as_u64()
@@ -996,8 +1000,14 @@ async fn dispatch(
         "invite" => {
             manager_view(node, session).await?;
             let record: InviteRecord = from_field(&params, "record")?;
-            let join_id = { let device = session.device_id.clone();
-                node.store.call("register_invite", move |store| store.register_invite(&record, &device)).await }?;
+            let join_id = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("register_invite", move |store| {
+                        store.register_invite(&record, &device)
+                    })
+                    .await
+            }?;
             Ok(json!({"join_id":join_id,"entry":node.share_link()?.to_string()}))
         }
         "entrances" => {
@@ -1008,8 +1018,15 @@ async fn dispatch(
             )
         }
         "join_check" => {
-            let state = { let secret = text(&params, "secret")?.to_owned(); let device = session.device_id.clone();
-                node.store.call("invite_state", move |store| store.invite_state(&secret, &device)).await }?;
+            let state = {
+                let secret = text(&params, "secret")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("invite_state", move |store| {
+                        store.invite_state(&secret, &device)
+                    })
+                    .await
+            }?;
             Ok(json!({"invite":state}))
         }
         "join" => {
@@ -1018,18 +1035,24 @@ async fn dispatch(
                 join.public_key == session.device_id,
                 "join key differs from this channel's device"
             );
-            let request = { let device = session.device_id.clone();
-                node.store.call("join", move |store| store.join(&join, &device)).await }?;
+            let request = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("join", move |store| store.join(&join, &device))
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
             let Some(join_id) = params.get("join_id") else {
                 manager_view(node, session).await?;
-                let mut pending = serde_json::to_value(
-                    { let device = session.device_id.clone();
-                    node.store.call("pending_joins", move |store| store.pending_joins(&device)).await }?,
-                )?;
+                let mut pending = serde_json::to_value({
+                    let device = session.device_id.clone();
+                    node.store
+                        .call("pending_joins", move |store| store.pending_joins(&device))
+                        .await
+                }?)?;
                 // A join waits on the Node whose invite it used; managers see it from any entry.
                 if let Some(local) = pending.as_array_mut() {
                     for remote in node.remote_joins(&session.device_id).await {
@@ -1045,10 +1068,16 @@ async fn dispatch(
             };
             let join_id = join_id.as_str().context("join_id must be a string")?;
             let reveal = params.get("reveal").and_then(Value::as_str);
-            let request =
-                { let join_id = join_id.to_owned(); let device = session.device_id.clone();
-                    let reveal = reveal.map(str::to_owned);
-                    node.store.call("join_status", move |store| store.join_status(&join_id, &device, reveal.as_deref())).await }?;
+            let request = {
+                let join_id = join_id.to_owned();
+                let device = session.device_id.clone();
+                let reveal = reveal.map(str::to_owned);
+                node.store
+                    .call("join_status", move |store| {
+                        store.join_status(&join_id, &device, reveal.as_deref())
+                    })
+                    .await
+            }?;
             if reveal.is_some() {
                 node.join_changed(&request.network_id);
             }
@@ -1062,22 +1091,37 @@ async fn dispatch(
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
                 state.project()?.member(&session.device_id)?;
-                result["addresses"] = json!(node.store.call("address_book", |store| store.address_book()).await?);
+                result["addresses"] = json!(
+                    node.store
+                        .call("address_book", |store| store.address_book())
+                        .await?
+                );
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
         }
         "join_withdraw" => {
-            let request = { let join_id = text(&params, "join_id")?.to_owned(); let device = session.device_id.clone();
-                node.store.call("withdraw_join", move |store| store.withdraw_join(&join_id, &device)).await }?;
+            let request = {
+                let join_id = text(&params, "join_id")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("withdraw_join", move |store| {
+                        store.withdraw_join(&join_id, &device)
+                    })
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
             manager_view(node, session).await?;
             let join_id = text(&params, "join_id")?;
-            if { let join_id = join_id.to_owned();
-                node.store.call("holds_join", move |store| store.holds_join(&join_id)).await }? {
+            if {
+                let join_id = join_id.to_owned();
+                node.store
+                    .call("holds_join", move |store| store.holds_join(&join_id))
+                    .await
+            }? {
                 approve_join(node, &session.device_id, &params).await
             } else {
                 node.forward_join_approval(&session.device_id, &params)
@@ -1250,8 +1294,12 @@ async fn dispatch(
                 })
                 .context("recovery key does not own this personal network")?;
             state.check_root(key, now as u64, false)?;
-            let heads = { let network = state.genesis.network_id.clone();
-                node.store.call("heads", move |store| store.heads(&network)).await }?;
+            let heads = {
+                let network = state.genesis.network_id.clone();
+                node.store
+                    .call("heads", move |store| store.heads(&network))
+                    .await
+            }?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1344,9 +1392,16 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
             incoming.recover_at(next, now)?;
         }
         stays(&incoming.project_at(now)?, &node_id)?;
-        { let incoming = incoming.clone(); let capability = text(params, "capability")?.to_owned();
+        {
+            let incoming = incoming.clone();
+            let capability = text(params, "capability")?.to_owned();
             let device = session.device_id.clone();
-            node.store.call("bootstrap_network", move |store| store.bootstrap_network(incoming, &capability, &device)).await }?;
+            node.store
+                .call("bootstrap_network", move |store| {
+                    store.bootstrap_network(incoming, &capability, &device)
+                })
+                .await
+        }?;
         node.install_membership(incoming).await?;
         return Ok(());
     }
@@ -1419,16 +1474,38 @@ pub(crate) async fn approve_join(
 ) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
-        { let join_id = join_id.to_owned(); let admin = admin.to_owned();
-            node.store.call("reject_join", move |store| store.reject_join(&join_id, &admin)).await }?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("reject_join", move |store| {
+                    store.reject_join(&join_id, &admin)
+                })
+                .await
+        }?
     } else if let Some(nonce) = params.get("admin_nonce") {
         let nonce = nonce.as_str().context("admin_nonce must be a string")?;
-        { let join_id = join_id.to_owned(); let admin = admin.to_owned(); let nonce = nonce.to_owned();
-            node.store.call("approve_nonce", move |store| store.approve_nonce(&join_id, &admin, &nonce)).await }?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            let nonce = nonce.to_owned();
+            node.store
+                .call("approve_nonce", move |store| {
+                    store.approve_nonce(&join_id, &admin, &nonce)
+                })
+                .await
+        }?
     } else {
         let event: GovernanceEvent = from_field(params, "event")?;
-        let (request, state) = { let join_id = join_id.to_owned(); let admin = admin.to_owned();
-            node.store.call("approve_grant", move |store| store.approve_grant(&join_id, &admin, event)).await }?;
+        let (request, state) = {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("approve_grant", move |store| {
+                    store.approve_grant(&join_id, &admin, event)
+                })
+                .await
+        }?;
         node.install_membership(state.clone()).await?;
         request
     };
@@ -1459,27 +1536,8 @@ async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> 
 async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
     let view = node.membership_state().await?.project()?;
     let node_id = node.identity.device_id()?;
-    ensure!(
-        view.revocation(&node_id).is_none(),
-        "this Node has been removed from the personal network"
-    );
-    if session.operator {
-        return Ok(Principal {
-            source: "local_operator",
-            network_id: view.network_id,
-            device_id: node_id,
-            epoch: view.epoch,
-            can_manage: false,
-        });
-    }
-    if let Ok(member) = view.client(&session.device_id) {
-        return Ok(Principal {
-            source: "membership",
-            network_id: view.network_id,
-            device_id: member.device_id,
-            epoch: view.epoch,
-            can_manage: member.manage,
-        });
+    if let Some(principal) = member_principal(&view, &node_id, session)? {
+        return Ok(principal);
     }
     let cookie = session
         .cookie
@@ -1500,6 +1558,36 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
         epoch: view.epoch,
         can_manage: false,
     })
+}
+
+fn member_principal(
+    view: &AuthorizationView,
+    node_id: &str,
+    session: &Session,
+) -> Result<Option<Principal>> {
+    ensure!(
+        view.revocation(node_id).is_none(),
+        "this Node has been removed from the personal network"
+    );
+    if session.operator {
+        return Ok(Some(Principal {
+            source: "local_operator",
+            network_id: view.network_id.clone(),
+            device_id: node_id.to_owned(),
+            epoch: view.epoch,
+            can_manage: false,
+        }));
+    }
+    if let Ok(member) = view.client(&session.device_id) {
+        return Ok(Some(Principal {
+            source: "membership",
+            network_id: view.network_id.clone(),
+            device_id: member.device_id,
+            epoch: view.epoch,
+            can_manage: member.manage,
+        }));
+    }
+    Ok(None)
 }
 
 /// Starting over is for the owner at this computer, once the signed removal is installed here.
@@ -1627,16 +1715,22 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
                 json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state,"now_ms":now}),
             )
         }
-        Err(_) => Ok(
-            json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
-        ),
+        Err(_) => {
+            let recovery = recovery_status(&state, &view, &session.device_id)?;
+            let owns_recovery = !recovery.is_null();
+            let mut result = json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery,"now_ms":now});
+            if owns_recovery {
+                result["network_id"] = json!(view.network_id);
+            }
+            Ok(result)
+        }
     }
 }
 
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+        return Ok(json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}));
     }
     for checkpoint in &state.checkpoints {
         if checkpoint
@@ -1645,7 +1739,7 @@ fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str)
             .is_some_and(|d| manages(&d.members))
             && view.stopped.contains(&checkpoint.hash()?)
         {
-            return Ok(json!({"status":"stopped"}));
+            return Ok(json!({"status":"stopped","checkpoint_hash":checkpoint.hash()?}));
         }
     }
     Ok(Value::Null)
@@ -1671,7 +1765,14 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     }
     if matches!(
         input["method"].as_str(),
-        Some("message" | "presence" | "notifications" | "ack" | "workspace_command_receipt" | "signed_receipt")
+        Some(
+            "message"
+                | "presence"
+                | "notifications"
+                | "ack"
+                | "workspace_command_receipt"
+                | "signed_receipt"
+        )
     ) {
         input
             .as_object_mut()
@@ -1862,8 +1963,14 @@ async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Resul
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    { let capability = text(params, "capability")?.to_owned();
-        node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
+    {
+        let capability = text(params, "capability")?.to_owned();
+        node.store
+            .call("verify_bootstrap_capability", move |store| {
+                store.verify_bootstrap_capability(&capability)
+            })
+            .await
+    }?;
     let ticket = parse_join_link(text(params, "link")?)?;
     let link = JoinLink::open(node, &ticket).await?;
     let reply = link
@@ -1921,8 +2028,14 @@ pub(crate) async fn start_node_join(
         "this Node already belongs to a personal network"
     );
     if let JoinOwner::Page(capability) = &owner {
-        { let capability = capability.clone();
-            node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
+        {
+            let capability = capability.clone();
+            node.store
+                .call("verify_bootstrap_capability", move |store| {
+                    store.verify_bootstrap_capability(&capability)
+                })
+                .await
+        }?;
     }
     let mut slot = node
         .node_join
@@ -2674,7 +2787,12 @@ mod tests {
             signature: String::new(),
         };
         record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
-        target.store.call("fixture_invite", move |store| store.register_invite(&record, &record.issuer)).await?;
+        target
+            .store
+            .call("fixture_invite", move |store| {
+                store.register_invite(&record, &record.issuer)
+            })
+            .await?;
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,
@@ -4553,8 +4671,15 @@ mod tests {
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
             assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
+            assert_eq!(waiting["network_id"], network);
+            assert_eq!(waiting["recovery"]["checkpoint_hash"], checkpoint.hash()?);
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"], waiting["recovery"], "readback preserves the exact recovery checkpoint");
+            let mut unrelated = connect(LocalIdentity::generate()).await?;
+            let unrelated_auth = unrelated.call("authenticate", json!({})).await?;
+            assert!(unrelated_auth["recovery"].is_null(), "another device cannot read the waiting recovery summary");
+            assert!(unrelated_auth.get("network_id").is_none());
             assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
             let seen = manager.call("authenticate", json!({})).await?;
             assert_eq!((&seen["view"]["pending"]["checkpoint"], &seen["recovery_since_ms"]), (&json!(checkpoint.hash()?), &first_since));
@@ -4564,7 +4689,13 @@ mod tests {
             let stopped = manager.call("veto", json!({"event":veto})).await?;
             assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
             assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
-            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            let stopped_summary = recovering.call("authenticate", json!({})).await?;
+            assert_eq!(stopped_summary["recovery"], json!({"status":"stopped","checkpoint_hash":checkpoint.hash()?}));
+            assert_eq!(stopped_summary["network_id"], network);
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"], stopped_summary["recovery"]);
+            let unrelated_auth = unrelated.call("authenticate", json!({})).await?;
+            assert!(unrelated_auth["recovery"].is_null(), "another device cannot read the stopped recovery summary");
+            assert!(unrelated_auth.get("network_id").is_none());
             refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
             recovering.call("recovery_state", read(&root)?).await?;
             // A guest sends events only to carry its file's vetoes; anything else is dropped.

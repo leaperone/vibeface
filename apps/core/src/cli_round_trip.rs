@@ -5,7 +5,7 @@ use crate::{crypto::LocalIdentity, runtime::Runtime};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{path::Path, sync::Arc, time::Duration};
-use vibeface_client::{self, ClientKey, Enrollment, Entry, Progress};
+use vibeface_client::{self as client, ClientKey, Enrollment, Entry, Progress};
 
 const PASSPHRASE: &str = "synthetic client passphrase";
 const PASSWORD: &str = "synthetic recovery password";
@@ -61,8 +61,8 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let mut admin = key(&dir, "admin")?;
         let admin_id = admin.device_id().to_owned();
         let recovery = dir.join("recovery.json");
-        let created = client::create_network(
-            &mut admin,
+        let plan = client::prepare_create(
+            &admin,
             entry.clone(),
             &capability.capability,
             "admin",
@@ -71,6 +71,15 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             PASSWORD,
         )
         .await?;
+        assert!(recovery.exists());
+        assert_eq!(plan.state(),client::IdentityOperationState::Prepared);
+        assert!(!node.has_membership().await?,"preparing a backup never initializes the Node");
+        drop(plan);
+        let mut plan=client::IdentityPlan::load(&admin,PASSWORD)?;
+        let created=plan.submit(&mut admin).await?;
+        plan.reconcile(&mut admin).await?;
+        assert_eq!(plan.state(),client::IdentityOperationState::Applied);
+        plan.discard()?;
         assert_eq!(created["principal"]["can_manage"], true);
         assert!(view().await?.member(&admin_id)?.manage);
         let settings = crate::client::operator_call(&node, "node_settings", json!({})).await?;
@@ -159,8 +168,8 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         // A recovery file starts a recovery; a manager stops one and approves the next.
         let mut rescuer = key(&dir, "rescuer")?;
         let rescuer_id = rescuer.device_id().to_owned();
-        client::recover(
-            &mut rescuer,
+        let mut first_recovery=client::prepare_recovery(
+            &rescuer,
             entry.clone(),
             &recovery,
             PASSWORD,
@@ -169,12 +178,24 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             None,
         )
         .await?;
+        assert!(view().await?.pending.is_none(),"saving the new backup does not rotate the root");
+        first_recovery.submit(&mut rescuer).await?;
+        first_recovery.reconcile(&mut rescuer).await?;
+        assert_eq!(first_recovery.state(),client::IdentityOperationState::Recorded);
+        let checkpoint_count=node.membership_state().await?.checkpoints.len();
+        drop(first_recovery);
+        let mut first_recovery=client::IdentityPlan::load(&rescuer,PASSWORD)?;
+        first_recovery.submit(&mut rescuer).await?;
+        assert_eq!(node.membership_state().await?.checkpoints.len(),checkpoint_count,"reopened recorded operation only reads its receipt");
         assert!(view().await?.pending.is_some());
         let mut session = admin.connect(None).await?;
         session.settle_recovery(false).await?;
         assert!(view().await?.pending.is_none());
-        client::recover(
-            &mut rescuer,
+        first_recovery.reconcile(&mut rescuer).await?;
+        assert_eq!(first_recovery.state(),client::IdentityOperationState::Stopped);
+        first_recovery.discard()?;
+        let mut second_recovery=client::prepare_recovery(
+            &rescuer,
             entry.clone(),
             &recovery,
             PASSWORD,
@@ -183,7 +204,11 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             None,
         )
         .await?;
+        second_recovery.submit(&mut rescuer).await?;
         session.settle_recovery(true).await?;
+        second_recovery.reconcile(&mut rescuer).await?;
+        assert_eq!(second_recovery.state(),client::IdentityOperationState::Applied);
+        second_recovery.discard()?;
         let view = view().await?;
         assert!(view.pending.is_none());
         assert!(view.member(&rescuer_id)?.manage);

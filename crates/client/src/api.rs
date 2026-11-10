@@ -4,21 +4,33 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, Semaphore};
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 use crate::{ClientKey, Connection, Endpoint, wire::*, outbox::{Operation, Outbox, Reconciliation}};
 pub use crate::outbox::{OperationSnapshot, OperationState};
 
 #[derive(Clone, Debug)]
 pub enum ReadRequest {
-    Home, Conversation { conversation_id: String }, Workspace, Nodes, NodeSettings,
-    Logs, Diagnostics, Questions, Notifications, RelaySettings, TriageSettings,
+    WriteState, Home, Conversation { conversation_id: String }, Workspace, WorkspaceOverview,
+    WorkspaceHistory {channel_id:Option<String>,task_id:Option<String>,limit:usize}, Nodes, NodeSettings,
+    Logs, LogsFiltered(LogFilter), Diagnostics, Questions, Notifications, RelaySettings, TriageSettings,
     ProviderModels { provider: Provider }, ProviderProbe { provider: Provider },
     Memory { conversation_id: String, memory_id: String },
     Work { conversation_id: String, work_id: String },
     Context { conversation_id: String, target: InputTarget },
     Artifact { conversation_id: String, blob_hash: String, offset: u64, limit: u64 },
+    ArtifactBytes {conversation_id:String,blob_hash:String,offset:u64},
     Delivery(DeliveryRead),
 }
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="lowercase")]
+pub enum LogLevel {Trace,Debug,Info,Warn,Error}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="lowercase")]
+pub enum LogSource {Node,Web,Agent,Cli,Codex,Cursor}
+#[derive(Clone,Debug,Default,Serialize,Deserialize)]
+pub struct LogFilter {pub since_ms:Option<i64>,pub until_ms:Option<i64>,pub level:Option<LogLevel>,pub sources:Vec<LogSource>,pub conversation_id:Option<String>,pub work_id:Option<String>,pub text:Option<String>,pub limit:Option<usize>}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ClientAuthority {Membership {can_manage:bool},LocalSession}
 #[derive(Clone, Debug)]
 pub enum DeliveryRead { Status, List, Providers, Get { order_id: String }, FindIntent { intent_id: String }, Read { order_id: String } }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,6 +103,9 @@ pub enum DeliveryAction {
     Configure { enabled: bool, charity_enabled: bool, paid_enabled: bool },
     Prepare(DeliveryPrepare), Confirm { intent_id: String }, Accept { order_id: String }, Reconcile { order_id: String },
 }
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum ResolveOutcome {Completed,Failed,Interrupted}
 #[derive(Clone)]
 pub enum Action {
     Input { conversation_id: String, input: InputRequest },
@@ -109,7 +124,9 @@ pub enum Action {
     NodeSettings(NodeSettings), ProviderSettings(ProviderSettings), Triage(TriageSettings),
     Relay { volunteer: bool, listen: Option<String>, url: Option<String>, rate: Option<std::num::NonZeroU32>, max_clients: Option<std::num::NonZeroUsize>, max_clients_per_ip: Option<std::num::NonZeroUsize> },
     CreateDecisionToken {label:String}, RevokeDecisionToken {token_id:String},
-    TestWebhook,
+    TestWebhook, ConfirmWritable,
+    AckNotification {conversation_id:String,notification_id:String},
+    ResolveCheck {conversation_id:String,check_id:String,work_id:Option<String>,outcome:Option<ResolveOutcome>,note:String},
     Delivery(DeliveryAction),
 }
 #[derive(Clone, Debug)]
@@ -118,28 +135,50 @@ pub struct ClientEvent { pub generation: String, pub network_id: String, pub pay
 #[derive(Clone)]
 pub struct Client {
     key: Arc<ClientKey>, connection: Connection, target: String,
+    network:String,authority:ClientAuthority,
     outbox: Arc<Mutex<Outbox>>, events: broadcast::Sender<ClientEvent>,
     generation: String,
     writes: Arc<Semaphore>,
     decision_tokens: Arc<Mutex<BTreeMap<String,DecisionToken>>>,
+    active: Arc<AtomicBool>,
 }
 
 impl Client {
     pub async fn open(key: Arc<ClientKey>, endpoint: Endpoint, outbox_dir: PathBuf) -> Result<Self> {
-        let network = key.network_id().context("client is not enrolled")?.to_owned();
+        let (connection,network,authority)=Self::authenticate(&key,&endpoint).await?;
+        let client_id=key.device_id().to_owned();
+        let outbox_network=network.clone();
+        let outbox=tokio::task::spawn_blocking(move||Outbox::open(&outbox_dir,&outbox_network,&client_id)).await??;
+        Self::attach(key,endpoint,connection,network,authority,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new()))).await
+    }
+    pub async fn open_local(key:Arc<ClientKey>,grant:crate::LocalGrant,outbox_dir:PathBuf)->Result<Self> {
+        Self::open(key,Endpoint::Local(grant),outbox_dir).await
+    }
+    async fn authenticate(key:&ClientKey, endpoint:&Endpoint)->Result<(Connection,String,ClientAuthority)> {
+        let network = match endpoint {Endpoint::Local(grant)=>{ensure!(grant.client_id()==key.device_id(),"local grant belongs to another client");grant.network_id()},_=>key.network_id().context("client is not enrolled")?}.to_owned();
+        ensure!(key.network_id().is_none_or(|known|known==network),"entry belongs to another personal network");
         let connection = Connection::open_endpoint(&endpoint, &key.identity).await?;
-        connection.call("authenticate", json!({})).await?;
+        let authentication=connection.call("authenticate", json!({})).await?;
+        ensure!(authentication["network_id"]==network && authentication["principal"]["device_id"]==key.device_id(),"principal identity mismatch");
         let mut directory = connection.call("directory", json!({})).await?;
         let state: vibeface_secure::membership::NetworkState = serde_json::from_value(directory["state"].take())?;
         ensure!(state.genesis.network_id == network, "Node answered for another network");
         let now = directory["now_ms"].as_u64().context("directory time missing")?;
         let view = state.project_at(now)?;
-        view.client(key.device_id())?;
+        let authority=if key.network_id().is_some() && authentication["principal"]["source"]=="membership" {
+            let member=view.client(key.device_id())?;
+            ensure!(authentication["principal"]["can_manage"]==member.manage,"principal permission mismatch");
+            ClientAuthority::Membership {can_manage:member.manage}
+        } else {
+            ensure!(matches!(endpoint,Endpoint::Local(_)) && matches!(authentication["principal"]["source"].as_str(),Some("local_session"|"membership")),"client has no enrolled membership or local grant");
+            ClientAuthority::LocalSession
+        };
         let node = view.member(endpoint.node_id())?;
         ensure!(node.kind == vibeface_secure::membership::IdentityKind::Node, "endpoint is not a network Node");
-        let client_id = key.device_id().to_owned();
-        let outbox_network = network.clone();
-        let outbox = tokio::task::spawn_blocking(move || Outbox::open(&outbox_dir, &outbox_network, &client_id)).await??;
+        Ok((connection,network,authority))
+    }
+    async fn attach(key:Arc<ClientKey>,endpoint:Endpoint,connection:Connection,network:String,authority:ClientAuthority,outbox:Arc<Mutex<Outbox>>,writes:Arc<Semaphore>,decision_tokens:Arc<Mutex<BTreeMap<String,DecisionToken>>>)->Result<Self> {
+        let event_network=network.clone();
         let (events, _) = broadcast::channel(128);
         let generation = uuid::Uuid::new_v4().to_string();
         let mut pushes = connection.subscribe();
@@ -150,19 +189,32 @@ impl Client {
                 let payload = match pushes.recv().await {
                     Ok(value) => value,
                     Err(broadcast::error::RecvError::Lagged(_)) => json!({"type":"resync_required"}),
-                    Err(broadcast::error::RecvError::Closed) => { let _=updates.send(ClientEvent {generation:token.clone(),network_id:network.clone(),payload:json!({"type":"disconnected"})}); break; }
+                    Err(broadcast::error::RecvError::Closed) => { let _=updates.send(ClientEvent {generation:token.clone(),network_id:event_network.clone(),payload:json!({"type":"disconnected"})}); break; }
                 };
-                let _ = updates.send(ClientEvent { generation:token.clone(), network_id:network.clone(), payload });
+                let _ = updates.send(ClientEvent { generation:token.clone(), network_id:event_network.clone(), payload });
             }
         });
         connection.call("subscribe",json!({})).await?;
-        Ok(Self { key, connection, target:endpoint.node_id().into(), outbox:Arc::new(Mutex::new(outbox)), events, generation, writes:Arc::new(Semaphore::new(8)), decision_tokens:Arc::new(Mutex::new(BTreeMap::new())) })
+        Ok(Self {key,connection,target:endpoint.node_id().into(),network,authority,outbox,events,generation,writes,decision_tokens,active:Arc::new(AtomicBool::new(true))})
     }
+    /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
+    pub async fn reconnect(&self,endpoint:Endpoint)->Result<Self> {
+        let (connection,network,authority)=Self::authenticate(&self.key,&endpoint).await?;
+        ensure!(network==self.network,"reconnect cannot switch outbox networks");
+        let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
+        self.close();
+        Ok(next)
+    }
+    /// Stops queued calls. A request already crossing the transport remains unknown until reconciled.
+    pub fn close(&self) { self.active.store(false,Ordering::Release);self.connection.close(); }
+    fn require_active(&self)->Result<()> { ensure!(self.active.load(Ordering::Acquire),"client generation is closed");Ok(()) }
     pub fn take_decision_token(&self, operation_id:&str)->Result<Option<DecisionToken>> {
         Ok(self.decision_tokens.lock().map_err(|_|anyhow::anyhow!("token lock poisoned"))?.remove(operation_id))
     }
     pub fn generation(&self) -> &str { &self.generation }
-    pub fn network_id(&self) -> &str { self.key.network_id().expect("validated at open") }
+    pub fn network_id(&self) -> &str { &self.network }
+    pub fn authority(&self)->ClientAuthority {self.authority}
+    pub fn can_write(&self)->bool {matches!(self.authority,ClientAuthority::Membership {..})}
     pub fn client_id(&self) -> &str { self.key.device_id() }
     pub fn subscribe(&self) -> broadcast::Receiver<ClientEvent> { self.events.subscribe() }
     async fn stored<T: Send + 'static>(&self, task: impl FnOnce(&mut Outbox)->Result<T> + Send + 'static) -> Result<T> {
@@ -170,35 +222,46 @@ impl Client {
         tokio::task::spawn_blocking(move || { let mut store=outbox.lock().map_err(|_|anyhow::anyhow!("outbox lock poisoned"))?; task(&mut store) }).await?
     }
     pub async fn next_input_sequence(&self, conversation_id: &str, target: &InputTarget) -> Result<u64> {
-        let lane=format!("input:{}:{}",conversation_id,serde_json::to_string(target)?);
+        ensure!(self.can_write(),"local session cannot submit network inputs");
+        let lane=input_lane(conversation_id,target)?;
         self.stored(move|db|db.reserve_sequence(&lane)).await
     }
     pub async fn pending(&self) -> Result<Vec<OperationSnapshot>> { self.stored(|db|db.snapshots()).await }
     pub async fn store_attachment(&self, name: String, data: Vec<u8>) -> Result<Attachment> { self.stored(move|db|db.store_attachment(&name,&data)).await }
     pub async fn read(&self, request: ReadRequest) -> Result<Value> {
+        self.require_active()?;
         let (rpc, method, mut params) = request.wire();
         if rpc { params["method"]=json!(method); self.connection.call("rpc",params).await }
         else { self.connection.call(method,params).await }
     }
     /// The worker owns the operation after queueing; cancelling the UI future cannot interrupt persistence/send/settlement.
     pub async fn submit(&self, action: Action) -> Result<OperationSnapshot> {
+        self.require_active()?;
+        ensure!(self.can_write(),"local session is read-only; enroll this client before writing");
         let permit=self.writes.clone().acquire_owned().await?;
         let client=self.clone();
         tokio::spawn(async move { let _permit=permit; client.submit_owned(action).await }).await?
     }
     async fn submit_owned(&self, action: Action) -> Result<OperationSnapshot> {
+        self.require_active()?;
         let operation=self.prepare(action)?;
         let id=operation.snapshot.id.clone();
         self.stored(move|db|db.prepare(&operation)).await?;
         let lookup=id.clone();
         let existing=self.stored(move|db|db.get(&lookup)).await?;
         if existing.snapshot.state!=OperationState::Prepared { return Ok(existing.snapshot); }
+        self.send_prepared(id).await
+    }
+    async fn send_prepared(&self,id:String)->Result<OperationSnapshot> {
+        self.require_active()?;
         let operation=self.stored(move|db|db.begin(&id)).await?;
         let id=operation.snapshot.id.clone();
         let sent = async {
+            self.require_active()?;
             if let Some(conversation_id)=&operation.upload_scope {
                 for attachment in &operation.attachments { self.upload(conversation_id,attachment).await?; }
             }
+            self.require_active()?;
             self.connection.call_bytes(operation.bytes.clone()).await
         }.await;
         match sent {
@@ -221,9 +284,14 @@ impl Client {
         }
     }
     pub async fn reconcile(&self, id: &str) -> Result<OperationSnapshot> {
+        self.require_active()?;
         let id=id.to_owned();
         let op=self.stored(move|db|db.get(&id)).await?;
         ensure!(op.snapshot.target_node==self.target && op.snapshot.network_id==self.network_id() && op.snapshot.client_id==self.client_id(),"operation belongs to another endpoint or identity");
+        if op.snapshot.state==OperationState::Prepared {
+            let client=self.clone();let id=op.snapshot.id;
+            return tokio::spawn(async move{client.send_prepared(id).await}).await?;
+        }
         if op.snapshot.state!=OperationState::Unknown { return Ok(op.snapshot); }
         let result=match &op.reconciliation {
             Reconciliation::Input {conversation_id,message_id,target} => self.connection.call("rpc",json!({"method":"input_receipt","conversation_id":conversation_id,"message_id":message_id,"target":target})).await?,
@@ -296,6 +364,7 @@ impl Client {
         let mut offset=0usize;
         let mut attempts=0usize;
         while offset < data.len() {
+            self.require_active()?;
             attempts+=1; ensure!(attempts<=data.len()/65536+3,"attachment upload did not advance");
             let end=(offset+65536).min(data.len());
             let result=self.connection.call("rpc",json!({"method":"upload_attachment","conversation_id":conversation,"hash":attachment.hash,"size":attachment.size,"offset":offset,"data":base64::engine::general_purpose::STANDARD.encode(&data[offset..end])})).await?;
@@ -331,7 +400,7 @@ impl Client {
                 reconciliation=Reconciliation::Input {conversation_id:conversation_id.clone(),message_id:id.clone(),target:input.route.target.clone()};
                 let mut body=serde_json::to_value(&input)?; body["type"]=json!("input_posted");
                 let mut params=serde_json::to_value(&input)?; params["conversation_id"]=json!(conversation_id);
-                let lane=format!("input:{}:{}",conversation_id,serde_json::to_string(&input.route.target)?);
+                let lane=input_lane(&conversation_id,&input.route.target)?;
                 (true,"message",params,lane,Some((conversation_id,body)))
             }
             Action::Workspace {command} | Action::WorkspaceWithAttachments {command,..} => {
@@ -389,6 +458,20 @@ impl Client {
             }
             Action::CreateDecisionToken {label} => (false,"create_decision_token",json!({"label":label}),"decision-token".into(),None),
             Action::RevokeDecisionToken {token_id} => (false,"revoke_decision_token",json!({"token_id":token_id}),"decision-token".into(),None),
+            Action::ConfirmWritable => (false,"confirm_writable",json!({}),"node-write-status".into(),None),
+            Action::AckNotification {conversation_id,notification_id} => {
+                let body=json!({"type":"notification_acked","notification_id":notification_id,"client_id":self.client_id()});
+                (true,"ack",json!({"notification_id":notification_id}),format!("notification:{notification_id}"),Some((conversation_id,body)))
+            }
+            Action::ResolveCheck {conversation_id,check_id,work_id,outcome,note} => {
+                let signature=if check_id.starts_with("work:") {
+                    let work_id=work_id.context("work ID required for work resolution")?;
+                    ensure!(check_id==format!("work:{work_id}"),"check does not identify this work");
+                    let outcome=outcome.as_ref().context("work outcome required")?;
+                    Some((conversation_id.clone(),json!({"type":"work_finished","work_id":work_id,"outcome":outcome,"result_text":note})))
+                } else {None};
+                (true,"resolve",json!({"conversation_id":conversation_id,"check_id":check_id,"outcome":outcome,"note":note}),format!("check:{conversation_id}:{check_id}"),signature)
+            }
             Action::TestWebhook => (false,"test_webhook",json!({}),"webhook-test".into(),None),
             Action::Delivery(action) => {
                 let params=match action {
@@ -453,12 +536,21 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
 impl ReadRequest {
     fn wire(self)->(bool,&'static str,Value) {
         match self {
+            Self::WriteState=>(false,"write_state",json!({})),
             Self::Home=>(true,"bots",json!({})),
             Self::Conversation {conversation_id}=>(true,"conversation",json!({"conversation_id":conversation_id})),
             Self::Workspace=>(true,"workspace_state",json!({})),
+            Self::WorkspaceOverview=>(true,"workspace_overview",json!({})),
+            Self::WorkspaceHistory {channel_id,task_id,limit}=>{
+                let mut params=json!({"limit":limit});
+                if let Some(id)=channel_id{params["channel_id"]=json!(id);}
+                if let Some(id)=task_id{params["task_id"]=json!(id);}
+                (true,"workspace_history",params)
+            },
             Self::Nodes=>(true,"nodes",json!({})),
             Self::NodeSettings=>(false,"node_settings",json!({})),
             Self::Logs=>(false,"logs",json!({})),
+            Self::LogsFiltered(filter)=>(false,"logs",serde_json::to_value(filter).expect("log filter contains only serializable fields")),
             Self::Diagnostics=>(false,"diagnostics",json!({})),
             Self::Questions=>(true,"questions",json!({})),
             Self::Notifications=>(true,"notifications",json!({})),
@@ -470,6 +562,7 @@ impl ReadRequest {
             Self::Work {conversation_id,work_id}=>(true,"work_detail",json!({"conversation_id":conversation_id,"work_id":work_id})),
             Self::Context {conversation_id,target}=>(true,"scope_context",json!({"conversation_id":conversation_id,"target":target})),
             Self::Artifact {conversation_id,blob_hash,offset,limit}=>(true,"read_artifact",json!({"conversation_id":conversation_id,"blob_hash":blob_hash,"offset":offset,"limit":limit})),
+            Self::ArtifactBytes {conversation_id,blob_hash,offset}=>(true,"read_artifact",json!({"conversation_id":conversation_id,"blob_hash":blob_hash,"offset":offset,"binary":true})),
             Self::Delivery(read)=>(false,"delivery",match read {
                 DeliveryRead::Status=>json!({"op":"status"}), DeliveryRead::List=>json!({"op":"list"}),DeliveryRead::Providers=>json!({"op":"providers"}),
                 DeliveryRead::Get {order_id}=>json!({"op":"get","order_id":order_id}),DeliveryRead::FindIntent {intent_id}=>json!({"op":"find_intent","intent_id":intent_id}),DeliveryRead::Read {order_id}=>json!({"op":"read","order_id":order_id}),
@@ -496,6 +589,7 @@ mod tests {
         let node_secret=node.secret_hex();
         let genesis=Genesis::create(&Identity::generate()?,Member::client(&key.identity,"fixture",true)?,Member::node(&node,"fixture-node")?)?;
         let network=genesis.network_id.clone();let state=NetworkState::new(genesis)?;
+        let fixture_client_id=key.device_id().to_owned();
         let effects=Arc::new(AtomicUsize::new(0));
         let input=InputRequest {message_id:"original-message".into(),route:InputRoute {target:InputTarget::BotMain {bot_id:"bot".into()},intent:InputIntent::Continue,sequence:1,expected_revision:None},text:"controlled input".into(),attachments:vec![],report_results:Some(true)};
         for cycle in 0..2 {
@@ -503,13 +597,14 @@ mod tests {
             let origin=format!("http://{}",listener.local_addr()?);
             let entry=crate::Entry {origin,node_id:node.device_id()};
             key.remember(&network,entry.clone())?;
-            let fixture_node=Identity::from_secret_hex(&node_secret)?;let fixture_state=state.clone();let counter=effects.clone();let fixture_input=input.clone();
+            let fixture_node=Identity::from_secret_hex(&node_secret)?;let fixture_state=state.clone();let counter=effects.clone();let fixture_input=input.clone();let fixture_client_id=fixture_client_id.clone();
             let task=tokio::spawn(async move {
                 let (mut socket,mut channel)=server(listener,&fixture_node).await?;
                 loop {
                     let request=receive(&mut socket,&mut channel).await?;
                     let result=match request["method"].as_str() {
-                        Some("authenticate"|"subscribe")=>json!({}),
+                        Some("authenticate")=>json!({"network_id":fixture_state.genesis.network_id,"principal":{"source":"membership","device_id":fixture_client_id,"can_manage":true}}),
+                        Some("subscribe")=>json!({}),
                         Some("directory")=>json!({"state":fixture_state,"now_ms":vibeface_protocol::now_ms()}),
                         Some("rpc")=>match request["params"]["method"].as_str() {
                             Some("message")=> {counter.fetch_add(1,Ordering::SeqCst); socket.close(None).await?;break;},
@@ -564,4 +659,9 @@ fn decimal_at_most(actual:&str,maximum:&str)->bool {
     if actual.is_empty()||maximum.is_empty()||!actual.bytes().chain(maximum.bytes()).all(|b|b.is_ascii_digit()) {return false;}
     let actual=actual.trim_start_matches('0');let maximum=maximum.trim_start_matches('0');
     actual.len()<maximum.len() || actual.len()==maximum.len() && actual<=maximum
+}
+
+fn input_lane(conversation_id:&str,target:&InputTarget)->Result<String> {
+    let target=match target {InputTarget::Task {task_id}|InputTarget::ChannelTask {task_id,..}=>json!(["workspace_task",task_id]),other=>serde_json::to_value(other)?};
+    Ok(format!("input:{conversation_id}:{target}"))
 }

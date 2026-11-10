@@ -133,11 +133,14 @@ struct ReplyPointer {
     prompt_hash: String,
 }
 
+type PendingResponses =
+    std::sync::Mutex<Option<HashMap<String, oneshot::Sender<transport::HeldJson>>>>;
+
 /// One pi process's commands: each goes out with an ID and its response comes back by it.
 struct Rpc {
     stdin: Mutex<Option<ChildStdin>>,
     /// `None` once pi closed its output.
-    waiting: std::sync::Mutex<Option<HashMap<String, oneshot::Sender<transport::HeldJson>>>>,
+    waiting: PendingResponses,
     responses: transport::JsonBudget,
     commands: transport::JsonBudget,
     next: AtomicU64,
@@ -420,6 +423,61 @@ impl Seen {
     }
 }
 
+/// A frame owns stdin until all its bytes and flush complete. Cancelling `write_all` may
+/// leave a prefix on the pipe, so an interrupted writer must never return to the input slot.
+struct InFlightFrame<'a, W> {
+    pipe: Option<W>,
+    slot: &'a mut Option<W>,
+    waiting: &'a PendingResponses,
+}
+
+impl<W> InFlightFrame<'_, W> {
+    fn complete(mut self) {
+        *self.slot = self.pipe.take();
+    }
+}
+
+impl<W> Drop for InFlightFrame<'_, W> {
+    fn drop(&mut self) {
+        if self.pipe.is_some() {
+            *lock(self.waiting) = None;
+            tracing::warn!("pi input frame interrupted; closing stdin and reconciling native session");
+        }
+        // An incomplete frame's pipe closes here. Its native process is left for readback.
+    }
+}
+
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    stdin: &mut Option<W>,
+    waiting: &PendingResponses,
+    bytes: &[u8],
+    started: &AtomicBool,
+    prompt_started: Option<&AtomicBool>,
+) -> Result<(), Reply> {
+    let Some(pipe) = stdin.take() else { return Err(Reply::Unsent); };
+    let mut frame = InFlightFrame { pipe: Some(pipe), slot: stdin, waiting };
+    started.store(true, Relaxed);
+    if let Some(prompt_started) = prompt_started { prompt_started.store(true, Relaxed); }
+    let pipe = frame.pipe.as_mut().expect("in-flight frame owns stdin");
+    pipe.write_all(bytes).await.map_err(|_| Reply::Lost)?;
+    pipe.flush().await.map_err(|_| Reply::Lost)?;
+    frame.complete();
+    Ok(())
+}
+
+async fn write_command<W: tokio::io::AsyncWrite + Unpin>(
+    stdin: &Mutex<Option<W>>,
+    waiting: &PendingResponses,
+    line: &Value,
+    started: &AtomicBool,
+) -> Result<(), Reply> {
+    let mut stdin = stdin.lock().await;
+    let mut bytes = transport::json(line, transport::FRAME_BYTES)
+        .map_err(|error| Reply::Refused(error.to_string()))?;
+    bytes.push(b'\n');
+    write_frame(&mut stdin, waiting, &bytes, started, None).await
+}
+
 impl Rpc {
     async fn call(&self, command: Value, within: Duration) -> Reply {
         self.call_with_prompt(command, within, None).await
@@ -444,11 +502,15 @@ impl Rpc {
             None => return Reply::Unsent,
         };
         let _pending = PendingReply { rpc: self, id };
+        let write_started = AtomicBool::new(false);
         let written = tokio::time::timeout(within, async { match prompt {
-            Some(prompt) => self.write_prompt(&command.value, prompt).await,
-            None if self.write(&command.value).await => Ok(()),
-            None => Err(Reply::Unsent),
-        }}).await.unwrap_or(Err(Reply::Lost));
+            Some(prompt) => self.write_prompt(&command.value, prompt, &write_started).await,
+            None => write_command(&self.stdin, &self.waiting, &command.value, &write_started).await,
+        }}).await.unwrap_or_else(|_| Err(if write_started.load(Relaxed) {
+            Reply::Lost
+        } else {
+            Reply::Unsent
+        }));
         if let Err(reply) = written { return reply; }
         let answer = tokio::time::timeout(within, answer).await;
         match answer {
@@ -465,7 +527,12 @@ impl Rpc {
         }
     }
 
-    async fn write_prompt(&self, line: &Value, prompt: PromptWrite<'_>) -> Result<(), Reply> {
+    async fn write_prompt(
+        &self,
+        line: &Value,
+        prompt: PromptWrite<'_>,
+        started: &AtomicBool,
+    ) -> Result<(), Reply> {
         let mut stdin = self.stdin.lock().await;
         let mut bytes = transport::json(line, transport::FRAME_BYTES)
             .map_err(|error| Reply::Refused(error.to_string()))?;
@@ -473,9 +540,7 @@ impl Rpc {
         if *prompt.cancel.borrow() {
             return Err(Reply::Refused("stopped before pi took the prompt".into()));
         }
-        let Some(pipe) = stdin.as_mut() else {
-            return Err(Reply::Unsent);
-        };
+        if stdin.is_none() { return Err(Reply::Unsent); }
         let _lease = match prompt.work {
             Some(work) => Some(
                 work.node
@@ -488,20 +553,13 @@ impl Rpc {
         if *prompt.cancel.borrow() {
             return Err(Reply::Refused("stopped before pi took the prompt".into()));
         }
-        prompt.writing.store(true, Relaxed);
-        pipe.write_all(&bytes).await.map_err(|_| Reply::Lost)?;
-        pipe.flush().await.map_err(|_| Reply::Lost)
+        write_frame(&mut stdin, &self.waiting, &bytes, started, Some(prompt.writing)).await
     }
 
     /// One JSON line on pi's input; false when pi no longer reads it.
     async fn write(&self, line: &Value) -> bool {
-        let mut stdin = self.stdin.lock().await;
-        let Ok(mut bytes) = transport::json(line, transport::FRAME_BYTES) else { return false; };
-        bytes.push(b'\n');
-        match stdin.as_mut() {
-            Some(pipe) => pipe.write_all(&bytes).await.is_ok() && pipe.flush().await.is_ok(),
-            None => false,
-        }
+        let started = AtomicBool::new(false);
+        write_command(&self.stdin, &self.waiting, line, &started).await.is_ok()
     }
 }
 
@@ -1827,6 +1885,7 @@ impl Executor for Pi {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
 
     fn rpc() -> Arc<Rpc> {
         Arc::new(Rpc {
@@ -1836,6 +1895,140 @@ mod transport_tests {
             commands: transport::JsonBudget::new(4096),
             next: AtomicU64::new(1),
         })
+    }
+
+    fn pending_response() -> (PendingResponses, oneshot::Receiver<transport::HeldJson>) {
+        let (reply, answer) = oneshot::channel();
+        (std::sync::Mutex::new(Some(HashMap::from([("pending".into(), reply)]))), answer)
+    }
+
+    #[tokio::test]
+    async fn timed_out_partial_frame_closes_stdin_and_never_appends_another_command() {
+        let (pipe, mut reader) = tokio::io::duplex(8);
+        let stdin = Mutex::new(Some(pipe));
+        let (waiting, answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"steer", "text":"a prompt longer than the pipe"});
+        let result = tokio::time::timeout(Duration::from_millis(5),
+            write_command(&stdin, &waiting, &command, &started)).await;
+        assert!(result.is_err());
+        assert!(started.load(Relaxed));
+        assert!(stdin.lock().await.is_none());
+        assert!(lock(&waiting).is_none());
+        assert!(answer.await.is_err());
+        let next = AtomicBool::new(false);
+        assert!(matches!(write_command(&stdin, &waiting, &json!({"type":"abort"}), &next).await,
+            Err(Reply::Unsent)));
+        assert!(!next.load(Relaxed));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, transport::json(&command, transport::FRAME_BYTES).unwrap()[..8]);
+        assert!(!received.contains(&b'\n'), "the partial frame never gained a second command");
+    }
+
+    #[tokio::test]
+    async fn cancelling_partial_prompt_closes_stdin_and_releases_other_rpc_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(8);
+        let mut stdin = Some(pipe);
+        let (waiting, answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let prompt_started = AtomicBool::new(false);
+        let (stop, mut cancel) = watch::channel(false);
+        let bytes = b"{\"type\":\"prompt\",\"text\":\"long partial prompt\"}\n";
+        {
+            let writing = write_frame(&mut stdin, &waiting, bytes, &started, Some(&prompt_started));
+            tokio::pin!(writing);
+            assert!(futures_util::poll!(writing.as_mut()).is_pending());
+            stop.send(true).unwrap();
+            tokio::select! {
+                biased;
+                _ = agent::wait_for_cancel(&mut cancel) => {},
+                _ = &mut writing => panic!("the undrained pipe cannot finish this frame"),
+            }
+            // Dropping the selected-away write future is the same cancellation used by begin.
+        }
+        assert!(started.load(Relaxed) && prompt_started.load(Relaxed));
+        assert!(stdin.is_none());
+        assert!(lock(&waiting).is_none());
+        assert!(answer.await.is_err());
+        let next = AtomicBool::new(false);
+        assert!(matches!(write_frame(&mut stdin, &waiting, b"next\n", &next, None).await,
+            Err(Reply::Unsent)));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, bytes[..8]);
+        assert!(!next.load(Relaxed));
+    }
+
+    #[tokio::test]
+    async fn timeout_before_writing_keeps_stdin_and_does_not_poison_other_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let held = stdin.lock().await;
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        assert!(tokio::time::timeout(Duration::from_millis(5),
+            write_command(&stdin, &waiting, &json!({"type":"abort"}), &started)).await.is_err());
+        assert!(!started.load(Relaxed));
+        assert!(held.is_some());
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        drop(held);
+        let command = json!({"type":"get_state"});
+        assert!(write_command(&stdin, &waiting, &command, &started).await.is_ok());
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        let mut expected = transport::json(&command, transport::FRAME_BYTES).unwrap();
+        expected.push(b'\n');
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_writing_keeps_stdin_and_pending_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let held = stdin.lock().await;
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"abort"});
+        {
+            let writing = write_command(&stdin, &waiting, &command, &started);
+            tokio::pin!(writing);
+            assert!(futures_util::poll!(writing.as_mut()).is_pending());
+        }
+        assert!(!started.load(Relaxed));
+        assert!(held.is_some());
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        drop(held);
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_complete_frame_keeps_stdin_for_readback_commands() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"get_state"});
+        {
+            let call = async {
+                assert!(write_command(&stdin, &waiting, &command, &started).await.is_ok());
+                std::future::pending::<()>().await;
+            };
+            tokio::pin!(call);
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+        }
+        assert!(started.load(Relaxed));
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        let mut expected = transport::json(&command, transport::FRAME_BYTES).unwrap();
+        expected.push(b'\n');
+        assert_eq!(received, expected);
     }
 
     #[tokio::test]

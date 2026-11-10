@@ -6,8 +6,9 @@ use crate::{
     model::*,
     scheduling::{AdmissionReceipt, TriggerKind, task_trigger},
     work::{
-        Dispatch, DispatchState, Handle, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
-        WorkRecord, WorkRequest, WorkSpec, WorkState, RECONCILE_GRACE_MS, accept, transition,
+        Dispatch, DispatchState, Handle, RECONCILE_GRACE_MS, RequestedWorkKind, Signal,
+        StopRequest, WorkAdmission, WorkRecord, WorkRequest, WorkSpec, WorkState, accept,
+        transition,
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -85,9 +86,11 @@ fn query_runs(
     filter: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<WorkRecord>> {
-    query_runs_sql(connection, &format!(
-        "SELECT {RUN_COLUMNS} FROM work_runs WHERE {filter} ORDER BY work_id"
-    ), params)
+    query_runs_sql(
+        connection,
+        &format!("SELECT {RUN_COLUMNS} FROM work_runs WHERE {filter} ORDER BY work_id"),
+        params,
+    )
 }
 
 fn query_runs_sql(
@@ -96,15 +99,28 @@ fn query_runs_sql(
     params: impl rusqlite::Params,
 ) -> Result<Vec<WorkRecord>> {
     let mut statement = connection.prepare(sql)?;
-    let rows = statement.query_map(params, run_row)?
+    let rows = statement
+        .query_map(params, run_row)?
         .collect::<rusqlite::Result<Vec<RunRow>>>()?;
     rows.into_iter().map(record_from).collect()
 }
 
 fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     Ok((
-        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-        r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+        r.get(13)?,
     ))
 }
 
@@ -522,8 +538,11 @@ impl Store {
         } else {
             "kind<>?1 AND state IN ('accepted','starting') AND send_by_ms<=?2"
         };
-        query_runs(&self.connection, filter,
-            params![enum_text(&WorkKind::Task), at - RECONCILE_GRACE_MS])
+        query_runs(
+            &self.connection,
+            filter,
+            params![enum_text(&WorkKind::Task), at - RECONCILE_GRACE_MS],
+        )
     }
 
     /// The runs on one App Server thread, by index: a streamed event reads only these.
@@ -579,14 +598,21 @@ impl Store {
 /// A run that has not started stays unstarted once the user settled it; a running one keeps
 /// going and its late result stays on record without reporting again.
 fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
-    let columns = RUN_COLUMNS.split(',').map(|column| format!("r.{column}"))
-        .collect::<Vec<_>>().join(",");
+    let columns = RUN_COLUMNS
+        .split(',')
+        .map(|column| format!("r.{column}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!("SELECT {columns},json_extract(w.finish,'$.outcome') FROM work_runs r CROSS JOIN works w
         WHERE w.network_id=?1 AND w.work_id=r.work_id AND r.state IN ('unverified','accepted','starting')
             AND w.dispatch IS NOT NULL AND w.finish IS NOT NULL
             AND json_extract(w.finish,'$.outcome')<>?2 ORDER BY r.work_id");
-    let rows = connection.prepare(&sql)?.query_map(params![network, enum_text(&WorkOutcome::Unverified)],
-        |row| Ok((run_row(row)?, row.get::<_, String>(14)?)))?
+    let rows = connection
+        .prepare(&sql)?
+        .query_map(
+            params![network, enum_text(&WorkOutcome::Unverified)],
+            |row| Ok((run_row(row)?, row.get::<_, String>(14)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (row, outcome) in rows {
         let mut record = record_from(row)?;
@@ -713,9 +739,11 @@ impl Store {
 
     /// Scoped UI projection; accepted rows remain visible until shared sync arrives.
     pub fn dispatches_for_scopes(&self, scopes: &[String]) -> Result<Vec<Dispatch>> {
-        query_dispatches(&self.connection,
+        query_dispatches(
+            &self.connection,
             "json_extract(spec,'$.conversation') IN (SELECT value FROM json_each(?))",
-            [serde_json::to_string(scopes)?])
+            [serde_json::to_string(scopes)?],
+        )
     }
 
     pub fn pending_dispatches(&self) -> Result<Vec<Dispatch>> {
@@ -878,8 +906,16 @@ fn query_stops(
         "SELECT work_id,conversation_id,target_node,requested_at_ms,deadline_ms,timed_out
          FROM work_stops WHERE {filter} ORDER BY work_id"
     ))?;
-    Ok(statement.query_map(params, |row| Ok(StopRequest {
-        work_id: row.get(0)?, conversation: row.get(1)?, target: row.get(2)?,
-        requested_at_ms: row.get(3)?, deadline_ms: row.get(4)?, timed_out: row.get(5)?,
-    }))?.collect::<rusqlite::Result<_>>()?)
+    Ok(statement
+        .query_map(params, |row| {
+            Ok(StopRequest {
+                work_id: row.get(0)?,
+                conversation: row.get(1)?,
+                target: row.get(2)?,
+                requested_at_ms: row.get(3)?,
+                deadline_ms: row.get(4)?,
+                timed_out: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }

@@ -283,12 +283,14 @@ impl Runtime {
         ensure!(targets.len() <= MAX_TARGETS, "too many progress sources");
         {
             let (network, targets) = (access.network_id.clone(), targets.clone());
-            self.store.call("observation.authorize_targets", move |store| {
-                for target in &targets {
-                    store.authorize_node(&network, target)?;
-                }
-                Ok(())
-            }).await?;
+            self.store
+                .call("observation.authorize_targets", move |store| {
+                    for target in &targets {
+                        store.authorize_node(&network, target)?;
+                    }
+                    Ok(())
+                })
+                .await?;
         }
         let mut state = self
             .observation
@@ -345,7 +347,11 @@ impl Runtime {
         {
             let network = network.to_owned();
             let origin = origin.to_owned();
-            self.store.call("observation.authorize_node", move |store| store.authorize_node(&network, &origin)).await
+            self.store
+                .call("observation.authorize_node", move |store| {
+                    store.authorize_node(&network, &origin)
+                })
+                .await
         }?;
         let since = input
             .get("cursor")
@@ -415,7 +421,11 @@ impl Runtime {
             {
                 let network = stream.network.to_owned();
                 let source = stream.source.to_owned();
-                self.store.call("observation.authorize_node", move |store| store.authorize_node(&network, &source)).await
+                self.store
+                    .call("observation.authorize_node", move |store| {
+                        store.authorize_node(&network, &source)
+                    })
+                    .await
             }?;
             self.require_scope(
                 &Access {
@@ -496,11 +506,17 @@ impl Runtime {
             "invalid progress cursor"
         );
         {
-            let (network, source, local) = (stream.network.clone(), stream.source.clone(), self.identity.device_id()?);
-            self.store.call("observation.authorize_stream", move |store| {
-                store.authorize_node(&network, &source)?;
-                store.authorize_node(&network, &local)
-            }).await?;
+            let (network, source, local) = (
+                stream.network.clone(),
+                stream.source.clone(),
+                self.identity.device_id()?,
+            );
+            self.store
+                .call("observation.authorize_stream", move |store| {
+                    store.authorize_node(&network, &source)?;
+                    store.authorize_node(&network, &local)
+                })
+                .await?;
         }
         {
             let mut state = self

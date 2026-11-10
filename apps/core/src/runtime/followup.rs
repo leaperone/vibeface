@@ -16,10 +16,14 @@ impl Runtime {
         let epoch = args["epoch"].as_u64().context("epoch is required")?;
         let current = {
             let (network, scope, owner) = (network.to_owned(), scope.to_owned(), owner.clone());
-            self.store.call("followup.current", move |store| {
-                store.authorize_node(&network, &owner)?;
-                store.conversation(&network, &scope)?.context("conversation not found")
-            }).await?
+            self.store
+                .call("followup.current", move |store| {
+                    store.authorize_node(&network, &owner)?;
+                    store
+                        .conversation(&network, &scope)?
+                        .context("conversation not found")
+                })
+                .await?
         };
         ensure!(
             epoch == current.owner_epoch + 1,
@@ -41,10 +45,10 @@ impl Runtime {
         self.unverify_revoked_works(network).await;
         self.schedule_wakeup.notify_one();
         self.outbox_wakeup.notify_one();
-        Ok(json!({"conversation":{
+        Ok(json!({"conversation":({
             let network = network.to_owned();
             let scope = scope.to_owned();
             self.store.call("followup.conversation", move |store| store.conversation(&network, &scope)).await
-        }?}))
+        }?)}))
     }
 }

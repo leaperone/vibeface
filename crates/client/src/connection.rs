@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use vibeface_secure::{Channel, Handshake, Identity};
 use vibeface_secure_ffi::lan::{LanStream, lan_connect};
@@ -16,12 +16,12 @@ type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     Gateway(Entry),
-    Local(Entry),
+    Local(crate::LocalGrant),
     Lan { node_id: String, addresses: Vec<String> },
 }
 impl Endpoint {
     pub fn node_id(&self) -> &str {
-        match self { Self::Gateway(e) | Self::Local(e) => &e.node_id, Self::Lan { node_id, .. } => node_id }
+        match self { Self::Gateway(e) => &e.node_id, Self::Local(grant)=>&grant.entry().node_id, Self::Lan { node_id, .. } => node_id }
     }
 }
 
@@ -38,7 +38,7 @@ struct Pending { reply: oneshot::Sender<Result<Value>>, deadline: tokio::time::I
 
 /// A bounded multiplexed Noise connection. Dropping a caller never cancels the stream reader.
 #[derive(Clone)]
-pub struct Connection { requests: mpsc::Sender<Request>, pushes: broadcast::Sender<Value> }
+pub struct Connection { requests: mpsc::Sender<Request>, pushes: broadcast::Sender<Value>, shutdown: watch::Sender<bool> }
 impl Connection {
     pub async fn open(origin: &str, identity: &Identity, target: &str) -> Result<Self> {
         Self::open_endpoint(&Endpoint::Gateway(Entry { origin: origin.into(), node_id: target.into() }), identity).await
@@ -48,15 +48,12 @@ impl Connection {
     }
     async fn handshake(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
         let mut transport = match endpoint {
-            Endpoint::Gateway(entry) | Endpoint::Local(entry) => {
-                if matches!(endpoint, Endpoint::Local(_)) {
-                    let url = reqwest::Url::parse(&entry.origin)?;
-                    ensure!(matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "local endpoint must be loopback");
-                }
+            Endpoint::Gateway(entry) => {
                 let (mut socket, _) = tokio_tungstenite::connect_async(client_url(&entry.origin)?).await?;
                 socket.send(Message::Text(json!({"type":"connect","target":entry.node_id}).to_string().into())).await?;
                 Transport::Web(socket)
             }
+            Endpoint::Local(grant) => {let (socket,_)=tokio_tungstenite::connect_async(grant.websocket_request(&identity.device_id())?).await?;Transport::Web(socket)},
             Endpoint::Lan { node_id, addresses } => Transport::Lan(lan_connect(node_id.clone(), addresses.clone(), 10_000).await?),
         };
         let mut handshake = Handshake::signed(true, identity, Some(endpoint.node_id().into()), PROLOGUE)?;
@@ -76,22 +73,25 @@ impl Connection {
     fn spawn(transport: Transport, channel: Channel) -> Self {
         let (requests, incoming) = mpsc::channel(LIMIT);
         let (pushes, _) = broadcast::channel(128);
+        let (shutdown, stop) = watch::channel(false);
         let (frames_tx, frames) = mpsc::channel(16);
         let (writer, reader) = transport.split();
         let reader_task = tokio::spawn(async move { reader.run(frames_tx).await; });
         let events = pushes.clone();
         tokio::spawn(async move {
-            run(incoming, frames, writer, channel, events).await;
+            run(incoming, frames, writer, channel, events, stop).await;
             reader_task.abort();
         });
-        Self { requests, pushes }
+        Self { requests, pushes, shutdown }
     }
+    pub fn close(&self) { self.shutdown.send_replace(true); }
     pub fn subscribe(&self) -> broadcast::Receiver<Value> { self.pushes.subscribe() }
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.call_bytes(serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"method":method,"params":params}))?).await
     }
     /// Sends the original persisted envelope, without regenerating its ID or signature.
     pub async fn call_bytes(&self, bytes: Vec<u8>) -> Result<Value> {
+        ensure!(!*self.shutdown.borrow(), "connection is closed");
         ensure!(bytes.len() <= MAX_REQUEST, "request exceeds limit");
         let value: Value = serde_json::from_slice(&bytes)?;
         let id = value["id"].as_str().context("request ID missing")?.to_owned();
@@ -101,12 +101,14 @@ impl Connection {
     }
 }
 
-async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<Result<Message>>, mut writer: Writer, mut channel: Channel, pushes: broadcast::Sender<Value>) {
+async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<Result<Message>>, mut writer: Writer, mut channel: Channel, pushes: broadcast::Sender<Value>, mut shutdown: watch::Receiver<bool>) {
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let result: Result<()> = async {
         loop {
+            ensure!(!*shutdown.borrow(), "connection closed; outcome unknown");
             tokio::select! {
+                _ = shutdown.changed() => { return Ok(()); }
                 request = requests.recv(), if pending.len() < LIMIT => {
                     let Some(request) = request else { return Ok(()); };
                     if request.reply.is_closed() { continue; }
@@ -156,7 +158,7 @@ impl Transport {
 }
 enum Writer { Web(futures_util::stream::SplitSink<Socket, Message>), Lan(Arc<LanStream>) }
 impl Writer {
-    async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => Ok(s.send(bytes)?) } }
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => send_lan(s, bytes).await } }
     async fn close(&mut self) { match self { Self::Web(s) => { let _ = s.close().await; }, Self::Lan(s) => s.close() } }
 }
 enum Reader { Web(futures_util::stream::SplitStream<Socket>), Lan(Arc<LanStream>) }
@@ -166,6 +168,15 @@ impl Reader {
             let frame = match &mut self { Self::Web(s) => match s.next().await { Some(f) => f.map_err(Into::into), None => return }, Self::Lan(s) => lan_frame(s).await };
             let ended = frame.is_err() || matches!(&frame, Ok(Message::Close(_)));
             if tx.send(frame).await.is_err() || ended { return; }
+        }
+    }
+}
+async fn send_lan(stream:&Arc<LanStream>, bytes:Vec<u8>)->Result<()> {
+    loop {
+        match stream.send(bytes.clone()) {
+            Ok(())=>return Ok(()),
+            Err(vibeface_secure_ffi::SecureError::Failed {reason}) if reason=="stream backpressure limit reached"=>tokio::time::sleep(Duration::from_millis(5)).await,
+            Err(error)=>return Err(error.into()),
         }
     }
 }

@@ -1009,7 +1009,12 @@ async fn local_setup(
         )?;
         let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
         let verified_capability = capability.capability.clone();
-        app.node.store.call("local_bootstrap_capability", move |store| store.verify_bootstrap_capability(&verified_capability)).await?;
+        app.node
+            .store
+            .call("local_bootstrap_capability", move |store| {
+                store.verify_bootstrap_capability(&verified_capability)
+            })
+            .await?;
         Ok::<_, anyhow::Error>(capability)
     }
     .await
@@ -1489,7 +1494,11 @@ mod tests {
         use crate::runtime::{test_bot as bot, test_node as node, test_start_reply as start_reply};
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
-        let network = node.store.call("fixture_network", |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("fixture_network", |store| store.network())
+            .await?
+            .context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
         node.register_manager_attempt_fixture(
             "mcp-current-attempt".into(),

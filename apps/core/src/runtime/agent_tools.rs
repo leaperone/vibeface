@@ -83,10 +83,14 @@ impl Runtime {
                 {
                     let arg0 = (scope).to_owned();
                     let arg1 = (manager.trigger).to_owned();
-                    self.store.call("agent_tools.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+                    self.store
+                        .call("agent_tools.scheduler_job", move |store| {
+                            store.scheduler_job(&arg0, &arg1)
+                        })
+                        .await
                 }?
-                    .context("this turn is not running here")?
-                    .tool_kind(),
+                .context("this turn is not running here")?
+                .tool_kind(),
             )
         } else {
             None
@@ -104,59 +108,64 @@ impl Runtime {
         *stage = "execution";
         let network = access.network_id.as_str();
         if let Some(manager) = &access.manager {
-            let network = network.to_owned(); let scope = scope.clone(); let manager = manager.clone(); let args = args.clone();
-            kind = self.store.call("agent_tools.validate_scope", move |store| {
-
-            let job = store
-                .scheduler_job(&scope, &manager.trigger)?
-                .context("this turn is not running here")?;
-            if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope {
-                let task = store
-                    .workspace_task(&network, task_id)?
-                    .context("task not found")?;
-                ensure!(
-                    !task.reply_only || tool.effect() == Effect::Read,
-                    "reply-only tasks cannot dispatch or control other work"
-                );
-                if task.reply_only {
-                    kind = None;
-                }
-            }
-            if matches!(tool, Tool::InterruptWork | Tool::BindWork | Tool::WaitWork)
-                && let Some(work_id) = args["work_id"].as_str()
-            {
-                ensure!(
-                    store.scheduler_work_in_scope(&network, &job, work_id)?,
-                    "work is outside this task scope"
-                );
-            }
-            if matches!(tool, Tool::DispatchWork | Tool::TrackWork) {
-                for key in ["continues", "parent"] {
-                    if let Some(work_id) = args[key].as_str() {
+            let network = network.to_owned();
+            let scope = scope.clone();
+            let manager = manager.clone();
+            let args = args.clone();
+            kind = self
+                .store
+                .call("agent_tools.validate_scope", move |store| {
+                    let job = store
+                        .scheduler_job(&scope, &manager.trigger)?
+                        .context("this turn is not running here")?;
+                    if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope {
+                        let task = store
+                            .workspace_task(&network, task_id)?
+                            .context("task not found")?;
+                        ensure!(
+                            !task.reply_only || tool.effect() == Effect::Read,
+                            "reply-only tasks cannot dispatch or control other work"
+                        );
+                        if task.reply_only {
+                            kind = None;
+                        }
+                    }
+                    if matches!(tool, Tool::InterruptWork | Tool::BindWork | Tool::WaitWork)
+                        && let Some(work_id) = args["work_id"].as_str()
+                    {
                         ensure!(
                             store.scheduler_work_in_scope(&network, &job, work_id)?,
                             "work is outside this task scope"
                         );
                     }
-                }
-            }
-            if matches!(
-                tool,
-                Tool::DispatchWork | Tool::TrackWork | Tool::HandOverSession
-            ) && let Some(thread) = args[if tool == Tool::HandOverSession {
-                "session_id"
-            } else {
-                "thread"
-            }]
-            .as_str()
-            {
-                ensure!(
-                    store.scheduler_native_in_scope(&network, &job, thread)?,
-                    "native session is outside this task scope"
-                );
-            }
-        Ok(kind)
-            }).await?;
+                    if matches!(tool, Tool::DispatchWork | Tool::TrackWork) {
+                        for key in ["continues", "parent"] {
+                            if let Some(work_id) = args[key].as_str() {
+                                ensure!(
+                                    store.scheduler_work_in_scope(&network, &job, work_id)?,
+                                    "work is outside this task scope"
+                                );
+                            }
+                        }
+                    }
+                    if matches!(
+                        tool,
+                        Tool::DispatchWork | Tool::TrackWork | Tool::HandOverSession
+                    ) && let Some(thread) = args[if tool == Tool::HandOverSession {
+                        "session_id"
+                    } else {
+                        "thread"
+                    }]
+                    .as_str()
+                    {
+                        ensure!(
+                            store.scheduler_native_in_scope(&network, &job, thread)?,
+                            "native session is outside this task scope"
+                        );
+                    }
+                    Ok(kind)
+                })
+                .await?;
         }
         match tool {
             Tool::WorkspaceState | Tool::WorkspaceHistory | Tool::WorkspaceCommand => {
@@ -176,52 +185,66 @@ impl Runtime {
             // Dispatches the DAG does not name yet are listed too, so none is sent twice.
             Tool::WorkStatus => {
                 let (works, dispatches) = {
-                    let access = access.clone(); let network = network.to_owned(); let scope = scope.clone();
-                    self.store.call("agent_tools.work_status", move |store| {
-                let job = access
-                    .manager
-                    .as_ref()
-                    .map(|manager| {
-                        store
-                            .scheduler_job(&scope, &manager.trigger)?
-                            .context("this turn is not running here")
-                    })
-                    .transpose()?;
-                let works = store
-                    .works(&network, &scope)?
-                    .into_iter()
-                    .filter_map(|work| {
-                        match job
-                            .as_ref()
-                            .map(|job| store.scheduler_work_in_scope(&network, job, &work.work_id))
-                            .transpose()
-                        {
-                            Ok(Some(false)) => None,
-                            Ok(_) => Some(Ok(work)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let dispatches = store
-                    .undelivered_dispatches(&network, &scope)?
-                    .into_iter()
-                    .filter_map(|dispatch| {
-                        match job
-                            .as_ref()
-                            .map(|job| {
-                                store.scheduler_work_in_scope(&network, job, &dispatch.spec.work_id)
-                            })
-                            .transpose()
-                        {
-                            Ok(Some(false)) => None,
-                            Ok(_) => Some(Ok(dispatch)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    let access = access.clone();
+                    let network = network.to_owned();
+                    let scope = scope.clone();
+                    self.store
+                        .call("agent_tools.work_status", move |store| {
+                            let job = access
+                                .manager
+                                .as_ref()
+                                .map(|manager| {
+                                    store
+                                        .scheduler_job(&scope, &manager.trigger)?
+                                        .context("this turn is not running here")
+                                })
+                                .transpose()?;
+                            let works = store
+                                .works(&network, &scope)?
+                                .into_iter()
+                                .filter_map(|work| {
+                                    match job
+                                        .as_ref()
+                                        .map(|job| {
+                                            store.scheduler_work_in_scope(
+                                                &network,
+                                                job,
+                                                &work.work_id,
+                                            )
+                                        })
+                                        .transpose()
+                                    {
+                                        Ok(Some(false)) => None,
+                                        Ok(_) => Some(Ok(work)),
+                                        Err(error) => Some(Err(error)),
+                                    }
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let dispatches = store
+                                .undelivered_dispatches(&network, &scope)?
+                                .into_iter()
+                                .filter_map(|dispatch| {
+                                    match job
+                                        .as_ref()
+                                        .map(|job| {
+                                            store.scheduler_work_in_scope(
+                                                &network,
+                                                job,
+                                                &dispatch.spec.work_id,
+                                            )
+                                        })
+                                        .transpose()
+                                    {
+                                        Ok(Some(false)) => None,
+                                        Ok(_) => Some(Ok(dispatch)),
+                                        Err(error) => Some(Err(error)),
+                                    }
+                                })
+                                .collect::<Result<Vec<_>>>()?;
 
-                        Ok((works, dispatches))
-                    }).await?
+                            Ok((works, dispatches))
+                        })
+                        .await?
                 };
                 work_status(&works, &dispatches, &args)
             }
@@ -235,50 +258,51 @@ impl Runtime {
                 let network = network.to_owned();
                 let scope = scope.clone();
                 let manager = manager.cloned();
-                self.store.call("agent_tools.recall", move |store| {
-
-                let mut notes: Vec<_> = store
-                    .memories(&network, &scope)?
-                    .into_iter()
-                    .filter(|note| {
-                        query
-                            .as_ref()
-                            .is_none_or(|query| note.text.to_lowercase().contains(query))
-                    })
-                    .collect();
-                let mut staged = Vec::new();
-                if let Some(manager) = manager {
-                    for mutation in store.staged_memory_overlay(
-                        &scope,
-                        &manager.trigger,
-                        &manager.attempt_id,
-                    )? {
-                        notes.retain(|note| note.memory_id != mutation.memory_id);
-                        if let Some(text) = mutation.after {
-                            if query
-                                .as_ref()
-                                .is_none_or(|query| text.to_lowercase().contains(query))
-                            {
-                                notes.push(crate::model::MemoryEntry {
-                                    memory_id: mutation.memory_id.clone(),
-                                    text: text.clone(),
-                                });
-                                staged.push(json!({
-                                    "memory_id": mutation.memory_id,
-                                    "text": text,
-                                    "state": "staged"
-                                }));
+                self.store
+                    .call("agent_tools.recall", move |store| {
+                        let mut notes: Vec<_> = store
+                            .memories(&network, &scope)?
+                            .into_iter()
+                            .filter(|note| {
+                                query
+                                    .as_ref()
+                                    .is_none_or(|query| note.text.to_lowercase().contains(query))
+                            })
+                            .collect();
+                        let mut staged = Vec::new();
+                        if let Some(manager) = manager {
+                            for mutation in store.staged_memory_overlay(
+                                &scope,
+                                &manager.trigger,
+                                &manager.attempt_id,
+                            )? {
+                                notes.retain(|note| note.memory_id != mutation.memory_id);
+                                if let Some(text) = mutation.after {
+                                    if query
+                                        .as_ref()
+                                        .is_none_or(|query| text.to_lowercase().contains(query))
+                                    {
+                                        notes.push(crate::model::MemoryEntry {
+                                            memory_id: mutation.memory_id.clone(),
+                                            text: text.clone(),
+                                        });
+                                        staged.push(json!({
+                                            "memory_id": mutation.memory_id,
+                                            "text": text,
+                                            "state": "staged"
+                                        }));
+                                    }
+                                } else {
+                                    staged.push(json!({
+                                        "memory_id": mutation.memory_id,
+                                        "state": "staged_forget"
+                                    }));
+                                }
                             }
-                        } else {
-                            staged.push(json!({
-                                "memory_id": mutation.memory_id,
-                                "state": "staged_forget"
-                            }));
                         }
-                    }
-                }
-                Ok(json!({ "memory": notes, "staged": staged }))
-            }).await
+                        Ok(json!({ "memory": notes, "staged": staged }))
+                    })
+                    .await
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
             Tool::ListBots => {
@@ -312,48 +336,54 @@ impl Runtime {
             }).await
             }
             Tool::ReadBot => {
-                let network = network.to_owned(); let bot = field(&args, "bot")?.to_owned();
-                self.store.call("agent_tools.read_bot", move |store| read_bot(store, &network, &bot, now_ms())).await
-            },
+                let network = network.to_owned();
+                let bot = field(&args, "bot")?.to_owned();
+                self.store
+                    .call("agent_tools.read_bot", move |store| {
+                        read_bot(store, &network, &bot, now_ms())
+                    })
+                    .await
+            }
             Tool::ListSessions => {
                 let network = network.to_owned();
                 let scope = scope.clone();
                 let access = access.clone();
                 let args = args.clone();
-                self.store.call("agent_tools.listsessions", move |store| {
-
-                let job = access
-                    .manager
-                    .as_ref()
-                    .map(|manager| {
-                        store
-                            .scheduler_job(&scope, &manager.trigger)?
-                            .context("this turn is not running here")
-                    })
-                    .transpose()?;
-                let sessions = store
-                    .attributed_sessions(&network, &scope)?
-                    .into_iter()
-                    .filter_map(|session| {
-                        match job
+                self.store
+                    .call("agent_tools.listsessions", move |store| {
+                        let job = access
+                            .manager
                             .as_ref()
-                            .map(|job| {
-                                store.scheduler_native_in_scope(
-                                    &network,
-                                    job,
-                                    session["session_id"].as_str().unwrap_or(""),
-                                )
+                            .map(|manager| {
+                                store
+                                    .scheduler_job(&scope, &manager.trigger)?
+                                    .context("this turn is not running here")
                             })
-                            .transpose()
-                        {
-                            Ok(Some(false)) => None,
-                            Ok(_) => Some(Ok(session)),
-                            Err(error) => Some(Err(error)),
-                        }
+                            .transpose()?;
+                        let sessions = store
+                            .attributed_sessions(&network, &scope)?
+                            .into_iter()
+                            .filter_map(|session| {
+                                match job
+                                    .as_ref()
+                                    .map(|job| {
+                                        store.scheduler_native_in_scope(
+                                            &network,
+                                            job,
+                                            session["session_id"].as_str().unwrap_or(""),
+                                        )
+                                    })
+                                    .transpose()
+                                {
+                                    Ok(Some(false)) => None,
+                                    Ok(_) => Some(Ok(session)),
+                                    Err(error) => Some(Err(error)),
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        list_sessions(&sessions, &args)
                     })
-                    .collect::<Result<Vec<_>>>()?;
-                list_sessions(&sessions, &args)
-            }).await
+                    .await
             }
             Tool::DeleteBot => {
                 let manager = access
@@ -366,17 +396,21 @@ impl Runtime {
                     let arg2 = (scope).to_owned();
                     let arg3 = (manager.trigger).to_owned();
                     let arg4 = (field(&args, "bot")?).to_owned();
-                    self.store.call("agent_tools.delete_bot_in_turn", move |store| store.delete_bot_in_turn(&arg0, &arg1, &arg2, &arg3, &arg4, now_ms())).await
+                    self.store
+                        .call("agent_tools.delete_bot_in_turn", move |store| {
+                            store.delete_bot_in_turn(&arg0, &arg1, &arg2, &arg3, &arg4, now_ms())
+                        })
+                        .await
                 }?;
                 if let Some(event) = &event {
                     self.bot_deleted(network, &deleted, &event.hash);
                 }
                 Ok(
                     json!({"conversation_id":deleted,"deleted":true,"written":event.is_some(),
-                    "primary":{
+                    "primary":({
                         let arg0 = (network).to_owned();
                         self.store.call("agent_tools.primary_bot", move |store| store.primary_bot(&arg0)).await
-                    }?}),
+                    }?)}),
                 )
             }
             Tool::CreateBot => {
@@ -397,20 +431,36 @@ impl Runtime {
                 let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
                 let existing = {
                     let arg0 = (network).to_owned();
-                    self.store.call("agent_tools.bots", move |store| store.bots(&arg0)).await
+                    self.store
+                        .call("agent_tools.bots", move |store| store.bots(&arg0))
+                        .await
                 }?
-                    .iter()
-                    .any(|bot| bot.bot_id == bot_id);
+                .iter()
+                .any(|bot| bot.bot_id == bot_id);
                 if !existing && let Some(project) = &project {
                     self.validate_bot_project(network, project).await?;
                 }
                 let (bot, created) = {
-                    let identity = self.identity.clone(); let network = network.to_owned(); let scope = scope.clone();
-                    let trigger = manager.trigger.clone(); let call_ref = call_ref.to_owned();
-                    let name = field(&args, "name")?.to_owned(); let instructions = optional("instructions").unwrap_or("").to_owned();
-                    self.store.call("agent_tools.create_bot", move |store| store.create_bot_in_turn(
-                        &identity, &network, &scope, &trigger, &call_ref, (&name, &instructions, project), now_ms(),
-                    )).await
+                    let identity = self.identity.clone();
+                    let network = network.to_owned();
+                    let scope = scope.clone();
+                    let trigger = manager.trigger.clone();
+                    let call_ref = call_ref.to_owned();
+                    let name = field(&args, "name")?.to_owned();
+                    let instructions = optional("instructions").unwrap_or("").to_owned();
+                    self.store
+                        .call("agent_tools.create_bot", move |store| {
+                            store.create_bot_in_turn(
+                                &identity,
+                                &network,
+                                &scope,
+                                &trigger,
+                                &call_ref,
+                                (&name, &instructions, project),
+                                now_ms(),
+                            )
+                        })
+                        .await
                 }?;
                 if created {
                     self.publish_changed(
@@ -434,7 +484,20 @@ impl Runtime {
                     let arg4 = (field(&args, "call_ref")?).to_owned();
                     let arg5 = (field(&args, "bot")?).to_owned();
                     let arg6 = (field(&args, "text")?).to_owned();
-                    self.store.call("agent_tools.message_bot", move |store| store.message_bot(&arg0, &arg1, &arg2, &arg3, &arg4, &arg5, &arg6, now_ms())).await
+                    self.store
+                        .call("agent_tools.message_bot", move |store| {
+                            store.message_bot(
+                                &arg0,
+                                &arg1,
+                                &arg2,
+                                &arg3,
+                                &arg4,
+                                &arg5,
+                                &arg6,
+                                now_ms(),
+                            )
+                        })
+                        .await
                 }?;
                 if written {
                     self.publish_changed(
@@ -452,9 +515,11 @@ impl Runtime {
                 let skill = {
                     let arg0 = (network).to_owned();
                     let arg1 = (id).to_owned();
-                    self.store.call("agent_tools.skill", move |store| store.skill(&arg0, &arg1)).await
+                    self.store
+                        .call("agent_tools.skill", move |store| store.skill(&arg0, &arg1))
+                        .await
                 }?
-                    .with_context(|| format!("skill {id} not found"))?;
+                .with_context(|| format!("skill {id} not found"))?;
                 let mut value = json!(skill);
                 value["skill_id"] = json!(id);
                 Ok(value)
@@ -493,7 +558,20 @@ impl Runtime {
                     let arg4 = (call_ref).to_owned();
                     let arg5 = request;
                     let arg6 = provider;
-                    self.store.call("agent_tools.change_bot", move |store| store.change_bot(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, arg6, now_ms())).await
+                    self.store
+                        .call("agent_tools.change_bot", move |store| {
+                            store.change_bot(
+                                &arg0,
+                                &arg1,
+                                &arg2,
+                                &arg3,
+                                &arg4,
+                                arg5,
+                                arg6,
+                                now_ms(),
+                            )
+                        })
+                        .await
                 }?;
                 if written {
                     self.publish_changed(
@@ -525,7 +603,11 @@ impl Runtime {
                     let arg3 = (manager.attempt_id).to_owned();
                     let arg4 = (call_ref).to_owned();
                     let arg5 = request;
-                    self.store.call("agent_tools.stage_memory", move |store| store.stage_memory(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, now_ms())).await
+                    self.store
+                        .call("agent_tools.stage_memory", move |store| {
+                            store.stage_memory(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, now_ms())
+                        })
+                        .await
                 }
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
@@ -580,9 +662,13 @@ impl Runtime {
                         {
                             let arg0 = (network).to_owned();
                             let arg1 = (bot).to_owned();
-                            self.store.call("agent_tools.find_bot", move |store| store.find_bot(&arg0, &arg1)).await
+                            self.store
+                                .call("agent_tools.find_bot", move |store| {
+                                    store.find_bot(&arg0, &arg1)
+                                })
+                                .await
                         }?
-                            .conversation_id,
+                        .conversation_id,
                     ),
                     (None, true) => None,
                     _ => bail!("give either to or stop_following=true"),
@@ -608,7 +694,10 @@ impl Runtime {
         args: &Value,
     ) -> Result<Value> {
         let network = &access.network_id;
-        let access = access.clone(); let conversation = conversation.to_owned(); let args = args.clone(); let identity = self.identity.clone();
+        let access = access.clone();
+        let conversation = conversation.to_owned();
+        let args = args.clone();
+        let identity = self.identity.clone();
         let (value, written) = self.store.call("agent_tools.workspace", move |store| {
             let network = &access.network_id;
             let conversation = conversation.as_str();
@@ -747,7 +836,11 @@ impl Runtime {
             Ok((value, written))
         }).await?;
         if let Some(event_hash) = written {
-            self.publish_changed(network, crate::workspace::WORKSPACE_SCOPE, Changed::Event(&event_hash));
+            self.publish_changed(
+                network,
+                crate::workspace::WORKSPACE_SCOPE,
+                Changed::Event(&event_hash),
+            );
             self.schedule_wakeup.notify_one();
             self.outbox_wakeup.notify_one();
         }
@@ -1130,13 +1223,18 @@ impl Runtime {
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let work_trigger = {
-            let network = network.to_owned(); let scope = scope.to_owned(); let manager = manager.clone(); let local = local.clone();
-            self.store.call("agent_tools.work_trigger", move |store| {
-            let job = store
-                .scheduler_job(&scope, &manager.trigger)?
-                .context("this turn is not registered here")?;
-            store.scheduler_work_trigger(&network, &local, &job)
-                    }).await?
+            let network = network.to_owned();
+            let scope = scope.to_owned();
+            let manager = manager.clone();
+            let local = local.clone();
+            self.store
+                .call("agent_tools.work_trigger", move |store| {
+                    let job = store
+                        .scheduler_job(&scope, &manager.trigger)?
+                        .context("this turn is not registered here")?;
+                    store.scheduler_work_trigger(&network, &local, &job)
+                })
+                .await?
         };
         let work_id = WorkSpec::id(scope, &work_trigger, call_ref);
         ensure!(
@@ -1191,11 +1289,13 @@ impl Runtime {
             Some(original) => {
                 let arg0 = (network).to_owned();
                 let arg1 = (scope).to_owned();
-                self.store.call("agent_tools.works", move |store| store.works(&arg0, &arg1)).await
+                self.store
+                    .call("agent_tools.works", move |store| store.works(&arg0, &arg1))
+                    .await
             }?
-                .into_iter()
-                .find(|work| &work.work_id == original)
-                .and_then(|work| work.thread_id),
+            .into_iter()
+            .find(|work| &work.work_id == original)
+            .and_then(|work| work.thread_id),
         };
         let may_send = created
             && self
@@ -1210,18 +1310,26 @@ impl Runtime {
         let record = match created {
             true => ({
                 let arg0 = (record.work_id).to_owned();
-                self.store.call("agent_tools.work_record", move |store| store.work_record(&arg0)).await
+                self.store
+                    .call("agent_tools.work_record", move |store| {
+                        store.work_record(&arg0)
+                    })
+                    .await
             }?)
-                .context("work not found on this device")?,
+            .context("work not found on this device")?,
             false => record,
         };
         let expected_turn_id = if may_send {
             {
                 let arg0 = (network).to_owned();
                 let arg1 = (record.work_id).to_owned();
-                self.store.call("agent_tools.work_native_execution", move |store| store.work_native_execution(&arg0, &arg1)).await
+                self.store
+                    .call("agent_tools.work_native_execution", move |store| {
+                        store.work_native_execution(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .map(|execution| execution.turn_id)
+            .map(|execution| execution.turn_id)
         } else {
             None
         };
@@ -1248,16 +1356,28 @@ impl Runtime {
     /// one the work it continues ran on; else the bot's own provider when it executes work
     /// here, else the first one that does.
     async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
-        let agent: Option<Provider> = serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
+        let agent: Option<Provider> =
+            serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let network = network.to_owned();
         let local = self.identity.device_id()?;
         let execution = self.providers().switches.execution;
         let manager = self.manager().map(|manager| manager.provider);
         let thread = args["thread"].as_str().map(str::to_owned);
         let continues = args["continues"].as_str().map(str::to_owned);
-        self.store.call("agent_tools.executing", move |store| {
-            Self::execution_provider_from(store, &network, &local, &execution, manager, agent, thread.as_deref(), continues.as_deref())
-        }).await
+        self.store
+            .call("agent_tools.executing", move |store| {
+                Self::execution_provider_from(
+                    store,
+                    &network,
+                    &local,
+                    &execution,
+                    manager,
+                    agent,
+                    thread.as_deref(),
+                    continues.as_deref(),
+                )
+            })
+            .await
     }
 
     pub(super) fn execution_provider_from(
@@ -1273,11 +1393,13 @@ impl Runtime {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let earlier = match (agent, thread, continues) {
             (Some(_), _, _) => None,
-            (None, Some(thread), _) => Self::ran_on_from(store, network, local, thread)?.or_else(|| {
-                Provider::ALL
-                    .into_iter()
-                    .find(|provider| provider.work().any_thread)
-            }),
+            (None, Some(thread), _) => {
+                Self::ran_on_from(store, network, local, thread)?.or_else(|| {
+                    Provider::ALL
+                        .into_iter()
+                        .find(|provider| provider.work().any_thread)
+                })
+            }
             (None, None, Some(original)) => {
                 store.work_record(original)?.and_then(|run| match run.kind {
                     WorkKind::Agent(provider) => Some(provider),
@@ -1559,24 +1681,33 @@ mod tests {
         let id = id.to_owned();
         let text = text.to_owned();
         let identity = node.identity.clone();
-        node.store.call("agent_tools.post", move |store| {
-            let (admin,network,scope,id,text) = (&admin,network.as_str(),scope.as_str(),id.as_str(),text.as_str());
+        node.store
+            .call("agent_tools.post", move |store| {
+                let (admin, network, scope, id, text) = (
+                    &admin,
+                    network.as_str(),
+                    scope.as_str(),
+                    id.as_str(),
+                    text.as_str(),
+                );
 
-        let body = signed_main_input(
-            admin,
-            network,
-            scope,
-            id,
-            text,
-            vec![],
-            store.messages(network, scope)?.len() as u64 + 1,
-        )?;
-        let signed = store.append_event(&identity, network, scope, body, vec![], now_ms())?;
-        Ok(HashedEvent {
-            hash: signed.hash,
-            event: serde_json::from_str(&signed.canonical_body)?,
-        })
-    }).await
+                let body = signed_main_input(
+                    admin,
+                    network,
+                    scope,
+                    id,
+                    text,
+                    vec![],
+                    store.messages(network, scope)?.len() as u64 + 1,
+                )?;
+                let signed =
+                    store.append_event(&identity, network, scope, body, vec![], now_ms())?;
+                Ok(HashedEvent {
+                    hash: signed.hash,
+                    event: serde_json::from_str(&signed.canonical_body)?,
+                })
+            })
+            .await
     }
 
     #[tokio::test]
@@ -1584,7 +1715,11 @@ mod tests {
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
         bot(&node, &admin, "d", "Private", &[]).await?;
-        let network = node.store.call("agent_tools.network", move |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("agent_tools.network", move |store| store.network())
+            .await?
+            .context("network")?;
         for i in 0..5 {
             post(
                 &node,
@@ -1690,7 +1825,11 @@ mod tests {
     {
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
-        let network = node.store.call("agent_tools.network", move |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("agent_tools.network", move |store| store.network())
+            .await?
+            .context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
         let idle = test_access(network.clone(), false, Some("c".into()));
         let access = node
@@ -1720,7 +1859,11 @@ mod tests {
             .await?;
         let basis = {
             let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
+            node.store
+                .call("agent_tools.version_vector", move |store| {
+                    store.version_vector(&arg0)
+                })
+                .await
         }?;
         let replay = node
             .tool(
@@ -1733,7 +1876,11 @@ mod tests {
         assert_eq!(first["event_hash"], replay["event_hash"]);
         assert_eq!(basis, {
             let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
+            node.store
+                .call("agent_tools.version_vector", move |store| {
+                    store.version_vector(&arg0)
+                })
+                .await
         }?);
         let lookup = node
             .tool(access.clone(), "call_lookup", json!({"call_ref":"one"}))
@@ -1757,7 +1904,11 @@ mod tests {
         );
         assert_eq!(basis, {
             let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
+            node.store
+                .call("agent_tools.version_vector", move |store| {
+                    store.version_vector(&arg0)
+                })
+                .await
         }?);
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1771,14 +1922,22 @@ mod tests {
 
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
-        let network = node.store.call("agent_tools.network", move |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("agent_tools.network", move |store| store.network())
+            .await?
+            .context("network")?;
         let (trigger, attempt) = claim_reply(&node, &admin, "c", "trigger", "boot").await?;
         let claimed = {
             let arg0 = ("c").to_owned();
             let arg1 = (trigger).to_owned();
-            node.store.call("agent_tools.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+            node.store
+                .call("agent_tools.scheduler_job", move |store| {
+                    store.scheduler_job(&arg0, &arg1)
+                })
+                .await
         }?
-            .context("claimed job")?;
+        .context("claimed job")?;
         assert!(matches!(
             claimed.state,
             crate::scheduling::JobState::Claimed { .. }
@@ -1814,7 +1973,11 @@ mod tests {
             let arg1 = (trigger).to_owned();
             let arg2 = (attempt).to_owned();
             let arg3 = (runtime).to_owned();
-            node.store.call("agent_tools.record_turn_runtime", move |store| store.record_turn_runtime(&arg0, &arg1, &arg2, &arg3)).await
+            node.store
+                .call("agent_tools.record_turn_runtime", move |store| {
+                    store.record_turn_runtime(&arg0, &arg1, &arg2, &arg3)
+                })
+                .await
         }?;
         node.register_manager_attempt_fixture(
             "old-token".into(),
@@ -1854,19 +2017,28 @@ mod tests {
             let arg1 = (trigger).to_owned();
             let arg2 = (attempt).to_owned();
             let arg3 = (SessionConfig {
-                    stable_fingerprint: "backup-stable".into(),
-                    runtime_fingerprint: "backup-runtime".into(),
-                    provider: Provider::Pi,
-                }).to_owned();
-            node.store.call("agent_tools.switch_scheduler_session", move |store| store.switch_scheduler_session(&arg0, &arg1, &arg2, &arg3)).await
+                stable_fingerprint: "backup-stable".into(),
+                runtime_fingerprint: "backup-runtime".into(),
+                provider: Provider::Pi,
+            })
+            .to_owned();
+            node.store
+                .call("agent_tools.switch_scheduler_session", move |store| {
+                    store.switch_scheduler_session(&arg0, &arg1, &arg2, &arg3)
+                })
+                .await
         }?
-            .session_generation;
+        .session_generation;
         {
             let arg0 = ("c").to_owned();
             let arg1 = (trigger).to_owned();
             let arg2 = (attempt).to_owned();
             let arg3 = (runtime).to_owned();
-            node.store.call("agent_tools.record_turn_runtime", move |store| store.record_turn_runtime(&arg0, &arg1, &arg2, &arg3)).await
+            node.store
+                .call("agent_tools.record_turn_runtime", move |store| {
+                    store.record_turn_runtime(&arg0, &arg1, &arg2, &arg3)
+                })
+                .await
         }?;
         node.register_manager_attempt_fixture(
             "new-token".into(),
@@ -1893,15 +2065,24 @@ mod tests {
         );
         let local = node.identity.device_id()?;
         {
-            let local = local.clone(); let old = old.clone(); let current = current.clone();
-            node.store.call("agent_tools.permission_fixture", move |store| {
-            assert!(Runtime::check_manager_permission(store, &local, &old).is_err());
-            Runtime::check_manager_permission(store, &local, &current)?;
-                Ok(()) }).await?;
+            let local = local.clone();
+            let old = old.clone();
+            let current = current.clone();
+            node.store
+                .call("agent_tools.permission_fixture", move |store| {
+                    assert!(Runtime::check_manager_permission(store, &local, &old).is_err());
+                    Runtime::check_manager_permission(store, &local, &current)?;
+                    Ok(())
+                })
+                .await?;
         }
         let before = {
             let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
+            node.store
+                .call("agent_tools.version_vector", move |store| {
+                    store.version_vector(&arg0)
+                })
+                .await
         }?;
         assert!(
             node.tool(
@@ -1912,18 +2093,29 @@ mod tests {
             .await
             .is_err()
         );
-        assert_eq!({
-            let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
-        }?, before);
+        assert_eq!(
+            {
+                let arg0 = (network).to_owned();
+                node.store
+                    .call("agent_tools.version_vector", move |store| {
+                        store.version_vector(&arg0)
+                    })
+                    .await
+            }?,
+            before
+        );
         assert!(
             !{
                 let arg0 = ("c").to_owned();
                 let arg1 = (trigger).to_owned();
-                node.store.call("agent_tools.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+                node.store
+                    .call("agent_tools.scheduler_job", move |store| {
+                        store.scheduler_job(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .context("job")?
-                .tool_calls
+            .context("job")?
+            .tool_calls
         );
         let created = node
             .tool(
@@ -1934,10 +2126,17 @@ mod tests {
             .await?;
         assert_eq!(created["name"], "Fresh bot");
         assert!(created["bot_id"].as_str().is_some());
-        assert_ne!({
-            let arg0 = (network).to_owned();
-            node.store.call("agent_tools.version_vector", move |store| store.version_vector(&arg0)).await
-        }?, before);
+        assert_ne!(
+            {
+                let arg0 = (network).to_owned();
+                node.store
+                    .call("agent_tools.version_vector", move |store| {
+                        store.version_vector(&arg0)
+                    })
+                    .await
+            }?,
+            before
+        );
         node.finish_manager_attempt(&attempt).await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1965,7 +2164,11 @@ mod tests {
     async fn accepted_execution_keeps_its_first_model_after_defaults_change() -> Result<()> {
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Bot", &[]).await?;
-        let network = node.store.call("agent_tools.network", move |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("agent_tools.network", move |store| store.network())
+            .await?
+            .context("network")?;
         post(&node, &admin, &network, "c", "m1", "go").await?;
         node.settings.lock().unwrap().roots = vec![dir.clone()];
         node.providers
@@ -2009,7 +2212,9 @@ mod tests {
         let works = {
             let arg0 = (network).to_owned();
             let arg1 = ("c").to_owned();
-            node.store.call("agent_tools.works", move |store| store.works(&arg0, &arg1)).await
+            node.store
+                .call("agent_tools.works", move |store| store.works(&arg0, &arg1))
+                .await
         }?;
         assert_eq!(works.len(), 1);
         assert_eq!(works[0].resolved.model.as_deref(), Some("first"));

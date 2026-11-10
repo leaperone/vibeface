@@ -16,9 +16,12 @@ impl Runtime {
         if {
             let network_id = access.network_id.to_owned();
             let command_id = id(input, "command_id")?;
-            self.store.call("workspace.workspace_command_recorded", move |store| store.workspace_command_recorded(&network_id, &command_id)).await
-        }?
-        {
+            self.store
+                .call("workspace.workspace_command_recorded", move |store| {
+                    store.workspace_command_recorded(&network_id, &command_id)
+                })
+                .await
+        }? {
             return self
                 .accept_workspace_command(&access.network_id, input)
                 .await;
@@ -26,10 +29,16 @@ impl Runtime {
         if let WorkspaceCommand::ControlInput { message_id, .. } = &command {
             let owner = {
                 let (network, message_id) = (access.network_id.clone(), message_id.clone());
-                self.store.call("workspace.input_owner", move |store| {
-                    let input = store.workspace_input(&network, &message_id)?.context("input not found")?;
-                    Ok(store.resolve_input_target(&network, &input.input.route.target)?.owner_node)
-                }).await?
+                self.store
+                    .call("workspace.input_owner", move |store| {
+                        let input = store
+                            .workspace_input(&network, &message_id)?
+                            .context("input not found")?;
+                        Ok(store
+                            .resolve_input_target(&network, &input.input.route.target)?
+                            .owner_node)
+                    })
+                    .await?
             };
             if owner != self.identity.device_id()? {
                 return self.peer_request(&access.network_id, &owner, json!({"type":"workspace_command","command_id":id(input,"command_id")?,"command":command,"attestation":attestation(input)?})).await;
@@ -55,7 +64,20 @@ impl Runtime {
             let network = network.to_owned();
             let command_id = command_id.to_owned();
             let signature = Some(attestation(input)?);
-            self.store.call("workspace.apply_workspace_command", move |store| store.apply_workspace_command(&identity, &network, &command_id, command, signature, None, None, now_ms())).await
+            self.store
+                .call("workspace.apply_workspace_command", move |store| {
+                    store.apply_workspace_command(
+                        &identity,
+                        &network,
+                        &command_id,
+                        command,
+                        signature,
+                        None,
+                        None,
+                        now_ms(),
+                    )
+                })
+                .await
         };
         let receipt = match result {
             Ok(receipt) => receipt,
@@ -95,14 +117,16 @@ impl Runtime {
             .map(|_| id(input, "task_id"))
             .transpose()?;
         let limit = domain_limit(input)?;
-        Ok(serde_json::to_value(
-            {
-                let network_id = access.network_id.to_owned();
-                let channel = channel.clone();
-                let task = task.clone();
-                self.store.read("workspace.workspace_state", move |store| store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)).await
-            }?,
-        )?)
+        Ok(serde_json::to_value({
+            let network_id = access.network_id.to_owned();
+            let channel = channel.clone();
+            let task = task.clone();
+            self.store
+                .read("workspace.workspace_state", move |store| {
+                    store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)
+                })
+                .await
+        }?)?)
     }
     pub(super) async fn workspace_history(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
@@ -122,7 +146,11 @@ impl Runtime {
             let network_id = access.network_id.to_owned();
             let channel = channel.clone();
             let task = task.clone();
-            self.store.read("workspace.workspace_history", move |store| store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)).await
+            self.store
+                .read("workspace.workspace_history", move |store| {
+                    store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)
+                })
+                .await
         }?;
         Ok(
             json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task.is_some(){"task"}else if channel.is_some(){"channel"}else{"workspace"}}}),

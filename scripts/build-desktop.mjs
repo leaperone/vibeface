@@ -156,6 +156,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   fs.copyFileSync(path.join(targetDirectory, target, 'release', `vibeface-desktop${platform.exe}`), executable);
   fs.chmodSync(executable, 0o755);
   copyRuntime(runtimeDir, path.join(resources, 'runtime'));
+  fs.copyFileSync(path.join(desktop, 'RUNTIME-REQUIREMENTS.md'), path.join(resources, 'NATIVE-REQUIREMENTS.md'));
   const base = `vibeface-desktop-${version}-${target}`;
   const produced = path.join(stage, 'out');
   fs.mkdirSync(produced, { recursive: true });
@@ -188,6 +189,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
       [`/DAPP_DIR=${appRoot}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
     if (signed) await signNative([path.join(produced, `${base}.exe`)]);
   } else {
+    run(process.env.PY || 'python3', [path.join(repo, 'scripts/native-desktop/dependencies.py'), '--executable', executable, '--target', target, '--output', path.join(appRoot, 'native-dependencies.json')]);
     fs.copyFileSync(path.join(desktop, 'build/icon.png'), path.join(appRoot, 'vibeface.png'));
     fs.copyFileSync(path.join(desktop, 'build/vibeface.desktop'), path.join(appRoot, 'vibeface.desktop'));
     fs.writeFileSync(path.join(appRoot, 'AppRun'), '#!/bin/sh\ncd "$(dirname "$0")"\nexec ./vibeface "$@"\n', { mode: 0o755 });

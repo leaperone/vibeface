@@ -48,6 +48,12 @@ pub struct LocalSession {
     expires_at_ms: i64,
 }
 
+impl LocalSession {
+    pub(crate) fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+}
+
 pub use vibeface_control::LocalHttpCredential as Launcher;
 
 impl LocalAccess {
@@ -261,12 +267,14 @@ impl LocalAccess {
         if state.enabled == enabled {
             return Ok(());
         }
-        state.enabled = enabled;
         state.generation = state.generation.wrapping_add(1);
+        // Fence existing transport snapshots before changing cookie authority or persisting
+        // its removal. Socket pumps can observe this watch without taking the disk-held lock.
+        self.changes.send_replace(state.generation);
+        state.enabled = enabled;
         state.tokens.clear();
         state.sessions.clear();
         self.save_sessions(&state)?;
-        self.changes.send_replace(state.generation);
         Ok(())
     }
 

@@ -634,6 +634,7 @@ pub struct Runtime {
     pub(crate) write_state: tokio::sync::watch::Sender<WriteState>,
     /// Bumped on every membership change, so open sessions and connections recheck their peer.
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
+    client_authority: tokio::sync::watch::Sender<(u64, Option<Arc<NetworkState>>)>,
     codex_rx: Mutex<Option<mpsc::UnboundedReceiver<vibeface_bridge::codex::ExecEvent>>>,
     pub(crate) triage: triage::TriageState,
     pub(crate) node_join: std::sync::Mutex<Option<crate::client::NodeJoinTask>>,
@@ -706,12 +707,13 @@ impl Runtime {
         let forwards = crate::client::Forwards::new(&config.forwarding);
         let identity = config::identity(dir)?;
         let have_wakeup = Arc::new(tokio::sync::Notify::new());
-        let log_wakeup = have_wakeup.clone();
-        let store = StoreActor::open(dir.join("node.sqlite3"), process_lock, move |store| {
+        let mut store = StoreActor::open(dir.join("node.sqlite3"), process_lock, |store| {
             store.recover_triage()?;
-            store.on_log_head_written(move || log_wakeup.notify_one());
             Ok(())
         }).await?;
+        let membership = tokio::sync::watch::Sender::new(0);
+        let client_authority = tokio::sync::watch::Sender::new((0, None));
+        store.publish_membership_to(client_authority.clone(), membership.clone(), have_wakeup.clone()).await?;
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         vibeface_bridge::agent::CursorAgent::kill_orphan(&dir.join(cursor::PIDFILE));
@@ -906,7 +908,8 @@ impl Runtime {
             local_access,
             forwards,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
-            membership: tokio::sync::watch::Sender::new(0),
+            membership,
+            client_authority,
             codex_rx: Mutex::new(Some(rx)),
             triage,
             node_join: std::sync::Mutex::new(None),
@@ -963,7 +966,6 @@ impl Runtime {
         if rebuilt || changed {
             self.publish_reread(&network);
         }
-        self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
         self.align(&network).await;
         self.wake_sync_all();
@@ -983,6 +985,11 @@ impl Runtime {
     }
     pub async fn rejoin_requested(&self) {
         self.rejoin.notified().await
+    }
+
+    /// Only committed membership history, shared without entering the SQLite queue.
+    pub(crate) fn client_membership(&self) -> (u64, Option<Arc<NetworkState>>) {
+        self.client_authority.borrow().clone()
     }
 
     pub async fn has_membership(&self) -> Result<bool> {
@@ -1045,7 +1052,7 @@ impl Runtime {
     fn start_recovery_timer(self: &Arc<Self>) {
         let node = Arc::downgrade(self);
         let mut membership = self.membership.subscribe();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 let Some(runtime) = node.upgrade() else {
                     return;
@@ -1069,7 +1076,9 @@ impl Runtime {
                     changed = membership.changed() => if changed.is_err() { return },
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "recovery timer skipped while the Node is shutting down");
+        }
     }
     /// Returns when the waiting recovery is due.
     async fn settle_recovery(&self) -> Result<Option<u64>> {

@@ -176,10 +176,10 @@ impl Runtime {
             self.bot_deleted(network, &scope, &event.hash);
         }
         Ok(
-            json!({"written":written.is_some(),"primary":{
+            json!({"written":written.is_some(),"primary":({
                 let network = network.to_owned();
                 self.store.call("bots.primary_bot", move |store| store.primary_bot(&network)).await
-            }?}),
+            }?)}),
         )
     }
 
@@ -285,10 +285,10 @@ impl Runtime {
             .await?;
         tracing::info!(event = "bot.primary", "primary bot set");
         self.publish_changed(&access.network_id, BOTS_SCOPE, Changed::Event(&event.hash));
-        Ok(json!({"primary":{
+        Ok(json!({"primary":({
             let network_id = access.network_id.to_owned();
             self.store.call("bots.primary_bot", move |store| store.primary_bot(&network_id)).await
-        }?}))
+        }?)}))
     }
 
     /// The user moves a bot's project folder, or clears it; asking for the current one writes nothing.
@@ -332,11 +332,11 @@ impl Runtime {
             "bot project set"
         );
         self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
-        Ok(json!({"bot":{
+        Ok(json!({"bot":({
             let network_id = access.network_id.to_owned();
             let scope = scope.to_owned();
             self.store.call("bots.bot_for_conversation", move |store| store.bot_for_conversation(&network_id, &scope)).await
-        }?}))
+        }?)}))
     }
 
     /// The user picks a bot's face, or `null` for the one its ID gives, over the face's `version`
