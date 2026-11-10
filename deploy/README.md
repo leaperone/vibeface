@@ -116,4 +116,4 @@ python3 deploy/static-config.py --self-test
 python3 scripts/deploy-activate.py --self-test
 ```
 
-镜像跨 Docker 存储后端传输时，接收端的不可变 ID 可能与构建端不同。导入流程应先校验传输归档的 SHA-256，再使用 Docker 返回的实际导入 ID 执行激活检查。
+导入流程先校验传输归档的 SHA-256，再核对 Docker 返回的唯一不可变 ID 与调用方指定的 `--image` 严格一致。ID 不一致时在停止服务或修改部署数据前拒绝激活，不改用导入结果。
