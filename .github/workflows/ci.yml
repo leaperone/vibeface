@@ -104,6 +104,8 @@ jobs:
         if: needs.plan.outputs.rust == 'true'
         run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
+        env:
+          GOTOOLCHAIN: go1.26.3
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
