@@ -150,8 +150,15 @@ def check(source, helpers):
     require('scripts/release.py begin-product' not in final and 'scripts/release.py publish-part' not in final,
             'final product job must only finalize the complete Release')
 
+    marker = workflow.get('release-failed', '')
+    require(needs(marker) == {'identity', 'release-start', 'publish-product'}
+            and "if: failure() && needs.release-start.result == 'success'" in marker
+            and 'scripts/release.py fail-product' in marker and 'scripts/release.py publish' not in marker
+            and 'scripts/release.py begin-product' not in marker,
+            'failed product run must only mark its unfinished Release')
+
     for name, block in workflow.items():
-        if name not in {'release-start', 'publish', 'publish-product', *PARTS}:
+        if name not in {'release-start', 'publish', 'publish-product', 'release-failed', *PARTS}:
             require('contents: write' not in block and 'scripts/release.py publish' not in block
                     and 'scripts/release.py begin-product' not in block,
                     name + ' must not mutate a public Release')
@@ -246,6 +253,8 @@ def self_test(source, helpers):
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
         source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www'",
                        "if: needs.identity.outputs.app == 'www'"),
+        source.replace('scripts/release.py fail-product', 'scripts/release.py publish product .artifacts/release'),
+        source.replace("if: failure() && needs.release-start.result == 'success'", 'if: always()'),
     ]
     broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
                       helper.replace('actions: read', 'contents: read'),

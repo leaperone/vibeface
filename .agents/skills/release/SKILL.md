@@ -84,7 +84,7 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 
 每次推送 tag 后立即按完整 `SOURCE_SHA`、`TAG` 和事件核对 [release.yml](../../../.github/workflows/release.yml) 的 runs。使用 `gh-run-watch` 持续跟踪所有本次关联 runs 到终态。不要用“最新一条”猜 run，也不要把 API 观察超时当作构建失败后重复发布。
 
-公开附件不代表整套发布已完成。缺少全局 `release.json` 时，报告为构建中，用户可手动下载已校验平台；新版安装器和自动更新器跳过它。已安装旧客户端无法追溯修改，可能更新已具备完整电脑包和校验文件的平台，缺少目标时失败并保留现版。完整发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
+公开附件不代表整套发布已完成。缺少全局 `release.json` 时，报告为构建中，用户可手动下载已校验平台；新版安装器和自动更新器跳过它。产品 run 失败且尚无 `release.json` 时，`release-failed` 把正文标为 FAILED；重跑失败 job 完成后写回完成说明，完整重跑先恢复为构建中。已安装旧客户端无法追溯修改，可能更新已具备完整电脑包和校验文件的平台，缺少目标时失败并保留现版。完整发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
 
 产品发布不更新 App 或公共节点。用户要求部署这些服务时，使用相邻的 [deploy skill](../deploy/SKILL.md)，显式选择已经完整发布的产品 Tag。不得由 `release product` 自动派发部署。
 

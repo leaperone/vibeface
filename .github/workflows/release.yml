@@ -538,6 +538,22 @@ jobs:
           python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
           python3 -B scripts/check-android-manifest-tool.py
           python3 -B scripts/release.py publish product .artifacts/release
+  release-failed:
+    needs: [identity, release-start, publish-product]
+    if: failure() && needs.release-start.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - name: Mark the unfinished Release as failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/release.py fail-product
   npm:
     needs: [identity, collect, publish-product]
     if: needs.publish-product.result == 'success' && needs.identity.outputs.app == 'product' && contains(needs.identity.outputs.version, '-nightly.')
