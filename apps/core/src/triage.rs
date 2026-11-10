@@ -225,161 +225,43 @@ fn s(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_owned()
 }
 
-/// A Codex hook's stdin (`Stop`, `PermissionRequest`). The tool input is left out: commands
-/// are not surfaced.
-pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
-    let (event, status, detail) = match input["hook_event_name"].as_str()? {
-        "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
-        "PermissionRequest" => (Kind::NeedsInput, None, s(input, "tool_name")),
-        _ => return None,
-    };
-    Some(AgentEvent {
-        source: Source::Hook,
-        agent: Provider::Codex,
-        event,
-        status,
-        session_id: s(input, "session_id"),
-        turn_id: s(input, "turn_id"),
-        cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
-        detail,
-        ..Default::default()
-    })
+// Exercise Core ingestion with events normalized by the CLI used in production.
+#[cfg(test)]
+#[path = "../../cli/src/triage.rs"]
+#[allow(dead_code)]
+mod cli_hooks;
+
+#[cfg(test)]
+fn cli_hook(
+    agent: cli_hooks::Provider,
+    input: &Value,
+    transcript_bytes: u64,
+) -> Option<AgentEvent> {
+    let event = cli_hooks::from_hook(agent, input, transcript_bytes)?;
+    Some(
+        serde_json::from_value(serde_json::to_value(event).expect("serialize CLI hook event"))
+            .expect("CLI hook events match the Core wire shape"),
+    )
 }
 
-/// A Claude Code hook's stdin (`Stop`, `StopFailure`, `Notification`, `PermissionRequest`);
-/// `transcript_bytes` keys the turn. A permission request or question waits for the answer.
-pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
-    let (event, status, detail) = match input["hook_event_name"].as_str()? {
-        "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
-        "StopFailure" => (
-            Kind::TurnEnd,
-            Some("failed".to_owned()),
-            [s(input, "error"), s(input, "error_details")]
-                .join(" ")
-                .trim()
-                .into(),
-        ),
-        // A held permission request that got no answer falls back to Claude Code's own prompt,
-        // which notifies again; the request already woke the Agent.
-        "Notification" if input["notification_type"] == "permission_prompt" => return None,
-        "Notification" => (
-            Kind::Notification,
-            None,
-            [s(input, "notification_type"), s(input, "message")]
-                .join(" ")
-                .trim()
-                .into(),
-        ),
-        "PermissionRequest" => (
-            Kind::NeedsInput,
-            None,
-            crate::runtime::claude::describe_request(input),
-        ),
-        _ => return None,
-    };
-    // Permission requests a turn asks at once share the transcript's length.
-    let turn_id = match event {
-        Kind::NeedsInput => format!(
-            "tx:{transcript_bytes}:{}",
-            hex32(&[&s(input, "tool_name"), &input["tool_input"].to_string()])
-        ),
-        _ => format!("tx:{transcript_bytes}"),
-    };
-    Some(AgentEvent {
-        source: Source::Hook,
-        agent: Provider::Claude,
-        event,
-        status,
-        session_id: s(input, "session_id"),
-        turn_id,
-        cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
-        detail,
-        hold: (event == Kind::NeedsInput).then(|| crate::runtime::claude::request_kind(input)),
-        ..Default::default()
-    })
+#[cfg(test)]
+fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
+    cli_hook(cli_hooks::Provider::Codex, input, 0)
 }
 
-/// What the vibeface pi extension sends when a run of a pi session settles, keyed by the
-/// session's last entry. A run the user stopped is left alone; one that replied or failed holds
-/// its session for what it does next.
-pub fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
-    let (status, detail) = match input["stop_reason"].as_str()? {
-        "stop" => ("completed", String::new()),
-        "length" => ("failed", "pi stopped at the model's output limit".into()),
-        "error" => ("failed", s(input, "error")),
-        _ => return None,
-    };
-    Some(AgentEvent {
-        source: Source::Hook,
-        agent: Provider::Pi,
-        event: Kind::TurnEnd,
-        status: Some(status.into()),
-        session_id: s(input, "session_id"),
-        turn_id: s(input, "turn_id"),
-        cwd: s(input, "cwd"),
-        last_message: s(input, "last_message"),
-        detail,
-        hold: Some(RequestKind::Continue),
-        ..Default::default()
-    })
+#[cfg(test)]
+pub(crate) fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
+    cli_hook(cli_hooks::Provider::Claude, input, transcript_bytes)
 }
 
-/// What the vibeface opencode plugin sends: a settled run, keyed by its last reply, or a
-/// permission or question a session asks, keyed by the request and held for the answer. A
-/// permission is named by its kind; its commands stay out.
-pub fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
-    let request = || input["request_id"].as_str().filter(|id| !id.is_empty());
-    let (event, status, turn_id, detail, hold) = match input["event"].as_str()? {
-        "session.idle" => {
-            let status = input["status"]
-                .as_str()
-                .filter(|status| matches!(*status, "completed" | "interrupted" | "failed"))?;
-            let turn = s(input, "turn_id");
-            (Kind::TurnEnd, Some(status), turn, s(input, "error"), None)
-        }
-        "permission.asked" => (
-            Kind::NeedsInput,
-            None,
-            request()?.to_owned(),
-            format!(
-                "opencode asks to use {}. Answer with {{\"reply\":\"once\"}}, {{\"reply\":\"always\"}} or {{\"reply\":\"reject\"}}.",
-                input["permission"].as_str().unwrap_or("a tool")
-            ),
-            Some(RequestKind::Permission),
-        ),
-        "question.asked" => {
-            let questions = question_lines(&input["questions"]);
-            // The answer's form comes first: the Agent sees the start of a long detail.
-            let detail = format!(
-                "Answer with {{\"answers\":[[\"LABEL\"]]}}, the labels chosen for each question in order, or {{\"reject\":true}}. opencode asks: {}.",
-                questions.join("; ")
-            );
-            let request = request()?.to_owned();
-            (
-                Kind::NeedsInput,
-                None,
-                request,
-                detail,
-                Some(RequestKind::Question),
-            )
-        }
-        _ => return None,
-    };
-    Some(AgentEvent {
-        source: Source::Hook,
-        agent: Provider::Opencode,
-        event,
-        status: status.map(String::from),
-        session_id: s(input, "session_id"),
-        turn_id,
-        cwd: s(input, "cwd"),
-        last_message: s(input, "last_message"),
-        detail,
-        hold,
-        ..Default::default()
-    })
+#[cfg(test)]
+pub(crate) fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
+    cli_hook(cli_hooks::Provider::Pi, input, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
+    cli_hook(cli_hooks::Provider::Opencode, input, 0)
 }
 
 /// Each question of a request with its option labels, as `text [A | B]`, or its bare text when
