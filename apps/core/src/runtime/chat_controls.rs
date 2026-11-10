@@ -62,15 +62,23 @@ impl Runtime {
         if scope != crate::workspace::WORKSPACE_SCOPE {
             return self.require_scope(access, scope).await;
         }
-        ensure!(access.human && access.conversation_id.is_none(),
-            "workspace attachments need the user's personal network access");
+        ensure!(
+            access.human && access.conversation_id.is_none(),
+            "workspace attachments need the user's personal network access"
+        );
         let state = self.membership_state().await?;
-        ensure!(state.genesis.network_id == access.network_id, "wrong personal network");
-        let network = access.network_id.clone(); let local = self.identity.device_id()?;
-        self.store.call("chat_controls.attachment_scope", move |store| {
-            store.authorize_node(&network, &local)?;
-            Ok(())
-        }).await
+        ensure!(
+            state.genesis.network_id == access.network_id,
+            "wrong personal network"
+        );
+        let network = access.network_id.clone();
+        let local = self.identity.device_id()?;
+        self.store
+            .call("chat_controls.attachment_scope", move |store| {
+                store.authorize_node(&network, &local)?;
+                Ok(())
+            })
+            .await
     }
 
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
@@ -233,7 +241,13 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         let scope = field(input, "conversation_id")?;
-        self.read_display(access, input, "chat_controls.conversation_snapshot.authorize", |_| Ok(())).await?;
+        self.read_display(
+            access,
+            input,
+            "chat_controls.conversation_snapshot.authorize",
+            |_| Ok(()),
+        )
+        .await?;
         let network = &access.network_id;
         let projection = self.scheduler_projection()?;
         let local_manager = self.scheduler_manager_metadata();
@@ -267,28 +281,77 @@ impl Runtime {
             history_authority,
         ) = {
             let (network, scope, local) = (network.clone(), scope.to_owned(), local.clone());
-            self.read_display(access, input, "chat_controls.conversation_snapshot", move |store| {
+            self.read_display(
+                access,
+                input,
+                "chat_controls.conversation_snapshot",
+                move |store| {
                     let (network, scope) = (network.as_str(), scope.as_str());
 
                     use vibeface_protocol::history::HistorySection;
                     let history_authority = store.conversation_history_authority(network, scope)?;
                     let mut history_starts = BTreeMap::new();
-                    for section in HistorySection::ALL.into_iter().filter(|section| !matches!(section,
-                        HistorySection::OwnerJobs | HistorySection::OwnerScopeJobs | HistorySection::OwnerMemoryConflicts)) {
-                        let name = serde_json::to_value(section)?.as_str().context("history section name")?.to_owned();
-                        history_starts.insert(name, store.conversation_history_start_cursor(network, scope, section)?);
+                    for section in HistorySection::ALL.into_iter().filter(|section| {
+                        !matches!(
+                            section,
+                            HistorySection::OwnerJobs
+                                | HistorySection::OwnerScopeJobs
+                                | HistorySection::OwnerMemoryConflicts
+                        )
+                    }) {
+                        let name = serde_json::to_value(section)?
+                            .as_str()
+                            .context("history section name")?
+                            .to_owned();
+                        history_starts.insert(
+                            name,
+                            store.conversation_history_start_cursor(network, scope, section)?,
+                        );
                     }
                     let works = store.conversation_works_page(network, scope, None, 50)?;
                     let task_jobs = task_observations(&store, scope, &works.items)?;
-                    let jobs = projection.history_page(store, network, scope, HistorySection::Jobs, None, 50, &local_manager)?;
-                    let scope_jobs = projection.history_page(store, network, scope, HistorySection::ScopeJobs, None, 50, &local_manager)?;
-                    let checks = projection.history_page(store, network, scope, HistorySection::Checks, None, 50, &local_manager)?;
-                    let deliveries = projection.history_page(store, network, scope, HistorySection::Deliveries, None, 50, &local_manager)?;
+                    let jobs = projection.history_page(
+                        store,
+                        network,
+                        scope,
+                        HistorySection::Jobs,
+                        None,
+                        50,
+                        &local_manager,
+                    )?;
+                    let scope_jobs = projection.history_page(
+                        store,
+                        network,
+                        scope,
+                        HistorySection::ScopeJobs,
+                        None,
+                        50,
+                        &local_manager,
+                    )?;
+                    let checks = projection.history_page(
+                        store,
+                        network,
+                        scope,
+                        HistorySection::Checks,
+                        None,
+                        50,
+                        &local_manager,
+                    )?;
+                    let deliveries = projection.history_page(
+                        store,
+                        network,
+                        scope,
+                        HistorySection::Deliveries,
+                        None,
+                        50,
+                        &local_manager,
+                    )?;
                     let conversation = store.conversation(network, scope)?;
                     // Devices whose live progress this conversation shows: its owner and those running its open works.
                     let mut targets = Vec::new();
                     let sources = conversation.iter().filter_map(|c| c.owner.as_ref()).chain(
-                        works.items
+                        works
+                            .items
                             .iter()
                             .filter(|work| work.outcome.is_none())
                             .map(|work| &work.target_node),
@@ -303,9 +366,15 @@ impl Runtime {
                         }
                     }
                     let bot = store.bot_for_conversation(network, scope)?;
-                    let messages = store.conversation_messages_page(network, scope, None, vibeface_protocol::history::HISTORY_DEFAULT_LIMIT)?;
+                    let messages = store.conversation_messages_page(
+                        network,
+                        scope,
+                        None,
+                        vibeface_protocol::history::HISTORY_DEFAULT_LIMIT,
+                    )?;
                     let changes = store.conversation_changes_page(network, scope, None, 50)?;
-                    let overwritten = store.conversation_overwritten_page(network, scope, None, 50)?;
+                    let overwritten =
+                        store.conversation_overwritten_page(network, scope, None, 50)?;
                     let omitted_sent = store.sent_bot_message_count(network, scope)?;
                     let questions = store.conversation_questions_page(network, scope, None, 50)?;
                     let sessions = store.conversation_sessions_page(network, scope, None, 50)?;
@@ -313,10 +382,20 @@ impl Runtime {
                     let schedules = store.conversation_schedules_page(network, scope, None, 50)?;
                     let now = now_ms();
                     let memory = store.conversation_memory_page(network, scope, None, 50)?;
-                    let memory_sync_conflicts = store.conversation_memory_sync_conflicts_page(network, scope, None, 50)?;
+                    let memory_sync_conflicts =
+                        store.conversation_memory_sync_conflicts_page(network, scope, None, 50)?;
                     let memory_staged_count = store.conversation_memory_staged_count(scope)?;
-                    let memory_conflicts = store.conversation_memory_conflicts_page(network, scope, None, 50)?;
-                    let unanswered = projection.history_page(store, network, scope, HistorySection::Unanswered, None, 50, &local_manager)?;
+                    let memory_conflicts =
+                        store.conversation_memory_conflicts_page(network, scope, None, 50)?;
+                    let unanswered = projection.history_page(
+                        store,
+                        network,
+                        scope,
+                        HistorySection::Unanswered,
+                        None,
+                        50,
+                        &local_manager,
+                    )?;
 
                     Ok((
                         jobs,
@@ -345,15 +424,21 @@ impl Runtime {
                         history_starts,
                         history_authority,
                     ))
-                })
-                .await?
+                },
+            )
+            .await?
         };
-        let work_values = works.items
+        let work_values = works
+            .items
             .iter()
             .map(|work| work_view(work, &task_jobs))
             .collect::<Result<Vec<_>>>()?;
         let skill_values: Vec<_> = skills.items.iter().map(skill_summary).collect();
-        let schedule_values: Vec<_> = schedules.items.iter().filter_map(|entry| schedule_summary(entry, now)).collect();
+        let schedule_values: Vec<_> = schedules
+            .items
+            .iter()
+            .filter_map(|entry| schedule_summary(entry, now))
+            .collect();
         let local_context = self
             .scheduler_context_observation(
                 network,
@@ -404,13 +489,19 @@ impl Runtime {
         });
         let mut history_starts = history_starts;
         for section in vibeface_protocol::history::HistorySection::ALL {
-            let name = serde_json::to_value(section)?.as_str().context("history section name")?.to_owned();
+            let name = serde_json::to_value(section)?
+                .as_str()
+                .context("history section name")?
+                .to_owned();
             if snapshot["history"][&name].is_null() {
                 snapshot["history"][&name] = json!({"next_cursor":null,"complete":true});
             }
         }
         for name in ["owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"] {
-            if let Some(coverage) = snapshot["scheduler"]["remote"]["history"].get(name).cloned() {
+            if let Some(coverage) = snapshot["scheduler"]["remote"]["history"]
+                .get(name)
+                .cloned()
+            {
                 snapshot["history"][name] = coverage;
             }
             if let Some(cursor) = snapshot["scheduler"]["remote"]["history_starts"][name].as_str() {
@@ -425,67 +516,163 @@ impl Runtime {
         Ok(snapshot)
     }
 
-    pub(super) async fn conversation_history(&self, access: &Access, input: &Value) -> Result<Value> {
+    pub(super) async fn conversation_history(
+        &self,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
         use vibeface_protocol::history::{HistoryRequest, HistorySection};
         let mut parameters = input.clone();
-        parameters.as_object_mut().context("history request must be an object")?.remove("method");
+        parameters
+            .as_object_mut()
+            .context("history request must be an object")?
+            .remove("method");
         let request: HistoryRequest = serde_json::from_value(parameters)?;
-        if matches!(request.section, HistorySection::OwnerJobs | HistorySection::OwnerScopeJobs | HistorySection::OwnerMemoryConflicts) {
+        if matches!(
+            request.section,
+            HistorySection::OwnerJobs
+                | HistorySection::OwnerScopeJobs
+                | HistorySection::OwnerMemoryConflicts
+        ) {
             return self.conversation_owner_history(access, input).await;
         }
         let projection = self.scheduler_projection()?;
         let manager = self.scheduler_manager_metadata();
         let network = access.network_id.clone();
-        let page = self.read_display(access, input, "chat_controls.conversation_history", move |store| {
-            match request.section {
-                HistorySection::Messages => Ok(serde_json::to_value(store.conversation_messages_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
-                )?)?),
-                HistorySection::Works => Ok(serde_json::to_value(store.conversation_works_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
-                )?)?),
-                HistorySection::Changes => Ok(serde_json::to_value(store.conversation_changes_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
-                )?)?),
-                HistorySection::Questions => Ok(serde_json::to_value(store.conversation_questions_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
-                )?)?),
-                HistorySection::Sessions => Ok(serde_json::to_value(store.conversation_sessions_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
-                )?)?),
-                HistorySection::Jobs | HistorySection::ScopeJobs | HistorySection::Checks
-                | HistorySection::Deliveries | HistorySection::Unanswered => Ok(serde_json::to_value(
-                    projection.history_page(store, &network, &request.conversation_id, request.section,
-                        request.cursor.as_deref(), request.limit, &manager)?)?),
-                HistorySection::Skills => {
-                    let page = store.conversation_skills_page(&network, &request.conversation_id, request.cursor.as_deref(), request.limit)?;
-                    let items: Vec<_> = page.items.iter().map(skill_summary).collect();
-                    let mut value = serde_json::to_value(&page)?;
-                    value["items"] = json!(items);
-                    Ok(value)
+        let page = self
+            .read_display(
+                access,
+                input,
+                "chat_controls.conversation_history",
+                move |store| match request.section {
+                    HistorySection::Messages => {
+                        Ok(serde_json::to_value(store.conversation_messages_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::Works => {
+                        Ok(serde_json::to_value(store.conversation_works_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::Changes => {
+                        Ok(serde_json::to_value(store.conversation_changes_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::Questions => {
+                        Ok(serde_json::to_value(store.conversation_questions_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::Sessions => {
+                        Ok(serde_json::to_value(store.conversation_sessions_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::Jobs
+                    | HistorySection::ScopeJobs
+                    | HistorySection::Checks
+                    | HistorySection::Deliveries
+                    | HistorySection::Unanswered => {
+                        Ok(serde_json::to_value(projection.history_page(
+                            store,
+                            &network,
+                            &request.conversation_id,
+                            request.section,
+                            request.cursor.as_deref(),
+                            request.limit,
+                            &manager,
+                        )?)?)
+                    }
+                    HistorySection::Skills => {
+                        let page = store.conversation_skills_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?;
+                        let items: Vec<_> = page.items.iter().map(skill_summary).collect();
+                        let mut value = serde_json::to_value(&page)?;
+                        value["items"] = json!(items);
+                        Ok(value)
+                    }
+                    HistorySection::Schedules => {
+                        let page = store.conversation_schedules_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?;
+                        let now = now_ms();
+                        let items: Vec<_> = page
+                            .items
+                            .iter()
+                            .filter_map(|entry| schedule_summary(entry, now))
+                            .collect();
+                        let mut value = serde_json::to_value(&page)?;
+                        value["items"] = json!(items);
+                        Ok(value)
+                    }
+                    HistorySection::Memory => {
+                        Ok(serde_json::to_value(store.conversation_memory_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::MemoryConflicts => Ok(serde_json::to_value(
+                        store.conversation_memory_conflicts_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?,
+                    )?),
+                    HistorySection::MemorySyncConflicts => Ok(serde_json::to_value(
+                        store.conversation_memory_sync_conflicts_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?,
+                    )?),
+                    HistorySection::Overwritten => {
+                        Ok(serde_json::to_value(store.conversation_overwritten_page(
+                            &network,
+                            &request.conversation_id,
+                            request.cursor.as_deref(),
+                            request.limit,
+                        )?)?)
+                    }
+                    HistorySection::OwnerJobs
+                    | HistorySection::OwnerScopeJobs
+                    | HistorySection::OwnerMemoryConflicts => {
+                        unreachable!("owner history is routed before opening the local read")
+                    }
                 },
-                HistorySection::Schedules => {
-                    let page = store.conversation_schedules_page(&network, &request.conversation_id, request.cursor.as_deref(), request.limit)?;
-                    let now = now_ms();
-                    let items: Vec<_> = page.items.iter().filter_map(|entry| schedule_summary(entry, now)).collect();
-                    let mut value = serde_json::to_value(&page)?;
-                    value["items"] = json!(items);
-                    Ok(value)
-                },
-                HistorySection::Memory => Ok(serde_json::to_value(store.conversation_memory_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit)?)?),
-                HistorySection::MemoryConflicts => Ok(serde_json::to_value(store.conversation_memory_conflicts_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit)?)?),
-                HistorySection::MemorySyncConflicts => Ok(serde_json::to_value(store.conversation_memory_sync_conflicts_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit)?)?),
-                HistorySection::Overwritten => Ok(serde_json::to_value(store.conversation_overwritten_page(
-                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit)?)?),
-                HistorySection::OwnerJobs | HistorySection::OwnerScopeJobs | HistorySection::OwnerMemoryConflicts =>
-                    unreachable!("owner history is routed before opening the local read"),
-            }
-        }).await?;
-        ensure!(serde_json::to_vec(&page)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
-            "history record exceeds the response byte limit");
+            )
+            .await?;
+        ensure!(
+            serde_json::to_vec(&page)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
+            "history record exceeds the response byte limit"
+        );
         Ok(page)
     }
 
@@ -548,43 +735,64 @@ impl Runtime {
 /// Defer whole sections to their real first-page cursor when their combined payload is
 /// larger than one response. No record is shortened or made unreachable.
 fn fit_history_snapshot(snapshot: &mut Value, starts: &BTreeMap<String, String>) -> Result<()> {
-    use vibeface_protocol::history::{HistorySection, HISTORY_RESPONSE_BYTES};
+    use vibeface_protocol::history::{HISTORY_RESPONSE_BYTES, HistorySection};
     let mut size = serde_json::to_vec(snapshot)?.len();
-    if size < HISTORY_RESPONSE_BYTES { return Ok(()); }
+    if size < HISTORY_RESPONSE_BYTES {
+        return Ok(());
+    }
     let mut sections = Vec::new();
     for name in starts.keys() {
         let section: HistorySection = serde_json::from_value(json!(name))?;
-        let value = section.snapshot_path().iter().fold(&*snapshot, |value, key| &value[*key]);
-        if value.is_array() { sections.push((serde_json::to_vec(value)?.len(), name, section)); }
+        let value = section
+            .snapshot_path()
+            .iter()
+            .fold(&*snapshot, |value, key| &value[*key]);
+        if value.is_array() {
+            sections.push((serde_json::to_vec(value)?.len(), name, section));
+        }
     }
     sections.sort_by(|left, right| right.0.cmp(&left.0));
     for (previous_size, name, section) in sections {
         let coverage_size = serde_json::to_vec(&snapshot["history"][name])?.len();
-        let value = section.snapshot_path().iter().fold(&mut *snapshot, |value, key| &mut value[*key]);
+        let value = section
+            .snapshot_path()
+            .iter()
+            .fold(&mut *snapshot, |value, key| &mut value[*key]);
         *value = json!([]);
         snapshot["history"][name] = json!({"next_cursor":starts[name],"complete":false});
-        size = size - previous_size + 2 - coverage_size + serde_json::to_vec(&snapshot["history"][name])?.len();
+        size = size - previous_size + 2 - coverage_size
+            + serde_json::to_vec(&snapshot["history"][name])?.len();
         if section == HistorySection::MemorySyncConflicts {
             let has_more = &mut snapshot["bot_settings"]["memory_sync_conflicts"]["has_more"];
             let previous = serde_json::to_vec(has_more)?.len();
             *has_more = json!(true);
             size = size - previous + 4;
         }
-        if size < HISTORY_RESPONSE_BYTES { break; }
+        if size < HISTORY_RESPONSE_BYTES {
+            break;
+        }
     }
     // Verify the actual final payload once, after accounting for replacements. Repeated
     // whole-snapshot serialization would otherwise grow with the number of deferred sections.
-    ensure!(serde_json::to_vec(snapshot)?.len() < HISTORY_RESPONSE_BYTES,
-        "conversation metadata exceeds the response byte limit");
+    ensure!(
+        serde_json::to_vec(snapshot)?.len() < HISTORY_RESPONSE_BYTES,
+        "conversation metadata exceeds the response byte limit"
+    );
     Ok(())
 }
 
-fn task_observations(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<BTreeMap<String, Value>> {
-    works.iter()
+fn task_observations(
+    store: &Store,
+    scope: &str,
+    works: &[WorkProjection],
+) -> Result<BTreeMap<String, Value>> {
+    works
+        .iter()
         .filter(|work| work.kind == crate::model::WorkKind::Task)
         .map(|work| store.scheduler_job(scope, &crate::scheduling::task_trigger(&work.work_id)))
         .collect::<Result<Vec<_>>>()?
-        .into_iter().flatten()
+        .into_iter()
+        .flatten()
         .filter(|job| job.kind == TriggerKind::AgentTask)
         .map(|job| {
             Ok((
@@ -612,7 +820,9 @@ fn skill_summary(entry: &SkillEntry) -> Value {
 }
 
 fn schedule_summary(entry: &ScheduleEntry, now: i64) -> Option<Value> {
-    if !crate::scheduling::ahead(&entry.schedule, now) { return None; }
+    if !crate::scheduling::ahead(&entry.schedule, now) {
+        return None;
+    }
     let mut value = json!(entry.schedule);
     value["schedule_id"] = json!(entry.schedule_id);
     value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.schedule, now));
@@ -652,12 +862,16 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
-    use crate::runtime::{test_support::access as test_access, triage::tests::{bot, node}};
+    use crate::runtime::{
+        test_support::access as test_access,
+        triage::tests::{bot, node},
+    };
     use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
     use base64::Engine as _;
 
     #[tokio::test]
-    async fn workspace_channel_upload_and_download_require_unscoped_human_network_access() -> Result<()> {
+    async fn workspace_channel_upload_and_download_require_unscoped_human_network_access()
+    -> Result<()> {
         let (node, admin, directory) = node().await?;
         let result = async {
             bot(&node, &admin, "c", "Channel bot", &[]).await?;
@@ -707,7 +921,10 @@ mod attachment_tests {
 #[cfg(test)]
 mod conversation_history_tests {
     use super::*;
-    use crate::runtime::{test_support::{access as test_access, signed_main_input}, triage::tests::{bot, node}};
+    use crate::runtime::{
+        test_support::{access as test_access, signed_main_input},
+        triage::tests::{bot, node},
+    };
     use vibeface_protocol::history::HISTORY_RESPONSE_BYTES;
 
     #[tokio::test]

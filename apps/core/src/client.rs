@@ -634,7 +634,9 @@ async fn serve_session_with_heartbeat(
         calls.start_ordered(&node, &session, &authority);
         let mut delivered = false;
         if authority.ready(&node)? {
-            if resync_pending && session.subscribed.is_some() && pushes.is_empty()
+            if resync_pending
+                && session.subscribed.is_some()
+                && pushes.is_empty()
                 && let Some(principal) = authority.current(&node, &session)?
             {
                 pushes.start(&node, &session, principal, json!({"type":"resync"}));
@@ -654,7 +656,9 @@ async fn serve_session_with_heartbeat(
                 delivered = true;
             }
         }
-        if delivered { continue; }
+        if delivered {
+            continue;
+        }
         tokio::select! {
             frame = socket.next() => {
                 received = Instant::now();
@@ -781,7 +785,10 @@ async fn dispatch(
 }
 
 fn snapshot_request(method: &str, params: &Value) -> bool {
-    method == "rpc" && params["method"].as_str().is_some_and(crate::runtime::snapshot_rpc)
+    method == "rpc"
+        && params["method"]
+            .as_str()
+            .is_some_and(crate::runtime::snapshot_rpc)
 }
 
 async fn dispatch_inner(

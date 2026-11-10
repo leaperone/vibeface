@@ -3,8 +3,8 @@ extern crate gpui_kit as gpui;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Subscription, TestAppContext,
-    Window, div,
+    AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Subscription,
+    TestAppContext, Window, div,
 };
 struct InputProbe {
     input: Entity<InputState>,
@@ -41,11 +41,13 @@ fn native_field_focus_text_and_enter_reach_owner(cx: &mut TestAppContext) {
         })
         .unwrap();
     let native_window: gpui_kit::AnyWindowHandle = handle.into();
-    native_window.update(cx, |_, window, cx| {
-        window.render_frame(cx);
-        window.input("native-gpui-fixture", cx);
-        window.press("enter", cx);
-    }).unwrap();
+    native_window
+        .update(cx, |_, window, cx| {
+            window.render_frame(cx);
+            window.input("native-gpui-fixture", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
     cx.run_until_parked();
     handle
         .update(cx, |view, window, cx| {

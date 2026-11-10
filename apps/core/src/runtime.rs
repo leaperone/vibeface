@@ -1,3 +1,4 @@
+pub(crate) use crate::store::actor::{ClientAuthorityState, ClientMembership};
 use crate::{
     config::{self, Config},
     crypto::LocalIdentity,
@@ -18,7 +19,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
-pub(crate) use crate::store::actor::{ClientAuthorityState, ClientMembership};
 
 pub(crate) mod agent_tools;
 mod bots;
@@ -653,8 +653,16 @@ pub fn now_ms() -> i64 {
 }
 /// These display requests may use committed WAL snapshots; mutation receipts and controls cannot.
 pub(crate) fn snapshot_rpc(method: &str) -> bool {
-    matches!(method, "conversations" | "conversation_history" | "open_works" | "workspace_overview"
-        | "workspace_state" | "workspace_history" | "notifications")
+    matches!(
+        method,
+        "conversations"
+            | "conversation_history"
+            | "open_works"
+            | "workspace_overview"
+            | "workspace_state"
+            | "workspace_history"
+            | "notifications"
+    )
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -718,10 +726,18 @@ impl Runtime {
         let mut store = StoreActor::open(dir.join("node.sqlite3"), process_lock, |store| {
             store.recover_triage()?;
             Ok(())
-        }).await?;
+        })
+        .await?;
         let membership = tokio::sync::watch::Sender::new(0);
-        let client_authority = tokio::sync::watch::Sender::new((0, ClientAuthorityState::Initializing));
-        store.publish_membership_to(client_authority.clone(), membership.clone(), have_wakeup.clone()).await?;
+        let client_authority =
+            tokio::sync::watch::Sender::new((0, ClientAuthorityState::Initializing));
+        store
+            .publish_membership_to(
+                client_authority.clone(),
+                membership.clone(),
+                have_wakeup.clone(),
+            )
+            .await?;
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = vibeface_bridge::codex::event_channel();
         vibeface_bridge::agent::CursorAgent::kill_orphan(&dir.join(cursor::PIDFILE));
@@ -952,26 +968,29 @@ impl Runtime {
     }
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
-        let (view, rebuilt, changed, network) = self.store.call("install_membership", move |store| {
-        let previous = if store.has_network()? {
-            Some(store.public_state()?)
-        } else {
-            None
-        };
-        let state = match &previous {
-            Some(previous) => previous.merge(&incoming)?,
-            None => incoming,
-        };
-        // Clients read the device list on a change, so a join, removal or permission change
-        // shows on every open page without a reload.
-        let changed = previous.as_ref() != Some(&state);
-        let network = state.genesis.network_id.clone();
-        let (view, rebuilt) = store.install_state(state)?;
-        if rebuilt {
-            store.settle_local_works(&network)?;
-        }
-            Ok((view, rebuilt, changed, network))
-        }).await?;
+        let (view, rebuilt, changed, network) = self
+            .store
+            .call("install_membership", move |store| {
+                let previous = if store.has_network()? {
+                    Some(store.public_state()?)
+                } else {
+                    None
+                };
+                let state = match &previous {
+                    Some(previous) => previous.merge(&incoming)?,
+                    None => incoming,
+                };
+                // Clients read the device list on a change, so a join, removal or permission change
+                // shows on every open page without a reload.
+                let changed = previous.as_ref() != Some(&state);
+                let network = state.genesis.network_id.clone();
+                let (view, rebuilt) = store.install_state(state)?;
+                if rebuilt {
+                    store.settle_local_works(&network)?;
+                }
+                Ok((view, rebuilt, changed, network))
+            })
+            .await?;
         if rebuilt || changed {
             self.publish_reread(&network);
         }
@@ -1001,7 +1020,9 @@ impl Runtime {
         self.client_authority.borrow().clone()
     }
 
-    pub(crate) fn subscribe_client_membership(&self) -> tokio::sync::watch::Receiver<ClientMembership> {
+    pub(crate) fn subscribe_client_membership(
+        &self,
+    ) -> tokio::sync::watch::Receiver<ClientMembership> {
         self.client_authority.subscribe()
     }
 
@@ -1013,7 +1034,10 @@ impl Runtime {
             match state {
                 ClientAuthorityState::Ready(state) => return Ok((generation, state)),
                 ClientAuthorityState::Initializing | ClientAuthorityState::Updating => {
-                    authority.changed().await.context("client authority channel closed")?;
+                    authority
+                        .changed()
+                        .await
+                        .context("client authority channel closed")?;
                 }
                 ClientAuthorityState::Unavailable => bail!("database authority is unavailable"),
             }
@@ -1021,16 +1045,24 @@ impl Runtime {
     }
 
     pub async fn has_membership(&self) -> Result<bool> {
-        self.store.call("has_network", |store| store.has_network()).await
+        self.store
+            .call("has_network", |store| store.has_network())
+            .await
     }
 
     pub async fn membership_state(&self) -> Result<NetworkState> {
-        self.store.call("public_state", |store| store.public_state()).await
+        self.store
+            .call("public_state", |store| store.public_state())
+            .await
     }
     pub async fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
         {
             let recovery_key = recovery_key.to_owned();
-            self.store.call("recovery_since", move |store| store.recovery_since_ms(&recovery_key)).await
+            self.store
+                .call("recovery_since", move |store| {
+                    store.recovery_since_ms(&recovery_key)
+                })
+                .await
         }
     }
     pub fn info(&self) -> Value {
@@ -1083,7 +1115,9 @@ impl Runtime {
             loop {
                 let state = match authority.borrow_and_update().1.clone() {
                     ClientAuthorityState::Ready(state) => state,
-                    ClientAuthorityState::Initializing | ClientAuthorityState::Updating | ClientAuthorityState::Unavailable => None,
+                    ClientAuthorityState::Initializing
+                    | ClientAuthorityState::Updating
+                    | ClientAuthorityState::Unavailable => None,
                 };
                 let due = match state.map(|state| state.project()).transpose() {
                     Ok(Some(view)) => {
@@ -1094,7 +1128,10 @@ impl Runtime {
                         }
                         view.pending.map(|pending| pending.effective_at_ms)
                     }
-                    Ok(None) => { effective = None; None }
+                    Ok(None) => {
+                        effective = None;
+                        None
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "committed client authority could not be projected");
                         membership.send_modify(|_| {});
@@ -1167,17 +1204,18 @@ impl Runtime {
     }
     /// Work, scheduling and observation append to the log, so they wait for `writable`.
     /// Later authority loss fences execution while readers and stop delivery remain alive.
-    fn start_writers(
-        self: &Arc<Self>,
-        events: vibeface_bridge::codex::EventReceiver,
-    ) {
+    fn start_writers(self: &Arc<Self>, events: vibeface_bridge::codex::EventReceiver) {
         self.start_codex(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
         self.start_triage();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
-        self.store.call("maintenance_idle", |store| store.scheduler_maintenance_idle()).await
+        self.store
+            .call("maintenance_idle", |store| {
+                store.scheduler_maintenance_idle()
+            })
+            .await
     }
     pub(crate) fn spawn_background(
         &self,
@@ -1229,9 +1267,19 @@ impl Runtime {
         let identity = self.identity.clone();
         let event_network = network.to_owned();
         let event_scope = scope.to_owned();
-        let event = self.store.call("append_event", move |store| {
-            store.append_event(&identity, &event_network, &event_scope, body, blobs, now_ms())
-        }).await?;
+        let event = self
+            .store
+            .call("append_event", move |store| {
+                store.append_event(
+                    &identity,
+                    &event_network,
+                    &event_scope,
+                    body,
+                    blobs,
+                    now_ms(),
+                )
+            })
+            .await?;
         self.publish_changed(network, scope, Changed::Event(&event.hash));
         Ok(event)
     }
@@ -1287,22 +1335,47 @@ impl Runtime {
         let query_network = network.clone();
         let query_scope = scope_filter.map(str::to_owned);
         let projection = self.scheduler_projection()?;
-        let (owner_epoch, active_bots, conversations, shown_works, omitted_finished, dispatches,
-            open_refusals, stops, questions, checks, projected_jobs, sessions, heads) =
-            self.read_display(access, input, "workspace_overview", move |store| {
+        let (
+            owner_epoch,
+            active_bots,
+            conversations,
+            shown_works,
+            omitted_finished,
+            dispatches,
+            open_refusals,
+            stops,
+            questions,
+            checks,
+            projected_jobs,
+            sessions,
+            heads,
+        ) = self
+            .read_display(access, input, "workspace_overview", move |store| {
                 let network = &query_network;
                 let owner_epoch = store.public_state()?.project()?.epoch;
                 let scope_filter = query_scope.as_deref();
                 let active_bots = store.bots(network)?;
-                let active_scopes: BTreeSet<_> = active_bots.iter()
-                    .map(|bot| bot.conversation_id.as_str()).collect();
-                let conversations = store.conversations(network)?.into_iter()
-                    .filter(|conversation| active_scopes.contains(conversation.conversation_id.as_str())
-                        && scope_filter.is_none_or(|scope| scope == conversation.conversation_id))
+                let active_scopes: BTreeSet<_> = active_bots
+                    .iter()
+                    .map(|bot| bot.conversation_id.as_str())
+                    .collect();
+                let conversations = store
+                    .conversations(network)?
+                    .into_iter()
+                    .filter(|conversation| {
+                        active_scopes.contains(conversation.conversation_id.as_str())
+                            && scope_filter
+                                .is_none_or(|scope| scope == conversation.conversation_id)
+                    })
                     .collect::<Vec<_>>();
-                let scope_ids: BTreeSet<_> = conversations.iter()
-                    .map(|conversation| conversation.conversation_id.as_str()).collect();
-                let query_scopes = scope_ids.iter().map(|scope| (*scope).to_owned()).collect::<Vec<_>>();
+                let scope_ids: BTreeSet<_> = conversations
+                    .iter()
+                    .map(|conversation| conversation.conversation_id.as_str())
+                    .collect();
+                let query_scopes = scope_ids
+                    .iter()
+                    .map(|scope| (*scope).to_owned())
+                    .collect::<Vec<_>>();
                 let mut shown_works = Vec::new();
                 let mut omitted_finished = 0;
                 for conversation in &conversations {
@@ -1314,47 +1387,91 @@ impl Runtime {
                         omitted_finished += store.finished_works(network, scope)?;
                     }
                 }
-                let dispatches = store.dispatches_for_scopes(&query_scopes)?.into_iter()
+                let dispatches = store
+                    .dispatches_for_scopes(&query_scopes)?
+                    .into_iter()
                     .map(|dispatch| {
                         let waiting_sync = dispatch.state == crate::work::DispatchState::Accepted
                             && store.work(network, &dispatch.spec.work_id)?.is_none();
                         Ok((dispatch, waiting_sync))
-                    }).collect::<Result<Vec<_>>>()?;
-                let open_refusals: BTreeSet<_> = store.open_dispatches(network, None)?
-                    .into_iter().map(|dispatch| dispatch.spec.work_id).collect();
-                let stops = store.stop_requests()?.into_iter()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let open_refusals: BTreeSet<_> = store
+                    .open_dispatches(network, None)?
+                    .into_iter()
+                    .map(|dispatch| dispatch.spec.work_id)
+                    .collect();
+                let stops = store
+                    .stop_requests()?
+                    .into_iter()
                     .filter(|stop| scope_ids.contains(stop.conversation.as_str()))
                     .map(|stop| {
                         let work = store.work(network, &stop.work_id)?;
                         Ok((stop, work))
-                    }).collect::<Result<Vec<_>>>()?;
-                let questions = store.unanswered_questions(network)?.into_iter()
-                    .filter(|question| question["conversation_id"].as_str()
-                        .is_some_and(|scope| scope_ids.contains(scope)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let questions = store
+                    .unanswered_questions(network)?
+                    .into_iter()
+                    .filter(|question| {
+                        question["conversation_id"]
+                            .as_str()
+                            .is_some_and(|scope| scope_ids.contains(scope))
+                    })
                     .collect::<Vec<_>>();
-                let checks = store.pending_checks()?.into_iter()
+                let checks = store
+                    .pending_checks()?
+                    .into_iter()
                     .filter(|check| scope_ids.contains(check.conversation_id.as_str()))
                     .collect::<Vec<_>>();
-                let projected_jobs = store.scheduler_jobs_for_scopes(&query_scopes, include_finished)?
-                    .into_iter().map(|job| {
+                let projected_jobs = store
+                    .scheduler_jobs_for_scopes(&query_scopes, include_finished)?
+                    .into_iter()
+                    .map(|job| {
                         let hold = projection.hold_reason(store, network, &job)?;
                         let context = store.scheduler_job_context_projection(&job)?;
                         Ok((job, hold, context))
-                    }).collect::<Result<Vec<_>>>()?;
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let sessions = if include_sessions {
-                    store.attributed_sessions_all(network)?.into_iter()
-                        .filter(|session| session["conversation_id"].as_str()
-                            .is_some_and(|scope| scope_ids.contains(scope)))
+                    store
+                        .attributed_sessions_all(network)?
+                        .into_iter()
+                        .filter(|session| {
+                            session["conversation_id"]
+                                .as_str()
+                                .is_some_and(|scope| scope_ids.contains(scope))
+                        })
                         .collect::<Vec<_>>()
-                } else { Vec::new() };
+                } else {
+                    Vec::new()
+                };
                 let heads = store.heads(network)?;
-                Ok((owner_epoch, active_bots, conversations, shown_works, omitted_finished, dispatches,
-                    open_refusals, stops, questions, checks, projected_jobs, sessions, heads))
-            }).await?;
-        let scope_ids: BTreeSet<_> = conversations.iter()
-            .map(|conversation| conversation.conversation_id.as_str()).collect();
-        let conversation_by_id: BTreeMap<_, _> = conversations.iter()
-            .map(|conversation| (conversation.conversation_id.as_str(), conversation)).collect();
+                Ok((
+                    owner_epoch,
+                    active_bots,
+                    conversations,
+                    shown_works,
+                    omitted_finished,
+                    dispatches,
+                    open_refusals,
+                    stops,
+                    questions,
+                    checks,
+                    projected_jobs,
+                    sessions,
+                    heads,
+                ))
+            })
+            .await?;
+        let scope_ids: BTreeSet<_> = conversations
+            .iter()
+            .map(|conversation| conversation.conversation_id.as_str())
+            .collect();
+        let conversation_by_id: BTreeMap<_, _> = conversations
+            .iter()
+            .map(|conversation| (conversation.conversation_id.as_str(), conversation))
+            .collect();
         let mut tasks = shown_works
             .iter()
             .map(|work| workspace_work_summary(work, "dag"))
@@ -1435,12 +1552,16 @@ impl Runtime {
             deliveries.push(delivery);
         }
 
-        let questions = questions.iter().map(workspace_question_summary).collect::<Vec<_>>();
+        let questions = questions
+            .iter()
+            .map(workspace_question_summary)
+            .collect::<Vec<_>>();
         let pending_jobs: BTreeSet<_> = checks
             .iter()
             .map(|check| format!("{}\n{}", check.conversation_id, check.trigger))
             .collect();
-        let jobs = projected_jobs.into_iter()
+        let jobs = projected_jobs
+            .into_iter()
             .map(|(job, hold, context)| {
                 let epoch = conversation_by_id
                     .get(job.conversation_id.as_str())
@@ -1462,7 +1583,10 @@ impl Runtime {
                 .cloned()
                 .unwrap_or(Value::Null);
         }
-        let sessions = sessions.iter().map(workspace_session_summary).collect::<Vec<_>>();
+        let sessions = sessions
+            .iter()
+            .map(workspace_session_summary)
+            .collect::<Vec<_>>();
         let bots = active_bots
             .into_iter()
             .filter(|bot| {
@@ -1477,7 +1601,8 @@ impl Runtime {
                 })
             })
             .collect::<Vec<_>>();
-        let heads = heads.into_iter()
+        let heads = heads
+            .into_iter()
             .map(|(device, (sequence, _))| (device, sequence))
             .collect::<BTreeMap<_, _>>();
         let mut remote_owners = Vec::new();
@@ -1631,16 +1756,27 @@ impl Runtime {
         if let (Some(allowed), Some(scope)) = (&access.conversation_id, &scope) {
             ensure!(allowed == scope, "outside this tool's conversation");
         }
-        self.store.read(operation, move |store| {
-            let committed = store.public_state()?;
-            ensure!(&committed == authority.as_ref(), "membership changed while reading the snapshot");
-            ensure!(committed.genesis.network_id == network, "wrong personal network");
-            committed.project()?.node(&local)?;
-            if let Some(scope) = scope {
-                ensure!(store.has_conversation(&network, &scope)?, "conversation not found");
-            }
-            read(store)
-        }).await
+        self.store
+            .read(operation, move |store| {
+                let committed = store.public_state()?;
+                ensure!(
+                    &committed == authority.as_ref(),
+                    "membership changed while reading the snapshot"
+                );
+                ensure!(
+                    committed.genesis.network_id == network,
+                    "wrong personal network"
+                );
+                committed.project()?.node(&local)?;
+                if let Some(scope) = scope {
+                    ensure!(
+                        store.has_conversation(&network, &scope)?,
+                        "conversation not found"
+                    );
+                }
+                read(store)
+            })
+            .await
     }
 
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
@@ -1655,11 +1791,16 @@ impl Runtime {
         let network = access.network_id.clone();
         let scope = scope.to_owned();
         let local = self.identity.device_id()?;
-        self.store.call("require_scope", move |store| {
-            store.authorize_node(&network, &local)?;
-            ensure!(store.has_conversation(&network, &scope)?, "conversation not found");
-            Ok(())
-        }).await
+        self.store
+            .call("require_scope", move |store| {
+                store.authorize_node(&network, &local)?;
+                ensure!(
+                    store.has_conversation(&network, &scope)?,
+                    "conversation not found"
+                );
+                Ok(())
+            })
+            .await
     }
     /// The workspace roots this Node publishes and the state of each capability. A root listed
     /// here is not an execution grant: the submitting side checks execution and roots again.
@@ -1697,13 +1838,23 @@ impl Runtime {
         if snapshot {
             let (_, current) = self.ready_client_membership().await?;
             let current = current.context("personal network is not installed")?;
-            ensure!(current.genesis.network_id == *network, "wrong personal network");
+            ensure!(
+                current.genesis.network_id == *network,
+                "wrong personal network"
+            );
             current.project()?.node(&node_id)?;
         } else {
             let current = self.membership_state().await?;
-            ensure!(current.genesis.network_id == *network, "wrong personal network");
+            ensure!(
+                current.genesis.network_id == *network,
+                "wrong personal network"
+            );
             let authorized_network = network.clone();
-            self.store.call("authorize_rpc", move |store| store.authorize_node(&authorized_network, &node_id)).await?;
+            self.store
+                .call("authorize_rpc", move |store| {
+                    store.authorize_node(&authorized_network, &node_id)
+                })
+                .await?;
         }
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
@@ -1716,10 +1867,19 @@ impl Runtime {
         match method {
             "nodes" => {
                 let query_network = network.clone();
-                let bundle = self.store.call("node_membership", move |store| store.trust_bundle(&query_network)).await?.context("unknown network")?;
+                let bundle = self
+                    .store
+                    .call("node_membership", move |store| {
+                        store.trust_bundle(&query_network)
+                    })
+                    .await?
+                    .context("unknown network")?;
                 let local = self.identity.device_id()?;
                 let query_network = network.clone();
-                let heads = self.store.call("node_heads", move |store| store.heads(&query_network)).await?;
+                let heads = self
+                    .store
+                    .call("node_heads", move |store| store.heads(&query_network))
+                    .await?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
                 let display_names = node_display_names(&bundle);
@@ -1772,7 +1932,11 @@ impl Runtime {
             }
             "conversations" => {
                 let network = network.clone();
-                let conversations = self.read_display(&access, &input, "conversations", move |store| store.conversations(&network)).await?;
+                let conversations = self
+                    .read_display(&access, &input, "conversations", move |store| {
+                        store.conversations(&network)
+                    })
+                    .await?;
                 Ok(json!({"conversations":conversations}))
             }
             "create_conversation" => {
@@ -1785,9 +1949,19 @@ impl Runtime {
                 let query_scope = scope.clone();
                 let title = title.to_owned();
                 let owner = first_owner(&input)?;
-                let conversation = self.store.call("create_conversation", move |store| {
-                    store.create_conversation(&identity, &query_network, &query_scope, &title, owner, now_ms())
-                }).await?;
+                let conversation = self
+                    .store
+                    .call("create_conversation", move |store| {
+                        store.create_conversation(
+                            &identity,
+                            &query_network,
+                            &query_scope,
+                            &title,
+                            owner,
+                            now_ms(),
+                        )
+                    })
+                    .await?;
                 self.publish_changed(network, &scope, Changed::Reload);
                 Ok(json!(conversation))
             }
@@ -1796,35 +1970,58 @@ impl Runtime {
             "open_works" => {
                 ensure!(access.human, "only clients list open works");
                 let network = network.clone();
-                let works = self.read_display(&access, &input, "open_works", move |store| chat_controls::open_works(store, &network, None)).await?;
+                let works = self
+                    .read_display(&access, &input, "open_works", move |store| {
+                        chat_controls::open_works(store, &network, None)
+                    })
+                    .await?;
                 Ok(json!({"works":works}))
             }
             "work_detail" => self.work_detail(&access, &input).await,
             "workspace_overview" => self.workspace_overview(&access, &input).await,
             "workspace_command" => self.workspace_command(&access, &input).await,
             "signed_receipt" => {
-                ensure!(access.human && access.conversation_id.is_none(), "signed receipt requires the authenticated user");
+                ensure!(
+                    access.human && access.conversation_id.is_none(),
+                    "signed receipt requires the authenticated user"
+                );
                 let network = network.clone();
                 let client = field(&input, "client_id")?.to_owned();
                 let scope = id(&input, "scope_id")?;
                 let body = input["body"].clone();
                 let attestation = attestation(&input)?;
-                self.store.call("signed_receipt", move |store| {
-                    store.client_signed_receipt(&network, &client, &scope, body, &attestation)
-                }).await
-            },
+                self.store
+                    .call("signed_receipt", move |store| {
+                        store.client_signed_receipt(&network, &client, &scope, body, &attestation)
+                    })
+                    .await
+            }
             "workspace_command_receipt" => {
-                ensure!(access.human && access.conversation_id.is_none(), "workspace receipt requires the authenticated user");
-                ensure!(input.get("cause").is_none() && input.get("acting_assignment").is_none(), "receipt must identify the original user command");
+                ensure!(
+                    access.human && access.conversation_id.is_none(),
+                    "workspace receipt requires the authenticated user"
+                );
+                ensure!(
+                    input.get("cause").is_none() && input.get("acting_assignment").is_none(),
+                    "receipt must identify the original user command"
+                );
                 let network = network.clone();
                 let client = field(&input, "client_id")?.to_owned();
                 let command_id = id(&input, "command_id")?;
                 let command = serde_json::from_value(input["command"].clone())?;
                 let attestation = attestation(&input)?;
-                self.store.call("workspace_command_receipt", move |store| {
-                    store.client_workspace_receipt(&network, &client, &command_id, &command, &attestation)
-                }).await
-            },
+                self.store
+                    .call("workspace_command_receipt", move |store| {
+                        store.client_workspace_receipt(
+                            &network,
+                            &client,
+                            &command_id,
+                            &command,
+                            &attestation,
+                        )
+                    })
+                    .await
+            }
             "workspace_state" => self.workspace_state(&access, &input).await,
             "workspace_history" => self.workspace_history(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
@@ -1864,9 +2061,13 @@ impl Runtime {
             "notifications" => {
                 let network = network.clone();
                 let client = field(&input, "client_id")?.to_owned();
-                let notifications = self.read_display(&access, &input, "notifications", move |store| store.pending_notifications(&network, &client)).await?;
+                let notifications = self
+                    .read_display(&access, &input, "notifications", move |store| {
+                        store.pending_notifications(&network, &client)
+                    })
+                    .await?;
                 Ok(json!({"notifications":notifications}))
-            },
+            }
             "dismiss_work" => {
                 ensure!(access.human, "only clients close failed works");
                 let scope = scope.context("conversation_id is required")?;
@@ -1874,13 +2075,20 @@ impl Runtime {
                 let query_network = network.clone();
                 let query_scope = scope.clone();
                 let query_work = work_id.clone();
-                let failed = self.store.call("dismiss_work_check", move |store| {
-                    if store.closed_in_inbox(&query_network, &query_work)? {
-                        return Ok(None);
-                    }
-                    store.failed_work(&query_network, &query_scope, &query_work).map(Some)
-                }).await?;
-                let Some(failed) = failed else { return Ok(json!({"dismissed":true})); };
+                let failed = self
+                    .store
+                    .call("dismiss_work_check", move |store| {
+                        if store.closed_in_inbox(&query_network, &query_work)? {
+                            return Ok(None);
+                        }
+                        store
+                            .failed_work(&query_network, &query_scope, &query_work)
+                            .map(Some)
+                    })
+                    .await?;
+                let Some(failed) = failed else {
+                    return Ok(json!({"dismissed":true}));
+                };
                 ensure!(failed, "这个任务没有失败，不用关掉");
                 self.append(
                     network,
@@ -1900,7 +2108,12 @@ impl Runtime {
                 let client = id(&input, "client_id")?;
                 let query_network = network.clone();
                 let query_client = client.clone();
-                let pending = self.store.call("pending_notifications", move |store| store.pending_notifications(&query_network, &query_client)).await?;
+                let pending = self
+                    .store
+                    .call("pending_notifications", move |store| {
+                        store.pending_notifications(&query_network, &query_client)
+                    })
+                    .await?;
                 if let Some(n) = pending
                     .into_iter()
                     .find(|n| n.notification_id == notification)

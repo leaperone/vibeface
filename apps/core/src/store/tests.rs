@@ -132,7 +132,8 @@ impl Store {
             },
             text,
             attachments,
-            report_results: report_results.context("signed input fixture requires report_results")?,
+            report_results: report_results
+                .context("signed input fixture requires report_results")?,
         };
         let stored = self.post_workspace_input(identity, network, input, attestation, at)?;
         let receipt =
@@ -6323,7 +6324,10 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
         origin.last_messages(&net.network)?["c"].text,
         "main visible"
     );
-    assert_eq!(conversation_history_tests::paged(&origin, &net.network, 1)?, origin.main_messages(&net.network, "c")?);
+    assert_eq!(
+        conversation_history_tests::paged(&origin, &net.network, 1)?,
+        origin.main_messages(&net.network, "c")?
+    );
     let notifications = origin.pending_notifications(&net.network, "web")?;
     assert_eq!(
         notifications
@@ -6690,7 +6694,10 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
                 .collect::<Vec<_>>(),
             ["m1"]
         );
-        assert_eq!(conversation_history_tests::paged(node, &net.network, 1)?, node.main_messages(&net.network, "c")?);
+        assert_eq!(
+            conversation_history_tests::paged(node, &net.network, 1)?,
+            node.main_messages(&net.network, "c")?
+        );
         assert_eq!(
             node.trigger_input_target(&net.network, "c", &message_trigger("a-q-scoped"))?,
             Some(target.clone())

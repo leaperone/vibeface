@@ -69,13 +69,10 @@ fn verify_entry(
         node_id == expected.device_id && node_id == launcher.node_id,
         "本机设置返回了另一个节点身份。"
     );
-    let url = reqwest::Url::parse(origin)
-        .map_err(|_| anyhow::anyhow!("本机设置返回了无效来源。"))?;
+    let url =
+        reqwest::Url::parse(origin).map_err(|_| anyhow::anyhow!("本机设置返回了无效来源。"))?;
     launcher.require_origin(&url)?;
-    ensure!(
-        origin == launcher.origin,
-        "本机设置来源与所选节点不一致。"
-    );
+    ensure!(origin == launcher.origin, "本机设置来源与所选节点不一致。");
     Ok(())
 }
 
@@ -84,8 +81,8 @@ fn parse_invitation(
     expected: &NodeIdentity,
     launcher: &LocalHttpCredential,
 ) -> Result<BootstrapInvitation> {
-    let setup: LocalSetupReply = serde_json::from_value(value)
-        .map_err(|_| anyhow::anyhow!("本机设置返回了无效结果。"))?;
+    let setup: LocalSetupReply =
+        serde_json::from_value(value).map_err(|_| anyhow::anyhow!("本机设置返回了无效结果。"))?;
     match setup {
         LocalSetupReply::Uninitialized { invitation } => {
             let capability = Zeroizing::new(invitation.capability);

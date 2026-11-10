@@ -614,36 +614,59 @@ impl Graph {
                 Ok(())
             }
             Err(error) => {
-                connection.execute_batch("ROLLBACK TO workspace_lookup_save; RELEASE workspace_lookup_save")?;
+                connection.execute_batch(
+                    "ROLLBACK TO workspace_lookup_save; RELEASE workspace_lookup_save",
+                )?;
                 Err(error)
             }
         }
     }
     fn save_lookups(&self, connection: &Connection, network: &str) -> Result<()> {
         if self.replace_lookups {
-            connection.execute("DELETE FROM workspace_tasks_lookup WHERE network_id=?", [network])?;
-            connection.execute("DELETE FROM workspace_assignments_lookup WHERE network_id=?", [network])?;
+            connection.execute(
+                "DELETE FROM workspace_tasks_lookup WHERE network_id=?",
+                [network],
+            )?;
+            connection.execute(
+                "DELETE FROM workspace_assignments_lookup WHERE network_id=?",
+                [network],
+            )?;
         }
         let task_ids: Box<dyn Iterator<Item = &String> + '_> = if self.replace_lookups {
             Box::new(self.tasks.keys())
-        } else { Box::new(self.dirty_tasks.iter()) };
-        let mut task_insert = connection.prepare_cached("INSERT INTO workspace_tasks_lookup(network_id,task_id,record) VALUES(?,?,?)
-            ON CONFLICT(network_id,task_id) DO UPDATE SET record=excluded.record")?;
+        } else {
+            Box::new(self.dirty_tasks.iter())
+        };
+        let mut task_insert = connection.prepare_cached(
+            "INSERT INTO workspace_tasks_lookup(network_id,task_id,record) VALUES(?,?,?)
+            ON CONFLICT(network_id,task_id) DO UPDATE SET record=excluded.record",
+        )?;
         for id in task_ids {
             if let Some(task) = self.tasks.get(id) {
                 task_insert.execute(params![network, id, serde_json::to_string(task)?])?;
             } else {
-                connection.execute("DELETE FROM workspace_tasks_lookup WHERE network_id=? AND task_id=?", params![network,id])?;
+                connection.execute(
+                    "DELETE FROM workspace_tasks_lookup WHERE network_id=? AND task_id=?",
+                    params![network, id],
+                )?;
             }
         }
         let assignment_ids: Box<dyn Iterator<Item = &String> + '_> = if self.replace_lookups {
             Box::new(self.assignments.keys())
-        } else { Box::new(self.dirty_assignments.iter()) };
+        } else {
+            Box::new(self.dirty_assignments.iter())
+        };
         let mut assignment_insert = connection.prepare_cached("INSERT INTO workspace_assignments_lookup(network_id,assignment_id,work_id,created_at_ms,record) VALUES(?,?,?,?,?)
             ON CONFLICT(network_id,assignment_id) DO UPDATE SET work_id=excluded.work_id,created_at_ms=excluded.created_at_ms,record=excluded.record")?;
         for id in assignment_ids {
             if let Some(assignment) = self.assignments.get(id) {
-                assignment_insert.execute(params![network,id,assignment.work_id,assignment.created_at_ms,serde_json::to_string(assignment)?])?;
+                assignment_insert.execute(params![
+                    network,
+                    id,
+                    assignment.work_id,
+                    assignment.created_at_ms,
+                    serde_json::to_string(assignment)?
+                ])?;
             } else {
                 connection.execute("DELETE FROM workspace_assignments_lookup WHERE network_id=? AND assignment_id=?", params![network,id])?;
             }
@@ -1474,12 +1497,22 @@ impl Graph {
             .map(|error| error.to_string());
         if error.is_none() {
             if !next.replace_lookups {
-            let changed_tasks: BTreeSet<_> = self.tasks.keys().chain(next.tasks.keys())
-                .filter(|id| self.tasks.get(*id) != next.tasks.get(*id)).cloned().collect();
-            let changed_assignments: BTreeSet<_> = self.assignments.keys().chain(next.assignments.keys())
-                .filter(|id| self.assignments.get(*id) != next.assignments.get(*id)).cloned().collect();
-            next.dirty_tasks.extend(changed_tasks);
-            next.dirty_assignments.extend(changed_assignments);
+                let changed_tasks: BTreeSet<_> = self
+                    .tasks
+                    .keys()
+                    .chain(next.tasks.keys())
+                    .filter(|id| self.tasks.get(*id) != next.tasks.get(*id))
+                    .cloned()
+                    .collect();
+                let changed_assignments: BTreeSet<_> = self
+                    .assignments
+                    .keys()
+                    .chain(next.assignments.keys())
+                    .filter(|id| self.assignments.get(*id) != next.assignments.get(*id))
+                    .cloned()
+                    .collect();
+                next.dirty_tasks.extend(changed_tasks);
+                next.dirty_assignments.extend(changed_assignments);
             }
             *self = next;
         }
@@ -1562,10 +1595,13 @@ pub(crate) fn authorization_ancestor_walks() -> usize {
     AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
-pub(crate) fn fresh_main_inputs() -> usize { FRESH_MAIN_INPUTS.with(std::cell::Cell::get) }
+pub(crate) fn fresh_main_inputs() -> usize {
+    FRESH_MAIN_INPUTS.with(std::cell::Cell::get)
+}
 #[cfg(test)]
-pub(crate) fn reset_fresh_main_inputs() { FRESH_MAIN_INPUTS.with(|count| count.set(0)); }
-
+pub(crate) fn reset_fresh_main_inputs() {
+    FRESH_MAIN_INPUTS.with(|count| count.set(0));
+}
 
 fn projection_basis(
     connection: &Connection,
@@ -1783,29 +1819,67 @@ pub(crate) fn authorize_fresh_bot_main(
     network: &str,
     event: &Event,
 ) -> Result<bool> {
-    let EventBody::InputPosted { message_id, target: InputTarget::BotMain { .. }, expected_revision: None,
-        intent: InputIntent::Continue | InputIntent::Defer, .. } = &event.body else { return Ok(false); };
+    let EventBody::InputPosted {
+        message_id,
+        target: InputTarget::BotMain { .. },
+        expected_revision: None,
+        intent: InputIntent::Continue | InputIntent::Defer,
+        ..
+    } = &event.body
+    else {
+        return Ok(false);
+    };
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=?1 AND kind='input_posted' AND subject=?2)
             OR EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?3 AND message_id=?2)",
         params![network,message_id,event.scope_id], |row| row.get(0),
     )?;
-    if exists { return Ok(false); }
+    if exists {
+        return Ok(false);
+    }
     authorize_input_target_at_graph(connection, network, event, &Graph::default())?;
     #[cfg(test)]
     FRESH_MAIN_INPUTS.with(|count| count.set(count.get() + 1));
     Ok(true)
 }
 
-fn authorize_input_target_at_graph(connection: &Connection, network: &str, event: &Event, graph: &Graph) -> Result<()> {
-    let EventBody::InputPosted { target,expected_revision,intent,.. } = &event.body else { bail!("input authorization needs an input"); };
+fn authorize_input_target_at_graph(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+    graph: &Graph,
+) -> Result<()> {
+    let EventBody::InputPosted {
+        target,
+        expected_revision,
+        intent,
+        ..
+    } = &event.body
+    else {
+        bail!("input authorization needs an input");
+    };
     validate_target(target)?;
-    ensure!(!matches!(target,InputTarget::ChannelMember { .. }), "channel input must first name its stable task");
-    ensure!(*intent != InputIntent::NewTask || matches!(target,InputTarget::Task { .. } | InputTarget::ChannelTask { .. }),
-        "new task input requires a stable task");
-    let resolved = resolve_with_graph(connection,network,target,graph)?;
-    ensure!(resolved.conversation_id == event.scope_id,"input target belongs to another conversation");
-    ensure!(resolved.task_revision == *expected_revision,"input task revision changed");
+    ensure!(
+        !matches!(target, InputTarget::ChannelMember { .. }),
+        "channel input must first name its stable task"
+    );
+    ensure!(
+        *intent != InputIntent::NewTask
+            || matches!(
+                target,
+                InputTarget::Task { .. } | InputTarget::ChannelTask { .. }
+            ),
+        "new task input requires a stable task"
+    );
+    let resolved = resolve_with_graph(connection, network, target, graph)?;
+    ensure!(
+        resolved.conversation_id == event.scope_id,
+        "input target belongs to another conversation"
+    );
+    ensure!(
+        resolved.task_revision == *expected_revision,
+        "input task revision changed"
+    );
     Ok(())
 }
 
@@ -1857,7 +1931,9 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
         _ => {}
     }
     match &event.body {
-        EventBody::InputPosted { .. } => authorize_input_target_at_graph(connection,network,event,&graph)?,
+        EventBody::InputPosted { .. } => {
+            authorize_input_target_at_graph(connection, network, event, &graph)?
+        }
         EventBody::WorkspaceCommanded {
             command,
             acting_assignment,
@@ -2456,7 +2532,8 @@ fn input_from_event(hash: &str, event: Event) -> Result<Option<WorkspaceInput>> 
                 },
                 text,
                 attachments,
-                report_results: report_results.context("stored input must specify report_results")?,
+                report_results: report_results
+                    .context("stored input must specify report_results")?,
             },
             conversation_id: event.scope_id,
             source_event: hash.into(),
@@ -3514,12 +3591,24 @@ fn queued_input_from_control(
         .flatten()
         .context("queue input source is missing")?;
     let mut input = original.input;
-    if let Some(text) = &control.text { input.text = text.clone(); }
-    if let Some(attachments) = &control.attachments { input.attachments = attachments.clone(); }
-    if !control.deferred && input.route.intent == InputIntent::Defer { input.route.intent = InputIntent::Continue; }
-    Ok(QueuedInput { input, conversation_id: original.conversation_id,
-        source_event: control.source_event.clone(), control_event: control.control_event.clone(),
-        effective_order: index as u64 + 1, deferred: control.deferred, cancelled: control.cancelled })
+    if let Some(text) = &control.text {
+        input.text = text.clone();
+    }
+    if let Some(attachments) = &control.attachments {
+        input.attachments = attachments.clone();
+    }
+    if !control.deferred && input.route.intent == InputIntent::Defer {
+        input.route.intent = InputIntent::Continue;
+    }
+    Ok(QueuedInput {
+        input,
+        conversation_id: original.conversation_id,
+        source_event: control.source_event.clone(),
+        control_event: control.control_event.clone(),
+        effective_order: index as u64 + 1,
+        deferred: control.deferred,
+        cancelled: control.cancelled,
+    })
 }
 
 fn queued_inputs_from(
@@ -3527,10 +3616,18 @@ fn queued_inputs_from(
     network: &str,
     graph: &Graph,
 ) -> Result<Vec<QueuedInput>> {
-    graph.queue_order.iter().enumerate().map(|(index, message_id)| {
-        let control = graph.inputs.get(message_id).context("queue input projection is missing")?;
-        queued_input_from_control(connection, network, index, control)
-    }).collect()
+    graph
+        .queue_order
+        .iter()
+        .enumerate()
+        .map(|(index, message_id)| {
+            let control = graph
+                .inputs
+                .get(message_id)
+                .context("queue input projection is missing")?;
+            queued_input_from_control(connection, network, index, control)
+        })
+        .collect()
 }
 pub(crate) fn queued_workspace_input_from(
     connection: &Connection,
@@ -3538,9 +3635,16 @@ pub(crate) fn queued_workspace_input_from(
     message_id: &str,
 ) -> Result<Option<QueuedInput>> {
     let graph = Graph::read(connection, network)?;
-    let Some(index) = graph.queue_order.iter().position(|id| id == message_id) else { return Ok(None); };
-    let control = graph.inputs.get(message_id).context("queue input projection is missing")?;
-    Ok(Some(queued_input_from_control(connection, network, index, control)?))
+    let Some(index) = graph.queue_order.iter().position(|id| id == message_id) else {
+        return Ok(None);
+    };
+    let control = graph
+        .inputs
+        .get(message_id)
+        .context("queue input projection is missing")?;
+    Ok(Some(queued_input_from_control(
+        connection, network, index, control,
+    )?))
 }
 
 impl Store {
@@ -4725,7 +4829,9 @@ pub(crate) fn workspace_assignment_from(
         "SELECT record FROM workspace_assignments_lookup WHERE network_id=?1 AND assignment_id=?2",
         params![network, assignment_id], |row| row.get(0),
     ).optional()?;
-    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
+    encoded
+        .map(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+        .transpose()
 }
 
 pub(crate) fn assignment_admission_allowed_from(
@@ -4840,23 +4946,33 @@ pub(crate) fn workspace_task_from(
     network: &str,
     task_id: &str,
 ) -> Result<Option<WorkspaceTask>> {
-    let encoded: Option<String> = connection.query_row(
-        "SELECT record FROM workspace_tasks_lookup WHERE network_id=?1 AND task_id=?2",
-        params![network,task_id], |row| row.get(0),
-    ).optional()?;
-    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT record FROM workspace_tasks_lookup WHERE network_id=?1 AND task_id=?2",
+            params![network, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    encoded
+        .map(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+        .transpose()
 }
 pub(crate) fn workspace_assignment_for_work_from(
     connection: &Connection,
     network: &str,
     work_id: &str,
 ) -> Result<Option<Assignment>> {
-    let encoded: Option<String> = connection.query_row(
-        "SELECT record FROM workspace_assignments_lookup WHERE network_id=?1 AND work_id=?2
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT record FROM workspace_assignments_lookup WHERE network_id=?1 AND work_id=?2
             ORDER BY created_at_ms DESC,assignment_id DESC LIMIT 1",
-        params![network,work_id], |row| row.get(0),
-    ).optional()?;
-    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
+            params![network, work_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    encoded
+        .map(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+        .transpose()
 }
 
 impl Store {

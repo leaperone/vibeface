@@ -239,8 +239,13 @@ pub fn channel<T>(
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        Self { sender: self.sender.clone(), measure: self.measure, bytes: self.bytes.clone(),
-            budget: self.budget, failure: self.failure.clone() }
+        Self {
+            sender: self.sender.clone(),
+            measure: self.measure,
+            bytes: self.bytes.clone(),
+            budget: self.budget,
+            failure: self.failure.clone(),
+        }
     }
 }
 

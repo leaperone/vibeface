@@ -395,20 +395,36 @@ mod tests {
     use super::*;
     #[test]
     fn input_requires_an_explicit_boolean_reporting_choice() {
-        let mut input=serde_json::json!({"message_id":"input-1","target":{"kind":"bot_main","bot_id":"bot-1"},"intent":"defer","sequence":1,"text":"Keep this input deferred"});
-        assert!(serde_json::from_value::<InputRequest>(input.clone()).is_err(),"missing reporting choice must not become a default");
-        for invalid in [serde_json::Value::Null,serde_json::json!("true"),serde_json::json!(0)] {
-            input["report_results"]=invalid;
-            assert!(serde_json::from_value::<InputRequest>(input.clone()).is_err(),"reporting choice must be a JSON boolean");
+        let mut input = serde_json::json!({"message_id":"input-1","target":{"kind":"bot_main","bot_id":"bot-1"},"intent":"defer","sequence":1,"text":"Keep this input deferred"});
+        assert!(
+            serde_json::from_value::<InputRequest>(input.clone()).is_err(),
+            "missing reporting choice must not become a default"
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(0),
+        ] {
+            input["report_results"] = invalid;
+            assert!(
+                serde_json::from_value::<InputRequest>(input.clone()).is_err(),
+                "reporting choice must be a JSON boolean"
+            );
         }
-        input["report_results"]=serde_json::json!(true);
-        let reports:InputRequest=serde_json::from_value(input.clone()).unwrap();
+        input["report_results"] = serde_json::json!(true);
+        let reports: InputRequest = serde_json::from_value(input.clone()).unwrap();
         assert!(reports.report_results);
-        assert_eq!(serde_json::to_value(reports).unwrap()["report_results"],serde_json::json!(true));
-        input["report_results"]=serde_json::json!(false);
-        let quiet:InputRequest=serde_json::from_value(input).unwrap();
+        assert_eq!(
+            serde_json::to_value(reports).unwrap()["report_results"],
+            serde_json::json!(true)
+        );
+        input["report_results"] = serde_json::json!(false);
+        let quiet: InputRequest = serde_json::from_value(input).unwrap();
         assert!(!quiet.report_results);
-        assert_eq!(serde_json::to_value(quiet).unwrap()["report_results"],serde_json::json!(false));
+        assert_eq!(
+            serde_json::to_value(quiet).unwrap()["report_results"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Connection-owned work. Only the transport task owns Noise and the observation lease.
 use super::*;
-use tokio::task::JoinSet;
 use crate::runtime::ClientAuthorityState;
+use tokio::task::JoinSet;
 
 const LONG_CALLS: usize = 4;
 const READ_CALLS: usize = 8;
@@ -50,15 +50,26 @@ impl Authority {
         let (_, state) = node.client_membership();
         let state = match state {
             ClientAuthorityState::Ready(state) => state,
-            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => return Err(AuthorityUpdating.into()),
+            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => {
+                return Err(AuthorityUpdating.into());
+            }
             ClientAuthorityState::Unavailable => bail!("client authority is unavailable"),
         };
         let local = if let (Some(cookie), Some(state)) = (&session.cookie, state) {
             let view = state.project()?;
             let generation = *local_changes.borrow();
-            match node.local_access.session(cookie, &node.identity.device_id()?, &view.network_id) {
-                Ok(local) if local.device_id == session.device_id && *local_changes.borrow() == generation => {
-                    Some(LocalAuthority { generation, session: local })
+            match node
+                .local_access
+                .session(cookie, &node.identity.device_id()?, &view.network_id)
+            {
+                Ok(local)
+                    if local.device_id == session.device_id
+                        && *local_changes.borrow() == generation =>
+                {
+                    Some(LocalAuthority {
+                        generation,
+                        session: local,
+                    })
                 }
                 Ok(_) if view.client(&session.device_id).is_ok() => None,
                 Ok(_) => bail!("local browser cookie is bound to another device or was revoked"),
@@ -68,7 +79,10 @@ impl Authority {
         } else {
             None
         };
-        Ok(Self { local, local_changes })
+        Ok(Self {
+            local,
+            local_changes,
+        })
     }
 
     pub(super) async fn initialize(
@@ -80,8 +94,13 @@ impl Authority {
         loop {
             match Self::new(node, session, local_changes.clone()) {
                 Err(error) if is_updating(&error) => {
-                    if !node.client_membership().1.pending() { continue; }
-                    membership.changed().await.context("client authority initialization stopped")?;
+                    if !node.client_membership().1.pending() {
+                        continue;
+                    }
+                    membership
+                        .changed()
+                        .await
+                        .context("client authority initialization stopped")?;
                 }
                 result => return result,
             }
@@ -92,16 +111,23 @@ impl Authority {
         let (generation, state) = node.client_membership();
         let state = match state {
             ClientAuthorityState::Ready(state) => state,
-            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => return Err(AuthorityUpdating.into()),
+            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => {
+                return Err(AuthorityUpdating.into());
+            }
             ClientAuthorityState::Unavailable => bail!("client authority is unavailable"),
         };
-        let view = state.context("personal network is not initialized")?.project()?;
+        let view = state
+            .context("personal network is not initialized")?
+            .project()?;
         let node_id = node.identity.device_id()?;
         let principal = if let Some(member) = member_principal(&view, &node_id, session)? {
             member
         } else {
             view.node(&node_id)?;
-            let local = self.local.as_ref().context("this device is not a member of the personal network")?;
+            let local = self
+                .local
+                .as_ref()
+                .context("this device is not a member of the personal network")?;
             ensure!(
                 *self.local_changes.borrow() == local.generation
                     && local.session.expires_at_ms() > crate::runtime::now_ms()
@@ -121,7 +147,12 @@ impl Authority {
             return Err(AuthorityUpdating.into());
         }
         if principal.source == "local_session" {
-            ensure!(self.local.as_ref().is_some_and(|local| *self.local_changes.borrow() == local.generation), "local browser access was revoked");
+            ensure!(
+                self.local
+                    .as_ref()
+                    .is_some_and(|local| *self.local_changes.borrow() == local.generation),
+                "local browser access was revoked"
+            );
         }
         Ok(principal)
     }
@@ -144,20 +175,32 @@ impl Authority {
     async fn wait_ready(&self, node: &Runtime) -> Result<()> {
         let mut membership = node.subscribe_client_membership();
         while !self.ready(node)? {
-            membership.changed().await.context("client authority publication stopped")?;
+            membership
+                .changed()
+                .await
+                .context("client authority publication stopped")?;
         }
         Ok(())
     }
 
-    pub(super) async fn display_principal(&self, node: &Runtime, session: &Session) -> Result<Principal> {
+    pub(super) async fn display_principal(
+        &self,
+        node: &Runtime,
+        session: &Session,
+    ) -> Result<Principal> {
         loop {
             self.wait_ready(node).await?;
-            if let Some(principal) = self.current(node, session)? { return Ok(principal); }
+            if let Some(principal) = self.current(node, session)? {
+                return Ok(principal);
+            }
         }
     }
 
     pub(super) fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
-        ensure!(self.principal(node, session)? == *was, "this device's permission changed during a client request");
+        ensure!(
+            self.principal(node, session)? == *was,
+            "this device's permission changed during a client request"
+        );
         Ok(())
     }
 }
@@ -178,9 +221,13 @@ impl Pushes {
         self.tasks.is_empty() && self.deferred.is_none()
     }
 
-    pub(super) fn running(&self) -> bool { !self.tasks.is_empty() }
+    pub(super) fn running(&self) -> bool {
+        !self.tasks.is_empty()
+    }
 
-    pub(super) fn take_deferred(&mut self) -> Option<PreparedPush> { self.deferred.take() }
+    pub(super) fn take_deferred(&mut self) -> Option<PreparedPush> {
+        self.deferred.take()
+    }
 
     pub(super) fn start(
         &mut self,
@@ -195,14 +242,20 @@ impl Pushes {
         self.tasks.spawn(async move {
             let session = snapshot.session();
             let authority = principal(&node, &session).await?;
-            ensure!(authority == expected, "this device's permission changed before a push");
+            ensure!(
+                authority == expected,
+                "this device's permission changed before a push"
+            );
             let payload = pushed(&node, &authority.network_id, &session.device_id, payload).await;
             Ok(PreparedPush { authority, payload })
         });
     }
 
     pub(super) async fn next(&mut self) -> Result<PreparedPush> {
-        self.tasks.join_next().await.context("client push task missing")?
+        self.tasks
+            .join_next()
+            .await
+            .context("client push task missing")?
             .context("client push task failed")?
     }
 
@@ -214,7 +267,10 @@ impl Pushes {
         prepared: PreparedPush,
     ) -> Result<Option<Value>> {
         match authority.check(node, session, &prepared.authority) {
-            Err(error) if is_updating(&error) => { self.deferred = Some(prepared); Ok(None) }
+            Err(error) if is_updating(&error) => {
+                self.deferred = Some(prepared);
+                Ok(None)
+            }
             Err(error) => Err(error),
             Ok(()) => Ok(Some(json!({"type":"changed","payload":prepared.payload}))),
         }
@@ -232,17 +288,34 @@ enum Lane {
 impl Lane {
     fn for_request(request: &Request) -> Self {
         match request.method.as_str() {
-            "provider_probe" | "provider_models" | "test_codex_app_server" | "test_webhook"
-            | "logs" | "diagnostics" => Self::Long,
+            "provider_probe"
+            | "provider_models"
+            | "test_codex_app_server"
+            | "test_webhook"
+            | "logs"
+            | "diagnostics" => Self::Long,
             "info" | "directory" | "write_state" | "node_settings" | "triage_settings"
             | "relay_settings" | "share_link" | "entrances" => Self::Read,
             "rpc" => match request.params["method"].as_str() {
                 Some("interrupt_work" | "cancel_manager") => Self::Control,
                 Some(
-                    "nodes" | "conversations" | "conversation_history" | "open_works" | "work_detail"
-                    | "workspace_overview" | "workspace_state" | "workspace_history" | "workspace_command_receipt" | "signed_receipt"
-                    | "input_receipt" | "scope_context" | "read_artifact" | "bots"
-                    | "questions" | "memory_state" | "notifications",
+                    "nodes"
+                    | "conversations"
+                    | "conversation_history"
+                    | "open_works"
+                    | "work_detail"
+                    | "workspace_overview"
+                    | "workspace_state"
+                    | "workspace_history"
+                    | "workspace_command_receipt"
+                    | "signed_receipt"
+                    | "input_receipt"
+                    | "scope_context"
+                    | "read_artifact"
+                    | "bots"
+                    | "questions"
+                    | "memory_state"
+                    | "notifications",
                 ) => Self::Read,
                 // Conversation reads replace the observation lease. Unrecognized operations
                 // and writes retain arrival order; they are never retried by this scheduler.
@@ -326,12 +399,19 @@ impl Calls {
         self.tasks.is_empty() && self.deferred.is_empty()
     }
 
-    pub(super) fn running(&self) -> bool { !self.tasks.is_empty() }
+    pub(super) fn running(&self) -> bool {
+        !self.tasks.is_empty()
+    }
 
-    pub(super) fn take_deferred(&mut self) -> Option<Completed> { self.deferred.pop_front() }
+    pub(super) fn take_deferred(&mut self) -> Option<Completed> {
+        self.deferred.pop_front()
+    }
 
     fn count(&self, lane: Lane) -> usize {
-        self.active.values().filter(|call| call.lane == lane).count()
+        self.active
+            .values()
+            .filter(|call| call.lane == lane)
+            .count()
     }
 
     pub(super) fn accept(
@@ -392,13 +472,21 @@ impl Calls {
         // Only governance responses that can change their own caller retain the explicit
         // transition path. Invite and join approval keep the manager's original authority.
         let guest_method = GUEST_METHODS.contains(&request.method.as_str());
-        let authority_transition = matches!(request.method.as_str(),
-            "grant" | "revoke" | "veto" | "approve_recovery");
-        let fenced = lane != Lane::Ordered
-            || (!guest_method && !authority_transition);
+        let authority_transition = matches!(
+            request.method.as_str(),
+            "grant" | "revoke" | "veto" | "approve_recovery"
+        );
+        let fenced = lane != Lane::Ordered || (!guest_method && !authority_transition);
         let display = snapshot_request(&request.method, &request.params);
-        self.active
-            .insert(request.id.clone(), Active { lane, authority: fenced.then(|| authority.principal(node, session).ok()).flatten() });
+        self.active.insert(
+            request.id.clone(),
+            Active {
+                lane,
+                authority: fenced
+                    .then(|| authority.principal(node, session).ok())
+                    .flatten(),
+            },
+        );
         let snapshot = Snapshot::from(session);
         let cached_authority = authority.clone();
         let node = node.clone();
@@ -406,7 +494,9 @@ impl Calls {
             let mut request_session = snapshot.session();
             let (authority, denied) = if fenced {
                 let authenticated = if display {
-                    cached_authority.display_principal(&node, &request_session).await
+                    cached_authority
+                        .display_principal(&node, &request_session)
+                        .await
                 } else {
                     principal(&node, &request_session).await
                 };
@@ -421,14 +511,16 @@ impl Calls {
             let observing = request.method == "rpc" && request.params["method"] == "conversation";
             let result = match denied {
                 Some(error) => Err(error),
-                None => dispatch_inner(
-                    &node,
-                    &mut request_session,
-                    &request.method,
-                    request.params,
-                    if display { authority.clone() } else { None },
-                )
-                .await,
+                None => {
+                    dispatch_inner(
+                        &node,
+                        &mut request_session,
+                        &request.method,
+                        request.params,
+                        if display { authority.clone() } else { None },
+                    )
+                    .await
+                }
             };
             let effect = match request.method.as_str() {
                 "subscribe" => Some(Effect::Subscribe(request_session.subscribed)),
@@ -461,9 +553,13 @@ impl Calls {
         session: &Session,
         authority: &Authority,
     ) -> Result<()> {
-        if !authority.ready(node)? { return Ok(()); }
+        if !authority.ready(node)? {
+            return Ok(());
+        }
         if self.active.values().any(|call| call.authority.is_some()) {
-            let Some(now) = authority.current(node, session)? else { return Ok(()); };
+            let Some(now) = authority.current(node, session)? else {
+                return Ok(());
+            };
             ensure!(
                 self.active
                     .values()
@@ -481,10 +577,15 @@ impl Calls {
         authority: &Authority,
         completed: &Completed,
     ) -> Result<()> {
-        if !authority.ready(node)? { return Err(AuthorityUpdating.into()); }
+        if !authority.ready(node)? {
+            return Err(AuthorityUpdating.into());
+        }
         // Check even if membership/local-access notifications have not won select yet. A
         // completed task must not leak its old result after a revocation raced its completion.
-        let active = self.active.get(&completed.id).context("unknown client result")?;
+        let active = self
+            .active
+            .get(&completed.id)
+            .context("unknown client result")?;
         if let Some(was) = active.authority.as_ref() {
             ensure!(
                 &authority.principal(node, session)? == was,
@@ -496,14 +597,21 @@ impl Calls {
         }
         if let Ok(result) = &completed.result {
             if completed.method == "info" && result["network_id"].is_string() {
-                ensure!(result["network_id"] == authority.principal(node, session)?.network_id,
-                    "this device's permission changed before client information was delivered");
+                ensure!(
+                    result["network_id"] == authority.principal(node, session)?.network_id,
+                    "this device's permission changed before client information was delivered"
+                );
             }
-            if matches!(completed.method.as_str(), "authenticate" | "recover" | "revoke" | "grant" | "veto")
-                && result["principal"].is_object()
+            if matches!(
+                completed.method.as_str(),
+                "authenticate" | "recover" | "revoke" | "grant" | "veto"
+            ) && result["principal"].is_object()
             {
-                ensure!(result["principal"] == serde_json::to_value(authority.principal(node, session)?)?,
-                    "this device's permission changed before authentication was delivered");
+                ensure!(
+                    result["principal"]
+                        == serde_json::to_value(authority.principal(node, session)?)?,
+                    "this device's permission changed before authentication was delivered"
+                );
             }
         }
         Ok(())
@@ -517,14 +625,19 @@ impl Calls {
         completed: Completed,
     ) -> Result<Option<Response>> {
         match self.validate_completed(node, session, authority, &completed) {
-            Err(error) if is_updating(&error) => { self.deferred.push_back(completed); Ok(None) }
+            Err(error) if is_updating(&error) => {
+                self.deferred.push_back(completed);
+                Ok(None)
+            }
             Err(error) => Err(error),
             Ok(()) => self.finish_ready(session, completed).map(Some),
         }
     }
 
     fn finish_ready(&mut self, session: &mut Session, completed: Completed) -> Result<Response> {
-        self.active.remove(&completed.id).context("unknown client result")?;
+        self.active
+            .remove(&completed.id)
+            .context("unknown client result")?;
         match completed.effect {
             Some(Effect::Subscribe(subscribed)) => session.subscribed = subscribed,
             Some(Effect::Observe(observation)) => session.observation = observation,
@@ -538,20 +651,23 @@ impl Calls {
                 code: None,
             },
             Err(error) => {
-                if matches!(error.downcast_ref::<crate::store::actor::StoreCallError>(),
-                    Some(crate::store::actor::StoreCallError::OutcomeUnknown))
-                {
+                if matches!(
+                    error.downcast_ref::<crate::store::actor::StoreCallError>(),
+                    Some(crate::store::actor::StoreCallError::OutcomeUnknown)
+                ) {
                     // An accepted writer operation may have committed before its reply was
                     // lost. Closing keeps the client outcome unknown instead of refusing it.
-                    return Err(error.context("client request outcome may be unknown; reconcile before retrying"));
+                    return Err(error.context(
+                        "client request outcome may be unknown; reconcile before retrying",
+                    ));
                 }
                 Response {
-                id: completed.id,
-                result: Value::Null,
-                error: Some(crate::logging::scrub(&error.to_string())),
-                code: error
-                    .downcast_ref::<crate::discovery::CodexMissing>()
-                    .map(|_| crate::discovery::CodexMissing::CODE),
+                    id: completed.id,
+                    result: Value::Null,
+                    error: Some(crate::logging::scrub(&error.to_string())),
+                    code: error
+                        .downcast_ref::<crate::discovery::CodexMissing>()
+                        .map(|_| crate::discovery::CodexMissing::CODE),
                 }
             }
         })

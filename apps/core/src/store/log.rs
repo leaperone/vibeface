@@ -59,7 +59,9 @@ pub(crate) mod test_metrics {
     pub(crate) fn with_full_workspace_authorization<T>(f: impl FnOnce() -> T) -> T {
         struct Restore(bool);
         impl Drop for Restore {
-            fn drop(&mut self) { FULL_WORKSPACE_AUTHORIZATION.with(|value| value.set(self.0)); }
+            fn drop(&mut self) {
+                FULL_WORKSPACE_AUTHORIZATION.with(|value| value.set(self.0));
+            }
         }
         let _restore = Restore(FULL_WORKSPACE_AUTHORIZATION.with(|value| value.replace(true)));
         f()
@@ -366,21 +368,30 @@ fn place(
     // events. Keep authorization failures inside input_rejection so one bad row cannot abort
     // an otherwise valid batch. SQL/decoding failures still propagate as storage failures.
     let authorization = (|| {
-        let fresh_main_input = main && event.seq == max + 1
-            && matches!(&event.body, EventBody::InputPosted { target: crate::workspace::InputTarget::BotMain { .. }, .. })
+        let fresh_main_input = main
+            && event.seq == max + 1
+            && matches!(
+                &event.body,
+                EventBody::InputPosted {
+                    target: crate::workspace::InputTarget::BotMain { .. },
+                    ..
+                }
+            )
             && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
             && first_fork(connection, network, &event.author)?.is_none();
         #[cfg(test)]
         let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
-        if fresh_main_input && super::workspace::authorize_fresh_bot_main(connection, network, event)? {
+        if fresh_main_input
+            && super::workspace::authorize_fresh_bot_main(connection, network, event)?
+        {
             Ok(())
         } else {
             super::workspace::authorize_event(connection, network, event)
         }
     })()
-        .and_then(|()| authorize_memory(connection, network, event))
-        .and_then(|()| authorize_cause(connection, view, event))
-        .and_then(|()| authorize_owner(connection, view, event));
+    .and_then(|()| authorize_memory(connection, network, event))
+    .and_then(|()| authorize_cause(connection, view, event))
+    .and_then(|()| authorize_owner(connection, view, event));
     if let Some(error) = input_rejection(authorization)? {
         tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
         return Ok(IngestStatus::Rejected(error.to_string()));
@@ -1001,9 +1012,15 @@ pub(crate) fn append_from(
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     // This branch is only for this transaction's freshly signed local head extension.
     // Forked/cutoff authors retain causal authorization, as does full recomputation.
-    let fresh_main_input = matches!(&event.body, EventBody::InputPosted { target: crate::workspace::InputTarget::BotMain { .. }, .. })
-        && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
-        && first_fork(connection, network, &event.author)?.is_none();
+    let fresh_main_input =
+        matches!(
+            &event.body,
+            EventBody::InputPosted {
+                target: crate::workspace::InputTarget::BotMain { .. },
+                ..
+            }
+        ) && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
     #[cfg(test)]
     let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
     let fresh_main_input = fresh_main_input

@@ -420,16 +420,27 @@ async fn unresponsive_owned_child_escalates_through_the_saved_handle() -> Result
 }
 
 #[tokio::test]
-async fn single_instance_defers_busy_join_without_overwriting_or_losing_later_intents() -> Result<()> {
+async fn single_instance_defers_busy_join_without_overwriting_or_losing_later_intents() -> Result<()>
+{
     let fixture = Fixture::new()?;
-    let InstanceClaim::Primary(mut primary) = SingleInstance::claim(&fixture.profile, &[]).await? else {
+    let InstanceClaim::Primary(mut primary) = SingleInstance::claim(&fixture.profile, &[]).await?
+    else {
         panic!("the controlled primary must hold the activation queue");
     };
     assert_eq!(primary.try_recv(), Some(Activation::Focus));
-    let first = Activation::Join { ticket: "vibeface1first".into() };
-    let second = Activation::Join { ticket: "vibeface1second".into() };
-    let third = Activation::Join { ticket: "vibeface1third".into() };
-    assert!(matches!(SingleInstance::claim(&fixture.profile, &["vibeface://join/vibeface1first".into()]).await?, InstanceClaim::Forwarded));
+    let first = Activation::Join {
+        ticket: "vibeface1first".into(),
+    };
+    let second = Activation::Join {
+        ticket: "vibeface1second".into(),
+    };
+    let third = Activation::Join {
+        ticket: "vibeface1third".into(),
+    };
+    assert!(matches!(
+        SingleInstance::claim(&fixture.profile, &["vibeface://join/vibeface1first".into()]).await?,
+        InstanceClaim::Forwarded
+    ));
     assert_eq!(primary.pending_capacity(), 31);
     assert!(primary.enqueue(second.clone()));
     assert!(primary.enqueue(third.clone()));
@@ -448,14 +459,25 @@ async fn single_instance_defers_busy_join_without_overwriting_or_losing_later_in
     assert_eq!(primary.try_recv(), Some(third));
     assert_eq!(primary.try_recv(), None);
     for index in 0..32 {
-        assert!(primary.enqueue(Activation::Join { ticket: format!("vibeface1bounded{index}") }));
+        assert!(primary.enqueue(Activation::Join {
+            ticket: format!("vibeface1bounded{index}")
+        }));
     }
     assert_eq!(primary.pending_capacity(), 0);
     let busy_join = primary.try_recv().unwrap();
     assert!(primary.defer(busy_join));
-    assert_eq!(primary.pending_capacity(), 0, "defer must not be deduplicated away or lose a tail entry");
+    assert_eq!(
+        primary.pending_capacity(),
+        0,
+        "defer must not be deduplicated away or lose a tail entry"
+    );
     for index in 0..32 {
-        assert_eq!(primary.try_recv(), Some(Activation::Join { ticket: format!("vibeface1bounded{index}") }));
+        assert_eq!(
+            primary.try_recv(),
+            Some(Activation::Join {
+                ticket: format!("vibeface1bounded{index}")
+            })
+        );
     }
     assert_eq!(primary.try_recv(), None);
     assert!(!fixture.node().exists());

@@ -120,14 +120,13 @@ impl Fixture {
         } else {
             "vibeface-core"
         });
-        let status = std::process::Command::new(
-            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        )
-        .args(["--edition=2024"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&core)
-        .status()?;
+        let status =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args(["--edition=2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&core)
+                .status()?;
         ensure!(status.success(), "compile the controlled Core fixture");
         let fixture = Self {
             root,
@@ -242,7 +241,11 @@ async fn selected_node_bootstrap_uses_local_setup_without_initializing_or_leakin
     }
     let commands = std::fs::read_to_string(fixture.profile.join("fixture-commands"))?;
     assert!(commands.lines().any(|command| command == "local_setup"));
-    assert!(commands.lines().all(|command| matches!(command, "inspect" | "local_setup")));
+    assert!(
+        commands
+            .lines()
+            .all(|command| matches!(command, "inspect" | "local_setup"))
+    );
     assert!(!commands.contains(BOOTSTRAP_CAPABILITY));
     assert!(!commands.contains(LAUNCHER_CAPABILITY));
     assert!(host.snapshot().owned.is_none());

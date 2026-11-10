@@ -618,7 +618,8 @@ fn context_projection_from(
     let total: usize = connection.query_row(
         "SELECT count(*) FROM scheduler_jobs WHERE conversation_id=?1
             AND state IN ('steering','steered') AND json_extract(detail,'$.into.attempt_id')=?2",
-        params![session.conversation_id,context.attempt_id], |row| row.get(0),
+        params![session.conversation_id, context.attempt_id],
+        |row| row.get(0),
     )?;
     let mut statement = connection.prepare(
         "SELECT j.reply_to,j.state,j.detail,m.event_hash FROM scheduler_jobs j
@@ -627,13 +628,28 @@ fn context_projection_from(
             AND json_extract(j.detail,'$.into.attempt_id')=?3
          ORDER BY j.sequence,j.rowid LIMIT 64",
     )?;
-    let rows = statement.query_map(params![context.network_id,session.conversation_id,context.attempt_id], |row| {
-        Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))
-    })?;
+    let rows = statement.query_map(
+        params![
+            context.network_id,
+            session.conversation_id,
+            context.attempt_id
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
     for row in rows {
         let (message_id, stored_state, detail, source) = row?;
         let state: JobState = serde_json::from_str(&detail)?;
-        ensure!(state.name() == stored_state, "scheduler job steer state mismatch");
+        ensure!(
+            state.name() == stored_state,
+            "scheduler job steer state mismatch"
+        );
         let (into, receipt, stage) = match &state {
             JobState::Steering {
                 into,
@@ -716,15 +732,24 @@ fn earlier_input_holds(
     let scope = job.scope.storage_key();
     let parameters = params![network, job.conversation_id, scope, job.sequence];
     if fixed_assignment.is_none() {
-        return Ok(connection.query_row(&format!("SELECT EXISTS({EARLIER_INPUTS})"), parameters, |row| row.get(0))?);
+        return Ok(connection.query_row(
+            &format!("SELECT EXISTS({EARLIER_INPUTS})"),
+            parameters,
+            |row| row.get(0),
+        )?);
     }
-    let mut statement = connection.prepare(&format!("{EARLIER_INPUTS} ORDER BY j.sequence,j.rowid"))?;
+    let mut statement =
+        connection.prepare(&format!("{EARLIER_INPUTS} ORDER BY j.sequence,j.rowid"))?;
     let mut rows = statement.query(parameters)?;
     while let Some(row) = rows.next()? {
         let trigger: String = row.get(0)?;
-        let earlier = load_job(connection, &job.conversation_id, &trigger)?.context("earlier scheduler input missing")?;
-        if super::workspace::workspace_assignment_for_job_from(connection, network, local, &earlier)?
-            .as_ref().map(|assignment| assignment.assignment_id.as_str())
+        let earlier = load_job(connection, &job.conversation_id, &trigger)?
+            .context("earlier scheduler input missing")?;
+        if super::workspace::workspace_assignment_for_job_from(
+            connection, network, local, &earlier,
+        )?
+        .as_ref()
+        .map(|assignment| assignment.assignment_id.as_str())
             == fixed_assignment.map(|assignment| assignment.assignment_id.as_str())
         {
             return Ok(true);
@@ -820,7 +845,8 @@ fn job_hold_from(
         "SELECT EXISTS(SELECT 1 FROM pending_checks c JOIN scheduler_jobs j
             ON j.conversation_id=c.conversation_id AND j.trigger=c.trigger
          WHERE c.conversation_id=?1 AND j.scope=?2)",
-        params![key.conversation_id, scope], |row| row.get(0),
+        params![key.conversation_id, scope],
+        |row| row.get(0),
     )?;
     if pending_in_scope {
         return Ok(Some(QueueHoldReason::PendingCheck));
@@ -828,7 +854,8 @@ fn job_hold_from(
     let active_in_scope: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM scheduler_sessions
             WHERE conversation_id=?1 AND scope=?2 AND active IS NOT NULL)",
-        params![key.conversation_id, scope], |row| row.get(0),
+        params![key.conversation_id, scope],
+        |row| row.get(0),
     )?;
     if active_in_scope {
         return Ok(Some(QueueHoldReason::ActiveTurn));
@@ -839,7 +866,8 @@ fn job_hold_from(
         let steering: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM scheduler_jobs
                 WHERE conversation_id=?1 AND scope=?2 AND state='steering')",
-            params![key.conversation_id, scope], |row| row.get(0),
+            params![key.conversation_id, scope],
+            |row| row.get(0),
         )?;
         if steering {
             return Ok(Some(QueueHoldReason::SteeringSettlement));
@@ -855,13 +883,15 @@ fn job_hold_from(
                 JOIN scheduler_jobs j ON j.conversation_id=c.conversation_id AND j.trigger=c.trigger
                 JOIN scheduler_sessions s ON s.conversation_id=j.conversation_id AND s.scope=j.scope
                 WHERE c.conversation_id=?1 AND s.provider=?2)",
-            params![key.conversation_id, super::enum_text(&provider)], |row| row.get(0),
+            params![key.conversation_id, super::enum_text(&provider)],
+            |row| row.get(0),
         )?;
         if instance_busy {
             return Ok(Some(QueueHoldReason::ProviderSerial));
         }
     }
-    if job.kind == TriggerKind::AgentTask || matches!(job.scope, SessionScope::WorkspaceTask { .. }) {
+    if job.kind == TriggerKind::AgentTask || matches!(job.scope, SessionScope::WorkspaceTask { .. })
+    {
         // Duplicate checks count separately, while orphan checks count only towards the machine.
         let task_limit = i64::try_from(limits.task_limit).unwrap_or(i64::MAX);
         let task_full: bool = connection.query_row(
@@ -2313,9 +2343,11 @@ impl Store {
         network: &str,
         message_id: &str,
     ) -> Result<Vec<HashedEvent>> {
-        Ok(self.input_attachment_source(network, message_id)?
+        Ok(self
+            .input_attachment_source(network, message_id)?
             .filter(|source| !source.input.input.attachments.is_empty())
-            .map(|source| vec![source.source]).unwrap_or_default())
+            .map(|source| vec![source.source])
+            .unwrap_or_default())
     }
 
     pub(crate) fn scheduler_work_in_scope(
@@ -2597,7 +2629,12 @@ impl Store {
         }
         for source in self.edited_attachment_sources(network, &job.conversation_id, hash)? {
             if self.scheduler_event_allowed(network, job, &source.original)?
-                && source.source.event.seq <= job.basis.get(&source.source.event.author).copied().unwrap_or(0)
+                && source.source.event.seq
+                    <= job
+                        .basis
+                        .get(&source.source.event.author)
+                        .copied()
+                        .unwrap_or(0)
             {
                 return Ok(Some(job.conversation_id.clone()));
             }
@@ -2605,7 +2642,12 @@ impl Store {
         for input in accepted_steering_jobs(&self.connection, job)? {
             if let Some(source) = self.input_attachment_source(network, &input.reply_to)?
                 && source.input.conversation_id == job.conversation_id
-                && source.input.input.attachments.iter().any(|attachment| attachment.hash == hash)
+                && source
+                    .input
+                    .input
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.hash == hash)
                 && self.scheduler_event_allowed(network, job, &source.original)?
             {
                 return Ok(Some(job.conversation_id.clone()));
@@ -5667,11 +5709,10 @@ impl Store {
     }
 }
 
-
 #[cfg(test)]
 mod hold_query_tests {
     use super::*;
-    use crate::{crypto::LocalIdentity, config::SchedulingLimits};
+    use crate::{config::SchedulingLimits, crypto::LocalIdentity};
 
     // Frozen pre-optimization implementation. Literal expectations below also guard the oracle.
     fn reference_hold_from(
@@ -5688,8 +5729,9 @@ mod hold_query_tests {
         }
         let key = job.session_key();
         let session = load_scoped_session(connection, &key)?;
-        let fixed_assignment =
-            crate::store::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
+        let fixed_assignment = crate::store::workspace::workspace_assignment_for_job_from(
+            connection, network, local, job,
+        )?;
         for earlier in queued_jobs(connection, &job.conversation_id)? {
             if earlier.scope == job.scope
                 && earlier.sequence < job.sequence
@@ -5715,7 +5757,8 @@ mod hold_query_tests {
             }
         }
         if let SessionScope::WorkspaceTask { task_id } = &job.scope {
-            if !crate::store::workspace::task_execution_allowed_from(connection, network, task_id)? {
+            if !crate::store::workspace::task_execution_allowed_from(connection, network, task_id)?
+            {
                 return Ok(Some(QueueHoldReason::PendingCheck));
             }
             let Some(assignment) = fixed_assignment else {
@@ -5736,14 +5779,19 @@ mod hold_query_tests {
             {
                 return Ok(Some(QueueHoldReason::PendingCheck));
             }
-            if !crate::store::workspace::assignment_resources_available_from(connection, network, &assignment)?
-            {
+            if !crate::store::workspace::assignment_resources_available_from(
+                connection,
+                network,
+                &assignment,
+            )? {
                 return Ok(Some(QueueHoldReason::ResourceConflict));
             }
         }
-        if let Some(input) =
-            crate::store::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
-        {
+        if let Some(input) = crate::store::workspace::queued_workspace_input_from(
+            connection,
+            network,
+            &job.reply_to,
+        )? {
             if input.deferred || input.cancelled {
                 return Ok(Some(QueueHoldReason::SteeringSettlement));
             }
@@ -5769,8 +5817,9 @@ mod hold_query_tests {
                     &input.input.route.target,
                 )?;
                 if let Some(id) = resolved.assignment_id
-                    && let Some(assignment) =
-                        crate::store::workspace::workspace_assignment_from(connection, network, &id)?
+                    && let Some(assignment) = crate::store::workspace::workspace_assignment_from(
+                        connection, network, &id,
+                    )?
                     && input.input.route.expected_revision != Some(assignment.started_revision)
                     && input.input.route.expected_revision != assignment.adopted_revision
                 {
@@ -5820,7 +5869,8 @@ mod hold_query_tests {
         {
             return Ok(Some(QueueHoldReason::ProviderSerial));
         }
-        if job.kind == TriggerKind::AgentTask || matches!(job.scope, SessionScope::WorkspaceTask { .. })
+        if job.kind == TriggerKind::AgentTask
+            || matches!(job.scope, SessionScope::WorkspaceTask { .. })
         {
             let active_tasks = active
                 .iter()
@@ -5850,32 +5900,101 @@ mod hold_query_tests {
         Ok(None)
     }
 
-    struct Fixture { store: Store, identity: LocalIdentity, network: String }
+    struct Fixture {
+        store: Store,
+        identity: LocalIdentity,
+        network: String,
+    }
     fn fixture() -> Result<Fixture> {
-        let identity = LocalIdentity::generate(); let network = identity.fixture_network_id()?;
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(&network, &identity.sign_network_fixture(1, vec![identity.device_id()?])?)?;
-        store.create_conversation(&identity, &network, "c", "Synthetic hold", identity.owner_fixture(&network, "c", &identity.device_id()?)?, 1)?;
-        let body = identity.fixture_admin().attest(&network, "c", EventBody::BotCreated { bot_id: "bot".into(), name: "Hold fixture".into(),
-            instructions: "Synthetic fixture".into(), project: None, attestation: None, cause: None })?;
+        store.install_trust_bundle(
+            &network,
+            &identity.sign_network_fixture(1, vec![identity.device_id()?])?,
+        )?;
+        store.create_conversation(
+            &identity,
+            &network,
+            "c",
+            "Synthetic hold",
+            identity.owner_fixture(&network, "c", &identity.device_id()?)?,
+            1,
+        )?;
+        let body = identity.fixture_admin().attest(
+            &network,
+            "c",
+            EventBody::BotCreated {
+                bot_id: "bot".into(),
+                name: "Hold fixture".into(),
+                instructions: "Synthetic fixture".into(),
+                project: None,
+                attestation: None,
+                cause: None,
+            },
+        )?;
         store.append_event(&identity, &network, "c", body, vec![], 2)?;
-        Ok(Fixture { store, identity, network })
+        Ok(Fixture {
+            store,
+            identity,
+            network,
+        })
     }
     fn job(scope: SessionScope, trigger: &str, sequence: u64, kind: TriggerKind) -> SchedulerJob {
-        SchedulerJob { conversation_id: "c".into(), scope, trigger: trigger.into(), kind, sequence,
-            basis: VersionVector::new(), reply_to: trigger.into(), message_id: format!("reply-{trigger}"),
-            runtime: None, pending_check: false, tool_calls: false, state: JobState::Queued }
+        SchedulerJob {
+            conversation_id: "c".into(),
+            scope,
+            trigger: trigger.into(),
+            kind,
+            sequence,
+            basis: VersionVector::new(),
+            reply_to: trigger.into(),
+            message_id: format!("reply-{trigger}"),
+            runtime: None,
+            pending_check: false,
+            tool_calls: false,
+            state: JobState::Queued,
+        }
     }
-    fn expect(f: &Fixture, job: &SchedulerJob, provider: Provider, limits: SchedulingLimits, expected: Option<QueueHoldReason>) -> Result<()> {
-        let actual = f.store.scheduler_job_hold(&f.network, &f.identity.device_id()?, job, provider, &limits)?;
+    fn expect(
+        f: &Fixture,
+        job: &SchedulerJob,
+        provider: Provider,
+        limits: SchedulingLimits,
+        expected: Option<QueueHoldReason>,
+    ) -> Result<()> {
+        let actual = f.store.scheduler_job_hold(
+            &f.network,
+            &f.identity.device_id()?,
+            job,
+            provider,
+            &limits,
+        )?;
         assert_eq!(actual, expected);
-        assert_eq!(actual, reference_hold_from(&f.store.connection, &f.store.blob_dir, &f.network,
-            &f.identity.device_id()?, job, provider, &limits)?);
+        assert_eq!(
+            actual,
+            reference_hold_from(
+                &f.store.connection,
+                &f.store.blob_dir,
+                &f.network,
+                &f.identity.device_id()?,
+                job,
+                provider,
+                &limits
+            )?
+        );
         Ok(())
     }
-    fn session(f: &Fixture, conversation: &str, scope: SessionScope, provider: Provider, active: bool) -> Result<()> {
+    fn session(
+        f: &Fixture,
+        conversation: &str,
+        scope: SessionScope,
+        provider: Provider,
+        active: bool,
+    ) -> Result<()> {
         let mut session = SchedulerSession::in_scope(conversation, scope);
-        session.provider = Some(provider); session.active = active.then(|| "active".into());
+        session.provider = Some(provider);
+        session.active = active.then(|| "active".into());
         save_session(&f.store.connection, &session)
     }
     fn check(f: &Fixture, attempt: &str, conversation: &str, trigger: &str) -> Result<()> {
@@ -5887,50 +6006,193 @@ mod hold_query_tests {
     #[test]
     fn hold_reason_precedence_matches_reference_and_literal_results() -> Result<()> {
         let f = fixture()?;
-        let limits = SchedulingLimits { machine_slots: 20, task_limit: 10 };
+        let limits = SchedulingLimits {
+            machine_slots: 20,
+            task_limit: 10,
+        };
         let target = job(SessionScope::Main, "target", 20, TriggerKind::Human);
         save_job(&f.store.connection, &target)?;
         expect(&f, &target, Provider::Codex, limits, None)?;
-        expect(&f, &target, Provider::Codex, SchedulingLimits { machine_slots: 0, task_limit: 0 }, Some(QueueHoldReason::MachineSlot))?;
+        expect(
+            &f,
+            &target,
+            Provider::Codex,
+            SchedulingLimits {
+                machine_slots: 0,
+                task_limit: 0,
+            },
+            Some(QueueHoldReason::MachineSlot),
+        )?;
         session(&f, "c", SessionScope::Main, Provider::Cursor, true)?;
         check(&f, "pending-target", "c", "target")?;
-        expect(&f, &target, Provider::Cursor, limits, Some(QueueHoldReason::PendingCheck))?;
-        f.store.connection.execute("DELETE FROM pending_checks", [])?;
-        expect(&f, &target, Provider::Cursor, limits, Some(QueueHoldReason::ActiveTurn))?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            limits,
+            Some(QueueHoldReason::PendingCheck),
+        )?;
+        f.store
+            .connection
+            .execute("DELETE FROM pending_checks", [])?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            limits,
+            Some(QueueHoldReason::ActiveTurn),
+        )?;
         session(&f, "c", SessionScope::Main, Provider::Cursor, false)?;
         let mut steering = job(SessionScope::Main, "steering", 1, TriggerKind::Human);
-        steering.state = JobState::Steering { into: SteerTarget { provider: Provider::Cursor, attempt_id: "attempt".into(),
-            thread_id: "thread".into(), turn_id: "turn".into() }, receipt: None, uncertain: false,
-            unread_since_ms: None, running_since_ms: None };
+        steering.state = JobState::Steering {
+            into: SteerTarget {
+                provider: Provider::Cursor,
+                attempt_id: "attempt".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            receipt: None,
+            uncertain: false,
+            unread_since_ms: None,
+            running_since_ms: None,
+        };
         save_job(&f.store.connection, &steering)?;
-        expect(&f, &target, Provider::Cursor, limits, Some(QueueHoldReason::SteeringSettlement))?;
-        f.store.connection.execute("DELETE FROM scheduler_jobs WHERE trigger='steering'", [])?;
-        session(&f, "c", SessionScope::Task { work_id: "running".into() }, Provider::Cursor, true)?;
-        expect(&f, &target, Provider::Cursor, limits, Some(QueueHoldReason::ProviderSerial))?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            limits,
+            Some(QueueHoldReason::SteeringSettlement),
+        )?;
+        f.store
+            .connection
+            .execute("DELETE FROM scheduler_jobs WHERE trigger='steering'", [])?;
+        session(
+            &f,
+            "c",
+            SessionScope::Task {
+                work_id: "running".into(),
+            },
+            Provider::Cursor,
+            true,
+        )?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            limits,
+            Some(QueueHoldReason::ProviderSerial),
+        )?;
         expect(&f, &target, Provider::Codex, limits, None)?;
-        f.store.connection.execute("DELETE FROM scheduler_sessions WHERE conversation_id='c'", [])?;
+        f.store.connection.execute(
+            "DELETE FROM scheduler_sessions WHERE conversation_id='c'",
+            [],
+        )?;
         session(&f, "other", SessionScope::Main, Provider::Cursor, true)?;
         expect(&f, &target, Provider::Cursor, limits, None)?;
-        let mut ended = target.clone(); ended.state = JobState::Cancelled { attempt: None, evidence: "cancelled".into() };
-        expect(&f, &ended, Provider::Codex, SchedulingLimits { machine_slots: 0, task_limit: 0 }, None)?;
+        let mut ended = target.clone();
+        ended.state = JobState::Cancelled {
+            attempt: None,
+            evidence: "cancelled".into(),
+        };
+        expect(
+            &f,
+            &ended,
+            Provider::Codex,
+            SchedulingLimits {
+                machine_slots: 0,
+                task_limit: 0,
+            },
+            None,
+        )?;
         Ok(())
     }
 
     #[test]
     fn duplicate_and_orphan_pending_checks_keep_their_original_slot_semantics() -> Result<()> {
         let f = fixture()?;
-        let target = job(SessionScope::Task { work_id: "next".into() }, "next", 20, TriggerKind::AgentTask);
-        let pending = job(SessionScope::Task { work_id: "previous".into() }, "previous", 1, TriggerKind::AgentTask);
+        let target = job(
+            SessionScope::Task {
+                work_id: "next".into(),
+            },
+            "next",
+            20,
+            TriggerKind::AgentTask,
+        );
+        let pending = job(
+            SessionScope::Task {
+                work_id: "previous".into(),
+            },
+            "previous",
+            1,
+            TriggerKind::AgentTask,
+        );
         save_job(&f.store.connection, &pending)?;
         session(&f, "c", pending.scope.clone(), Provider::Cursor, false)?;
-        check(&f, "one", "c", "previous")?; check(&f, "two", "c", "previous")?;
-        expect(&f, &target, Provider::Codex, SchedulingLimits { machine_slots: 2, task_limit: 2 }, Some(QueueHoldReason::TaskLimit))?;
-        expect(&f, &target, Provider::Cursor, SchedulingLimits { machine_slots: 2, task_limit: 2 }, Some(QueueHoldReason::ProviderSerial))?;
-        f.store.connection.execute("DELETE FROM scheduler_jobs", [])?;
-        expect(&f, &target, Provider::Codex, SchedulingLimits { machine_slots: 2, task_limit: 1 }, Some(QueueHoldReason::MachineSlot))?;
-        expect(&f, &target, Provider::Cursor, SchedulingLimits { machine_slots: 3, task_limit: 1 }, None)?;
-        session(&f, "c", SessionScope::Task { work_id: "running".into() }, Provider::Codex, true)?;
-        expect(&f, &target, Provider::Codex, SchedulingLimits { machine_slots: 0, task_limit: 1 }, Some(QueueHoldReason::TaskLimit))?;
+        check(&f, "one", "c", "previous")?;
+        check(&f, "two", "c", "previous")?;
+        expect(
+            &f,
+            &target,
+            Provider::Codex,
+            SchedulingLimits {
+                machine_slots: 2,
+                task_limit: 2,
+            },
+            Some(QueueHoldReason::TaskLimit),
+        )?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            SchedulingLimits {
+                machine_slots: 2,
+                task_limit: 2,
+            },
+            Some(QueueHoldReason::ProviderSerial),
+        )?;
+        f.store
+            .connection
+            .execute("DELETE FROM scheduler_jobs", [])?;
+        expect(
+            &f,
+            &target,
+            Provider::Codex,
+            SchedulingLimits {
+                machine_slots: 2,
+                task_limit: 1,
+            },
+            Some(QueueHoldReason::MachineSlot),
+        )?;
+        expect(
+            &f,
+            &target,
+            Provider::Cursor,
+            SchedulingLimits {
+                machine_slots: 3,
+                task_limit: 1,
+            },
+            None,
+        )?;
+        session(
+            &f,
+            "c",
+            SessionScope::Task {
+                work_id: "running".into(),
+            },
+            Provider::Codex,
+            true,
+        )?;
+        expect(
+            &f,
+            &target,
+            Provider::Codex,
+            SchedulingLimits {
+                machine_slots: 0,
+                task_limit: 1,
+            },
+            Some(QueueHoldReason::TaskLimit),
+        )?;
         Ok(())
     }
 
@@ -5943,16 +6205,44 @@ mod hold_query_tests {
         for (index, intent, report, expected) in [
             (0, InputIntent::Continue, Some(false), None),
             (1, InputIntent::Defer, Some(true), None),
-            (3, InputIntent::Continue, Some(true), Some(QueueHoldReason::EarlierInput)),
+            (
+                3,
+                InputIntent::Continue,
+                Some(true),
+                Some(QueueHoldReason::EarlierInput),
+            ),
         ] {
-            f.store.connection.execute("DELETE FROM scheduler_jobs", [])?;
+            f.store
+                .connection
+                .execute("DELETE FROM scheduler_jobs", [])?;
             let id = format!("input.{index}");
-            let body = f.identity.fixture_admin().attest(&f.network, "c", EventBody::InputPosted { message_id: id.clone(),
-                target: InputTarget::BotMain { bot_id: "bot".into() }, intent, sequence: index + 1, expected_revision: None,
-                text: "Synthetic signed input".into(), attachments: vec![], report_results: report, attestation: None })?;
-            f.store.post_input_fixture(&f.identity, &f.network, body, index as i64 + 3)?;
-            let mut earlier = job(SessionScope::Main, &format!("message:{id}"), 1, TriggerKind::Human);
-            earlier.reply_to = id.clone(); save_job(&f.store.connection, &earlier)?;
+            let body = f.identity.fixture_admin().attest(
+                &f.network,
+                "c",
+                EventBody::InputPosted {
+                    message_id: id.clone(),
+                    target: InputTarget::BotMain {
+                        bot_id: "bot".into(),
+                    },
+                    intent,
+                    sequence: index + 1,
+                    expected_revision: None,
+                    text: "Synthetic signed input".into(),
+                    attachments: vec![],
+                    report_results: report,
+                    attestation: None,
+                },
+            )?;
+            f.store
+                .post_input_fixture(&f.identity, &f.network, body, index as i64 + 3)?;
+            let mut earlier = job(
+                SessionScope::Main,
+                &format!("message:{id}"),
+                1,
+                TriggerKind::Human,
+            );
+            earlier.reply_to = id.clone();
+            save_job(&f.store.connection, &earlier)?;
             expect(&f, &target, Provider::Codex, limits, expected)?;
             earlier.sequence = target.sequence;
             save_job(&f.store.connection, &earlier)?;
@@ -5960,21 +6250,62 @@ mod hold_query_tests {
             earlier.sequence = 1;
             save_job(&f.store.connection, &earlier)?;
 
-            let mut other_scope = target.clone(); other_scope.scope = SessionScope::Task { work_id: "isolated".into() };
+            let mut other_scope = target.clone();
+            other_scope.scope = SessionScope::Task {
+                work_id: "isolated".into(),
+            };
             expect(&f, &other_scope, Provider::Codex, limits, None)?;
-            let single = f.store.queued_workspace_input(&f.network, &id)?.context("single input")?;
-            let all = f.store.workspace_queue(&f.network)?.into_iter().find(|input| input.input.message_id == id).context("full queue input")?;
+            let single = f
+                .store
+                .queued_workspace_input(&f.network, &id)?
+                .context("single input")?;
+            let all = f
+                .store
+                .workspace_queue(&f.network)?
+                .into_iter()
+                .find(|input| input.input.message_id == id)
+                .context("full queue input")?;
             assert_eq!(single, all);
-            assert!(f.store.queued_workspace_input("wrong-network", &id)?.is_none());
+            assert!(
+                f.store
+                    .queued_workspace_input("wrong-network", &id)?
+                    .is_none()
+            );
             if intent == InputIntent::Defer {
-                let command = crate::workspace::WorkspaceCommand::ControlInput { message_id: id.clone(), expected_event: single.control_event,
-                    action: crate::workspace::InputControl::Release };
-                let body = f.identity.fixture_admin().attest(&f.network, crate::workspace::WORKSPACE_SCOPE, EventBody::WorkspaceCommanded {
-                    command_id: "release-input".into(), command: command.clone(), attestation: None, cause: None, acting_assignment: None })?;
-                f.store.apply_workspace_command(&f.identity, &f.network, "release-input", command, body.attestation().cloned(), None, None, 10)?;
-                expect(&f, &target, Provider::Codex, limits, Some(QueueHoldReason::EarlierInput))?;
+                let command = crate::workspace::WorkspaceCommand::ControlInput {
+                    message_id: id.clone(),
+                    expected_event: single.control_event,
+                    action: crate::workspace::InputControl::Release,
+                };
+                let body = f.identity.fixture_admin().attest(
+                    &f.network,
+                    crate::workspace::WORKSPACE_SCOPE,
+                    EventBody::WorkspaceCommanded {
+                        command_id: "release-input".into(),
+                        command: command.clone(),
+                        attestation: None,
+                        cause: None,
+                        acting_assignment: None,
+                    },
+                )?;
+                f.store.apply_workspace_command(
+                    &f.identity,
+                    &f.network,
+                    "release-input",
+                    command,
+                    body.attestation().cloned(),
+                    None,
+                    None,
+                    10,
+                )?;
+                expect(
+                    &f,
+                    &target,
+                    Provider::Codex,
+                    limits,
+                    Some(QueueHoldReason::EarlierInput),
+                )?;
             }
-
         }
         Ok(())
     }
@@ -5983,15 +6314,28 @@ mod hold_query_tests {
     fn hold_query_plans_use_scoped_and_active_indexes() -> Result<()> {
         let f = fixture()?;
         let plan = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<String> {
-            Ok(f.store.connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
-                .query_map(values, |row| row.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+            Ok(f.store
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(values, |row| row.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .join("\n"))
         };
-        let details = plan(&format!("SELECT EXISTS({EARLIER_INPUTS})"), &[&f.network, &"c", &"main", &20i64])?;
+        let details = plan(
+            &format!("SELECT EXISTS({EARLIER_INPUTS})"),
+            &[&f.network, &"c", &"main", &20i64],
+        )?;
         assert!(details.contains("scheduler_jobs_hold"), "{details}");
         assert!(details.contains("sequence<?"), "{details}");
-        let details = plan("SELECT 1 FROM pending_checks WHERE conversation_id=?", &[&"c"])?;
+        let details = plan(
+            "SELECT 1 FROM pending_checks WHERE conversation_id=?",
+            &[&"c"],
+        )?;
         assert!(details.contains("pending_checks_scope"), "{details}");
-        let details = plan("SELECT count(*) FROM (SELECT 1 FROM scheduler_sessions WHERE active IS NOT NULL LIMIT 4)", &[])?;
+        let details = plan(
+            "SELECT count(*) FROM (SELECT 1 FROM scheduler_sessions WHERE active IS NOT NULL LIMIT 4)",
+            &[],
+        )?;
         assert!(details.contains("scheduler_sessions_active"), "{details}");
         Ok(())
     }

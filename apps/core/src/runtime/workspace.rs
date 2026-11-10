@@ -122,9 +122,9 @@ impl Runtime {
             let channel = channel.clone();
             let task = task.clone();
             self.read_display(access, input, "workspace.workspace_state", move |store| {
-                    store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)
-                })
-                .await
+                store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)
+            })
+            .await
         }?)?)
     }
     pub(super) async fn workspace_history(&self, access: &Access, input: &Value) -> Result<Value> {
@@ -146,9 +146,9 @@ impl Runtime {
             let channel = channel.clone();
             let task = task.clone();
             self.read_display(access, input, "workspace.workspace_history", move |store| {
-                    store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)
-                })
-                .await
+                store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)
+            })
+            .await
         }?;
         Ok(
             json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task.is_some(){"task"}else if channel.is_some(){"channel"}else{"workspace"}}}),

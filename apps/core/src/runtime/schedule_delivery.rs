@@ -13,10 +13,11 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(
-        job.pending_check || checks
-            .iter()
-            .any(|check| check.conversation_id == job.conversation_id
-                && check.trigger == job.trigger)
+        job.pending_check
+            || checks
+                .iter()
+                .any(|check| check.conversation_id == job.conversation_id
+                    && check.trigger == job.trigger)
     );
     value["retryable"] = json!(job.retryable() && value["pending_check"] != true);
     if let JobState::Failed { failure, .. }
@@ -1082,7 +1083,9 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
         let request: crate::workspace::InputRequest = serde_json::from_value(input.clone())
-            .context("message requires a typed target, intent, sequence and explicit report_results")?;
+            .context(
+                "message requires a typed target, intent, sequence and explicit report_results",
+            )?;
         ensure!(
             !matches!(
                 request.route.target,
@@ -1287,54 +1290,91 @@ impl Runtime {
         scope: &str,
     ) -> Result<Option<(Value, Value)>> {
         let local = self.identity.device_id()?;
-        let owner = self.store.read("scheduler_owner_observation.owner", {
-            let network = network.to_owned();
-            let scope = scope.to_owned();
-            move |store| Ok(store.conversation(&network, &scope)?
-                .and_then(|c| c.owner.map(|owner| (owner, c.owner_epoch))))
-        }).await?;
-        let Some((owner, owner_epoch)) = owner.filter(|(owner, _)| owner != &local) else { return Ok(None) };
+        let owner = self
+            .store
+            .read("scheduler_owner_observation.owner", {
+                let network = network.to_owned();
+                let scope = scope.to_owned();
+                move |store| {
+                    Ok(store
+                        .conversation(&network, &scope)?
+                        .and_then(|c| c.owner.map(|owner| (owner, c.owner_epoch))))
+                }
+            })
+            .await?;
+        let Some((owner, owner_epoch)) = owner.filter(|(owner, _)| owner != &local) else {
+            return Ok(None);
+        };
         let request = json!({"type":"scheduler_jobs","conversation_id":scope});
-        let reply = match tokio::time::timeout(OWNER_READ_WAIT, self.peer_request(network, &owner, request)).await {
+        let reply = match tokio::time::timeout(
+            OWNER_READ_WAIT,
+            self.peer_request(network, &owner, request),
+        )
+        .await
+        {
             Ok(Ok(reply)) => reply,
             outcome => {
                 if let Ok(Err(error)) = outcome {
                     tracing::debug!(%error, "the conversation's owner did not report its jobs");
                 }
-                return Ok(Some((super::scheduler_history::unavailable_owner_observation(
-                    network, scope, &owner, owner_epoch)?, Value::Null)));
+                return Ok(Some((
+                    super::scheduler_history::unavailable_owner_observation(
+                        network,
+                        scope,
+                        &owner,
+                        owner_epoch,
+                    )?,
+                    Value::Null,
+                )));
             }
         };
-        ensure!(serde_json::to_vec(&reply)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
-            "owner observation exceeds the response byte limit");
+        ensure!(
+            serde_json::to_vec(&reply)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
+            "owner observation exceeds the response byte limit"
+        );
         let metadata = reply["manager"].clone();
         let query_network = network.to_owned();
         let query_scope = scope.to_owned();
         let query_owner = owner.clone();
-        let remote = self.store.read("scheduler_owner_observation", move |store| {
-            ensure!(store.conversation(&query_network, &query_scope)?.is_some_and(|conversation|
-                conversation.owner.as_deref() == Some(query_owner.as_str()) && conversation.owner_epoch == owner_epoch),
-                "conversation owner changed; refresh the conversation");
-            let mut remote = reply;
-            remote.as_object_mut().context("invalid owner observation")?.remove("manager");
-            if let Some(jobs) = remote["jobs"].as_array_mut() {
-                ensure!(jobs.len() <= MAX_OWNER_JOBS, "owner returned too many jobs");
-                for job in jobs {
-                    if job["replied"] == true
-                        && let Some(message) = job["reply_message_id"].as_str()
-                        && !store.scheduler_reply_is_present(&query_network, &query_scope, message)? {
-                        job["state"] = json!("publishing");
+        let remote = self
+            .store
+            .read("scheduler_owner_observation", move |store| {
+                ensure!(
+                    store
+                        .conversation(&query_network, &query_scope)?
+                        .is_some_and(|conversation| conversation.owner.as_deref()
+                            == Some(query_owner.as_str())
+                            && conversation.owner_epoch == owner_epoch),
+                    "conversation owner changed; refresh the conversation"
+                );
+                let mut remote = reply;
+                remote
+                    .as_object_mut()
+                    .context("invalid owner observation")?
+                    .remove("manager");
+                if let Some(jobs) = remote["jobs"].as_array_mut() {
+                    ensure!(jobs.len() <= MAX_OWNER_JOBS, "owner returned too many jobs");
+                    for job in jobs {
+                        if job["replied"] == true
+                            && let Some(message) = job["reply_message_id"].as_str()
+                            && !store.scheduler_reply_is_present(
+                                &query_network,
+                                &query_scope,
+                                message,
+                            )?
+                        {
+                            job["state"] = json!("publishing");
+                        }
+                        job["source_node"] = json!(query_owner);
                     }
-                    job["source_node"] = json!(query_owner);
                 }
-            }
-            remote["owner"] = json!(query_owner);
-            remote["reachable"] = json!(true);
-            Ok(remote)
-        }).await?;
+                remote["owner"] = json!(query_owner);
+                remote["reachable"] = json!(true);
+                Ok(remote)
+            })
+            .await?;
         Ok(Some((remote, metadata)))
     }
-
 }
 
 /// The most recent jobs a conversation's owner reports to another device.

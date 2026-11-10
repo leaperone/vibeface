@@ -513,7 +513,9 @@ pub(crate) fn apply(
         // Read from the log by rank; see `store::bots::primary_bot_from`.
         EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}
     }
-    super::conversation_settings_projection::apply_projection(connection, network, hash, event, rank)?;
+    super::conversation_settings_projection::apply_projection(
+        connection, network, hash, event, rank,
+    )?;
     Ok(())
 }
 

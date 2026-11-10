@@ -6,12 +6,12 @@
 //! governance for it.
 
 use crate::connection::{Connection, Endpoint};
-mod plan;
 mod durable;
 mod enrollment;
-pub use enrollment::{Enrollment, Progress};
-pub use plan::{IdentityPlan, IdentityOperationState};
+mod plan;
 use anyhow::{Context, Result, bail, ensure};
+pub use enrollment::{Enrollment, Progress};
+pub use plan::{IdentityOperationState, IdentityPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -50,18 +50,48 @@ pub struct Entry {
     pub node_id: String,
 }
 
-#[derive(Clone,Serialize,Deserialize)]
-#[serde(tag="transport",rename_all="snake_case",deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
 enum RememberedEndpoint {
-    Gateway {entry:Entry},
-    Lan {node_id:String,addresses:Vec<String>},
-    Preferred {entry:Entry,addresses:Vec<String>},
+    Gateway {
+        entry: Entry,
+    },
+    Lan {
+        node_id: String,
+        addresses: Vec<String>,
+    },
+    Preferred {
+        entry: Entry,
+        addresses: Vec<String>,
+    },
 }
 impl RememberedEndpoint {
-    fn endpoint(&self)->Endpoint {match self {Self::Gateway {entry}=>Endpoint::Gateway(entry.clone()),Self::Lan {node_id,addresses}=>Endpoint::Lan {node_id:node_id.clone(),addresses:addresses.clone()},Self::Preferred {entry,addresses}=>Endpoint::Preferred {gateway:entry.clone(),addresses:addresses.clone()}}}
-    fn from_endpoint(endpoint:Endpoint)->Result<Self> {
+    fn endpoint(&self) -> Endpoint {
+        match self {
+            Self::Gateway { entry } => Endpoint::Gateway(entry.clone()),
+            Self::Lan { node_id, addresses } => Endpoint::Lan {
+                node_id: node_id.clone(),
+                addresses: addresses.clone(),
+            },
+            Self::Preferred { entry, addresses } => Endpoint::Preferred {
+                gateway: entry.clone(),
+                addresses: addresses.clone(),
+            },
+        }
+    }
+    fn from_endpoint(endpoint: Endpoint) -> Result<Self> {
         endpoint.validate()?;
-        Ok(match endpoint {Endpoint::Gateway(entry)=>Self::Gateway {entry},Endpoint::Lan {node_id,addresses}=>Self::Lan {node_id,addresses},Endpoint::Preferred {gateway,addresses}=>Self::Preferred {entry:gateway,addresses},Endpoint::Local(_)=>anyhow::bail!("a local session credential must not be remembered as network membership")})
+        Ok(match endpoint {
+            Endpoint::Gateway(entry) => Self::Gateway { entry },
+            Endpoint::Lan { node_id, addresses } => Self::Lan { node_id, addresses },
+            Endpoint::Preferred { gateway, addresses } => Self::Preferred {
+                entry: gateway,
+                addresses,
+            },
+            Endpoint::Local(_) => anyhow::bail!(
+                "a local session credential must not be remembered as network membership"
+            ),
+        })
     }
 }
 
@@ -105,7 +135,12 @@ impl ClientKey {
             envelope: serde_json::from_slice(&envelope)?,
         };
         let path = dir.join(KEY_FILE);
-        durable::publish_new(&path,&serde_json::to_vec_pretty(&file)?).with_context(||format!("{} already holds a client key or cannot publish it privately",path.display()))?;
+        durable::publish_new(&path, &serde_json::to_vec_pretty(&file)?).with_context(|| {
+            format!(
+                "{} already holds a client key or cannot publish it privately",
+                path.display()
+            )
+        })?;
         Ok(Self {
             dir: dir.to_owned(),
             identity,
@@ -150,20 +185,31 @@ impl ClientKey {
     }
 
     pub fn entry(&self) -> Option<&Entry> {
-        match self.file.endpoint.as_ref()? {RememberedEndpoint::Gateway {entry}|RememberedEndpoint::Preferred {entry,..}=>Some(entry),RememberedEndpoint::Lan {..}=>None}
+        match self.file.endpoint.as_ref()? {
+            RememberedEndpoint::Gateway { entry } | RememberedEndpoint::Preferred { entry, .. } => {
+                Some(entry)
+            }
+            RememberedEndpoint::Lan { .. } => None,
+        }
     }
-    pub fn remembered_endpoint(&self)->Result<Endpoint> {
-        let endpoint=self.file.endpoint.as_ref().context("this client has no remembered network entry")?.endpoint();
-        endpoint.validate()?;Ok(endpoint)
+    pub fn remembered_endpoint(&self) -> Result<Endpoint> {
+        let endpoint = self
+            .file
+            .endpoint
+            .as_ref()
+            .context("this client has no remembered network entry")?
+            .endpoint();
+        endpoint.validate()?;
+        Ok(endpoint)
     }
 
     /// Records the network this key is a member of and the Node it reaches it through.
     pub fn remember(&mut self, network_id: &str, entry: Entry) -> Result<()> {
-        self.remember_endpoint(network_id,Endpoint::Gateway(entry))
+        self.remember_endpoint(network_id, Endpoint::Gateway(entry))
     }
-    pub fn remember_endpoint(&mut self,network_id:&str,endpoint:Endpoint)->Result<()> {
+    pub fn remember_endpoint(&mut self, network_id: &str, endpoint: Endpoint) -> Result<()> {
         vibeface_secure::membership::validate_hash(network_id)?;
-        let endpoint=RememberedEndpoint::from_endpoint(endpoint)?;
+        let endpoint = RememberedEndpoint::from_endpoint(endpoint)?;
         self.file.network_id = Some(network_id.to_owned());
         self.file.endpoint = Some(endpoint);
         privatefs::write_atomic(
@@ -175,15 +221,24 @@ impl ClientKey {
 
     /// Opens a channel to the remembered Node, or to `entry` when given.
     pub async fn connect(&self, entry: Option<&Entry>) -> Result<Session<'_>> {
-        let endpoint=match entry {Some(entry)=>Endpoint::Gateway(entry.clone()),None=>self.remembered_endpoint()?};
+        let endpoint = match entry {
+            Some(entry) => Endpoint::Gateway(entry.clone()),
+            None => self.remembered_endpoint()?,
+        };
         self.connect_endpoint(&endpoint).await
     }
 
-    pub async fn connect_endpoint(&self, endpoint:&Endpoint)->Result<Session<'_>> {
-        let connection=Connection::open_endpoint(endpoint,&self.identity).await?;
-        Ok(self.session(connection,endpoint.clone()))
+    pub async fn connect_endpoint(&self, endpoint: &Endpoint) -> Result<Session<'_>> {
+        let connection = Connection::open_endpoint(endpoint, &self.identity).await?;
+        Ok(self.session(connection, endpoint.clone()))
     }
-    pub(crate) fn session(&self,connection:Connection,entry:Endpoint)->Session<'_> {Session {key:self,connection,entry}}
+    pub(crate) fn session(&self, connection: Connection, entry: Endpoint) -> Session<'_> {
+        Session {
+            key: self,
+            connection,
+            entry,
+        }
+    }
 
     pub(crate) fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
         Ok(self.identity.sign(domain, payload)?)
@@ -530,14 +585,18 @@ struct RecoveryMaterial {
     events: Vec<GovernanceEvent>,
 }
 
-fn recovery_file_bytes(material:&RecoveryMaterial,password:&str)->Result<Vec<u8>> {
-    let payload=Zeroizing::new(serde_json::to_vec(material)?);
-    let envelope=recovery_seal(&payload,password)?;
-    Ok(serde_json::to_vec_pretty(&RecoveryFile {version:1,network_id:material.network_id.clone(),envelope:serde_json::from_slice(&envelope)?})?)
+fn recovery_file_bytes(material: &RecoveryMaterial, password: &str) -> Result<Vec<u8>> {
+    let payload = Zeroizing::new(serde_json::to_vec(material)?);
+    let envelope = recovery_seal(&payload, password)?;
+    Ok(serde_json::to_vec_pretty(&RecoveryFile {
+        version: 1,
+        network_id: material.network_id.clone(),
+        envelope: serde_json::from_slice(&envelope)?,
+    })?)
 }
 #[cfg(test)]
-fn write_recovery_file(path:&Path,material:&RecoveryMaterial,password:&str)->Result<()> {
-    durable::publish_new(path,&recovery_file_bytes(material,password)?)
+fn write_recovery_file(path: &Path, material: &RecoveryMaterial, password: &str) -> Result<()> {
+    durable::publish_new(path, &recovery_file_bytes(material, password)?)
 }
 
 fn read_recovery_file(path: &Path, password: &str) -> Result<RecoveryMaterial> {
@@ -566,7 +625,10 @@ pub async fn prepare_create(
     recovery_file: &Path,
     password: &str,
 ) -> Result<IdentityPlan> {
-    ensure!(!IdentityPlan::exists(key),"an identity operation is pending; reopen it instead of generating another root");
+    ensure!(
+        !IdentityPlan::exists(key),
+        "an identity operation is pending; reopen it instead of generating another root"
+    );
     let mut session = key.connect(Some(&entry)).await?;
     let info = session.call("info", json!({})).await?;
     ensure!(
@@ -584,11 +646,23 @@ pub async fn prepare_create(
         Member::client(&session.key.identity, name, true)?,
         Member::new(&entry.node_id, IdentityKind::Node, node_name, false)?,
     )?;
-    let material=RecoveryMaterial {
-        version:1,network_id:genesis.network_id.clone(),root_secret_key:Zeroizing::new(root.secret_hex()),genesis:genesis.clone(),checkpoints:vec![],events:vec![],
+    let material = RecoveryMaterial {
+        version: 1,
+        network_id: genesis.network_id.clone(),
+        root_secret_key: Zeroizing::new(root.secret_hex()),
+        genesis: genesis.clone(),
+        checkpoints: vec![],
+        events: vec![],
     };
     drop(session);
-    IdentityPlan::prepare(key,entry,recovery_file,&material,password,json!({"genesis":genesis,"capability":capability}))
+    IdentityPlan::prepare(
+        key,
+        entry,
+        recovery_file,
+        &material,
+        password,
+        json!({"genesis":genesis,"capability":capability}),
+    )
 }
 
 /// Starts a recovery with `recovery_file`: every current member stays, this client joins as a
@@ -604,7 +678,10 @@ pub async fn prepare_recovery(
     name: &str,
     capability: Option<&str>,
 ) -> Result<IdentityPlan> {
-    ensure!(!IdentityPlan::exists(key),"an identity operation is pending; reopen it instead of generating another root");
+    ensure!(
+        !IdentityPlan::exists(key),
+        "an identity operation is pending; reopen it instead of generating another root"
+    );
     let material = read_recovery_file(recovery_file, password)?;
     let root = Identity::from_secret_hex(&material.root_secret_key)?;
     let me = key.device_id().to_owned();
@@ -672,13 +749,21 @@ pub async fn prepare_recovery(
     state.clone().recover_at(checkpoint.clone(), now)?;
     let mut checkpoints = state.checkpoints.clone();
     checkpoints.push(checkpoint);
-    let backup=RecoveryMaterial {
-        version:1,network_id:material.network_id.clone(),root_secret_key:Zeroizing::new(next.secret_hex()),genesis:state.genesis.clone(),checkpoints:checkpoints.clone(),events:state.events.clone(),
+    let backup = RecoveryMaterial {
+        version: 1,
+        network_id: material.network_id.clone(),
+        root_secret_key: Zeroizing::new(next.secret_hex()),
+        genesis: state.genesis.clone(),
+        checkpoints: checkpoints.clone(),
+        events: state.events.clone(),
     };
-    let mut params=json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
-    if fresh {params["capability"]=json!(capability.context("an empty Node needs its capability")?);}
+    let mut params =
+        json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
+    if fresh {
+        params["capability"] = json!(capability.context("an empty Node needs its capability")?);
+    }
     drop(session);
-    IdentityPlan::prepare(key,entry,new_file,&backup,password,params)
+    IdentityPlan::prepare(key, entry, new_file, &backup, password, params)
 }
 
 fn text<'v>(value: &'v Value, key: &str) -> Result<&'v str> {
@@ -748,21 +833,58 @@ mod tests {
     }
 
     #[test]
-    fn remembered_route_preserves_numeric_hints_and_exact_node_across_restarts()->Result<()> {
-        let dir=temp_dir("remembered-route");let mut key=ClientKey::create(&dir,"fixture passphrase")?;
-        let node=Identity::generate()?.device_id();let network=Identity::generate()?.device_id();
-        let entry=Entry {origin:"https://gateway.example".into(),node_id:node.clone()};
-        key.remember_endpoint(&network,Endpoint::Preferred {gateway:entry.clone(),addresses:vec!["127.0.0.1:4790".into(),"[::1]:4790".into()]})?;
-        drop(key);let mut key=ClientKey::open(&dir,"fixture passphrase")?;
-        let Endpoint::Preferred {gateway,addresses}=key.remembered_endpoint()? else {bail!("preferred route was not retained")};
-        assert_eq!(gateway,entry);assert_eq!(addresses,vec!["127.0.0.1:4790","[::1]:4790"]);
-        assert!(key.remember_endpoint(&network,Endpoint::Lan {node_id:node.clone(),addresses:vec!["malformed:4790".into()]}).is_err());
-        assert!(matches!(ClientKey::open(&dir,"fixture passphrase")?.remembered_endpoint()?,Endpoint::Preferred {..}));
-        key.remember_endpoint(&network,Endpoint::Lan {node_id:node.clone(),addresses:vec!["127.0.0.1:4790".into()]})?;
-        let reopened=ClientKey::open(&dir,"fixture passphrase")?;
-        assert!(reopened.entry().is_none(),"direct-only entries never manufacture a Gateway origin");
-        assert_eq!(reopened.remembered_endpoint()?.node_id(),node);
-        std::fs::remove_dir_all(dir)?;Ok(())
+    fn remembered_route_preserves_numeric_hints_and_exact_node_across_restarts() -> Result<()> {
+        let dir = temp_dir("remembered-route");
+        let mut key = ClientKey::create(&dir, "fixture passphrase")?;
+        let node = Identity::generate()?.device_id();
+        let network = Identity::generate()?.device_id();
+        let entry = Entry {
+            origin: "https://gateway.example".into(),
+            node_id: node.clone(),
+        };
+        key.remember_endpoint(
+            &network,
+            Endpoint::Preferred {
+                gateway: entry.clone(),
+                addresses: vec!["127.0.0.1:4790".into(), "[::1]:4790".into()],
+            },
+        )?;
+        drop(key);
+        let mut key = ClientKey::open(&dir, "fixture passphrase")?;
+        let Endpoint::Preferred { gateway, addresses } = key.remembered_endpoint()? else {
+            bail!("preferred route was not retained")
+        };
+        assert_eq!(gateway, entry);
+        assert_eq!(addresses, vec!["127.0.0.1:4790", "[::1]:4790"]);
+        assert!(
+            key.remember_endpoint(
+                &network,
+                Endpoint::Lan {
+                    node_id: node.clone(),
+                    addresses: vec!["malformed:4790".into()]
+                }
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            ClientKey::open(&dir, "fixture passphrase")?.remembered_endpoint()?,
+            Endpoint::Preferred { .. }
+        ));
+        key.remember_endpoint(
+            &network,
+            Endpoint::Lan {
+                node_id: node.clone(),
+                addresses: vec!["127.0.0.1:4790".into()],
+            },
+        )?;
+        let reopened = ClientKey::open(&dir, "fixture passphrase")?;
+        assert!(
+            reopened.entry().is_none(),
+            "direct-only entries never manufacture a Gateway origin"
+        );
+        assert_eq!(reopened.remembered_endpoint()?.node_id(), node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
     #[test]
     fn recovery_files_round_trip_and_never_overwrite() -> Result<()> {

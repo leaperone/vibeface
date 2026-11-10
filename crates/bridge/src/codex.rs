@@ -12,16 +12,22 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     sync::{RwLock, mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
-use tokio_tungstenite::{WebSocketStream, client_async_with_config, tungstenite::{Message, protocol::WebSocketConfig}};
 #[cfg(test)]
 use tokio_tungstenite::client_async;
+use tokio_tungstenite::{
+    WebSocketStream, client_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use vibeface_protocol::{RpcId, now_ms};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -135,17 +141,32 @@ fn event_bytes(event: &ExecEvent) -> usize {
     std::mem::size_of::<ExecEvent>().saturating_add(payload)
 }
 fn rpc_id_bytes(id: &RpcId) -> usize {
-    match id { RpcId::String(id) => id.capacity(), RpcId::Number(_) => 0 }
+    match id {
+        RpcId::String(id) => id.capacity(),
+        RpcId::Number(_) => 0,
+    }
 }
 
 pub fn event_channel() -> (EventSender, EventReceiver) {
     event_channel_with_limits(transport::QUEUE_ITEMS, transport::QUEUE_BYTES)
 }
 fn event_channel_with_limits(items: usize, bytes: usize) -> (EventSender, EventReceiver) {
-    let (queue, receiver) = transport::channel(items, bytes, |(_, event)| event_bytes(event).saturating_add(8));
+    let (queue, receiver) = transport::channel(items, bytes, |(_, event)| {
+        event_bytes(event).saturating_add(8)
+    });
     let (failure, failures) = watch::channel(0);
-    (EventSender { queue, epoch: Arc::new(AtomicU64::new(0)), failure },
-        EventReceiver { queue: receiver, failure: failures, epoch: 0 })
+    (
+        EventSender {
+            queue,
+            epoch: Arc::new(AtomicU64::new(0)),
+            failure,
+        },
+        EventReceiver {
+            queue: receiver,
+            failure: failures,
+            epoch: 0,
+        },
+    )
 }
 impl EventSender {
     fn send(&self, event: ExecEvent) -> Result<(), String> {
@@ -154,7 +175,9 @@ impl EventSender {
             self.failure.send_replace(epoch);
             return Ok(());
         }
-        self.queue.try_send((self.epoch.load(Ordering::Acquire), event)).map_err(|error| error.to_string())
+        self.queue
+            .try_send((self.epoch.load(Ordering::Acquire), event))
+            .map_err(|error| error.to_string())
     }
 }
 impl EventReceiver {
@@ -166,15 +189,21 @@ impl EventReceiver {
         None
     }
     pub fn try_recv(&mut self) -> Result<ExecEvent, mpsc::error::TryRecvError> {
-        if let Some(event) = self.disconnected() { return Ok(event); }
+        if let Some(event) = self.disconnected() {
+            return Ok(event);
+        }
         loop {
             let (epoch, event) = self.queue.try_recv()?;
-            if epoch >= self.epoch { return Ok(event); }
+            if epoch >= self.epoch {
+                return Ok(event);
+            }
         }
     }
     pub async fn recv(&mut self) -> Option<ExecEvent> {
         loop {
-            if let Some(event) = self.disconnected() { return Some(event); }
+            if let Some(event) = self.disconnected() {
+                return Some(event);
+            }
             tokio::select! {
                 biased;
                 changed = self.failure.changed(), if self.failure.has_changed().is_ok() => {
@@ -211,10 +240,7 @@ pub struct CodexClient {
 impl CodexClient {
     /// Connects to whatever socket `endpoint` names and follows it when it changes; `None` stays
     /// disconnected. Setting the same path again cuts a reconnect backoff short.
-    pub fn start(
-        endpoint: watch::Receiver<Option<PathBuf>>,
-        events: EventSender,
-    ) -> Self {
+    pub fn start(endpoint: watch::Receiver<Option<PathBuf>>, events: EventSender) -> Self {
         let (commands, receiver) = command_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
         let (observed_threads, observed) = watch::channel(BTreeSet::new());
@@ -247,13 +273,16 @@ impl CodexClient {
         self.commands
             .try_send(Command::Call(Execute { call, reply }))
             .map_err(|error| rejected(format!("Codex command was not queued: {error}")))?;
-        response.await.map(|result| result.map(|held: transport::HeldJson| held.value)).unwrap_or_else(|_| {
-            Err(CodexError {
-                uncertain,
-                answered: false,
-                message: "Codex adapter stopped before returning a result".into(),
+        response
+            .await
+            .map(|result| result.map(|held: transport::HeldJson| held.value))
+            .unwrap_or_else(|_| {
+                Err(CodexError {
+                    uncertain,
+                    answered: false,
+                    message: "Codex adapter stopped before returning a result".into(),
+                })
             })
-        })
     }
 
     pub fn set_observed_threads(&self, threads: Vec<String>) -> Result<(), CodexError> {
@@ -303,10 +332,13 @@ impl CodexClient {
                 reply,
             }))
             .map_err(|error| rejected(format!("Codex command was not queued: {error}")))?;
-        response
-            .await
-            .unwrap_or_else(|_| Err(CodexError { uncertain: true, answered: false,
-                message: "Codex adapter stopped before confirming the server response".into() }))
+        response.await.unwrap_or_else(|_| {
+            Err(CodexError {
+                uncertain: true,
+                answered: false,
+                message: "Codex adapter stopped before confirming the server response".into(),
+            })
+        })
     }
 }
 
@@ -361,20 +393,39 @@ impl Command {
 
 fn command_bytes(command: &Command) -> usize {
     let payload = match command {
-        Command::Call(execute) => execute.call.method.capacity().saturating_add(transport::value_bytes(&execute.call.params)),
-        Command::Respond(respond) => rpc_id_bytes(&respond.id).saturating_add(respond.decision.capacity())
-            .saturating_add(transport::value_bytes(match &respond.result { Ok(value) | Err(value) => value })),
+        Command::Call(execute) => execute
+            .call
+            .method
+            .capacity()
+            .saturating_add(transport::value_bytes(&execute.call.params)),
+        Command::Respond(respond) => rpc_id_bytes(&respond.id)
+            .saturating_add(respond.decision.capacity())
+            .saturating_add(transport::value_bytes(match &respond.result {
+                Ok(value) | Err(value) => value,
+            })),
     };
     std::mem::size_of::<Command>().saturating_add(payload)
 }
 fn command_channel() -> (transport::Sender<Command>, transport::Receiver<Command>) {
-    transport::channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES, command_bytes)
+    transport::channel(
+        transport::QUEUE_ITEMS,
+        transport::QUEUE_BYTES,
+        command_bytes,
+    )
 }
 fn write_bytes(write: &Write) -> usize {
     let bytes = match write {
         Write::Message(message) => message.len(),
-        Write::Response { message, method, thread, decision, .. } => message.len()
-            .saturating_add(method.capacity()).saturating_add(thread.as_ref().map_or(0, String::capacity))
+        Write::Response {
+            message,
+            method,
+            thread,
+            decision,
+            ..
+        } => message
+            .len()
+            .saturating_add(method.capacity())
+            .saturating_add(thread.as_ref().map_or(0, String::capacity))
             .saturating_add(decision.capacity()),
     };
     std::mem::size_of::<Write>().saturating_add(bytes)
@@ -383,19 +434,31 @@ fn writer_channel() -> (transport::Sender<Write>, transport::Receiver<Write>) {
     transport::channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES, write_bytes)
 }
 fn wire(value: &Value) -> Result<Message, String> {
-    let bytes = transport::json(value, transport::FRAME_BYTES).map_err(|error| error.to_string())?;
-    Ok(Message::Text(String::from_utf8(bytes).expect("JSON serialization is UTF-8").into()))
+    let bytes =
+        transport::json(value, transport::FRAME_BYTES).map_err(|error| error.to_string())?;
+    Ok(Message::Text(
+        String::from_utf8(bytes)
+            .expect("JSON serialization is UTF-8")
+            .into(),
+    ))
 }
 
 enum Write {
     Message(Message),
-    Response { message: Message, method: String, thread: Option<String>, decision: String,
-        reply: oneshot::Sender<Result<(), CodexError>> },
+    Response {
+        message: Message,
+        method: String,
+        thread: Option<String>,
+        decision: String,
+        reply: oneshot::Sender<Result<(), CodexError>>,
+    },
 }
 
 struct AbortWriter(tokio::task::AbortHandle);
 impl Drop for AbortWriter {
-    fn drop(&mut self) { self.0.abort(); }
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 const TEXT_LIMIT: usize = 16_384;
@@ -815,17 +878,30 @@ impl Session {
         kind: PendingKind,
         uncertain: bool,
     ) -> Result<(), String> {
-        let size = |kind: &PendingKind| std::mem::size_of::<Pending>().saturating_add(match kind {
-            PendingKind::Request(execute) => execute.call.method.capacity()
-                .saturating_add(transport::value_bytes(&execute.call.params)),
-            PendingKind::ObserveThread(id) | PendingKind::ObserveTurns(id) | PendingKind::SubscribeThread(id) => id.capacity(),
-            PendingKind::Initialize => 0,
+        let size = |kind: &PendingKind| {
+            std::mem::size_of::<Pending>().saturating_add(match kind {
+                PendingKind::Request(execute) => execute
+                    .call
+                    .method
+                    .capacity()
+                    .saturating_add(transport::value_bytes(&execute.call.params)),
+                PendingKind::ObserveThread(id)
+                | PendingKind::ObserveTurns(id)
+                | PendingKind::SubscribeThread(id) => id.capacity(),
+                PendingKind::Initialize => 0,
+            })
+        };
+        let held = self.pending.values().fold(0usize, |bytes, pending| {
+            bytes.saturating_add(size(&pending.kind))
         });
-        let held = self.pending.values().fold(0usize, |bytes, pending| bytes.saturating_add(size(&pending.kind)));
         let added = size(&kind);
-        if self.pending.len() >= transport::QUEUE_ITEMS || added > transport::QUEUE_BYTES.saturating_sub(held) {
+        if self.pending.len() >= transport::QUEUE_ITEMS
+            || added > transport::QUEUE_BYTES.saturating_sub(held)
+        {
             if let PendingKind::Request(execute) = kind {
-                let _ = execute.reply.send(Err(rejected("Codex request was not written: pending RPC budget exhausted")));
+                let _ = execute.reply.send(Err(rejected(
+                    "Codex request was not written: pending RPC budget exhausted",
+                )));
             }
             return Err("Codex pending RPC budget exhausted".into());
         }
@@ -882,7 +958,9 @@ impl Session {
             {
                 continue;
             }
-            if self.pending.len() >= transport::QUEUE_ITEMS { break; }
+            if self.pending.len() >= transport::QUEUE_ITEMS {
+                break;
+            }
             self.resuming.insert(id.clone());
             self.request(
                 writer,
@@ -1044,19 +1122,34 @@ async fn run_session(
         while let Some(write) = writes.recv().await {
             let (message, response) = match write {
                 Write::Message(message) => (message, None),
-                Write::Response { message, method, thread, decision, reply } => (message, Some((method, thread, decision, reply))),
+                Write::Response {
+                    message,
+                    method,
+                    thread,
+                    decision,
+                    reply,
+                } => (message, Some((method, thread, decision, reply))),
             };
-            let result = timeout(RPC_TIMEOUT, sink.send(message)).await
+            let result = timeout(RPC_TIMEOUT, sink.send(message))
+                .await
                 .map_err(|_| "Codex write timed out".to_string())
                 .and_then(|result| result.map_err(|error| error.to_string()));
             if let Some((method, thread, decision, reply)) = response {
                 match &result {
                     Ok(()) => {
-                        writer_cache.write().await.replied(&method, thread.as_deref(), &decision);
+                        writer_cache
+                            .write()
+                            .await
+                            .replied(&method, thread.as_deref(), &decision);
                         let _ = reply.send(Ok(()));
                     }
-                    Err(reason) => { let _ = reply.send(Err(CodexError { uncertain: true,
-                        answered: false, message: reason.clone() })); }
+                    Err(reason) => {
+                        let _ = reply.send(Err(CodexError {
+                            uncertain: true,
+                            answered: false,
+                            message: reason.clone(),
+                        }));
+                    }
                 }
             }
             result?;
@@ -1246,7 +1339,9 @@ async fn run_session(
 }
 
 fn websocket_config(limit: usize) -> WebSocketConfig {
-    WebSocketConfig::default().max_message_size(Some(limit)).max_frame_size(Some(limit))
+    WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit))
         .max_write_buffer_size(transport::QUEUE_BYTES)
 }
 
@@ -1257,10 +1352,14 @@ async fn connect(socket: &Path) -> Result<WebSocketStream<LocalStream>, String> 
         let stream = LocalStream::connect(&endpoint)
             .await
             .map_err(|error| format!("{error:#}"))?;
-        client_async_with_config("ws://localhost/", stream, Some(websocket_config(transport::FRAME_BYTES)))
-            .await
-            .map(|(stream, _)| stream)
-            .map_err(|error| error.to_string())
+        client_async_with_config(
+            "ws://localhost/",
+            stream,
+            Some(websocket_config(transport::FRAME_BYTES)),
+        )
+        .await
+        .map(|(stream, _)| stream)
+        .map_err(|error| error.to_string())
     };
     timeout(Duration::from_secs(10), connect)
         .await
@@ -1340,7 +1439,9 @@ impl DirectSession {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
-        if self.poisoned { return Err(rejected("Codex connection needs a fresh readback session")); }
+        if self.poisoned {
+            return Err(rejected("Codex connection needs a fresh readback session"));
+        }
         let uncertain = methods::access(method) != methods::Access::Read;
         let lost = |message: String| CodexError {
             uncertain,
@@ -1379,12 +1480,19 @@ impl DirectSession {
                 continue;
             }
             if message["method"].is_string() {
-                let retained = self.arrived.iter().fold(0usize, |bytes, value| bytes.saturating_add(transport::value_bytes(value)));
+                let retained = self.arrived.iter().fold(0usize, |bytes, value| {
+                    bytes.saturating_add(transport::value_bytes(value))
+                });
                 if self.arrived.len() >= transport::QUEUE_ITEMS
-                    || transport::value_bytes(&message) > transport::QUEUE_BYTES.saturating_sub(retained) {
+                    || transport::value_bytes(&message)
+                        > transport::QUEUE_BYTES.saturating_sub(retained)
+                {
                     self.poisoned = true;
                     let _ = timeout(Duration::from_secs(1), self.stream.close(None)).await;
-                    return Err(lost("Codex notification budget exhausted; reconcile with a fresh session".into()));
+                    return Err(lost(
+                        "Codex notification budget exhausted; reconcile with a fresh session"
+                            .into(),
+                    ));
                 }
                 self.arrived.push_back(message);
                 continue;
@@ -1408,7 +1516,9 @@ impl DirectSession {
 
     /// The next notification or server request on this connection.
     pub async fn notification(&mut self) -> Result<Value, CodexError> {
-        if self.poisoned { return Err(rejected("Codex connection needs a fresh readback session")); }
+        if self.poisoned {
+            return Err(rejected("Codex connection needs a fresh readback session"));
+        }
         if let Some(message) = self.arrived.pop_front() {
             return Ok(message);
         }
@@ -1663,12 +1773,25 @@ mod tests {
     #[tokio::test]
     async fn full_event_queue_still_reports_disconnect_and_invalidates_old_terminal_events() {
         let (sender, mut events) = event_channel_with_limits(1, 4096);
-        sender.send(ExecEvent::Message(json!({"method":"turn/completed"}))).unwrap();
-        assert!(sender.send(ExecEvent::Request(ServerRequest { id: RpcId::Number(7), method: "approval".into(),
-            thread_id: None, params: json!({}) })).is_err());
+        sender
+            .send(ExecEvent::Message(json!({"method":"turn/completed"})))
+            .unwrap();
+        assert!(
+            sender
+                .send(ExecEvent::Request(ServerRequest {
+                    id: RpcId::Number(7),
+                    method: "approval".into(),
+                    thread_id: None,
+                    params: json!({})
+                }))
+                .is_err()
+        );
         sender.send(ExecEvent::Disconnected).unwrap();
         assert_eq!(events.recv().await, Some(ExecEvent::Disconnected));
-        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         sender.send(ExecEvent::Connected).unwrap();
         assert_eq!(events.recv().await, Some(ExecEvent::Connected));
         sender.send(ExecEvent::Disconnected).unwrap();
@@ -1679,7 +1802,9 @@ mod tests {
 
     #[tokio::test]
     async fn event_bytes_and_command_bytes_are_bounded_without_waiting_for_consumers() {
-        let event = ExecEvent::Message(json!({"method":"item/updated", "params":{"text":"x".repeat(1024)}}));
+        let event = ExecEvent::Message(
+            json!({"method":"item/updated", "params":{"text":"x".repeat(1024)}}),
+        );
         let (sender, mut events) = event_channel_with_limits(8, event_bytes(&event) + 8);
         sender.send(event.clone()).unwrap();
         assert!(sender.send(event).is_err());
@@ -1687,10 +1812,22 @@ mod tests {
         assert_eq!(events.recv().await, Some(ExecEvent::Disconnected));
         assert!(events.try_recv().is_err());
         let (commands, _receiver) = transport::channel(8, 128, command_bytes);
-        let client = CodexClient { commands, cache: Arc::new(RwLock::new(Cache::default())),
-            observed_threads: watch::channel(BTreeSet::new()).0 };
-        let error = client.request("turn/start", json!({"threadId":"known", "input":"x".repeat(1024)})).await.unwrap_err();
-        assert!(!error.uncertain && !error.answered, "queue rejection precedes any native write");
+        let client = CodexClient {
+            commands,
+            cache: Arc::new(RwLock::new(Cache::default())),
+            observed_threads: watch::channel(BTreeSet::new()).0,
+        };
+        let error = client
+            .request(
+                "turn/start",
+                json!({"threadId":"known", "input":"x".repeat(1024)}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.uncertain && !error.answered,
+            "queue rejection precedes any native write"
+        );
     }
 
     #[tokio::test]
@@ -1698,25 +1835,52 @@ mod tests {
         let first = Write::Message(wire(&json!({"method":"initialized"})).unwrap());
         let (writer, _receiver) = transport::channel(8, write_bytes(&first), write_bytes);
         writer.try_send(first).unwrap();
-        assert!(writer.try_send(Write::Message(Message::Text("more".into()))).is_err());
+        assert!(
+            writer
+                .try_send(Write::Message(Message::Text("more".into())))
+                .is_err()
+        );
         let mut state = Session::default();
         let (reply, answer) = oneshot::channel();
-        let reason = state.command(&writer, Execute { call: NativeCall { method:"turn/start".into(),
-            params:json!({"clientUserMessageId":"work"}) }, reply }).unwrap_err();
+        let reason = state
+            .command(
+                &writer,
+                Execute {
+                    call: NativeCall {
+                        method: "turn/start".into(),
+                        params: json!({"clientUserMessageId":"work"}),
+                    },
+                    reply,
+                },
+            )
+            .unwrap_err();
         state.disconnect(&reason);
         let error = answer.await.unwrap().unwrap_err();
         assert!(error.uncertain && !error.answered);
         assert!(state.pending.is_empty());
     }
 
-    async fn controlled_session(events: EventSender) -> (CodexClient, WebSocketStream<LocalStream>, tokio::task::JoinHandle<String>) {
+    async fn controlled_session(
+        events: EventSender,
+    ) -> (
+        CodexClient,
+        WebSocketStream<LocalStream>,
+        tokio::task::JoinHandle<String>,
+    ) {
         let (left, right) = crate::platform::ipc::pair().await.unwrap();
-        let (client, server) = tokio::join!(client_async("ws://localhost/", left), tokio_tungstenite::accept_async(right));
+        let (client, server) = tokio::join!(
+            client_async("ws://localhost/", left),
+            tokio_tungstenite::accept_async(right)
+        );
         let websocket = client.unwrap().0;
         let (commands, mut receiver) = command_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
         let (observed_threads, observed) = watch::channel(BTreeSet::new());
-        let client = CodexClient { commands, cache: cache.clone(), observed_threads };
+        let client = CodexClient {
+            commands,
+            cache: cache.clone(),
+            observed_threads,
+        };
         let session = tokio::spawn(async move {
             let reason = run_session(websocket, &mut receiver, &observed, &cache, &events).await;
             cache.write().await.disconnect(&reason);
@@ -1724,9 +1888,16 @@ mod tests {
             reason
         });
         let mut server = server.unwrap();
-        let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        server.send(wire(&json!({"id":initialize["id"],"result":{"userAgent":"controlled"}})).unwrap()).await.unwrap();
-        let initialized: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        let initialize: Value =
+            serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        server
+            .send(
+                wire(&json!({"id":initialize["id"],"result":{"userAgent":"controlled"}})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let initialized: Value =
+            serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(initialized["method"], "initialized");
         (client, server, session)
     }
@@ -1765,13 +1936,21 @@ mod tests {
             let (client, mut server, session) = controlled_session(sender).await;
             assert_eq!(events.recv().await, Some(ExecEvent::Connected));
             assert_eq!(events.recv().await, Some(ExecEvent::Observed));
-            let pending = tokio::spawn(async move { client.request("turn/start", json!({"threadId":"t"})).await });
+            let pending =
+                tokio::spawn(
+                    async move { client.request("turn/start", json!({"threadId":"t"})).await },
+                );
             let _request = server.next().await.unwrap().unwrap();
             session.abort();
             assert!(session.await.unwrap_err().is_cancelled());
             assert!(pending.await.unwrap().unwrap_err().uncertain);
-            assert!(!matches!(server.next().await, Some(Ok(Message::Text(_)))), "cancelled writer never stays detached");
-        }).await.unwrap();
+            assert!(
+                !matches!(server.next().await, Some(Ok(Message::Text(_)))),
+                "cancelled writer never stays detached"
+            );
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1781,17 +1960,40 @@ mod tests {
             let (client, mut server, session) = controlled_session(sender).await;
             assert_eq!(events.recv().await, Some(ExecEvent::Connected));
             assert_eq!(events.recv().await, Some(ExecEvent::Observed));
-            server.send(wire(&json!({"id":"decision","method":"item/tool/requestUserInput","params":{}})).unwrap()).await.unwrap();
+            server
+                .send(
+                    wire(
+                        &json!({"id":"decision","method":"item/tool/requestUserInput","params":{}}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
             assert!(matches!(events.recv().await, Some(ExecEvent::Request(_))));
             assert!(matches!(events.recv().await, Some(ExecEvent::Message(_))));
-            let response = tokio::spawn(async move { client.respond(&json!("decision"), Ok(json!({"text":"x".repeat(2 << 20)})), "answer").await });
+            let response = tokio::spawn(async move {
+                client
+                    .respond(
+                        &json!("decision"),
+                        Ok(json!({"text":"x".repeat(2 << 20)})),
+                        "answer",
+                    )
+                    .await
+            });
             let mut response = response;
-            assert!(timeout(Duration::from_millis(10), &mut response).await.is_err(), "queue admission cannot acknowledge an unflushed decision");
+            assert!(
+                timeout(Duration::from_millis(10), &mut response)
+                    .await
+                    .is_err(),
+                "queue admission cannot acknowledge an unflushed decision"
+            );
             session.abort();
             assert!(session.await.unwrap_err().is_cancelled());
             let error = response.await.unwrap().unwrap_err();
             assert!(error.uncertain && !error.answered);
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1799,12 +2001,19 @@ mod tests {
         let (left, right) = crate::platform::ipc::pair().await.unwrap();
         let (client, server) = tokio::join!(
             client_async_with_config("ws://localhost/", left, Some(websocket_config(32))),
-            tokio_tungstenite::accept_async(right));
+            tokio_tungstenite::accept_async(right)
+        );
         let mut client = client.unwrap().0;
         let mut server = server.unwrap();
-        server.send(Message::Text("x".repeat(33).into())).await.unwrap();
+        server
+            .send(Message::Text("x".repeat(33).into()))
+            .await
+            .unwrap();
         let error = client.next().await.unwrap().unwrap_err();
-        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Capacity(_)));
+        assert!(matches!(
+            error,
+            tokio_tungstenite::tungstenite::Error::Capacity(_)
+        ));
     }
 
     #[tokio::test]

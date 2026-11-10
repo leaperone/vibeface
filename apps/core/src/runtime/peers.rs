@@ -3170,7 +3170,8 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let barrier_node = node.clone();
             let blocked = tokio::spawn(async move {
-                barrier_node.store
+                barrier_node
+                    .store
                     .call("peers.shutdown_barrier", move |_store| {
                         let _ = entered_tx.send(());
                         release_rx.recv().context("release peer shutdown barrier")?;
@@ -4558,20 +4559,23 @@ mod tests {
         let q = crate::store::actor::StoreActor::from_store(q)?;
         let pulls = Mutex::new(0);
         let fetch = async |to: &crate::store::actor::StoreActor,
-                           from: &crate::store::actor::StoreActor| -> Result<bool> {
+                           from: &crate::store::actor::StoreActor|
+               -> Result<bool> {
             let their = {
                 let network = network.clone();
                 let author = author.clone();
                 from.call("fork_fixture.source_head", move |store| {
                     Ok(store.heads(&network)?[&author].clone())
-                }).await?
+                })
+                .await?
             };
             let our_max = {
                 let network = network.clone();
                 let author = author.clone();
                 to.call("fork_fixture.target_head", move |store| {
                     Ok(store.heads(&network)?[&author].0)
-                }).await?
+                })
+                .await?
             };
             reconcile_log(
                 our_max,
@@ -4581,7 +4585,8 @@ mod tests {
                     async move {
                         to.call("fork_fixture.event", move |store| {
                             Ok(store.event(&network, &hash)?.is_some())
-                        }).await
+                        })
+                        .await
                     }
                 },
                 |seq, limit| {
@@ -4591,7 +4596,8 @@ mod tests {
                     async move {
                         from.call("fork_fixture.events", move |store| {
                             store.events_from(&network, &author, seq, limit)
-                        }).await
+                        })
+                        .await
                     }
                 },
                 |events| {
@@ -4600,13 +4606,18 @@ mod tests {
                         to.call("fork_fixture.ingest", move |store| {
                             store.ingest_events(&network, &events)?;
                             Ok(())
-                        }).await
+                        })
+                        .await
                     }
                 },
-            ).await
+            )
+            .await
         };
         assert!(fetch(&q, &p).await?);
-        assert!(*pulls.lock().unwrap() <= 4, "walk-back probes in doubling steps");
+        assert!(
+            *pulls.lock().unwrap() <= 4,
+            "walk-back probes in doubling steps"
+        );
         assert!(fetch(&p, &q).await?);
         assert!(!fetch(&q, &p).await? && !fetch(&p, &q).await?);
         let evidence = async |store: &crate::store::actor::StoreActor| -> Result<(Vec<String>, Vec<String>, String)> {
@@ -5205,7 +5216,8 @@ mod tests {
                         break anyhow::Ok(at);
                     }
                 }
-            }).await??;
+            })
+            .await??;
             let (_, cached) = a.ready_client_membership().await?;
             let effective = cached.context("committed membership")?.project()?;
             assert_eq!(effective.epoch, expected_epoch);
@@ -5213,7 +5225,11 @@ mod tests {
             assert!(effective.node(&ia.device_id()?).is_ok());
             assert!(a.settle_recovery().await?.is_none());
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(a.recovery_since_ms(&next).await?, Some(installed_at), "the durable recovery marker must not be rewritten");
+            assert_eq!(
+                a.recovery_since_ms(&next).await?,
+                Some(installed_at),
+                "the durable recovery marker must not be rewritten"
+            );
             anyhow::Ok(())
         }
         .await;
@@ -5235,7 +5251,12 @@ mod tests {
         let issued = now_ms() as u64 + 1_000 - RECOVERY_DELAY_MS;
         let mut waiting = state.clone();
         waiting.recover(RootCheckpoint::recovery(
-            &state, &identity.fixture_root_at(2), &next, state.project()?.members, vec![], issued,
+            &state,
+            &identity.fixture_root_at(2),
+            &next,
+            state.project()?.members,
+            vec![],
+            issued,
         )?)?;
         node.install_membership(waiting).await?;
         let mut changed = node.membership.subscribe();
@@ -5243,15 +5264,20 @@ mod tests {
         let (release, held) = std::sync::mpsc::channel();
         let writer_node = node.clone();
         let writer = tokio::spawn(async move {
-            writer_node.store.call("fixture_hold_authority_writer", move |store| {
-                let transaction = store.connection.transaction()?;
-                let count: i64 = transaction.query_row("SELECT count(*) FROM networks", [], |row| row.get(0))?;
-                assert_eq!(count, 1);
-                let _ = entered.send(());
-                held.recv()?;
-                transaction.commit()?;
-                Ok(())
-            }).await
+            writer_node
+                .store
+                .call("fixture_hold_authority_writer", move |store| {
+                    let transaction = store.connection.transaction()?;
+                    let count: i64 =
+                        transaction
+                            .query_row("SELECT count(*) FROM networks", [], |row| row.get(0))?;
+                    assert_eq!(count, 1);
+                    let _ = entered.send(());
+                    held.recv()?;
+                    transaction.commit()?;
+                    Ok(())
+                })
+                .await
         });
         let result = async {
             tokio::time::timeout(Duration::from_secs(2), running).await??;
@@ -5260,14 +5286,21 @@ mod tests {
                     changed.changed().await?;
                     let (_, state) = node.ready_client_membership().await?;
                     let view = state.context("cached authority")?.project()?;
-                    if view.epoch != before_epoch { break anyhow::Ok(view); }
+                    if view.epoch != before_epoch {
+                        break anyhow::Ok(view);
+                    }
                 }
-            }).await??;
-            assert!(!writer.is_finished(), "permission notification must not wait for the writer");
+            })
+            .await??;
+            assert!(
+                !writer.is_finished(),
+                "permission notification must not wait for the writer"
+            );
             assert_eq!(projected.recovery_key, next);
             assert!(projected.epoch > before_epoch);
             anyhow::Ok(())
-        }.await;
+        }
+        .await;
         let _ = release.send(());
         let written = writer.await;
         node.shutdown().await;

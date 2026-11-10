@@ -12,7 +12,14 @@ use host::{
     platform::NativeAction,
 };
 use sha2::Digest;
-use std::{path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 struct Options {
     profile: PathBuf,
@@ -115,9 +122,14 @@ fn run() -> Result<()> {
     };
     let desktop_host =
         host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
-    let credential_base=format!("vibeface-native://{}",hex::encode(sha2::Sha256::digest(options.profile.to_string_lossy().as_bytes())));
+    let credential_base = format!(
+        "vibeface-native://{}",
+        hex::encode(sha2::Sha256::digest(
+            options.profile.to_string_lossy().as_bytes()
+        ))
+    );
     let (tx, events, snapshots, stop, backend_task) =
-        views::backend::Backend::spawn(desktop_host, runtime.handle(),credential_base);
+        views::backend::Backend::spawn(desktop_host, runtime.handle(), credential_base);
     let shutdown = stop.clone();
     let finish_runtime = runtime.clone();
     let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(32);

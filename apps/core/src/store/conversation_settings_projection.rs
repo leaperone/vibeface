@@ -22,13 +22,24 @@ fn provider_number(provider: Provider) -> i64 {
 pub(super) fn setting(number: i64) -> Result<bot_settings::Setting> {
     use bot_settings::Setting;
     let provider = |number| match number {
-        0 => Ok(Provider::Codex), 1 => Ok(Provider::Cursor), 2 => Ok(Provider::Claude),
-        3 => Ok(Provider::Pi), 4 => Ok(Provider::Opencode), _ => bail!("invalid setting provider"),
+        0 => Ok(Provider::Codex),
+        1 => Ok(Provider::Cursor),
+        2 => Ok(Provider::Claude),
+        3 => Ok(Provider::Pi),
+        4 => Ok(Provider::Opencode),
+        _ => bail!("invalid setting provider"),
     };
     Ok(match number {
-        0 => Setting::Name, 1 => Setting::Instructions, 2 => Setting::Skills, 3 => Setting::Avatar,
-        4..=8 => Setting::Model { provider: provider(number - 4)? },
-        9..=13 => Setting::ReasoningEffort { provider: provider(number - 9)? },
+        0 => Setting::Name,
+        1 => Setting::Instructions,
+        2 => Setting::Skills,
+        3 => Setting::Avatar,
+        4..=8 => Setting::Model {
+            provider: provider(number - 4)?,
+        },
+        9..=13 => Setting::ReasoningEffort {
+            provider: provider(number - 9)?,
+        },
         _ => bail!("invalid setting projection"),
     })
 }
@@ -41,8 +52,15 @@ fn built_on(saw: &str, earlier_hash: &str, earlier_after: &str) -> Result<bool> 
 }
 
 pub(super) fn clear_projection(connection: &Connection, network: &str) -> Result<()> {
-    for table in ["conversation_setting_writes", "memory_history_operations", "memory_winner_chain"] {
-        connection.execute(&format!("DELETE FROM {table} WHERE network_id=?"), [network])?;
+    for table in [
+        "conversation_setting_writes",
+        "memory_history_operations",
+        "memory_winner_chain",
+    ] {
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE network_id=?"),
+            [network],
+        )?;
     }
     Ok(())
 }
@@ -57,33 +75,78 @@ pub(super) fn apply_projection(
 ) -> Result<()> {
     let mut writes: Vec<(i64, Option<&str>, Saw, Value)> = Vec::new();
     match &event.body {
-        EventBody::BotChanged { change_id, change: BotChange::Profile {
-            name, instructions, model, reasoning_effort, skills, avatar,
-        }, .. } => {
+        EventBody::BotChanged {
+            change_id,
+            change:
+                BotChange::Profile {
+                    name,
+                    instructions,
+                    model,
+                    reasoning_effort,
+                    skills,
+                    avatar,
+                },
+            ..
+        } => {
             for (number, edit) in [(0, name), (1, instructions)] {
                 if let Some(edit) = edit {
-                    writes.push((number, Some(change_id), Saw::Value(serde_json::to_value(&edit.before)?), serde_json::to_value(&edit.after)?));
+                    writes.push((
+                        number,
+                        Some(change_id),
+                        Saw::Value(serde_json::to_value(&edit.before)?),
+                        serde_json::to_value(&edit.after)?,
+                    ));
                 }
             }
             if let Some(edit) = skills {
-                writes.push((2, Some(change_id), Saw::Value(serde_json::to_value(&edit.before)?), serde_json::to_value(&edit.after)?));
+                writes.push((
+                    2,
+                    Some(change_id),
+                    Saw::Value(serde_json::to_value(&edit.before)?),
+                    serde_json::to_value(&edit.after)?,
+                ));
             }
             if let Some(edit) = avatar {
-                writes.push((3, Some(change_id), Saw::Value(serde_json::to_value(edit.before)?), serde_json::to_value(edit.after)?));
+                writes.push((
+                    3,
+                    Some(change_id),
+                    Saw::Value(serde_json::to_value(edit.before)?),
+                    serde_json::to_value(edit.after)?,
+                ));
             }
             if let Some(edit) = model {
-                writes.push((4 + provider_number(edit.provider), Some(change_id), Saw::Value(serde_json::to_value(&edit.before)?), serde_json::to_value(&edit.after)?));
+                writes.push((
+                    4 + provider_number(edit.provider),
+                    Some(change_id),
+                    Saw::Value(serde_json::to_value(&edit.before)?),
+                    serde_json::to_value(&edit.after)?,
+                ));
             }
             if let Some(edit) = reasoning_effort {
-                writes.push((9 + provider_number(edit.provider), Some(change_id), Saw::Value(serde_json::to_value(&edit.before)?), serde_json::to_value(&edit.after)?));
+                writes.push((
+                    9 + provider_number(edit.provider),
+                    Some(change_id),
+                    Saw::Value(serde_json::to_value(&edit.before)?),
+                    serde_json::to_value(&edit.after)?,
+                ));
             }
         }
-        EventBody::BotAvatarSet { version, avatar, .. } => {
-            writes.push((3, None, Saw::Version(version.clone()), serde_json::to_value(avatar)?));
+        EventBody::BotAvatarSet {
+            version, avatar, ..
+        } => {
+            writes.push((
+                3,
+                None,
+                Saw::Version(version.clone()),
+                serde_json::to_value(avatar)?,
+            ));
         }
         _ => {}
     }
-    let by = event.body.attestation().map_or(&event.author, |attestation| &attestation.device_id);
+    let by = event
+        .body
+        .attestation()
+        .map_or(&event.author, |attestation| &attestation.device_id);
     for (number, change_id, saw, after) in writes {
         connection.execute(
             "INSERT INTO conversation_setting_writes(network_id,conversation_id,setting,rank,event_hash,change_id,by,saw,after_value,built_on_previous)
@@ -125,24 +188,40 @@ pub(super) fn apply_projection(
     Ok(())
 }
 
-fn update_winner_chain(connection: &Connection, network: &str, conversation: &str, memory: &str) -> Result<()> {
-    let Some(winner) = bot_settings::memory_state_from(connection, network, conversation, memory)? else { return Ok(()); };
+fn update_winner_chain(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    memory: &str,
+) -> Result<()> {
+    let Some(winner) = bot_settings::memory_state_from(connection, network, conversation, memory)?
+    else {
+        return Ok(());
+    };
     let head: Option<String> = connection.query_row(
         "SELECT revision FROM memory_winner_chain WHERE network_id=? AND conversation_id=? AND memory_id=? ORDER BY depth DESC LIMIT 1",
         params![network, conversation, memory], |row| row.get(0),
     ).optional()?;
-    if head.as_deref() == Some(&winner.metadata.revision) { return Ok(()); }
+    if head.as_deref() == Some(&winner.metadata.revision) {
+        return Ok(());
+    }
     let mut branch = Vec::new();
     let mut visited = std::collections::BTreeSet::new();
     let mut cursor = winner.metadata.base().version;
     let mut shared_depth = -1_i64;
     while let Some(version) = cursor {
-        ensure!(visited.insert(version.revision.clone()), "memory operation ancestry has a cycle");
+        ensure!(
+            visited.insert(version.revision.clone()),
+            "memory operation ancestry has a cycle"
+        );
         let depth: Option<i64> = connection.query_row(
             "SELECT depth FROM memory_winner_chain WHERE network_id=? AND conversation_id=? AND memory_id=? AND revision=?",
             params![network, conversation, memory, version.revision], |row| row.get(0),
         ).optional()?;
-        if let Some(depth) = depth { shared_depth = depth; break; }
+        if let Some(depth) = depth {
+            shared_depth = depth;
+            break;
+        }
         let base: Option<String> = connection.query_row(
             "SELECT base FROM memory_history_operations WHERE network_id=? AND conversation_id=? AND memory_id=? AND revision=?",
             params![network, conversation, memory, version.revision], |row| row.get(0),
@@ -150,9 +229,12 @@ fn update_winner_chain(connection: &Connection, network: &str, conversation: &st
         cursor = match base {
             Some(base) => serde_json::from_str::<MemoryBase>(&base)?.version,
             None => {
-                let source = log::event_from(connection, network, &version.source_event_hash)?.context("memory base is not stored here")?;
+                let source = log::event_from(connection, network, &version.source_event_hash)?
+                    .context("memory base is not stored here")?;
                 bot_settings::memory_operation(network, &version.source_event_hash, &source)?
-                    .context("memory base is not a memory operation")?.base.version
+                    .context("memory base is not a memory operation")?
+                    .base
+                    .version
             }
         };
         branch.push(version.revision);
@@ -192,7 +274,13 @@ pub(super) fn rebuild_projection(connection: &Connection, network: &str) -> Resu
         let hash: String = row.get(0)?;
         let signed: SignedEvent = serde_json::from_str(&row.get::<_, String>(1)?)?;
         let event: Event = serde_json::from_str(&signed.canonical_body)?;
-        apply_projection(connection, network, &hash, &event, &super::rank(row.get(2)?, row.get(3)?, &hash))?;
+        apply_projection(
+            connection,
+            network,
+            &hash,
+            &event,
+            &super::rank(row.get(2)?, row.get(3)?, &hash),
+        )?;
     }
     Ok(())
 }

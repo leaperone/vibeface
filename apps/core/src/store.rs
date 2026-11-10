@@ -760,9 +760,14 @@ impl Store {
         message_id: &str,
         attachment: &Attachment,
     ) -> Result<(PathBuf, Vec<u8>)> {
-        let source = self.input_attachment_source(network, message_id)?.context("signed input missing")?;
-        ensure!(source.input.conversation_id == conversation && source.input.input.attachments.contains(attachment),
-            "attachment is outside the signed input");
+        let source = self
+            .input_attachment_source(network, message_id)?
+            .context("signed input missing")?;
+        ensure!(
+            source.input.conversation_id == conversation
+                && source.input.input.attachments.contains(attachment),
+            "attachment is outside the signed input"
+        );
         self.verified_blob_path(network, conversation, attachment)
     }
 

@@ -94,10 +94,14 @@ impl ProfileRegistry {
     pub fn open(default_client_dir: &Path) -> Result<Self> {
         safe_path(default_client_dir)?;
         ensure!(
-            default_client_dir.file_name().is_some_and(|name| name == "native-client"),
+            default_client_dir
+                .file_name()
+                .is_some_and(|name| name == "native-client"),
             "默认身份目录无效。"
         );
-        let parent = default_client_dir.parent().context("默认身份目录缺少上级目录。")?;
+        let parent = default_client_dir
+            .parent()
+            .context("默认身份目录缺少上级目录。")?;
         private_directory(parent)?;
         let root = std::fs::canonicalize(parent)?;
         let path = root.join(REGISTRY_FILE);
@@ -107,14 +111,12 @@ impl ProfileRegistry {
         }
         let lock = privatefs::open_or_create(&lock_path)?;
         private_file(&lock_path)?;
-        lock.try_lock().context("个人网络档案已由另一客户端打开。")?;
+        lock.try_lock()
+            .context("个人网络档案已由另一客户端打开。")?;
 
         let (data, saved) = if metadata_exists(&path)? {
-            let saved = privatefs::read_private_bounded(
-                &path,
-                MAX_REGISTRY_BYTES,
-                "个人网络档案注册表",
-            )?;
+            let saved =
+                privatefs::read_private_bounded(&path, MAX_REGISTRY_BYTES, "个人网络档案注册表")?;
             // Hide parse details so arbitrary damaged bytes cannot enter logs or UI errors.
             let data = serde_json::from_slice(&saved)
                 .map_err(|_| anyhow::anyhow!("个人网络档案注册表已损坏，原文件已保留。"))?;
@@ -133,13 +135,21 @@ impl ProfileRegistry {
             validate_data(&data)?;
             validate_locations(&root, &data)?;
             let saved = serde_json::to_vec(&data)?;
-            ensure!(!metadata_exists(&path)?, "个人网络档案注册表已在外部出现，请重新打开。");
+            ensure!(
+                !metadata_exists(&path)?,
+                "个人网络档案注册表已在外部出现，请重新打开。"
+            );
             privatefs::write_atomic(&path, &saved)?;
             (data, saved)
         };
         validate_data(&data)?;
         validate_locations(&root, &data)?;
-        Ok(Self { root, data, saved, _lock: lock })
+        Ok(Self {
+            root,
+            data,
+            saved,
+            _lock: lock,
+        })
     }
 
     pub fn profiles(&self) -> &[PersonalProfile] {
@@ -151,30 +161,54 @@ impl ProfileRegistry {
     }
 
     pub fn selected(&self) -> &PersonalProfile {
-        self.data.profiles.iter().find(|profile| profile.id == self.data.selected_id)
+        self.data
+            .profiles
+            .iter()
+            .find(|profile| profile.id == self.data.selected_id)
             .expect("validated registry selection")
     }
 
     pub fn paths(&self, id: &ProfileId) -> Result<ProfilePaths> {
-        ensure!(self.data.profiles.iter().any(|profile| &profile.id == id), "个人网络档案不存在。");
+        ensure!(
+            self.data.profiles.iter().any(|profile| &profile.id == id),
+            "个人网络档案不存在。"
+        );
         validate_locations(&self.root, &self.data)?;
         Ok(profile_paths(&self.root, id))
     }
 
     /// Keeps the exact existing OS service name, including its original path spelling, for default.
-    pub fn credential_scope_from_base(&self, id: &ProfileId, existing_base: &str) -> Result<String> {
+    pub fn credential_scope_from_base(
+        &self,
+        id: &ProfileId,
+        existing_base: &str,
+    ) -> Result<String> {
         self.paths(id)?;
-        let digest = existing_base.strip_prefix("vibeface-native://")
+        let digest = existing_base
+            .strip_prefix("vibeface-native://")
             .context("个人网络档案凭证服务无效。")?;
-        ensure!(digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "个人网络档案凭证服务无效。");
-        Ok(if id.as_str() == "default" { existing_base.to_owned() } else { format!("{existing_base}/{}", id.as_str()) })
+        ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "个人网络档案凭证服务无效。"
+        );
+        Ok(if id.as_str() == "default" {
+            existing_base.to_owned()
+        } else {
+            format!("{existing_base}/{}", id.as_str())
+        })
     }
 
     /// Call only for an explicit create action. No key, enrollment, connection or Node is created.
     /// Selection stays unchanged until the caller has confirmed and closed its previous client.
     pub fn create(&mut self, label: &str) -> Result<ProfileId> {
         validate_label(label)?;
-        ensure!(self.data.profiles.len() < MAX_PROFILES, "个人网络档案已达上限，请保留并核对现有档案。");
+        ensure!(
+            self.data.profiles.len() < MAX_PROFILES,
+            "个人网络档案已达上限，请保留并核对现有档案。"
+        );
         self.check_saved()?;
         let parent = self.root.join(PROFILE_DIRECTORY);
         create_private_directory(&parent)?;
@@ -185,7 +219,11 @@ impl ProfileRegistry {
         create_private_directory(&paths.outbox_dir)?;
         create_private_directory(&paths.draft_dir)?;
         let mut next = self.data.clone();
-        next.profiles.push(PersonalProfile { id: id.clone(), label: label.into(), hints: ProfileHints::default() });
+        next.profiles.push(PersonalProfile {
+            id: id.clone(),
+            label: label.into(),
+            hints: ProfileHints::default(),
+        });
         // On failure retain the new directory. Never erase identity files or pending operations.
         self.save(next)?;
         Ok(id)
@@ -202,7 +240,10 @@ impl ProfileRegistry {
 
     pub fn set_hints(&mut self, id: &ProfileId, hints: ProfileHints) -> Result<()> {
         let mut next = self.data.clone();
-        let profile = next.profiles.iter_mut().find(|profile| &profile.id == id)
+        let profile = next
+            .profiles
+            .iter_mut()
+            .find(|profile| &profile.id == id)
             .context("个人网络档案不存在。")?;
         profile.hints = hints;
         self.save(next)
@@ -211,8 +252,15 @@ impl ProfileRegistry {
     fn check_saved(&self) -> Result<()> {
         private_directory(&self.root)?;
         validate_locations(&self.root, &self.data)?;
-        let actual = privatefs::read_private_bounded(&self.root.join(REGISTRY_FILE), MAX_REGISTRY_BYTES, "个人网络档案注册表")?;
-        ensure!(actual == self.saved, "个人网络档案注册表已在外部改变，原文件已保留，请重新打开。");
+        let actual = privatefs::read_private_bounded(
+            &self.root.join(REGISTRY_FILE),
+            MAX_REGISTRY_BYTES,
+            "个人网络档案注册表",
+        )?;
+        ensure!(
+            actual == self.saved,
+            "个人网络档案注册表已在外部改变，原文件已保留，请重新打开。"
+        );
         Ok(())
     }
 
@@ -221,7 +269,10 @@ impl ProfileRegistry {
         validate_locations(&self.root, &next)?;
         self.check_saved()?;
         let bytes = serde_json::to_vec(&next)?;
-        ensure!(bytes.len() as u64 <= MAX_REGISTRY_BYTES, "个人网络档案注册表超出范围。");
+        ensure!(
+            bytes.len() as u64 <= MAX_REGISTRY_BYTES,
+            "个人网络档案注册表超出范围。"
+        );
         privatefs::write_atomic(&self.root.join(REGISTRY_FILE), &bytes)?;
         self.data = next;
         self.saved = bytes;
@@ -245,7 +296,10 @@ fn profile_paths(root: &Path, id: &ProfileId) -> ProfilePaths {
 
 fn validate_data(data: &RegistryData) -> Result<()> {
     ensure!(data.version == 1, "个人网络档案注册表版本无效。");
-    ensure!(!data.profiles.is_empty() && data.profiles.len() <= MAX_PROFILES, "个人网络档案数量无效。");
+    ensure!(
+        !data.profiles.is_empty() && data.profiles.len() <= MAX_PROFILES,
+        "个人网络档案数量无效。"
+    );
     let mut ids = HashSet::new();
     for profile in &data.profiles {
         ProfileId::parse(profile.id.as_str())?;
@@ -259,8 +313,16 @@ fn validate_data(data: &RegistryData) -> Result<()> {
             validate_display(&entry.node_id, 128)?;
         }
     }
-    ensure!(data.profiles.iter().any(|profile| profile.id.as_str() == "default"), "默认身份档案缺失，拒绝替换已有身份。");
-    ensure!(ids.contains(&data.selected_id), "选中的个人网络档案不存在。");
+    ensure!(
+        data.profiles
+            .iter()
+            .any(|profile| profile.id.as_str() == "default"),
+        "默认身份档案缺失，拒绝替换已有身份。"
+    );
+    ensure!(
+        ids.contains(&data.selected_id),
+        "选中的个人网络档案不存在。"
+    );
     Ok(())
 }
 
@@ -271,7 +333,10 @@ fn validate_label(value: &str) -> Result<()> {
 }
 
 fn validate_display(value: &str, max: usize) -> Result<()> {
-    ensure!(!value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control), "个人网络档案显示信息无效。");
+    ensure!(
+        !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control),
+        "个人网络档案显示信息无效。"
+    );
     Ok(())
 }
 
@@ -284,7 +349,10 @@ fn validate_locations(root: &Path, data: &RegistryData) -> Result<()> {
     for profile in &data.profiles {
         let paths = profile_paths(root, &profile.id);
         if !metadata_exists(&paths.client_dir)? {
-            ensure!(profile.id.as_str() == "default", "个人网络档案目录缺失，拒绝生成替代身份。");
+            ensure!(
+                profile.id.as_str() == "default",
+                "个人网络档案目录缺失，拒绝生成替代身份。"
+            );
             continue;
         }
         private_directory(&paths.client_dir)?;
@@ -293,7 +361,13 @@ fn validate_locations(root: &Path, data: &RegistryData) -> Result<()> {
                 private_directory(path)?;
             }
         }
-        for name in ["client.json", "approvals.json", "identity-operation.json", "enrollment.json", "delivery-intents.json"] {
+        for name in [
+            "client.json",
+            "approvals.json",
+            "identity-operation.json",
+            "enrollment.json",
+            "delivery-intents.json",
+        ] {
             let path = paths.client_dir.join(name);
             if metadata_exists(&path)? {
                 private_file(&path)?;
@@ -304,9 +378,18 @@ fn validate_locations(root: &Path, data: &RegistryData) -> Result<()> {
 }
 
 fn safe_path(path: &Path) -> Result<()> {
-    let text = path.to_str().context("个人网络档案路径不是有效的 Unicode。")?;
-    ensure!(path.is_absolute() && text.len() <= 4096 && !text.chars().any(char::is_control)
-        && !path.components().any(|part| matches!(part, Component::ParentDir)), "个人网络档案路径无效。");
+    let text = path
+        .to_str()
+        .context("个人网络档案路径不是有效的 Unicode。")?;
+    ensure!(
+        path.is_absolute()
+            && text.len() <= 4096
+            && !text.chars().any(char::is_control)
+            && !path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir)),
+        "个人网络档案路径无效。"
+    );
     Ok(())
 }
 
@@ -320,12 +403,18 @@ fn metadata_exists(path: &Path) -> Result<bool> {
 
 fn private_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
-    ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "个人网络档案目录必须是普通目录。");
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "个人网络档案目录必须是普通目录。"
+    );
     privatefs::ensure_private(path, "个人网络档案目录")
 }
 
 fn private_file(path: &Path) -> Result<()> {
-    ensure!(privatefs::is_plain_file(&std::fs::symlink_metadata(path)?), "个人网络档案文件必须是普通文件。");
+    ensure!(
+        privatefs::is_plain_file(&std::fs::symlink_metadata(path)?),
+        "个人网络档案文件必须是普通文件。"
+    );
     privatefs::ensure_private(path, "个人网络档案文件")
 }
 

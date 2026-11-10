@@ -15,9 +15,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
-        let root = std::env::temp_dir().join(format!("vf-profiles-fixture-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("vf-profiles-fixture-{}", uuid::Uuid::new_v4()));
         privatefs::create_dir_new(&root)?;
-        Ok(Self { root: std::fs::canonicalize(root)? })
+        Ok(Self {
+            root: std::fs::canonicalize(root)?,
+        })
     }
 
     fn default_dir(&self) -> PathBuf {
@@ -36,10 +39,22 @@ impl Fixture {
         privatefs::create_dir_new(&self.default_dir())?;
         let mut files = vec![];
         for (name, bytes) in [
-            ("client.json", b"synthetic sealed original identity".as_slice()),
-            ("identity-operation.json", b"synthetic sealed unknown identity operation".as_slice()),
-            ("outbox/original-network/original-client/outbox.sqlite3", b"synthetic unknown operation with original signature".as_slice()),
-            ("input-drafts/original-network/original-client/draft.json", b"synthetic original input and attachment lease".as_slice()),
+            (
+                "client.json",
+                b"synthetic sealed original identity".as_slice(),
+            ),
+            (
+                "identity-operation.json",
+                b"synthetic sealed unknown identity operation".as_slice(),
+            ),
+            (
+                "outbox/original-network/original-client/outbox.sqlite3",
+                b"synthetic unknown operation with original signature".as_slice(),
+            ),
+            (
+                "input-drafts/original-network/original-client/draft.json",
+                b"synthetic original input and attachment lease".as_slice(),
+            ),
         ] {
             let path = self.default_dir().join(name);
             make_parents(&self.default_dir(), path.parent().unwrap())?;
@@ -55,8 +70,17 @@ impl Fixture {
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
                 let name = entry.file_name();
-                assert!(!["node", "identity.json", "config.json", "local-access.json", "running"]
-                    .iter().any(|unexpected| name == *unexpected));
+                assert!(
+                    ![
+                        "node",
+                        "identity.json",
+                        "config.json",
+                        "local-access.json",
+                        "running"
+                    ]
+                    .iter()
+                    .any(|unexpected| name == *unexpected)
+                );
                 if entry.file_type()?.is_dir() {
                     inspect(&entry.path())?;
                 }
@@ -92,7 +116,8 @@ fn assert_bytes(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
 }
 
 #[test]
-fn discovery_preserves_default_identity_pending_operations_plans_and_leases_byte_exact() -> Result<()> {
+fn discovery_preserves_default_identity_pending_operations_plans_and_leases_byte_exact()
+-> Result<()> {
     let fixture = Fixture::new()?;
     let original = fixture.seed_default()?;
     let registry = fixture.open()?;
@@ -104,8 +129,14 @@ fn discovery_preserves_default_identity_pending_operations_plans_and_leases_byte
     assert_eq!(paths.plan_dir, fixture.default_dir());
     assert_eq!(paths.outbox_dir, fixture.default_dir().join("outbox"));
     assert_eq!(paths.draft_dir, fixture.default_dir().join("input-drafts"));
-    let existing_base = format!("vibeface-native://{}", hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes())));
-    assert_eq!(registry.credential_scope_from_base(registry.selected_id(), &existing_base)?, existing_base);
+    let existing_base = format!(
+        "vibeface-native://{}",
+        hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes()))
+    );
+    assert_eq!(
+        registry.credential_scope_from_base(registry.selected_id(), &existing_base)?,
+        existing_base
+    );
     assert_bytes(&original)?;
     drop(registry);
     let reopened = fixture.open()?;
@@ -115,22 +146,45 @@ fn discovery_preserves_default_identity_pending_operations_plans_and_leases_byte
 }
 
 #[test]
-fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_services() -> Result<()> {
+fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_services()
+-> Result<()> {
     let fixture = Fixture::new()?;
     let original = fixture.seed_default()?;
     let mut registry = fixture.open()?;
     let default = registry.selected_id().clone();
-    let default_scope = format!("vibeface-native://{}", hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes())));
-    assert_eq!(registry.credential_scope_from_base(&default, &default_scope)?, default_scope);
+    let default_scope = format!(
+        "vibeface-native://{}",
+        hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes()))
+    );
+    assert_eq!(
+        registry.credential_scope_from_base(&default, &default_scope)?,
+        default_scope
+    );
     let second = registry.create("另一个个人网络")?;
-    assert_eq!(registry.selected_id(), &default, "creation must not silently switch identities");
+    assert_eq!(
+        registry.selected_id(),
+        &default,
+        "creation must not silently switch identities"
+    );
     let paths = registry.paths(&second)?;
-    assert!(paths.client_dir.starts_with(fixture.root.join("native-client-profiles")));
+    assert!(
+        paths
+            .client_dir
+            .starts_with(fixture.root.join("native-client-profiles"))
+    );
     assert!(paths.client_dir.is_dir());
     assert!(paths.outbox_dir.is_dir());
     assert!(paths.draft_dir.is_dir());
-    assert!(!paths.client_dir.join("client.json").exists(), "registry must not generate a key");
-    for path in [&paths.client_dir, &paths.outbox_dir, &paths.draft_dir, &fixture.metadata()] {
+    assert!(
+        !paths.client_dir.join("client.json").exists(),
+        "registry must not generate a key"
+    );
+    for path in [
+        &paths.client_dir,
+        &paths.outbox_dir,
+        &paths.draft_dir,
+        &fixture.metadata(),
+    ] {
         privatefs::ensure_private(path, "synthetic profile fixture")?;
     }
     let second_key = paths.client_dir.join("client.json");
@@ -138,24 +192,52 @@ fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_se
     let second_scope = registry.credential_scope_from_base(&second, &default_scope)?;
     assert_eq!(second_scope, format!("{default_scope}/{}", second.as_str()));
     let original_spelling_scope = format!("vibeface-native://{}", "a".repeat(64));
-    assert_eq!(registry.credential_scope_from_base(&default, &original_spelling_scope)?, original_spelling_scope);
-    assert_eq!(registry.credential_scope_from_base(&second, &original_spelling_scope)?, format!("{original_spelling_scope}/{}", second.as_str()));
-    assert!(registry.credential_scope_from_base(&second, "arbitrary-service").is_err());
-    registry.set_hints(&second, ProfileHints {
-        network: Some("untrusted-display-network".into()),
-        entry: Some(Entry { origin: "https://display.invalid".into(), node_id: "untrusted-display-node".into() }),
-    })?;
+    assert_eq!(
+        registry.credential_scope_from_base(&default, &original_spelling_scope)?,
+        original_spelling_scope
+    );
+    assert_eq!(
+        registry.credential_scope_from_base(&second, &original_spelling_scope)?,
+        format!("{original_spelling_scope}/{}", second.as_str())
+    );
+    assert!(
+        registry
+            .credential_scope_from_base(&second, "arbitrary-service")
+            .is_err()
+    );
+    registry.set_hints(
+        &second,
+        ProfileHints {
+            network: Some("untrusted-display-network".into()),
+            entry: Some(Entry {
+                origin: "https://display.invalid".into(),
+                node_id: "untrusted-display-node".into(),
+            }),
+        },
+    )?;
     registry.select(&second)?;
-    assert_eq!(registry.selected().hints.network.as_deref(), Some("untrusted-display-network"));
+    assert_eq!(
+        registry.selected().hints.network.as_deref(),
+        Some("untrusted-display-network")
+    );
     registry.select(&default)?;
     assert_bytes(&original)?;
     registry.select(&second)?;
     drop(registry);
     let reopened = fixture.open()?;
     assert_eq!(reopened.selected_id(), &second);
-    assert_eq!(reopened.credential_scope_from_base(&second, &default_scope)?, second_scope);
-    assert_eq!(reopened.credential_scope_from_base(&default, &default_scope)?, default_scope);
-    assert_eq!(std::fs::read(second_key)?, b"synthetic independent sealed key");
+    assert_eq!(
+        reopened.credential_scope_from_base(&second, &default_scope)?,
+        second_scope
+    );
+    assert_eq!(
+        reopened.credential_scope_from_base(&default, &default_scope)?,
+        default_scope
+    );
+    assert_eq!(
+        std::fs::read(second_key)?,
+        b"synthetic independent sealed key"
+    );
     assert_bytes(&original)?;
     fixture.assert_no_node()
 }
@@ -165,7 +247,11 @@ fn empty_startup_registers_location_without_creating_identity_or_node() -> Resul
     let fixture = Fixture::new()?;
     let registry = fixture.open()?;
     assert!(!registry.paths(registry.selected_id())?.client_dir.exists());
-    assert_eq!(std::fs::read_dir(&fixture.root)?.count(), 2, "only metadata and its lock may appear");
+    assert_eq!(
+        std::fs::read_dir(&fixture.root)?.count(),
+        2,
+        "only metadata and its lock may appear"
+    );
     fixture.assert_no_node()
 }
 
@@ -174,7 +260,17 @@ fn invalid_ids_paths_and_labels_are_refused_without_mutating_metadata() -> Resul
     let fixture = Fixture::new()?;
     let mut registry = fixture.open()?;
     let before = std::fs::read(fixture.metadata())?;
-    for id in ["", ".", "..", "../native-client", "/absolute", "a/b", "default/child", "DEFAULT", "550e8400-e29b-41d4-a716-446655440000\n"] {
+    for id in [
+        "",
+        ".",
+        "..",
+        "../native-client",
+        "/absolute",
+        "a/b",
+        "default/child",
+        "DEFAULT",
+        "550e8400-e29b-41d4-a716-446655440000\n",
+    ] {
         assert!(ProfileId::parse(id).is_err());
     }
     for label in ["", " ", " leading", "trailing ", "line\nbreak"] {
@@ -192,7 +288,8 @@ fn invalid_ids_paths_and_labels_are_refused_without_mutating_metadata() -> Resul
 }
 
 #[test]
-fn corrupt_duplicate_unknown_and_injected_path_metadata_fail_closed_preserving_bytes() -> Result<()> {
+fn corrupt_duplicate_unknown_and_injected_path_metadata_fail_closed_preserving_bytes() -> Result<()>
+{
     let fixture = Fixture::new()?;
     let original = fixture.seed_default()?;
     let registry = fixture.open()?;
@@ -253,7 +350,10 @@ fn registry_cap_refuses_creation_without_discarding_any_profile() -> Result<()> 
     assert!(registry.create("one too many").is_err());
     assert_eq!(registry.profiles().len(), MAX_PROFILES);
     assert_eq!(std::fs::read(fixture.metadata())?, before);
-    assert_eq!(std::fs::read_dir(fixture.root.join("native-client-profiles"))?.count(), MAX_PROFILES - 1);
+    assert_eq!(
+        std::fs::read_dir(fixture.root.join("native-client-profiles"))?.count(),
+        MAX_PROFILES - 1
+    );
     fixture.assert_no_node()
 }
 
@@ -283,7 +383,10 @@ fn symlinked_registry_profile_container_key_and_draft_directory_are_refused() ->
     let registry = fixture.open()?;
     drop(registry);
     let before = std::fs::read(fixture.metadata())?;
-    for target in [fixture.default_dir(), fixture.default_dir().join("input-drafts")] {
+    for target in [
+        fixture.default_dir(),
+        fixture.default_dir().join("input-drafts"),
+    ] {
         let saved = fixture.root.join("held-directory");
         std::fs::rename(&target, &saved)?;
         privatefs::link_dir(&saved, &target)?;
@@ -300,7 +403,10 @@ fn symlinked_registry_profile_container_key_and_draft_directory_are_refused() ->
     assert!(fixture.open().is_err());
     privatefs::remove_dir_link(&container)?;
     #[cfg(unix)]
-    for target in [fixture.metadata(), fixture.default_dir().join("client.json")] {
+    for target in [
+        fixture.metadata(),
+        fixture.default_dir().join("client.json"),
+    ] {
         let saved = fixture.root.join("held-file");
         std::fs::rename(&target, &saved)?;
         std::os::unix::fs::symlink(&saved, &target)?;
@@ -329,7 +435,10 @@ fn permissive_registry_key_and_directory_are_refused_without_chmod() -> Result<(
     ] {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
         assert!(fixture.open().is_err());
-        assert_eq!(std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777, mode);
+        assert_eq!(
+            std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777,
+            mode
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(private_mode))?;
         assert_eq!(std::fs::read(fixture.metadata())?, before);
         assert_bytes(&original)?;

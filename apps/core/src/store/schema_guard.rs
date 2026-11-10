@@ -81,7 +81,10 @@ const DERIVED_INDEXES: &[(&str, &str)] = &[
     ("scheduler_sessions", "scheduler_sessions_active"),
     ("work_stops", "work_stops_conversation"),
     ("work_dispatches", "work_dispatches_conversation"),
-    ("conversation_setting_writes", "conversation_setting_observed"),
+    (
+        "conversation_setting_writes",
+        "conversation_setting_observed",
+    ),
     ("memory_winner_chain", "memory_winner_depth"),
     ("memory_history_operations", "memory_history_conflicts"),
     ("schedules", "schedules_history"),
@@ -93,10 +96,22 @@ const DERIVED_INDEXES: &[(&str, &str)] = &[
 // The new covering indexes or existing primary keys already serve these prefixes.
 // Only remove the exact former definitions; preserve any user-modified index.
 const SUPERSEDED_INDEXES: &[(&str, &str)] = &[
-    ("messages_order", "CREATE INDEX messages_order ON messages(network_id,conversation_id,rank)"),
-    ("memories_conversation", "CREATE INDEX memories_conversation ON memories(network_id,conversation_id)"),
-    ("bot_changes_order", "CREATE INDEX bot_changes_order ON bot_changes(network_id,conversation_id,rank)"),
-    ("questions_conversation", "CREATE INDEX questions_conversation ON questions(network_id,conversation_id,rank)"),
+    (
+        "messages_order",
+        "CREATE INDEX messages_order ON messages(network_id,conversation_id,rank)",
+    ),
+    (
+        "memories_conversation",
+        "CREATE INDEX memories_conversation ON memories(network_id,conversation_id)",
+    ),
+    (
+        "bot_changes_order",
+        "CREATE INDEX bot_changes_order ON bot_changes(network_id,conversation_id,rank)",
+    ),
+    (
+        "questions_conversation",
+        "CREATE INDEX questions_conversation ON questions(network_id,conversation_id,rank)",
+    ),
 ];
 
 fn normalize_type_name(raw: &str) -> String {
@@ -357,9 +372,13 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     validate_schema(connection, true)?;
     let mut superseded = Vec::new();
     for &(name, expected) in SUPERSEDED_INDEXES {
-        let sql: Option<String> = connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?", [name], |row| row.get(0),
-        ).optional()?;
+        let sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
         if sql.is_some_and(|sql| sql_tokens(&sql) == sql_tokens(expected)) {
             superseded.push(name);
         }
@@ -367,22 +386,37 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     let present = |kind: &str, name: &str| -> Result<bool> {
         Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=? AND name=?)",
-            [kind, name], |row| row.get(0),
+            [kind, name],
+            |row| row.get(0),
         )?)
     };
     let mut missing = Vec::new();
     for &table in DERIVED_TABLES {
-        if !present("table", table)? { missing.push(("table", table)); }
+        if !present("table", table)? {
+            missing.push(("table", table));
+        }
     }
-    let rebuild_settings = missing.iter().any(|(_, name)| matches!(*name,
-        "conversation_setting_writes" | "memory_history_operations" | "memory_winner_chain"));
-    let rebuild_workspace = missing.iter().any(|(_, name)| matches!(*name,
-        "workspace_tasks_lookup" | "workspace_assignments_lookup"));
+    let rebuild_settings = missing.iter().any(|(_, name)| {
+        matches!(
+            *name,
+            "conversation_setting_writes" | "memory_history_operations" | "memory_winner_chain"
+        )
+    });
+    let rebuild_workspace = missing.iter().any(|(_, name)| {
+        matches!(
+            *name,
+            "workspace_tasks_lookup" | "workspace_assignments_lookup"
+        )
+    });
     let initialize_history = missing.contains(&("table", "conversation_history_revisions"));
     for &(_, index) in DERIVED_INDEXES {
-        if !present("index", index)? { missing.push(("index", index)); }
+        if !present("index", index)? {
+            missing.push(("index", index));
+        }
     }
-    if missing.is_empty() && superseded.is_empty() { return Ok(()); }
+    if missing.is_empty() && superseded.is_empty() {
+        return Ok(());
+    }
 
     // Execute the authoritative definitions, rather than a second hand-maintained DDL.
     let reference = Connection::open_in_memory()?;
@@ -391,7 +425,8 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     for (kind, name) in missing {
         let sql: String = reference.query_row(
             "SELECT sql FROM sqlite_schema WHERE type=? AND name=?",
-            [kind, name], |row| row.get(0),
+            [kind, name],
+            |row| row.get(0),
         )?;
         tx.execute_batch(&sql)?;
     }
@@ -658,7 +693,8 @@ mod tests {
         for &(name, _) in SUPERSEDED_INDEXES {
             let exists: bool = store.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?)",
-                [name], |row| row.get(0),
+                [name],
+                |row| row.get(0),
             )?;
             assert!(!exists, "redundant index {name} was retained");
         }
@@ -685,7 +721,10 @@ mod tests {
             "events_main",
         )?;
         assert_schema_refused(
-            &INITIAL_SCHEMA.replace("`winning` integer NOT NULL DEFAULT 0", "`winning` text NOT NULL DEFAULT 0"),
+            &INITIAL_SCHEMA.replace(
+                "`winning` integer NOT NULL DEFAULT 0",
+                "`winning` text NOT NULL DEFAULT 0",
+            ),
             "memory_history_operations.winning",
         )
     }
@@ -694,15 +733,27 @@ mod tests {
     fn customized_index_is_preserved_when_redundant_former_indexes_are_removed() -> Result<()> {
         let db = Connection::open_in_memory()?;
         init_current_db(&db)?;
-        for &(_, sql) in SUPERSEDED_INDEXES { db.execute_batch(sql)?; }
-        db.execute_batch("DROP INDEX messages_order; CREATE INDEX messages_order ON messages(role)")?;
+        for &(_, sql) in SUPERSEDED_INDEXES {
+            db.execute_batch(sql)?;
+        }
+        db.execute_batch(
+            "DROP INDEX messages_order; CREATE INDEX messages_order ON messages(role)",
+        )?;
         install_derived_objects(&db)?;
         let sql: String = db.query_row(
-            "SELECT sql FROM sqlite_schema WHERE name='messages_order'", [], |row| row.get(0),
+            "SELECT sql FROM sqlite_schema WHERE name='messages_order'",
+            [],
+            |row| row.get(0),
         )?;
-        assert_eq!(sql_tokens(&sql), sql_tokens("CREATE INDEX messages_order ON messages(role)"));
+        assert_eq!(
+            sql_tokens(&sql),
+            sql_tokens("CREATE INDEX messages_order ON messages(role)")
+        );
         assert_schema_refused(
-            &format!("{INITIAL_SCHEMA}\n{}; DROP INDEX events_main;", SUPERSEDED_INDEXES[0].1),
+            &format!(
+                "{INITIAL_SCHEMA}\n{}; DROP INDEX events_main;",
+                SUPERSEDED_INDEXES[0].1
+            ),
             "events_main",
         )?;
         Ok(())
@@ -724,7 +775,8 @@ mod tests {
         for &table in DERIVED_TABLES {
             let exists: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?)",
-                [table], |row| row.get(0),
+                [table],
+                |row| row.get(0),
             )?;
             assert!(!exists, "failed reconstruction retained {table}");
         }

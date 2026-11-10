@@ -21,8 +21,18 @@ struct Cursor {
 }
 
 // The digest binds all request context without copying those strings into each cursor.
-fn cursor_binding(network: &str, conversation: &str, section: HistorySection, authority: &str) -> Result<String> {
-    Ok(digest(&serde_json::to_vec(&(network, conversation, section, authority))?))
+fn cursor_binding(
+    network: &str,
+    conversation: &str,
+    section: HistorySection,
+    authority: &str,
+) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&(
+        network,
+        conversation,
+        section,
+        authority,
+    ))?))
 }
 
 pub(super) fn history_page<T: Serialize>(
@@ -50,35 +60,60 @@ pub(super) fn history_page<T: Serialize>(
         next_cursor,
         complete: !has_more,
     };
-    ensure!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES,
-        "history record exceeds the response byte limit");
+    ensure!(
+        serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES,
+        "history record exceeds the response byte limit"
+    );
     Ok(page)
 }
 
 /// Runs before applying an effective event, in that event's projection transaction.
 /// This local cache revision also records late associations, so it need not converge
 /// between replicas. The empty scope tracks changes across conversations.
-pub(super) fn advance_revision(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+pub(super) fn advance_revision(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<()> {
     use crate::workspace::WorkspaceCommand;
     let scope = event.scope_id.as_str();
     let affected = match &event.body {
-        EventBody::BotDeleted { .. } | EventBody::SessionAttributed { .. }
-        | EventBody::SessionMuted { .. } | EventBody::WorkDispatched { .. } => Some(""),
-        EventBody::WorkspaceCommanded { command, .. } =>
-            (!matches!(command, WorkspaceCommand::PostChannelMessage { .. })).then_some(""),
-        EventBody::WorkProgress { work_id, thread_id: Some(thread), .. } => {
-            let previous: Option<String> = connection.query_row(
-                "SELECT thread_id FROM works WHERE network_id=? AND work_id=?",
-                params![network, work_id], |row| row.get(0),
-            ).optional()?.flatten();
+        EventBody::BotDeleted { .. }
+        | EventBody::SessionAttributed { .. }
+        | EventBody::SessionMuted { .. }
+        | EventBody::WorkDispatched { .. } => Some(""),
+        EventBody::WorkspaceCommanded { command, .. } => {
+            (!matches!(command, WorkspaceCommand::PostChannelMessage { .. })).then_some("")
+        }
+        EventBody::WorkProgress {
+            work_id,
+            thread_id: Some(thread),
+            ..
+        } => {
+            let previous: Option<String> = connection
+                .query_row(
+                    "SELECT thread_id FROM works WHERE network_id=? AND work_id=?",
+                    params![network, work_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
             (previous.as_deref() != Some(thread.as_str())).then_some("")
         }
-        EventBody::BotChanged { change: BotChange::Skill { .. }, .. } => Some(""),
-        EventBody::ConversationOwner { .. } | EventBody::BotCreated { .. }
-        | EventBody::MessageSteered { .. } | EventBody::QuestionClosed { .. }
-        | EventBody::BotChanged { .. } | EventBody::BotAvatarSet { .. }
-        | EventBody::ScheduleControlled { .. } | EventBody::MemoryControlled { .. } => Some(scope),
-        EventBody::InputPosted { message_id, .. } | EventBody::MessagePosted { message_id, .. }
+        EventBody::BotChanged {
+            change: BotChange::Skill { .. },
+            ..
+        } => Some(""),
+        EventBody::ConversationOwner { .. }
+        | EventBody::BotCreated { .. }
+        | EventBody::MessageSteered { .. }
+        | EventBody::QuestionClosed { .. }
+        | EventBody::BotChanged { .. }
+        | EventBody::BotAvatarSet { .. }
+        | EventBody::ScheduleControlled { .. }
+        | EventBody::MemoryControlled { .. } => Some(scope),
+        EventBody::InputPosted { message_id, .. }
+        | EventBody::MessagePosted { message_id, .. }
         | EventBody::BotMessaged { message_id, .. } => {
             let replacing: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3)
@@ -97,7 +132,9 @@ pub(super) fn advance_revision(connection: &Connection, network: &str, event: &E
         }
         _ => None,
     };
-    if let Some(scope) = affected { bump_revision(connection, network, scope)?; }
+    if let Some(scope) = affected {
+        bump_revision(connection, network, scope)?;
+    }
     Ok(())
 }
 
@@ -127,11 +164,14 @@ impl Store {
         // Ordinary appends leave this unchanged. Governance changes and new fork evidence
         // invalidate all old windows, including rows whose keyset boundary still exists.
         let bundle: String = self.connection.query_row(
-            "SELECT bundle FROM networks WHERE network_id=?", [network], |row| row.get(0),
+            "SELECT bundle FROM networks WHERE network_id=?",
+            [network],
+            |row| row.get(0),
         )?;
         let forks: (u64, Option<String>) = self.connection.query_row(
             "SELECT count(*),max(hash) FROM events WHERE network_id=? AND main=0",
-            [network], |row| Ok((row.get(0)?, row.get(1)?)),
+            [network],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let revisions: (u64, u64) = self.connection.query_row(
             "SELECT COALESCE((SELECT revision FROM conversation_history_revisions WHERE network_id=?1 AND conversation_id=''),0),
@@ -139,30 +179,52 @@ impl Store {
             params![network, conversation], |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let authority = digest(&serde_json::to_vec(&(bundle, forks, revisions))?);
-        let before = cursor.map(|cursor| -> Result<Option<HistoryBoundary>> {
-            ensure!(cursor.len() <= 8192, "history cursor is too large");
-            let cursor: Cursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)
-                .context("invalid history cursor")?).context("invalid history cursor")?;
-            ensure!(cursor.binding == cursor_binding(network, conversation, section, &authority)?,
-                "history changed; refresh the conversation");
-            if let Some(before) = &cursor.before {
-                ensure!(!before.rank.is_empty() && !before.id.is_empty(), "history cursor has an empty boundary");
-            }
-            Ok(cursor.before)
-        }).transpose()?.flatten();
+        let before = cursor
+            .map(|cursor| -> Result<Option<HistoryBoundary>> {
+                ensure!(cursor.len() <= 8192, "history cursor is too large");
+                let cursor: Cursor = serde_json::from_slice(
+                    &URL_SAFE_NO_PAD
+                        .decode(cursor)
+                        .context("invalid history cursor")?,
+                )
+                .context("invalid history cursor")?;
+                ensure!(
+                    cursor.binding == cursor_binding(network, conversation, section, &authority)?,
+                    "history changed; refresh the conversation"
+                );
+                if let Some(before) = &cursor.before {
+                    ensure!(
+                        !before.rank.is_empty() && !before.id.is_empty(),
+                        "history cursor has an empty boundary"
+                    );
+                }
+                Ok(cursor.before)
+            })
+            .transpose()?
+            .flatten();
         Ok((authority, before))
     }
 
-    pub(crate) fn conversation_history_authority(&self, network: &str, conversation: &str) -> Result<String> {
-        Ok(self.history_cursor(network, conversation, HistorySection::Messages, None)?.0)
+    pub(crate) fn conversation_history_authority(
+        &self,
+        network: &str,
+        conversation: &str,
+    ) -> Result<String> {
+        Ok(self
+            .history_cursor(network, conversation, HistorySection::Messages, None)?
+            .0)
     }
 
     pub(crate) fn conversation_history_start_cursor(
-        &self, network: &str, conversation: &str, section: HistorySection,
+        &self,
+        network: &str,
+        conversation: &str,
+        section: HistorySection,
     ) -> Result<String> {
         let (authority, _) = self.history_cursor(network, conversation, section, None)?;
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Cursor {
-            binding: cursor_binding(network, conversation, section, &authority)?, before: None,
+            binding: cursor_binding(network, conversation, section, &authority)?,
+            before: None,
         })?))
     }
 
@@ -173,17 +235,30 @@ impl Store {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<HistoryPage<Message>> {
-        ensure!((1..=HISTORY_MAX_LIMIT).contains(&limit), "history limit must be 1 to 100");
-        let (authority, before) = self.history_cursor(network, conversation, HistorySection::Messages, cursor)?;
-        let seek = if before.is_some() { " AND (rank,message_id)<(?3,?4)" } else { "" };
+        ensure!(
+            (1..=HISTORY_MAX_LIMIT).contains(&limit),
+            "history limit must be 1 to 100"
+        );
+        let (authority, before) =
+            self.history_cursor(network, conversation, HistorySection::Messages, cursor)?;
+        let seek = if before.is_some() {
+            " AND (rank,message_id)<(?3,?4)"
+        } else {
+            ""
+        };
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages
              WHERE network_id=?1 AND conversation_id=?2
              {seek}
              ORDER BY rank DESC,message_id DESC LIMIT ?5"
         ))?;
-        let mut rows = statement.query(params![network, conversation,
-            before.as_ref().map(|b| &b.rank), before.as_ref().map(|b| &b.id), limit + 1])?;
+        let mut rows = statement.query(params![
+            network,
+            conversation,
+            before.as_ref().map(|b| &b.rank),
+            before.as_ref().map(|b| &b.id),
+            limit + 1
+        ])?;
         let mut items = Vec::new();
         let mut boundary = before;
         let mut bytes = 0;
@@ -201,7 +276,10 @@ impl Store {
                 Some(crate::workspace::InputTarget::BotMain { .. }) => true,
                 Some(_) => false,
                 None => scope_projection::message_is_main_from(
-                    &self.connection, network, conversation, &message.message_id,
+                    &self.connection,
+                    network,
+                    conversation,
+                    &message.message_id,
                 )?,
             };
             if main {
@@ -212,13 +290,24 @@ impl Store {
                 }
                 bytes += size;
             }
-            boundary = Some(HistoryBoundary { rank: message.rank.clone(), id: message.message_id.clone() });
+            boundary = Some(HistoryBoundary {
+                rank: message.rank.clone(),
+                id: message.message_id.clone(),
+            });
             scanned += 1;
             if main {
                 items.push(message);
             }
         }
         items.reverse();
-        history_page(network, conversation, HistorySection::Messages, authority, boundary, items, has_more)
+        history_page(
+            network,
+            conversation,
+            HistorySection::Messages,
+            authority,
+            boundary,
+            items,
+            has_more,
+        )
     }
 }

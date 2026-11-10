@@ -17,6 +17,6 @@ pub use local::{LocalGrant, LocalTarget};
 mod profile;
 
 mod settings;
-pub use settings::{SettingsKind, SettingsField, SettingsReview};
+pub use settings::{SettingsField, SettingsKind, SettingsReview};
 
 pub use vibeface_protocol::history;

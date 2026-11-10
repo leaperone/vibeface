@@ -36,7 +36,7 @@ pub(crate) struct Operation {
     pub reconciliation: Reconciliation,
     pub attachments: Vec<Attachment>,
     pub upload_scope: Option<String>,
-    pub prerequisites:Vec<String>,
+    pub prerequisites: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum Reconciliation {
@@ -61,9 +61,17 @@ pub(crate) enum Reconciliation {
         order_id: Option<String>,
         operation: String,
     },
-    StopReply {conversation_id:String,trigger:String},
-    StopWork {conversation_id:String,work_id:String},
-    Settings {kind:crate::SettingsKind},
+    StopReply {
+        conversation_id: String,
+        trigger: String,
+    },
+    StopWork {
+        conversation_id: String,
+        work_id: String,
+    },
+    Settings {
+        kind: crate::SettingsKind,
+    },
     Manual,
 }
 
@@ -75,12 +83,22 @@ pub struct Outbox {
     client: String,
 }
 impl Outbox {
-    pub(crate) fn stored_network(dir:&Path,client:&str)->Result<String> {
-        privatefs::ensure_private(dir,"client outbox directory")?;
-        let path=dir.join("outbox.sqlite3");privatefs::ensure_private(&path,"client outbox")?;drop(privatefs::open_no_follow(&path)?);
-        let db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let (network,owner):(String,String)=db.query_row("SELECT network,client FROM identity",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
-        ensure!(owner==client,"private pending data belongs to another client");vibeface_secure::membership::validate_hash(&network)?;Ok(network)
+    pub(crate) fn stored_network(dir: &Path, client: &str) -> Result<String> {
+        privatefs::ensure_private(dir, "client outbox directory")?;
+        let path = dir.join("outbox.sqlite3");
+        privatefs::ensure_private(&path, "client outbox")?;
+        drop(privatefs::open_no_follow(&path)?);
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let (network, owner): (String, String) =
+            db.query_row("SELECT network,client FROM identity", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        ensure!(
+            owner == client,
+            "private pending data belongs to another client"
+        );
+        vibeface_secure::membership::validate_hash(&network)?;
+        Ok(network)
     }
     pub fn open(dir: &Path, network: &str, client: &str) -> Result<Self> {
         privatefs::create_dir(dir)?;
@@ -124,7 +142,7 @@ impl Outbox {
             }
         }
         privatefs::sync_dir(dir)?;
-        let outbox=Self {
+        let outbox = Self {
             _lock: lock,
             db,
             dir: dir.to_owned(),
@@ -133,36 +151,88 @@ impl Outbox {
         };
         Ok(outbox)
     }
-    pub(crate) fn cache_profile(&self,profile:&crate::profile::CachedProfile)->Result<()> {
-        ensure!(profile.network_id==self.network && profile.client_id==self.client,"profile cache identity mismatch");
-        let existing:Option<Vec<u8>>=self.db.query_row("SELECT payload FROM verified_profiles WHERE target=?1",[&profile.target_node],|row|row.get(0)).optional()?;
-        if let Some(existing)=existing {
-            let known:crate::profile::CachedProfile=serde_json::from_slice(&existing)?;
+    pub(crate) fn cache_profile(&self, profile: &crate::profile::CachedProfile) -> Result<()> {
+        ensure!(
+            profile.network_id == self.network && profile.client_id == self.client,
+            "profile cache identity mismatch"
+        );
+        let existing: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT payload FROM verified_profiles WHERE target=?1",
+                [&profile.target_node],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let known: crate::profile::CachedProfile = serde_json::from_slice(&existing)?;
             if known.revoked && !profile.revoked {
-                let prior=known.state.project_at(known.observed_at_ms)?;
-                let fresh=profile.state.project_at(profile.observed_at_ms)?;
-                ensure!(fresh.epoch>prior.epoch,"known revocation needs an explicit newer root recovery");
-                fresh.client(&profile.client_id)?;fresh.node(&profile.target_node)?;
+                let prior = known.state.project_at(known.observed_at_ms)?;
+                let fresh = profile.state.project_at(profile.observed_at_ms)?;
+                ensure!(
+                    fresh.epoch > prior.epoch,
+                    "known revocation needs an explicit newer root recovery"
+                );
+                fresh.client(&profile.client_id)?;
+                fresh.node(&profile.target_node)?;
             }
-            ensure!(known.write_gate!=2 || profile.write_gate==2,"known Node fork cannot be overwritten by older write status");
+            ensure!(
+                known.write_gate != 2 || profile.write_gate == 2,
+                "known Node fork cannot be overwritten by older write status"
+            );
         }
-        let bytes=serde_json::to_vec(profile)?;ensure!(bytes.len()<=4*1024*1024,"profile proof exceeds cache limit");
-        let count:u64=self.db.query_row("SELECT count(*) FROM verified_profiles",[],|row|row.get(0))?;
-        let exists:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM verified_profiles WHERE target=?1)",[&profile.target_node],|row|row.get(0))?;
-        ensure!(count<64||exists,"too many cached Node profiles");
-        self.db.execute("INSERT INTO verified_profiles VALUES(?1,?2) ON CONFLICT(target) DO UPDATE SET payload=excluded.payload",params![profile.target_node,bytes])?;Ok(())
+        let bytes = serde_json::to_vec(profile)?;
+        ensure!(
+            bytes.len() <= 4 * 1024 * 1024,
+            "profile proof exceeds cache limit"
+        );
+        let count: u64 =
+            self.db
+                .query_row("SELECT count(*) FROM verified_profiles", [], |row| {
+                    row.get(0)
+                })?;
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM verified_profiles WHERE target=?1)",
+            [&profile.target_node],
+            |row| row.get(0),
+        )?;
+        ensure!(count < 64 || exists, "too many cached Node profiles");
+        self.db.execute("INSERT INTO verified_profiles VALUES(?1,?2) ON CONFLICT(target) DO UPDATE SET payload=excluded.payload",params![profile.target_node,bytes])?;
+        Ok(())
     }
-    pub(crate) fn cached_profile(&self,target:&str)->Result<crate::profile::CachedProfile> {
-        let bytes:Vec<u8>=self.db.query_row("SELECT payload FROM verified_profiles WHERE target=?1",[target],|row|row.get(0))?;
-        ensure!(bytes.len()<=4*1024*1024,"profile cache exceeds limit");Ok(serde_json::from_slice(&bytes)?)
+    pub(crate) fn cached_profile(&self, target: &str) -> Result<crate::profile::CachedProfile> {
+        let bytes: Vec<u8> = self.db.query_row(
+            "SELECT payload FROM verified_profiles WHERE target=?1",
+            [target],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            bytes.len() <= 4 * 1024 * 1024,
+            "profile cache exceeds limit"
+        );
+        Ok(serde_json::from_slice(&bytes)?)
     }
-    pub(crate) fn cache_write_gate(&self,target:&str,gate:u8)->Result<()> {
-        let mut profile=self.cached_profile(target)?;if profile.write_gate!=2 {profile.write_gate=gate;}
+    pub(crate) fn cache_write_gate(&self, target: &str, gate: u8) -> Result<()> {
+        let mut profile = self.cached_profile(target)?;
+        if profile.write_gate != 2 {
+            profile.write_gate = gate;
+        }
         self.cache_profile(&profile)
     }
-    pub(crate) fn invalidate_profile(&self,target:&str)->Result<()> {
-        let mut profile=match self.cached_profile(target) {Ok(profile)=>profile,Err(error) if error.downcast_ref::<rusqlite::Error>().is_some_and(|error|matches!(error,rusqlite::Error::QueryReturnedNoRows))=>return Ok(()),Err(error)=>return Err(error)};
-        profile.revoked=true;self.cache_profile(&profile)
+    pub(crate) fn invalidate_profile(&self, target: &str) -> Result<()> {
+        let mut profile = match self.cached_profile(target) {
+            Ok(profile) => profile,
+            Err(error)
+                if error
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(|error| matches!(error, rusqlite::Error::QueryReturnedNoRows)) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        profile.revoked = true;
+        self.cache_profile(&profile)
     }
     pub(crate) fn reserve_sequence(&mut self, lane: &str) -> Result<u64> {
         let tx = self
@@ -187,16 +257,31 @@ impl Outbox {
         let rows = query.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         rows.map(|r| Ok(serde_json::from_slice(&r?)?)).collect()
     }
-    pub(crate) fn find(&self,id:&str)->Result<Option<Operation>> {
-        let bytes:Option<Vec<u8>>=self.db.query_row("SELECT payload FROM operations WHERE id=?1",[id],|row|row.get(0)).optional()?;
-        bytes.map(|bytes|Ok(serde_json::from_slice(&bytes)?)).transpose()
+    pub(crate) fn find(&self, id: &str) -> Result<Option<Operation>> {
+        let bytes: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT payload FROM operations WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        bytes
+            .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
+            .transpose()
     }
-    pub(crate) fn can_begin(&self,id:&str)->Result<bool> {
-        let operation=self.get(id)?;
-        if operation.snapshot.state!=OperationState::Prepared {return Ok(false);}
+    pub(crate) fn can_begin(&self, id: &str) -> Result<bool> {
+        let operation = self.get(id)?;
+        if operation.snapshot.state != OperationState::Prepared {
+            return Ok(false);
+        }
         let blocked:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE lane=?1 AND state IN ('prepared','unknown') AND rowid<(SELECT rowid FROM operations WHERE id=?2))",params![operation.lane,id],|row|row.get(0))?;
-        if blocked {return Ok(false);}
-        for id in &operation.prerequisites {if self.get(id)?.snapshot.state!=OperationState::Accepted {return Ok(false);}}
+        if blocked {
+            return Ok(false);
+        }
+        for id in &operation.prerequisites {
+            if self.get(id)?.snapshot.state != OperationState::Accepted {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
     pub(crate) fn get(&self, id: &str) -> Result<Operation> {
@@ -245,11 +330,21 @@ impl Outbox {
             count < 256,
             "outbox is full; reconcile outstanding operations"
         );
-        ensure!(operation.prerequisites.len()<=16,"too many operation prerequisites");
+        ensure!(
+            operation.prerequisites.len() <= 16,
+            "too many operation prerequisites"
+        );
         for prerequisite in &operation.prerequisites {
-            let bytes:Vec<u8>=tx.query_row("SELECT payload FROM operations WHERE id=?1",[prerequisite],|row|row.get(0))?;
-            let prior:Operation=serde_json::from_slice(&bytes)?;
-            ensure!(prior.snapshot.target_node==operation.snapshot.target_node,"prerequisite belongs to another target");
+            let bytes: Vec<u8> = tx.query_row(
+                "SELECT payload FROM operations WHERE id=?1",
+                [prerequisite],
+                |row| row.get(0),
+            )?;
+            let prior: Operation = serde_json::from_slice(&bytes)?;
+            ensure!(
+                prior.snapshot.target_node == operation.snapshot.target_node,
+                "prerequisite belongs to another target"
+            );
         }
         if let Some(sequence) = operation.snapshot.sequence {
             ensure!(
@@ -280,14 +375,24 @@ impl Outbox {
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn dismiss_rejected(&mut self,id:&str)->Result<()> {
-        let operation=self.get(id)?;
-        ensure!(operation.snapshot.state==OperationState::Rejected,"only an explicitly rejected operation may be discarded");
-        self.db.execute("DELETE FROM operations WHERE id=?1 AND state='rejected'",[id])?;Ok(())
+    pub(crate) fn dismiss_rejected(&mut self, id: &str) -> Result<()> {
+        let operation = self.get(id)?;
+        ensure!(
+            operation.snapshot.state == OperationState::Rejected,
+            "only an explicitly rejected operation may be discarded"
+        );
+        self.db.execute(
+            "DELETE FROM operations WHERE id=?1 AND state='rejected'",
+            [id],
+        )?;
+        Ok(())
     }
     /// Persists uncertainty BEFORE crossing the network boundary. Process death cannot create a retryable write.
     pub(crate) fn begin(&mut self, id: &str) -> Result<Operation> {
-        ensure!(self.can_begin(id)?,"an earlier operation or prerequisite still needs confirmation");
+        ensure!(
+            self.can_begin(id)?,
+            "an earlier operation or prerequisite still needs confirmation"
+        );
         let mut op = self.get(id)?;
         ensure!(
             op.snapshot.state == OperationState::Prepared,
@@ -297,45 +402,96 @@ impl Outbox {
         self.save(&op, "unknown")?;
         Ok(op)
     }
-    fn affected_prepared(&self,id:&str)->Result<Vec<Operation>> {
-        let all=self.operations()?;
-        let root=all.iter().position(|op|op.snapshot.id==id).context("operation missing")?;
-        let mut affected=std::collections::HashSet::from([id.to_owned()]);
-        let mut lanes=std::collections::HashMap::from([(all[root].lane.clone(),root)]);
-        let mut changed=true;
+    fn affected_prepared(&self, id: &str) -> Result<Vec<Operation>> {
+        let all = self.operations()?;
+        let root = all
+            .iter()
+            .position(|op| op.snapshot.id == id)
+            .context("operation missing")?;
+        let mut affected = std::collections::HashSet::from([id.to_owned()]);
+        let mut lanes = std::collections::HashMap::from([(all[root].lane.clone(), root)]);
+        let mut changed = true;
         while changed {
-            changed=false;
-            for (index,op) in all.iter().enumerate() {
-                if op.snapshot.state!=OperationState::Prepared || affected.contains(&op.snapshot.id) {continue;}
-                if op.prerequisites.iter().any(|dependency|affected.contains(dependency)) || lanes.get(&op.lane).is_some_and(|prior|index>*prior) {
-                    affected.insert(op.snapshot.id.clone());lanes.entry(op.lane.clone()).or_insert(index);changed=true;
+            changed = false;
+            for (index, op) in all.iter().enumerate() {
+                if op.snapshot.state != OperationState::Prepared
+                    || affected.contains(&op.snapshot.id)
+                {
+                    continue;
+                }
+                if op
+                    .prerequisites
+                    .iter()
+                    .any(|dependency| affected.contains(dependency))
+                    || lanes.get(&op.lane).is_some_and(|prior| index > *prior)
+                {
+                    affected.insert(op.snapshot.id.clone());
+                    lanes.entry(op.lane.clone()).or_insert(index);
+                    changed = true;
                 }
             }
         }
-        Ok(all.into_iter().filter(|op|affected.contains(&op.snapshot.id)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|op| affected.contains(&op.snapshot.id))
+            .collect())
     }
-    pub(crate) fn review_settings(&self,id:&str)->Result<crate::SettingsReview> {
-        let operation=self.get(id)?;
-        let dependent_ids=self.affected_prepared(id)?.into_iter().filter(|op|op.snapshot.id!=id).map(|op|op.snapshot.id).collect();
-        crate::settings::review(&operation,dependent_ids)
+    pub(crate) fn review_settings(&self, id: &str) -> Result<crate::SettingsReview> {
+        let operation = self.get(id)?;
+        let dependent_ids = self
+            .affected_prepared(id)?
+            .into_iter()
+            .filter(|op| op.snapshot.id != id)
+            .map(|op| op.snapshot.id)
+            .collect();
+        crate::settings::review(&operation, dependent_ids)
     }
-    pub(crate) fn close_unknown_settings(&mut self,review:&crate::SettingsReview,note:&str)->Result<Vec<OperationSnapshot>> {
-        ensure!(!note.trim().is_empty() && note.len()<=2048,"record what was reviewed on the original Node");
-        let fresh=self.review_settings(&review.operation_id)?;
-        ensure!(fresh.fingerprint==review.fingerprint && fresh.kind==review.kind && fresh.fields==review.fields && fresh.has_secret_changes==review.has_secret_changes && fresh.network_id==review.network_id && fresh.client_id==review.client_id && fresh.target_node==review.target_node && fresh.dependent_ids==review.dependent_ids,"settings or dependent drafts changed; review the original group again");
-        let operations=self.affected_prepared(&review.operation_id)?;
-        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;let mut closed=vec![];
+    pub(crate) fn close_unknown_settings(
+        &mut self,
+        review: &crate::SettingsReview,
+        note: &str,
+    ) -> Result<Vec<OperationSnapshot>> {
+        ensure!(
+            !note.trim().is_empty() && note.len() <= 2048,
+            "record what was reviewed on the original Node"
+        );
+        let fresh = self.review_settings(&review.operation_id)?;
+        ensure!(
+            fresh.fingerprint == review.fingerprint
+                && fresh.kind == review.kind
+                && fresh.fields == review.fields
+                && fresh.has_secret_changes == review.has_secret_changes
+                && fresh.network_id == review.network_id
+                && fresh.client_id == review.client_id
+                && fresh.target_node == review.target_node
+                && fresh.dependent_ids == review.dependent_ids,
+            "settings or dependent drafts changed; review the original group again"
+        );
+        let operations = self.affected_prepared(&review.operation_id)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut closed = vec![];
         for mut operation in operations {
-            operation.snapshot.state=OperationState::ClosedByUser;
-            operation.snapshot.result=Some(serde_json::json!({"local_resolution":"closed_by_user","server_outcome":if operation.snapshot.id==review.operation_id {"unknown"}else{"not_sent"},"note":note,"reviewed_at_ms":vibeface_protocol::now_ms(),"parent_operation":review.operation_id}));
-            tx.execute("UPDATE operations SET state='closed_by_user',payload=?2 WHERE id=?1",params![operation.snapshot.id,serde_json::to_vec(&operation)?])?;
+            operation.snapshot.state = OperationState::ClosedByUser;
+            operation.snapshot.result = Some(
+                serde_json::json!({"local_resolution":"closed_by_user","server_outcome":if operation.snapshot.id==review.operation_id {"unknown"}else{"not_sent"},"note":note,"reviewed_at_ms":vibeface_protocol::now_ms(),"parent_operation":review.operation_id}),
+            );
+            tx.execute(
+                "UPDATE operations SET state='closed_by_user',payload=?2 WHERE id=?1",
+                params![operation.snapshot.id, serde_json::to_vec(&operation)?],
+            )?;
             closed.push(operation.snapshot);
         }
-        tx.commit()?;Ok(closed)
+        tx.commit()?;
+        Ok(closed)
     }
-    pub(crate) fn observe_unknown(&mut self,id:&str,result:Value)->Result<OperationSnapshot> {
-        let mut op=self.get(id)?;
-        if op.snapshot.state==OperationState::Unknown {op.snapshot.result=Some(result);self.save(&op,"unknown")?;}
+    pub(crate) fn observe_unknown(&mut self, id: &str, result: Value) -> Result<OperationSnapshot> {
+        let mut op = self.get(id)?;
+        if op.snapshot.state == OperationState::Unknown {
+            op.snapshot.result = Some(result);
+            self.save(&op, "unknown")?;
+        }
         Ok(op.snapshot)
     }
     pub(crate) fn settle(
@@ -349,7 +505,12 @@ impl Outbox {
             "invalid settlement"
         );
         let mut op = self.get(id)?;
-        if matches!(op.snapshot.state,OperationState::ClosedByUser|OperationState::Accepted|OperationState::Rejected) {return Ok(op.snapshot);}
+        if matches!(
+            op.snapshot.state,
+            OperationState::ClosedByUser | OperationState::Accepted | OperationState::Rejected
+        ) {
+            return Ok(op.snapshot);
+        }
         op.snapshot.state = state;
         op.snapshot.result = Some(result);
         self.save(
@@ -369,22 +530,56 @@ impl Outbox {
         )?;
         Ok(())
     }
-    pub(crate) fn retain_attachments(&mut self,owner:&str,references:&[Attachment])->Result<()> {
-        ensure!(!owner.is_empty() && owner.len()<=256,"invalid attachment owner");
-        ensure!(references.len()<=128,"too many attachments in a draft");
-        for attachment in references {self.read_attachment(attachment)?;}
-        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let owners:u64=tx.query_row("SELECT count(DISTINCT owner) FROM attachment_leases",[],|row|row.get(0))?;
-        let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachment_leases WHERE owner=?1)",[owner],|row|row.get(0))?;
-        ensure!(owners<256 || exists,"too many retained attachment drafts");
-        for attachment in references {tx.execute("INSERT OR IGNORE INTO attachment_leases VALUES(?1,?2)",params![owner,attachment.hash])?;}
-        tx.commit()?;Ok(())
+    pub(crate) fn retain_attachments(
+        &mut self,
+        owner: &str,
+        references: &[Attachment],
+    ) -> Result<()> {
+        ensure!(
+            !owner.is_empty() && owner.len() <= 256,
+            "invalid attachment owner"
+        );
+        ensure!(references.len() <= 128, "too many attachments in a draft");
+        for attachment in references {
+            self.read_attachment(attachment)?;
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owners: u64 = tx.query_row(
+            "SELECT count(DISTINCT owner) FROM attachment_leases",
+            [],
+            |row| row.get(0),
+        )?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment_leases WHERE owner=?1)",
+            [owner],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            owners < 256 || exists,
+            "too many retained attachment drafts"
+        );
+        for attachment in references {
+            tx.execute(
+                "INSERT OR IGNORE INTO attachment_leases VALUES(?1,?2)",
+                params![owner, attachment.hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
-    pub(crate) fn release_attachments(&self,owner:&str)->Result<()> {
-        self.db.execute("DELETE FROM attachment_leases WHERE owner=?1",[owner])?;Ok(())
+    pub(crate) fn release_attachments(&self, owner: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM attachment_leases WHERE owner=?1", [owner])?;
+        Ok(())
     }
-    pub(crate) fn attachment_owners(&self)->Result<Vec<String>> {
-        Ok(self.db.prepare("SELECT DISTINCT owner FROM attachment_leases ORDER BY owner")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?)
+    pub(crate) fn attachment_owners(&self) -> Result<Vec<String>> {
+        Ok(self
+            .db
+            .prepare("SELECT DISTINCT owner FROM attachment_leases ORDER BY owner")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     /// Content is synced before a SQLite row may reference it. Names never become paths.
     pub fn store_attachment(&self, name: &str, data: &[u8]) -> Result<Attachment> {
@@ -439,17 +634,26 @@ impl Outbox {
         Ok(data)
     }
     /// Explicit cleanup runs with the application's outbox lock held. Referenced bytes survive restart.
-    pub fn collect_unreferenced(&self) -> Result<()> { self.collect_attachments(&[]) }
-    pub fn collect_attachments(&self,keep:&[Attachment]) -> Result<()> {
+    pub fn collect_unreferenced(&self) -> Result<()> {
+        self.collect_attachments(&[])
+    }
+    pub fn collect_attachments(&self, keep: &[Attachment]) -> Result<()> {
         let mut hashes: std::collections::HashSet<_> = self
             .operations()?
             .into_iter()
-            .filter(|op|op.snapshot.state!=OperationState::Accepted)
+            .filter(|op| op.snapshot.state != OperationState::Accepted)
             .flat_map(|op| op.attachments.into_iter().map(|a| a.hash))
             .collect();
-        for attachment in keep {self.read_attachment(attachment)?;hashes.insert(attachment.hash.clone());}
-        let mut leases=self.db.prepare("SELECT DISTINCT hash FROM attachment_leases")?;
-        for hash in leases.query_map([],|row|row.get::<_,String>(0))? {hashes.insert(hash?);}
+        for attachment in keep {
+            self.read_attachment(attachment)?;
+            hashes.insert(attachment.hash.clone());
+        }
+        let mut leases = self
+            .db
+            .prepare("SELECT DISTINCT hash FROM attachment_leases")?;
+        for hash in leases.query_map([], |row| row.get::<_, String>(0))? {
+            hashes.insert(hash?);
+        }
         for entry in std::fs::read_dir(self.dir.join("attachments"))? {
             let entry = entry?;
             if !hashes.contains(&entry.file_name().to_string_lossy().to_string())
@@ -533,20 +737,22 @@ mod lease_tests {
     use super::*;
     #[test]
     fn draft_lease_survives_a_crash_before_the_ui_sidecar_or_outbox_reference() -> Result<()> {
-        let dir=std::env::temp_dir().join(format!("native-draft-lease-{}",uuid::Uuid::new_v4()));
-        let mut db=Outbox::open(&dir,"network","client")?;
-        let file=db.store_attachment("draft.txt",b"must survive")?;
-        let orphan=db.store_attachment("orphan.txt",b"not referenced")?;
-        db.retain_attachments("message-draft",&[file.clone()])?;
+        let dir = std::env::temp_dir().join(format!("native-draft-lease-{}", uuid::Uuid::new_v4()));
+        let mut db = Outbox::open(&dir, "network", "client")?;
+        let file = db.store_attachment("draft.txt", b"must survive")?;
+        let orphan = db.store_attachment("orphan.txt", b"not referenced")?;
+        db.retain_attachments("message-draft", &[file.clone()])?;
         drop(db);
-        let db=Outbox::open(&dir,"network","client")?;
+        let db = Outbox::open(&dir, "network", "client")?;
         db.collect_attachments(&[])?;
-        assert_eq!(db.read_attachment(&file)?,b"must survive");
+        assert_eq!(db.read_attachment(&file)?, b"must survive");
         assert!(db.read_attachment(&orphan).is_err());
-        assert_eq!(db.attachment_owners()?,vec!["message-draft"]);
+        assert_eq!(db.attachment_owners()?, vec!["message-draft"]);
         db.release_attachments("message-draft")?;
         db.collect_attachments(&[])?;
         assert!(db.read_attachment(&file).is_err());
-        drop(db);std::fs::remove_dir_all(dir)?;Ok(())
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }
