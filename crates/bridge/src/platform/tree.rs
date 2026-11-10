@@ -321,9 +321,11 @@ impl Leftover {
         #[cfg(windows)]
         {
             let recorded: super::winjob::Record = token.trim().parse()?;
+            // A job outlives its programs while any handle to it is open, so an empty one is
+            // a tree with nothing left.
             match super::winjob::Job::open(recorded.key())? {
-                Some(job) => Ok(Some(Self { job, recorded })),
-                None => Ok(None),
+                Some(job) if job.member_count()? > 0 => Ok(Some(Self { job, recorded })),
+                _ => Ok(None),
             }
         }
     }

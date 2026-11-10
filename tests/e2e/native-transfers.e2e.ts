@@ -606,7 +606,12 @@ test('receives a charity file through a real native pairing and verifies the sav
   await device.clearKeychain();
   await app.open();
   await device.openLink(network.invitation);
-  await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible({ timeout: 30000 });
+  const filled = screen.getByText('已填入加入链接', { exact: true });
+  const openConfirmation = screen.getByRole('alert', 'Open in “Vibeface”?', { exact: true });
+  await expect.poll(async () => await openConfirmation.isVisible() || await filled.isVisible(), { timeout: 30000 }).toBe(true);
+  // Accepted, not dismissed: the link opening the app is what scanning does.
+  if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
+  await expect(filled).toBeVisible({ timeout: 30000 });
   const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
   await deviceName.fill('VDP native receiver');
   await expect(deviceName).toHaveValue('VDP native receiver');

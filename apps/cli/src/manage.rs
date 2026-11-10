@@ -1066,8 +1066,10 @@ mod tests {
         assert_eq!(json_arg(Some(r#"{"op":"list"}"#))?, json!({"op":"list"}));
         assert!(json_arg(Some("[1]")).is_err());
         assert!(json_arg(Some("not json")).is_err());
+        let node = std::env::temp_dir().join("node");
+        let node = node.to_str().context("a UTF-8 temporary directory")?;
         assert!(matches!(
-            parse(&["call", "node_settings", "--data-dir", "/tmp/node"])?,
+            parse(&["call", "node_settings", "--data-dir", node])?,
             Command::Call(Call { method, .. }) if method == "node_settings"
         ));
         assert!(matches!(

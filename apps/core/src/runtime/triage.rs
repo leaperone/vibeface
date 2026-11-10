@@ -4060,10 +4060,19 @@ pub(super) mod tests {
             while held_stop(&a, "w-far").await?.is_some() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            assert!(matches!(
-                state(&b, "w-far").await?,
-                crate::work::WorkState::Interrupting { .. }
-            ));
+            // B records the stop once the App Server has taken the interrupt, which the
+            // fixture answers before reporting it here.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(
+                    state(&b, "w-far").await?,
+                    crate::work::WorkState::Interrupting { .. }
+                ) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("B did not record the interrupt")??;
             assert!(
                 held_stop(&b, "w-far").await?.is_some(),
                 "B holds the stop it took"
