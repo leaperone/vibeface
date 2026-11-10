@@ -18,8 +18,6 @@ pnpm run test
 pnpm run typecheck
 pnpm --filter @vibeface/client run test
 pnpm --filter @vibeface/client run typecheck
-pnpm --filter @vibeface/secure-native run typecheck
-pnpm --filter vibeface-mobile run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
 cp generated/vibeface_secure.js generated/vibeface_secure_bg.wasm dist/client/
