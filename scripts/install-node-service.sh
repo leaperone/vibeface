@@ -87,6 +87,38 @@ different_data() {
   exit 1
 }
 
+launchd_node_action() {
+  [[ -f "$service" ]] || { echo 'Installed node service is required.' >&2; return 1; }
+  if [[ "$action" == stop || "$action" == restart ]]; then
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+      launchctl bootout "$domain/$label" || return
+    fi
+  fi
+  if [[ "$action" == restart ]]; then
+    local attempt observation
+    # Keep the normal stop path so Core can finish shutting down its managed process trees.
+    for ((attempt = 0; attempt < 300; attempt++)); do
+      if observation=$(launchctl print "$domain/$label" 2>&1); then
+        sleep 0.1
+      elif [[ "$observation" == *'Could not find service'* ]]; then
+        launchctl bootstrap "$domain" "$service" || return
+        launchctl kickstart "$domain/$label"
+        return
+      else
+        echo 'Could not confirm node service removal.' >&2
+        return 1
+      fi
+    done
+    echo 'Timed out waiting for node service removal.' >&2
+    return 1
+  elif [[ "$action" == start ]]; then
+    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+      launchctl bootstrap "$domain" "$service" || return
+    fi
+    launchctl kickstart "$domain/$label"
+  fi
+}
+
 case "$(uname -s)" in
   Darwin)
     if [[ "$service_id" == node ]]; then
@@ -177,18 +209,7 @@ PLIST
         printf 'Installed %s\n' "$service"
         ;;
       start|stop|restart)
-        [[ -f "$service" ]] || { echo 'Installed node service is required.' >&2; exit 1; }
-        if [[ "$action" == stop || "$action" == restart ]]; then
-          if launchctl print "$domain/$label" >/dev/null 2>&1; then
-            launchctl bootout "$domain/$label"
-          fi
-        fi
-        if [[ "$action" == start || "$action" == restart ]]; then
-          if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
-            launchctl bootstrap "$domain" "$service"
-          fi
-          launchctl kickstart "$domain/$label"
-        fi
+        launchd_node_action
         ;;
       status)
         status_code=0

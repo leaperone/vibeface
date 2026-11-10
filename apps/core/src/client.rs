@@ -37,6 +37,7 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
+use vibeface_protocol::valid_business_id;
 use vibeface_secure::{
     Channel,
     join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
@@ -2189,15 +2190,7 @@ fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Resul
     .with_context(|| format!("invalid {key}"))
 }
 fn validate_request(request: &Request) -> Result<()> {
-    ensure!(
-        !request.id.is_empty()
-            && request.id.len() <= 128
-            && request
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
-        "invalid request ID"
-    );
+    ensure!(valid_business_id(&request.id), "invalid request ID");
     ensure!(
         !request.method.is_empty() && request.method.len() <= 64 && request.params.is_object(),
         "invalid client method or params"
@@ -4814,15 +4807,22 @@ mod tests {
     #[test]
     fn channel_requests_require_bounded_ids_and_object_params() {
         let mut request = Request {
-            id: "valid-request".into(),
+            id: "valid:request-._1".into(),
             method: "info".into(),
             params: json!({}),
         };
         assert!(validate_request(&request).is_ok());
+        request.id = "a".repeat(128);
+        assert!(validate_request(&request).is_ok());
         request.params = json!("untyped payload");
         assert!(validate_request(&request).is_err());
         request.params = json!({});
-        request.id = "\n".into();
-        assert!(validate_request(&request).is_err());
+        for id in ["", "\n", "bad/id", "bad id", "é", &"a".repeat(129)] {
+            request.id = id.into();
+            assert_eq!(
+                validate_request(&request).unwrap_err().to_string(),
+                "invalid request ID"
+            );
+        }
     }
 }

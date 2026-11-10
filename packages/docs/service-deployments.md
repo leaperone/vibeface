@@ -31,10 +31,14 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 
 ```sh
 python3 scripts/deploy.py release --service www --tag '<WEBSITE_TAG>'
-gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRODUCT_TAG>' -F apply=false
+gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=node -f tag='<PRODUCT_TAG>' -F apply=false
 ```
 
-真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、main 归属、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、共享发布来源规则（main 或受信机械 Nightly）、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+
+激活前同时核对传输归档的 SHA256 和导入后的 image ID。归档中的镜像必须与调用方指定的 `--image` 一致；摘要正确不能替代镜像身份校验。
+
+`node` 无论是否 `apply` 都先在 runner 演练。脚本选择候选发布时间之前最近的完整产品 Release，排除候选本身、Draft 和缺少最终 manifest 或必要组件的发布，并核对其 `release.json`、来源和附件摘要。旧 Core 初始化并启动隔离 fixture 后，脚本原子换入候选 Core 生成的完整配置，再激活候选镜像并验证重复激活、原身份和初始化数据保留。fixture 只用回环地址、独立 mesh 和生成的数据，不带 Provider 或部署凭证。没有历史完整产品 Release 时明确输出 `first_release`，只演练首次安装和重复激活；查询、校验或升级失败都停止，不退到更老版本或略过升级。
 
 ## 配置部署目标
 

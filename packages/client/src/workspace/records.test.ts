@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import type { SessionScope } from './types.ts'
 import test from "node:test"
 import { parseChanged } from "../lib/progress.ts"
-import { botReadiness, confirmReason, overviewFromWorkspace, parseConversation, parseNodes, parseOpenWorks, parseQuestions, parseRecords, parseScopeContext, parseWorkDetail, parseWorkspaceHistory, parseWorkspaceState, workChecks } from "./model.ts"
+import { parsePrincipal, text } from "../lib/node.ts"
+import { botReadiness, confirmReason, overviewFromWorkspace, parseConversation, parseNodes, parseNotifications, parseOpenWorks, parseQuestions, parseRecords, parseScopeContext, parseWorkDetail, parseWorkspaceHistory, parseWorkspaceState, workChecks } from "./model.ts"
 import { answerBody } from './questions.ts'
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions, mergeWorkspaceState } from "./records.ts"
 import { taskAgent } from "./labels.ts"
@@ -38,6 +39,19 @@ const records = (extra: Record<string, unknown> = {}) => {
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)
 }
+
+test('response parsers retain their text, numeric and error boundaries', () => {
+  const principal = { network_id: 'a'.repeat(64), device_id: 'b'.repeat(64), source: 'membership', can_manage: false, epoch: 1 }
+  assert.equal(parsePrincipal(principal).epoch, 1)
+  assert.throws(() => parsePrincipal({ ...principal, epoch: 0 }), { message: '设备返回的编号或版本无效。' })
+  assert.throws(() => text(''), { message: '文本缺失或格式无效。' })
+  assert.equal(parseNotifications({ notifications: [{ notification_id: 'n', conversation_id: 'chat', kind: 'message', text: '' }] })[0].text, '')
+  const state = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 0, truncated: false } }
+  assert.equal(parseWorkspaceState(state).coverage.limit, 0)
+  assert.throws(() => parseWorkspaceState({ ...state, channels: {} }), { message: '设备返回的内容缺少列表。' })
+  assert.throws(() => parseWorkspaceState({ ...state, coverage: { limit: 0, truncated: 'false' } }), { message: '设备返回的内容缺少开关值。' })
+  assert.throws(() => parseWorkspaceState([]), { message: '设备返回的内容格式不对。' })
+})
 
 test("task labels use the accepted provider and leave summaries unknown", () => {
   const accepted = records({ works: [work("frozen", { kind: "task", resolved: { provider: "claude", model: null } })] }).works[0]

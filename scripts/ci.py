@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import urllib.request
 
+import release
+
 
 PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
@@ -306,7 +308,7 @@ def release_metadata(ref_type, ref_name):
     if ref_type == "tag":
         if ref_name != f"v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
-        git("merge-base", "--is-ancestor", "HEAD", "origin/main")
+        release.validate_source(git("rev-parse", "HEAD").decode().strip(), "product")
     return {"version": version, "msrv": package["rust_version"], "channel": channel, "prerelease": channel != "stable"}
 
 
@@ -519,7 +521,7 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py",
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py", "scripts/nightly_source.py",
                  "apps/desktop/electron-builder.cjs", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
@@ -706,7 +708,7 @@ def self_test():
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS[:-1]]))
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS, SLOW_TESTS[0] + "_extra"]))
     expect_failure(lambda: package_args(["vibeface", "vibeface"]))
-    scratch = Path(__file__).resolve().parent.parent / ".artifacts/ci-self-test"
+    scratch = Path(os.environ.get("VIBEFACE_RELEASE_SCRATCH", Path(__file__).resolve().parent.parent / ".artifacts/ci-self-test"))
     scratch.mkdir(parents=True, exist_ok=True)
     native_delivery_self_test(scratch)
     with tempfile.TemporaryDirectory(prefix="git-", dir=scratch) as directory:
@@ -754,10 +756,10 @@ def self_test():
         coverage_self_test(directory, base, new_base)
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
-            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:
+            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release.validate_source") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
                 assert release_metadata("tag", f"v{version}")["prerelease"] == (channel != "stable")
-                ancestor.assert_called_once_with("merge-base", "--is-ancestor", "HEAD", "origin/main")
+                ancestor.assert_called_once_with("a" * 40, "product")
                 expect_failure(lambda: release_metadata("tag", "v0.0.0"))
         for version in ("01.2.3", "1.2.3-nightly.20260229.1", "1.2.3-nightly.20261019.0", "1.2.3+build"):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}

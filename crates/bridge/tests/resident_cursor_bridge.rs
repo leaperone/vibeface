@@ -373,6 +373,8 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
     let mut turn = turn(&root, "redaction");
     turn.env
         .insert("FIXTURE_SECRET".into(), "synthetic-sensitive-token".into());
+    turn.env
+        .insert("FIXTURE_SHORT_SECRET".into(), "synthetic-sensitive".into());
     turn.env.insert("FAKE_ACP_CHUNK_SIZE".into(), "1".into());
     let updates = Arc::new(Mutex::new(Vec::new()));
     let seen = updates.clone();
@@ -397,6 +399,7 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
         .filter_map(|r| r["text"].as_str())
         .collect::<String>();
     assert!(!joined.contains("synthetic-sensitive-token"));
+    assert!(!joined.contains("-token"));
     {
         let updates = updates.lock().unwrap();
         let snapshot = updates.last().context("final reply snapshot")?;
