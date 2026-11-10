@@ -82,7 +82,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         {mine.length ? <View className="gap-2">
           <Text className="text-meta font-medium">{transferCopy.sendTo}</Text>
           <View className="overflow-hidden rounded-lg border border-border">{mine.map((item, index) => <Pressable key={item.device_id} accessibilityRole="radio" accessibilityState={{ checked: draft.receiver_peer === item.device_id, disabled: working }} disabled={working}
-            className={cn('min-h-11 flex-row items-center gap-3 px-3 active:bg-muted/60', index > 0 && 'border-t border-border')} onPress={() => setDraft({ ...draft, receiver_peer: item.device_id })}>
+            className={cn('min-h-11 flex-row items-center gap-3 px-3 active:bg-muted', index > 0 && 'border-t border-border')} onPress={() => setDraft({ ...draft, receiver_peer: item.device_id })}>
             <Icon as={Laptop} className="size-4 text-muted-foreground" />
             <Text numberOfLines={1} className="min-w-0 flex-1">{item.name}</Text>
             {draft.receiver_peer === item.device_id ? <Icon as={Check} className="size-4 text-primary" /> : null}
@@ -144,7 +144,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <Button disabled={working || !delivery.canManage || !status?.enabled || !status.paid_enabled} onPress={() => { setOrigin('page'); void delivery.acceptBatch(batch) }}><Text>同时接收这两份文件</Text></Button>
       </View>)}
       {delivery.orders.length ? <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{delivery.orders.map((order, index) => <Pressable key={order.order_id} accessibilityRole="button" accessibilityState={{ selected: selected?.order_id === order.order_id }}
-        className={cn('min-h-16 flex-row items-center gap-3 px-4 py-3 active:bg-muted/60', index > 0 && 'border-t border-border', selected?.order_id === order.order_id && 'bg-muted/60')} onPress={() => delivery.select(order.order_id)}>
+        className={cn('min-h-16 flex-row items-center gap-3 px-4 py-3 active:bg-muted', index > 0 && 'border-t border-border', selected?.order_id === order.order_id && 'bg-muted/60')} onPress={() => delivery.select(order.order_id)}>
         <Icon as={roleIcons[order.role]} className="size-4 text-muted-foreground" />
         <View className="min-w-0 flex-1 gap-0.5">
           <Text numberOfLines={1} className="font-medium">{orderTitle(order)}</Text>

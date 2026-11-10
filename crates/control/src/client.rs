@@ -829,18 +829,46 @@ pub async fn create_network(
         },
         password,
     )?;
-    let created = session
+    let network = genesis.network_id.clone();
+    let reply = session
         .call(
             "recover",
             json!({"genesis":genesis,"capability":capability}),
         )
-        .await?;
+        .await;
+    drop(session);
+    let created = match reply {
+        Ok(created) => created,
+        Err(error) if error.is::<Refused>() => return Err(error),
+        // The outcome is unknown: the Node may still be installing the network or have lost the
+        // reply. Ask it for a while before failing, never sending `recover` again.
+        Err(error) => {
+            let mut created = None;
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let reply = async {
+                    key.connect(Some(&entry))
+                        .await?
+                        .call("authenticate", json!({}))
+                        .await
+                }
+                .await;
+                match reply {
+                    Ok(reply) if reply["network_id"] == network.as_str() => {
+                        created = Some(reply);
+                        break;
+                    }
+                    Ok(reply) if reply["initialized"] == true => break,
+                    _ => {}
+                }
+            }
+            created.ok_or(error)?
+        }
+    };
     ensure!(
         created["principal"]["can_manage"] == true,
         "the Node did not make this client a manager"
     );
-    let network = genesis.network_id.clone();
-    drop(session);
     key.remember(&network, entry)?;
     Ok(created)
 }
