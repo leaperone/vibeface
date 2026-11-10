@@ -306,4 +306,4 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 桌面测试使用打包应用自身的 DevTools 页面，核对真实 Electron 版本、窗口隔离、内置包来源、自有 Core、退出和重启。测试预先用包内 CLI 建立不入全网（`--no-mesh`）的独立 Node，随后由真实启动器启动并持有 Core；首次初始化逻辑另由桌面会话测试覆盖。Windows 另外核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程回收和当前用户服务。Unix shell、Unix 权限位及 Linux 证明宿主夹具保留在 Unix 测试中；协调器的协议测试在两端使用各自的私有 IPC。所有 Provider 均为受控夹具，不调用真实模型。
 
 
-原生移动端构建可使用 `ci.yml` 的 `mobile_apps=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；现有 `mobile.yml` 保留模拟器界面测试。手动移动端验收按运行编号隔离并行，避免新提交取消尚在验证的专用模拟器任务。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。
+原生移动端构建可使用 `ci.yml` 的 `mobile_apps=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；现有 `mobile.yml` 保留模拟器界面测试。手动移动端验收按运行编号隔离并行，避免新提交取消尚在验证的专用模拟器任务。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、lock 文件及 `build-mobile-secure.sh` 的摘要，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。界面测试期间 `scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
