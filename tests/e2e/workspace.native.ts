@@ -168,7 +168,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   // The join page must not stay under the tabs as a back button.
   await screen.getByLabel('任务', { exact: true }).click();
-  await expect(screen.getByRole('heading', '任务', { exact: true, visible: true })).toBeVisible();
+  await expect(screen.getByTestId('任务', { visible: true })).toBeVisible();
   await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
   // Opening the same network's link again from a page deep in another tab lands on home alone.
   await screen.getByLabel('设置', { exact: true }).click();
@@ -180,7 +180,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect.poll(async () => await openConfirmation.isVisible() || await screen.getByTestId('BackButton', { visible: true }).count() === 0, { timeout: 30000 }).toBe(true);
   if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
   await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
-  await screen.getByLabel('消息', { exact: true }).click();
+  await screen.getByRole('button', '消息', { exact: true }).click();
   const inspect = async () => {
     const value = await network.call({ op: 'workspace_inspect' });
     return {
@@ -473,7 +473,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
 
   await expect(backButton).toHaveAccessibleName(/^(任务|Back)$/);
   await backButton.click();
-  await screen.getByLabel('消息', { exact: true }).click();
+  await screen.getByRole('button', '消息', { exact: true }).click();
   await screen.getByRole('link', '管理频道', { exact: true }).click();
   await screen.getByRole('link', '新频道', { exact: true }).click();
   await textbox('频道目标').fill('手机定向交给本人 Reviewer', { timeout: 30000 });
