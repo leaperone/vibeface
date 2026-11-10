@@ -2,7 +2,7 @@ import { type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import { awaitsAnswer, workApproval } from "./questions.ts"
-import type { AgentLane, ContextProjection, InputReceipt, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
 
 export const contextStages = {
   compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },
@@ -37,7 +37,6 @@ export const queueHoldLabels: Record<QueueHoldReason, string> = {
   resource_conflict: '等待正在使用的工作目录释放',
 }
 export const agentLaneLabels: Record<AgentLane, string> = { main: '主对话', task: '独立任务', schedule_routine: '定时任务', bot_message: 'Bot 消息' }
-export const inputReceiptLabels: Record<InputReceipt['stage'], string> = { entry_accepted: '接收设备已保存', owner_accepted: '运行设备已接收', submitting: '正在提交给 AI', provider_accepted: 'AI 服务已接受', associated: '已确认实际回合', refused: '已拒绝', unknown: '结果未知' }
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
@@ -35,8 +35,6 @@ test('automatic Task commands meet the Node expected-result contract and retain 
   assert.deepEqual(sources, ['a'.repeat(64), 'b'.repeat(64)])
 })
 test('send waits for a loaded conversation', () => {
-  assert.equal(roleLabel('user'), '你')
-  assert.equal(roleLabel('assistant'), 'Bot')
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')

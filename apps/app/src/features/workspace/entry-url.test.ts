@@ -13,7 +13,7 @@ import type { InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessag
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
@@ -29,6 +29,7 @@ import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
 import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
+import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../routes/_app/inbox.tsx"), "utf8")
@@ -146,29 +147,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 })
 
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
-  const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
-  let cursor = 0
-  const afterRender: (() => void)[] = []
-  const react = {
-    createContext: () => ({}), useContext: () => null,
-    useState(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = initial
-      return [values[index], (next: unknown) => { values[index] = typeof next === "function" ? next(values[index]) : next }]
-    },
-    useRef(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = { current: initial }
-      return values[index]
-    },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.()
-        effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
-  }
+  const hooks = hookHarness(), { react, values, effects, afterRender } = hooks
   const stored = new Map<string, string>()
   const browser = {
     location: { href: "https://node.example/app?conversation=chat" },
@@ -189,25 +168,14 @@ test("workspace preserves bot and message requests while routing native decision
     put: async (item: OutboxItem) => { outboxItems.set(item.key, structuredClone(item)) },
     delete: async (key: string) => { outboxItems.delete(key) },
   }
-  const modules = new Map<string, { exports: Record<string, unknown> }>()
   const clientRoot = fileURLToPath(new URL("../../../../../packages/client/src/", import.meta.url))
-  function load(filename: string): Record<string, unknown> {
-    const cached = modules.get(filename)
-    if (cached) return cached.exports
-    const module = { exports: {} }
-    modules.set(filename, module)
-    // Export the real hook only inside this test; production keeps its provider boundary.
-    const source = readFileSync(filename, "utf8") + (filename.endsWith("/workspace/context.tsx") ? "\nexport { useWorkspaceState }\n" : "")
-    const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-    const require = (specifier: string) => {
-      if (specifier === "react") return react
-      if (specifier.endsWith("/lib/node.ts")) return { ...nodeSettings, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
-      if (specifier === "react/jsx-runtime") return { jsx: () => null }
-      return load(resolve(dirname(filename), specifier))
-    }
-    new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
-    return module.exports
-  }
+  // Export the real hook only inside this test; production keeps its provider boundary.
+  const load = moduleLoader(sandbox, (specifier, filename) => {
+    if (specifier === "react") return react
+    if (specifier.endsWith("/lib/node.ts")) return { ...nodeSettings, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+    if (specifier === "react/jsx-runtime") return { jsx: () => null }
+    return load(resolve(dirname(filename), specifier))
+  }, (filename) => readFileSync(filename, "utf8") + (filename.endsWith("/workspace/context.tsx") ? "\nexport { useWorkspaceState }\n" : ""))
   type Workspace = ReturnType<typeof import("@vibeface/client/workspace/context.tsx").useWorkspace>
   const workspaceModule = load(resolve(clientRoot, "workspace/context.tsx"))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
@@ -307,7 +275,7 @@ test("workspace preserves bot and message requests while routing native decision
   }
   let activeConnection = connection
   const render = () => {
-    cursor = 0
+    hooks.reset()
     const state = useWorkspaceState(platform, activeConnection)
     afterRender.splice(0).forEach((run) => run())
     return state
@@ -1391,40 +1359,28 @@ test("workspace preserves bot and message requests while routing native decision
 })
 
 function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '') {
-  const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
+  const hooks = hookHarness(true), { values, effects, afterRender } = hooks
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
-  const elements: { type: unknown; props: Props; key?: string }[] = [], afterRender: (() => void)[] = []
-  let cursor = 0, focused = true, output: unknown
-  function effect(run: () => (() => void) | void, dependencies: unknown[]) {
-    const index = cursor++, previous = effects.get(index)
-    if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-      previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-    })
-  }
+  const elements: { type: unknown; props: Props; key?: string }[] = []
+  let focused = true, output: unknown
   const react = {
+    ...hooks.react,
     lazy: () => 'Lazy', Suspense: 'Suspense',
-    createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
-    useState(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
-      return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
-    },
-    useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
     useCallback(callback: unknown, dependencies: unknown[]) {
-      const index = cursor++
+      const index = hooks.next()
       const previous = values[index] as { callback: unknown; dependencies: unknown[] } | undefined
       if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { callback, dependencies }
       return (values[index] as { callback: unknown }).callback
     },
     useMemo(read: () => unknown, dependencies: unknown[]) {
-      const index = cursor++, previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
+      const index = hooks.next(), previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
       if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { value: read(), dependencies }
       return (values[index] as { value: unknown }).value
     },
-    useEffect: effect, useLayoutEffect: effect,
+    useLayoutEffect: hooks.react.useEffect,
   }
   const jsx = (type: unknown, props: Props, key?: string) => { const element = key === undefined ? { type, props } : { type, props, key }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => name === 'useAction' ? () => ({ busy: null, error: null, run() {}, clear() {} }) : String(name) })
@@ -1432,7 +1388,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const draftStorage = new Map<string, string>()
   const platformStorage = { getItem: (key: string) => draftStorage.get(key) ?? null, setItem: (key: string, value: string) => { draftStorage.set(key, value) } }
   const useFocusEffect = (run: () => (() => void) | void) => {
-    const index = cursor++, previous = focusEffects.get(index)
+    const index = hooks.next(), previous = focusEffects.get(index)
     if (!previous || previous.run !== run) afterRender.push(() => {
       previous?.cleanup?.()
       focusEffects.set(index, { run, cleanup: focused ? run() ?? undefined : undefined })
@@ -1460,7 +1416,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
   return {
     render(name: string, props: unknown = {}) {
-      cursor = 0; elements.length = 0
+      hooks.reset(); elements.length = 0
       const component = module.exports[name]
       assert.ok(typeof component === 'function')
       output = component(props)
@@ -1981,7 +1937,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
     '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
-    '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval },
+    '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval },
     '@vibeface/client/lib/errors.ts': errors,
   }, chatGlobals)
   const messages = componentHarness('../chat/elements/message.tsx', {
@@ -3206,7 +3162,7 @@ test("question cards send a choice on tap, send written text from the last line,
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
@@ -3560,7 +3516,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -4094,7 +4050,7 @@ test("conversation preserves local input while execution devices are unavailable
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -4135,7 +4091,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
     generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -4154,7 +4110,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")

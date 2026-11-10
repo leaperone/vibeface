@@ -683,8 +683,6 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
   }
 }
 
-export const workspaceOverview = overviewFromWorkspace
-
 function parseOverviewBot(value: unknown): OverviewBot {
   const data = record(value)
   return { bot_id: text(data.bot_id), conversation_id: text(data.conversation_id), name: data.name == null ? "" : text(data.name) }
