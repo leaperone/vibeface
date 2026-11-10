@@ -2464,8 +2464,16 @@ def work_checks(run, workspace, a, network, passed):
     name = "chat-work-steer"
     directory, receipt, work_id = start(name)
     running = wait_for("the steered work is running", lambda: in_state(name, work_id, "running"))
+    sends_before = len(rpc("turn/start")) + len(rpc("turn/steer"))
     shell = node_cli(a, "codex", "send", running["thread_id"], "x", "--id", "shell-1", socket=socket_path, check=False)
-    require(shell.returncode != 0 and "bot turn" in shell.stderr, "codex send outside a bot turn is refused")
+    rejected = json.loads(shell.stderr.splitlines()[0])
+    record = rejected["call_record"]
+    require(shell.returncode != 0 and not shell.stdout and rejected["code"] == "tool_not_authorized"
+            and record["tool"] == "dispatch_work" and record["call_ref"] == "shell-1"
+            and record["stage"] == "authorization" and record["execution"] == "not_started"
+            and record["confirmation"] == "confirmed" and record["retry"] == "none"
+            and len(rpc("turn/start")) + len(rpc("turn/steer")) == sends_before,
+            "codex send outside a bot turn is refused before any send")
     steer_label = name + "-send"
     steer_receipt = a.client.rpc("message", conversation_id=name, message_id=steer_label, report_results=True,
         text=json.dumps({"chat_agent": True, "label": steer_label, "send": {
