@@ -1082,7 +1082,7 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
         let request: crate::workspace::InputRequest = serde_json::from_value(input.clone())
-            .context("message requires a typed target, intent and sequence")?;
+            .context("message requires a typed target, intent, sequence and explicit report_results")?;
         ensure!(
             !matches!(
                 request.route.target,
@@ -1858,7 +1858,7 @@ mod tests {
                     let request = InputRequest {
                         message_id:id.into(), route:InputRoute { target:InputTarget::Task { task_id:"task".into() },
                             intent:InputIntent::Continue, sequence, expected_revision:Some(1) },
-                        text:id.into(), attachments:vec![], report_results:Some(true),
+                        text:id.into(), attachments:vec![], report_results:true,
                     };
                     let signed = admin.attest(&network, "c", EventBody::InputPosted {
                         message_id:request.message_id.clone(), target:request.route.target.clone(), intent:request.route.intent,

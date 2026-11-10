@@ -2433,8 +2433,8 @@ pub(crate) fn input_route_from(
         },
     )
 }
-fn input_from_event(hash: &str, event: Event) -> Option<WorkspaceInput> {
-    match event.body {
+fn input_from_event(hash: &str, event: Event) -> Result<Option<WorkspaceInput>> {
+    Ok(match event.body {
         EventBody::InputPosted {
             message_id,
             target,
@@ -2456,14 +2456,14 @@ fn input_from_event(hash: &str, event: Event) -> Option<WorkspaceInput> {
                 },
                 text,
                 attachments,
-                report_results,
+                report_results: report_results.context("stored input must specify report_results")?,
             },
             conversation_id: event.scope_id,
             source_event: hash.into(),
             created_at_ms: event.created_at_ms,
         }),
         _ => None,
-    }
+    })
 }
 fn workspace_input_from(
     connection: &Connection,
@@ -2479,7 +2479,7 @@ fn workspace_input_from(
     let mut found = None;
     for hash in hashes {
         if let Some(event) = log::event_from(connection, network, &hash)?
-            && let Some(input) = input_from_event(&hash, event)
+            && let Some(input) = input_from_event(&hash, event)?
         {
             ensure!(found.is_none(), "input ID is ambiguous in this network");
             found = Some(input);
@@ -2928,7 +2928,7 @@ impl Store {
             expected_revision: input.route.expected_revision,
             text: input.text.clone(),
             attachments: input.attachments.clone(),
-            report_results: input.report_results,
+            report_results: Some(input.report_results),
             attestation: Some(attestation),
         };
         crate::crypto::verify_attestation(network, &resolved.conversation_id, &body)?;
@@ -3509,7 +3509,9 @@ fn queued_input_from_control(
     control: &InputControlState,
 ) -> Result<QueuedInput> {
     let original = log::event_from(connection, network, &control.source_event)?
-        .and_then(|event| input_from_event(&control.source_event, event))
+        .map(|event| input_from_event(&control.source_event, event))
+        .transpose()?
+        .flatten()
         .context("queue input source is missing")?;
     let mut input = original.input;
     if let Some(text) = &control.text { input.text = text.clone(); }
@@ -4163,7 +4165,9 @@ impl Store {
             if *state == AssignmentState::Adopted && *revision > assignment.started_revision {
                 let hash = input_event.as_ref().context("adoption needs its input")?;
                 let input = log::event_from(&self.connection, network, hash)?
-                    .and_then(|event| input_from_event(hash, event))
+                    .map(|event| input_from_event(hash, event))
+                    .transpose()?
+                    .flatten()
                     .context("adoption input not found")?;
                 ensure!(
                     self.workspace_input_accepted(
@@ -4191,7 +4195,9 @@ impl Store {
                     .as_ref()
                     .context("assignment has no signed input source")?;
                 log::event_from(&self.connection, network, source)?
-                    .and_then(|event| input_from_event(source, event))
+                    .map(|event| input_from_event(source, event))
+                    .transpose()?
+                    .flatten()
                     .context("delegated workspace commands require the original signed input")?
             } else {
                 let source = self
@@ -5342,7 +5348,7 @@ pub(crate) fn bind_waiting_workspace_inputs_from(
         let source = log::event_from(connection, network, &source_event)?
             .context("waiting input source is missing")?;
         let input =
-            input_from_event(&source_event, source).context("waiting source is not an input")?;
+            input_from_event(&source_event, source)?.context("waiting source is not an input")?;
         ensure!(
             target_task(&input.input.route.target) == Some(task_id.as_str())
                 && input.input.route.expected_revision == Some(revision)

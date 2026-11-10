@@ -767,7 +767,7 @@ mod tests {
         let network=genesis.network_id.clone();let state=NetworkState::new(genesis)?;
         let fixture_client_id=key.device_id().to_owned();
         let effects=Arc::new(AtomicUsize::new(0));
-        let input=InputRequest {message_id:"original-message".into(),route:InputRoute {target:InputTarget::BotMain {bot_id:"bot".into()},intent:InputIntent::Continue,sequence:1,expected_revision:None},text:"controlled input".into(),attachments:vec![],report_results:Some(true)};
+        let input=InputRequest {message_id:"original-message".into(),route:InputRoute {target:InputTarget::BotMain {bot_id:"bot".into()},intent:InputIntent::Continue,sequence:1,expected_revision:None},text:"controlled input".into(),attachments:vec![],report_results:true};
         for cycle in 0..2 {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let origin=format!("http://{}",listener.local_addr()?);
@@ -936,7 +936,7 @@ mod offline_tests {
         Ok((Endpoint::Gateway(entry),task))
     }
     fn input(id:&str,target:InputTarget)->Action {
-        Action::Input {conversation_id:"chat".into(),input:InputRequest {message_id:id.into(),route:InputRoute {target,intent:InputIntent::Continue,sequence:0,expected_revision:Some(1)},text:format!("input {id}"),attachments:vec![],report_results:Some(true)}}
+        Action::Input {conversation_id:"chat".into(),input:InputRequest {message_id:id.into(),route:InputRoute {target,intent:InputIntent::Continue,sequence:0,expected_revision:Some(1)},text:format!("input {id}"),attachments:vec![],report_results:true}}
     }
     fn provider_change()->ProviderSettings {ProviderSettings {provider:Provider::Codex,bot:None,execution:None,execution_model:None,bin:None,app_server:None,connect_local:false,env:BTreeMap::from([("SYNTHETIC_KEY".into(),Some("synthetic-secret-never-in-review".into()))])}}
     #[tokio::test]

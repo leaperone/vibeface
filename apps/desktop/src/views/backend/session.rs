@@ -1,14 +1,16 @@
 use super::*;
 
 impl Backend{
+ pub(super) async fn cancel_reconnect(&mut self){if let Some(task)=self.reconnect_task.take(){task.abort();let _=task.await;}while let Ok(recovered)=self.recovery.try_recv(){if let Ok(client)=recovered.result{client.close();}}}
+ pub(super) async fn prepare_connection(&mut self,key:&ClientKey,network:&str,status:&str)->Result<Option<Client>>{
+ ensure!(key.network_id().is_none_or(|known|known==network),"目标设备属于另一个个人网络，原身份保持不变");self.cancel_reconnect().await;
+ let previous=self.take_profile_client()?;let key_network=key.network_id().map(str::to_owned);let reusable=previous.filter(|previous|previous.client.network_id()==network&&previous.client.client_id()==key.device_id()&&previous.key_network==key_network).map(|previous|previous.client);
+ self.active_record=ActiveRecord::None;self.key=None;self.active_entry=None;self.pushes=None;self.history_state=None;self.conversation=None;self.attachments.clear();self.reconnect=None;self.retry_attempt=0;self.retry_at=tokio::time::Instant::now();self.state=Snapshot{generation:self.state.generation+1,status:status.into(),..Default::default()};self.publish();Ok(reusable)
+ }
  pub(super) async fn connect(&mut self,key:Arc<ClientKey>,endpoint:Endpoint)->Result<()>{#[cfg(test)] Self::test_phase("connect-enter");
  endpoint.validate()?;let entry=match &endpoint{Endpoint::Gateway(entry)|Endpoint::Preferred{gateway:entry,..}=>entry.clone(),Endpoint::Lan{node_id,..}=>Entry{origin:String::new(),node_id:node_id.clone()},Endpoint::Local(_)=>anyhow::bail!("本机会话须通过明确的本机Node入口建立")};
- if let Some(task)=self.reconnect_task.take(){task.abort();let _=task.await;}
  let network=key.network_id().map(str::to_owned).or_else(||self.client_profiles.as_ref().and_then(|registry|registry.selected().hints.network.clone())).context("此身份没有可验证缓存位置，请通过邀请加入或明确连接本机Node")?;
- let profile_id=self.current_profile_id()?;let previous=self.client.take().or_else(||self.retired_clients.remove(&profile_id));
- let reusable=previous.as_ref().filter(|client|key.network_id()==Some(client.network_id())&&key.device_id()==client.client_id()&&!matches!(client.authority(),vibeface_client::ClientAuthority::LocalSession|vibeface_client::ClientAuthority::PrivateDataOnly{reason:vibeface_client::OfflineBlockReason::NotEnrolled})).cloned();if let Some(client)=&previous{client.close();}drop(previous);
- self.active_record=ActiveRecord::None;self.key=None;self.active_entry=None;self.pushes=None;self.history_state=None;self.conversation=None;self.attachments.clear();
- self.state=Snapshot{generation:self.state.generation+1,status:"正在验证目标设备和成员目录。".into(),..Default::default()};self.publish();
+ let reusable=self.prepare_connection(&key,&network,"正在验证目标设备和成员目录。").await?;
  let client=if let Some(client)=reusable{match client.reopen_offline(endpoint.clone()).await{Ok(client)=>client,Err(error)=>{ensure!(client.offline_block_reason().is_none(),"旧身份只允许读取已验证的本机私有数据：{error}");client.reconnect_or_offline(endpoint.clone()).await?}}}else{let outbox=self.prepare_outbox(&network,key.device_id())?;match Client::open_offline(key.clone(),endpoint.clone(),outbox.clone()).await{Ok(client)=>client,Err(error)=>{ensure!(key.network_id().is_some(),"此身份尚未加入网络，且找不到匹配的签名缓存；没有连接网络或申请授权：{error}");Client::open_or_offline(key.clone(),endpoint.clone(),outbox).await?}}};
  self.state.network=Some(client.network_id().into());self.state.client_id=Some(client.client_id().into());self.reconnect=Some(ReconnectTarget::Network(endpoint));self.active_entry=Some(entry);self.key=Some(key);self.pushes=Some(client.subscribe());self.client=Some(client);
  if !self.client()?.is_online(){self.load_projection().await?;return Ok(())}self.remember_profile_hints()?;self.identity(IdentityAction::Directory).await?;self.refresh().await?;self.flush_prepared().await

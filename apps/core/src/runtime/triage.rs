@@ -5183,7 +5183,7 @@ pub(super) mod tests {
             let target = InputTarget::Task { task_id: "held-task".into() };
             let input = InputRequest {
                 message_id: "task-input".into(), route: InputRoute { target: target.clone(), intent: InputIntent::Continue,
-                    sequence: 1, expected_revision: Some(1) }, text: "do the task".into(), attachments: vec![], report_results: Some(true),
+                    sequence: 1, expected_revision: Some(1) }, text: "do the task".into(), attachments: vec![], report_results: true,
             };
             let signed_input = admin.attest(&network, "c", EventBody::InputPosted {
                 message_id: input.message_id.clone(), target: target.clone(), intent: input.route.intent,

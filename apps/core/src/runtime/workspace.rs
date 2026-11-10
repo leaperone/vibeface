@@ -191,7 +191,7 @@ mod tests {
                     target: InputTarget::BotMain { bot_id: bot.bot_id },
                     intent: InputIntent::Defer, sequence: 1, expected_revision: None,
                 },
-                text: "saved input".into(), attachments: vec![], report_results: Some(true),
+                text: "saved input".into(), attachments: vec![], report_results: true,
             };
             let signed = admin.attest(&network, "c", EventBody::InputPosted {
                 message_id: request.message_id.clone(), target: request.route.target.clone(),

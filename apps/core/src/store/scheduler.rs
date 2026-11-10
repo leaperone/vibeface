@@ -5701,7 +5701,7 @@ mod hold_query_tests {
                 && !input.deferred
                 && !input.cancelled
                 && input.input.route.intent == crate::workspace::InputIntent::Continue
-                && input.input.report_results != Some(false)
+                && input.input.report_results
             {
                 if let Some(assignment) = &fixed_assignment
                     && !crate::store::workspace::workspace_assignment_for_job_from(

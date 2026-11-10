@@ -177,13 +177,13 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
                 target: InputTarget::BotMain { bot_id: "fixture-bot".into() },
                 intent: InputIntent::Continue, sequence: 1, expected_revision: None,
             },
-            text: "Fixture input".into(), attachments: vec![], report_results: Some(true),
+            text: "Fixture input".into(), attachments: vec![], report_results: true,
         };
         let signed_input = self.admin.attest(network, "scope", EventBody::InputPosted {
             message_id: input.message_id.clone(), target: input.route.target.clone(),
             intent: input.route.intent, sequence: input.route.sequence,
             expected_revision: input.route.expected_revision, text: input.text.clone(),
-            attachments: input.attachments.clone(), report_results: input.report_results,
+            attachments: input.attachments.clone(), report_results: Some(input.report_results),
             attestation: None,
         })?;
         let network = network.clone();

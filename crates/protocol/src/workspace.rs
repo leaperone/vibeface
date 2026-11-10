@@ -59,8 +59,7 @@ pub struct InputRequest {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report_results: Option<bool>,
+    pub report_results: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -394,6 +393,24 @@ impl Attachment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_requires_an_explicit_boolean_reporting_choice() {
+        let mut input=serde_json::json!({"message_id":"input-1","target":{"kind":"bot_main","bot_id":"bot-1"},"intent":"defer","sequence":1,"text":"Keep this input deferred"});
+        assert!(serde_json::from_value::<InputRequest>(input.clone()).is_err(),"missing reporting choice must not become a default");
+        for invalid in [serde_json::Value::Null,serde_json::json!("true"),serde_json::json!(0)] {
+            input["report_results"]=invalid;
+            assert!(serde_json::from_value::<InputRequest>(input.clone()).is_err(),"reporting choice must be a JSON boolean");
+        }
+        input["report_results"]=serde_json::json!(true);
+        let reports:InputRequest=serde_json::from_value(input.clone()).unwrap();
+        assert!(reports.report_results);
+        assert_eq!(serde_json::to_value(reports).unwrap()["report_results"],serde_json::json!(true));
+        input["report_results"]=serde_json::json!(false);
+        let quiet:InputRequest=serde_json::from_value(input).unwrap();
+        assert!(!quiet.report_results);
+        assert_eq!(serde_json::to_value(quiet).unwrap()["report_results"],serde_json::json!(false));
+    }
+
     #[test]
     fn all_six_input_targets_and_cas_controls_preserve_the_wire_shape() {
         let targets = [

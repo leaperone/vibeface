@@ -141,10 +141,10 @@ mod tests {
     }
     fn post(f: &mut Fixture, id: &str, at: i64) -> Result<String> {
         let request = InputRequest { message_id: id.into(), route: InputRoute { target: InputTarget::BotMain { bot_id: "bot".into() },
-            intent: InputIntent::Defer, sequence: at as u64, expected_revision: None }, text: "Saved input".into(), attachments: vec![], report_results: Some(true) };
+            intent: InputIntent::Defer, sequence: at as u64, expected_revision: None }, text: "Saved input".into(), attachments: vec![], report_results: true };
         let signed = f.admin.attest(&f.network, "c", EventBody::InputPosted { message_id: id.into(), target: request.route.target.clone(),
             intent: request.route.intent, sequence: request.route.sequence, expected_revision: None, text: request.text.clone(),
-            attachments: vec![], report_results: request.report_results, attestation: None })?;
+            attachments: vec![], report_results: Some(request.report_results), attestation: None })?;
         Ok(f.store.post_workspace_input(&f.node, &f.network, request, signed.attestation().cloned().context("input signature")?, at)?.source_event)
     }
     fn file(f: &mut Fixture, content: &[u8], name: &str) -> Result<Attachment> {

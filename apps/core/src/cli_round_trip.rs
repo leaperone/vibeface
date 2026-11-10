@@ -177,6 +177,42 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let bots = crate::client::operator_call(&node, "rpc", json!({"method":"bots"})).await?;
         assert_eq!(bots["bots"][0]["bot_id"], "b1");
         assert!(!bots["primary"].is_null());
+        // The actual native producer crosses Noise and Core's signature/shape boundary.
+        // Defer proves storage/admission without scheduling a Provider turn.
+        assert!(node.settings_snapshot().manager.is_none());
+        for (message_id,report_results) in [("native-reports",true),("native-no-reports",false)] {
+            let accepted=phone_client.submit(client::Action::Input {
+                conversation_id:scope.clone(),
+                input:client::wire::InputRequest {
+                    message_id:message_id.into(),
+                    route:client::wire::InputRoute {target:client::wire::InputTarget::BotMain {bot_id:bot_id.clone()},intent:client::wire::InputIntent::Defer,sequence:0,expected_revision:None},
+                    text:"Native input saved without running a Provider".into(),attachments:vec![],report_results,
+                },
+            }).await?;
+            assert_eq!(accepted.state,client::OperationState::Accepted,"real Core must accept native signed input");
+            let receipt=accepted.result.context("native input acceptance receipt")?;
+            assert_eq!(receipt["accepted"],json!(true));
+            assert_eq!(receipt["message_id"],message_id);
+            assert_eq!(receipt["state"],"deferred");
+            assert_eq!(receipt["receipt"]["state"],"deferred");
+            let network=network.clone();let scope=scope.clone();let id=message_id.to_owned();
+            let (stored,queued,event,has_job)=node.store.call("native_input_reporting_acceptance",move|store| {
+                let stored=store.workspace_input(&network,&id)?.context("native input was not stored")?;
+                let queued=store.queued_workspace_input(&network,&id)?.context("native input queue projection missing")?;
+                let event=store.event(&network,&stored.source_event)?.context("native signed event missing")?;
+                let has_job=store.scheduler_job(&scope,&crate::scheduling::message_trigger(&id))?.is_some();
+                Ok((stored,queued,event,has_job))
+            }).await?;
+            assert_eq!(stored.input.message_id,message_id);
+            assert_eq!(stored.input.report_results,report_results);
+            assert_eq!(stored.input.route.intent,client::wire::InputIntent::Defer);
+            assert!(queued.deferred);assert!(!queued.cancelled);assert!(!has_job,"a deferred input must not create a Provider job");
+            let canonical:serde_json::Value=serde_json::from_str(&event.canonical_body)?;
+            assert_eq!(canonical["body"]["type"],"input_posted");
+            assert_eq!(canonical["body"]["report_results"],json!(report_results));
+            assert_eq!(canonical["body"]["intent"],"defer");
+        }
+
         let forged = json!({"type":"bot_deleted"});
         let mut attestation = session.attest(&scope, &forged)?;
         attestation["device_id"] = json!(phone_id);

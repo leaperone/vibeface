@@ -1,4 +1,5 @@
-//! A debug generator budget catches oversized transport futures before they enter a Tokio stack.
+//! Bounds retained async state size, which does not measure generated poll-function stack use.
+//! Real actor form-boundary and cold-offline tests exercise the default worker stack.
 #[path="../src/app.rs"]#[allow(dead_code,unused_imports)]mod app;
 #[path="../src/host/mod.rs"]#[allow(dead_code,unused_imports)]mod host;
 #[path="../src/ui.rs"]#[allow(dead_code)]mod ui;

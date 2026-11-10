@@ -224,7 +224,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `conversation_history` | `conversation_id`、`section`，可选 `cursor`、`limit` | 读取指定分区的一页完整记录，返回 `{conversation_id, section, history_authority, items, next_cursor, complete}`。默认 50 项，limit 为 1 至 100；游标不可跨网络、会话、分区或负责人复用。详见[会话历史分页](#会话历史分页) |
 | `open_works` | 无 | 全网仍要本人看的工作 `{works}`：没有结果或结果未知的工作；每个会话最新结束的工作失败或被拒、且还没跟进的那一项；以及本机发出、被拒且还没跟进的派发。跟进指之后又有工作结束、本人在它结束后发的消息有了完成的回复、它的汇报回合回复完成，或本人在待处理关掉它。只在 SQL 里选出这些工作，不读整段历史。派发项的 `state` 为 `dispatch_rejected`，没有 `outcome`。只有本人客户端能调用 |
 | `workspace_overview` | 可选 `conversation_id`、`limit`（1 至 256，默认 256）、`include_finished`（默认 `false`）、`include_sessions`（默认 `true`）；不支持 `cursor` | 本机所知事实的有界只读汇总，只给本人客户端：`{schema: 1, generated_at_ms, network_epoch, heads, consistency, truncated, conversations, bots, tasks, questions, checks, jobs, sessions, deliveries, relations, coverage}`。只含未删除 Bot 的会话。不带 `include_finished` 时 `tasks` 只取 `open_works` 那部分工作，已结束的只按 SQL 计数进 `coverage.omitted_finished`；本机还没被接收、被拒（仍未跟进）或结果未知的派发，以及已接收但工作还没同步来的派发（`accepted_waiting_sync`）也列进 `tasks` 和 `deliveries`。各列表超过 `limit` 时截断，`truncated` 为 `true`，`coverage.omitted_*` 给出截掉的条数。负责人是其他设备的会话不去问它，列进 `coverage.remote_owners`，此时 `consistency` 为 `partial` |
-| `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments`、`report_results` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
+| `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`report_results`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作；排队中的回合记为已停止并写一条 `stopped` 回复。本机不持有该回合时转给会话负责人，超时返回 `{cancel_requested: false, unconfirmed: true, owner}`，不重发，客户端重读会话对账 |
 | `reply_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，为其中仍未回复的消息排队回复，返回 `{receipts}`；重试不会再排 |
@@ -388,7 +388,7 @@ Event {
 | `bot_project_set` | `project`、`attestation` | 入口 Node，写在该 bot 的会话 |
 | `bot_avatar_set` | `version`、`avatar`、`attestation` | 入口 Node，写在该 bot 的会话；`version` 为 `null` 或 16 位十六进制，签名覆盖 `version`，投影只用 `avatar` |
 | `message_steered` | `message_id`、`reply` | steer 这条本人消息的 Node，在宿主回复 `reply` 完成且消息并入其中时写 |
-| `input_posted` | `message_id`、`target`、`intent`、`sequence`、`expected_revision?`、`text`、`attachments`（空时省略）、`report_results?`、`attestation?` | 入口 Node 封装本人签名的普通输入 |
+| `input_posted` | `message_id`、`target`、`intent`、`sequence`、`expected_revision?`、`text`、`attachments`（空时省略）、`report_results`、`attestation?` | 入口 Node 封装本人签名的普通输入 |
 | `workspace_commanded` | `command_id`、`command`、`acting_assignment?`、`attestation?`、`cause?` | 命令写入 Node；按具体命令核验本人签名、Bot 因果来源或执行 Node 身份 |
 | `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`failure?`、`answers?`、`attestation?` | 本人对原问题的答案（含普通问题与审批）由接收答案的 Node 写，`answers` 绑定原问题，`message_id` 为 `a-<question_id>`；assistant 回复由负责人写 |
 | `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（执行它的产品名，或 `task`）、`model?`、`resolved {provider, model}`、`cwd`、`title`、`prompt`、`continues?`、`parent?`、`thread?` | 目标 Node；`resolved` 必填，其 `model` 为 `null` 时跟随 Provider 默认 |
@@ -566,7 +566,7 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`，`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`。临时进度不写入事件日志。客户端读取 `conversation` 时，入口为该会话建立有界的只读观察，经 `progress_read` 从负责人和执行节点读取进度。回合状态变化时，该设备在进度环里放一条只在环内的 `job_changed` 提示，观察方收到后让客户端重读会话；它不进事件日志，也不推给本机客户端。
 
-`message.report_results` 默认 `true`，保存在签名的用户消息中。为 `false` 时，该消息引出的工作结束后不再入队汇报。
+客户端界面默认选择 `report_results=true`。签名输入和 `message` RPC 必须显式携带布尔值 `report_results`，该值保存在用户输入中；缺失、null 或非布尔值会被拒绝。为 `false` 时，该消息引出的工作结束后不再入队汇报。
 
 协调 Agent 总是完全权限，没有自主度设置和只读汇报轮。
 

@@ -132,7 +132,7 @@ impl Store {
             },
             text,
             attachments,
-            report_results,
+            report_results: report_results.context("signed input fixture requires report_results")?,
         };
         let stored = self.post_workspace_input(identity, network, input, attestation, at)?;
         let receipt =
@@ -13061,7 +13061,7 @@ fn workspace_input_fixture(
         },
         text: format!("input {id}"),
         attachments: vec![],
-        report_results: Some(true),
+        report_results: true,
     };
     workspace_signed_input_fixture(net, origin, &net.a, input, at)
 }
@@ -16848,7 +16848,7 @@ fn workspace_signed_input_fixture(
             expected_revision: input.route.expected_revision,
             text: input.text.clone(),
             attachments: input.attachments.clone(),
-            report_results: input.report_results,
+            report_results: Some(input.report_results),
             attestation: None,
         },
     )?;
@@ -16934,7 +16934,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 },
                 text: "perform the task".into(),
                 attachments: vec![],
-                report_results: Some(reports),
+                report_results: reports,
             },
             4,
         )?;
@@ -17468,7 +17468,7 @@ fn an_owner_freezes_a_partial_dag_followup_to_its_first_assignment() -> Result<(
             },
             text: "continue this task".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         7,
     )?;
@@ -17659,7 +17659,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
             },
             text: "full inbox".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         8,
     )?;
@@ -17711,7 +17711,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
                 },
                 text: message_id.into(),
                 attachments: vec![],
-                report_results: Some(true),
+                report_results: true,
             },
             9 + index as i64,
         )?;
@@ -17962,7 +17962,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
             },
             text: "replacement".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         24,
     )?;
