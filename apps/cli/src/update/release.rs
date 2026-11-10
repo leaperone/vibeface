@@ -883,45 +883,7 @@ pub(crate) fn same_package_bytes(left: &Path, right: &Path) -> Result<bool> {
 }
 
 fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
-    let metadata = fs::symlink_metadata(package.join("BUILD-INFO.json"))?;
-    ensure!(
-        metadata.file_type().is_file() && metadata.len() <= 4096,
-        "BUILD-INFO exceeds limit"
-    );
-    let entries = tree(package)?;
-    let checksums = fs::read_to_string(package.join("FILES.sha256"))?;
-    ensure!(
-        checksums.len() <= 1024 * 1024,
-        "file checksums exceed limit"
-    );
-    let mut declared = BTreeMap::new();
-    for line in checksums.lines() {
-        let (hash, name) = line.split_once("  ").context("invalid file checksum")?;
-        ensure!(name != "FILES.sha256", "self-referencing checksum");
-        ensure!(
-            declared
-                .insert(PathBuf::from(name), hash.to_owned())
-                .is_none(),
-            "duplicate file checksum"
-        );
-    }
-    let actual: BTreeMap<_, _> = entries
-        .iter()
-        .filter_map(|(name, entry)| match entry {
-            TreeEntry::File { sha256, .. } if name != Path::new("FILES.sha256") => Some((
-                name.clone(),
-                sha256
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-            )),
-            _ => None,
-        })
-        .collect();
-    ensure!(declared == actual, "package file checksums differ");
-    let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
-        .context("package does not declare a supported update protocol and data epoch")?;
-    build.validate()?;
+    let build = verify_sealed_contents(package, &release.target)?;
     ensure!(
         build.version == release.version.to_string()
             && build.target == release.target
@@ -1054,20 +1016,8 @@ fn tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mark_runnable;
     use flate2::{Compression, write::GzEncoder};
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
-    }
 
     #[test]
     fn channels_accept_only_canonical_release_tags() {

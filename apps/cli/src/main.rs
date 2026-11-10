@@ -2479,6 +2479,18 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    pub(crate) fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(vibeface_bridge::platform::privatefs::is_executable(path));
+    }
+
     const TEST_PRIVATE_NODE: &str = if cfg!(windows) {
         r"C:\vibeface\private\node"
     } else {

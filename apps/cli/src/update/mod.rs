@@ -1716,19 +1716,7 @@ async fn checked(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
-    }
+    use crate::tests::mark_runnable;
 
     /// Writes a fixture service script that records the arguments it was handed.
     fn recording_service_script(package: &Path) -> PathBuf {

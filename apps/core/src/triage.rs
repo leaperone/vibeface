@@ -1,8 +1,8 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
-//! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
-//! installation. The coordination Agent judges; nothing here decides what matters.
+//! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery. The
+//! coordination Agent judges; nothing here decides what matters.
 use crate::crypto::hmac_sha256;
-use crate::providers::{Provider, Watch};
+use crate::providers::Provider;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -676,139 +676,6 @@ impl OutboxEntry {
     }
 }
 
-/// Hook files `vibeface hooks install` edits under a home directory.
-pub struct HookFile {
-    pub agent: Provider,
-    pub path: PathBuf,
-    pub events: &'static [&'static str],
-}
-
-/// The hook files under `home`, Codex's under `codex_home`.
-pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
-    hook_files_with_claude_root(home, &home.join(".claude"), codex_home)
-}
-
-/// Hook files when the caller already resolved the provider-owned Claude config root.
-pub fn hook_files_with_claude_root(
-    home: &Path,
-    claude_home: &Path,
-    codex_home: &Path,
-) -> Vec<HookFile> {
-    Provider::ALL
-        .into_iter()
-        .filter_map(|agent| match agent.watch()? {
-            Watch::Hooks { file, events } => Some(HookFile {
-                agent,
-                path: match agent {
-                    Provider::Codex => codex_home.join(file),
-                    Provider::Claude => claude_home.join("settings.json"),
-                    _ => home.join(file),
-                },
-                events,
-            }),
-            Watch::Extension { .. } => None,
-        })
-        .collect()
-}
-
-/// An extension's code as `vibeface hooks install` writes it (see `Watch::Extension`).
-pub fn extension_code(source: &str, program: &Path, agent: Provider, data_dir: &Path) -> String {
-    let hook = json!([
-        program.to_string_lossy(),
-        "hook",
-        agent.name(),
-        "--data-dir",
-        data_dir.to_string_lossy()
-    ]);
-    source.replace("__VIBEFACE_HOOK__", &hook.to_string())
-}
-
-pub fn hook_command(program: &Path, agent: Provider, data_dir: &Path) -> String {
-    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
-    format!(
-        "{} hook {} --data-dir {}",
-        quote(&program.to_string_lossy()),
-        agent.name(),
-        quote(&data_dir.to_string_lossy())
-    )
-}
-
-fn ours(entry: &Value, agent: Provider) -> bool {
-    entry["hooks"].as_array().is_some_and(|hooks| {
-        hooks.iter().any(|hook| {
-            hook["command"].as_str().is_some_and(|command| {
-                command.contains(&format!(" hook {} ", agent.name()))
-                    && command.contains("vibeface")
-            })
-        })
-    })
-}
-
-/// Adds this Node's hook to each event of `settings`, leaving every other entry in place.
-/// Returns the events it added; an event that already has it is left alone.
-pub fn add_hooks(settings: &mut Value, file: &HookFile, command: &str) -> Result<Vec<String>> {
-    if settings.is_null() {
-        *settings = json!({});
-    }
-    let hooks = settings
-        .as_object_mut()
-        .context("hook file is not a JSON object")?
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("`hooks` is not an object")?;
-    let mut added = Vec::new();
-    for event in file.events {
-        let entries = hooks
-            .entry(*event)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .with_context(|| format!("`hooks.{event}` is not a list"))?;
-        if entries.iter().any(|entry| ours(entry, file.agent)) {
-            continue;
-        }
-        // A Claude Code permission request waits for the bot's answer.
-        let timeout = match (file.agent, *event) {
-            (Provider::Claude, "PermissionRequest") => {
-                crate::runtime::HOOK_ANSWER_WITHIN.as_secs() + 15
-            }
-            _ => 10,
-        };
-        entries.push(json!({"hooks":[{"type":"command","command":command,"timeout":timeout}]}));
-        added.push((*event).to_owned());
-    }
-    Ok(added)
-}
-
-/// Removes only entries this tool added; returns the events it changed.
-pub fn remove_hooks(settings: &mut Value, file: &HookFile) -> Vec<String> {
-    let mut removed = Vec::new();
-    if let Some(hooks) = settings["hooks"].as_object_mut() {
-        for event in file.events {
-            if let Some(entries) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
-                let before = entries.len();
-                entries.retain(|entry| !ours(entry, file.agent));
-                if entries.len() != before {
-                    removed.push((*event).to_owned());
-                }
-            }
-        }
-    }
-    removed
-}
-
-pub fn installed(settings: &Value, file: &HookFile) -> Vec<String> {
-    file.events
-        .iter()
-        .filter(|event| {
-            settings["hooks"][**event]
-                .as_array()
-                .is_some_and(|entries| entries.iter().any(|entry| ours(entry, file.agent)))
-        })
-        .map(|event| (*event).to_owned())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,54 +851,6 @@ mod tests {
             .validate()
             .is_ok()
         );
-    }
-
-    #[test]
-    fn hook_install_appends_once_and_removes_only_its_own_entries() {
-        let home = Path::new("/home/u");
-        let codex_home = Path::new("/srv/codex");
-        let [codex, claude] = &hook_files(home, codex_home)[..] else {
-            panic!("Codex and Claude Code take hooks");
-        };
-        assert_eq!(codex.path, codex_home.join("hooks.json"));
-        assert_eq!(
-            claude.path,
-            home.join(".claude/settings.json"),
-            "CODEX_HOME moves only Codex's hooks"
-        );
-        let command = hook_command(
-            Path::new("/opt/vibeface"),
-            Provider::Claude,
-            Path::new("/d'x"),
-        );
-        assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
-        let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
-        let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
-        assert_eq!(
-            add_hooks(&mut settings, claude, &command).unwrap(),
-            ["Stop", "StopFailure", "Notification", "PermissionRequest"]
-        );
-        assert!(
-            add_hooks(&mut settings, claude, &command)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(settings["hooks"]["Stop"][0], other);
-        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
-        assert_eq!(
-            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 45,
-            "a permission request outlasts the wait for the bot's answer"
-        );
-        assert_eq!(installed(&settings, claude).len(), 4);
-        assert!(installed(&settings, codex).is_empty());
-        assert_eq!(remove_hooks(&mut settings, claude).len(), 4);
-        assert_eq!(
-            settings,
-            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[],
-                "PermissionRequest":[]}})
-        );
-        assert!(add_hooks(&mut json!([]), codex, &command).is_err());
     }
 
     #[test]

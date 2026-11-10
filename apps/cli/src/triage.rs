@@ -528,4 +528,58 @@ mod tests {
         .unwrap();
         assert_eq!(event.hold, Some(RequestKind::Continue));
     }
+
+    #[test]
+    fn hook_install_appends_once_and_removes_only_its_own_entries() {
+        let home = Path::new("/home/u");
+        let codex_home = Path::new("/srv/codex");
+        let [codex, claude] =
+            &hook_files_with_claude_root(home, &home.join(".claude"), codex_home)[..]
+        else {
+            panic!("Codex and Claude Code take hooks");
+        };
+        assert_eq!(codex.path, codex_home.join("hooks.json"));
+        assert_eq!(
+            claude.path,
+            home.join(".claude/settings.json"),
+            "CODEX_HOME moves only Codex's hooks"
+        );
+        let custom_claude = home.join("custom-claude");
+        let custom = hook_files_with_claude_root(home, &custom_claude, codex_home);
+        assert_eq!(custom[0].path, codex.path);
+        assert_eq!(custom[1].path, custom_claude.join("settings.json"));
+        let command = hook_command(
+            Path::new("/opt/vibeface"),
+            Provider::Claude,
+            Path::new("/d'x"),
+        );
+        assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
+        let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
+        let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
+        assert_eq!(
+            add_hooks(&mut settings, claude, &command).unwrap(),
+            ["Stop", "StopFailure", "Notification", "PermissionRequest"]
+        );
+        assert!(
+            add_hooks(&mut settings, claude, &command)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(settings["hooks"]["Stop"][0], other);
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 45,
+            "a permission request outlasts the wait for the bot's answer"
+        );
+        assert_eq!(installed(&settings, claude).len(), 4);
+        assert!(installed(&settings, codex).is_empty());
+        assert_eq!(remove_hooks(&mut settings, claude).len(), 4);
+        assert_eq!(
+            settings,
+            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[],
+                "PermissionRequest":[]}})
+        );
+        assert!(add_hooks(&mut json!([]), codex, &command).is_err());
+    }
 }
