@@ -1635,12 +1635,11 @@ async fn codex(socket: Option<PathBuf>, command: CodexCommand) -> Result<()> {
             effort,
             image,
         } => {
-            ensure!(
-                std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
-                "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one, ask the bot in its chat"
-            );
             let args = json!({"thread":thread,"prompt":text,"call_ref":id,"agent":"codex","model":model,"effort":effort,"images":image});
-            let result = dispatch_work(&args, &id, socket.as_deref()).await?;
+            let tools = ToolContext::from_env().map_err(|error| {
+                report_tool_failure("dispatch_work", &args, "authorization", false, &error)
+            })?;
+            let result = dispatch_work(&tools, &args, &id, socket.as_deref()).await?;
             println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
@@ -1667,26 +1666,18 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
+    let tools = ToolContext::from_env()
+        .map_err(|error| report_tool_failure(&name, &arguments, "authorization", false, &error))?;
     if name != "dispatch_work" {
         let result = post_tool(
+            &tools,
             &name,
             arguments.clone(),
             call_ref.as_deref().unwrap_or_default(),
         )
         .await
         .map_err(|error| {
-            let response = tool_failure(&name, &arguments, "execution", call_ref.is_some(), &error);
-            eprintln!(
-                "{}",
-                serde_json::to_string(&response)
-                    .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
-            );
-            anyhow::anyhow!(
-                response["error"]
-                    .as_str()
-                    .unwrap_or("tool call failed")
-                    .to_owned()
-            )
+            report_tool_failure(&name, &arguments, "execution", call_ref.is_some(), &error)
         })?;
         // Core performs schema validation and annotation at the authenticated HTTP boundary.
         println!("{}", serde_json::to_string(&result)?);
@@ -1715,22 +1706,10 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     );
     let result = {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from);
-        dispatch_work(&arguments, call_id, socket.as_deref()).await
+        dispatch_work(&tools, &arguments, call_id, socket.as_deref()).await
     };
-    let result = result.map_err(|error| {
-        let response = tool_failure(&name, &arguments, "execution", true, &error);
-        eprintln!(
-            "{}",
-            serde_json::to_string(&response)
-                .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
-        );
-        anyhow::anyhow!(
-            response["error"]
-                .as_str()
-                .unwrap_or("tool call failed")
-                .to_owned()
-        )
-    })?;
+    let result = result
+        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
     println!(
         "{}",
         serde_json::to_string(&annotate_tool(&name, &arguments, result))?
@@ -1738,15 +1717,20 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     Ok(())
 }
 
-async fn dispatch_work(arguments: &Value, call_id: &str, socket: Option<&Path>) -> Result<Value> {
+async fn dispatch_work(
+    tools: &ToolContext,
+    arguments: &Value,
+    call_id: &str,
+    socket: Option<&Path>,
+) -> Result<Value> {
     vibeface_control::agent::dispatch(
         arguments,
-        |ref_id| post_tool("call_lookup", json!({"call_ref":ref_id}), call_id),
-        |args| post_tool("track_work", args, call_id),
-        |work_id, report| post_tool("bind_work", json!({"work_id":work_id,"report":report}), call_id),
+        |ref_id| post_tool(tools, "call_lookup", json!({"call_ref":ref_id}), call_id),
+        |args| post_tool(tools, "track_work", args, call_id),
+        |work_id, report| post_tool(tools, "bind_work", json!({"work_id":work_id,"report":report}), call_id),
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
-            let ready = post_tool("wait_work", asked, call_id).await?;
+            let ready = post_tool(tools, "wait_work", asked, call_id).await?;
             Ok(ready["agent"].as_str().map(str::to_owned))
         },
         socket,
@@ -1784,16 +1768,51 @@ fn is_loopback(url: &Url) -> bool {
     })
 }
 
-async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value> {
-    let url =
-        origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
-    ensure!(
-        is_loopback(&url),
-        "SDK tools must connect to a loopback node URL"
-    );
-    let token = std::env::var("VIBEFACE_TOOL_TOKEN").context("VIBEFACE_TOOL_TOKEN is required")?;
-    ensure!(!token.is_empty(), "VIBEFACE_TOOL_TOKEN is empty");
-    let response = reqwest::Client::builder().timeout(Duration::from_secs(30)).no_proxy().redirect(reqwest::redirect::Policy::none()).build()?.post(url.join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?).bearer_auth(token).json(&json!({"toolName":name,"args":arguments,"agentId":"cli"})).send().await.map_err(|error| anyhow::anyhow!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying: {error}"))?;
+struct ToolContext {
+    url: Url,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl ToolContext {
+    fn from_env() -> Result<Self> {
+        Self::new(
+            std::env::var("VIBEFACE_NODE_URL").ok().as_deref(),
+            std::env::var("VIBEFACE_TOOL_TOKEN").ok().as_deref(),
+        )
+    }
+
+    fn new(node_url: Option<&str>, token: Option<&str>) -> Result<Self> {
+        let context = || {
+            let url = origin(node_url.context("VIBEFACE_NODE_URL is required")?)?;
+            ensure!(
+                is_loopback(&url),
+                "SDK tools must connect to a loopback node URL"
+            );
+            let token = token.context("VIBEFACE_TOOL_TOKEN is required")?;
+            ensure!(!token.is_empty(), "VIBEFACE_TOOL_TOKEN is empty");
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            Ok(Self {
+                url,
+                token: token.to_owned(),
+                client,
+            })
+        };
+        context().context("tool authorization requires a live Bot turn; open an authenticated browser enrolled in your personal network and send a new task in the Bot chat for the Bot to dispatch; do not copy tool tokens from other sessions")
+    }
+}
+
+async fn post_tool(
+    tools: &ToolContext,
+    name: &str,
+    arguments: Value,
+    call_id: &str,
+) -> Result<Value> {
+    let response = tools.client.post(tools.url.join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?).bearer_auth(&tools.token).json(&json!({"toolName":name,"args":arguments,"agentId":"cli"})).send().await.map_err(|error| anyhow::anyhow!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying: {error}"))?;
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
@@ -1831,7 +1850,32 @@ fn tool_failure(
     unknown: bool,
     error: &anyhow::Error,
 ) -> Value {
-    json!({"error":format!("{error:#}"),"code":if stage == "validation" { "invalid_tool_arguments" } else { "tool_execution_failed" },"call_record":{"tool":name,"call_ref":args.get("call_ref"),"stage":stage,"execution":if unknown { "unknown" } else { "not_started" },"confirmation":if unknown { "unknown" } else { "confirmed" },"approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}})
+    json!({"error":format!("{error:#}"),"code":match stage {
+        "validation" => "invalid_tool_arguments",
+        "authorization" => "tool_not_authorized",
+        _ => "tool_execution_failed",
+    },"call_record":{"tool":name,"call_ref":args.get("call_ref"),"stage":stage,"execution":if unknown { "unknown" } else { "not_started" },"confirmation":if unknown { "unknown" } else { "confirmed" },"approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}})
+}
+
+fn report_tool_failure(
+    name: &str,
+    args: &Value,
+    stage: &str,
+    unknown: bool,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    let response = tool_failure(name, args, stage, unknown, error);
+    eprintln!(
+        "{}",
+        serde_json::to_string(&response)
+            .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
+    );
+    anyhow::anyhow!(
+        response["error"]
+            .as_str()
+            .unwrap_or("tool call failed")
+            .to_owned()
+    )
 }
 
 fn annotate_tool(name: &str, args: &Value, mut value: Value) -> Value {
@@ -3002,6 +3046,94 @@ mod tests {
         assert!(is_loopback(&origin("http://127.0.0.1:4790").unwrap()));
         assert!(is_loopback(&origin("http://[::1]:4790").unwrap()));
         assert!(!is_loopback(&origin("http://192.168.1.5:4790").unwrap()));
+    }
+
+    #[test]
+    fn tool_preflight_authorization_is_not_started_but_send_failures_remain_unknown() {
+        let args = json!({"call_ref":"dispatch-preflight"});
+        let error = anyhow::anyhow!("VIBEFACE_TOOL_TOKEN is required");
+        let rejected = tool_failure("dispatch_work", &args, "authorization", false, &error);
+        assert_eq!(rejected["code"], "tool_not_authorized");
+        assert_eq!(rejected["call_record"]["stage"], "authorization");
+        assert_eq!(rejected["call_record"]["execution"], "not_started");
+        assert_eq!(rejected["call_record"]["confirmation"], "confirmed");
+        assert_eq!(rejected["call_record"]["retry"], "none");
+
+        let unknown = tool_failure("dispatch_work", &args, "execution", true, &error);
+        assert_eq!(unknown["code"], "tool_execution_failed");
+        assert_eq!(unknown["call_record"]["execution"], "unknown");
+        assert_eq!(unknown["call_record"]["confirmation"], "unknown");
+        assert_eq!(unknown["call_record"]["retry"], "lookup_same_ref");
+    }
+
+    #[test]
+    fn tool_preflight_rejects_missing_or_invalid_context_without_exposing_credentials() {
+        let token = "fixture-tool-token-do-not-log";
+        for (url, token, reason) in [
+            (None, Some(token), "VIBEFACE_NODE_URL is required"),
+            (
+                Some("http://127.0.0.1:1"),
+                None,
+                "VIBEFACE_TOOL_TOKEN is required",
+            ),
+            (
+                Some("http://127.0.0.1:1"),
+                Some(""),
+                "VIBEFACE_TOOL_TOKEN is empty",
+            ),
+            (
+                Some("fixture-tool-token-do-not-log"),
+                Some(token),
+                "invalid node URL",
+            ),
+            (
+                Some("https://example.invalid"),
+                Some(token),
+                "SDK tools must connect to a loopback node URL",
+            ),
+            (
+                Some("http://user:fixture-tool-token-do-not-log@localhost"),
+                Some(token),
+                "node URL must not contain credentials",
+            ),
+            (
+                Some("http://localhost/?token=fixture-tool-token-do-not-log"),
+                Some(token),
+                "node URL must not contain query or fragment",
+            ),
+        ] {
+            let Err(error) = ToolContext::new(url, token) else {
+                panic!("invalid tool context was accepted")
+            };
+            let response = tool_failure(
+                "dispatch_work",
+                &json!({"call_ref":"dispatch-preflight"}),
+                "authorization",
+                false,
+                &error,
+            );
+            let message = response["error"].as_str().unwrap();
+            assert!(message.contains(reason));
+            assert!(message.contains("new task in the Bot chat"));
+            assert!(message.contains("do not copy tool tokens"));
+            assert!(!message.contains("fixture-tool-token-do-not-log"));
+            assert_eq!(response["call_record"]["execution"], "not_started");
+            assert_eq!(response["call_record"]["retry"], "none");
+        }
+    }
+
+    #[test]
+    fn tool_preflight_accepts_loopback_context_without_sending() {
+        for url in [
+            "http://127.0.0.1:1",
+            "http://[::1]:1",
+            "http://localhost:1",
+            "https://localhost:1",
+        ] {
+            let context = ToolContext::new(Some(url), Some("fixture-token")).unwrap();
+            assert_eq!(context.url.as_str().trim_end_matches('/'), url);
+            assert_eq!(context.token, "fixture-token");
+        }
     }
 
     #[tokio::test]
