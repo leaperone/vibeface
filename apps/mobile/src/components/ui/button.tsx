@@ -110,7 +110,8 @@ function Button({ className, variant, size, instant, style, onPressIn, onPressOu
     <TextClassContext.Provider value={cn(buttonTextVariants({ variant, size }), muted && 'text-muted-foreground')}>
       <AnimatedPressable
         className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
-        role="button"
+        // `role` outranks `accessibilityRole`, so a caller's radio or tab keeps its own.
+        role={props.accessibilityRole ? undefined : 'button'}
         {...props}
         style={[typeof style === 'function' ? undefined : style, pressed, !instant && fade]}
         onPressIn={(event) => { scale.value = withTiming(variant === 'link' ? 1 : 0.97, tap); onPressIn?.(event); }}

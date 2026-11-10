@@ -6,7 +6,7 @@ import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx
 import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
-import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
@@ -54,6 +54,12 @@ export function useInbox(): InboxItem[] {
   const device = useDevice()
   const shared = useLive()
   return shared ? inboxItems({ device, workspace: shared }).filter((item) => item.kind !== 'session') : []
+}
+
+/** How many things wait on the person, as the home card and the 待处理 tab count them. */
+export function useWaiting(): number {
+  const shared = useLive()
+  return waitingItems(useInbox()).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
 }
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */

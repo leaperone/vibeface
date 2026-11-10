@@ -1,16 +1,16 @@
 import * as Clipboard from 'expo-clipboard'
 import { Link, type Href } from 'expo-router'
-import { Asterisk, Braces, Check, ChevronDown, ChevronRight, Copy, MousePointer2, Pi, SquareTerminal, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { Asterisk, Braces, Check, ChevronRight, Copy, MousePointer2, Pi, SquareTerminal, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { Children, Fragment, isValidElement, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, Pressable, View } from 'react-native'
-import Animated, { useReducedMotion } from 'react-native-reanimated'
+import Animated, { LayoutAnimationConfig, useAnimatedStyle, useReducedMotion, useSharedValue, withTiming } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { oklch } from '@vibeface/client/avatar/face.ts'
 import type { ProviderId } from '@vibeface/client/lib/node.ts'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
-import { fadeIn } from '@/lib/motion'
+import { fadeIn, glide } from '@/lib/motion'
 import { cn } from '@/lib/utils'
 
 const AnimatedView = withUniwind(Animated.View)
@@ -147,21 +147,23 @@ export function CopyableId({ value, label }: { value: string; label: string }) {
 
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 
-/** Technical detail folded away by default, as the web's <Details>. */
+/** Technical detail folded away by default, as the web's <Details>. Only an open by press fades in; one open from the start just shows. */
 export function Details({ children, label = '详细信息', open: initial = false, keepMounted = false }: { children: ReactNode; label?: string; open?: boolean; keepMounted?: boolean }) {
   const [open, setOpen] = useState(initial)
-  return <View>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 self-start" onPress={() => setOpen(!open)}>
-      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{label}</Text>
+  const turn = useSharedValue(initial ? 90 : 0)
+  const chevron = useAnimatedStyle(() => ({ transform: [{ rotate: `${turn.value}deg` }] }))
+  return <LayoutAnimationConfig skipEntering><View>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 self-start" onPress={() => { turn.value = withTiming(open ? 0 : 90, glide); setOpen(!open) }}>
+      <Animated.View style={chevron}><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Animated.View><Text className="text-meta text-muted-foreground">{label}</Text>
     </Pressable>
-    {open || keepMounted ? <View className={cn('gap-2', !open && 'hidden')}>{children}</View> : null}
-  </View>
+    {open || keepMounted ? <AnimatedView entering={fadeIn} className={cn('gap-2', !open && 'hidden')}>{children}</AnimatedView> : null}
+  </View></LayoutAnimationConfig>
 }
 
 export function Badge({ count, fill, ink }: { count: number; fill?: string; ink?: string }) {
   if (!count) return null
   return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-brand px-1.5" style={fill ? { backgroundColor: fill } : undefined}>
-    <Text maxFontSizeMultiplier={1.4} className="text-[11px] leading-5 font-semibold text-brand-foreground" style={[{ fontVariant: ['tabular-nums'] }, ink ? { color: ink } : null]}>{count}</Text>
+    <Text maxFontSizeMultiplier={1.4} className="text-meta leading-5 font-semibold text-brand-foreground" style={[{ fontVariant: ['tabular-nums'] }, ink ? { color: ink } : null]}>{count}</Text>
   </View>
 }
 

@@ -66,6 +66,7 @@ export default function Inbox() {
   const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
   return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
+    {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} /> : null)}
     {decisions.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">需要决定</Text>{decisions.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}</View> : null}
     {confirmations.length || inputs.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">待确认</Text>{confirmations.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
     {attention.length ? <Text role="heading" className="mt-3 text-heading font-semibold">更新</Text> : null}
@@ -74,8 +75,7 @@ export default function Inbox() {
       <Button variant="outline" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
     </View> : null}
     {error ? <ErrorText error={error} /> : status ? <Text role="status" className="text-meta text-muted-foreground">{status}</Text> : null}
-    {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
-      : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
+    {items.map((item) => item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
       : item.kind === 'undelivered' ? null
       : item.kind === 'failed' ? <FailedCard key={item.key} item={item} replace={wide} />

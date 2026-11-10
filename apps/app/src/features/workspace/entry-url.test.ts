@@ -866,7 +866,7 @@ test("workspace preserves bot and message requests while routing native decision
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
       const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
-        'expo-router': { Stack: stack, usePathname: () => '/' }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
+        'expo-router': { Stack: stack, usePathname: () => '/' }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared, useWaiting: () => 0 },
         '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
       })
@@ -3022,7 +3022,7 @@ test('native Stack focus restores non-chat views while the chat route owns its a
   const stack = { Screen: 'Screen', Protected: 'Protected' }
   const app = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
     'expo-router': { Stack: stack, usePathname: () => '/' }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) }, 'expo-linking': { useLinkingURL: () => null },
-    '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => ({ setView: (view: string) => { views.push(view) } }) },
+    '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => ({ setView: (view: string) => { views.push(view) } }), useWaiting: () => 0 },
     '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({}) },
     'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
   })
@@ -3775,7 +3775,7 @@ test('native chat folds runtime diagnostics and retains result checks without pr
     '@vibeface/client/workspace/questions.ts': { questionOpen }, '@vibeface/client/lib/errors.ts': errors,
   })
   const details = componentHarness('../../../../../apps/mobile/src/components/kit.tsx', {
-    'react-native-reanimated': { default: { View: 'AnimatedView' } }, 'uniwind': { withUniwind: (value: unknown) => value },
+    'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }), withTiming: (value: number) => value }, 'uniwind': { withUniwind: (value: unknown) => value },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
   })
   const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { after: Map<string, { key: string; node: HarnessElement }[]>; cards: HarnessElement[] } }
