@@ -256,6 +256,68 @@ def activate(service, output):
             'image': receipt['image'], 'prepared_image': identity}
 
 
+def rehearse(output):
+    """Activate the prepared Core on this runner as a fixture host: fresh install, handover, then a no-op."""
+    release.require(os.geteuid() == 0, 'the activation rehearsal runs as root on a disposable runner')
+    output = Path(output).resolve()
+    info = json.loads((output / 'deployment.json').read_text())
+    identity = info['images']['core']
+    host = Path(tempfile.mkdtemp(prefix='vibeface-rehearsal-'))
+    data, tls = host / 'state', host / 'tls'
+    public_url = 'https://127.0.0.1:4792'
+    options = {'data_dir': '/data', 'listen': '0.0.0.0:4792', 'public_url': public_url, 'tls': True,
+               'allowed_origins': ['https://app.vibeface.dev'], 'relay_listen': '0.0.0.0:3340',
+               'relay_url': 'http://127.0.0.1:3340', 'relay_open': True, 'relay_rate': 16384,
+               'relay_max_clients': 128, 'relay_max_clients_per_ip': 8, 'forward_any': True,
+               'forward_sessions': 32, 'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
+               'mesh_network': 'deploy-fixture'}
+    # The host initialization in deploy/README.md, step by step.
+    data.mkdir()
+    result = json.loads(subprocess.check_output(
+        ['docker', 'run', '--rm', '-i', '--network', 'none', '-v', f'{data}:/data', '--entrypoint',
+         '/opt/vibeface/vibeface-core', identity, '--control'],
+        input=json.dumps({'command': 'init', 'options': options}), text=True))
+    release.require(result.get('ok') is True, 'fixture Node initialization failed')
+    (data / 'node.lock').touch()
+    checked(['chown', '-R', '1001:1001', str(data)])
+    os.chmod(data, 0o700)
+    checked(['install', '-d', '-o', 'root', '-g', '1001', '-m', '0750', str(tls)])
+    checked(['install', '-o', 'root', '-g', 'root', '-m', '0644', str(data / 'tls-cert.pem'), str(tls / 'tls-cert.pem')])
+    checked(['install', '-o', 'root', '-g', '1001', '-m', '0640', str(data / 'tls-key.pem'), str(tls / 'tls-key.pem')])
+    device = json.loads(subprocess.check_output(
+        ['docker', 'run', '--rm', '-i', '--network', 'none', '-v', f'{data}:/data', '--user', '1001:1001',
+         '--entrypoint', '/opt/vibeface/vibeface-core', identity, '--control'],
+        input='{"command":"inspect","data_dir":"/data"}', text=True))['result']['device_id']
+    # The image pins the official issuer, so the rehearsal pins this fixture Node instead.
+    anchor = host / 'public-bootstrap.json'
+    anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4792, 'gateway_url': public_url}))
+    container = subprocess.check_output(['docker', 'create', identity], text=True).strip()
+    try:
+        checked(['docker', 'cp', str(anchor), container + ':/opt/vibeface/public-bootstrap.json'])
+        fixture = subprocess.check_output(['docker', 'commit', container], text=True).strip()
+    finally:
+        checked(['docker', 'rm', container], stdout=subprocess.DEVNULL)
+    config = {'project': 'vibeface-rehearsal', 'role': 'node', 'deploy_dir': str(host / 'deploy'),
+              'listen': '0.0.0.0:4792', 'data_dir': str(data), 'tls_dir': str(tls), 'device_id': device,
+              'uid': 1001, 'gid': 1001}
+    receipts = []
+    try:
+        for settings, expected in ((config, 'activated'), (dict(config, public_url=public_url), 'activated'),
+                                   (dict(config, public_url=public_url), 'already_active')):
+            result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/deploy-activate.py'), '--config', '-',
+                                     '--image', fixture, '--tag', info['tag'], '--source-sha', info['source_sha'],
+                                     '--version', info['version']],
+                                    input=json.dumps(settings), capture_output=True, text=True)
+            release.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
+            receipt = json.loads(result.stdout)
+            release.require(receipt['status'] == expected and receipt['image'] == fixture, 'rehearsal receipt differs')
+            receipts.append(receipt['status'])
+    finally:
+        subprocess.run(['docker', 'compose', '--project-name', 'vibeface-rehearsal', 'down'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {'service': 'node', 'tag': info['tag'], 'rehearsal': receipts}
+
+
 def self_test():
     base = {'DEPLOY_HOST': 'host.example', 'DEPLOY_USER': 'deploy', 'DEPLOY_SSH_KEY': 'fixture',
             'DEPLOY_KNOWN_HOSTS': 'fixture', 'DEPLOY_CONFIG': '{}'}
@@ -275,6 +337,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('self-test')
+    sub.add_parser('rehearse').add_argument('--output', required=True)
     for action in ('build', 'activate'):
         command = sub.add_parser(action)
         command.add_argument('--service', choices=deploy.SERVICES, required=True)
@@ -284,6 +347,8 @@ def main():
     args = parser.parse_args()
     if args.action == 'self-test':
         self_test()
+    elif args.action == 'rehearse':
+        print(json.dumps(rehearse(args.output)))
     else:
         info = build(args.service, args.tag, args.output) if args.action == 'build' else activate(args.service, args.output)
         print(json.dumps(info))

@@ -150,8 +150,15 @@ def check(source, helpers):
     require('scripts/release.py begin-product' not in final and 'scripts/release.py publish-part' not in final,
             'final product job must only finalize the complete Release')
 
+    marker = workflow.get('release-failed', '')
+    require(needs(marker) == {'identity', 'release-start', 'publish-product'}
+            and "if: failure() && needs.release-start.result == 'success'" in marker
+            and 'scripts/release.py fail-product' in marker and 'scripts/release.py publish' not in marker
+            and 'scripts/release.py begin-product' not in marker,
+            'failed product run must only mark its unfinished Release')
+
     for name, block in workflow.items():
-        if name not in {'release-start', 'publish', 'publish-product', *PARTS}:
+        if name not in {'release-start', 'publish', 'publish-product', 'release-failed', *PARTS}:
             require('contents: write' not in block and 'scripts/release.py publish' not in block
                     and 'scripts/release.py begin-product' not in block,
                     name + ' must not mutate a public Release')
@@ -246,6 +253,8 @@ def self_test(source, helpers):
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
         source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www'",
                        "if: needs.identity.outputs.app == 'www'"),
+        source.replace('scripts/release.py fail-product', 'scripts/release.py publish product .artifacts/release'),
+        source.replace("if: failure() && needs.release-start.result == 'success'", 'if: always()'),
     ]
     broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
                       helper.replace('actions: read', 'contents: read'),
@@ -278,6 +287,12 @@ def check_deployment(source):
     require(len(activate) == 2 and re.search(r'^        if: inputs\.apply$', activate[1], re.M),
             'production activation must be disabled for validation runs')
     require("|| 'vibeface-validation'" in source, 'validation must not use a production environment')
+    rehearsal = source.split('      - name: Rehearse the Core activation on this runner', 1)
+    require(len(rehearsal) == 2 and rehearsal[1].index('deploy-run.py rehearse') < rehearsal[1].index('deploy-run.py activate'),
+            'the Core activation must be rehearsed before the host activation')
+    step = rehearsal[1].split('      - name:', 1)[0]
+    require("        if: matrix.service == 'node'\n" in step and step.count('if:') == 1
+            and 'continue-on-error' not in step, 'every Core deployment must pass the rehearsal')
 
 
 def main():
@@ -294,7 +309,11 @@ def main():
     check_deployment(deployment)
     if args.self_test:
         for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
-                          deployment.replace('if: inputs.apply', 'if: always()')):
+                          deployment.replace('if: inputs.apply', 'if: always()'),
+                          deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
+                          deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
+                          deployment.replace("if: matrix.service == 'node'",
+                                             "if: matrix.service == 'node'\n        continue-on-error: true")):
             try:
                 check_deployment(candidate)
             except ValueError:
