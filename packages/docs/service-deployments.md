@@ -57,6 +57,6 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。从宿主 systemd 服务迁入前，须由维护者先停旧服务并完成数据交接；脚本不自动迁移或停止宿主进程。全新安装没有旧服务，校验已初始化的数据目录并备份后直接启动容器，失败时只停新容器。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
 
-公共节点不提供网页文件。`node.vibeface.dev` 是指向 `8.217.72.118` 的 DNS-only A 记录，浏览器直接连接 `https://node.vibeface.dev:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的域名证书，安装到数据目录后 Core 不重启即换用。部署前必须在阿里云安全组对公网开放 TCP 4792、UDP 4792 和 TCP 3340（TCP 80 供 acme.sh 签证书），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点主机上的网页接入、relay 和全网的 UDP 端口，都不经过 App 主机。
+公共节点不提供网页文件。`node.vibeface.dev` 是指向 `84.54.3.78` 的 DNS-only A 记录，浏览器直接连接 `https://node.vibeface.dev:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的域名证书，安装到数据目录后 Core 不重启即换用。部署前必须确认目标主机与提供商防火墙对公网开放 TCP 4792、UDP 4792 和 TCP 3340（TCP 80 供 acme.sh 签证书），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点主机上的网页接入、relay 和全网的 UDP 端口，都不经过 App 主机。
 
 部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表全网公网 UDP 入网、relay 连接、浏览器排队接入、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。

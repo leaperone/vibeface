@@ -135,7 +135,7 @@ vibeface hooks status [--home '<同一个目录>']
 
 公网部署使用 HTTPS 反向代理，将网页和 WebSocket 请求转发到配置的回环监听地址。域名、证书、防火墙和 relay 地址都属于部署配置。具体角色配置见 [从外网访问](node.md#从外网访问)。
 
-官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，不转发接口；公共节点 `node.vibeface.dev` 是指向 `8.217.72.118` 的 DNS-only A 记录，不经代理，是全网的默认 bootstrap 节点（UDP 4792），提供开放 Relay 和浏览器接入 `https://node.vibeface.dev:4792`，网页的 `/api/client`、`/api/info` 和 `/api/decision` 直接连它，证书是宿主 acme.sh 续期的 Let's Encrypt 域名证书。自建节点可以不用域名，按纯 IP `https://<IP>:4792` 直连，配 Let's Encrypt 短期 IP 证书。公共节点的设备编号、UDP 地址、`relay_url` 和 `gateway_url` 写在 `config/public-bootstrap.json`：Core 编入这个文件，只用设备编号、UDP 地址和 `relay_url` 生成默认 bootstrap 节点；网页和 App 构建时经 `packages/client` 导入它，只用 `gateway_url`；部署 guard 用它核对公共节点的设备编号和 `public_url`。`deploy/README.md` 的初始化命令要写同样的地址。官方页面与手机、桌面 App 以 `gateway_url` 为默认接入地址，由 Node 提供的页面用该页面自己的 origin，用户可在设置里改。自建公共节点使用各自明确配置的地址与身份，个人 Node 可用 `--bootstrap` 经它入网。
+官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，不转发接口；公共节点 `node.vibeface.dev` 是指向 `84.54.3.78` 的 DNS-only A 记录，不经代理，是全网的默认 bootstrap 节点（UDP 4792），提供开放 Relay 和浏览器接入 `https://node.vibeface.dev:4792`，网页的 `/api/client`、`/api/info` 和 `/api/decision` 直接连它，证书是宿主 acme.sh 续期的 Let's Encrypt 域名证书。自建节点可以不用域名，按纯 IP `https://<IP>:4792` 直连，配 Let's Encrypt 短期 IP 证书。公共节点的设备编号、UDP 地址、`relay_url` 和 `gateway_url` 写在 `config/public-bootstrap.json`：Core 编入这个文件，只用设备编号、UDP 地址和 `relay_url` 生成默认 bootstrap 节点；网页和 App 构建时经 `packages/client` 导入它，只用 `gateway_url`；部署 guard 用它核对公共节点的设备编号和 `public_url`。`deploy/README.md` 的初始化命令要写同样的地址。官方页面与手机、桌面 App 以 `gateway_url` 为默认接入地址，由 Node 提供的页面用该页面自己的 origin，用户可在设置里改。自建公共节点使用各自明确配置的地址与身份，个人 Node 可用 `--bootstrap` 经它入网。
 
 
 ## 安装程序和后台服务
