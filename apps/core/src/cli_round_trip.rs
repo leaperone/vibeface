@@ -93,6 +93,8 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         assert!(local_client.next_input_sequence("chat",&client::wire::InputTarget::BotMain {bot_id:"bot".into()}).await.is_err());
         assert!(local_client.submit(client::Action::DeleteBot {conversation_id:"chat".into()}).await.is_err());
         assert!(local_client.management_session().is_err());
+        assert!(!local_client.can_control());
+        assert!(local_client.submit(client::Action::StopReply {conversation_id:"chat".into(),trigger:"message:original".into()}).await.is_err());
         assert!(local_client.can_configure_node(),"private local owner retains Node settings authority");
         let local_root=std::fs::canonicalize(&dir)?;
         let configured=local_client.submit(client::Action::NodeSettings(client::NodeSettings {roots:vec![local_root.clone()],manager:None})).await?;
@@ -111,7 +113,7 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         assert_eq!(settings["settings"]["roots"], json!([root]));
 
         // A second CLI enrolls through an invite; both sides see the same short code.
-        let phone = key(&dir, "phone")?;
+        let mut phone = key(&dir, "phone")?;
         let phone_id = phone.device_id().to_owned();
         let mut session = admin.connect(None).await?;
         let link = session.invite().await?;
@@ -146,7 +148,10 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         assert_eq!(reopened_code,joiner_code);
         session.grant_join(&join_id, false).await?;
         assert!(matches!(enrollment.poll().await?, Progress::Joined));
-        let (network, _) = enrollment.finish()?;
+        let (network, phone_entry) = enrollment.finish()?;
+        phone.remember(&network,phone_entry)?;
+        let phone_client=client::Client::open(Arc::new(phone),client::Endpoint::Gateway(entry.clone()),dir.join("phone-outbox")).await?;
+        assert!(phone_client.can_control());
         assert_eq!(network, view().await?.network_id);
         assert!(!view().await?.member(&phone_id)?.manage);
 
@@ -188,6 +193,10 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         assert_eq!((member.name.as_str(), member.manage), ("tablet", true));
         session.revoke(&phone_id).await?;
         assert!(view().await?.revocation(&phone_id).is_some());
+        assert!(phone_client.reconnect(client::Endpoint::Gateway(entry.clone())).await.is_err());
+        assert!(!phone_client.can_control());assert!(!phone_client.can_save_locally());
+        assert!(phone_client.submit(client::Action::StopWork {conversation_id:scope.clone(),work_id:"old-work".into()}).await.is_err());
+        phone_client.close();drop(phone_client);
 
         // A recovery file starts a recovery; a manager stops one and approves the next.
         let mut rescuer = key(&dir, "rescuer")?;

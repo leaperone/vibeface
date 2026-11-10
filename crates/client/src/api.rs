@@ -149,32 +149,48 @@ pub struct Client {
 
 impl Client {
     pub async fn open(key: Arc<ClientKey>, endpoint: Endpoint, outbox_dir: PathBuf) -> Result<Self> {
-        let (connection,network,authority,proof)=Self::authenticate(&key,&endpoint).await?;
+        let (connection,network,authority,proof)=match Self::authenticate(&key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>() {Self::invalidate_cached(&key,&endpoint,&outbox_dir).await?;}return Err(error);}};
         let client_id=key.device_id().to_owned();
         let outbox_network=network.clone();
         let outbox=tokio::task::spawn_blocking(move||Outbox::open(&outbox_dir,&outbox_network,&client_id)).await??;
         Self::attach(key,endpoint,connection,network,authority,proof,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new()))).await
     }
+    async fn invalidate_cached(key:&ClientKey,endpoint:&Endpoint,outbox_dir:&std::path::Path)->Result<()> {
+        if !outbox_dir.join("outbox.sqlite3").exists() {return Ok(());}
+        let Some(network)=key.network_id() else {return Ok(());};
+        let network=network.to_owned();let id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();let dir=outbox_dir.to_owned();
+        tokio::task::spawn_blocking(move||Outbox::open(&dir,&network,&id)?.invalidate_profile(&target)).await?
+    }
     pub async fn open_or_offline(key:Arc<ClientKey>,endpoint:Endpoint,outbox_dir:PathBuf)->Result<Self> {
         match Self::open(key.clone(),endpoint.clone(),outbox_dir.clone()).await {
             Ok(client)=>Ok(client),
             Err(error) if crate::connection::transport_failure(&error)=>Self::open_offline(key,endpoint,outbox_dir).await.context("Node is unreachable and no usable verified offline profile is available"),
-            Err(error)=>{
-                if error.is::<Revoked>() && let Some(network)=key.network_id() {
-                    let network=network.to_owned();let id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();
-                    tokio::task::spawn_blocking(move||Outbox::open(&outbox_dir,&network,&id)?.invalidate_profile(&target)).await??;
-                }
-                Err(error)
-            }
+            Err(error)=>Err(error),
         }
     }
     pub async fn open_offline(key:Arc<ClientKey>,endpoint:Endpoint,outbox_dir:PathBuf)->Result<Self> {
         let network=key.network_id().context("offline use needs previously verified membership")?.to_owned();
         let client_id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();let cache_target=target.clone();let cache_network=network.clone();
         let (outbox,proof)=tokio::task::spawn_blocking(move||->Result<_>{let db=Outbox::open(&outbox_dir,&cache_network,&client_id)?;let proof=db.cached_profile(&cache_target)?;Ok((db,proof))}).await??;
-        let authority=proof.verify_offline(&key,&target)?;
+        Self::offline_generation(key,endpoint,proof,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new())))
+    }
+    fn offline_generation(key:Arc<ClientKey>,endpoint:Endpoint,proof:crate::profile::CachedProfile,outbox:Arc<Mutex<Outbox>>,writes:Arc<Semaphore>,decision_tokens:Arc<Mutex<BTreeMap<String,DecisionToken>>>)->Result<Self> {
+        let target=endpoint.node_id().to_owned();
+        if let Endpoint::Local(grant)=&endpoint {ensure!(grant.network_id()==proof.network_id && grant.client_id()==key.device_id(),"local grant belongs to another cached profile");}
+        let authority=proof.verify_offline(&key,&target)?;let network=proof.network_id.clone();
         let (events,_)=broadcast::channel(128);
-        Ok(Self {key,connection:Connection::disconnected(),target,network,authority,endpoint,outbox:Arc::new(Mutex::new(outbox)),events,generation:uuid::Uuid::new_v4().to_string(),writes:Arc::new(Semaphore::new(8)),decision_tokens:Arc::new(Mutex::new(BTreeMap::new())),active:Arc::new(AtomicBool::new(false)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(proof.write_gate))})
+        Ok(Self {key,connection:Connection::disconnected(),target,network,authority,endpoint,outbox,events,generation:uuid::Uuid::new_v4().to_string(),writes,decision_tokens,active:Arc::new(AtomicBool::new(false)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(proof.write_gate))})
+    }
+    pub async fn reconnect_or_offline(&self,endpoint:Endpoint)->Result<Self> {
+        match self.reconnect(endpoint.clone()).await {
+            Ok(client)=>Ok(client),
+            Err(error) if crate::connection::transport_failure(&error)=>{
+                let target=endpoint.node_id().to_owned();let proof=self.stored(move|db|db.cached_profile(&target)).await?;
+                let next=Self::offline_generation(self.key.clone(),endpoint,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone())?;
+                self.close();Ok(next)
+            }
+            Err(error)=>Err(error),
+        }
     }
     pub fn is_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open()}
     pub fn target_node(&self)->&str {&self.target}
@@ -231,7 +247,6 @@ impl Client {
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
     pub async fn reconnect(&self,endpoint:Endpoint)->Result<Self> {
-        ensure!(!self.revoked.load(Ordering::Acquire),"known revoked profile cannot reconnect");
         let (connection,network,authority,proof)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>() {self.revoked.store(true,Ordering::Release);let target=self.target.clone();self.stored(move|db|db.invalidate_profile(&target)).await?;}return Err(error);}};
         ensure!(network==self.network,"reconnect cannot switch outbox networks");
         let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
@@ -249,6 +264,7 @@ impl Client {
     pub fn authority(&self)->ClientAuthority {self.authority}
     pub fn can_write(&self)->bool {matches!(self.authority,ClientAuthority::Membership {..}) && !self.revoked.load(Ordering::Acquire)}
     pub fn can_save_locally(&self)->bool {self.can_write() && self.write_gate.load(Ordering::Acquire)!=2}
+    pub fn can_control(&self)->bool {self.is_online() && self.can_write()}
     pub fn can_send_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open() && self.write_gate.load(Ordering::Acquire)==1 && self.can_write()}
     pub fn can_configure_node(&self)->bool {matches!(self.authority,ClientAuthority::LocalSession|ClientAuthority::Membership {can_manage:true})}
     pub fn management_session(&self)->Result<crate::Session<'_>> {
@@ -267,6 +283,13 @@ impl Client {
         self.stored(move|db|db.reserve_sequence(&lane)).await
     }
     pub async fn pending(&self) -> Result<Vec<OperationSnapshot>> { self.stored(|db|Ok(db.snapshots()?.into_iter().filter(|snapshot|snapshot.state!=OperationState::Accepted).collect())).await }
+    pub async fn review_settings(&self,id:&str)->Result<crate::SettingsReview> {
+        let id=id.to_owned();let target=self.target.clone();self.stored(move|db|{let review=db.review_settings(&id)?;ensure!(review.target_node==target,"return to the original Node before reviewing this operation");Ok(review)}).await
+    }
+    pub async fn close_unknown_settings(&self,review:crate::SettingsReview,note:String)->Result<Vec<OperationSnapshot>> {
+        ensure!(review.network_id==self.network_id() && review.client_id==self.client_id() && review.target_node==self.target,"review belongs to another profile or Node");
+        self.stored(move|db|db.close_unknown_settings(&review,&note)).await
+    }
     pub async fn dismiss_rejected(&self,id:&str)->Result<()> {
         self.require_active()?;let id=id.to_owned();self.stored(move|db|db.dismiss_rejected(&id)).await
     }
@@ -301,14 +324,15 @@ impl Client {
     }
     pub async fn stage(&self,action:Action)->Result<OperationSnapshot> {self.stage_after(action,vec![]).await}
     pub async fn stage_after(&self,action:Action,mut prerequisites:Vec<String>)->Result<OperationSnapshot> {
-        ensure!(self.can_save_locally(),"this profile cannot stage network writes");
+        ensure!(if safety_action(&action) {self.can_write()} else {self.can_save_locally()},"this profile cannot stage this intent");
         if matches!(&action,Action::Delivery(_)|Action::NodeSettings(_)|Action::ProviderSettings(_)|Action::Triage(_)|Action::Relay {..}|Action::CreateDecisionToken {..}|Action::RevokeDecisionToken {..}|Action::ConfirmWritable|Action::TestWebhook) {ensure!(matches!(self.authority,ClientAuthority::Membership {can_manage:true}),"operation requires a managing member");}
         prerequisites.sort();prerequisites.dedup();
         let client=self.clone();
         self.stored(move|db|client.stage_in(db,action,prerequisites)).await
     }
     fn stage_in(&self,db:&mut Outbox,mut action:Action,prerequisites:Vec<String>)->Result<OperationSnapshot> {
-        ensure!(!self.revoked.load(Ordering::Acquire) && self.write_gate.load(Ordering::Acquire)!=2,"known revoked or forked profile cannot stage writes");
+        let local_control=matches!(&action,Action::NodeSettings(_)|Action::ProviderSettings(_)|Action::Triage(_)|Action::Relay {..}|Action::CreateDecisionToken {..}|Action::RevokeDecisionToken {..}|Action::ConfirmWritable|Action::TestWebhook);
+        ensure!(!self.revoked.load(Ordering::Acquire) && (self.write_gate.load(Ordering::Acquire)!=2 || safety_action(&action) || local_control),"known revoked or forked profile cannot stage new network work");
         let known=match &action {
             Action::Input {input,..}=>Some(input.message_id.clone()),
             Action::Workspace {command}=>Some(self.operation_id("workspace",&json!({"type":"workspace_commanded","command":command}))?),
@@ -333,7 +357,7 @@ impl Client {
     /// Local staging survives transport loss; only an admitted writer changes Prepared to Unknown.
     pub async fn submit(&self,action:Action)->Result<OperationSnapshot> {
         let node_operator=matches!(&action,Action::NodeSettings(_)|Action::ProviderSettings(_)|Action::Triage(_)|Action::Relay {..}|Action::TestWebhook|Action::CreateDecisionToken {..}|Action::RevokeDecisionToken {..}|Action::ConfirmWritable);
-        let allowed=if node_operator {self.can_configure_node() && self.active.load(Ordering::Acquire)} else if matches!(&action,Action::Delivery(_)) {self.can_save_locally() && matches!(self.authority,ClientAuthority::Membership {can_manage:true})} else {self.can_save_locally()};
+        let allowed=if node_operator {self.can_configure_node() && self.active.load(Ordering::Acquire)} else if matches!(&action,Action::Delivery(_)) {self.can_save_locally() && matches!(self.authority,ClientAuthority::Membership {can_manage:true})} else if safety_action(&action) {self.can_write()} else {self.can_save_locally()};
         ensure!(allowed,"this client is not authorized for this operation");
         let client=self.clone();let staged=self.stored(move|db|client.stage_in(db,action,vec![])).await?;
         if staged.state!=OperationState::Prepared {return Ok(staged);}
@@ -348,10 +372,12 @@ impl Client {
         ensure!(operation.snapshot.target_node==self.target,"original operation cannot switch target");
         if operation.snapshot.state!=OperationState::Prepared || !self.active.load(Ordering::Acquire) || !self.connection.is_open() {return Ok(operation.snapshot);}
         let request:Value=serde_json::from_slice(&operation.bytes)?;
-        let network_write=request["method"]=="rpc" || request["method"]=="delivery";
+        let safety=safety_request(&request);
+        let network_write=(request["method"]=="rpc" || request["method"]=="delivery") && !safety;
+        if safety && !self.can_control() {return Ok(operation.snapshot);}
         if network_write && !self.can_send_online() {return Ok(operation.snapshot);}
         if request["method"]=="delivery" {ensure!(matches!(self.authority,ClientAuthority::Membership {can_manage:true}),"delivery requires current management permission");}
-        if !network_write {ensure!(self.can_configure_node(),"Node operation requires current owner permission");}
+        if !network_write && !safety {ensure!(self.can_configure_node(),"Node operation requires current owner permission");}
         let check=id.clone();if !self.stored(move|db|db.can_begin(&check)).await? {return self.stored(move|db|Ok(db.get(&id)?.snapshot)).await;}
         let sent = async {
             if let Some(conversation_id)=&operation.upload_scope {for attachment in &operation.attachments {self.upload(conversation_id,attachment).await?;}}
@@ -377,7 +403,7 @@ impl Client {
                 }
                 if let Some(state)=validate_result(&operation,&result)? {
                     self.stored(move|db|db.settle(&id,state,result)).await
-                } else { Ok(operation.snapshot) }
+                } else { self.stored(move|db|db.observe_unknown(&id,result)).await }
             }
             // Generic RPC errors do not prove no side effect; only method-specific receipts settle a write.
             Err(_) => self.stored(move|db|Ok(db.get(&id)?.snapshot)).await,
@@ -406,6 +432,9 @@ impl Client {
                 } else {None};
                 if let Some(id)=order_id {self.connection.call("delivery",json!({"op":"receipt","order_id":id})).await?} else {Value::Null}
             }
+            Reconciliation::Settings {kind}=>self.connection.call(crate::settings::read_method(*kind),json!({})).await?,
+            Reconciliation::StopReply {conversation_id,..}=>self.connection.call("rpc",json!({"method":"conversation","conversation_id":conversation_id})).await?,
+            Reconciliation::StopWork {conversation_id,work_id}=>self.connection.call("rpc",json!({"method":"work_detail","conversation_id":conversation_id,"work_id":work_id})).await?,
             Reconciliation::Manual => return Ok(op.snapshot),
         };
         let state=match &op.reconciliation {
@@ -459,6 +488,18 @@ impl Client {
                         _=>None,
                     }
                 }
+            }
+            Reconciliation::Settings {kind}=>{
+                let request:Value=serde_json::from_slice(&op.bytes)?;
+                crate::settings::goal_matches(*kind,&request["params"],&result).then_some(OperationState::Accepted)
+            }
+            Reconciliation::StopReply {conversation_id,trigger}=>{
+                ensure!(result["conversation"]["conversation_id"]==*conversation_id,"stop readback belongs to another conversation");
+                result["scheduler"]["jobs"].as_array().and_then(|jobs|jobs.iter().find(|job|job["trigger"]==*trigger)).filter(|job|terminal_reply(&job["state"])).map(|_|OperationState::Accepted)
+            }
+            Reconciliation::StopWork {conversation_id,work_id}=>{
+                ensure!(result["work"]["work_id"]==*work_id && result["work"]["conversation_id"]==*conversation_id,"stop readback belongs to another work");
+                matches!(result["work"]["outcome"].as_str(),Some("completed"|"failed"|"interrupted"|"rejected")).then_some(OperationState::Accepted)
             }
             Reconciliation::Manual=>None,
         };
@@ -534,8 +575,8 @@ impl Client {
                 let body=json!({"type":"schedule_controlled","schedule_id":schedule_id,"action":action});
                 (true,"control_schedule",json!({"conversation_id":conversation_id,"schedule_id":schedule_id,"action":action}),format!("schedule:{conversation_id}:{schedule_id}"),Some((conversation_id,body)))
             }
-            Action::StopReply {conversation_id,trigger} => (true,"cancel_manager",json!({"conversation_id":conversation_id,"trigger":trigger}),format!("reply:{conversation_id}:{trigger}"),None),
-            Action::StopWork {conversation_id,work_id} => (true,"interrupt_work",json!({"conversation_id":conversation_id,"work_id":work_id}),format!("work:{conversation_id}:{work_id}"),None),
+            Action::StopReply {conversation_id,trigger} => {reconciliation=Reconciliation::StopReply {conversation_id:conversation_id.clone(),trigger:trigger.clone()};(true,"cancel_manager",json!({"conversation_id":conversation_id,"trigger":trigger}),format!("reply:{conversation_id}:{trigger}"),None)},
+            Action::StopWork {conversation_id,work_id} => {reconciliation=Reconciliation::StopWork {conversation_id:conversation_id.clone(),work_id:work_id.clone()};(true,"interrupt_work",json!({"conversation_id":conversation_id,"work_id":work_id}),format!("work:{conversation_id}:{work_id}"),None)},
             Action::Answer {conversation_id,question_id,text} => {
                 id=format!("a-{question_id}");
                 let body=json!({"type":"message_posted","message_id":id,"role":"user","text":text,"report_results":true,"answers":question_id});
@@ -603,8 +644,11 @@ impl Client {
             params["attestation"]=self.attest(&scope,&body)?;
             if matches!(reconciliation,Reconciliation::Manual) {reconciliation=Reconciliation::Signed {scope_id:scope,body,attestation:params["attestation"].clone()};}
         }
+        let lane=if !rpc && method!="delivery" {format!("node:{}:{lane}",self.target)} else {lane};
         let method=if rpc { params["method"]=json!(method); "rpc" } else {method};
-        let bytes=serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
+        let request=json!({"id":id,"method":method,"params":params});
+        if let Some(kind)=crate::settings::kind(&request) {reconciliation=Reconciliation::Settings {kind};}
+        let bytes=serde_json::to_vec(&request)?;
         Ok(Operation {snapshot:OperationSnapshot {id,network_id:self.network_id().into(),client_id:self.client_id().into(),target_node:self.target.clone(),state:OperationState::Prepared,sequence,result:None},lane,expected_revision:revision,bytes,reconciliation,attachments,upload_scope,prerequisites:vec![]})
     }
 }
@@ -621,6 +665,15 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
     }
     let method=request["params"]["method"].as_str().unwrap_or_default();
     match method {
+        "cancel_manager"=>{
+            if result["unconfirmed"]==true {return Ok(None);}
+            ensure!(result["job"]["trigger"]==request["params"]["trigger"] && result["job"]["conversation_id"]==request["params"]["conversation_id"],"stop receipt identifies another reply");
+            Ok((result["cancel_requested"]==true || terminal_reply(&result["job"]["state"]["state"])).then_some(OperationState::Accepted))
+        }
+        "interrupt_work"=>{
+            ensure!(result["work_id"]==request["params"]["work_id"],"stop receipt identifies another work");
+            Ok((result["interrupt_requested"]==true || result["confirmed"]==true || result["admission"]["state"]=="owner_accepted").then_some(OperationState::Accepted))
+        }
         "message" => {
             ensure!(result["message_id"]==op.snapshot.id,"input response has another message ID");
             if result["accepted"]==true { Ok(Some(OperationState::Accepted)) }
@@ -798,7 +851,7 @@ mod offline_tests {
     use crate::connection::tests::{receive,send,server};
     use vibeface_secure::{Identity,membership::{Genesis,Member,NetworkState}};
 
-    struct Evidence {counts:BTreeMap<String,u32>,inputs:BTreeMap<String,Value>}
+    struct Evidence {counts:BTreeMap<String,u32>,inputs:BTreeMap<String,Value>,write_state:String,controls:Vec<Value>}
     async fn fixture(node_secret:&str,state:NetworkState,client_id:String,evidence:Arc<Mutex<Evidence>>,drop_message:Option<String>)->Result<(Endpoint,tokio::task::JoinHandle<Result<()>>)> {
         let node=Identity::from_secret_hex(node_secret)?;
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -811,8 +864,16 @@ mod offline_tests {
                     Some("authenticate")=>json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}}),
                     Some("directory")=>json!({"state":state,"now_ms":vibeface_protocol::now_ms()}),
                     Some("subscribe")=>json!({}),
-                    Some("write_state")=>json!({"state":"writable"}),
+                    Some("write_state")=>json!({"state":evidence.lock().expect("fixture evidence").write_state}),
                     Some("rpc")=>match request["params"]["method"].as_str() {
+                        Some("cancel_manager")=>{
+                            let params=&request["params"];evidence.lock().expect("fixture evidence").controls.push(params.clone());
+                            json!({"cancel_requested":true,"job":{"conversation_id":params["conversation_id"],"trigger":params["trigger"],"state":{"state":"cancelled"}}})
+                        }
+                        Some("interrupt_work")=>{
+                            let params=&request["params"];evidence.lock().expect("fixture evidence").controls.push(params.clone());
+                            json!({"work_id":params["work_id"],"interrupt_requested":true,"confirmed":true})
+                        }
                         Some("message")=>{
                             let params=&request["params"];
                             let id=params["message_id"].as_str().context("message ID")?.to_owned();
@@ -857,14 +918,37 @@ mod offline_tests {
         Action::Input {conversation_id:"chat".into(),input:InputRequest {message_id:id.into(),route:InputRoute {target,intent:InputIntent::Continue,sequence:0,expected_revision:Some(1)},text:format!("input {id}"),attachments:vec![],report_results:Some(true)}}
     }
     #[tokio::test]
+    async fn current_member_safety_stops_work_on_read_only_and_forked_nodes_without_starting_work()->Result<()> {
+        let dir=std::env::temp_dir().join(format!("native-stop-policy-{}",uuid::Uuid::new_v4()));
+        let mut key=ClientKey::create(&dir.join("key"),"fixture password")?;let node=Identity::generate()?;
+        let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"read_only".into(),controls:vec![]}));
+        let (endpoint,server)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
+        let Endpoint::Gateway(entry)=&endpoint else {unreachable!()};key.remember(&state.genesis.network_id,entry.clone())?;
+        let client=Client::open(Arc::new(key),endpoint,dir.join("outbox")).await?;
+        assert!(client.can_control());assert!(!client.can_send_online());
+        let staged=client.submit(input("must-stay-local",InputTarget::BotMain {bot_id:"bot".into()})).await?;
+        assert_eq!(staged.state,OperationState::Prepared);
+        assert_eq!(client.submit(Action::StopReply {conversation_id:"chat".into(),trigger:"message:original".into()}).await?.state,OperationState::Accepted);
+        evidence.lock().expect("fixture").write_state="forked".into();client.read(ReadRequest::WriteState).await?;
+        assert!(client.can_control());assert!(!client.can_save_locally());
+        assert!(client.stage(input("must-not-stage",InputTarget::BotMain {bot_id:"bot".into()})).await.is_err());
+        assert_eq!(client.submit(Action::StopWork {conversation_id:"chat".into(),work_id:"original-work".into()}).await?.state,OperationState::Accepted);
+        assert_eq!(client.send_staged("must-stay-local").await?.state,OperationState::Prepared);
+        let saved=evidence.lock().expect("fixture");assert!(saved.counts.is_empty());
+        assert_eq!(saved.controls,vec![json!({"method":"cancel_manager","conversation_id":"chat","trigger":"message:original"}),json!({"method":"interrupt_work","conversation_id":"chat","work_id":"original-work"})]);drop(saved);
+        client.close();drop(client);server.await??;std::fs::remove_dir_all(dir)?;Ok(())
+    }
+    #[tokio::test]
     async fn offline_queue_restart_and_concurrent_flush_preserve_exact_inputs_without_duplicate_effects()->Result<()> {
         let dir=std::env::temp_dir().join(format!("native-offline-{}",uuid::Uuid::new_v4()));
         let mut key=ClientKey::create(&dir.join("key"),"client fixture password")?;
         let node=Identity::generate()?;
         let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
-        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new()}));
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"writable".into(),controls:vec![]}));
         let (entry,first)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
         let Endpoint::Gateway(gateway)=&entry else {unreachable!()};key.remember(&state.genesis.network_id,gateway.clone())?;
+        let original_endpoint=entry.clone();
         let client=Client::open(Arc::new(key),entry,dir.join("outbox")).await?;
         let task=InputTarget::Task {task_id:"task".into()};
         let channel_task=InputTarget::ChannelTask {channel_id:"channel".into(),task_id:"task".into(),bot_id:"bot".into()};
@@ -872,7 +956,13 @@ mod offline_tests {
         assert_eq!((a.state,a.sequence),(OperationState::Prepared,Some(1)));
         let original=client.stored(|db|Ok(db.get("offline-a")?.bytes)).await?;
         client.close();first.await??;
-        assert!(client.can_save_locally());
+        assert!(client.can_save_locally());drop(client);
+        // No server listens here. The new process verifies its signed cache and only touches private storage.
+        let key=Arc::new(ClientKey::open(&dir.join("key"),"client fixture password")?);
+        let client=Client::open_or_offline(key,original_endpoint,dir.join("outbox")).await?;
+        assert!(!client.is_online());assert!(client.can_save_locally());
+        assert_eq!(client.pending().await?.iter().map(|pending|(pending.id.as_str(),pending.state)).collect::<Vec<_>>(),vec![("offline-a",OperationState::Prepared)]);
+        assert_eq!(client.stored(|db|Ok(db.get("offline-a")?.bytes)).await?,original);
         let b=client.stage(input("offline-b",channel_task)).await?;
         let c=client.stage(input("offline-c",task.clone())).await?;
         assert_eq!((b.sequence,c.sequence),(Some(2),Some(3)),"task and channel-task share one durable sequence");
@@ -907,3 +997,7 @@ mod offline_tests {
         std::fs::remove_dir_all(dir)?;Ok(())
     }
 }
+
+fn safety_action(action:&Action)->bool {matches!(action,Action::StopReply {..}|Action::StopWork {..})}
+fn safety_request(request:&Value)->bool {request["method"]=="rpc" && matches!(request["params"]["method"].as_str(),Some("cancel_manager"|"interrupt_work"))}
+fn terminal_reply(state:&Value)->bool {matches!(state.as_str(),Some("cancelled"|"interrupted"|"completed"|"failed"|"rejected"))}

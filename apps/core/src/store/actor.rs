@@ -188,7 +188,19 @@ impl Drop for Lane {
     }
 }
 
-type ClientMembership = (u64, Option<Arc<NetworkState>>);
+#[derive(Clone)]
+pub(crate) enum ClientAuthorityState {
+    Initializing,
+    Updating,
+    Ready(Option<Arc<NetworkState>>),
+    Unavailable,
+}
+impl ClientAuthorityState {
+    pub(crate) fn pending(&self) -> bool {
+        matches!(self, Self::Initializing | Self::Updating)
+    }
+}
+pub(crate) type ClientMembership = (u64, ClientAuthorityState);
 
 struct MembershipPublication {
     dirty: Arc<AtomicBool>,
@@ -206,11 +218,13 @@ impl MembershipPublication {
         let state = if store.has_network()? { Some(store.public_state()?) } else { None };
         let previous = self.authority.borrow().clone();
         let fenced = self.fenced.swap(false, Ordering::AcqRel);
-        if previous.1.as_deref() != state.as_ref() {
+        let unchanged = matches!(&previous.1, ClientAuthorityState::Ready(previous)
+            if previous.as_deref() == state.as_ref());
+        if !unchanged {
             let generation = if fenced { previous.0 } else {
                 previous.0.checked_add(1).context("membership generation overflow")?
             };
-            self.authority.send_replace((generation, state.map(Arc::new)));
+            self.authority.send_replace((generation, ClientAuthorityState::Ready(state.map(Arc::new))));
             self.changed.send_replace(generation);
         } else {
             // A timed recovery can change the effective directory without changing its history.
@@ -219,11 +233,11 @@ impl MembershipPublication {
         Ok(())
     }
 
-    fn invalidate(&self) {
+    fn invalidate(&self, state: ClientAuthorityState) {
         self.fenced.store(true, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         let generation = self.authority.borrow().0.saturating_add(1);
-        self.authority.send_replace((generation, None));
+        self.authority.send_replace((generation, state));
         self.changed.send_replace(generation);
     }
 }
@@ -296,7 +310,7 @@ impl StoreActor {
                 if committed.network_dirty.swap(false, Ordering::AcqRel) {
                     // Fence before the new directory becomes visible to WAL readers. The
                     // enclosing operation may keep running after this physical commit.
-                    committed.invalidate();
+                    committed.invalidate(ClientAuthorityState::Updating);
                 }
                 false
             }));
@@ -321,10 +335,13 @@ impl StoreActor {
         self.writer.call(operation, move |store| {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(store)));
             let published = publication.refresh(store);
-            if published.is_err() { publication.invalidate(); }
+            if published.is_err() { publication.invalidate(ClientAuthorityState::Unavailable); }
             match result {
                 Ok(result) => { published?; result }
-                Err(panic) => std::panic::resume_unwind(panic),
+                Err(panic) => {
+                    publication.invalidate(ClientAuthorityState::Unavailable);
+                    std::panic::resume_unwind(panic)
+                },
             }
         }).await
     }
@@ -567,7 +584,7 @@ mod tests {
     async fn membership_publication_changes_generation_only_for_committed_history() -> Result<()> {
         let (directory, actor) = fixture().await?;
         let mut actor = Arc::try_unwrap(actor).ok().context("unshared fixture actor")?;
-        let authority = watch::Sender::new((0, None));
+        let authority = watch::Sender::new((0, ClientAuthorityState::Initializing));
         let changed = watch::Sender::new(0);
         actor.publish_membership_to(authority.clone(), changed.clone(), Arc::new(tokio::sync::Notify::new())).await?;
         let identity = crate::crypto::LocalIdentity::generate();
@@ -577,7 +594,7 @@ mod tests {
         let installed_generation = authority.borrow().0;
         assert!(installed_generation > 0);
         assert_eq!(*changed.borrow(), installed_generation);
-        assert!(authority.borrow().1.as_deref() == Some(&state));
+        assert!(matches!(&authority.borrow().1, ClientAuthorityState::Ready(Some(current)) if current.as_ref() == &state));
         let repeated = state.clone();
         actor.call("same_history", move |store| store.install_state(repeated)).await?;
         assert_eq!(authority.borrow().0, installed_generation, "identical sync must not invalidate in-flight calls");
@@ -587,7 +604,7 @@ mod tests {
         }).await.unwrap_err();
         assert!(error.to_string().contains("rolled-back"));
         assert_eq!(authority.borrow().0, installed_generation);
-        assert!(authority.borrow().1.as_deref() == Some(&state));
+        assert!(matches!(&authority.borrow().1, ClientAuthorityState::Ready(Some(current)) if current.as_ref() == &state));
         actor.shutdown().await?;
         drop(actor);
         std::fs::remove_dir_all(directory)?;

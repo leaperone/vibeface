@@ -1,19 +1,20 @@
 use gpui_kit::{component::input::{Input,InputState,Textarea,TextareaState},*};
 use std::collections::BTreeMap;
 #[derive(Clone,Debug)]
-pub enum Editor{Connect,ConnectLocal,CreateProfile,CreateNetwork,Join,CreateBot,EditBot,BotModel(vibeface_client::Provider),CreateTask,EditTask(String,u64),CreateChannel,ChannelPost(String),Member(String),EditChannel(String,u64,u64),Memory(Option<crate::ui::Memory>),Schedule,EditSchedule(crate::ui::Schedule),AssignTask(String,u64),QueuedEdit(vibeface_protocol::workspace::QueuedInput),Provider,DecisionToken,NodeSettings,Triage,Avatar,Logs,Relay,Transfer,Answer(String,String),Recovery}
+pub enum Editor{Connect,ConnectLocal,CreateProfile,CreateNetwork,Join,CreateBot,EditBot,BotModel(vibeface_client::Provider),CloseSettings(vibeface_client::SettingsReview),CreateTask,EditTask(String,u64),CreateChannel,ChannelPost(String),Member(String),EditChannel(String,u64,u64),Memory(Option<crate::ui::Memory>),Schedule,EditSchedule(crate::ui::Schedule),AssignTask(String,u64),QueuedEdit(vibeface_protocol::workspace::QueuedInput),Provider,DecisionToken,NodeSettings,Triage,Avatar,Logs,Relay,Transfer,Answer(String,String),Recovery}
 pub struct Field{pub key:&'static str,pub label:&'static str,pub state:Entity<InputState>,pub area:Option<Entity<TextareaState>>}
 pub struct Form{pub submission_id:String,pub generation:u64,pub owner_node_id:Option<String>,pub editor:Editor,pub fields:Vec<Field>}
 impl Form{
  pub fn new(editor:Editor,values:BTreeMap<&str,String>,generation:u64,window:&mut Window,cx:&mut App)->Self{
  let specs:&[(&str,&str,bool)]=match &editor{
  Editor::CreateProfile=>&[("label","个人网络档案名称",false)],
- Editor::ConnectLocal=>&[],
- Editor::Connect=>&[("transport","接入方式 gateway 或 lan",false),("addresses","LAN 地址，每行一个，可留空",false),("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false)],
- Editor::Join=>&[("origin","Gateway 地址",false),("ticket","邀请链接",true),("name","设备名称",false)],
- Editor::CreateNetwork=>&[("name","本设备名称",false),("node_name","Node 名称",false),("password","新恢复文件口令",true),("new_file","恢复文件保存路径",false)],
- Editor::Recovery=>&[("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false),("name","设备名称",false),("password","恢复文件口令",true),("old_file","原恢复文件路径",false),("new_file","新恢复文件保存路径",false)],
+ Editor::ConnectLocal=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true)],
+ Editor::Connect=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("transport","接入方式 gateway 或 lan",false),("addresses","LAN 地址，每行一个，可留空",false),("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false)],
+ Editor::Join=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("origin","Gateway 地址",false),("ticket","邀请链接",true),("name","设备名称",false)],
+ Editor::CreateNetwork=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("name","本设备名称",false),("node_name","Node 名称",false),("password","新恢复文件口令",true),("new_file","恢复文件保存路径",false)],
+ Editor::Recovery=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false),("name","设备名称",false),("password","恢复文件口令",true),("old_file","原恢复文件路径",false),("new_file","新恢复文件保存路径",false)],
  Editor::CreateBot|Editor::EditBot=>&[("name","Bot 名称",false),("instructions","指令",false),("target_node","项目设备 ID",false),("cwd","项目目录",false)],
+ Editor::CloseSettings(_)=>&[("note","说明你如何核对原设置；关闭不会确认服务器已执行",false)],
  Editor::BotModel(_)=>&[("model","模型，空白表示设备默认",false),("effort","推理强度，空白表示由Provider控制",false)],
  Editor::CreateTask|Editor::EditTask(..)=>&[("title","任务标题",false),("owner_bot","负责的 Bot ID",false),("request","任务要求",false),("expected_result","预期结果",false),("dependencies","依赖任务 ID，逗号分隔",false)],
  Editor::Member(_)=>&[("name","设备名称",false)],
@@ -32,7 +33,7 @@ impl Form{
  Editor::Relay=>&[("device_id","设备 ID",false),("url","中继地址",false),("volunteer","提供中继服务，true 或 false",false),("listen","监听地址，可留空",false),("rate","速率上限，可留空",false),("max_clients","客户端上限，可留空",false),("max_clients_per_ip","每个 IP 上限，可留空",false)],
  Editor::Transfer=>&[("file","文件路径",false),("receiver_peer","接收设备 ID",false),("provider_peer","传输服务设备 ID",false),("mode","传输方式 charity 或 paid",false),("acceptance","结算条件 recoverable 或 strict",false),("max_service_amount","最高服务费",false),("max_gas_amount","最高网络费",false)],
  Editor::Answer(..)=>&[("text","回复内容",false)]};
- let fields=specs.iter().map(|&(key,label,secret)|{let state=cx.new(|cx|InputState::new(window,cx).placeholder(label).masked(secret));if let Some(value)=values.get(key){state.update(cx,|s,cx|s.set_value(value.clone(),window,cx));}let area=if !secret&&["text","instructions","request","expected_result","prompt","roots","projects","addresses","backup_candidates"].contains(&key){let area=cx.new(|cx|TextareaState::new(window,cx).placeholder(label));if let Some(value)=values.get(key){area.update(cx,|s,cx|s.set_value(value.clone(),window,cx));}Some(area)}else{None};Field{key,label,state,area}}).collect();Self{submission_id:uuid::Uuid::new_v4().to_string(),generation,owner_node_id:values.get("_owner_node_id").cloned(),editor,fields}
+ let fields=specs.iter().map(|&(key,label,secret)|{let state=cx.new(|cx|InputState::new(window,cx).placeholder(label).masked(secret));if let Some(value)=values.get(key){state.update(cx,|s,cx|s.set_value(value.clone(),window,cx));}let area=if !secret&&["text","instructions","request","expected_result","prompt","roots","projects","addresses","backup_candidates","note"].contains(&key){let area=cx.new(|cx|TextareaState::new(window,cx).placeholder(label));if let Some(value)=values.get(key){area.update(cx,|s,cx|s.set_value(value.clone(),window,cx));}Some(area)}else{None};Field{key,label,state,area}}).collect();Self{submission_id:uuid::Uuid::new_v4().to_string(),generation,owner_node_id:values.get("_owner_node_id").cloned(),editor,fields}
  }
  pub fn values(&self,cx:&App)->BTreeMap<String,String>{let mut values:BTreeMap<_,_>=self.fields.iter().map(|f|(f.key.to_owned(),f.area.as_ref().map(|area|area.read(cx).value().to_string()).unwrap_or_else(||f.state.read(cx).value().to_string()))).collect();values.insert("_submission_id".into(),self.submission_id.clone());if let Some(node)=&self.owner_node_id{values.insert("_owner_node_id".into(),node.clone());}values}
  pub fn render(&self)->AnyElement{div().flex().flex_col().gap_4().children(self.fields.iter().map(|f|{let input=if let Some(area)=&f.area{Textarea::new(area).h(px(100.)).aria_label(f.label).into_any_element()}else{Input::new(&f.state).aria_label(f.label).into_any_element()};div().flex().flex_col().gap_2().child(div().text_sm().child(f.label)).child(input)})).into_any_element()}

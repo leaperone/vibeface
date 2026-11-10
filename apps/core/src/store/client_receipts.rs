@@ -119,7 +119,11 @@ mod tests {
         let signed = client.attest(&network, scope, body)?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(&network, &state)?;
-        store.append_event(&node, &network, scope, signed.clone(), vec![], 1)?;
+        if scope==WORKSPACE_SCOPE {
+            let bot=client.attest(&network,"chat",EventBody::BotCreated {bot_id:"bot".into(),name:"Fixture".into(),instructions:String::new(),project:None,attestation:None,cause:None})?;
+            store.create_bot(&node,&network,&BotCreateSpec {bot_id:"bot".into(),conversation_id:"chat".into(),name:"Fixture".into(),instructions:String::new(),project:None,attestation:bot.attestation().context("fixture bot signature")?.clone(),owner:node.owner_fixture(&network,"chat",&node.device_id()?)?},1)?;
+        }
+        store.append_event(&node, &network, scope, signed.clone(), vec![], 2)?;
         Ok((store, network, client.device_id()?, signed))
     }
     #[test]

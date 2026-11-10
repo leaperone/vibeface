@@ -25,7 +25,7 @@ impl Desktop {
             .child(format!("来源：{}。完整执行历史{}。", detail.coverage.source, if detail.coverage.complete {"已提供"} else {"未提供"}));
         if !self.snapshot.online { page = page.child("当前显示缓存记录。连接中断期间的进度和停止结果尚未确认。"); }
         if self.snapshot.local_session { page = page.child("当前为本机管理会话。加入个人网络后才能发送签名输入。"); }
-        page = page.child(self.row("执行设备", node.map(|n|format!("{} · {}{}", n.name, if n.online {"在线"} else {"离线"}, if n.revoked {" · 已撤销"} else {""})).unwrap_or_else(||format!("{} · 尚未读取设备状态", work.target_node))))
+        page = page.child(self.row("执行设备", node.map(|n|format!("{} · {}{}", n.name, if !self.snapshot.online {"当前状态未确认"} else if n.online {"在线"} else {"离线"}, if n.revoked {" · 已撤销"} else {""})).unwrap_or_else(||format!("{} · 尚未读取设备状态", work.target_node))))
             .child(self.row("Provider 与模型", format!("{:?} · {}", work.resolved.provider, work.resolved.model.as_deref().unwrap_or("接收时的设备默认模型"))))
             .child(self.row("工作目录", work.cwd.clone()))
             .child(self.row("原始交代", "发送给执行设备的原文"))
@@ -52,7 +52,7 @@ impl Desktop {
                 .child(self.ask("work-settle-completed", "我已核实：已完成", Command::ResolveWork {conversation_id:conversation_id.clone(),work_id:work_id.clone(),outcome:ResolveOutcome::Completed}, cx).disabled(!self.snapshot.writable || !self.snapshot.online))
                 .child(self.ask("work-settle-interrupted", "我已核实：未完成", Command::ResolveWork {conversation_id:conversation_id.clone(),work_id:work_id.clone(),outcome:ResolveOutcome::Interrupted}, cx).disabled(!self.snapshot.writable || !self.snapshot.online));
         } else if active && work.state != WorkState::Interrupting {
-            page = page.child(self.ask("work-stop", "请求停止工作", Command::StopWork {conversation_id:conversation_id.clone(),work_id:work_id.clone()}, cx).disabled(!self.snapshot.writable));
+            page = page.child(self.ask("work-stop", "请求停止工作", Command::StopWork {conversation_id:conversation_id.clone(),work_id:work_id.clone()}, cx).disabled(!self.snapshot.can_control));
         }
         if let (Some(thread), Some(turn)) = (&work.thread_id, &work.turn_id) {
             page = page.child(self.row("执行会话与运行", format!("线程 {thread}\n运行 {turn}")));

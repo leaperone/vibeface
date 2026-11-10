@@ -38,11 +38,15 @@ fn native_field_focus_text_and_enter_reach_owner(cx: &mut TestAppContext) {
     handle
         .update(cx, |view, window, cx| {
             view.input.update(cx, |state, cx| state.focus(window, cx));
-            window.render_frame(cx);
-            window.input("native-gpui-fixture", cx);
-            window.press("enter", cx);
         })
         .unwrap();
+    let native_window: gpui_kit::AnyWindowHandle = handle.into();
+    native_window.update(cx, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("native-gpui-fixture", cx);
+        window.press("enter", cx);
+    }).unwrap();
+    cx.run_until_parked();
     handle
         .update(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).value().as_str(), "native-gpui-fixture");

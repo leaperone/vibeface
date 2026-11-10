@@ -2,6 +2,7 @@
 name = "vibeface-desktop"
 version = "0.0.1-nightly.20261110.3"
 edition.workspace = true
+rust-version = "1.98.1"
 
 [features]
 native-ui-tests = ["gpui-kit/test-support"]
@@ -30,3 +31,4 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true

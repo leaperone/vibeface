@@ -41,8 +41,23 @@ try {
     node scripts/windows-signing.mjs verify $uninstaller
     if ($LASTEXITCODE -ne 0) { throw 'Signed installer has no verified signed uninstaller' }
   }
-  node scripts/e2e-desktop.mjs --app (Join-Path $destination 'Vibeface.exe') --runtime $Runtime --output $Output
-  if ($LASTEXITCODE -ne 0) { throw 'The installed native application failed its real-window checks' }
+  $previousApp = $env:VIBEFACE_E2E_DESKTOP_APP
+  $previousRuntime = $env:VIBEFACE_E2E_DESKTOP_RUNTIME
+  $previousOutput = $env:VIBEFACE_E2E_DESKTOP_OUTPUT
+  $previousTelemetry = $env:E2E_TELEMETRY_DISABLED
+  try {
+    $env:VIBEFACE_E2E_DESKTOP_APP = Join-Path $destination 'Vibeface.exe'
+    $env:VIBEFACE_E2E_DESKTOP_RUNTIME = $Runtime
+    $env:VIBEFACE_E2E_DESKTOP_OUTPUT = $Output
+    $env:E2E_TELEMETRY_DISABLED = '1'
+    pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts --output (Join-Path $PWD 'tests/e2e/.artifacts/native-desktop/installed-runner')
+    if ($LASTEXITCODE -ne 0) { throw 'The installed native application failed its real-window e2e checks' }
+  } finally {
+    $env:VIBEFACE_E2E_DESKTOP_APP = $previousApp
+    $env:VIBEFACE_E2E_DESKTOP_RUNTIME = $previousRuntime
+    $env:VIBEFACE_E2E_DESKTOP_OUTPUT = $previousOutput
+    $env:E2E_TELEMETRY_DISABLED = $previousTelemetry
+  }
 } finally {
   if ($installed) {
     $uninstaller = Join-Path $destination 'Uninstall.exe'

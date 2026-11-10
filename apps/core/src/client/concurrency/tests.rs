@@ -11,6 +11,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::
 
 const DEADLINE: Duration = Duration::from_secs(2);
 
+fn fixture_work_id() -> String {
+    crate::work::WorkSpec::id("scope", "message:fixture-message", "fixture-call")
+}
+
 struct HeldWriter {
     release: Option<std::sync::mpsc::Sender<()>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -161,6 +165,11 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         let owner = self.admin.attest(network, "scope", EventBody::ConversationOwner {
             scheduler_node: node_id.clone(), epoch: 1, attestation: None, cause: None,
         })?;
+        let message = self.admin.attest(network, "scope", EventBody::MessagePosted {
+            message_id: "fixture-message".into(), role: crate::model::Role::User,
+            text: "Fixture input".into(), attachments: vec![], report_results: Some(true),
+            in_reply_to: None, status: None, failure: None, answers: None, attestation: None,
+        })?;
         let network = network.clone();
         let identity = self.node.identity.clone();
         let cwd = self.dir.display().to_string();
@@ -168,8 +177,9 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         store.create_conversation(&identity, &network, "scope", "Fixture work",
             FirstOwner { scheduler_node: node_id.clone(), attestation: owner.attestation().cloned().context("owner attestation")? },
             crate::runtime::now_ms())?;
+        store.append_event(&identity, &network, "scope", message, vec![], crate::runtime::now_ms())?;
         store.accept_work(&identity, &network, WorkRequest {
-            work_id: "held-work".into(), conversation: "scope".into(), trigger: "fixture-trigger".into(),
+            work_id: fixture_work_id(), conversation: "scope".into(), trigger: "message:fixture-message".into(),
             target: node_id.clone(), dispatcher: node_id, call_ref: "fixture-call".into(),
             kind: RequestedWorkKind::Agent(Some(Provider::Pi)), model: None,
             cwd, title: "Fixture work".into(), prompt: "Never execute".into(),
@@ -290,11 +300,11 @@ async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or
     let result = async {
         for index in 0..CONTROL_CALLS {
             send(&mut client, &format!("stop-under-writer-{index}"), "rpc", json!({
-                "method":"interrupt_work", "conversation_id":"scope", "work_id":"held-work",
+                "method":"interrupt_work", "conversation_id":"scope", "work_id":fixture_work_id(),
             })).await?;
         }
         send(&mut client, "control-intake-barrier", "rpc", json!({
-            "method":"interrupt_work", "conversation_id":"scope", "work_id":"held-work",
+            "method":"interrupt_work", "conversation_id":"scope", "work_id":fixture_work_id(),
         })).await?;
         let overload = response(&mut client, "control-intake-barrier").await?;
         assert_eq!(overload["code"], "client_overloaded",
@@ -322,7 +332,7 @@ async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or
             returned.insert(value["id"].as_str().context("response ID")?.to_owned());
         }
         for index in 0..CONTROL_CALLS { assert!(returned.contains(&format!("stop-under-writer-{index}"))); }
-        assert_eq!(fixture.node.store.call("fixture_stopped_under_writer", |store| store.stop_requests()).await?[0].work_id, "held-work");
+        assert_eq!(fixture.node.store.call("fixture_stopped_under_writer", |store| store.stop_requests()).await?[0].work_id, fixture_work_id());
     }
     close(&mut client, serving).await?;
     fixture.cleanup().await?;
@@ -366,17 +376,48 @@ async fn a_committed_revocation_fences_results_before_the_writer_closure_returns
     fixture.state.append(GovernanceEvent::revoke(&fixture.backup, &fixture.state.project()?,
         Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
     let state = fixture.state.clone();
-    // install_state commits before this barrier. The accepted closure remains parked, so an
-    // end-of-closure cache publication alone cannot pass this encrypted-socket check.
+    // install_state commits before this barrier. Updating authority must withhold old data,
+    // while keeping the transport alive until the definitive committed view is published.
     let writer = HeldWriter::after(&fixture.node, move |store| {
         store.install_state(state)?;
         Ok(())
     }).await?;
-    let closed = tokio::time::timeout(DEADLINE, serving).await??;
-    assert!(closed.is_err(), "a physically committed revocation must fence the old connection immediately");
+    probe.write_all(b"G").await?;
     probe_exited(&mut probe).await?;
-    assert!(receive(&mut client).await.is_err(), "the physically revoked device received its old result");
+    ping_and_heartbeat(&mut client).await?;
+    assert!(!serving.is_finished(), "an updating cache alone does not establish revocation");
     writer.finish().await?;
+    let closed = tokio::time::timeout(DEADLINE, serving).await??;
+    assert!(closed.is_err(), "the published revocation must close the old connection");
+    assert!(receive(&mut client).await.is_err(), "the physically revoked device received its old result");
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn unrelated_member_grants_pause_sensitive_results_then_resume_the_same_connection() -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let (mut client, serving) = fixture.connect(&fixture.admin, None).await?;
+    client.call("subscribe", json!({})).await?;
+    send(&mut client, "probe-during-grant", "provider_probe", json!({"provider":"pi"})).await?;
+    let mut probe = fixture.probe_started().await?;
+    fixture.state.append(GovernanceEvent::grant(&fixture.admin, &fixture.state.project()?,
+        Member::client(&LocalIdentity::generate(), "unrelated", false)?)?)?;
+    let state = fixture.state.clone();
+    let writer = HeldWriter::after(&fixture.node, move |store| {
+        store.install_state(state)?;
+        Ok(())
+    }).await?;
+    probe.write_all(b"G").await?;
+    probe_exited(&mut probe).await?;
+    fixture.node.publish_reread(&fixture.state.genesis.network_id);
+    ping_and_heartbeat(&mut client).await?;
+    assert!(!serving.is_finished(), "an unrelated grant cannot reset an authorized connection");
+    writer.finish().await?;
+    let completed = response(&mut client, "probe-during-grant").await?;
+    assert!(completed["error"].is_null(), "{completed}");
+    assert_eq!(completed["result"]["probe"]["catalog"]["models"][0]["id"], "fixture/held-model");
+    assert_eq!(client.call("authenticate", json!({})).await?["principal"]["device_id"], fixture.admin.device_id()?);
+    close(&mut client, serving).await?;
     fixture.cleanup().await
 }
 
@@ -404,13 +445,13 @@ async fn held_process_does_not_block_reads_stop_push_heartbeat_or_overload_respo
         assert_eq!(fast["result"]["conversations"][0]["title"], "Fixture work");
 
         send(&mut client, "stop", "rpc", json!({
-            "method":"interrupt_work", "conversation_id":"scope", "work_id":"held-work",
+            "method":"interrupt_work", "conversation_id":"scope", "work_id":fixture_work_id(),
         })).await?;
         let stopped = response(&mut client, "stop").await?;
         assert!(stopped["error"].is_null(), "{stopped}");
         assert_eq!(stopped["result"]["interrupt_requested"], true);
         assert_eq!(stopped["result"]["waiting_for_start"], true);
-        assert_eq!(fixture.node.store.call("fixture_stops", |store| store.stop_requests()).await?[0].work_id, "held-work");
+        assert_eq!(fixture.node.store.call("fixture_stops", |store| store.stop_requests()).await?[0].work_id, fixture_work_id());
 
         fixture.node.events.send(crate::runtime::Update {
             network_id: fixture.state.genesis.network_id.clone(), payload: json!({"type":"fixture-marker"}),
@@ -602,8 +643,38 @@ async fn a_completed_display_result_is_rechecked_even_before_membership_watch_is
         Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
     fixture.node.install_membership(fixture.state.clone()).await?;
     let writer = HeldWriter::new(&fixture.node).await?;
-    assert!(calls.finish(&fixture.node, &mut session, &authority, completed).is_err());
-    assert!(Pushes::default().finish(&fixture.node, &session, &authority, prepared).is_err());
+    assert!(calls.deliver(&fixture.node, &mut session, &authority, completed).is_err());
+    assert!(Pushes::default().deliver(&fixture.node, &session, &authority, prepared).is_err());
+    drop(calls);
+    writer.finish().await?;
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn a_completed_invite_does_not_release_its_result_after_the_manager_is_revoked() -> Result<()> {
+    use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
+    let mut fixture = Fixture::new().await?;
+    let mut session = Snapshot { device_id: fixture.admin.device_id()?, cookie: None, operator: false }.session();
+    let authority = Authority::new(&fixture.node, &session, fixture.node.local_access.subscribe())?;
+    let mut record = InviteRecord {
+        network_id: fixture.state.genesis.network_id.clone(),
+        invite_hash: invite_hash(&[3; 32]), issuer: fixture.admin.device_id()?,
+        expires_at_ms: crate::runtime::now_ms() + 60_000, signature: String::new(),
+    };
+    record.signature = fixture.admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
+    let mut calls = Calls::default();
+    calls.accept(&fixture.node, &session, &authority, Request {
+        id: "manager-invite".into(), method: "invite".into(), params: json!({"record":record}),
+    })?;
+    calls.start_ordered(&fixture.node, &session, &authority);
+    let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
+    assert!(completed.result.as_ref().expect("signed manager invite succeeds")["join_id"].is_string());
+    fixture.state.append(GovernanceEvent::revoke(&fixture.backup, &fixture.state.project()?,
+        Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
+    fixture.node.install_membership(fixture.state.clone()).await?;
+    let writer = HeldWriter::new(&fixture.node).await?;
+    assert!(calls.deliver(&fixture.node, &mut session, &authority, completed).is_err(),
+        "the manager's completed invite must stay private after revocation");
     drop(calls);
     writer.finish().await?;
     fixture.cleanup().await

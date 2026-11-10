@@ -5204,7 +5204,7 @@ mod tests {
                     }
                 }
             }).await??;
-            let (_, cached) = a.client_membership();
+            let (_, cached) = a.ready_client_membership().await?;
             let effective = cached.context("committed membership")?.project()?;
             assert_eq!(effective.epoch, expected_epoch);
             assert_eq!(effective.recovery_key, next);
@@ -5256,7 +5256,7 @@ mod tests {
             let projected = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     changed.changed().await?;
-                    let (_, state) = node.client_membership();
+                    let (_, state) = node.ready_client_membership().await?;
                     let view = state.context("cached authority")?.project()?;
                     if view.epoch != before_epoch { break anyhow::Ok(view); }
                 }

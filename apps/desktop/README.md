@@ -12,7 +12,7 @@ node scripts/build-desktop.mjs --target <target> --runtime-dir <runtime> --runti
 node scripts/verify-desktop.mjs --target <target> --input <output>
 ```
 
-图形依赖的工具链和 hosted runner 系统库由 [native-desktop action](../../.github/actions/native-desktop/action.yml) 固定。不要按 Core 的最低 Rust 版本推断 GPUI 已可编译。构建包保留 macOS ARM64 DMG/ZIP、Windows x64 当前用户安装器/ZIP、Linux x64 和 ARM64 AppImage/ZIP。封存 Core/CLI 的字节与摘要不能被桌面签名重写。
+桌面构建固定使用已验证可编译的 Rust 1.98.1，独立 Core/CLI 的最低版本声明不变。图形依赖的工具链和 hosted runner 系统库由 [native-desktop action](../../.github/actions/native-desktop/action.yml) 固定。不要按 Core 的最低 Rust 版本推断 GPUI 已可编译。构建包保留 macOS ARM64 DMG/ZIP、Windows x64 当前用户安装器/ZIP、Linux x64 和 ARM64 AppImage/ZIP。封存 Core/CLI 的字节与摘要不能被桌面签名重写。
 
 真实窗口检查使用 `scripts/e2e-desktop.mjs`，必须传入打包后的程序和同源运行包。它使用独立 profile 和显式 `--controlled-fixture`，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，再核对 GPUI 输入/焦点/动作回执、正常退出和无自动启动的 Node。普通 Rust 单测不证明图形、IME、无障碍、通知送达或各平台完整功能验收通过。完整验收范围见 [GPUI 设计](../../packages/docs/design/gpui-desktop.md)。
 

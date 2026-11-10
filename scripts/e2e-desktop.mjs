@@ -32,6 +32,10 @@ child.stderr.pipe(logs, { end: false });
 let spawnError;
 child.on('error', error => { spawnError = error; });
 const exit = new Promise(resolve => child.on('close', (code, signal) => resolve({ code, signal })));
+for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  process.exitCode = 1;
+});
 function processRows() {
   if (process.platform === 'win32') {
     const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress';

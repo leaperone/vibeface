@@ -7,3 +7,4 @@ pub mod records;
 pub mod work_detail;
 pub mod channels;
 pub mod tasks;
+pub mod offline;

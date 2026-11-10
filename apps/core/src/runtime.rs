@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
+pub(crate) use crate::store::actor::{ClientAuthorityState, ClientMembership};
 
 pub(crate) mod agent_tools;
 mod bots;
@@ -634,7 +635,7 @@ pub struct Runtime {
     pub(crate) write_state: tokio::sync::watch::Sender<WriteState>,
     /// Bumped on every membership change, so open sessions and connections recheck their peer.
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
-    client_authority: tokio::sync::watch::Sender<(u64, Option<Arc<NetworkState>>)>,
+    client_authority: tokio::sync::watch::Sender<ClientMembership>,
     codex_rx: Mutex<Option<vibeface_bridge::codex::EventReceiver>>,
     pub(crate) triage: triage::TriageState,
     pub(crate) node_join: std::sync::Mutex<Option<crate::client::NodeJoinTask>>,
@@ -718,7 +719,7 @@ impl Runtime {
             Ok(())
         }).await?;
         let membership = tokio::sync::watch::Sender::new(0);
-        let client_authority = tokio::sync::watch::Sender::new((0, None));
+        let client_authority = tokio::sync::watch::Sender::new((0, ClientAuthorityState::Initializing));
         store.publish_membership_to(client_authority.clone(), membership.clone(), have_wakeup.clone()).await?;
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = vibeface_bridge::codex::event_channel();
@@ -994,9 +995,28 @@ impl Runtime {
         self.rejoin.notified().await
     }
 
-    /// Only committed membership history, shared without entering the SQLite queue.
-    pub(crate) fn client_membership(&self) -> (u64, Option<Arc<NetworkState>>) {
+    /// A commit fences authority until its complete history is ready to inspect.
+    pub(crate) fn client_membership(&self) -> ClientMembership {
         self.client_authority.borrow().clone()
+    }
+
+    pub(crate) fn subscribe_client_membership(&self) -> tokio::sync::watch::Receiver<ClientMembership> {
+        self.client_authority.subscribe()
+    }
+
+    /// For request workers only; the transport pump observes the state without awaiting it.
+    pub(crate) async fn ready_client_membership(&self) -> Result<(u64, Option<Arc<NetworkState>>)> {
+        let mut authority = self.subscribe_client_membership();
+        loop {
+            let (generation, state) = authority.borrow_and_update().clone();
+            match state {
+                ClientAuthorityState::Ready(state) => return Ok((generation, state)),
+                ClientAuthorityState::Initializing | ClientAuthorityState::Updating => {
+                    authority.changed().await.context("client authority channel closed")?;
+                }
+                ClientAuthorityState::Unavailable => bail!("database authority is unavailable"),
+            }
+        }
     }
 
     pub async fn has_membership(&self) -> Result<bool> {
@@ -1060,7 +1080,10 @@ impl Runtime {
         self.background_tasks.spawn(async move {
             let mut effective = None;
             loop {
-                let state = authority.borrow_and_update().1.clone();
+                let state = match authority.borrow_and_update().1.clone() {
+                    ClientAuthorityState::Ready(state) => state,
+                    ClientAuthorityState::Initializing | ClientAuthorityState::Updating | ClientAuthorityState::Unavailable => None,
+                };
                 let due = match state.map(|state| state.project()).transpose() {
                     Ok(Some(view)) => {
                         let projected = (view.epoch, view.recovery_key);
@@ -1599,7 +1622,7 @@ impl Runtime {
         read: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         ensure!(access.human, "display snapshot requires the user");
-        let (_, authority) = self.client_membership();
+        let (_, authority) = self.ready_client_membership().await?;
         let authority = authority.context("personal network is not installed")?;
         let network = access.network_id.clone();
         let local = self.identity.device_id()?;
@@ -1671,7 +1694,7 @@ impl Runtime {
         let network = &access.network_id;
         let node_id = self.identity.device_id()?;
         if snapshot {
-            let (_, current) = self.client_membership();
+            let (_, current) = self.ready_client_membership().await?;
             let current = current.context("personal network is not installed")?;
             ensure!(current.genesis.network_id == *network, "wrong personal network");
             current.project()?.node(&node_id)?;

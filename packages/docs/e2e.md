@@ -259,7 +259,9 @@ Desktop 使用 GPUI。浏览器和手机 e2e 保留各自的配置，不把网�
 
 ```sh
 cargo test -p vibeface-desktop --locked
-node scripts/e2e-desktop.mjs --app <packaged-executable-or-mac-app> --runtime <sealed-runtime-directory> --output <fresh-evidence-directory>
+VIBEFACE_E2E_DESKTOP_APP=<absolute-packaged-executable-or-mac-app> \
+VIBEFACE_E2E_DESKTOP_RUNTIME=<absolute-sealed-runtime-directory> \
+pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
 ```
 
-Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。窗口驱动只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。
+Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。该配置使用现有 e2e runner 的 tools-only 原生目标，不设置浏览器引擎或 AI 模型；workers 为 1，retries 为 0。测试调用确定性的 OS 窗口驱动，只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。

@@ -15,6 +15,7 @@ pub enum OperationState {
     Unknown,
     Accepted,
     Rejected,
+    ClosedByUser,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationSnapshot {
@@ -60,6 +61,9 @@ pub(crate) enum Reconciliation {
         order_id: Option<String>,
         operation: String,
     },
+    StopReply {conversation_id:String,trigger:String},
+    StopWork {conversation_id:String,work_id:String},
+    Settings {kind:crate::SettingsKind},
     Manual,
 }
 
@@ -127,7 +131,12 @@ impl Outbox {
         let existing:Option<Vec<u8>>=self.db.query_row("SELECT payload FROM verified_profiles WHERE target=?1",[&profile.target_node],|row|row.get(0)).optional()?;
         if let Some(existing)=existing {
             let known:crate::profile::CachedProfile=serde_json::from_slice(&existing)?;
-            ensure!(!known.revoked || profile.revoked,"known revocation cannot be overwritten by cached membership");
+            if known.revoked && !profile.revoked {
+                let prior=known.state.project_at(known.observed_at_ms)?;
+                let fresh=profile.state.project_at(profile.observed_at_ms)?;
+                ensure!(fresh.epoch>prior.epoch,"known revocation needs an explicit newer root recovery");
+                fresh.client(&profile.client_id)?;fresh.node(&profile.target_node)?;
+            }
             ensure!(known.write_gate!=2 || profile.write_gate==2,"known Node fork cannot be overwritten by older write status");
         }
         let bytes=serde_json::to_vec(profile)?;ensure!(bytes.len()<=4*1024*1024,"profile proof exceeds cache limit");
@@ -145,7 +154,8 @@ impl Outbox {
         self.cache_profile(&profile)
     }
     pub(crate) fn invalidate_profile(&self,target:&str)->Result<()> {
-        let mut profile=self.cached_profile(target)?;profile.revoked=true;self.cache_profile(&profile)
+        let mut profile=match self.cached_profile(target) {Ok(profile)=>profile,Err(error) if error.downcast_ref::<rusqlite::Error>().is_some_and(|error|matches!(error,rusqlite::Error::QueryReturnedNoRows))=>return Ok(()),Err(error)=>return Err(error)};
+        profile.revoked=true;self.cache_profile(&profile)
     }
     pub(crate) fn reserve_sequence(&mut self, lane: &str) -> Result<u64> {
         let tx = self
@@ -222,7 +232,7 @@ impl Outbox {
             );
             return Ok(());
         }
-        tx.execute("DELETE FROM operations WHERE state='accepted' AND rowid NOT IN (SELECT rowid FROM operations WHERE state='accepted' ORDER BY rowid DESC LIMIT 64) AND NOT EXISTS(SELECT 1 FROM operations pending,json_each(CAST(pending.payload AS TEXT),'$.prerequisites') dependency WHERE pending.state!='accepted' AND dependency.value=operations.id)", [])?;
+        tx.execute("DELETE FROM operations WHERE state IN ('accepted','closed_by_user') AND rowid NOT IN (SELECT rowid FROM operations WHERE state IN ('accepted','closed_by_user') ORDER BY rowid DESC LIMIT 64) AND NOT EXISTS(SELECT 1 FROM operations pending,json_each(CAST(pending.payload AS TEXT),'$.prerequisites') dependency WHERE pending.state!='accepted' AND dependency.value=operations.id)", [])?;
         let count: u64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
         ensure!(
             count < 256,
@@ -280,6 +290,47 @@ impl Outbox {
         self.save(&op, "unknown")?;
         Ok(op)
     }
+    fn affected_prepared(&self,id:&str)->Result<Vec<Operation>> {
+        let all=self.operations()?;
+        let root=all.iter().position(|op|op.snapshot.id==id).context("operation missing")?;
+        let mut affected=std::collections::HashSet::from([id.to_owned()]);
+        let mut lanes=std::collections::HashMap::from([(all[root].lane.clone(),root)]);
+        let mut changed=true;
+        while changed {
+            changed=false;
+            for (index,op) in all.iter().enumerate() {
+                if op.snapshot.state!=OperationState::Prepared || affected.contains(&op.snapshot.id) {continue;}
+                if op.prerequisites.iter().any(|dependency|affected.contains(dependency)) || lanes.get(&op.lane).is_some_and(|prior|index>*prior) {
+                    affected.insert(op.snapshot.id.clone());lanes.entry(op.lane.clone()).or_insert(index);changed=true;
+                }
+            }
+        }
+        Ok(all.into_iter().filter(|op|affected.contains(&op.snapshot.id)).collect())
+    }
+    pub(crate) fn review_settings(&self,id:&str)->Result<crate::SettingsReview> {
+        let operation=self.get(id)?;
+        let dependent_ids=self.affected_prepared(id)?.into_iter().filter(|op|op.snapshot.id!=id).map(|op|op.snapshot.id).collect();
+        crate::settings::review(&operation,dependent_ids)
+    }
+    pub(crate) fn close_unknown_settings(&mut self,review:&crate::SettingsReview,note:&str)->Result<Vec<OperationSnapshot>> {
+        ensure!(!note.trim().is_empty() && note.len()<=2048,"record what was reviewed on the original Node");
+        let fresh=self.review_settings(&review.operation_id)?;
+        ensure!(fresh.fingerprint==review.fingerprint && fresh.network_id==review.network_id && fresh.client_id==review.client_id && fresh.target_node==review.target_node && fresh.dependent_ids==review.dependent_ids,"settings or dependent drafts changed; review the original group again");
+        let operations=self.affected_prepared(&review.operation_id)?;
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;let mut closed=vec![];
+        for mut operation in operations {
+            operation.snapshot.state=OperationState::ClosedByUser;
+            operation.snapshot.result=Some(serde_json::json!({"local_resolution":"closed_by_user","server_outcome":if operation.snapshot.id==review.operation_id {"unknown"}else{"not_sent"},"note":note,"reviewed_at_ms":vibeface_protocol::now_ms(),"parent_operation":review.operation_id}));
+            tx.execute("UPDATE operations SET state='closed_by_user',payload=?2 WHERE id=?1",params![operation.snapshot.id,serde_json::to_vec(&operation)?])?;
+            closed.push(operation.snapshot);
+        }
+        tx.commit()?;Ok(closed)
+    }
+    pub(crate) fn observe_unknown(&mut self,id:&str,result:Value)->Result<OperationSnapshot> {
+        let mut op=self.get(id)?;
+        if op.snapshot.state==OperationState::Unknown {op.snapshot.result=Some(result);self.save(&op,"unknown")?;}
+        Ok(op.snapshot)
+    }
     pub(crate) fn settle(
         &mut self,
         id: &str,
@@ -291,6 +342,7 @@ impl Outbox {
             "invalid settlement"
         );
         let mut op = self.get(id)?;
+        if op.snapshot.state==OperationState::ClosedByUser {return Ok(op.snapshot);}
         op.snapshot.state = state;
         op.snapshot.result = Some(result);
         self.save(

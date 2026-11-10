@@ -97,3 +97,17 @@ fn non_operator_member_cannot_open_node_configuration(cx:&mut TestAppContext){
 fn profile_switch_requires_its_explicit_confirmation(cx:&mut TestAppContext){
  use host::profiles::{PersonalProfile,ProfileHints,ProfileId};let mut snapshot=fixture();let id="00000000-0000-4000-8000-000000000001";snapshot.profile_id=Some("default".into());snapshot.profiles=vec![PersonalProfile{id:ProfileId::parse("default").unwrap(),label:"原网络".into(),hints:ProfileHints::default()},PersonalProfile{id:ProfileId::parse(id).unwrap(),label:"另一个网络".into(),hints:ProfileHints::default()}];let mut h=open(cx,Route::Connect,snapshot);click(&h,cx,&format!("switch-profile-{id}"));assert!(h.commands.try_recv().is_err());assert!(h.view.read_with(cx,|view,_|view.confirmation.is_some()));click(&h,cx,"confirm-danger");match h.commands.try_recv().expect("explicit profile switch"){Command::SwitchProfile(profile)=>assert_eq!(profile,id),_=>panic!("profile switch must not submit a network command")}
 }
+#[gpui_kit::test]
+fn cold_cached_member_can_stage_without_claiming_a_fresh_read(cx:&mut TestAppContext){
+ let mut snapshot=fixture();snapshot.online=false;snapshot.synced=false;snapshot.writable=false;snapshot.cached=true;snapshot.can_save_locally=true;snapshot.status="离线缓存，状态尚未重新确认".into();let mut h=open(cx,Route::Chat("chat-a".into()),snapshot);enter_message(&h,cx,"冷启动后的本机待发输入");click(&h,cx,"send");let(_,command)=scoped(h.commands.try_recv().expect("cached target staging"));assert!(matches!(command,Command::Input{..}));assert!(!h.view.read_with(cx,|view,_|view.snapshot.synced));assert!(!h.view.read_with(cx,|view,_|view.snapshot.writable));
+}
+#[gpui_kit::test]
+fn explicit_manual_unlock_uses_the_entered_passphrase_without_requesting_a_vault(cx:&mut TestAppContext){
+ let mut h=open(cx,Route::Connect,fixture());h.window.update(cx,|_,window,cx|h.view.update(cx,|view,cx|view.edit(views::forms::Editor::Connect,std::collections::BTreeMap::from([("origin","https://fixture.invalid".into()),("node_id","a".repeat(64)),("unlock_mode","manual".into()),("unlock_password","fixture-unlock-passphrase".into())]),window,cx))).unwrap();click(&h,cx,"save-form");let command=h.commands.try_recv().expect("manual unlock intent");match command{Command::Save{values,editor,..}=>{assert!(matches!(editor,views::forms::Editor::Connect));assert_eq!(values.get("passphrase").map(String::as_str),Some("fixture-unlock-passphrase"));assert!(!values.contains_key("unlock_password"));},_=>panic!("manual unlock must use the explicit identity path")}
+}
+#[gpui_kit::test]
+fn stale_critical_events_cannot_clear_a_newer_draft_or_copy_an_old_profile_secret(cx:&mut TestAppContext){
+ let h=open(cx,Route::Chat("chat-a".into()),fixture());enter_message(&h,cx,"当前档案尚未保存的文字");
+ assert!(h.events.try_send(Event::Scoped{generation:6,profile_id:None,event:Box::new(Event::InputStored("当前档案尚未保存的文字".into()))}).is_ok());
+ assert!(h.events.try_send(Event::Scoped{generation:7,profile_id:Some("other-profile".into()),event:Box::new(Event::CopySecret(zeroize::Zeroizing::new("fixture-old-profile-secret".into())))}).is_ok());cx.run_until_parked();assert_eq!(h.view.read_with(cx,|view,cx|view.composer.read(cx).value().to_string()),"当前档案尚未保存的文字");assert!(cx.update(|cx|cx.read_from_clipboard()).is_none());
+}

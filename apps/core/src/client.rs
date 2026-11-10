@@ -293,6 +293,7 @@ impl FrameClient {
         })
         .await
         .context("client response timed out; outcome may be unknown")?
+        .with_context(|| format!("client {method} request failed"))
     }
 }
 
@@ -609,7 +610,7 @@ async fn serve_session_with_heartbeat(
         observation: None,
         operator: false,
     };
-    let authority = Authority::new(&node, &session, local_changes.clone())?;
+    let authority = Authority::initialize(&node, &session, local_changes.clone()).await?;
     let opened = Instant::now();
     let mut guest = if session.cookie.is_none() && authority.principal(&node, &session).is_err() {
         Some(
@@ -628,8 +629,32 @@ async fn serve_session_with_heartbeat(
     let mut partial_started: Option<Instant> = None;
     let mut calls = Calls::default();
     let mut pushes = Pushes::default();
+    let mut resync_pending = false;
     loop {
         calls.start_ordered(&node, &session, &authority);
+        let mut delivered = false;
+        if authority.ready(&node)? {
+            if resync_pending && session.subscribed.is_some() && pushes.is_empty()
+                && let Some(principal) = authority.current(&node, &session)?
+            {
+                pushes.start(&node, &session, principal, json!({"type":"resync"}));
+                resync_pending = false;
+            }
+            if let Some(completed) = calls.take_deferred()
+                && let Some(response) = calls.deliver(&node, &mut session, &authority, completed)?
+            {
+                send_value(&mut socket, &mut channel, &response).await?;
+                received = Instant::now();
+                delivered = true;
+            }
+            if let Some(prepared) = pushes.take_deferred()
+                && let Some(push) = pushes.deliver(&node, &session, &authority, prepared)?
+            {
+                send_value(&mut socket, &mut channel, &push).await?;
+                delivered = true;
+            }
+        }
+        if delivered { continue; }
         tokio::select! {
             frame = socket.next() => {
                 received = Instant::now();
@@ -648,17 +673,22 @@ async fn serve_session_with_heartbeat(
                     _ => bail!("client channel accepts only encrypted binary frames"),
                 }
             }
-            completed = calls.next(), if !calls.is_empty() => {
-                let response = calls.finish(&node, &mut session, &authority, completed?)?;
-                send_value(&mut socket, &mut channel, &response).await?;
-                received = Instant::now();
+            completed = calls.next(), if calls.running() => {
+                if let Some(response) = calls.deliver(&node, &mut session, &authority, completed?)? {
+                    send_value(&mut socket, &mut channel, &response).await?;
+                    received = Instant::now();
+                }
             }
-            prepared = pushes.next(), if !pushes.is_empty() => {
-                let push = pushes.finish(&node, &session, &authority, prepared?)?;
-                send_value(&mut socket, &mut channel, &push).await?;
+            prepared = pushes.next(), if pushes.running() => {
+                if let Some(push) = pushes.deliver(&node, &session, &authority, prepared?)? {
+                    send_value(&mut socket, &mut channel, &push).await?;
+                }
             }
-            event = events.recv(), if session.subscribed.is_some() && pushes.is_empty() => {
-                let principal = authority.principal(&node, &session)?;
+            event = events.recv(), if session.subscribed.is_some() && pushes.is_empty() && authority.ready(&node)? => {
+                let Some(principal) = authority.current(&node, &session)? else {
+                    resync_pending = true;
+                    continue;
+                };
                 match event {
                     Ok(event) if event.network_id == principal.network_id => {
                         // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
@@ -680,7 +710,7 @@ async fn serve_session_with_heartbeat(
                 // fresh interval, but a half-sent encrypted message still has its own deadline.
                 ensure!(!calls.is_empty() || received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed.is_some() || session.observation.is_some() { authority.principal(&node, &session)?; }
+                if session.subscribed.is_some() || session.observation.is_some() { authority.current(&node, &session)?; }
                 if guest.is_some() {
                     if authority.principal(&node, &session).is_ok() { guest = None; }
                     else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
@@ -694,13 +724,14 @@ async fn serve_session_with_heartbeat(
                 // A removed device loses its subscription at once, not at the next heartbeat; one
                 // whose management permission changed reconnects to pick up the new principal.
                 if session.subscribed.is_some() || session.observation.is_some() {
-                    let now = authority.principal(&node, &session)?.can_manage;
+                    let Some(now) = authority.current(&node, &session)? else { continue; };
+                    let now = now.can_manage;
                     ensure!(session.subscribed.is_none_or(|was| was == now), "this device's management permission changed");
                 }
             }
             changed = local_changes.changed(), if session.cookie.is_some() => {
                 changed.context("local access state closed")?;
-                if authority.principal(&node, &session).is_err() {
+                if authority.current(&node, &session).is_err() {
                     bail!("local browser access was revoked");
                 }
             }
@@ -739,8 +770,8 @@ async fn dispatch(
     params: Value,
 ) -> Result<Value> {
     if snapshot_request(method, &params) {
-        let authority = Authority::new(node, session, node.local_access.subscribe())?;
-        let principal = authority.principal(node, session)?;
+        let authority = Authority::initialize(node, session, node.local_access.subscribe()).await?;
+        let principal = authority.display_principal(node, session).await?;
         let result = dispatch_inner(node, session, method, params, Some(principal.clone())).await;
         authority.check(node, session, &principal)?;
         result

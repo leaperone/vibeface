@@ -13,9 +13,9 @@ impl Backend{
  // The outbox dependency prevents any generic resend path from bypassing task creation.
  if let Some(command)=saved.prerequisite.clone(){let prerequisite=client.stage(Action::Workspace{command}).await?;saved.prerequisite_id=Some(prerequisite.id);write_draft(path.clone(),saved.clone()).await?;}
  let prerequisites=saved.prerequisite_id.iter().cloned().collect();let staged=client.stage_after(Action::Input{conversation_id:saved.conversation_id.clone(),input:saved.input.clone()},prerequisites).await?;saved.input.route.sequence=staged.sequence.context("本机输入序号未持久化")?;
- write_draft(path.clone(),saved.clone()).await?;self.state.drafts=load_draft_summaries(directory).await?;self.state.pending=client.pending().await?.into_iter().map(|item|Pending{id:item.id,state:format!("{:?}",item.state)}).collect();self.publish();
- let _=self.out.send(Event::InputStored(saved.input.text.clone())).await;if let Some(id)=&self.form_id{let _=self.out.send(Event::FormSaved(id.clone())).await;}
- let _=self.out.send(Event::Notice(if self.state.online{"输入已存本机，等待发送或核对前序回执。"}else{"输入已存本机，等待连接；结果未知的原操作只核对，不重发。"}.into())).await;
+ write_draft(path.clone(),saved.clone()).await?;self.state.drafts=load_draft_summaries(directory).await?;self.state.pending=client.pending().await?.into_iter().map(|item|Pending{id:item.id,state:operation_label(item.state).into()}).collect();self.publish();
+ let _=self.emit(Event::InputStored(saved.input.text.clone())).await;if let Some(id)=&self.form_id{let _=self.emit(Event::FormSaved(id.clone())).await;}
+ let _=self.emit(Event::Notice(if self.state.online{"输入已存本机，等待发送或核对前序回执。"}else{"输入已存本机，等待连接；结果未知的原操作只核对，不重发。"}.into())).await;
  if !self.state.writable{return Ok(())}
  let completion=self.completion.clone();let generation=client.generation().to_owned();
  tokio::spawn(async move{let result=async{if let Some(id)=&saved.prerequisite_id{let prerequisite=client.send_staged(id).await?;if prerequisite.state!=vibeface_client::OperationState::Accepted{return Ok(prerequisite)}}let receipt=client.send_staged(&saved.input.message_id).await?;if receipt.state==vibeface_client::OperationState::Accepted{tokio::fs::remove_file(&path).await?;client.release_attachments(&format!("native-input:{}",saved.fingerprint)).await?;}Ok(receipt)}.await;let _=completion.send(Completed{generation,input:None,form_id:None,copy_token:false,delivery:false,result}).await;});Ok(())

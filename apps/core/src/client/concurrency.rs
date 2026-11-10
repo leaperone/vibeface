@@ -1,6 +1,7 @@
 //! Connection-owned work. Only the transport task owns Noise and the observation lease.
 use super::*;
 use tokio::task::JoinSet;
+use crate::runtime::ClientAuthorityState;
 
 const LONG_CALLS: usize = 4;
 const READ_CALLS: usize = 8;
@@ -10,6 +11,7 @@ const ORDERED_QUEUE: usize = 16;
 // new connection rather than evicting IDs and accidentally executing a retried write again.
 const REQUEST_IDS: usize = 4096;
 
+#[derive(Clone)]
 struct LocalAuthority {
     generation: u64,
     session: crate::local_access::LocalSession,
@@ -17,9 +19,24 @@ struct LocalAuthority {
 
 /// Display queries and transport delivery use committed authority. Mutations and controls
 /// still authenticate against the writer; a WAL reader or this cache never grants a write.
+#[derive(Clone)]
 pub(super) struct Authority {
     local: Option<LocalAuthority>,
     local_changes: tokio::sync::watch::Receiver<u64>,
+}
+
+#[derive(Debug)]
+struct AuthorityUpdating;
+
+impl std::fmt::Display for AuthorityUpdating {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client authority is being published")
+    }
+}
+impl std::error::Error for AuthorityUpdating {}
+
+fn is_updating(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AuthorityUpdating>().is_some()
 }
 
 impl Authority {
@@ -31,6 +48,11 @@ impl Authority {
         // Before the transport pump starts, validate a cookie once under LocalAccess's lock.
         // Afterwards use its immutable expiry and revocation generation without that lock.
         let (_, state) = node.client_membership();
+        let state = match state {
+            ClientAuthorityState::Ready(state) => state,
+            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => return Err(AuthorityUpdating.into()),
+            ClientAuthorityState::Unavailable => bail!("client authority is unavailable"),
+        };
         let local = if let (Some(cookie), Some(state)) = (&session.cookie, state) {
             let view = state.project()?;
             let generation = *local_changes.borrow();
@@ -49,8 +71,30 @@ impl Authority {
         Ok(Self { local, local_changes })
     }
 
+    pub(super) async fn initialize(
+        node: &Runtime,
+        session: &Session,
+        local_changes: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<Self> {
+        let mut membership = node.subscribe_client_membership();
+        loop {
+            match Self::new(node, session, local_changes.clone()) {
+                Err(error) if is_updating(&error) => {
+                    if !node.client_membership().1.pending() { continue; }
+                    membership.changed().await.context("client authority initialization stopped")?;
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub(super) fn principal(&self, node: &Runtime, session: &Session) -> Result<Principal> {
         let (generation, state) = node.client_membership();
+        let state = match state {
+            ClientAuthorityState::Ready(state) => state,
+            ClientAuthorityState::Updating | ClientAuthorityState::Initializing => return Err(AuthorityUpdating.into()),
+            ClientAuthorityState::Unavailable => bail!("client authority is unavailable"),
+        };
         let view = state.context("personal network is not initialized")?.project()?;
         let node_id = node.identity.device_id()?;
         let principal = if let Some(member) = member_principal(&view, &node_id, session)? {
@@ -73,11 +117,43 @@ impl Authority {
                 can_manage: false,
             }
         };
-        ensure!(node.client_membership().0 == generation, "membership changed during client authorization");
+        if node.client_membership().0 != generation {
+            return Err(AuthorityUpdating.into());
+        }
         if principal.source == "local_session" {
             ensure!(self.local.as_ref().is_some_and(|local| *self.local_changes.borrow() == local.generation), "local browser access was revoked");
         }
         Ok(principal)
+    }
+
+    pub(super) fn ready(&self, node: &Runtime) -> Result<bool> {
+        match node.client_membership().1 {
+            ClientAuthorityState::Initializing | ClientAuthorityState::Updating => Ok(false),
+            ClientAuthorityState::Ready(_) => Ok(true),
+            ClientAuthorityState::Unavailable => bail!("client authority is unavailable"),
+        }
+    }
+
+    pub(super) fn current(&self, node: &Runtime, session: &Session) -> Result<Option<Principal>> {
+        match self.principal(node, session) {
+            Err(error) if is_updating(&error) => Ok(None),
+            result => result.map(Some),
+        }
+    }
+
+    async fn wait_ready(&self, node: &Runtime) -> Result<()> {
+        let mut membership = node.subscribe_client_membership();
+        while !self.ready(node)? {
+            membership.changed().await.context("client authority publication stopped")?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn display_principal(&self, node: &Runtime, session: &Session) -> Result<Principal> {
+        loop {
+            self.wait_ready(node).await?;
+            if let Some(principal) = self.current(node, session)? { return Ok(principal); }
+        }
     }
 
     pub(super) fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
@@ -94,12 +170,17 @@ pub(super) struct PreparedPush {
 #[derive(Default)]
 pub(super) struct Pushes {
     tasks: JoinSet<Result<PreparedPush>>,
+    deferred: Option<PreparedPush>,
 }
 
 impl Pushes {
     pub(super) fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
+        self.tasks.is_empty() && self.deferred.is_none()
     }
+
+    pub(super) fn running(&self) -> bool { !self.tasks.is_empty() }
+
+    pub(super) fn take_deferred(&mut self) -> Option<PreparedPush> { self.deferred.take() }
 
     pub(super) fn start(
         &mut self,
@@ -125,15 +206,18 @@ impl Pushes {
             .context("client push task failed")?
     }
 
-    pub(super) fn finish(
-        &self,
+    pub(super) fn deliver(
+        &mut self,
         node: &Runtime,
         session: &Session,
         authority: &Authority,
         prepared: PreparedPush,
-    ) -> Result<Value> {
-        authority.check(node, session, &prepared.authority)?;
-        Ok(json!({"type":"changed","payload":prepared.payload}))
+    ) -> Result<Option<Value>> {
+        match authority.check(node, session, &prepared.authority) {
+            Err(error) if is_updating(&error) => { self.deferred = Some(prepared); Ok(None) }
+            Err(error) => Err(error),
+            Ok(()) => Ok(Some(json!({"type":"changed","payload":prepared.payload}))),
+        }
     }
 }
 
@@ -234,12 +318,17 @@ pub(super) struct Calls {
     active: BTreeMap<String, Active>,
     waiting: VecDeque<Request>,
     seen: BTreeSet<String>,
+    deferred: VecDeque<Completed>,
 }
 
 impl Calls {
     pub(super) fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
+        self.tasks.is_empty() && self.deferred.is_empty()
     }
+
+    pub(super) fn running(&self) -> bool { !self.tasks.is_empty() }
+
+    pub(super) fn take_deferred(&mut self) -> Option<Completed> { self.deferred.pop_front() }
 
     fn count(&self, lane: Lane) -> usize {
         self.active.values().filter(|call| call.lane == lane).count()
@@ -300,24 +389,26 @@ impl Calls {
         request: Request,
         lane: Lane,
     ) {
-        // Guest and signed governance methods deliberately remain usable after authority
-        // changes, including self-revoke/recovery replies. All independent work and the two
-        // connection-state operations are fenced by the principal that started them.
+        // Only governance responses that can change their own caller retain the explicit
+        // transition path. Invite and join approval keep the manager's original authority.
         let guest_method = GUEST_METHODS.contains(&request.method.as_str());
+        let authority_transition = matches!(request.method.as_str(),
+            "grant" | "revoke" | "veto" | "approve_recovery");
         let fenced = lane != Lane::Ordered
-            || (!guest_method && !SIGNED_METHODS.contains(&request.method.as_str()));
+            || (!guest_method && !authority_transition);
         let display = snapshot_request(&request.method, &request.params);
-        let display_authority = display.then(|| authority.principal(node, session));
         self.active
             .insert(request.id.clone(), Active { lane, authority: fenced.then(|| authority.principal(node, session).ok()).flatten() });
         let snapshot = Snapshot::from(session);
+        let cached_authority = authority.clone();
         let node = node.clone();
         self.tasks.spawn(async move {
             let mut request_session = snapshot.session();
             let (authority, denied) = if fenced {
-                let authenticated = match display_authority {
-                    Some(authority) => authority,
-                    None => principal(&node, &request_session).await,
+                let authenticated = if display {
+                    cached_authority.display_principal(&node, &request_session).await
+                } else {
+                    principal(&node, &request_session).await
                 };
                 match authenticated {
                     Ok(authority) => (Some(authority), None),
@@ -370,8 +461,9 @@ impl Calls {
         session: &Session,
         authority: &Authority,
     ) -> Result<()> {
+        if !authority.ready(node)? { return Ok(()); }
         if self.active.values().any(|call| call.authority.is_some()) {
-            let now = authority.principal(node, session)?;
+            let Some(now) = authority.current(node, session)? else { return Ok(()); };
             ensure!(
                 self.active
                     .values()
@@ -382,19 +474,20 @@ impl Calls {
         Ok(())
     }
 
-    pub(super) fn finish(
-        &mut self,
+    fn validate_completed(
+        &self,
         node: &Runtime,
-        session: &mut Session,
+        session: &Session,
         authority: &Authority,
-        completed: Completed,
-    ) -> Result<Response> {
+        completed: &Completed,
+    ) -> Result<()> {
+        if !authority.ready(node)? { return Err(AuthorityUpdating.into()); }
         // Check even if membership/local-access notifications have not won select yet. A
         // completed task must not leak its old result after a revocation raced its completion.
-        let active = self.active.remove(&completed.id).context("unknown client result")?;
-        if let Some(was) = active.authority {
+        let active = self.active.get(&completed.id).context("unknown client result")?;
+        if let Some(was) = active.authority.as_ref() {
             ensure!(
-                authority.principal(node, session)? == was,
+                &authority.principal(node, session)? == was,
                 "this device's permission changed during a client request"
             );
         }
@@ -413,6 +506,25 @@ impl Calls {
                     "this device's permission changed before authentication was delivered");
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn deliver(
+        &mut self,
+        node: &Runtime,
+        session: &mut Session,
+        authority: &Authority,
+        completed: Completed,
+    ) -> Result<Option<Response>> {
+        match self.validate_completed(node, session, authority, &completed) {
+            Err(error) if is_updating(&error) => { self.deferred.push_back(completed); Ok(None) }
+            Err(error) => Err(error),
+            Ok(()) => self.finish_ready(session, completed).map(Some),
+        }
+    }
+
+    fn finish_ready(&mut self, session: &mut Session, completed: Completed) -> Result<Response> {
+        self.active.remove(&completed.id).context("unknown client result")?;
         match completed.effect {
             Some(Effect::Subscribe(subscribed)) => session.subscribed = subscribed,
             Some(Effect::Observe(observation)) => session.observation = observation,
