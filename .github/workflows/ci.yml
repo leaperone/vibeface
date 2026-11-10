@@ -31,11 +31,11 @@ on:
         options: [none, ios, android, both]
         default: none
       desktop_only:
-        description: 'Run only independent Mac and Windows native builds, desktop windows and Windows platform checks'
+        description: 'Run only Mac, Windows and Linux desktop builds and acceptance, plus Windows platform checks'
         type: boolean
         default: false
       desktop:
-        description: 'Also run the hosted Windows native checks and the real Mac and Windows desktop window tests'
+        description: 'Also run Windows platform checks and real Mac, Windows and Linux desktop tests'
         type: boolean
         default: false
 
