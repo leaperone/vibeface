@@ -1544,14 +1544,30 @@ fn url_with_password(word: &str) -> bool {
     })
 }
 
-fn redact_text(mut text: String, secrets: &[&str]) -> String {
-    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
-        text = text.replace(secret, "[redacted]");
+pub fn redact_text(text: String, secrets: &[impl AsRef<str>]) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut redacted_until = 0;
+    for (index, ch) in text.char_indices() {
+        let end = secrets
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|secret| !secret.is_empty() && text[index..].starts_with(secret))
+            .map(|secret| index + secret.len())
+            .max()
+            .unwrap_or(index);
+        if end > index {
+            if index >= redacted_until {
+                clean.push_str("[redacted]");
+            }
+            redacted_until = redacted_until.max(end);
+        } else if index >= redacted_until {
+            clean.push(ch);
+        }
     }
-    text
+    clean
 }
 
-fn redact_progress(value: Value, secrets: &[&str]) -> Value {
+pub fn redact_progress(value: Value, secrets: &[impl AsRef<str>]) -> Value {
     match value {
         Value::String(text) => Value::String(redact_text(text, secrets)),
         Value::Array(items) => Value::Array(
@@ -1588,26 +1604,34 @@ fn redact_stream_progress(
         {
             let buffered = pending.entry(item).or_default();
             buffered.push_str(text);
-            let Value::String(clean) = redact_progress(json!(buffered), secrets) else {
-                unreachable!()
-            };
             let max_prefix = secrets
                 .iter()
                 .map(|secret| secret.len().saturating_sub(1))
                 .max()
                 .unwrap_or(0);
-            let split = clean
+            let mut split = buffered
                 .char_indices()
                 .map(|(index, _)| index)
-                .filter(|index| clean.len() - index <= max_prefix)
+                .filter(|index| buffered.len() - index <= max_prefix)
                 .find(|index| {
                     secrets.iter().any(|secret| {
-                        secret.len() > clean.len() - index && secret.starts_with(&clean[*index..])
+                        secret.len() > buffered.len() - index
+                            && secret.starts_with(&buffered[*index..])
                     })
                 })
-                .unwrap_or(clean.len());
-            *buffered = clean[split..].to_owned();
-            value["text"] = json!(&clean[..split]);
+                .unwrap_or(buffered.len());
+            // Keep complete matches intact when they overlap the unfinished secret suffix.
+            for (index, _) in buffered.char_indices().rev() {
+                if index < split
+                    && secrets.iter().any(|secret| {
+                        index + secret.len() > split && buffered[index..].starts_with(secret)
+                    })
+                {
+                    split = index;
+                }
+            }
+            value["text"] = json!(&buffered[..split]);
+            *buffered = buffered[split..].to_owned();
         }
     }
     redact_progress(value, secrets)
@@ -1631,7 +1655,78 @@ pub(crate) async fn bounded_line(
 
 #[cfg(test)]
 mod credential_tests {
-    use super::credential_value;
+    use super::{credential_value, redact_progress, redact_stream_progress};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn redaction_preserves_keys_and_masks_overlapping_secrets() {
+        let secrets = [
+            "synthetic-sensitive",
+            "synthetic-sensitive-token",
+            "token-suffix",
+            "",
+            "redacted",
+        ];
+        assert_eq!(
+            redact_progress(
+                json!({
+                    "synthetic-sensitive-token": [
+                        "prefix synthetic-sensitive-token-suffix ✓",
+                        {"nested": "synthetic-sensitive"},
+                    ],
+                    "literal": true,
+                    "number": 7,
+                    "null": null,
+                }),
+                &secrets,
+            ),
+            json!({
+                "synthetic-sensitive-token": [
+                    "prefix [redacted] ✓",
+                    {"nested": "[redacted]"},
+                ],
+                "literal": true,
+                "number": 7,
+                "null": null,
+            }),
+        );
+    }
+
+    #[test]
+    fn redaction_buffers_nested_and_overlapping_secrets_across_frames() {
+        let secrets = [
+            "synthetic-sensitive",
+            "synthetic-sensitive-token",
+            "aba",
+            "秘密🙂",
+        ];
+        for text in [
+            "before synthetic-sensitive-token after",
+            "before synthetic-sensitive after",
+            "before ababa after",
+            "before 秘密🙂 after",
+        ] {
+            let mut pending = BTreeMap::new();
+            let mut streamed = String::new();
+            for ch in text.chars() {
+                let update = redact_stream_progress(
+                    json!({"type": "text_delta", "item_id": "reply", "text": ch.to_string()}),
+                    &secrets,
+                    &mut pending,
+                );
+                streamed.push_str(update["text"].as_str().unwrap());
+            }
+            assert_eq!(streamed, "before [redacted] after");
+            let snapshot = redact_stream_progress(
+                json!({"type": "text_snapshot", "item_id": "reply", "text": text}),
+                &secrets,
+                &mut pending,
+            );
+            assert_eq!(snapshot["text"], "before [redacted] after");
+            assert!(pending.is_empty());
+        }
+    }
 
     #[test]
     fn credential_values_are_selected_by_name_or_shape_only() {
