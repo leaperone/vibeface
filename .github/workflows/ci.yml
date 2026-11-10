@@ -22,9 +22,9 @@ on:
         type: boolean
         default: false
       native_benchmarks:
-        description: 'With native_prepare, run signed performance comparisons at 1k or the full 1k/10k/100k matrix'
+        description: 'With native_prepare, measure signed local appends, synchronization or the full size matrix'
         type: choice
-        options: [none, small, full]
+        options: [none, small, ingest, full]
         default: none
       delivery_live:
         description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
@@ -1320,7 +1320,9 @@ jobs:
           done
           for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests fresh_main_input_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests workspace::lookup_tests scheduler::context_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
             if [[ "$CORE_COMPILE" != success ]]; then break; fi
-            if ! cargo test --locked -p vibeface-core --lib "$filter" -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+            test_options=(--test-threads=1)
+            if [[ "$filter" == conversation_history ]]; then test_options+=(--nocapture); fi
+            if ! cargo test --locked -p vibeface-core --lib "$filter" -- "${test_options[@]}" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
           if [[ "$DESKTOP_COMPILE" == success ]]; then
             if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --no-fail-fast -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
@@ -1335,6 +1337,7 @@ jobs:
           export VIBEFACE_PERF_SIZES=1000
           export VIBEFACE_PERF_KINDS=assistant
           filters=(signed_local_main_input_append_scale signed_ingest_concurrency signed_history_scale)
+          if [[ "$BENCHMARK_MODE" == ingest ]]; then filters=(signed_fresh_main_ingest_scale); fi
           if [[ "$BENCHMARK_MODE" == full ]]; then
             export VIBEFACE_PERF_SIZES=1000,10000,100000
             export VIBEFACE_PERF_KINDS=assistant,input,fork,multi

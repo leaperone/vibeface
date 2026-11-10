@@ -59,35 +59,35 @@ fn lookup_winners_and_isolation_match_the_complete_graph() -> Result<()> {
 
 #[test]
 fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -> Result<()> {
-    let store = Store::open(":memory:")?; let identity = LocalIdentity::generate();
+    let store = Store::open(":memory:")?; let identity = LocalIdentity::generate(); let network = identity.fixture_network_id()?;
     let mut graph = Graph::default(); graph.replace_lookups = true;
     for index in 0..1000 { let id=format!("task-{index}"); graph.tasks.insert(id.clone(),task(&id)); }
-    graph.save(&store.connection,"n")?;
-    let mut graph = Graph::read(&store.connection,"n")?;
-    let mut event = Event { version: WIRE_VERSION, network_id:"n".into(), author:identity.device_id()?, seq:1,prev:None,deps:vec![],
+    graph.save(&store.connection,&network)?;
+    let mut graph = Graph::read(&store.connection,&network)?;
+    let mut event = Event { version: WIRE_VERSION, network_id:network.clone(), author:identity.device_id()?, seq:1,prev:None,deps:vec![],
         scope_id:"c".into(),created_at_ms:2,body:EventBody::InputPosted { message_id:"input".into(),target:InputTarget::BotMain {bot_id:"bot".into()},
             intent:InputIntent::Continue,sequence:1,expected_revision:None,text:"Input".into(),attachments:vec![],report_results:Some(true),attestation:None },blobs:vec![] };
     graph.record("input-event",&event,"rank-1",VersionVector::new())?;
-    let before=changes(&store.connection)?; graph.save(&store.connection,"n")?;
+    let before=changes(&store.connection)?; graph.save(&store.connection,&network)?;
     assert_eq!(changes(&store.connection)?-before,1,"an input writes only the canonical graph");
-    let mut graph = Graph::read(&store.connection,"n")?;
+    let mut graph = Graph::read(&store.connection,&network)?;
     event.scope_id=WORKSPACE_SCOPE.into(); event.body=EventBody::WorkspaceCommanded {command_id:"defer".into(),
         command:WorkspaceCommand::ControlTask {task_id:"task-0".into(),expected_revision:1,action:TaskAction::Defer},
         attestation:None,cause:None,acting_assignment:None};
     graph.record("defer-event",&event,"rank-2",VersionVector::new())?;
     assert_eq!(graph.dirty_tasks.iter().map(String::as_str).collect::<Vec<_>>(),vec!["task-0"]);
-    let before=changes(&store.connection)?; graph.save(&store.connection,"n")?;
+    let before=changes(&store.connection)?; graph.save(&store.connection,&network)?;
     assert_eq!(changes(&store.connection)?-before,2,"one task change writes one canonical row and one lookup row");
-    oracle(&store,"n")?;
-    let previous:String=store.connection.query_row("SELECT state FROM workspace_projection WHERE network_id='n'",[],|row|row.get(0))?;
+    oracle(&store,&network)?;
+    let previous:String=store.connection.query_row("SELECT state FROM workspace_projection WHERE network_id=?",[&network],|row|row.get(0))?;
     store.connection.execute_batch("CREATE TEMP TRIGGER reject_task_lookup BEFORE UPDATE ON workspace_tasks_lookup BEGIN SELECT RAISE(FAIL,'lookup fixture failure'); END;")?;
-    let mut graph=Graph::read(&store.connection,"n")?;
+    let mut graph=Graph::read(&store.connection,&network)?;
     event.body=EventBody::WorkspaceCommanded {command_id:"resume".into(),command:WorkspaceCommand::ControlTask {task_id:"task-0".into(),expected_revision:1,action:TaskAction::Continue},
         attestation:None,cause:None,acting_assignment:None};
     graph.record("resume-event",&event,"rank-3",VersionVector::new())?;
-    assert!(graph.save(&store.connection,"n").is_err());
-    assert_eq!(store.connection.query_row("SELECT state FROM workspace_projection WHERE network_id='n'",[],|row|row.get::<_,String>(0))?,previous);
-    oracle(&store,"n")?;
+    assert!(graph.save(&store.connection,&network).is_err());
+    assert_eq!(store.connection.query_row("SELECT state FROM workspace_projection WHERE network_id=?",[&network],|row|row.get::<_,String>(0))?,previous);
+    oracle(&store,&network)?;
     Ok(())
 }
 

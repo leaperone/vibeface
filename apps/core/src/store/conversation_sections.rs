@@ -288,16 +288,23 @@ mod tests {
     }
 
     #[test]
-    fn sessions_continue_after_boundary_deletion_and_ignore_newer_arrivals() -> Result<()> {
+    fn sessions_continue_after_boundary_deletion_and_refresh_after_new_attribution() -> Result<()> {
         let mut f = fixture()?;
         for i in 0..5 { add_session(&mut f, &format!("s{i}"), "session", 10 + i)?; }
         let first = f.store.conversation_sessions_page(&f.network, "c", None, 2)?;
         let cursor = first.next_cursor.context("more sessions")?;
         // Keyset windows do not depend on the boundary row still being present.
         f.store.connection.execute("DELETE FROM session_owners WHERE session_id='s3'", [])?;
-        add_session(&mut f, "s5", "late", 100)?;
         let next = f.store.conversation_sessions_page(&f.network, "c", Some(&cursor), 2)?;
         assert_eq!(next.items.iter().map(|s| s["session_id"].as_str().unwrap()).collect::<Vec<_>>(), ["s1", "s2"]);
+        // Attribution can reclassify existing questions and replies, so it invalidates the
+        // old projection. A fresh window resumes with the new committed authority.
+        add_session(&mut f, "s5", "late", 100)?;
+        assert!(f.store.conversation_sessions_page(&f.network, "c", Some(&cursor), 2).is_err());
+        let refreshed = f.store.conversation_sessions_page(&f.network, "c", None, 2)?;
+        assert_eq!(refreshed.items.iter().map(|s| s["session_id"].as_str().unwrap()).collect::<Vec<_>>(), ["s4", "s5"]);
+        let older = f.store.conversation_sessions_page(&f.network, "c", refreshed.next_cursor.as_deref(), 2)?;
+        assert_eq!(older.items.iter().map(|s| s["session_id"].as_str().unwrap()).collect::<Vec<_>>(), ["s1", "s2"]);
         assert!(f.store.conversation_questions_page(&f.network, "c", Some(&cursor), 2).is_err());
         assert!(f.store.conversation_sessions_page(&f.network, "other", Some(&cursor), 2).is_err());
         assert!(f.store.conversation_sessions_page(&f.network, "c", Some("invalid"), 2).is_err());
