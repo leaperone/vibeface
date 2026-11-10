@@ -93,7 +93,7 @@ acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分三种情况：
 
-- 已有容器部署（`deploy_dir` 里有 `current.json`）：旧容器的维护租约成功后才停它。
+- 已有容器部署（`deploy_dir` 里有 `current.json`）：旧容器的维护租约成功后才停它。Core 角色只要求旧容器在记录的镜像上运行，不要求健康检查通过，因为新版的配置格式可能在激活前已经写入，旧程序的健康检查会重读配置而失败；租约回应核对运行中 Core 的设备编号。这时自动回滚的旧容器也读不了新配置，需要手动恢复激活前在本地留档的配置。
 - 配了 `legacy_service`：旧 systemd 服务的维护租约成功后才停它。
 - 没有 `current.json`，也没有配置 `legacy_service`，即全新安装：要求本项目没有正在运行的容器，并且宿主 systemd unit 文件和 drop-in（`/etc`、`/run`、`/usr/local/lib`、`/usr/lib`、`/lib` 下的 `systemd/system`）的任何字段都没有引用 `data_dir`；有引用就拒绝激活，提示改为配置 `legacy_service`。不停任何进程。
 
