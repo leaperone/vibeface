@@ -728,6 +728,10 @@ def self_test():
     assert '--filter "vibeface-mobile..."' in web_build, "Web behavior tests read Mobile package helpers"
     assert "pnpm --filter @vibeface/secure-native run typecheck" not in web_build
     assert "pnpm --filter vibeface-mobile run typecheck" not in web_build
+    for name in ("mobile.yml", "release.yml"):
+        standalone = (root / ".github/workflows" / name).read_text()
+        assert "pnpm --filter @vibeface/secure-native run typecheck" in standalone
+        assert "pnpm --filter vibeface-mobile run typecheck" in standalone
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
     assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
