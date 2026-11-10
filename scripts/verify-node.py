@@ -4757,11 +4757,16 @@ def npm_service_acceptance(options):
               "candidate_declared_version": {1: "higher", 0: "same", -1: "lower"}[version_order],
               "business_source_relation": pin["business_source_relation"], "real_provider_calls": 0,
               "replacement": "public current-format baseline to a different-source immutable CI candidate",
-              "not_checked": ["historical-format migration", "real AI Providers"]}
+              "not_checked": ["historical-format migration", "real AI Providers",
+                              "full lifecycle of the immutable public baseline; only the candidate lifecycle is required"]}
     node, owned = None, False
 
     def service(action, *, check=True):
-        return command([binary, "service", action, "--data-dir", node.directory], check=check)
+        entry = {"action": action, "source_commit": json.loads((vendor / "BUILD-INFO.json").read_text())["source_commit"]}
+        report.setdefault("service_actions", []).append(entry)
+        result = command([binary, "service", action, "--data-dir", node.directory], check=check)
+        entry["returncode"] = result.returncode
+        return result
 
     def passed(name):
         report["cases"].append(name)
@@ -4882,12 +4887,12 @@ def npm_service_acceptance(options):
         require(update["distribution"] == "npm" and update["automatic"] is False,
                 "npm owns updates and disables the built-in updater")
         rejected("install", "stop the node before installing its npm service")
-        passed("active Node refuses install without changing data or services")
+        passed("public baseline active Node refuses install without changing data or services")
         node.client.close()
         node.stop()
         stopped()
         idle_guards()
-        passed("second updater, OS-held updater lock and pending journal refuse without mutation")
+        passed("public baseline updater lock, pending journal and second updater refuse without mutation")
         saved_files, saved_events = persistent()
 
         def preserved():
@@ -4908,14 +4913,7 @@ def npm_service_acceptance(options):
         preserved()
         service("stop")
         stopped()
-        service("start")
-        previous = running()
-        service("restart")
-        require(running() != previous, "native manager restart replaces the running PID")
-        preserved()
-        passed("public baseline install, status, stop, start and restart use the scoped npm native path")
-        service("stop")
-        stopped()
+        passed("immutable public baseline installs a real service and stops before candidate replacement")
         node.client.close()
         definition = service_files[0].read_bytes()
         previous_inode = core.stat().st_ino

@@ -178,7 +178,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 `npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。来源相同、基线业务来源超前或 data epoch 不兼容均失败。
 
-受控 Node 和 App Server 夹具从公开基线包创建真实非空消息及附件并安装服务，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。两包都验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝，以及真实服务生命周期。候选重启后核对原身份、配置、签名历史和附件字节，卸载保留数据。收据分别记录两包的真实 version、source、摘要和来源关系；候选声明版本相同或较低时如实标注，不称为 SemVer 升级。只验证当前格式，不做跨历史格式迁移，也不据机械版本变化宣称业务升级或真实 Provider 验收。
+受控 Node 和 App Server 夹具从不可变的公开基线包创建真实非空消息及附件，安装真实服务并核对运行状态与数据，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。两包都验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝。完整的安装、状态、停止、启动、重启换 PID 和卸载生命周期由最终候选包验收；重启后核对原身份、配置、签名历史和附件字节，并确认已完成的受控调用未重放，卸载保留数据。公开基线不承担完整生命周期验收。收据分别记录两包的真实 version、source、摘要和来源关系；候选声明版本相同或较低时如实标注，不称为 SemVer 升级。只验证当前格式，不做跨历史格式迁移，也不据机械版本变化宣称业务升级或真实 Provider 验收。
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
 

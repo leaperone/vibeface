@@ -355,6 +355,138 @@ install_release() (
   case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add your bin directory to PATH, or use the absolute CLI path above:\n  export PATH=%q:"$PATH"\n' "$bin_dir" ;; esac
 )
 
+# The sourced production action reads fixture variables and calls the manager stubs.
+# shellcheck disable=SC2034,SC2329
+service_self_test() (
+  local service_script=$1 directory=$2 service data_dir domain=gui/fixture label=com.leaperone.vibeface.fixture action
+  mkdir -p "$directory/data"
+  service="$directory/service.plist"
+  data_dir="$directory/data"
+  printf 'identity and signed history fixture\n' > "$data_dir/history"
+  printf 'attachment\000\377\n' > "$data_dir/attachment"
+  cp "$data_dir/history" "$directory/history.expected"
+  cp "$data_dir/attachment" "$directory/attachment.expected"
+  sed -n '/^launchd_node_action() {$/,/^}$/p' "$service_script" > "$directory/action.sh"
+  [[ -s "$directory/action.sh" ]] || fail 'self-test: missing launchd service action'
+  # shellcheck source=/dev/null
+  source "$directory/action.sh"
+
+  model_count() { awk -v command="$1" '$1 == command {n++} END {print n+0}' "$directory/calls"; }
+  reset_manager() {
+    : > "$service"
+    : > "$directory/calls"
+    rm -f "$directory/cleaned" "$directory/stuck" "$directory/query-error" "$directory/bootout-error" "$directory/bootstrap-error" "$directory/query-overrun"
+    printf '%s\n' "$1" > "$directory/state"
+    printf '101\n' > "$directory/next-pid"
+    printf '2\n' > "$directory/ticks"
+    if [[ $1 == running ]]; then
+      printf '100\n' > "$directory/pid"
+      printf '1\n' > "$directory/children"
+    else
+      printf '0\n' > "$directory/pid"
+      printf '0\n' > "$directory/children"
+    fi
+  }
+  launchctl() {
+    printf '%s\n' "$*" >> "$directory/calls"
+    case "$1" in
+      print)
+        [[ $# == 2 && $2 == "$domain/$label" ]] || return 97
+        if (( $(model_count print) > 350 )); then touch "$directory/query-overrun"; return 98; fi
+        if [[ $(cat "$directory/state") == absent ]]; then
+          printf 'Could not find service fixture.\n' >&2
+          return 113
+        fi
+        if [[ $(cat "$directory/state") == removing && -f "$directory/query-error" ]]; then
+          printf 'Operation not permitted.\n' >&2
+          return 1
+        fi
+        ;;
+      bootout)
+        [[ $# == 2 && $2 == "$domain/$label" ]] || return 97
+        [[ ! -f "$directory/bootout-error" ]] || return 1
+        printf 'removing\n' > "$directory/state"
+        ;;
+      bootstrap)
+        [[ $# == 3 && $2 == "$domain" && $3 == "$service" ]] || return 97
+        [[ ! -f "$directory/bootstrap-error" ]] || return 1
+        [[ $(cat "$directory/state") == absent && $(cat "$directory/children") == 0 ]] || return 97
+        cp "$directory/next-pid" "$directory/pid"
+        printf 'running\n' > "$directory/state"
+        printf '1\n' > "$directory/children"
+        ;;
+      kickstart)
+        [[ $# == 2 && $2 == "$domain/$label" ]] || return 97
+        [[ $(cat "$directory/state") != absent ]] || return 1
+        ;;
+      *) return 97 ;;
+    esac
+  }
+  sleep() {
+    [[ $# == 1 && $1 == 0.1 ]] || return 97
+    [[ ! -f "$directory/stuck" ]] || return 0
+    local ticks
+    ticks=$(cat "$directory/ticks")
+    ticks=$((ticks - 1))
+    printf '%s\n' "$ticks" > "$directory/ticks"
+    if ((ticks == 0)); then
+      printf 'absent\n' > "$directory/state"
+      printf '0\n' > "$directory/pid"
+      printf '0\n' > "$directory/children"
+      touch "$directory/cleaned"
+      printf 'children-stopped\n' >> "$directory/calls"
+    fi
+  }
+
+  reset_manager running
+  action=restart
+  launchd_node_action
+  [[ $(cat "$directory/state") == running && $(cat "$directory/pid") == 101 && -f "$directory/cleaned" ]] || fail 'self-test: restart did not replace the stopped process'
+  [[ $(model_count bootout) == 1 && $(model_count bootstrap) == 1 && $(model_count kickstart) == 1 ]] || fail 'self-test: restart manager sequence'
+  awk '/^children-stopped$/ {cleaned=1} /^bootstrap / && !cleaned {bad=1} END {exit bad}' "$directory/calls" || fail 'self-test: restarted before child cleanup'
+  reset_manager idle
+  launchd_node_action
+  [[ $(cat "$directory/state") == running && $(cat "$directory/pid") == 101 ]] || fail 'self-test: restart of an idle registered service'
+  reset_manager absent
+  launchd_node_action
+  [[ $(cat "$directory/state") == running && $(model_count bootout) == 0 ]] || fail 'self-test: restart of an unloaded service'
+  reset_manager running
+  action=start
+  launchd_node_action
+  [[ $(cat "$directory/pid") == 100 && $(model_count bootout) == 0 && $(model_count bootstrap) == 0 ]] || fail 'self-test: start disturbed a running service'
+  reset_manager absent
+  launchd_node_action
+  [[ $(cat "$directory/state") == running && $(model_count bootstrap) == 1 ]] || fail 'self-test: start did not bootstrap an unloaded service'
+  reset_manager running
+  action=stop
+  launchd_node_action
+  [[ $(cat "$directory/state") == removing && $(model_count bootstrap) == 0 && $(model_count kickstart) == 0 ]] || fail 'self-test: stop restarted the service'
+  reset_manager running
+  action=restart
+  touch "$directory/stuck"
+  if launchd_node_action > "$directory/output" 2>&1; then fail 'self-test: restart ignored incomplete removal'; fi
+  [[ $(model_count bootstrap) == 0 && $(model_count kickstart) == 0 && ! -f "$directory/query-overrun" ]] || fail 'self-test: restart did not bound removal observation'
+  reset_manager running
+  touch "$directory/query-error"
+  if launchd_node_action > "$directory/output" 2>&1; then fail 'self-test: query failure counted as removal'; fi
+  [[ $(model_count bootstrap) == 0 && $(model_count kickstart) == 0 ]] || fail 'self-test: query failure restarted the service'
+  reset_manager running
+  touch "$directory/bootout-error"
+  if launchd_node_action > "$directory/output" 2>&1; then fail 'self-test: bootout failure ignored'; fi
+  [[ $(model_count bootstrap) == 0 && $(model_count kickstart) == 0 ]] || fail 'self-test: failed stop restarted the service'
+  reset_manager absent
+  touch "$directory/bootstrap-error"
+  if launchd_node_action > "$directory/output" 2>&1; then fail 'self-test: bootstrap failure ignored'; fi
+  [[ $(model_count kickstart) == 0 ]] || fail 'self-test: kickstart followed a failed bootstrap'
+  reset_manager running
+  rm "$service"
+  if launchd_node_action > "$directory/output" 2>&1; then fail 'self-test: missing service was accepted'; fi
+  [[ ! -s "$directory/calls" ]] || fail 'self-test: missing service reached the manager'
+  cmp "$data_dir/history" "$directory/history.expected" || fail 'self-test: service action changed history'
+  cmp "$data_dir/attachment" "$directory/attachment.expected" || fail 'self-test: service action changed attachment bytes'
+  printf 'User service self-test passed: asynchronous restart, cleanup ordering, stop/start, failure protection and preserved data.\n'
+)
+
 self_test() (
   local test_dir script fixture version target package case_dir
   script=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
@@ -681,6 +813,7 @@ JSON
   mkdir "$case_dir"
   expect_failure nightly 'no published Nightly release'
   reset_progressive_markers
+  service_self_test "$(dirname "$script")/scripts/install-node-service.sh" "$test_dir/service"
   printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
 )
 
