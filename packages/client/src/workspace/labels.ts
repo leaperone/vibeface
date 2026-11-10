@@ -27,7 +27,7 @@ export const contextCoverageLabels: Record<string, string> = {
   attachments_omitted: '附件', memory_omitted: '记忆', checkpoint_omitted: '历史检查点', handoff_omitted: '交接摘要', pending_checks_omitted: '结果待确认',
 }
 export const contextIndexLabels: Record<string, string> = { skills: 'Skill', schedules: '定时任务', memory: '记忆索引', sessions: '外部会话', sent: '发出的消息', bots: 'Bot' }
-export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录', review: '记忆整理' }
+export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录' }
 export const memoryConflictLabel = (reason: string) => reason === 'user_controlled' ? '受用户保护，未自动覆盖' : reason === 'epoch_changed' ? '数据版本已变化，未覆盖现有记忆' : reason === 'revision_changed' ? '记忆已被更新，未覆盖新值' : reason === 'capacity_exceeded' ? '记忆数量已达上限，未提交这条新增记忆' : '提交冲突，未覆盖现有记忆'
 export const queueHoldLabels: Record<QueueHoldReason, string> = {
   active_turn: '等待当前回合结束', steering_settlement: '等待补充消息结清', provider_serial: '等待 AI 空闲',
@@ -236,25 +236,6 @@ export function cardState(work: WorkCard, nodes: NodeInfo[], projected?: Pick<Ov
   const outcome = work.outcome ?? projected?.outcome
   if (outcome) return outcome
   return confirmReason(work, nodes) ? "awaiting_confirmation" : work.stop ?? projected?.state ?? work.state
-}
-
-/** An entry task check only folds into its unverified work; a bounded Bot list does not prove deletion. */
-export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: readonly OpenWorkCard[], nodes: NodeInfo[], knownBots: readonly OverviewBot[] = []) {
-  const local = nodes.find((node) => node.local)?.device_id
-  return overview.tasks.filter((check): check is Extract<OverviewTask, { kind: "check" }> => {
-    if (check.kind !== "check" || check.target_node !== null) return false
-    if (!check.work_id || !local) return true
-    return !works.some((work) => {
-      if (work.conversation_id !== check.conversation_id || work.work_id !== check.work_id || work.target_node !== local) return false
-      const projected = overview.tasks.find((item) => item.kind !== "check" && item.conversation_id === work.conversation_id && item.work_id === work.work_id)
-      if (work.state !== "unverified" && projected?.state !== "unverified") return false
-      return ["awaiting_confirmation", "unverified"].includes(cardState(work, nodes, projected))
-    })
-  }).map((check) => {
-    if (check.bot) return check
-    const bot = knownBots.find((bot) => bot.conversation_id === check.conversation_id)
-    return bot ? { ...check, bot, navigation: { bot_id: bot.bot_id, conversation_id: check.conversation_id } } : check
-  })
 }
 
 type WorkspaceActivityInput = {

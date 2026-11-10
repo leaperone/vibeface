@@ -1473,8 +1473,9 @@ mod tests {
                 if case != "runtime" {
                     let mut store = node.store.lock().await;
                     assert_eq!(store.scheduler_job("c", &trigger)?.context("recovered job")?.state, JobState::Queued);
-                    assert!(!store.manager_attempt_allowed(&network, &node.identity.device_id()?, "c", &trigger,
-                        &abandoned.state.attempt().context("old attempt")?.id)?);
+                    let previous = abandoned.state.attempt().context("old attempt")?;
+                    assert!(!store.manager_attempt_allowed_with_version(&network, &node.identity.device_id()?, "c", &trigger,
+                        &previous.id, previous.permission_version)?);
                     store.request_manager_cancel(&node.identity, &network, "c", &trigger)?;
                 }
                 node.store.lock().await.scheduler_maintenance_idle()?;

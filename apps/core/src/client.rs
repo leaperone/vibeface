@@ -34,6 +34,7 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc, time::Instant};
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_secure::{
     Channel,
@@ -57,6 +58,7 @@ const QUEUED_FRAMES: usize = 4;
 static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 const GUEST_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
 type NativeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -64,6 +66,7 @@ type NativeSocket =
 /// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
 pub enum ClientSocket {
     Server(Box<WebSocket>),
+    #[cfg(test)]
     Client(Box<NativeSocket>),
     Forwarded(Box<Forwarded>),
 }
@@ -110,6 +113,7 @@ impl ClientSocket {
     pub async fn next(&mut self) -> Option<Result<Message>> {
         match self {
             Self::Server(socket) => socket.next().await.map(|frame| frame.map_err(Into::into)),
+            #[cfg(test)]
             Self::Client(socket) => loop {
                 let frame = match socket.next().await? {
                     Ok(frame) => frame,
@@ -131,6 +135,7 @@ impl ClientSocket {
     pub async fn send(&mut self, message: Message) -> Result<()> {
         match self {
             Self::Server(socket) => socket.send(message).await.map_err(Into::into),
+            #[cfg(test)]
             Self::Client(socket) => socket
                 .send(match message {
                     Message::Text(text) => NativeMessage::Text(text.as_str().to_owned().into()),
@@ -233,26 +238,13 @@ struct Principal {
     can_manage: bool,
 }
 
-pub struct Client {
+#[cfg(test)]
+struct FrameClient {
     socket: ClientSocket,
     channel: Channel,
 }
-impl Client {
-    /// Connects through the Gateway at `origin` and pins `target`'s device key.
-    pub async fn connect(origin: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
-        let (socket, _) = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::connect_async(client_url(origin)?),
-        )
-        .await
-        .context("Gateway connection timed out")??;
-        let mut socket = ClientSocket::Client(Box::new(socket));
-        let connect = serde_json::to_string(&Connect::Connect {
-            target: target.to_owned(),
-        })?;
-        socket.send(Message::Text(connect.into())).await?;
-        Self::from_socket(socket, identity, target).await
-    }
+#[cfg(test)]
+impl FrameClient {
     async fn from_socket(
         mut socket: ClientSocket,
         identity: &LocalIdentity,
@@ -273,7 +265,7 @@ impl Client {
         .context("client handshake timed out")??;
         Ok(Self { socket, channel })
     }
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = Request {
             id: id.clone(),
@@ -1691,26 +1683,6 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     Ok(())
 }
 
-/// `http(s)://host` → `ws(s)://host/api/client`.
-fn client_url(origin: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(origin)?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => bail!("Gateway URL must be HTTP or HTTPS"),
-    };
-    ensure!(
-        url.host_str().is_some() && url.username().is_empty() && url.password().is_none(),
-        "Gateway URL must not contain credentials"
-    );
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("invalid Gateway URL"))?;
-    url.set_path("/api/client");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.into())
-}
-
 /// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
     Ok(Ticket::from_link(link)?)
@@ -2267,6 +2239,7 @@ async fn send_value<T: Serialize>(
     }
     Ok(())
 }
+#[cfg(test)]
 async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
         if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
@@ -2293,7 +2266,7 @@ mod tests {
         async fn connect(
             node: Arc<Runtime>,
             admin: &LocalIdentity,
-        ) -> Result<(Client, tokio::task::JoinHandle<Result<()>>)> {
+        ) -> Result<(FrameClient, tokio::task::JoinHandle<Result<()>>)> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let (client, accepted) = tokio::join!(
                 tokio::net::TcpStream::connect(listener.local_addr()?),
@@ -2319,7 +2292,8 @@ mod tests {
                 None,
             ));
             Ok((
-                Client::from_socket(ClientSocket::Client(Box::new(client)), admin, &target).await?,
+                FrameClient::from_socket(ClientSocket::Client(Box::new(client)), admin, &target)
+                    .await?,
                 serving,
             ))
         }
@@ -2329,7 +2303,7 @@ mod tests {
         /// pong is back it has read every frame in order, even one whose dispatch then blocks.
         /// Returns whether a heartbeat ping arrived first: tungstenite answers that with a pong
         /// of its own, which is then still on the wire.
-        async fn ping(client: &mut Client, frames: &[Vec<u8>]) -> Result<bool> {
+        async fn ping(client: &mut FrameClient, frames: &[Vec<u8>]) -> Result<bool> {
             let ClientSocket::Client(socket) = &mut client.socket else {
                 unreachable!()
             };
@@ -2888,7 +2862,7 @@ mod tests {
     }
 
     /// The payload of the next push this client receives.
-    async fn next_push(client: &mut Client) -> Result<Value> {
+    async fn next_push(client: &mut FrameClient) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let value: Value = serde_json::from_slice(
@@ -4073,12 +4047,12 @@ operator: false,
             target: &str,
             cookie: &str,
             identity: &LocalIdentity,
-        ) -> Result<Client> {
+        ) -> Result<FrameClient> {
             let endpoint = origin.replace("http://", "ws://") + "/api/local/ws";
             let mut request = endpoint.into_client_request()?;
             request.headers_mut().insert("cookie", cookie.parse()?);
             let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-            Client::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
+            FrameClient::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
         }
 
         async fn browser_node(
@@ -4443,13 +4417,21 @@ operator: false,
             let connect = |identity: LocalIdentity| {
                 let (origin, node_id) = (origin.clone(), node_id.clone());
                 async move {
+                    let open = || async {
+                        let (socket, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT,
+                            tokio_tungstenite::connect_async(format!("{}/api/client", origin.replace("http://", "ws://"))))
+                            .await.context("Gateway connection timed out")??;
+                        let mut socket = ClientSocket::Client(Box::new(socket));
+                        socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
+                        FrameClient::from_socket(socket, &identity, &node_id).await
+                    };
                     for _ in 0..100 {
-                        match Client::connect(&origin, &identity, &node_id).await {
+                        match open().await {
                             Ok(client) => return Ok(client),
                             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
                         }
                     }
-                    Client::connect(&origin, &identity, &node_id).await
+                    open().await
                 }
             };
             let (root, admin) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4696,7 +4678,7 @@ operator: false,
             assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
-            assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
+            assert!(vibeface_control::client::Connection::open(&origin, &vibeface_secure::Identity::from_secret_hex(&admin.secret_key_hex)?, &LocalIdentity::generate().device_id()?).await.is_err());
 
             let ws = |page: &str| -> Result<_> {
                 let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;
@@ -4706,7 +4688,7 @@ operator: false,
             let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
             let mut socket = ClientSocket::Client(Box::new(socket));
             socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
-            let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
+            let mut cross = FrameClient::from_socket(socket, &admin, &node_id).await?;
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
             // A target outside the network is refused before it would wait for a slot.
@@ -4776,7 +4758,8 @@ operator: false,
             let origin = &origin;
             // The trusted proxy on loopback names each browser's address.
             let request = |address: &'static str| -> Result<_> {
-                let mut request = client_url(origin)?.into_client_request()?;
+                let mut request = format!("{}/api/client", origin.replace("http://", "ws://"))
+                    .into_client_request()?;
                 request.headers_mut().insert("x-real-ip", address.parse()?);
                 Ok(request)
             };

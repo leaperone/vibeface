@@ -229,7 +229,7 @@ fn s(value: &Value, key: &str) -> String {
 #[cfg(test)]
 #[path = "../../cli/src/triage.rs"]
 #[allow(dead_code)]
-mod cli_hooks;
+pub(crate) mod cli_hooks;
 
 #[cfg(test)]
 fn cli_hook(
@@ -293,12 +293,6 @@ pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
         _ => false,
     };
     !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
-}
-
-/// Whether a Claude Code hook runs in a session the user drives; `claude -p` and the SDKs set
-/// an `sdk-*` entry point.
-pub fn interactive_claude(entrypoint: Option<&str>) -> bool {
-    !entrypoint.is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
 }
 
 /// The `session_meta` payload on a Codex rollout's first line, if it has one.
@@ -669,8 +663,11 @@ mod tests {
             let text = rollout(meta.clone());
             assert_eq!(scan_rollout(&text, 0), (vec![], text.len()), "{meta}");
         }
-        assert!(interactive_claude(None) && interactive_claude(Some("cli")));
-        assert!(!interactive_claude(Some("sdk-cli")) && !interactive_claude(Some("sdk-ts")));
+        assert!(cli_hooks::interactive_claude(None) && cli_hooks::interactive_claude(Some("cli")));
+        assert!(
+            !cli_hooks::interactive_claude(Some("sdk-cli"))
+                && !cli_hooks::interactive_claude(Some("sdk-ts"))
+        );
     }
 
     #[test]

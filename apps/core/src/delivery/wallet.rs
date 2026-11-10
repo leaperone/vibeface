@@ -14,40 +14,27 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use vibeface_bridge::platform::privatefs;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use vibeface_control::maintenance::{SecretString, WalletCommand};
+use zeroize::Zeroizing;
 
 const KEYSTORE_DOMAIN: &[u8] = b"vibeface-delivery-wallet-v1";
 const ARGON_MEMORY_KIB: u32 = 65_536;
 const ARGON_PASSES: u32 = 3;
 const MAX_KEYSTORE_BYTES: u64 = 4096;
 
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-#[serde(transparent)]
-pub struct SecretString(String);
-impl SecretString {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            (12..=1024).contains(&self.0.len()),
-            "wallet passphrase must contain 12 to 1024 bytes"
-        );
-        ensure!(
-            !self.0.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-            "wallet passphrase must occupy one line"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WalletCommand {
-    Status,
-    Create { passphrase: SecretString },
-    Unlock { passphrase: SecretString },
-    Lock,
+fn validate_passphrase(passphrase: &SecretString) -> Result<()> {
+    ensure!(
+        (12..=1024).contains(&passphrase.as_str().len()),
+        "wallet passphrase must contain 12 to 1024 bytes"
+    );
+    ensure!(
+        !passphrase
+            .as_str()
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
+        "wallet passphrase must occupy one line"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +112,7 @@ impl Wallet {
 
     pub fn create(&mut self, passphrase: &SecretString) -> Result<WalletStatus> {
         self.require_loaded()?;
-        passphrase.validate()?;
+        validate_passphrase(passphrase)?;
         ensure!(
             self.address.is_none() && !self.path.try_exists()?,
             "delivery wallet already exists"
@@ -164,7 +151,7 @@ impl Wallet {
 
     pub fn unlock(&mut self, passphrase: &SecretString) -> Result<WalletStatus> {
         self.require_loaded()?;
-        passphrase.validate()?;
+        validate_passphrase(passphrase)?;
         let store = read_keystore(&self.path)?;
         let address = chain::address(&store.address)?;
         ensure!(
@@ -266,7 +253,7 @@ fn derive_key(passphrase: &SecretString, salt: &[u8]) -> Result<Zeroizing<[u8; 3
         .map_err(|_| anyhow::anyhow!("invalid wallet password parameters"))?;
     let mut key = Zeroizing::new([0; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase.0.as_bytes(), salt, key.as_mut())
+        .hash_password_into(passphrase.as_str().as_bytes(), salt, key.as_mut())
         .map_err(|_| anyhow::anyhow!("wallet password derivation failed"))?;
     Ok(key)
 }

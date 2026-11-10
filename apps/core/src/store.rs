@@ -471,17 +471,6 @@ impl Store {
         log::version_vector_from(&self.connection, network_id)
     }
 
-    /// The conversation's effective events covered by `basis` (default: all of them), in shared
-    /// order.
-    pub fn context(
-        &self,
-        network_id: &str,
-        scope_id: &str,
-        basis: Option<&VersionVector>,
-    ) -> Result<Context> {
-        context_from(&self.connection, network_id, scope_id, basis)
-    }
-
     /// What a turn's prompt reads at the job's basis: the events after the newest checkpoint, or
     /// after what the resumed session `resumed` has seen, plus the trigger and the question it
     /// answers wherever they sit. Covered history stays on disk.
@@ -997,37 +986,9 @@ impl Store {
             })
             .collect()
     }
-    /// Counts one more model run against today's UTC limit, or refuses it.
-    pub fn reserve_budget(&mut self, network_id: &str, units: u64, limit: u64) -> Result<()> {
-        ensure!(
-            units > 0 && limit <= i64::MAX as u64,
-            "invalid budget units/limit"
-        );
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (day, used): (String, u64) = tx.query_row(
-            "SELECT date('now'), COALESCE((SELECT used FROM budget_days WHERE network_id=?1 AND day=date('now')), 0)",
-            [network_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let next = used.checked_add(units).context("budget overflow")?;
-        ensure!(next <= limit, "daily model budget exhausted");
-        tx.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
-        tx.commit()?;
-        Ok(())
-    }
     /// A Node belongs to at most one network.
     pub fn network(&self) -> Result<Option<NetworkId>> {
         network_from(&self.connection)
-    }
-    pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
-        let mut statement = self.connection.prepare(
-            "SELECT conversation_id FROM conversations WHERE network_id=? ORDER BY conversation_id",
-        )?;
-        Ok(statement
-            .query_map([network_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
     /// A member Node's last `capabilities` answer, kept only here to show while it is offline.
     pub fn peer_capabilities(&self, peer: &str) -> Result<Option<Value>> {
@@ -1255,21 +1216,6 @@ fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 
-pub(crate) fn context_from(
-    connection: &Connection,
-    network_id: &str,
-    scope_id: &str,
-    basis: Option<&VersionVector>,
-) -> Result<Context> {
-    context_after(
-        connection,
-        network_id,
-        scope_id,
-        basis,
-        &VersionVector::new(),
-    )
-}
-
 /// The newest effective checkpoint of the conversation within `basis` (default: all), and the
 /// vector it covers. Read through the kind index, so its cost does not grow with the history.
 pub(crate) fn latest_checkpoint_from(
@@ -1336,7 +1282,7 @@ pub(crate) fn event_about_from(
         .transpose()
 }
 
-fn context_after(
+pub(crate) fn context_after(
     connection: &Connection,
     network_id: &str,
     scope_id: &str,

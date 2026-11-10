@@ -35,13 +35,13 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 }
 ```
 
-替换宿主上已有的 systemd 服务时，另加 `"legacy_service": "official-node.service"` 和 `"maintenance_socket": "/tmp/private-node/maintenance.sock"`，两者要么都配，要么都不配。
+不支持从宿主 systemd 服务自动迁移。首次容器激活前，须由维护者先完成数据交接；已有容器之间的更新由激活脚本负责。
 
 每次配置一个服务，角色约束如下。
 
 | role | 运行方式 | 额外配置 |
 | --- | --- | --- |
-| node | Core host network，官方公共节点：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额；文件描述符上限 65536；无静态 App、无 Nginx | 上例全部 Core 字段，可选 `legacy_service` 与 `maintenance_socket` |
+| node | Core host network，官方公共节点：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额；文件描述符上限 65536；无静态 App、无 Nginx | 上例全部 Core 字段 |
 | app | 静态 App，bridge network；浏览器直连公共节点，App 主机不转发任何接口 | 通用字段，另加 `nginx_config`、`server_name` |
 | www | 静态 WWW，bridge network | 通用字段，另加 `nginx_config`、`server_name`，tag 使用 `www-v` 前缀 |
 
@@ -91,15 +91,14 @@ acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w
 
 **必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
 
-Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分三种情况：
+Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分两种情况：
 
 - 已有容器部署（`deploy_dir` 里有 `current.json`）：旧容器的维护租约成功后才停它。Core 角色只要求旧容器在记录的镜像上运行，不要求健康检查通过，因为新版的配置格式可能在激活前已经写入，旧程序的健康检查会重读配置而失败；租约回应核对运行中 Core 的设备编号。这时自动回滚的旧容器也读不了新配置，需要手动恢复激活前在本地留档的配置。
-- 配了 `legacy_service`：旧 systemd 服务的维护租约成功后才停它。
-- 没有 `current.json`，也没有配置 `legacy_service`，即全新安装：要求本项目没有正在运行的容器，并且宿主 systemd unit 文件和 drop-in（`/etc`、`/run`、`/usr/local/lib`、`/usr/lib`、`/lib` 下的 `systemd/system`）的任何字段都没有引用 `data_dir`；有引用就拒绝激活，提示改为配置 `legacy_service`。不停任何进程。
+- 没有 `current.json`，即首次容器安装：要求本项目没有正在运行的容器，并且宿主 systemd unit 文件和 drop-in（`/etc`、`/run`、`/usr/local/lib`、`/usr/lib`、`/lib` 下的 `systemd/system`）的任何字段都没有引用 `data_dir`；有引用就拒绝激活，要求维护者明确完成迁移。不停任何宿主进程。
 
 然后取 `node.lock` 离线备份到私有 `deploy_dir`，再用 Compose 启动新容器并检查健康。容器的 bind mount 禁止自动创建源目录。整个过程不执行 init、不修改配置、不迁移 epoch、不重置数据。
 
-激活日志和 Compose 文件留在私有 `deploy_dir`。旧 Nginx 文件和离线备份只供激活中回滚；确认新容器后删除，同时删除其他旧 release 目录和上一版镜像，主机只保留当前版本。需要留档时在激活前把数据拷到本地。镜像健康需同时满足容器 running/healthy 与 Core inspect 的 running、版本和 device ID。失败时先停新容器，再恢复旧容器或原 systemd 服务，并恢复 Nginx；全新安装没有旧服务，只停新容器；不会自动覆盖现有数据。中断后的非终态日志会先回滚并退出，检查旧服务后可重跑原命令。新容器无法确认停止时拒绝启动旧进程。确认后的同一请求会再次核对实际容器健康。
+激活日志和 Compose 文件留在私有 `deploy_dir`。旧 Nginx 文件和离线备份只供激活中回滚；确认新容器后删除，同时删除其他旧 release 目录和上一版镜像，主机只保留当前版本。需要留档时在激活前把数据拷到本地。镜像健康需同时满足容器 running/healthy 与 Core inspect 的 running、版本和 device ID。失败时先停新容器，再恢复旧容器，并恢复 Nginx；全新安装没有旧服务，只停新容器；不会自动覆盖现有数据。中断后的非终态日志会先回滚并退出，检查旧服务后可重跑原命令。新容器无法确认停止时拒绝启动旧进程。确认后的同一请求会再次核对实际容器健康。
 
 `deploy-services` 部署 node 时，无论是否 `apply`，先在 runner 上按上文初始化一个 fixture 数据目录，用只改了 `public-bootstrap.json` 的同一镜像依次演练全新安装、交接和重复激活；演练失败则不触碰主机。
 

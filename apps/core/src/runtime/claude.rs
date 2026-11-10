@@ -7,7 +7,6 @@ use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
-use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
 use std::collections::HashSet;
@@ -2082,48 +2081,11 @@ impl Executor for Claude {
     }
 }
 
-/// `AskUserQuestion` asks a question; every other tool asks permission.
-pub(crate) fn request_kind(input: &Value) -> RequestKind {
-    match input["tool_name"] == "AskUserQuestion" {
-        true => RequestKind::Question,
-        false => RequestKind::Permission,
-    }
-}
-
-/// What `vibeface hook claude` prints for the answer to its `PermissionRequest`: allow, with
-/// the question's answers filled in, or deny. An allow never changes the tool's input. `None`
-/// prints nothing, which leaves the decision to the session, as for `{"decision":null}`, an
-/// allow that carries `updatedInput`, or an answer that fits neither.
-pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
-    if input["hook_event_name"] != "PermissionRequest" {
-        return None;
-    }
-    let decision = match (&answer["answers"], answer["behavior"].as_str()) {
-        (Value::Object(answers), _) if request_kind(input) == RequestKind::Question => {
-            if !answers.values().all(Value::is_string) {
-                return None;
-            }
-            let mut updated = input["tool_input"].clone();
-            updated.as_object_mut()?;
-            updated["answers"] = Value::Object(answers.clone());
-            json!({"behavior":"allow","updatedInput":updated})
-        }
-        // What was approved is what runs: an allow that rewrites the input is not this
-        // approval, so it prints nothing and the session asks again.
-        (_, Some("allow")) if answer.get("updatedInput").is_some() => return None,
-        (_, Some("allow")) => json!({"behavior":"allow"}),
-        (_, Some("deny")) => json!({"behavior":"deny",
-            "message":answer["message"].as_str().unwrap_or("The owner's bot declined this."),
-            "interrupt":answer["interrupt"] == true}),
-        _ => return None,
-    };
-    Some(json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":decision}}))
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::runtime::test_support::{join_network, manager_settings, open_node, provider_work};
+    use crate::triage::{RequestKind, cli_hooks::hook_output};
     use crate::work::WorkState;
 
     fn fixture() -> PathBuf {

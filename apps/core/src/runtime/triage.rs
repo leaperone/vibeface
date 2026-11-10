@@ -5618,7 +5618,13 @@ pub(super) mod tests {
 
     async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
         let network = node.network_id().await?;
-        let context = node.store.lock().await.context(&network, scope, None)?;
+        let context = crate::store::context_after(
+            &node.store.lock().await.connection,
+            &network,
+            scope,
+            None,
+            &VersionVector::new(),
+        )?;
         Ok(context
             .events
             .iter()
@@ -6943,10 +6949,10 @@ pub(super) mod tests {
             let network = node.network_id().await?;
             let limit = node.config.daily_decision_limit;
             let triage = format!("triage:{network}");
-            node.store
-                .lock()
-                .await
-                .reserve_budget(&triage, limit - 1, limit)?;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO budget_days(network_id,day,used) VALUES(?1,date('now'),?2) ON CONFLICT(network_id,day) DO UPDATE SET used=budget_days.used+excluded.used",
+                rusqlite::params![triage, limit - 1],
+            )?;
             let mut requests = coordination_app_server(&node).await?;
 
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
@@ -6989,11 +6995,10 @@ pub(super) mod tests {
                     .contains_key(&request_id),
                 "a budget refusal must not shorten the request deadline"
             );
-            node.store
-                .lock()
-                .await
-                .reserve_budget(&network, limit, limit)
-                .context("the bots' own turns keep their whole budget")?;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO budget_days(network_id,day,used) VALUES(?1,date('now'),?2) ON CONFLICT(network_id,day) DO UPDATE SET used=budget_days.used+excluded.used",
+                rusqlite::params![network, limit],
+            ).context("seed the independent bot budget")?;
             let pending = node.pending_events().await?;
             assert_eq!(pending.len(), 2, "events were not offered to the model");
             assert!(pending.iter().any(|event| event.event_id == deferred_id));
@@ -7080,7 +7085,10 @@ pub(super) mod tests {
                     .used,
                 1
             );
-            store.reserve_budget(&format!("triage:{network}"), 7, 100)?;
+            store.connection.execute(
+                "INSERT INTO budget_days(network_id,day,used) VALUES(?1,date('now'),?2) ON CONFLICT(network_id,day) DO UPDATE SET used=budget_days.used+excluded.used",
+                rusqlite::params![format!("triage:{network}"), 7],
+            )?;
             dequeue(&store.connection, &event)?;
             store.finish_triage(attempt, &refused)?;
             assert_eq!(
@@ -8447,7 +8455,14 @@ pub(super) mod tests {
                 .count(),
             1
         );
-        let events = store.context(network, &request.conversation, None)?.events;
+        let events = crate::store::context_after(
+            &store.connection,
+            network,
+            &request.conversation,
+            None,
+            &VersionVector::new(),
+        )?
+        .events;
         assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkDispatched { work_id, .. } if work_id == &request.work_id)).count(), 1);
         assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == &request.work_id)).count(), 1);
         assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkProgress { work_id, .. } if work_id == &request.work_id)).count(), 0);
@@ -8604,7 +8619,7 @@ pub(super) mod tests {
             }
             let store = node.store.lock().await;
             assert_eq!(store.work_records()?.len(), 5);
-            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 5);
+            assert_eq!(crate::store::context_after(&store.connection, &network, "c", None, &VersionVector::new())?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 5);
             drop(store);
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())
@@ -8671,7 +8686,7 @@ pub(super) mod tests {
             assert_eq!(pi_fixture_log(&dir)?.iter().filter(|entry| entry.get("prompt").is_some()).count(), 3);
             let store = node.store.lock().await;
             assert_eq!(store.work_records()?.len(), 3);
-            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 3);
+            assert_eq!(crate::store::context_after(&store.connection, &network, "c", None, &VersionVector::new())?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 3);
             drop(store);
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())

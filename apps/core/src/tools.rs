@@ -590,12 +590,6 @@ impl Tool {
             .is_some_and(|(_, _, required)| required.contains(&"call_ref"))
     }
 
-    pub fn available(self, kind: Option<TriggerKind>) -> bool {
-        self.schema().is_some()
-            && (self.effect() == Effect::Read
-                || kind.is_some_and(|kind| self.effect().offered(kind)))
-    }
-
     pub fn input_schema(self) -> Option<Value> {
         let (_, properties, required) = self.schema()?;
         let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});

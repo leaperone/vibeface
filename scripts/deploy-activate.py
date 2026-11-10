@@ -10,9 +10,7 @@ from pathlib import Path
 import re
 import select
 import shutil
-import socket
 import stat
-import struct
 import subprocess
 import sys
 import tarfile
@@ -52,24 +50,19 @@ def validate_config(config):
     require(isinstance(config, dict) and config.get('role') in ROLES, 'invalid service role')
     core = config['role'] in CORE_ROLES
     required = common | ({'data_dir', 'tls_dir', 'device_id', 'uid', 'gid'} if core else {'nginx_config', 'server_name'})
-    # A Node that replaces a host service names it and its maintenance socket; a fresh install names neither.
-    legacy = {'legacy_service', 'maintenance_socket'} if core else set()
-    require(required <= config.keys() and config.keys() <= required | legacy | {'public_url'}
-            and (legacy <= config.keys() or not legacy & config.keys()),
+    require(required <= config.keys() and config.keys() <= required | {'public_url'},
             'unsupported or missing deployment configuration fields')
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', config['project']), 'invalid Compose project')
     # Browsers and devices reach the official node directly; a static container only its own host's nginx.
     host = '0.0.0.0' if config['role'] in CORE_ROLES else '127.0.0.1'
     require(re.fullmatch(re.escape(host) + r':[1-9][0-9]{0,4}', config['listen'])
             and int(config['listen'].split(':')[1]) <= 65535, 'listen must be an explicit port on ' + host)
-    for name in ('deploy_dir', 'data_dir', 'tls_dir', 'nginx_config', 'maintenance_socket'):
+    for name in ('deploy_dir', 'data_dir', 'tls_dir', 'nginx_config'):
         if name in config:
             canonical_path(config[name])
     if config['role'] in CORE_ROLES:
         require(re.fullmatch(r'[0-9a-f]{64}', config['device_id'])
-                and all(type(config[n]) is int and 0 < config[n] <= 2**31 - 1 for n in ('uid', 'gid'))
-                and ('legacy_service' not in config
-                     or re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}\.service', config['legacy_service'])),
+                and all(type(config[n]) is int and 0 < config[n] <= 2**31 - 1 for n in ('uid', 'gid')),
                 'invalid existing service identity')
         paths = [Path(config[name]) for name in ('data_dir', 'deploy_dir', 'tls_dir')]
         require(all(a != b and a not in b.parents for a in paths for b in paths if a is not b),
@@ -375,7 +368,7 @@ def transform_nginx(text, config):
 
 
 @contextmanager
-def lease(config, previous):
+def lease(previous):
     if previous:
         container = running(previous)
         process = subprocess.Popen([*DOCKER, 'exec', '-i', container, 'python3', '/opt/vibeface/runtime.py', 'lease'],
@@ -392,42 +385,9 @@ def lease(config, previous):
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
-    elif 'legacy_service' in config:
-        with legacy_channel(config, 'acquire') as health:
-            yield health
     else:
         yield None
 
-
-@contextmanager
-def legacy_channel(config, request):
-    endpoint = checked_path(Path(config['maintenance_socket']))
-    metadata, parent = endpoint.lstat(), endpoint.parent.lstat()
-    require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == config['uid']
-            and stat.S_IMODE(metadata.st_mode) == 0o600 and parent.st_uid == config['uid']
-            and stat.S_IMODE(parent.st_mode) == 0o700, 'legacy maintenance socket is not private')
-    stream = socket.socket(socket.AF_UNIX)
-    stream.settimeout(15)
-    try:
-        os.setegid(config['gid']); os.seteuid(config['uid'])
-        stream.connect(str(endpoint))
-    finally:
-        os.seteuid(0); os.setegid(0)
-    try:
-        _, uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        require(uid == config['uid'], 'legacy maintenance peer differs')
-        stream.sendall((json.dumps({'protocol': 1, 'command': request}) + '\n').encode())
-        packet = bytearray()
-        while not packet.endswith(b'\n') and len(packet) <= 4096:
-            part = stream.recv(4096)
-            require(part, 'legacy maintenance connection ended early')
-            packet.extend(part)
-        value = json.loads(packet)
-        require(len(packet) <= 4096 and value.get('protocol') == 1 and value.get('status') == ('ready' if request == 'acquire' else 'healthy')
-                and value['health']['device_id'] == config['device_id'], 'legacy maintenance lease was refused')
-        yield value['health']
-    finally:
-        stream.close()
 
 def units_using(path, roots=UNIT_DIRS):
     """Unit files and drop-ins naming `path` or a path under it in any field, read as text for systemd 219."""
@@ -512,35 +472,18 @@ def rollback(journal, journal_path):
         return
     previous = journal['previous']
     restored = restored_previous(previous)
-    legacy_restored = False
-    if not previous and 'legacy_service' in config:
-        if command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode == 0:
-            with legacy_channel(config, 'probe') as health:
-                require(health['version'] == journal['legacy_version'], 'legacy running version differs')
-            stopped(target)
-            legacy_restored = True
-    if phase != 'stopping_previous' and not restored and not legacy_restored and not previous_stopped(previous):
+    if phase != 'stopping_previous' and not restored and not previous_stopped(previous):
         stop(target)
     if phase == 'switching_nginx' and journal.get('nginx_backup'):
         path = checked_path(Path(config['nginx_config']))
         nginx_apply(config, Path(journal['nginx_backup']).read_bytes(), path.stat())
-    if config['role'] in CORE_ROLES and not restored and not legacy_restored:
+    if config['role'] in CORE_ROLES and not restored:
         with node_lock(config):
             require(hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
                     == journal['identity_sha256'], 'identity changed; automatic rollback was refused')
-        if previous:
-            compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
-            wait_healthy(previous)
-        elif 'legacy_service' in config:
-            command('systemctl', 'start', config['legacy_service'])
-            if journal['legacy_enabled']:
-                command('systemctl', 'enable', config['legacy_service'])
-            command('systemctl', 'is-active', '--quiet', config['legacy_service'])
-    elif previous and not restored:
+    if previous and not restored:
         compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
         wait_healthy(previous)
-    if legacy_restored and journal['legacy_enabled']:
-        command('systemctl', 'enable', config['legacy_service'])
     current_path = journal_path.parent / 'current.json'
     if previous:
         write_json(current_path, previous)
@@ -602,7 +545,7 @@ def activate(config, image, tag, source, version):
             target['device_id'] = config['device_id']
         compose(target, 'config', '--quiet')
         journal = {'schema': 1, 'phase': 'prepared', 'config': config, 'target': target,
-                   'previous': current, 'legacy_enabled': False}
+                   'previous': current}
         nginx_data = None
         if 'nginx_config' in config:
             nginx = checked_path(Path(config['nginx_config']))
@@ -615,30 +558,18 @@ def activate(config, image, tag, source, version):
             journal['nginx_backup'] = str(release / 'nginx.before')
         if config['role'] in CORE_ROLES:
             journal['identity_sha256'] = hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
-            if not current and 'legacy_service' in config:
-                command('systemctl', 'is-active', '--quiet', config['legacy_service'])
-                journal['legacy_enabled'] = command('systemctl', 'is-enabled', config['legacy_service'], check=False).stdout.strip() == 'enabled'
-            elif not current:
-                # A fresh install: no service of this project may already run on this data, and no host
-                # service may own it either; one that does is replaced only as `legacy_service`.
+            if not current:
                 units = units_using(config['data_dir'])
-                require(not units, 'systemd units use the data directory; configure legacy_service to replace '
+                require(not units, 'systemd units use the data directory; explicit migration is required: '
                         + ', '.join(units))
                 stopped(target)
         write_json(journal_path, journal)
         try:
             if config['role'] in CORE_ROLES:
-                with lease(config, current) as health:
-                    if health:
-                        journal['legacy_version'] = health['version']
-                    if current or health:
-                        journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
+                with lease(current):
                     if current:
+                        journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
                         stop(current)
-                    elif health:
-                        command('systemctl', 'stop', config['legacy_service'])
-                        require(command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode != 0,
-                                'legacy service did not stop')
                 with node_lock(config):
                     backup_data(config, release / 'data.before.tar.gz')
             elif current:
@@ -653,8 +584,6 @@ def activate(config, image, tag, source, version):
             if nginx_data is not None:
                 journal['phase'] = 'switching_nginx'; write_json(journal_path, journal)
                 nginx_apply(config, nginx_data, Path(config['nginx_config']).stat())
-            if config['role'] in CORE_ROLES and not current and journal['legacy_enabled']:
-                command('systemctl', 'disable', config['legacy_service'])
             healthy(target)
             nginx_matches(config, target)
             write_json(current_path, target)
@@ -702,19 +631,17 @@ def self_test():
     config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
               'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'tls_dir': '/etc/official-node/tls',
               'device_id': 'a' * 64,
-              'uid': 1001, 'gid': 1001, 'legacy_service': 'official-node.service',
-              'maintenance_socket': '/tmp/private-node/maintenance.sock'}
+              'uid': 1001, 'gid': 1001}
     app = {'project': 'official-app', 'role': 'app', 'deploy_dir': '/srv/service-control/app',
            'listen': '127.0.0.1:8088', 'nginx_config': '/etc/nginx/conf.d/app.conf',
            'server_name': 'app.example.invalid'}
-    fresh = {key: item for key, item in config.items() if key not in ('legacy_service', 'maintenance_socket')}
-    validate_config(config); validate_config(app); validate_config(fresh)
+    validate_config(config); validate_config(app)
     for base, field, value in ((config, 'data_dir', '/var/lib/../other'), (config, 'uid', 0),
                                (config, 'tls_dir', None), (config, 'tls_dir', '/var/lib/official-node/tls'),
                                (config, 'tls_dir', '/srv/service-control/node'),
                                (config, 'listen', '127.0.0.1:4792'), (config, 'device_id', 'wrong'),
-                               (config, 'legacy_service', '--help'), (config, 'legacy_service', None),
-                               (config, 'maintenance_socket', None),
+                               (config, 'legacy_service', 'official-node.service'),
+                               (config, 'maintenance_socket', '/tmp/private-node/maintenance.sock'),
                                (config, 'node_url', 'https://203.0.113.7:4792'),
                                (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://203.0.113.7:4792'),
                                (app, 'legacy_service', 'official-node.service')):
@@ -813,27 +740,15 @@ server {
             rollback(copy.deepcopy(state), directory / 'activation.json')
         assert events == ['start-previous', 'check-previous']
         events.clear()
-        @contextmanager
-        def restored_legacy(*args):
-            yield {'version': '1.0.0'}
-        legacy_state = dict(state, previous=None, legacy_version='1.0.0', legacy_enabled=False,
-                            config={'role': 'node', 'legacy_service': 'fixture.service'})
-        with patch(__name__ + '.legacy_channel', side_effect=restored_legacy), \
-                patch(__name__ + '.command', return_value=subprocess.CompletedProcess([], 0, '', '')), \
-                patch(__name__ + '.stopped', side_effect=lambda *a: events.append('verify-target-stopped')), \
-                patch(__name__ + '.stop', side_effect=lambda *a: events.append('unsafe-stop')):
-            rollback(legacy_state, directory / 'activation.json')
-        assert events == ['verify-target-stopped']
-        events.clear()
         with patch(__name__ + '.stop', side_effect=lambda target: events.append('unsafe-stop')):
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
         events.clear()
-        with lease(fresh, None) as health:
+        with lease(None) as health:
             assert health is None
         fresh_data = directory / 'fresh'; fresh_data.mkdir()
         (fresh_data / 'identity.json').write_text('fresh'); (fresh_data / 'node.lock').touch()
-        fresh_state = dict(state, previous=None, legacy_enabled=False, config=dict(fresh, data_dir=str(fresh_data)),
+        fresh_state = dict(state, previous=None, config=dict(config, data_dir=str(fresh_data)),
                            identity_sha256=hashlib.sha256(b'fresh').hexdigest())
         with patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
                 patch(__name__ + '.command', side_effect=lambda *a, **k: events.append('unsafe-systemctl')), \

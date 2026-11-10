@@ -1860,7 +1860,7 @@ fn admit_ended_from(
         },
     )?;
     // What reaches a deleted bot is recorded as cancelled, so a sender's retry reads it back.
-    // An agent task waits for `claim_next`, which also ends its work.
+    // An agent task waits for `claim_next_in_session`, which also ends its work.
     let deleted = kind != TriggerKind::AgentTask
         && super::bots::bot_deleted_from(connection, network, conversation)?;
     let ended = declined.or(deleted.then_some(BOT_DELETED));
@@ -1929,7 +1929,6 @@ fn stage_memory_from(
     trigger: &str,
     call_ref: &str,
     request: super::bot_settings::ChangeRequest,
-    review_revision: Option<(u32, &str)>,
 ) -> Result<Value> {
     use super::bot_settings::ChangeRequest;
     vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
@@ -1951,29 +1950,16 @@ fn stage_memory_from(
         super::bot_settings::user_cause(connection, network, conversation, trigger)?.is_some(),
         super::bot_settings::NOT_FROM_USER
     );
-    let origin = if review_revision.is_some() {
-        AutomaticMemoryOrigin::Review
-    } else {
-        AutomaticMemoryOrigin::Agent
-    };
     let staged = &session.shown.staged_memories;
     if let Some(previous) = staged.get(call_ref) {
         ensure!(
-            request.matches_memory(&previous.memory_id, previous.after.as_deref())
-                && previous.origin == origin
-                && review_revision.is_none_or(|(epoch, revision)| previous.base.epoch == epoch
-                    && previous
-                        .base
-                        .version
-                        .as_ref()
-                        .map_or("", |version| version.revision.as_str())
-                        == revision),
+            request.matches_memory(&previous.memory_id, previous.after.as_deref()),
             "call_ref {call_ref} already staged a different memory mutation"
         );
         return Ok(staged_memory_result(previous));
     }
     let committed = super::bot_settings::memory_records_from(connection, network, conversation)?;
-    let (memory_id, mut before, after, mut base, essential) = match request {
+    let (memory_id, before, after, base, essential) = match request {
         ChangeRequest::Remember { memory_id, text } => {
             validate_memory(&text)?;
             let memory_id = memory_id.unwrap_or_else(|| {
@@ -2048,39 +2034,13 @@ fn stage_memory_from(
         !staged.values().any(|entry| entry.memory_id == memory_id),
         "memory {memory_id} already has a staged mutation in this turn"
     );
-    if let Some((epoch, revision)) = review_revision {
-        base.epoch = epoch;
-        if base
-            .version
-            .as_ref()
-            .is_some_and(|version| version.revision != revision)
-        {
-            let source = super::log::event_from(connection, network, revision)?
-                .context("memory review base is not stored here")?;
-            let operation = super::bot_settings::memory_operation(network, revision, &source)?
-                .context("memory review base is not a memory operation")?;
-            ensure!(
-                source.scope_id == *conversation
-                    && operation.memory_id == memory_id
-                    && !operation.user_controlled,
-                "memory review base belongs to another note"
-            );
-            before = operation.after;
-            base.version = Some(operation.version);
-        } else if base.version.is_none() {
-            ensure!(
-                revision.is_empty(),
-                "a review update needs a committed base"
-            );
-        }
-    }
     let mutation = StagedMemory {
         call_ref: call_ref.into(),
         memory_id,
         before,
         after,
         base,
-        origin,
+        origin: AutomaticMemoryOrigin::Agent,
         essential,
     };
     let result = staged_memory_result(&mutation);
@@ -2695,20 +2655,6 @@ impl Store {
         super::workspace::task_input_allowed_from(&self.connection, network, task_id)
     }
 
-    pub fn apply_workspace_input_control(
-        &mut self,
-        network: &str,
-        local: &str,
-        message_id: &str,
-    ) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        apply_workspace_input_control_from(&tx, network, local, message_id)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn input_receipt(
         &self,
         network: &str,
@@ -2907,100 +2853,10 @@ impl Store {
                 .is_some_and(|attempt| attempt.id == attempt_id),
             "scheduler attempt does not match"
         );
-        let result =
-            stage_memory_from(&tx, &mut session, network, trigger, call_ref, request, None)?;
+        let result = stage_memory_from(&tx, &mut session, network, trigger, call_ref, request)?;
         save_session(&tx, &session)?;
         tx.commit()?;
         Ok(result)
-    }
-
-    /// Stages a data-only review atomically; the normal turn completion owns its commit.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the opt-in review and its active turn"
-    )]
-    pub fn stage_memory_review(
-        &mut self,
-        network: &str,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-        call_ref: &str,
-        policy: super::bot_settings::MemoryReviewPolicy,
-        review: &super::bot_settings::MemoryReview,
-    ) -> Result<Vec<Value>> {
-        use super::bot_settings::{ChangeRequest, MemoryReviewOperation, MemoryReviewPolicy};
-        ensure!(
-            policy == MemoryReviewPolicy::ReadOnly,
-            "memory review is disabled"
-        );
-        review.validate()?;
-        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
-        let mut session = load_job_session(&tx, &job)?;
-        ensure!(
-            job.state
-                .attempt()
-                .is_some_and(|attempt| attempt.id == attempt_id),
-            "scheduler attempt does not match"
-        );
-        let mut results = Vec::with_capacity(review.operations.len());
-        for (index, operation) in review.operations.iter().enumerate() {
-            let (request, expected) = match operation {
-                MemoryReviewOperation::Add { text } => (
-                    ChangeRequest::Remember {
-                        memory_id: None,
-                        text: text.clone(),
-                    },
-                    (crate::config::DATA_EPOCH, ""),
-                ),
-                MemoryReviewOperation::Update {
-                    memory_id,
-                    epoch,
-                    expected_revision,
-                    text,
-                } => (
-                    ChangeRequest::Remember {
-                        memory_id: Some(memory_id.clone()),
-                        text: text.clone(),
-                    },
-                    (*epoch, expected_revision.as_str()),
-                ),
-                MemoryReviewOperation::Forget {
-                    memory_id,
-                    epoch,
-                    expected_revision,
-                } => (
-                    ChangeRequest::Forget {
-                        memory_id: memory_id.clone(),
-                    },
-                    (*epoch, expected_revision.as_str()),
-                ),
-            };
-            let operation_ref = format!(
-                "review-{}",
-                super::bot_settings::change_digest(
-                    conversation,
-                    trigger,
-                    &format!("{call_ref}-{index}"),
-                )
-            );
-            results.push(stage_memory_from(
-                &tx,
-                &mut session,
-                network,
-                trigger,
-                &operation_ref,
-                request,
-                Some(expected),
-            )?);
-        }
-        save_session(&tx, &session)?;
-        tx.commit()?;
-        Ok(results)
     }
 
     /// The user messages of a conversation this Node schedules that no device answered, in
@@ -4584,36 +4440,6 @@ impl Store {
         Ok(ended)
     }
 
-    #[cfg(test)]
-    pub fn claim_next(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        conversation: &str,
-        boot: &str,
-        fingerprint: &str,
-    ) -> Result<Option<ClaimedJob>> {
-        self.recover_scheduler_jobs(identity, network, boot)?;
-        let mut queued = queued_jobs(&self.connection, conversation)?;
-        queued.sort_by(|a, b| a.priority().cmp(&b.priority()));
-        let Some(job) = queued.first() else {
-            return Ok(None);
-        };
-        let config = SessionConfig {
-            stable_fingerprint: fingerprint.into(),
-            runtime_fingerprint: fingerprint.into(),
-            provider: Provider::Codex,
-        };
-        self.claim_next_in_session(
-            identity,
-            network,
-            &job.session_key(),
-            boot,
-            &config,
-            &crate::config::SchedulingLimits::default(),
-        )
-    }
-
     /// Claim and every resource gate share one transaction. A held background candidate never
     /// blocks a runnable human message, and ties remain stable across concurrent consumers.
     pub fn claim_next_in_session(
@@ -5320,31 +5146,6 @@ impl Store {
             Ok(())
         })?;
         Ok(())
-    }
-
-    pub fn manager_attempt_allowed(
-        &self,
-        network: &str,
-        local: &str,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-    ) -> Result<bool> {
-        let Some(job) = self.scheduler_job(conversation, trigger)? else {
-            return Ok(false);
-        };
-        let session = load_job_session(&self.connection, &job)?;
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(false);
-        };
-        Ok(session.active.as_deref() == Some(trigger)
-            && attempt.id == attempt_id
-            && attempt.permission_version == session.permission_version
-            && matches!(
-                job.state,
-                JobState::Claimed { .. } | JobState::Running { .. }
-            )
-            && holds_turn(&self.connection, network, local, &session, &job)?)
     }
 
     pub fn manager_attempt_allowed_with_version(

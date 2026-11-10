@@ -58,11 +58,6 @@ export function parseLocalNodes(value: unknown): LocalNodes {
   }) }
 }
 
-export function uniqueRunningNode(catalog: LocalNodes): Extract<LocalNode, { kind: 'running' }> | null {
-  const running = catalog.nodes.filter((node): node is Extract<LocalNode, { kind: 'running' }> => node.kind === 'running')
-  return running.length === 1 ? running[0] ?? null : null
-}
-
 /** Read-only discovery; the native Core performs account, path, identity and health checks. */
 export async function discoverLocalNodes(program: CoreProgram, profileDir: string, rememberedDataDirs: string[]): Promise<LocalNodes> {
   return parseLocalNodes(await runControl(program, { command: 'discover_local_nodes', app_profile_dir: profileDir,

@@ -178,13 +178,19 @@ CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK �
 
 产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Nightly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
-Windows 运行包的定位可复用已完成 CI 中成功的 Windows package 制品，单独运行当前验收脚本：
+Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
 
 ```sh
-gh workflow run ci.yml --ref <branch> -F windows_only=true -f windows_package_run=<run-id>
+gh workflow run ci.yml --ref <branch> -F windows_only=true
 ```
 
-入口核对原运行、成功生产者、不可变 artifact ID、来源提交、有效期和文件摘要。诊断收据分别记录运行包与验收脚本的源码，并使用独立 artifact 名称。该模式跳过 Rust 编译与其他平台构建；最终交付仍需用最终提交构建并验收完整产品集。
+需要运行当前 Windows 包的真实进程、IPC、服务、更新和 Provider 夹具时，使用扩展平台入口：
+
+```sh
+gh workflow run ci.yml --ref <branch> -F desktop=true
+```
+
+该入口先构建当前源码的 Windows package，再从同一次运行下载按源码 SHA 命名的不可变制品，校验摘要后执行真实进程检查。
 
 ## 本地按改动补充验收
 

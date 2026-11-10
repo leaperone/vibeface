@@ -109,8 +109,7 @@ struct InspectResult {
     maintenance_socket: PathBuf,
     listen: SocketAddr,
     http_enabled: bool,
-    version: Option<String>,
-    core_version: Option<String>,
+    core_version: String,
     #[serde(default)]
     error: Option<String>,
 }
@@ -1045,17 +1044,11 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
     for _ in 0..150 {
         match inspect(data, &package.join(PROGRAMS[1])).await {
             Ok(inspected) => {
-                let running_version = inspected
-                    .core_version
-                    .as_deref()
-                    .or(inspected.version.as_deref());
                 if inspected.status != "running" {
                     last = inspected
                         .error
                         .unwrap_or_else(|| "node is not running".into());
-                } else if inspected.device_id != device_id
-                    || running_version != Some(version.as_str())
-                {
+                } else if inspected.device_id != device_id || inspected.core_version != version {
                     bail!("started node has an unexpected version or identity");
                 } else {
                     let health = maintenance::request(
@@ -1816,6 +1809,9 @@ mod tests {
             "http_enabled":false,
             "version":"9.0.0","core_version":"9.0.0"
         }});
+        let mut old_inspect = response["result"].clone();
+        old_inspect.as_object_mut().unwrap().remove("core_version");
+        assert!(serde_json::from_value::<InspectResult>(old_inspect).is_err());
         let core = candidate.join(PROGRAMS[1]);
         fs::write(
             &core,

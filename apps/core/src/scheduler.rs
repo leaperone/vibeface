@@ -242,21 +242,6 @@ fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
     value
 }
 
-pub async fn status(
-    node: &Runtime,
-    network: &str,
-    conversation: &str,
-    trigger: &str,
-) -> Result<Value> {
-    let _work = node.maintenance.enter()?;
-    let mut store = node.store.lock().await;
-    store.recover_scheduler_jobs(&node.identity, network, boot_id())?;
-    Ok(match store.scheduler_job(conversation, trigger)? {
-        Some(job) => invocation_value(&job, network),
-        None => json!({"state":"not_found","trigger":trigger}),
-    })
-}
-
 /// The reply text streamed so far, rebuilt from SDK progress: a snapshot replaces an item's
 /// text and a delta extends it. A stopped turn keeps this text.
 #[derive(Default)]

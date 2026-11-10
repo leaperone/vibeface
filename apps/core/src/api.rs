@@ -512,26 +512,6 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
         .with_state(app)
 }
 
-pub fn router(node: Arc<Runtime>) -> Router {
-    let sites = node
-        .config
-        .browser_origins()
-        .ok()
-        .and_then(|origins| {
-            origins
-                .into_iter()
-                .map(|origin| Site::parse(&origin))
-                .collect::<Result<Vec<_>>>()
-                .ok()
-        })
-        .unwrap_or_default();
-    router_with_sites(node, sites)
-}
-
-fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    browser_router_with_assets(node, sites, false, None)
-}
-
 #[cfg(test)]
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     browser_router_with_assets(node, sites, local, None)

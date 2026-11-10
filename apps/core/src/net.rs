@@ -618,17 +618,6 @@ impl Net {
         });
     }
 
-    pub fn connected(&self, device_id: &str) -> bool {
-        let Ok(id) = endpoint_id(device_id) else {
-            return false;
-        };
-        self.connections
-            .lock()
-            .expect("connection cache")
-            .iter()
-            .any(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
-    }
-
     /// Reuses an open connection; otherwise dials through the address book within `DIAL_TIMEOUT`.
     pub async fn connect(&self, device_id: &str, alpn: &'static [u8]) -> Result<Connection> {
         let id = endpoint_id(device_id)?;

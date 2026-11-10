@@ -37,22 +37,6 @@ pub fn has_program_extension(path: &Path) -> bool {
     program_extensions().contains(&extension)
 }
 
-/// The file `name` resolves to on this account's `PATH`, or `None` when nothing does.
-///
-/// A name that already carries a directory separator is checked as given rather than searched.
-pub fn find_on_path(name: &OsStr) -> Option<PathBuf> {
-    let direct = Path::new(name);
-    if direct.components().count() > 1 {
-        return candidates(direct).into_iter().find(|path| runnable(path));
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .filter(|directory| !directory.as_os_str().is_empty())
-            .flat_map(|directory| candidates(&directory.join(direct)))
-            .find(|path| runnable(path))
-    })
-}
-
 /// Every file name that could be the program `base` names.
 pub fn candidates(base: &Path) -> Vec<PathBuf> {
     #[cfg(unix)]

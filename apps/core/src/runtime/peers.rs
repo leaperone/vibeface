@@ -4517,7 +4517,14 @@ mod tests {
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
             b.sync_peer(&network, &ia.device_id()?).await?;
-            let events = b.store.lock().await.context(&network, "c", None)?.events;
+            let events = crate::store::context_after(
+                &b.store.lock().await.connection,
+                &network,
+                "c",
+                None,
+                &VersionVector::new(),
+            )?
+            .events;
             let file = b.store.lock().await.blob_file(&blob.hash)?;
             std::fs::remove_file(&file)?;
             assert!(
