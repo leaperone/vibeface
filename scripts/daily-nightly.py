@@ -37,7 +37,7 @@ PART_PUBLISHERS = (
     'publish-desktop-aarch64-unknown-linux-gnu',
     'publish-desktop-x86_64-pc-windows-msvc',
     'publish-android', 'publish-ios')
-PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'publish', 'npm')
+PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'release-failed', 'publish', 'npm')
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 require = release.require
 

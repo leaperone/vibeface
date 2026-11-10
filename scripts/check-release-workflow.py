@@ -290,6 +290,9 @@ def check_deployment(source):
     rehearsal = source.split('      - name: Rehearse the Core activation on this runner', 1)
     require(len(rehearsal) == 2 and rehearsal[1].index('deploy-run.py rehearse') < rehearsal[1].index('deploy-run.py activate'),
             'the Core activation must be rehearsed before the host activation')
+    step = rehearsal[1].split('      - name:', 1)[0]
+    require("        if: matrix.service == 'node'\n" in step and step.count('if:') == 1
+            and 'continue-on-error' not in step, 'every Core deployment must pass the rehearsal')
 
 
 def main():
@@ -307,7 +310,10 @@ def main():
     if args.self_test:
         for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
                           deployment.replace('if: inputs.apply', 'if: always()'),
-                          deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test')):
+                          deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
+                          deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
+                          deployment.replace("if: matrix.service == 'node'",
+                                             "if: matrix.service == 'node'\n        continue-on-error: true")):
             try:
                 check_deployment(candidate)
             except ValueError:

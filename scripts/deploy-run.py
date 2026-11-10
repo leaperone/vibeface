@@ -301,16 +301,20 @@ def rehearse(output):
               'listen': '0.0.0.0:4792', 'data_dir': str(data), 'tls_dir': str(tls), 'device_id': device,
               'uid': 1001, 'gid': 1001}
     receipts = []
-    for settings, expected in ((config, 'activated'), (dict(config, public_url=public_url), 'activated'),
-                               (dict(config, public_url=public_url), 'already_active')):
-        result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/deploy-activate.py'), '--config', '-',
-                                 '--image', fixture, '--tag', info['tag'], '--source-sha', info['source_sha'],
-                                 '--version', info['version']],
-                                input=json.dumps(settings), capture_output=True, text=True)
-        release.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
-        receipt = json.loads(result.stdout)
-        release.require(receipt['status'] == expected and receipt['image'] == fixture, 'rehearsal receipt differs')
-        receipts.append(receipt['status'])
+    try:
+        for settings, expected in ((config, 'activated'), (dict(config, public_url=public_url), 'activated'),
+                                   (dict(config, public_url=public_url), 'already_active')):
+            result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/deploy-activate.py'), '--config', '-',
+                                     '--image', fixture, '--tag', info['tag'], '--source-sha', info['source_sha'],
+                                     '--version', info['version']],
+                                    input=json.dumps(settings), capture_output=True, text=True)
+            release.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
+            receipt = json.loads(result.stdout)
+            release.require(receipt['status'] == expected and receipt['image'] == fixture, 'rehearsal receipt differs')
+            receipts.append(receipt['status'])
+    finally:
+        subprocess.run(['docker', 'compose', '--project-name', 'vibeface-rehearsal', 'down'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {'service': 'node', 'tag': info['tag'], 'rehearsal': receipts}
 
 
