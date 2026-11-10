@@ -3059,7 +3059,7 @@ pub(super) mod tests {
         config::Config,
         crypto::LocalIdentity,
         identity::Member,
-        model::{ResolvedModel, Role},
+        model::{ResolvedModel, Role, VersionVector},
     };
     use std::{collections::BTreeMap, sync::atomic::Ordering};
     use vibeface_bridge::failure::FailureKind;

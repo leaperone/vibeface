@@ -3,8 +3,9 @@
 //! Both ends prove their device key inside the Noise handshake. Membership is read again for
 //! every request, so a device that joins mid-session gains access and a revoked one loses it.
 
+#[cfg(test)]
+use crate::crypto::LocalIdentity;
 use crate::{
-    crypto::LocalIdentity,
     identity::{
         AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, LAST_MANAGER, Member,
         NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
