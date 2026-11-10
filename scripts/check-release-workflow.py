@@ -287,6 +287,9 @@ def check_deployment(source):
     require(len(activate) == 2 and re.search(r'^        if: inputs\.apply$', activate[1], re.M),
             'production activation must be disabled for validation runs')
     require("|| 'vibeface-validation'" in source, 'validation must not use a production environment')
+    rehearsal = source.split('      - name: Rehearse the Core activation on this runner', 1)
+    require(len(rehearsal) == 2 and rehearsal[1].index('deploy-run.py rehearse') < rehearsal[1].index('deploy-run.py activate'),
+            'the Core activation must be rehearsed before the host activation')
 
 
 def main():
@@ -303,7 +306,8 @@ def main():
     check_deployment(deployment)
     if args.self_test:
         for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
-                          deployment.replace('if: inputs.apply', 'if: always()')):
+                          deployment.replace('if: inputs.apply', 'if: always()'),
+                          deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test')):
             try:
                 check_deployment(candidate)
             except ValueError:
