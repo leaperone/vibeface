@@ -8,7 +8,7 @@ export const root = path.dirname(fileURLToPath(import.meta.url));
 const dependencyRoot = path.resolve(root, '../../.artifacts/vdp/contracts');
 export const artifacts = process.env.DELIVERY_CONTRACT_ARTIFACTS || dependencyRoot;
 export const requireDependency = createRequire(path.join(dependencyRoot, 'package.json'));
-export const abiFile = process.env.DELIVERY_ABI_FILE || path.resolve(root, '../../crates/delivery/abi/Statement.sol');
+export const abiFile = path.resolve(root, '../../crates/delivery/abi/Statement.sol');
 export const schema = fs.readFileSync(abiFile, 'utf8');
 const solc = requireDependency('solc');
 

@@ -1665,7 +1665,10 @@ pub(crate) async fn bounded_line(
 
 #[cfg(test)]
 mod credential_tests {
-    use super::{credential_value, redact_progress, redact_stream_progress};
+    use super::{
+        CursorCatalog, CursorModel, credential_value, cursor_models, redact_progress,
+        redact_stream_progress,
+    };
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1807,5 +1810,29 @@ mod credential_tests {
         assert!(!credential_value("HOME", "/Users/me/project"));
         assert!(!credential_value("API_BASE", "http://host:8080/path"));
         assert!(!credential_value("ORIGIN", "user@example.com"));
+    }
+
+    #[test]
+    fn cursor_catalog_rejects_only_echoed_credentials() {
+        let env = BTreeMap::from([
+            ("DEBUG".to_owned(), "1".to_owned()),
+            ("CURSOR_API_KEY".to_owned(), "k!secret1".to_owned()),
+        ]);
+        let catalog = |name: &str| {
+            cursor_models(
+                &json!({"models": {"availableModels": [{"modelId": "gpt-5.1", "name": name}]}}),
+                &env,
+            )
+        };
+        assert_eq!(
+            catalog("GPT 5.1"),
+            CursorCatalog::Available {
+                models: vec![CursorModel {
+                    id: "gpt-5.1".into(),
+                    display_name: "GPT 5.1".into(),
+                }],
+            }
+        );
+        assert_eq!(catalog("GPT k!secret1"), CursorCatalog::Unavailable);
     }
 }

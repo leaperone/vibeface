@@ -116,7 +116,8 @@ impl ServiceStore {
             admissions: (std::time::Instant::now(), 0),
         })
     }
-    pub fn root(&self) -> &Path {
+    #[cfg(test)]
+    pub(super) fn root(&self) -> &Path {
         &self.root
     }
     pub fn check_limits(&self, capacity: u64, max_orders: u32) -> Result<()> {
@@ -1096,7 +1097,8 @@ impl ServiceStore {
         )?;
         Ok(last.is_none_or(|last| last < nonce))
     }
-    pub fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
+    #[cfg(test)]
+    pub(super) fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
         let mut query = self
             .db
             .prepare("SELECT id FROM transactions ORDER BY rowid DESC LIMIT 128")?;
