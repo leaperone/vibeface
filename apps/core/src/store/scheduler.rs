@@ -5690,11 +5690,11 @@ mod hold_query_tests {
         let key = job.session_key();
         let session = load_scoped_session(connection, &key)?;
         let fixed_assignment =
-            super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
+            crate::store::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
         for earlier in queued_jobs(connection, &job.conversation_id)? {
             if earlier.scope == job.scope
                 && earlier.sequence < job.sequence
-                && let Some(input) = super::workspace::queued_workspace_input_from(
+                && let Some(input) = crate::store::workspace::queued_workspace_input_from(
                     connection,
                     network,
                     &earlier.reply_to,
@@ -5705,7 +5705,7 @@ mod hold_query_tests {
                 && input.input.report_results != Some(false)
             {
                 if let Some(assignment) = &fixed_assignment
-                    && !super::workspace::workspace_assignment_for_job_from(
+                    && !crate::store::workspace::workspace_assignment_for_job_from(
                         connection, network, local, &earlier,
                     )?
                     .is_some_and(|earlier| earlier.assignment_id == assignment.assignment_id)
@@ -5716,12 +5716,12 @@ mod hold_query_tests {
             }
         }
         if let SessionScope::WorkspaceTask { task_id } = &job.scope {
-            if !super::workspace::task_execution_allowed_from(connection, network, task_id)? {
+            if !crate::store::workspace::task_execution_allowed_from(connection, network, task_id)? {
                 return Ok(Some(QueueHoldReason::PendingCheck));
             }
             let Some(assignment) = fixed_assignment else {
                 return Ok(Some(
-                    if super::workspace::workspace_input_resources_blocked_from(
+                    if crate::store::workspace::workspace_input_resources_blocked_from(
                         connection, network, local, job,
                     )? {
                         QueueHoldReason::ResourceConflict
@@ -5730,20 +5730,20 @@ mod hold_query_tests {
                     },
                 ));
             };
-            if super::workspace::workspace_task_from(connection, network, task_id)?
+            if crate::store::workspace::workspace_task_from(connection, network, task_id)?
                 .and_then(|task| task.current_assignment)
                 .as_deref()
                 != Some(assignment.assignment_id.as_str())
             {
                 return Ok(Some(QueueHoldReason::PendingCheck));
             }
-            if !super::workspace::assignment_resources_available_from(connection, network, &assignment)?
+            if !crate::store::workspace::assignment_resources_available_from(connection, network, &assignment)?
             {
                 return Ok(Some(QueueHoldReason::ResourceConflict));
             }
         }
         if let Some(input) =
-            super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
+            crate::store::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
         {
             if input.deferred || input.cancelled {
                 return Ok(Some(QueueHoldReason::SteeringSettlement));
@@ -5764,14 +5764,14 @@ mod hold_query_tests {
                 }
             }
             if let SessionScope::WorkspaceTask { .. } = &job.scope {
-                let resolved = super::workspace::resolve_input_target_from(
+                let resolved = crate::store::workspace::resolve_input_target_from(
                     connection,
                     network,
                     &input.input.route.target,
                 )?;
                 if let Some(id) = resolved.assignment_id
                     && let Some(assignment) =
-                        super::workspace::workspace_assignment_from(connection, network, &id)?
+                        crate::store::workspace::workspace_assignment_from(connection, network, &id)?
                     && input.input.route.expected_revision != Some(assignment.started_revision)
                     && input.input.route.expected_revision != assignment.adopted_revision
                 {

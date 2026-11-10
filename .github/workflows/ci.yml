@@ -1241,23 +1241,34 @@ jobs:
             options=()
             if [[ "$package" == vibeface-desktop ]]; then options+=(--features native-ui-tests); fi
             printf '\nChecking %s\n' "$package" | tee -a .artifacts/native-prepare/compiler.log
-            if ! cargo check --all-targets -p "$package" "${options[@]}" 2>&1 | tee -a .artifacts/native-prepare/compiler.log; then
+            if cargo check --all-targets -p "$package" "${options[@]}" 2>&1 | tee -a .artifacts/native-prepare/compiler.log; then
+              printf '%s=success\n' "$package" >> "$GITHUB_OUTPUT"
+            else
+              printf '%s=failure\n' "$package" >> "$GITHUB_OUTPUT"
               result=1
             fi
           done
           exit "$result"
       - name: Run controlled native and runtime tests
         id: native-tests
-        if: ${{ always() && steps.compile.outcome == 'success' && inputs.native_tests }}
+        if: ${{ always() && steps.lockfile.outcome == 'success' && inputs.native_tests }}
+        env:
+          CLIENT_COMPILE: ${{ steps.compile.outputs.vibeface-client }}
+          CORE_COMPILE: ${{ steps.compile.outputs.vibeface-core }}
+          DESKTOP_COMPILE: ${{ steps.compile.outputs.vibeface-desktop }}
         run: |
           result=0
           for package in vibeface-protocol vibeface-bridge vibeface-client; do
+            if [[ "$package" == vibeface-client && "$CLIENT_COMPILE" != success ]]; then continue; fi
             if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
           for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
+            if [[ "$CORE_COMPILE" != success ]]; then break; fi
             if ! cargo test --locked -p vibeface-core --lib "$filter" -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
-          if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --no-fail-fast -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          if [[ "$DESKTOP_COMPILE" == success ]]; then
+            if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --no-fail-fast -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          fi
           exit "$result"
       - name: Record exact preparation outcomes even when the compiler rejects the source
         if: always()
