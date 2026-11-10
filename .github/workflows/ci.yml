@@ -1229,6 +1229,7 @@ jobs:
         run: cargo fmt --all 2>&1 | tee .artifacts/native-prepare/rustfmt.log
       - name: Compile all native callers and test targets
         id: compile
+        if: ${{ always() && steps.lockfile.outcome == 'success' }}
         run: |
           result=0
           for package in vibeface-client vibeface-core vibeface vibeface-desktop; do

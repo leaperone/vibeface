@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 // runtime/chat_controls.rs::work_detail and runtime/workspace.rs::workspace_history.
 // They are not serialized from the native DTOs under test. Core omits attestation on
 // ordinary Node records and includes it on human inputs; both cases must parse.
-const WORK: &str = r#"{
+const WORK: &str = r###"{
   "work": {
     "work_id":"work-1","conversation_id":"chat-a","target_node":"node-a",
     "trigger":"input:message-1","dispatcher":"node-b","kind":"codex",
@@ -22,8 +22,8 @@ const WORK: &str = r#"{
     "source_events":["event-dispatched","event-finished"]
   },
   "coverage":{"source":"shared_history","complete":false}
-}"#;
-const HISTORY: &str = r#"{
+}"###;
+const HISTORY: &str = r###"{
   "events":[
     {"event_hash":"event-input","created_at_ms":1,"scope_id":"chat-a","kind":"input_posted",
       "speaker":{"kind":"human","device_id":"client-a"},
@@ -49,7 +49,7 @@ const HISTORY: &str = r#"{
       "body":{"type":"work_finished","work_id":"work-1","outcome":"completed","result_text":"受控结果。"}}
   ],
   "coverage":{"limit":100,"truncated":true,"scope":"channel"}
-}"#;
+}"###;
 
 fn bindings() -> HistoryBindings {
     HistoryBindings {

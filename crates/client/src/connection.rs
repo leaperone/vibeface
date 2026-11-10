@@ -100,7 +100,7 @@ impl Connection {
         let value: Value = serde_json::from_slice(&bytes)?;
         let id = value["id"].as_str().context("request ID missing")?.to_owned();
         let (reply, response) = oneshot::channel();
-        tokio::time::timeout(TIMEOUT,self.requests.send(Request { id, bytes, reply, before_write })).await.context("request queue did not admit the operation")?.context("connection closed before request admission")?;
+        tokio::time::timeout(TIMEOUT,self.requests.send(Request { id, bytes, reply, before_write })).await.context("request queue did not admit the operation")?.map_err(|_|anyhow::anyhow!("connection closed before request admission"))?;
         response.await.context("connection closed; outcome unknown")?
     }
 }
@@ -122,6 +122,7 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
                     if let Some(before_write)=request.before_write.take() {
                         if let Err(error)=before_write().await {let _=request.reply.send(Err(error));continue;}
                     }
+                    ensure!(!*shutdown.borrow(),"connection closed before write");
                     let records = channel.seal_message(&request.bytes)?;
                     pending.insert(request.id, Pending { reply: request.reply, deadline: tokio::time::Instant::now() + TIMEOUT });
                     for record in records { tokio::time::timeout(Duration::from_secs(10), writer.send(record)).await.context("write timed out; outcome unknown")??; }
@@ -276,5 +277,51 @@ pub(crate) mod tests {
         let server_task=tokio::spawn(async move {server(listener,&node).await});
         assert!(Connection::open(&origin,&client,&wrong).await.is_err());
         server_task.abort();Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use super::tests::{receive,send,server};
+    use std::sync::atomic::{AtomicUsize,Ordering};
+
+    #[tokio::test]
+    async fn cancellation_while_the_bounded_queue_is_full_does_not_start_a_write()->Result<()> {
+        let (requests,mut queue)=mpsc::channel(1);
+        let (pushes,_)=broadcast::channel(1);
+        let (shutdown,_)=watch::channel(false);
+        let connection=Connection {requests:requests.clone(),pushes,shutdown};
+        let (reply,_)=oneshot::channel();
+        requests.send(Request {id:"occupied".into(),bytes:vec![],reply,before_write:None}).await.map_err(|_|anyhow::anyhow!("fixture queue closed"))?;
+        let starts=Arc::new(AtomicUsize::new(0));let observed=starts.clone();
+        let (ready,waiting)=oneshot::channel();
+        let task=tokio::spawn(async move {
+            let _=ready.send(());
+            connection.call_staged(serde_json::to_vec(&json!({"id":"not-admitted","method":"rpc","params":{}}))?,Box::new(move||Box::pin(async move {observed.fetch_add(1,Ordering::SeqCst);Ok(())}))).await
+        });
+        waiting.await?;tokio::task::yield_now().await;
+        task.abort();let _=task.await;
+        assert_eq!(queue.recv().await.context("occupied queue entry")?.id,"occupied");
+        assert!(queue.try_recv().is_err(),"cancelled unsent call never entered the queue");
+        assert_eq!(starts.load(Ordering::SeqCst),0);Ok(())
+    }
+    #[tokio::test]
+    async fn refused_before_write_keeps_the_noise_stream_usable_without_sending_the_operation()->Result<()> {
+        let node=Identity::generate()?;let client=Identity::generate()?;let target=node.device_id();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin=format!("http://{}",listener.local_addr()?);
+        let task=tokio::spawn(async move {
+            let (mut socket,mut channel)=server(listener,&node).await?;
+            let request=receive(&mut socket,&mut channel).await?;
+            assert_eq!(request["method"],"read-after-blocked-write");
+            send(&mut socket,&mut channel,json!({"id":request["id"],"result":{"read":true}})).await?;
+            Ok::<_,anyhow::Error>(())
+        });
+        let connection=Connection::open(&origin,&client,&target).await?;
+        let denied=connection.call_staged(serde_json::to_vec(&json!({"id":"blocked","method":"must-not-send","params":{}}))?,Box::new(||Box::pin(async {anyhow::bail!("earlier outcome is unknown")}))).await;
+        assert!(denied.unwrap_err().to_string().contains("earlier outcome is unknown"));
+        assert_eq!(connection.call("read-after-blocked-write",json!({})).await?,json!({"read":true}));
+        task.await??;Ok(())
     }
 }
