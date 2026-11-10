@@ -1,6 +1,6 @@
 {
   "issuer": "eb963306d731fa49648858f7a5489bd45aa1b96be18adb30e9909b9f8dd4b2dc",
-  "udp_host": "8.217.72.118",
+  "udp_host": "84.54.3.78",
   "udp_port": 4792,
   "gateway_url": "https://node.vibeface.dev:4792",
   "relay_url": "http://node.vibeface.dev:3340"

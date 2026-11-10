@@ -47,7 +47,7 @@ python3 scripts/deploy-activate.py --config /run/private/deploy.json \
 
 通用字段是 `project`、`role`、`deploy_dir`、`listen`。静态角色的 `listen` 是宿主回环端口；`node` 的 `listen` 是 `0.0.0.0:<端口>`，网页接口的 TCP 端口直接对公网只讲 TLS，前面没有代理，同号 UDP 端口是 iroh 端口，其他 Node 经它加入全网。可选 `public_url` 为 HTTPS origin，对 Core 校验现有配置中的相同值。`nginx_config` 应指向真实配置文件，例如 `/etc/nginx/conf.d/app.conf`；`server_name` 例如 `app.example.invalid`。脚本拒绝路径中的符号链接。Nginx 配置需有唯一匹配的 TLS server 和 `location /`。App 的已知静态 location 会切到容器，旧 App 的服务器级 CSP、缓存和版本头会移除。网页直接从浏览器连接公共节点的 `gateway_url`，App 主机不反代任何接口：其余非静态 location（包括 `/api/client`、`/api/info`、`/api/decision`）只能是 `return 404`，旧的反代规则、`/api/relay/grant`、`/bootstrap/` 和 relay 路由须先手动删除或改成 `return 404`，未知规则会拒绝激活。
 
-公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.mesh.enabled` 开启；`relay_listen` 和 `relay_url` 已设、`relay_open` 开启且没有 `relay_operator_token`，`relay_rate` 不超过 16384、`relay_max_clients` 不超过 128、`relay_max_clients_per_ip` 不超过 8；`forwarding.any` 开启，设了 `forwarding.rate` 和 `forwarding.per_ip`，没有 `forwarding.trusted_proxies`（浏览器直连，限额按真实对端地址计）；网页和 `tls` 开启，`tls_dir` 的证书和私钥以只读方式挂到数据目录的 `tls-cert.pem` 和 `tls-key.pem` 上、属主是 root，`public_url` 等于镜像里 `public-bootstrap.json` 的 `gateway_url`，`allowed_origins` 包含 `https://app.vibeface.dev`；没有 `manager` 和项目根目录；设备编号等于镜像里 `public-bootstrap.json` 的 `issuer`。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 16 KiB/s、最多 128 个连接、同一地址最多 8 个，同时转发 32 个浏览器会话、另有 192 个排队、同一浏览器地址最多 8 个连接、每会话 256 KiB/s。香港主机总上行约 3 Mbit/s，主机上的 `vibeface-relay-shape.service` 用 `tc` 把 relay 端口 3340 的出口限在 500 kbit/s，即总带宽的六分之一。浏览器接入端口本身最多接 1024 个连接，同一地址（IPv4 地址或 IPv6 /56，与 relay 相同）最多 32 个，超出的连接不读直接关闭；TLS 握手 10 秒内未完成、请求头 20 秒内未读完（包括两个请求之间的空闲）的连接被关闭，升级成 WebSocket 后不受这个超时影响。这些值写在 Core 里，不随配置变化。数据目录在首次激活前按下面初始化：
+公共节点对任何设备开放，guard 只接受各项都有上限的配置：`network.mesh.enabled` 开启；`relay_listen` 和 `relay_url` 已设、`relay_open` 开启且没有 `relay_operator_token`，`relay_rate` 不超过 16384、`relay_max_clients` 不超过 128、`relay_max_clients_per_ip` 不超过 8；`forwarding.any` 开启，设了 `forwarding.rate` 和 `forwarding.per_ip`，没有 `forwarding.trusted_proxies`（浏览器直连，限额按真实对端地址计）；网页和 `tls` 开启，`tls_dir` 的证书和私钥以只读方式挂到数据目录的 `tls-cert.pem` 和 `tls-key.pem` 上、属主是 root，`public_url` 等于镜像里 `public-bootstrap.json` 的 `gateway_url`，`allowed_origins` 包含 `https://app.vibeface.dev`；没有 `manager` 和项目根目录；设备编号等于镜像里 `public-bootstrap.json` 的 `issuer`。不符合时停止激活。官方取值只够正常使用：每个 relay 连接上行 16 KiB/s、最多 128 个连接、同一地址最多 8 个，同时转发 32 个浏览器会话、另有 192 个排队、同一浏览器地址最多 8 个连接、每会话 256 KiB/s。这些是应用内的连接和速率限制。若宿主机还需限制 relay 总出口，应单独约束 TCP 3340，不覆盖其他服务使用的根队列规则。浏览器接入端口本身最多接 1024 个连接，同一地址（IPv4 地址或 IPv6 /56，与 relay 相同）最多 32 个，超出的连接不读直接关闭；TLS 握手 10 秒内未完成、请求头 20 秒内未读完（包括两个请求之间的空闲）的连接被关闭，升级成 WebSocket 后不受这个超时影响。这些值写在 Core 里，不随配置变化。数据目录在首次激活前按下面初始化：
 
 ```sh
 vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --tls \
@@ -56,16 +56,20 @@ vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --t
   --relay-open --relay-rate 16384 --relay-max-clients 128 --relay-max-clients-per-ip 8 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
-vibeface config set --data-dir /opt/apps/vibeface-node/state mesh.advertise '["8.217.72.118:4792"]'
+vibeface config set --data-dir /opt/apps/vibeface-node/state mesh.advertise '["84.54.3.78:4792"]'
 touch /opt/apps/vibeface-node/state/node.lock
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
+
+迁移已有节点时不要运行 `init`。先停止旧容器并关闭其自动重启，再复制完整数据目录、外部 TLS 文件与已验证镜像；保留设备身份，只修改目标主机的 `network.mesh.advertise`。新旧主机不能同时运行同一身份。回滚前先停目标节点，将其最新一致状态回迁，再启动旧节点。
 
 容器里看不到宿主公网 IP，`mesh.advertise`（即 `network.mesh.advertise`）写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。镜像里只有 `vibeface-core`，没有 `vibeface` CLI，所以已部署的节点在容器里用 `python3` 读出 `/data/config.json`，加上 `network.mesh.advertise`，写临时文件后原子替换，保留原权限，再重启容器。先升级到认识这个字段的版本，再改配置；旧版读到未知字段会拒绝启动。
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 
-`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `8.217.72.118` 和上面的端口，`relay_url` 必须与上面的 `--relay-url` 相同，Core 用这四项生成默认 bootstrap 节点，每台默认入网的 Node 都把这个 relay 固定留在 relay 列表里；guard 只核对 `public_url` 等于 `gateway_url` 和设备编号等于 `issuer`，不核对 `relay_url` 和 UDP 地址，改动时两处一起改。`gateway_url` 是上面的 `public_url`，也是官方页面和 App 默认的接入地址。网页入口开启、`forwarding.any` 打开且 `public_url` 是公网 HTTPS 时 Node 宣告 `gateway` 角色；开放 relay 经邻居从外部探测通过后才宣告 `relay` 角色。`node.vibeface.dev` 只有一条指向 `8.217.72.118` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和全网 UDP 都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
+`config/public-bootstrap.json` 的 `issuer` 必须是该数据目录的设备编号，`udp_host`、`udp_port` 是公共节点的公网 IP `84.54.3.78` 和上面的端口，`relay_url` 必须与上面的 `--relay-url` 相同，Core 用这四项生成默认 bootstrap 节点，每台默认入网的 Node 都把这个 relay 固定留在 relay 列表里；guard 只核对 `public_url` 等于 `gateway_url` 和设备编号等于 `issuer`，不核对 `relay_url` 和 UDP 地址，改动时两处一起改。`gateway_url` 是上面的 `public_url`，也是官方页面和 App 默认的接入地址。网页入口开启、`forwarding.any` 打开且 `public_url` 是公网 HTTPS 时 Node 宣告 `gateway` 角色；开放 relay 经邻居从外部探测通过后才宣告 `relay` 角色。`node.vibeface.dev` 只有一条指向 `84.54.3.78` 的 DNS-only A 记录（不开 Cloudflare 代理），浏览器、relay 和全网 UDP 都直连这台主机；`issuer` 还是占位时 guard 拒绝激活。`init` 打印的设备编号同时写进 node 配置的 `device_id`。
+
+修改 `config/public-bootstrap.json` 只会改变之后构建的 Core 默认引导地址，不会改写已安装的客户端。旧客户端仍会携带旧 UDP 地址和同一个域名 relay 提示；切换时要分别验证目标 UDP 直连、域名 relay 重连，以及已配对客户端的实际连接。
 
 `init --tls` 写的是自签占位证书，浏览器不信任它；部署后它只是挂载点，容器里看到的是 `tls_dir` 的文件。真实证书由宿主 root 的 acme.sh 向 Let's Encrypt 申请，写进 root 所有的 `tls_dir`，不碰 1001 可写的数据目录，因此不会被数据目录里的符号链接引到别处。HTTP-01 验证走宿主 TCP 80 上指向 `/var/www/acme` 的 webroot。先建好目录和两个文件，属主和权限此后保持不变：
 
