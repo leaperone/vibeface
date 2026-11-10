@@ -43,7 +43,6 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
   const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
   let pending: { resolve(value: Record<string, unknown>): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | null = null;
   const wait = () => new Promise<Record<string, unknown>>((resolveValue, reject) => {
-    assert(!pending, 'Native fixture accepts one operation at a time');
     const timer = setTimeout(() => { pending = null; reject(new Error('Native fixture operation timed out')); }, 45000);
     pending = { resolve: resolveValue, reject, timer };
   });
@@ -72,6 +71,7 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
     } catch { current.reject(new Error('Native fixture returned an invalid response')); }
   });
   const call = async (request: Record<string, unknown>) => {
+    assert(!pending, 'Native fixture accepts one operation at a time');
     const result = wait();
     child.stdin.write(`${JSON.stringify(request)}\n`);
     return result;
