@@ -181,7 +181,7 @@ cp -R .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibefac
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
 VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
 VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
-VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
+VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
 AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
 AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
 pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a charity file'
@@ -202,11 +202,9 @@ VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.j
 pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts:123 --retries 0 --video off
 ```
 
-`VIBEFACE_E2E_BINARY` 同目录下还必须有 `vibeface-core`，先运行 `cargo build -p vibeface -p vibeface-core --locked`。
+`VIBEFACE_E2E_BINARY` 同目录下还必须有 `vibeface-core`，先运行 `cargo build -p vibeface -p vibeface-core --locked`。`VIBEFACE_E2E_CRYPTO_MODULE` 指向的 WASM 由 `scripts/build-web-crypto.sh` 和 `scripts/build-web.sh` 生成。
 
-用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
-
-这个用例目前在 iOS 27.2 模拟器上走不完：键盘没有收起键，`dismissKeyboard` 失败；返回按钮的名称读成 `Back`；消息列表外层容器合并了子节点名称，滚动可见性断言会命中它。最近一次完整通过是在 iOS 26.5 上。
+用例核对已安装 App 与构建文件，以 `vibeface://join/` 链接打开邀请，经安全码和管理授权加入，确认加入页不留返回按钮，从深层页面再次打开同网络链接也只回到首页，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消、下滑关闭目标面板及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
 
 ## 验证原生 Provider 设置和队列取消
 
