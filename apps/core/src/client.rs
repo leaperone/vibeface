@@ -2255,6 +2255,16 @@ mod tests {
     use crate::identity::{Genesis, Member, Revocation};
     use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
 
+    fn test_session(device_id: String) -> Session {
+        Session {
+            device_id,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+            operator: false,
+        }
+    }
+
     /// A ticket entry known only by device ID, found on the mesh or through relays.
     fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
         vibeface_secure::link::NodeLink::new(device_id, vec![], None).unwrap()
@@ -2909,16 +2919,7 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state.clone()).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         assert_eq!(
             dispatch(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
             false
@@ -2953,7 +2954,7 @@ mod tests {
             &network,
             &local.device_id()?,
         )?;
-        let mut local_session = session(&local)?;
+        let mut local_session = test_session(local.device_id()?);
         local_session.cookie = Some(cookie);
         assert_eq!(
             dispatch(&node, &mut local_session, "authenticate", json!({})).await?["principal"]["source"],
@@ -2964,7 +2965,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager, "delivery", change).await?["enabled"],
             true
@@ -3037,25 +3038,16 @@ mod tests {
             Member::client(&member, "browser", false)?,
         )?)?;
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         let record =
             json!({"level":"error","event":"web.uncaught","message":"TypeError: x is undefined"});
-        let mut stranger = session(&LocalIdentity::generate())?;
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(&node, &mut stranger, "log", json!({"records":[record]}))
                 .await
                 .is_err(),
             "a browser outside the network cannot write"
         );
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         let oversized =
             json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
         assert!(
@@ -3073,7 +3065,7 @@ mod tests {
                 .is_err(),
             "reading needs management"
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert!(
             dispatch(&node, &mut manager, "logs", json!({"level":"warn"})).await?["records"]
                 .is_array()
@@ -3117,17 +3109,8 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         for identity in [&client, &LocalIdentity::generate()] {
-            let mut unauthorized = session(identity)?;
+            let mut unauthorized = test_session(identity.device_id()?);
             assert!(
                 dispatch(&node, &mut unauthorized, "node_settings", json!({}))
                     .await
@@ -3144,7 +3127,7 @@ mod tests {
                 .is_err()
             );
         }
-        let mut manager_session = session(&admin)?;
+        let mut manager_session = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
             json!({"address":"http://127.0.0.1:4790","device_id":node.identity.device_id()?})
@@ -3393,15 +3376,6 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         let codex_key = "fixture-codex-secret-0123456789";
         let cursor_key = "fixture-cursor-secret-0123456789";
         let user_codex_home = dir.join("user-codex-home");
@@ -3413,7 +3387,7 @@ mod tests {
         )?;
         let set_codex = json!({"provider":"codex","connect_local":true,"bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
-        let mut member = session(&client)?;
+        let mut member = test_session(client.device_id()?);
         assert!(
             dispatch(&node, &mut member, "configure_provider", set_codex.clone())
                 .await
@@ -3421,7 +3395,7 @@ mod tests {
             "only the owner changes providers"
         );
 
-        let mut owner = session(&admin)?;
+        let mut owner = test_session(admin.device_id()?);
         let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
         let before_config = std::fs::read(dir.join("config.json"))?;
         let before_settings = serde_json::to_value(node.settings_snapshot())?;
@@ -3809,20 +3783,9 @@ mod tests {
             let cookie =
                 node.local_access
                     .exchange(&token, &node_id, &network, &browser.device_id()?)?;
-            let mut local = Session {
-                device_id: browser.device_id()?,
-                cookie: Some(cookie),
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
-            let mut remote_manager = Session {
-                device_id: admin.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
+            let mut local = test_session(browser.device_id()?);
+            local.cookie = Some(cookie);
+            let mut remote_manager = test_session(admin.device_id()?);
             assert!(
                 dispatch(&node, &mut local, "rejoin", json!({}))
                     .await
@@ -3879,13 +3842,7 @@ mod tests {
                 "link": format!("vibeface://join/{}", ticket.encode()?),
                 "name": "工作室 Mac",
             });
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
             assert_eq!(
                 status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
@@ -3995,13 +3952,7 @@ mod tests {
                 Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-operator: false,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let nonce = || -> Result<String> {
                 let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
                 Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
@@ -4191,11 +4142,8 @@ operator: false,
             assert_eq!(auth["principal"]["can_manage"], true);
             let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
             let browser_id = browser.device_id()?;
-            let mut local_session = Session {
-                device_id: browser_id.clone(), cookie: Some(cookie.into()),
-                subscribed: None, observation: None,
-operator: false,
-            };
+            let mut local_session = test_session(browser_id.clone());
+            local_session.cookie = Some(cookie.into());
             let save = node.config_save.lock().await;
             let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
             assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
@@ -4214,11 +4162,7 @@ operator: false,
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
             node.local_access.set_enabled(false)?;
-            let mut manager_session = Session {
-                device_id: manager.device_id()?, cookie: None,
-                subscribed: None, observation: None,
-operator: false,
-            };
+            let mut manager_session = test_session(manager.device_id()?);
             let save = node.config_save.lock().await;
             let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
             assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
@@ -4297,13 +4241,7 @@ operator: false,
         state.recover_at(checkpoint.clone(), now)?;
         node.install_membership(state.clone()).await?;
 
-        let mut session = Session {
-            device_id: manager.device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-            operator: false,
-        };
+        let mut session = test_session(manager.device_id()?);
         let view = state.project_at(now)?.clone();
         let event = GovernanceEvent::unsigned(
             &view,
@@ -4344,13 +4282,7 @@ operator: false,
             assert_eq!(node.membership_state().await?.events.len(), 0);
             assert_eq!(node.membership_state().await?.project()?.epoch, 1);
         }
-        let mut stranger = Session {
-            device_id: LocalIdentity::generate().device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-            operator: false,
-        };
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(
                 &node,
