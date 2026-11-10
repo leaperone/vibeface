@@ -104,8 +104,8 @@ fn discovery_preserves_default_identity_pending_operations_plans_and_leases_byte
     assert_eq!(paths.plan_dir, fixture.default_dir());
     assert_eq!(paths.outbox_dir, fixture.default_dir().join("outbox"));
     assert_eq!(paths.draft_dir, fixture.default_dir().join("input-drafts"));
-    assert_eq!(registry.credential_scope(registry.selected_id())?, format!(
-        "vibeface-native://{}", hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes()))));
+    let existing_base = format!("vibeface-native://{}", hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes())));
+    assert_eq!(registry.credential_scope_from_base(registry.selected_id(), &existing_base)?, existing_base);
     assert_bytes(&original)?;
     drop(registry);
     let reopened = fixture.open()?;
@@ -120,7 +120,8 @@ fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_se
     let original = fixture.seed_default()?;
     let mut registry = fixture.open()?;
     let default = registry.selected_id().clone();
-    let default_scope = registry.credential_scope(&default)?;
+    let default_scope = format!("vibeface-native://{}", hex::encode(Sha256::digest(fixture.root.to_string_lossy().as_bytes())));
+    assert_eq!(registry.credential_scope_from_base(&default, &default_scope)?, default_scope);
     let second = registry.create("另一个个人网络")?;
     assert_eq!(registry.selected_id(), &default, "creation must not silently switch identities");
     let paths = registry.paths(&second)?;
@@ -134,7 +135,7 @@ fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_se
     }
     let second_key = paths.client_dir.join("client.json");
     privatefs::create_durable(&second_key, b"synthetic independent sealed key")?;
-    let second_scope = registry.credential_scope(&second)?;
+    let second_scope = registry.credential_scope_from_base(&second, &default_scope)?;
     assert_eq!(second_scope, format!("{default_scope}/{}", second.as_str()));
     let original_spelling_scope = format!("vibeface-native://{}", "a".repeat(64));
     assert_eq!(registry.credential_scope_from_base(&default, &original_spelling_scope)?, original_spelling_scope);
@@ -152,8 +153,8 @@ fn explicit_create_select_switch_and_reopen_keep_both_profiles_and_credential_se
     drop(registry);
     let reopened = fixture.open()?;
     assert_eq!(reopened.selected_id(), &second);
-    assert_eq!(reopened.credential_scope(&second)?, second_scope);
-    assert_eq!(reopened.credential_scope(&default)?, default_scope);
+    assert_eq!(reopened.credential_scope_from_base(&second, &default_scope)?, second_scope);
+    assert_eq!(reopened.credential_scope_from_base(&default, &default_scope)?, default_scope);
     assert_eq!(std::fs::read(second_key)?, b"synthetic independent sealed key");
     assert_bytes(&original)?;
     fixture.assert_no_node()

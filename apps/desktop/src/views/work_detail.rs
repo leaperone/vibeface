@@ -26,7 +26,7 @@ impl Desktop {
         if !self.snapshot.online { page = page.child("当前显示缓存记录。连接中断期间的进度和停止结果尚未确认。"); }
         if self.snapshot.local_session { page = page.child("当前为本机管理会话。加入个人网络后才能发送签名输入。"); }
         page = page.child(self.row("执行设备", node.map(|n|format!("{} · {}{}", n.name, if !self.snapshot.online {"当前状态未确认"} else if n.online {"在线"} else {"离线"}, if n.revoked {" · 已撤销"} else {""})).unwrap_or_else(||format!("{} · 尚未读取设备状态", work.target_node))))
-            .child(self.row("Provider 与模型", format!("{:?} · {}", work.resolved.provider, work.resolved.model.as_deref().unwrap_or("接收时的设备默认模型"))))
+            .child(self.row("请求的模型", work.model.as_deref().unwrap_or("设备默认模型"))).child(self.row("接收时的 Provider 与模型", format!("{:?} · {}", work.resolved.provider, work.resolved.model.as_deref().unwrap_or("接收时的设备默认模型"))))
             .child(self.row("工作目录", work.cwd.clone()))
             .child(self.row("原始交代", "发送给执行设备的原文"))
             .child(self.record_text(&format!("work:{}:prompt", work.work_id), &work.prompt));
@@ -108,7 +108,7 @@ impl Desktop {
                 || (active && q.about.as_ref().is_some_and(|about|about.node==work.target_node&&Some(about.session_id.as_str())==work.thread_id.as_deref()&&about.request_id.as_deref().is_some_and(|id|!id.is_empty())))
         )) {
             let mut row = self.row("工作需要你回复", question.text.clone());
-            for choice in &question.choices { row = row.child(self.button(SharedString::from(format!("work-answer-{}-{}", question.question_id, choice.label)),choice.label.clone(),Command::Answer{conversation_id:conversation_id.clone(),question_id:question.question_id.clone(),text:choice.label.clone(),action:choice.action.clone()},cx).disabled(!self.snapshot.writable)); }
+            for choice in &question.choices { row = row.child(self.button(SharedString::from(format!("work-answer-{}-{}", question.question_id, choice.label)),choice.label.clone(),Command::Answer{conversation_id:conversation_id.clone(),question_id:question.question_id.clone(),text:choice.label.clone()},cx).disabled(!self.snapshot.writable)); }
             page = page.child(row.child(self.open_editor(SharedString::from(format!("work-answer-text-{}",question.question_id)),"输入回复",Editor::Answer(question.question_id.clone(),conversation_id.clone()),BTreeMap::new(),cx)));
         }
         page.child(self.record_artifact_preview(cx))

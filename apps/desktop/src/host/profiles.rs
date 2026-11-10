@@ -1,7 +1,6 @@
 //! Local identity locations. Display hints never grant network membership or authorize a Node.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::File,
@@ -160,13 +159,6 @@ impl ProfileRegistry {
         ensure!(self.data.profiles.iter().any(|profile| &profile.id == id), "个人网络档案不存在。");
         validate_locations(&self.root, &self.data)?;
         Ok(profile_paths(&self.root, id))
-    }
-
-    /// Canonical profile-directory service for a fresh installation. For an existing installation,
-    /// preserve main's original base service with credential_scope_from_base instead.
-    pub fn credential_scope(&self, id: &ProfileId) -> Result<String> {
-        let base = format!("vibeface-native://{}", hex::encode(Sha256::digest(self.root.to_string_lossy().as_bytes())));
-        self.credential_scope_from_base(id, &base)
     }
 
     /// Keeps the exact existing OS service name, including its original path spelling, for default.

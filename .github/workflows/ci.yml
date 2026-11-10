@@ -1270,6 +1270,13 @@ jobs:
           path: .artifacts/native-prepare/native-frames.log
           if-no-files-found: error
           retention-days: 7
+      - name: Prepare debugger for the requested controlled cold-start diagnosis
+        if: ${{ always() && inputs.native_frames && steps.compile.outputs.vibeface-desktop == 'success' }}
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends gdb
+          fi
       - name: Inspect the controlled native cold-start stack
         id: native-offline-diagnostic
         if: ${{ always() && inputs.native_frames && steps.compile.outputs.vibeface-desktop == 'success' }}

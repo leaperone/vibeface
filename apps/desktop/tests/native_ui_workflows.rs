@@ -32,7 +32,6 @@ struct Harness{
  commands:mpsc::Receiver<Command>,
  events:mpsc::Sender<Event>,
  _snapshots:watch::Sender<Arc<Snapshot>>,
- _stop:watch::Receiver<bool>,
 }
 fn fixture()->Snapshot{Snapshot{
  generation:7,online:true,synced:true,writable:true,can_save_locally:true,network:Some("network-fixture".into()),client_id:Some("client-fixture".into()),
@@ -41,10 +40,10 @@ fn fixture()->Snapshot{Snapshot{
 }}
 fn open(cx:&mut TestAppContext,route:Route,snapshot:Snapshot)->Harness{
  cx.update(gpui_kit::init);
- let(tx,commands)=mpsc::channel(32);let(events,event_rx)=mpsc::channel(32);let(snapshots,snapshot_rx)=watch::channel(Arc::new(snapshot.clone()));let(stop,stop_rx)=watch::channel(false);
- let(window,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,move|window,cx|cx.new(|cx|app::Desktop::new(tx,stop,event_rx,snapshot_rx,window,cx))).unwrap());
+ let(tx,commands)=mpsc::channel(32);let(events,event_rx)=mpsc::channel(32);let(snapshots,snapshot_rx)=watch::channel(Arc::new(snapshot.clone()));
+ let(window,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,move|window,cx|cx.new(|cx|app::Desktop::new(tx,event_rx,snapshot_rx,window,cx))).unwrap());
  view.update(cx,|view,cx|{view.snapshot=Arc::new(snapshot);view.route=route;view.selected=Some("chat-a".into());view.prepare_history_list();view.attachment_scope=Some("chat-a".into());cx.notify();});
- Harness{window,view,commands,events,_snapshots:snapshots,_stop:stop_rx}
+ Harness{window,view,commands,events,_snapshots:snapshots}
 }
 fn enter_message(h:&Harness,cx:&mut TestAppContext,text:&str){h.window.update(cx,|_,window,cx|h.view.update(cx,|view,cx|view.composer.update(cx,|input,cx|input.set_value(text.to_owned(),window,cx)))).unwrap();}
 fn click(h:&Harness,cx:&mut TestAppContext,id:&str){let id=id.to_owned();h.window.update(cx,|_,window,cx|{window.render_frame(cx);window.click(gpui_kit::SharedString::from(id),cx);}).unwrap();cx.run_until_parked();}
@@ -78,8 +77,8 @@ fn local_read_only_session_cannot_stage_chat(cx:&mut TestAppContext){
 }
 #[gpui_kit::test]
 fn inbox_choice_keeps_the_question_conversation(cx:&mut TestAppContext){
- let mut snapshot=fixture();snapshot.questions=vec![ui::Question{question_id:"question-b".into(),conversation_id:"chat-b".into(),text:"允许本次操作？".into(),choices:vec![ui::Choice{label:"仅允许一次".into(),action:Some("allow_once".into())}],..Default::default()}];
- let mut h=open(cx,Route::Inbox,snapshot);click(&h,cx,"q-question-b-仅允许一次");let(generation,command)=scoped(h.commands.try_recv().expect("answer command"));assert_eq!(generation,7);match command{Command::Answer{conversation_id,question_id,text,action}=>{assert_eq!(conversation_id,"chat-b");assert_eq!(question_id,"question-b");assert_eq!(text,"仅允许一次");assert_eq!(action.as_deref(),Some("allow_once"));},_=>panic!("wrong answer action")}
+ let mut snapshot=fixture();snapshot.questions=vec![ui::Question{question_id:"question-b".into(),conversation_id:"chat-b".into(),text:"允许本次操作？".into(),choices:vec![ui::Choice{label:"仅允许一次".into()}],..Default::default()}];
+ let mut h=open(cx,Route::Inbox,snapshot);click(&h,cx,"q-question-b-仅允许一次");let(generation,command)=scoped(h.commands.try_recv().expect("answer command"));assert_eq!(generation,7);match command{Command::Answer{conversation_id,question_id,text}=>{assert_eq!(conversation_id,"chat-b");assert_eq!(question_id,"question-b");assert_eq!(text,"仅允许一次");},_=>panic!("wrong answer action")}
 }
 
 #[gpui_kit::test]
@@ -157,4 +156,14 @@ fn native_non_message_history_preserves_record_identity_and_offset(cx:&mut TestA
 fn native_skill_history_reads_and_copies_the_complete_body(cx:&mut TestAppContext){
  let mut snapshot=fixture();snapshot.conversation=Arc::new(Conversation{bot_settings:ui::BotSettings{skills:vec![serde_json::from_value(serde_json::json!({"skill_id":"full-skill","name":"完整技能","description":"摘要","body":"# 完整指令\n\n保留正文，不以摘要代替。"})).unwrap()],..Default::default()},..(*snapshot.conversation).clone()});
  let h=open(cx,Route::History(vibeface_protocol::history::HistorySection::Skills),snapshot);click(&h,cx,"copy-skill-body-full-skill");let copied=cx.update(|cx|cx.read_from_clipboard().and_then(|item|item.text()));assert_eq!(copied.as_deref(),Some("# 完整指令\n\n保留正文，不以摘要代替。"));
+}
+
+#[gpui_kit::test]
+fn join_activation_keeps_the_existing_form_and_opens_only_one_invitation(cx:&mut TestAppContext){
+ let mut h=open(cx,Route::Home,fixture());h.window.update(cx,|_,window,cx|h.view.update(cx,|view,cx|{assert!(view.accept_join_activation("first-controlled-invitation".into(),window,cx));let original=view.form.as_ref().unwrap().submission_id.clone();assert!(!view.accept_join_activation("second-controlled-invitation".into(),window,cx));assert_eq!(view.form.as_ref().unwrap().submission_id,original);assert_eq!(view.form.as_ref().unwrap().values(cx).get("ticket").map(String::as_str),Some("first-controlled-invitation"));})).unwrap();assert!(h.commands.try_recv().is_err(),"opening an invitation only prefills its form");
+}
+
+#[gpui_kit::test]
+fn join_activation_waits_for_active_network_operations_and_user_confirmation(cx:&mut TestAppContext){
+ let h=open(cx,Route::Home,fixture());h.window.update(cx,|_,window,cx|h.view.update(cx,|view,cx|{view.snapshot=Arc::new(Snapshot{identity_busy:true,..(*view.snapshot).clone()});assert!(!view.accept_join_activation("controlled-invitation".into(),window,cx));assert!(view.form.is_none());view.snapshot=Arc::new(Snapshot{identity_busy:false,..(*view.snapshot).clone()});view.confirmation=Some(Command::SwitchProfile("profile-next".into()));assert!(!view.accept_join_activation("controlled-invitation".into(),window,cx));assert!(view.form.is_none());assert!(matches!(view.confirmation,Some(Command::SwitchProfile(_))));view.confirmation=None;assert!(view.accept_join_activation("controlled-invitation".into(),window,cx));})).unwrap();
 }

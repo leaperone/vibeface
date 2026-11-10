@@ -84,9 +84,6 @@ impl ActivationQueue {
     pub fn len(&self) -> usize {
         self.pending.len()
     }
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
 }
 
 pub enum InstanceClaim {
@@ -175,7 +172,7 @@ impl SingleInstance {
             _lock: lock,
         }))
     }
-    pub fn try_recv(&mut self) -> Option<Activation> {
+    fn receive_pending(&mut self) {
         while self.pending.len() < 32 {
             match self.receiver.try_recv() {
                 Ok(activation) => {
@@ -184,6 +181,17 @@ impl SingleInstance {
                 Err(_) => break,
             }
         }
+    }
+    /// Drain older IPC arrivals before admitting platform URL events into the same queue.
+    pub fn pending_capacity(&mut self) -> usize {
+        self.receive_pending();
+        32 - self.pending.len()
+    }
+    pub fn enqueue(&mut self, activation: Activation) -> bool {
+        self.pending.enqueue(activation)
+    }
+    pub fn try_recv(&mut self) -> Option<Activation> {
+        self.receive_pending();
         self.pending.pop()
     }
     pub fn defer(&mut self, activation: Activation) -> bool {

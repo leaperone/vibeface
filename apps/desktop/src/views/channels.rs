@@ -56,7 +56,7 @@ impl Desktop {
                 let mut row=self.row(speaker,format!("时间 {} · 事件 {}",event.created_at_ms,event.event_hash));
                 match &event.body {
                     HistoryBody::InputPosted{input}=>{
-                        row=row.child(self.record_text(&format!("history:{}:body",event.event_hash),&input.text)).child(format!("{:?} · 序号 {} · 修订 {}",input.intent,input.sequence,input.expected_revision.map(|v|v.to_string()).unwrap_or_else(||"未指定".into())));
+                        row=row.child(self.record_text(&format!("history:{}:body",event.event_hash),&input.text)).child(format!("{:?} · 序号 {} · 修订 {}",input.intent,input.sequence,input.expected_revision.map(|v|v.to_string()).unwrap_or_else(||"未指定".into()))).child(match input.report_results{Some(true)=>"要求报告结果",Some(false)=>"不要求报告结果",None=>"结果报告策略未提供"});
                         if let InputTarget::ChannelTask{task_id,bot_id,..}=&input.target {
                             if let Some(task)=tasks.iter().find(|task|task.task_id==*task_id&&task.owner_bot==*bot_id) {
                                 if let Some(bot)=self.snapshot.bots.iter().find(|bot|bot.bot_id==*bot_id&&bot.conversation_id==event.scope_id) {
@@ -70,8 +70,8 @@ impl Desktop {
                         if let Some(reply)=in_reply_to {row=row.child(format!("回复消息 {reply}"));}
                         if let Some(failure)=failure {row=row.child(format!("执行失败类型 {failure:?}"));}
                     }
-                    HistoryBody::WorkDispatched{work_id,title,prompt,resolved,cwd,..}=>{
-                        row=row.child(format!("接受工作 · {title}")).child(self.record_text(&format!("history:{}:body",event.event_hash),prompt)).child(format!("{:?} · {} · {cwd}",resolved.provider,resolved.model.as_deref().unwrap_or("设备默认模型"))).child(self.history_work_button(&event.scope_id,work_id,cx));
+                    HistoryBody::WorkDispatched{work_id,title,prompt,kind,model,resolved,cwd,..}=>{
+                        row=row.child(format!("接受工作 · {title}")).child(self.record_text(&format!("history:{}:body",event.event_hash),prompt)).child(format!("类型 {kind:?} · 请求模型 {} · 接收 {:?} / {} · {cwd}",model.as_deref().unwrap_or("设备默认模型"),resolved.provider,resolved.model.as_deref().unwrap_or("设备默认模型"))).child(self.history_work_button(&event.scope_id,work_id,cx));
                     }
                     HistoryBody::WorkProgress{work_id,phase,summary,thread_id,turn_id}=>{
                         row=row.child(format!("工作进度 · {phase:?}")).child(self.record_text(&format!("history:{}:body",event.event_hash),summary)).child(format!("线程 {} · 运行 {}",thread_id.as_deref().unwrap_or("未上报"),turn_id.as_deref().unwrap_or("未上报"))).child(self.history_work_button(&event.scope_id,work_id,cx));
@@ -107,7 +107,7 @@ impl Desktop {
         }else{page=page.child("尚未读取当前频道的历史；不会使用其他频道的缓存。");}
         for question in self.snapshot.questions.iter().filter(|q|q.answer.is_none()&&q.closed.is_none()&&match &q.target{Some(InputTarget::ChannelMember{channel_id:id,..}|InputTarget::ChannelTask{channel_id:id,..})=>id==channel_id,_=>false}){
             let mut row=self.row("频道任务需要你回复",question.text.clone());
-            for choice in &question.choices{row=row.child(self.button(SharedString::from(format!("channel-answer-{}-{}",question.question_id,choice.label)),choice.label.clone(),Command::Answer{conversation_id:question.conversation_id.clone(),question_id:question.question_id.clone(),text:choice.label.clone(),action:choice.action.clone()},cx).disabled(!self.snapshot.writable));}
+            for choice in &question.choices{row=row.child(self.button(SharedString::from(format!("channel-answer-{}-{}",question.question_id,choice.label)),choice.label.clone(),Command::Answer{conversation_id:question.conversation_id.clone(),question_id:question.question_id.clone(),text:choice.label.clone()},cx).disabled(!self.snapshot.writable));}
             page=page.child(row.child(self.open_editor(SharedString::from(format!("channel-answer-text-{}",question.question_id)),"输入回复",Editor::Answer(question.question_id.clone(),question.conversation_id.clone()),BTreeMap::new(),cx)));
         }
         for queued in self.snapshot.inputs.iter().filter(|queued|!queued.cancelled&&match &queued.input.route.target{InputTarget::ChannelMember{channel_id:id,..}|InputTarget::ChannelTask{channel_id:id,..}=>id==channel_id,_=>false}){

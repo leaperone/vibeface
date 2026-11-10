@@ -12,7 +12,7 @@ use host::{
     platform::NativeAction,
 };
 use sha2::Digest;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 struct Options {
     profile: PathBuf,
@@ -121,18 +121,25 @@ fn run() -> Result<()> {
     let shutdown = stop.clone();
     let finish_runtime = runtime.clone();
     let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(32);
+    let activation_overflow = Arc::new(AtomicBool::new(false));
     let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     let urls_tx = activation_tx.clone();
+    let urls_overflow = activation_overflow.clone();
     application.on_open_urls(move |urls| {
         for url in urls {
             if let Some(activation) = Activation::parse(&url) {
-                let _ = urls_tx.try_send(activation);
+                if urls_tx.try_send(activation).is_err() {
+                    urls_overflow.store(true, Ordering::Relaxed);
+                }
             }
         }
     });
+    let reopen_overflow = activation_overflow.clone();
     application.on_reopen(move |cx| {
         cx.activate(true);
-        let _ = activation_tx.try_send(Activation::Focus);
+        if activation_tx.try_send(Activation::Focus).is_err() {
+            reopen_overflow.store(true, Ordering::Relaxed);
+        }
     });
     application.run(move |cx| {
         gpui_kit::init(cx);
@@ -144,7 +151,7 @@ fn run() -> Result<()> {
             Err(error) => (None, Some(format!("系统托盘不可用：{error}"))),
         };
         let fixture = options.fixture && options.report.is_some();
-        let app_tx = tx.clone();let app_stop=stop.clone();let notifications=std::rc::Rc::new(std::cell::RefCell::new(host::platform::Notifications::default()));let app_notifications=notifications.clone();
+        let app_tx = tx.clone();let notifications=std::rc::Rc::new(std::cell::RefCell::new(host::platform::Notifications::default()));let app_notifications=notifications.clone();
         let (visible, view) = gpui_kit::open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(820.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some("Vibeface".into()), ..Default::default() }),
@@ -152,7 +159,7 @@ fn run() -> Result<()> {
         }, cx, move |window, cx| {
             window.on_window_should_close(cx, |_, cx| { cx.hide(); false });
             cx.new(|cx| {
-                let mut app = app::Desktop::new(app_tx, app_stop, events, snapshots, window, cx);
+                let mut app = app::Desktop::new(app_tx, events, snapshots, window, cx);
                 app.notifications=app_notifications;
                 app.notice_is_error=tray_error.is_some();app.notice = tray_error;
                 if fixture { app.configure_fixture(window, cx); }
@@ -177,17 +184,36 @@ fn run() -> Result<()> {
                 let mut actions = Vec::new();
                 while let Ok(action) = menu.try_recv() { actions.push(action); }
                 if let Some(tray) = tray.as_mut() { actions.extend(tray.poll()); }
-                let mut activations = Vec::new();
-                while let Some(activation) = instance.try_recv() { activations.push(activation); }
-                while let Ok(activation) = activation_rx.try_recv() { activations.push(activation); }
-                for activation in activations {
+                // Backpressure keeps accepted tail activations in their bounded source queue.
+                // All admitted IPC and platform activations share one ordered pending queue.
+                while instance.pending_capacity() > 0 {
+                    let Ok(activation) = activation_rx.try_recv() else { break; };
+                    if !instance.enqueue(activation) {
+                        activation_overflow.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if activation_overflow.swap(false, Ordering::Relaxed) {
+                    let _ = view.update(cx, |app, cx| {
+                        app.notice = Some("待处理的系统打开请求过多。请完成当前操作后重新打开邀请链接。".into());
+                        app.notice_is_error = true;
+                        cx.notify();
+                    });
+                }
+                // At most one invitation is offered each tick. A busy UI returns it to the
+                // front without draining or discarding any later accepted invitation.
+                if let Some(activation) = instance.try_recv() {
                     match activation {
                         Activation::Focus => actions.push(NativeAction::Focus),
                         Activation::Join { ticket } => {
-                            let _ = visible.update(cx, |_, window, cx| {
-                                view.update(cx, |app, cx| app.edit(views::forms::Editor::Join, std::collections::BTreeMap::from([("ticket", ticket)]), window, cx));
+                            let accepted = visible.update(cx, |_, window, cx| {
+                                let accepted = view.update(cx, |app, cx| app.accept_join_activation(ticket.clone(), window, cx));
                                 window.activate_window();
-                            });
+                                accepted
+                            }).unwrap_or(false);
+                            if !accepted && !instance.defer(Activation::Join { ticket }) {
+                                activation_overflow.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }

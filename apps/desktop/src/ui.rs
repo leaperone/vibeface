@@ -19,7 +19,7 @@ pub struct Work {#[serde(default)]pub source_events:Vec<String>,#[serde(default)
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct Question {#[serde(default)]pub about:Option<QuestionAbout>,#[serde(default)]pub target:Option<InputTarget>,#[serde(default)]pub closed:Option<String>,pub question_id:String,#[serde(default)]pub conversation_id:String,#[serde(default)]pub text:String,#[serde(default)]pub title:String,#[serde(default)]pub choices:Vec<Choice>,#[serde(default)]pub answer:Option<serde_json::Value>}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct Choice{pub label:String,#[serde(default)]pub action:Option<String>}
+pub struct Choice{pub label:String}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct Task {#[serde(default)]pub root_task_id:String,#[serde(default)]pub parent_task_id:Option<String>,#[serde(default)]pub source_events:Vec<String>,#[serde(default)]pub waiting_reason:Option<String>,#[serde(default)]pub current_assignment:Option<String>,#[serde(default)]pub channel_id:Option<String>,pub task_id:String,pub title:String,pub owner_bot:String,#[serde(default)]pub request:String,#[serde(default)]pub expected_result:String,#[serde(default)]pub dependencies:Vec<String>,pub revision:u64,#[serde(default)]pub state:String}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
@@ -59,7 +59,7 @@ pub struct Conversation {#[serde(default)]pub history_authority:String,#[serde(d
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct BotSettings{#[serde(default)]pub skills:Vec<Skill>,#[serde(default)]pub memory_sync_conflicts:MemorySyncConflicts,#[serde(default)]pub memory_staged_count:Option<u64>,#[serde(default)]pub memory_conflicts:Option<Vec<MemoryConflict>>,#[serde(default)]pub memory:Vec<Memory>,#[serde(default)]pub schedules:Vec<Schedule>}
 #[derive(Clone,Debug,Default)]
-pub struct Snapshot {pub profiles:Vec<crate::host::profiles::PersonalProfile>,pub profile_id:Option<String>,pub credential_scope:Option<String>,pub generation:u64,pub online:bool,pub synced:bool,pub private_block:Option<String>,pub projection_valid:bool,pub cached:bool,pub cached_at_ms:Option<u64>,pub cache_omitted:usize,pub writable:bool,pub can_save_locally:bool,pub can_control:bool,pub local_session:bool,pub write_state:String,pub network:Option<String>,pub client_id:Option<String>,pub can_manage:bool,pub can_configure:bool,pub can_configure_owner:bool,pub operator_unknown:Option<String>,pub operator_unknown_kind:Option<String>,pub operator_can_close:bool,pub operator_fields:Vec<String>,pub operator_secret_changes:bool,pub decision_tokens:Vec<DecisionTokenSummary>,pub bots:Vec<Bot>,pub nodes:Vec<Node>,pub members:Vec<Member>,pub joins:Vec<JoinRequest>,pub inputs:Vec<vibeface_protocol::workspace::QueuedInput>,pub tasks:Vec<Task>,pub assignments:Vec<vibeface_protocol::workspace::Assignment>,pub channels:Vec<Channel>,pub conversation:std::sync::Arc<Conversation>,pub work_detail:Option<std::sync::Arc<crate::views::records::WorkDetail>>,pub channel_history:Option<std::sync::Arc<crate::views::records::WorkspaceHistory>>,pub artifact_preview:Option<std::sync::Arc<crate::views::records::ArtifactPage>>,pub settings_review:Option<SettingsReviewView>,pub pending:Vec<Pending>,pub identity_plan:Option<IdentityPlanView>,pub drafts:Vec<NativeDraftSummary>,pub questions:Vec<Question>,pub notifications:Vec<Notification>,pub history_loading:Option<vibeface_protocol::history::HistorySection>,pub history_error:Option<String>,pub live:Vec<LiveProgress>,pub delivery:Delivery,pub status:String,pub error:Option<String>}
+pub struct Snapshot {pub identity_busy:bool,pub profiles:Vec<crate::host::profiles::PersonalProfile>,pub profile_id:Option<String>,pub credential_scope:Option<String>,pub generation:u64,pub online:bool,pub synced:bool,pub private_block:Option<String>,pub projection_valid:bool,pub cached:bool,pub cached_at_ms:Option<u64>,pub cache_omitted:usize,pub writable:bool,pub can_save_locally:bool,pub can_control:bool,pub local_session:bool,pub write_state:String,pub network:Option<String>,pub client_id:Option<String>,pub can_manage:bool,pub can_configure:bool,pub can_configure_owner:bool,pub operator_unknown:Option<String>,pub operator_unknown_kind:Option<String>,pub operator_can_close:bool,pub operator_fields:Vec<String>,pub operator_secret_changes:bool,pub decision_tokens:Vec<DecisionTokenSummary>,pub bots:Vec<Bot>,pub nodes:Vec<Node>,pub members:Vec<Member>,pub joins:Vec<JoinRequest>,pub inputs:Vec<vibeface_protocol::workspace::QueuedInput>,pub tasks:Vec<Task>,pub assignments:Vec<vibeface_protocol::workspace::Assignment>,pub channels:Vec<Channel>,pub conversation:std::sync::Arc<Conversation>,pub work_detail:Option<std::sync::Arc<crate::views::records::WorkDetail>>,pub channel_history:Option<std::sync::Arc<crate::views::records::WorkspaceHistory>>,pub artifact_preview:Option<std::sync::Arc<crate::views::records::ArtifactPage>>,pub settings_review:Option<SettingsReviewView>,pub pending:Vec<Pending>,pub identity_plan:Option<IdentityPlanView>,pub drafts:Vec<NativeDraftSummary>,pub questions:Vec<Question>,pub notifications:Vec<Notification>,pub history_loading:Option<vibeface_protocol::history::HistorySection>,pub history_error:Option<String>,pub live:Vec<LiveProgress>,pub delivery:Delivery,pub status:String,pub error:Option<String>}
 #[derive(Clone,Debug)]
 pub struct Pending{pub id:String,pub state:String,pub target_node:String}
 #[derive(Clone,Debug,Deserialize,Serialize)]
@@ -120,21 +120,6 @@ pub fn target_conversation(target:&InputTarget,shown:&Snapshot,current:Option<&s
 }
 
 #[derive(Clone,Debug)]pub struct NativeDraftSummary{pub fingerprint:String,pub text:String,pub conversation_id:String}
-#[derive(Clone,Debug,Default,Deserialize)]
-pub struct ConversationRecords{pub conversation_id:String,#[serde(default)]pub messages:Vec<Message>,#[serde(default)]pub works:Vec<Work>,#[serde(default)]pub questions:Vec<Question>,#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>,#[serde(default)]pub memory:Option<Vec<Memory>>,#[serde(default)]pub memory_sync_conflicts:Option<MemorySyncConflicts>,#[serde(default)]pub memory_staged_count:Option<u64>,#[serde(default)]pub memory_conflicts:Option<Vec<MemoryConflict>>}
-pub fn merge_records(shown:&Conversation,records:ConversationRecords)->anyhow::Result<Conversation>{
- let expected=shown.conversation.as_ref().ok_or_else(||anyhow::anyhow!("对话尚未首读"))?.conversation_id.as_str();
- anyhow::ensure!(records.conversation_id==expected&&records.scope_jobs.iter().all(|job|job.conversation_id==expected)&&records.questions.iter().all(|q|q.conversation_id==expected),"推送记录属于其他对话");
- for message in &records.messages{crate::views::records::validate_attachments(&message.attachments)?;}let mut next=shown.clone();
- for message in records.messages.into_iter().filter(|m|m.target.as_ref().is_none_or(|t|matches!(t,InputTarget::BotMain{..}))){if let Some(old)=next.messages.iter_mut().find(|old|old.message_id==message.message_id){*old=message}else{next.messages.push(message)}}
- next.messages.sort_by(|a,b|match(&a.rank,&b.rank){(Some(a),Some(b))=>a.cmp(b),(Some(_),None)=>std::cmp::Ordering::Less,(None,Some(_))=>std::cmp::Ordering::Greater,_=>std::cmp::Ordering::Equal});
- for work in records.works{if let Some(old)=next.works.iter_mut().find(|old|old.work_id==work.work_id){*old=work}else{next.works.push(work)}}
- next.scheduler.jobs=records.jobs.into_iter().filter(|job|matches!(job.scope,Scope::Main)).collect();next.scheduler.scope_jobs=records.scope_jobs;
- next.questions=records.questions.into_iter().filter(|q|matches!(q.target,Some(InputTarget::BotMain{..}))).collect();
- if let Some(memory)=records.memory{next.bot_settings.memory=memory;}if let Some(conflicts)=records.memory_sync_conflicts{next.bot_settings.memory_sync_conflicts=conflicts;}if let Some(count)=records.memory_staged_count{next.bot_settings.memory_staged_count=Some(count);}next.bot_settings.memory_conflicts=records.memory_conflicts;
- Ok(next)
-}
-
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct CoordinationCheck{pub check_id:String,pub conversation_id:String,pub trigger:String,pub attempt_id:String,pub detail:String}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct Notification{pub notification_id:String,pub kind:String,pub text:String,pub conversation_id:String,#[serde(default)]pub target:Option<InputTarget>}
 
@@ -170,7 +155,7 @@ pub fn can_read_transfer(order:&TransferOrder)->bool{order.mode=="charity"&&orde
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct LastMessage{pub text:String,pub role:String,pub created_at_ms:i64}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct MessageSender{pub name:String,pub conversation_id:String}
 
-#[derive(Clone,Debug)]pub struct SettingsReviewView{pub review:vibeface_client::SettingsReview,pub current:Vec<vibeface_client::SettingsField>,pub original_rows:Vec<(String,String)>,pub current_rows:Vec<(String,String)>,pub read_error:Option<String>}
+#[derive(Clone,Debug)]pub struct SettingsReviewView{pub review:vibeface_client::SettingsReview,pub current:Vec<vibeface_client::SettingsField>,pub original_rows:Vec<(String,String)>,pub read_error:Option<String>}
 
 impl Snapshot{pub fn can_stage_input(&self)->bool{self.can_save_locally&&(self.synced||self.cached||self.projection_valid)}}
 /// A remembered origin and Node are independent defaults. A typed Node must never be ignored.

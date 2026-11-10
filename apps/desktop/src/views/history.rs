@@ -1,6 +1,6 @@
 //! Conversation history boundary and merge state. UI rendering never parses wire JSON.
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use vibeface_protocol::history::{HistoryCoverage, HistoryPage, HistorySection, HISTORY_RESPONSE_BYTES};
@@ -23,11 +23,6 @@ pub struct HistoryRecord {
     pub rank: Option<String>,
     pub value: Value,
     revision: u64,
-}
-impl HistoryRecord {
-    pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_value(self.value.clone()).context("历史记录内容无效。")
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -187,6 +182,7 @@ impl HistoryState {
     }
     /// Retain valid loaded rows across a transport generation while fencing its old requests.
     pub fn scope(&self) -> &HistoryScope { &self.scope }
+    #[cfg(test)]
     pub fn authority(&self) -> Option<&str> { self.authority.as_deref() }
     pub fn section(&self, section: HistorySection) -> &SectionState {
         &self.sections.iter().find(|(candidate, _)| *candidate == section).expect("all protocol sections are initialized").1

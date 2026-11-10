@@ -133,7 +133,7 @@ async fn client_only_discovery_settings_and_forget_never_initialize_node() -> Re
     host.shutdown().await?;
     assert!(!fixture.node().exists());
     assert_eq!(
-        fixture.open(true)?.settings().node_mode,
+        fixture.open(true)?.snapshot().node_mode,
         NodeMode::Controller
     );
     // A missing bundle also leaves a fully usable client/profile and no Node directory.
@@ -303,8 +303,6 @@ fn activation_parser_queue_and_cancelled_file_save_preserve_intent() -> Result<(
     assert!(queue.enqueue(link.clone()));
     assert!(queue.enqueue(link.clone()));
     assert_eq!(queue.len(), 1);
-    let deferred = queue.pop().unwrap();
-    assert!(queue.defer(deferred));
     assert_eq!(queue.pop(), Some(link));
     for index in 0..32 {
         assert!(queue.enqueue(Activation::Join {
@@ -418,5 +416,48 @@ async fn unresponsive_owned_child_escalates_through_the_saved_handle() -> Result
         !fixture.node().join("fixture.exited").exists(),
         "an unresponsive child needs held-handle escalation"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_instance_defers_busy_join_without_overwriting_or_losing_later_intents() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let InstanceClaim::Primary(mut primary) = SingleInstance::claim(&fixture.profile, &[]).await? else {
+        panic!("the controlled primary must hold the activation queue");
+    };
+    assert_eq!(primary.try_recv(), Some(Activation::Focus));
+    let first = Activation::Join { ticket: "vibeface1first".into() };
+    let second = Activation::Join { ticket: "vibeface1second".into() };
+    let third = Activation::Join { ticket: "vibeface1third".into() };
+    assert!(matches!(SingleInstance::claim(&fixture.profile, &["vibeface://join/vibeface1first".into()]).await?, InstanceClaim::Forwarded));
+    assert_eq!(primary.pending_capacity(), 31);
+    assert!(primary.enqueue(second.clone()));
+    assert!(primary.enqueue(third.clone()));
+    for _ in 0..3 {
+        let busy_join = primary.try_recv().unwrap();
+        assert_eq!(busy_join, first);
+        assert!(primary.defer(busy_join));
+        assert_eq!(primary.pending_capacity(), 29);
+    }
+    // Finishing one form admits exactly one pending invitation, in original order.
+    assert_eq!(primary.try_recv(), Some(first));
+    let next = primary.try_recv().unwrap();
+    assert_eq!(next, second);
+    assert!(primary.defer(next));
+    assert_eq!(primary.try_recv(), Some(second));
+    assert_eq!(primary.try_recv(), Some(third));
+    assert_eq!(primary.try_recv(), None);
+    for index in 0..32 {
+        assert!(primary.enqueue(Activation::Join { ticket: format!("vibeface1bounded{index}") }));
+    }
+    assert_eq!(primary.pending_capacity(), 0);
+    let busy_join = primary.try_recv().unwrap();
+    assert!(primary.defer(busy_join));
+    assert_eq!(primary.pending_capacity(), 0, "defer must not be deduplicated away or lose a tail entry");
+    for index in 0..32 {
+        assert_eq!(primary.try_recv(), Some(Activation::Join { ticket: format!("vibeface1bounded{index}") }));
+    }
+    assert_eq!(primary.try_recv(), None);
+    assert!(!fixture.node().exists());
     Ok(())
 }

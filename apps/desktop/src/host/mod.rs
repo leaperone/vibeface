@@ -117,9 +117,6 @@ impl DesktopHost {
             last_owned_exit: None,
         })
     }
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
     pub fn client_storage_dir(&self) -> PathBuf {
         self.profile_dir.join("native-client")
     }
@@ -280,18 +277,6 @@ impl DesktopHost {
         self.settings = settings;
         self.selected = Some(inspected.identity());
         Ok(())
-    }
-    pub async fn resolve_selected(&mut self) -> Result<Option<Inspect>> {
-        let Some(expected) = self.selected.clone() else {
-            return Ok(None);
-        };
-        match self.verify(&expected, Some(NodeStatus::Running)).await {
-            Ok(inspected) => Ok(Some(inspected)),
-            Err(error) => {
-                self.selected = None;
-                Err(error)
-            }
-        }
     }
     /// Private local credentials remain on the background actor and never enter snapshots.
     pub async fn local_credential(

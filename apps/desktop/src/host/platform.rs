@@ -300,9 +300,4 @@ impl Notifications {
             .remove(tag)
             .map(|route| NativeAction::Notification { route })
     }
-    pub fn dismiss(&mut self, cx: &App, tag: &str) {
-        self.order.retain(|queued| queued != tag);
-        self.routes.remove(tag);
-        cx.dismiss_system_notification(tag);
-    }
 }
