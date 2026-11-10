@@ -183,6 +183,7 @@ let toasts: ToastItem[] = []
 let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
+const subscribeToasts = (listener: () => void) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
 /** A passing word about what just happened, as the web's toast: two at most, gone after 3 s, read out by VoiceOver. Anything to act on goes to 待处理 instead. */
@@ -190,13 +191,14 @@ export function toast(text: string, tone: Tone = 'neutral') {
   const item = { id: ++toastId, text, tone }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
-  AccessibilityInfo.announceForAccessibility(text)
+  // Queued, so the focus change that usually follows the action does not cut it off.
+  AccessibilityInfo.announceForAccessibilityWithOptions(text, { queue: true })
   setTimeout(() => { toasts = toasts.filter((entry) => entry.id !== item.id); emitToasts() }, 3000)
 }
 
 /** Mounted once at the root, `bottom` clear of the tab bar. */
 export function Toaster({ bottom }: { bottom: number }) {
-  const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }, () => toasts)
+  const items = useSyncExternalStore(subscribeToasts, () => toasts)
   return <View pointerEvents="none" className="absolute inset-x-0 items-center gap-2 px-4" style={{ bottom }}>
     {items.map((item) => <AnimatedView key={item.id} entering={fadeIn} exiting={fadeOut} layout={move} accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
       className="w-full max-w-sm flex-row items-center gap-2 rounded-xl border border-border bg-popover px-3 py-2 shadow-lg">

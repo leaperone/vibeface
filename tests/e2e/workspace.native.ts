@@ -149,11 +149,13 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await app.open();
   }
   // Opened as a scanned link, the way the stray back button to the join page appeared.
-  const invitation = (await readFile(process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt'), 'utf8')).trim();
-  await device.openLink(invitation.startsWith('vibeface://join/') ? invitation : `vibeface://join/${invitation.replace(/^.*\/join\//, '')}`);
-  const consent = screen.getByRole('alert', /Open in.*Vibeface/);
-  if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
-  await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
+  const raw = (await readFile(process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt'), 'utf8')).trim();
+  const invitation = raw.startsWith('vibeface://join/') ? raw : `vibeface://join/${raw.replace(/^.*\/join\//, '')}`;
+  await device.openLink(invitation);
+  const filled = screen.getByText('已填入加入链接', { exact: true });
+  await expect.poll(async () => await openConfirmation.isVisible() || await filled.isVisible(), { timeout: 30000 }).toBe(true);
+  if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
+  await expect(filled).toBeVisible({ timeout: 30000 });
   await textbox('这台设备的名字').fill('VDP native receiver');
   await textbox('这台设备的名字').press('Enter');
   await expect(textbox('这台设备的名字')).toHaveValue('VDP native receiver');
@@ -166,6 +168,17 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   // The join page must not stay under the tabs as a back button.
   await screen.getByLabel('任务', { exact: true }).click();
+  await expect(screen.getByRole('heading', '任务', { exact: true, visible: true })).toBeVisible();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
+  // Opening the same network's link again from a page deep in another tab lands on home alone.
+  await screen.getByLabel('设置', { exact: true }).click();
+  const lab = screen.getByRole('link', '实验室', { exact: true });
+  await screen.scrollUntilVisible(lab, { direction: 'down' });
+  await lab.click();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(1);
+  await device.openLink(invitation);
+  await expect.poll(async () => await openConfirmation.isVisible() || await screen.getByTestId('BackButton', { visible: true }).count() === 0, { timeout: 30000 }).toBe(true);
+  if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
   await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
   await screen.getByLabel('消息', { exact: true }).click();
   const inspect = async () => {
@@ -429,7 +442,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
     .toEqual([{ message_id: queuedMessageId, text: '原生稍后条目已编辑', cancelled: true }]);
   await expect(targetSheet).toHaveCount(1);
   await expect(queued).toHaveCount(0);
-  await targetSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
+  // Swiped down from its title, the sheet closes like the button does.
+  const sheetTop = await targetSheet.getByRole('heading', '目标和队列', { exact: true }).boundingBox();
+  assert(sheetTop, 'The sheet title exposes bounds');
+  await screen.swipe({ from: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y }, to: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y + 600 } });
   await expect(targetSheet).toHaveCount(0);
   await composer.fill('停止后保留的原生草稿');
   await expect(screen.getByRole('button', '补充当前工作', { exact: true, visible: true })).toBeEnabled();
