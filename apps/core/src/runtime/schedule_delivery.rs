@@ -1351,9 +1351,7 @@ mod tests {
                 let work_id = WorkSpec::id("c", "message:origin", case);
                 {
                     let mut store = node.store.lock().await;
-                    let posted = admin.attest(&network, "c", serde_json::from_value(json!({
-                        "type":"message_posted","message_id":"origin","role":"user","text":"fixture","report_results":true
-                    }))?)?;
+                    let posted = signed_main_input(&admin, &network, "c", "origin", "fixture", vec![], 1)?;
                     store.append_event(&node.identity, &network, "c", posted, vec![], now_ms())?;
                     store.accept_work_fixture(&node.identity, &network, WorkSpec {
                         work_id: work_id.clone(), conversation: "c".into(), trigger: "message:origin".into(),
