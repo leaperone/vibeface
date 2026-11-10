@@ -356,7 +356,7 @@ install_release() (
 )
 
 # The sourced production action reads fixture variables and calls the manager stubs.
-# shellcheck disable=SC2034,SC2329
+# shellcheck disable=SC2034,SC2317,SC2329
 service_self_test() (
   local service_script=$1 directory=$2 service data_dir domain=gui/fixture label=com.leaperone.vibeface.fixture action
   mkdir -p "$directory/data"
