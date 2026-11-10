@@ -7,8 +7,10 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+use vibeface_control::observation::{hex32, question_lines};
+pub use vibeface_control::observation::{interactive_codex, rollout_meta};
 
 pub const HOOK_ANSWER_WITHIN_SECS: u64 = 30;
 pub const SPOOL_DIR: &str = "hook-spool";
@@ -134,15 +136,6 @@ fn string(input: &Value, key: &str) -> String {
     input[key].as_str().unwrap_or_default().to_owned()
 }
 
-fn hex32(parts: &[&str]) -> String {
-    let mut hash = Sha256::new();
-    for part in parts {
-        hash.update(part.as_bytes());
-        hash.update([0]);
-    }
-    hex::encode(hash.finalize())[..32].to_owned()
-}
-
 pub fn from_hook(agent: Provider, input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
     match agent {
         Provider::Codex => from_codex_hook(input),
@@ -171,28 +164,6 @@ fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         detail,
         ..Default::default()
     })
-}
-
-fn question_lines(questions: &Value) -> Vec<String> {
-    questions
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|question| {
-            let text = question["question"].as_str().unwrap_or_default();
-            let options: Vec<&str> = question["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|option| option["label"].as_str())
-                .collect();
-            if options.is_empty() {
-                text.to_owned()
-            } else {
-                format!("{text} [{}]", options.join(" | "))
-            }
-        })
-        .collect()
 }
 
 fn request_kind(input: &Value) -> RequestKind {
@@ -345,27 +316,8 @@ fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
     })
 }
 
-pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
-    let background = match source {
-        Value::String(source) => matches!(source.to_ascii_lowercase().as_str(), "exec" | "mcp"),
-        Value::Object(source) => source
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("subagent")),
-        _ => false,
-    };
-    !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
-}
-
 pub fn interactive_claude(entrypoint: Option<&str>) -> bool {
     !entrypoint.is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
-}
-
-pub fn rollout_meta(first_line: &str) -> Value {
-    serde_json::from_str::<Value>(first_line)
-        .ok()
-        .filter(|line| line["type"] == "session_meta")
-        .map(|line| line["payload"].clone())
-        .unwrap_or(Value::Null)
 }
 
 pub struct HookFile {

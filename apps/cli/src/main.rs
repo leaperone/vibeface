@@ -629,14 +629,6 @@ enum LogLevel {
     Error,
 }
 
-impl std::str::FromStr for LogLevel {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("level is one of trace, debug, info, warn, error")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum LogSource {
@@ -646,14 +638,6 @@ enum LogSource {
     Cli,
     Codex,
     Cursor,
-}
-
-impl std::str::FromStr for LogSource {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, cursor")
-    }
 }
 
 #[derive(Args)]

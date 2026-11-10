@@ -6,8 +6,11 @@ use crate::providers::Provider;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
+
+use vibeface_control::observation::hex32;
+pub(crate) use vibeface_control::observation::question_lines;
+pub use vibeface_control::observation::{interactive_codex, rollout_meta};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_MESSAGE: usize = 4000;
@@ -153,15 +156,6 @@ fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn hex32(parts: &[&str]) -> String {
-    let mut hash = Sha256::new();
-    for part in parts {
-        hash.update(part.as_bytes());
-        hash.update([0]);
-    }
-    hex::encode(hash.finalize())[..32].to_owned()
-}
-
 /// The Node's ID for an App Server request: the same request asked again, on this connection or
 /// a later one, gets the same ID. `None` when the request names no item to tell it apart.
 pub fn request_id(method: &str, params: &Value) -> Option<String> {
@@ -262,46 +256,6 @@ pub(crate) fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
 #[cfg(test)]
 pub(crate) fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
     cli_hook(cli_hooks::Provider::Opencode, input, 0)
-}
-
-/// Each question of a request with its option labels, as `text [A | B]`, or its bare text when
-/// it offers none; the Agent answers with the labels.
-pub(crate) fn question_lines(questions: &Value) -> Vec<String> {
-    (questions.as_array().into_iter().flatten())
-        .map(|question| {
-            let text = question["question"].as_str().unwrap_or_default();
-            let options: Vec<&str> = (question["options"].as_array().into_iter().flatten())
-                .filter_map(|option| option["label"].as_str())
-                .collect();
-            match options.is_empty() {
-                true => text.to_owned(),
-                false => format!("{text} [{}]", options.join(" | ")),
-            }
-        })
-        .collect()
-}
-
-/// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
-/// is one the user drives. `codex exec`, MCP and sub-agent sessions run without anyone
-/// watching them.
-pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
-    let background = match source {
-        Value::String(source) => matches!(source.to_ascii_lowercase().as_str(), "exec" | "mcp"),
-        Value::Object(source) => source
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("subagent")),
-        _ => false,
-    };
-    !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
-}
-
-/// The `session_meta` payload on a Codex rollout's first line, if it has one.
-pub fn rollout_meta(first_line: &str) -> Value {
-    serde_json::from_str::<Value>(first_line)
-        .ok()
-        .filter(|line| line["type"] == "session_meta")
-        .map(|line| line["payload"].clone())
-        .unwrap_or(Value::Null)
 }
 
 /// Turn ends in the complete lines of a Codex rollout after `offset`, none for a session the
