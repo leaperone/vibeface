@@ -254,3 +254,7 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../../.agents/skills/e2e/SKILL.md)。
 
 当前未选择 AI 模型。需要 `agent.act` 时，先选择订阅、API 或本地模型，再按 `pnpm exec e2e guide setup` 配置 provider。ChatGPT 订阅的登录命令为 `pnpm exec e2e login openai`，完成登录后再运行模型测试。不要把凭证写入仓库；CI 保持不调用真实模型。
+
+## 真机启动检查
+
+真机安装应覆盖现有 App，保留数据和钥匙串。安装成功后还须确认 Release App 显示正常界面且进程仍存活；`devicectl` 返回启动成功并不证明 JavaScript 初始化成功。若 App 立即退出，先用 `devicectl device process launch --console` 抓取异常，不要通过卸载或清空数据排查。

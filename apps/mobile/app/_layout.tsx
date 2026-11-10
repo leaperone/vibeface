@@ -1,4 +1,3 @@
-import '@/platform/polyfills'
 import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
