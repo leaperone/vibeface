@@ -124,7 +124,7 @@ python3 scripts/check-delivery.py --sandbox --prove-small prepare
 
 `prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
 
-prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute 和 decoder 控制。公开摘要的 `executionControls` 记录各关系的 `cycles` 和 `segments`，其中 cycles 是 `user_cycles`，不包含全部 STARK padding 与 paging 工作。这些控制不生成证明，`PREPARED/NO_PROOF` 不能定位原 Source7200 的全部内部阶段，也不证明原两订单 fresh5 验收通过。guest、profile、11 GiB、64 PIDs、外层 Tokio2 和单 prove7200 均保持原设置。
+prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute 和 decoder 控制。公开摘要的 `executionControls` 记录各关系的 `cycles` 和 `segments`，其中 cycles 是 `user_cycles`，不包含全部 STARK padding 与 paging 工作。这些控制不生成证明，`PREPARED/NO_PROOF` 不能定位原 Source7200 的全部内部阶段，也不证明原两订单 fresh5 验收通过。guest、profile、11 GiB、64 PIDs 和外层 Tokio2 均保持原设置；Node 的单次证明 7200 秒上限未改动，但 small 实验的证明不经 Node，只受工作项绝对截止约束。
 
 公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
 
