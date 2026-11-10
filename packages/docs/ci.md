@@ -31,7 +31,11 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
-| 共享主题、根 JS package、pnpm workspace 或 lockfile | Node Web 检查与门户检查 |
+| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的桌面类型检查、单测和 main/preload 打包，不构建 Rust 或运行网页制品验收 |
+| `apps/desktop/src/shared/` | 桌面源码检查，以及直接导入这些文件的 Web 检查和网页制品验收 |
+| `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
+| `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
+| 根 JS package、pnpm workspace 或 lockfile | Web、Mobile、桌面源码和门户检查 |
 | Node Rust、迁移、安装、打包或进程验收脚本 | Node 快速测试、Clippy、Web 和 Linux x64 制品启动验收 |
 | Bridge | Bridge、Control、CLI 和 Node 的核心检查 |
 | Protocol | Protocol、Bridge、Control、CLI 和 Node 的核心检查 |
@@ -40,6 +44,10 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | Cargo manifest、`Cargo.lock`、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试和超出待补依赖上限的 4 万事件追平测试。
+
+`desktop-check` 在 Linux 上运行桌面 `typecheck`、`test` 和 `build`，不下载 Electron 程序、不启动窗口，也不替代手动平台验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
+
+`mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
 `www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
