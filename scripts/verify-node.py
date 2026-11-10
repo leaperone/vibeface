@@ -53,6 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from unittest import TestCase
 
 
 def definitions_of(bots):
@@ -1143,13 +1144,9 @@ def native_clipboard_selfcheck(options):
         marker.unlink()
         marker.symlink_to(target)
         calls.clear()
-        try:
+        with TestCase().assertRaises(AssertionError, msg='native clipboard must reject a symlinked marker'):
             native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
                                       system="darwin", xcrun_path="/usr/bin/xcrun")
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("native clipboard must reject a symlinked marker")
         require(not calls, "a symlinked marker is refused before invoking xcrun")
         marker.unlink()
         marker.write_text(simulator + "\n")
@@ -4606,18 +4603,23 @@ def gateway_refusal(client, device_id):
     return refused["error"]
 
 
-def acceptance(options):
-    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
-            "packaged browser WASM is available")
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("node-acceptance-" + uuid.uuid4().hex[:10])
+def acceptance_workspace(artifacts, module, prefix):
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts.resolve() / (prefix + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
+    return run, workspace, helper
+
+
+def acceptance(options):
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "packaged browser WASM is available")
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'node-acceptance-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "five real Node processes over iroh (four members and one outsider) with a member relay; WASM browser client; fixture SDK",
@@ -4895,14 +4897,7 @@ def phase4_acceptance(options):
     uses every entrance.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase4-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase4-')
     nodes, clients, roots = [], [], {}
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh (A, B and C each with a fixture coordination Agent and "
@@ -5407,14 +5402,7 @@ def public_node_acceptance(options):
     relay R with an operator token then carries A's traffic to an IPv6-only X while X holds the token, and
     nothing once it holds a wrong one."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("public-node-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'public-node-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "public node P (not a member) as a mesh bootstrap node, an open relay limited per address "
@@ -5645,12 +5633,8 @@ def public_node_acceptance(options):
         nodes += [t, t2]
         t.start()
         require(pinned_info(t)["device_id"] == t.device_id, "T answers over TLS pinned to its own certificate")
-        try:
+        with TestCase().assertRaises(ssl.SSLCertVerificationError, msg="another Node's certificate verifies T"):
             pinned_info(t, t2.directory / "tls-cert.pem")
-        except ssl.SSLCertVerificationError:
-            pass
-        else:
-            raise AssertionError("another Node's certificate verifies T")
         answer = b""
         with socket.create_connection(("127.0.0.1", t.port), timeout=5) as raw, contextlib.suppress(ConnectionResetError):
             raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
@@ -5683,14 +5667,7 @@ def mesh_acceptance(options):
     path is gone; D joins through B alone, gets all four records, then rejoins from its old table with B gone
     and no bootstrap node configured; A stops volunteering and B, C and D drop its relay."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("mesh-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'mesh-')
     nodes = []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "not_checked": ["public NAT types and UDP-blocked networks", "public HTTPS gateways",
@@ -5881,14 +5858,7 @@ def phase5_acceptance(options):
     data directory is copied and run as A' while A is stopped. One browser identity opens A and B.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase5-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase5-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "two real Node processes over iroh plus a copy of A's data directory; WASM browser client",

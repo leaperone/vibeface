@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -305,12 +306,8 @@ def self_test():
         archive = root / "invalid.tar.gz"
         with tarfile.open(archive, "w:gz") as contents:
             contents.addfile(tarfile.TarInfo("../outside"))
-        try:
+        with TestCase().assertRaises(ValueError, msg='Archive traversal must fail before extraction'):
             unpack(archive, root)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Archive traversal must fail before extraction")
     _self_test_download_retries()
     print("Guest installer layout and checksum self-tests passed; no compiler was downloaded or executed")
 

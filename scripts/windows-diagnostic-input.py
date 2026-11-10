@@ -13,6 +13,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release  # noqa: E402
+from unittest import TestCase
 
 TARGET = 'x86_64-pc-windows-msvc'
 WORKFLOW_PATH = '.github/workflows/ci.yml'
@@ -251,12 +252,8 @@ def selection_self_test():
     rejects(lambda r, j, a: a.update(artifacts=a['artifacts'] * 2, total_count=2), 'ambiguous')
     rejects(lambda r, j, a: a.update(total_count=2))
     for invalid in ('', '0', '-1', '01', '1x', str(MAX_ID + 1)):
-        try:
+        with TestCase().assertRaises(ValueError, msg='accepted invalid workflow run ID'):
             run_id_argument(invalid)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('accepted invalid workflow run ID')
 
     with tempfile.TemporaryDirectory(prefix='windows-diagnostic-self-test-') as temporary:
         root = Path(temporary)

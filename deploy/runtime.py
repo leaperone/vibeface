@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import urllib.request
+from unittest import TestCase
 
 
 ROOT = Path('/opt/vibeface')
@@ -229,52 +230,28 @@ def self_test():
             for unsafe in (patch.object(module, 'read_only', return_value=False),
                            patch.object(module, 'TLS_OWNER', os.geteuid() + 1)):
                 with unsafe:
-                    try:
+                    with TestCase().assertRaises(ValueError, msg='TLS files the Node could replace accepted'):
                         guard(info)
-                    except ValueError:
-                        pass
-                    else:
-                        raise AssertionError('TLS files the Node could replace accepted')
             (data / 'tls-key.pem').chmod(0o660)
-            try:
+            with TestCase().assertRaises(ValueError, msg='a group-writable TLS key accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('a group-writable TLS key accepted')
             (data / 'tls-key.pem').chmod(0o640)
             (directory / 'public-bootstrap.json').write_text(json.dumps(dict(anchor, issuer='c' * 64)))
-            try:
+            with TestCase().assertRaises(ValueError, msg='a Node other than the pinned issuer accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('a Node other than the pinned issuer accepted')
             (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
             (data / 'tls-cert.pem').unlink()
-            try:
+            with TestCase().assertRaises(ValueError, msg='missing TLS certificate accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('missing TLS certificate accepted')
             (data / 'tls-cert.pem').write_text('fixture')
             for marker in ('{"data_epoch":2}', '{"data_epoch":true}'):
                 (data / 'data-epoch.json').write_text(marker)
-                try:
+                with TestCase().assertRaises(ValueError, msg='different epoch accepted'):
                     guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError('different epoch accepted')
             (data / 'data-epoch.json').write_text('{"data_epoch":1}')
             (data / 'identity.json').unlink()
-            try:
+            with TestCase().assertRaises(ValueError, msg='missing identity accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('missing identity accepted')
             assert not (data / 'identity.json').exists()
             (data / 'identity.json').write_text('fixture')
             network, forwarding = config['network'], config['forwarding']
@@ -292,12 +269,8 @@ def self_test():
                            {'network': dict(network, relay_max_clients_per_ip=None)},
                            {'network': dict(network, relay_operator_token='c' * 64)}):
                 (data / 'config.json').write_text(json.dumps(dict(config, **change)))
-                try:
+                with TestCase().assertRaises(ValueError, msg=f'unbounded or private official node accepted: {change}'):
                     guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError(f'unbounded or private official node accepted: {change}')
             (data / 'config.json').write_text(json.dumps(config))
             assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')

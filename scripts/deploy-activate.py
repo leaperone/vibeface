@@ -18,6 +18,7 @@ import sys
 import tarfile
 import time
 import uuid
+from unittest import TestCase
 
 
 CORE_ROLES = ('node',)
@@ -691,21 +692,13 @@ def self_test():
             assert import_image(str(archive), digest) == imported
             load.assert_called_once_with('load', '--input', str(archive), timeout=300)
         with patch(__name__ + '.docker') as load:
-            try:
+            with TestCase().assertRaises(ValueError, msg='imported an unverified archive'):
                 import_image(str(archive), '0' * 64)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('imported an unverified archive')
             load.assert_not_called()
         for result in ('Loaded image: moving:tag', 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported):
             with patch(__name__ + '.docker', return_value=result):
-                try:
+                with TestCase().assertRaises(ValueError, msg='accepted an ambiguous imported image'):
                     import_image(str(archive), digest)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError('accepted an ambiguous imported image')
     config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
               'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'tls_dir': '/etc/official-node/tls',
               'device_id': 'a' * 64,
@@ -726,12 +719,8 @@ def self_test():
                                (app, 'listen', '0.0.0.0:8088'), (app, 'node_url', 'https://203.0.113.7:4792'),
                                (app, 'legacy_service', 'official-node.service')):
         bad = {key: item for key, item in dict(base, **{field: value}).items() if item is not None}
-        try:
+        with TestCase().assertRaises(ValueError, msg=field):
             validate_config(bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(field)
     runtime = compose_runtime(config, 'sha256:' + 'b' * 64, '1.0.0', 'c' * 40, 'd' * 64)['services']['service']
     assert runtime['network_mode'] == 'host' and runtime['user'] == '1001:1001'
     assert runtime['volumes'][0]['bind']['create_host_path'] is False
@@ -766,22 +755,14 @@ server {
                      'location = /api/decision { proxy_pass https://203.0.113.7:4792; }',
                      'location ^~ /bootstrap/ { proxy_pass http://127.0.0.1:4900; }',
                      'location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }'):
-        try:
+        with TestCase().assertRaises(ValueError, msg='unknown static route accepted'):
             transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('unknown static route accepted')
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
                 nginx.replace('location / {', 'include /old/routes.conf; location / {', 1),
                 nginx.replace('location = /api/client { return 404; }',
                               'location = /api/client { proxy_pass http://127.0.0.1:4900; }', 1)):
-        try:
+        with TestCase().assertRaises(ValueError, msg='invalid nginx configuration accepted'):
             transform_nginx(bad, app)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('invalid nginx configuration accepted')
     previous_manifest = {'project': 'owned', 'fingerprint': 'old-config', 'image': 'sha256:' + 'b' * 64}
     actual_container = {'Config': {'Labels': {'com.docker.compose.project': 'owned',
                         'com.docker.compose.service': 'service', 'dev.vibeface.deployment': 'new-config'}},
@@ -804,12 +785,8 @@ server {
         nginx_state = {'nginx_sha256': hashlib.sha256(b'confirmed').hexdigest()}
         nginx_matches({'nginx_config': str(nginx_file)}, nginx_state)
         nginx_file.write_text('drifted')
-        try:
+        with TestCase().assertRaises(ValueError, msg='nginx drift reported as already active'):
             nginx_matches({'nginx_config': str(nginx_file)}, nginx_state)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('nginx drift reported as already active')
         state = {'schema': 1, 'phase': 'starting', 'target': {'project': 'owned'}, 'config': {'role': 'app'},
                  'previous': {'project': 'previous'}}
         with patch(__name__ + '.restored_previous', return_value=False), \
@@ -882,19 +859,11 @@ server {
         for unsafe in (lambda: (tls / 'tls-key.pem').chmod(0o660), lambda: (tls / 'tls-key.pem').chmod(0o644),
                        lambda: tls.chmod(0o770), lambda: owned.update(gid=os.getegid() + 1)):
             unsafe()
-            try:
+            with TestCase().assertRaises(ValueError, msg='TLS files the Node could change or not read accepted'):
                 tls_directory(owned, owner=os.geteuid())
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('TLS files the Node could change or not read accepted')
             tls.chmod(0o750); (tls / 'tls-key.pem').chmod(0o640); owned['gid'] = os.getegid()
-        try:
+        with TestCase().assertRaises(ValueError, msg='TLS files not owned by root accepted'):
             tls_directory(owned)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('TLS files not owned by root accepted')
         units = directory / 'units'; (units / 'old.service.d').mkdir(parents=True)
         (units / 'other.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir /var/lib/official-node2\n')
         assert units_using('/var/lib/official-node', [str(units)]) == []
@@ -904,12 +873,8 @@ server {
             str(units / 'old.service'), str(units / 'old.service.d' / 'data.conf')]
         data = directory / 'data'; data.mkdir(); (data / 'identity.json').write_text('keep')
         (data / 'escape').symlink_to(directory)
-        try:
+        with TestCase().assertRaises(ValueError, msg='backup followed a symbolic link'):
             backup_data({'data_dir': str(data)}, directory / 'backup.tar.gz')
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('backup followed a symbolic link')
         assert (data / 'identity.json').read_text() == 'keep'
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
