@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
-    io::IsTerminal,
+    io::{IsTerminal, Read},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -37,6 +37,23 @@ fn json_arg(text: Option<&str>) -> Result<Value> {
         serde_json::from_str(text.unwrap_or("{}")).context("params must be a JSON object")?;
     ensure!(value.is_object(), "params must be a JSON object");
     Ok(value)
+}
+
+/// `text`, or standard input when it is `-`, which keeps a secret off the command line.
+fn arg_or_stdin(text: String) -> Result<String> {
+    if text != "-" {
+        return Ok(text);
+    }
+    let mut input = String::new();
+    std::io::stdin()
+        .take((1 << 20) + 1)
+        .read_to_string(&mut input)
+        .context("read standard input")?;
+    ensure!(
+        input.len() <= 1 << 20,
+        "standard input holds more than 1 MiB"
+    );
+    Ok(input.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// Calls `method` on the running Node as its local operator.
@@ -184,7 +201,8 @@ pub enum ProviderAction {
     Configure {
         #[arg(value_enum)]
         provider: Provider,
-        /// The change as a JSON object; absent fields keep their value.
+        /// The change as a JSON object; absent fields keep their value. `-` reads it from
+        /// standard input, for one holding API keys.
         change: String,
     },
     /// Check whether a provider is ready.
@@ -205,7 +223,7 @@ pub async fn provider(options: ProviderOptions) -> Result<()> {
     let dir = &options.node.data_dir;
     let result = match options.command {
         ProviderAction::Configure { provider, change } => {
-            let mut change = json_arg(Some(&change))?;
+            let mut change = json_arg(Some(&arg_or_stdin(change)?))?;
             change["provider"] = json!(provider.name());
             operator(dir, "configure_provider", change).await?
         }
@@ -337,7 +355,8 @@ pub struct ConfigOptions {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     /// Set one config.json value, such as mesh.allow_private true or mesh.bootstrap '[...]'.
-    /// The value is JSON, or text when it is not; null restores the default.
+    /// The value is JSON, or text when it is not; null restores the default; `-` reads it from
+    /// standard input.
     Set { key: String, value: String },
 }
 
@@ -353,11 +372,11 @@ pub async fn config(options: ConfigOptions) -> Result<()> {
         ControlRequest::ConfigSet {
             data_dir: dir.clone(),
             key: key.clone(),
-            value: config_value(&value),
+            value: config_value(&arg_or_stdin(value)?),
         },
     )
     .await?;
-    if result["running"] == true {
+    if result["restart_required"] == true {
         println!("Saved {key}; restart the Node to apply it.");
     } else {
         println!("Saved {key}.");
@@ -483,6 +502,7 @@ pub enum ClientAction {
     },
     /// Join a personal network with an invite link; a manager approves it.
     Enroll {
+        /// The invite link; `-` reads it from standard input.
         link: String,
         #[arg(long, default_value = "CLI")]
         name: String,
@@ -576,6 +596,11 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             Ok(())
         }
         ClientAction::Enroll { link, name } => {
+            ensure!(
+                link != "-" || access.passphrase_fd != Some(0),
+                "the invite link and the passphrase cannot both come from standard input"
+            );
+            let link = arg_or_stdin(link)?;
             let origin = match &access.url {
                 Some(url) => url.clone(),
                 None => access.local_entry(None).await?.origin,

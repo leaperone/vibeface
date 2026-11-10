@@ -9,12 +9,17 @@ use std::path::Path;
 impl Config {
     /// Sets `key`, a dotted path into config.json, to `value` and saves the result, refusing
     /// one `Config::load` would refuse. `mesh.` stands for `network.mesh.`; `null` restores a
-    /// field's default. Relay tokens come from files at `init`, never from a command line.
+    /// field's default. Relay tokens come from files at `init` and provider variables from
+    /// `provider configure`, never from this command.
     pub fn set(dir: &Path, key: &str, value: Value) -> Result<()> {
         let path = config_path(key)?;
         ensure!(
             !path.iter().any(|segment| segment.contains("token")) && !names_token(&value),
             "relay tokens are read from files; pass them to vibeface init"
+        );
+        ensure!(
+            path[0] != "provider_env",
+            "provider variables are set with vibeface provider configure <provider> -"
         );
         let mut document: Value = serde_json::from_slice(
             &std::fs::read(dir.join("config.json")).context("config.json is unreadable")?,
@@ -107,6 +112,11 @@ mod tests {
                 "network.relays",
                 json!([{"url":"https://relay.example","token":"00"}]),
                 "relay tokens",
+            ),
+            (
+                "provider_env",
+                json!({"codex":{"OPENAI_API_KEY":"k"}}),
+                "provider configure",
             ),
             ("Mesh..x", json!(1), "dotted path"),
         ] {
