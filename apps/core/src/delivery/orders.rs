@@ -1602,6 +1602,7 @@ mod tests {
             1
         );
         drop(database);
+        drop(delivery);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

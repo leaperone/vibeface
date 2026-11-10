@@ -94,7 +94,7 @@ python3 scripts/check-delivery.py --check-fixtures
 python3 scripts/check-delivery.py --sandbox
 ```
 
-`--sandbox` 先检查 fixture，再用固定的 `crates/delivery/proof/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。容器只挂四个目录，复用 `.artifacts/vdp/cargo`、`.artifacts/vdp/risc0` 和 `.artifacts/vdp/canonical`，不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
+`--sandbox` 先检查 fixture，再用固定的 `crates/delivery/proof/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。容器只挂四个宿主目录（Cargo 目录同时挂到 `/cargo` 和 `/home/runner/.cargo`），复用 `.artifacts/vdp/cargo`、`.artifacts/vdp/risc0` 和 `.artifacts/vdp/canonical`，不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
@@ -138,7 +138,7 @@ prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute �
 
 `delivery_live` 仍只在手动 workflow_dispatch 且输入为 true 时执行，默认 false。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。现有 gate 在显式选中该模式时仍要求 job success；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
 
-该选项选择专门的 native-only 实验：package matrix 只含 Linux x86_64，保留 `package_mode=node` 的全部制品、真实进程与 Chromium 验收，以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 CI、普通手动运行、定时及产品 Tag 的选择保持原样。计划摘要列出实际 target 和未选范围。
+该选项选择专门的 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 CI、普通手动运行、定时及产品 Tag 的选择保持原样。计划摘要列出实际 target 和未选范围。
 
 同时设置附加 `desktop=true` 时，`delivery_live` 现在优先选择 native-only，托管的 Mac/Windows 桌面窗口及 Windows native 验收不执行；这改变了原先同时执行两者的组合行为。`desktop_only`、`windows_only` 或非 `none` 的 `mobile_apps` 保持各专门入口优先，native 未选。`delivery_small=true` 与 `delivery_live=true` 仍被 small-prepare 的单模式检查拒绝，不会启动 native。native job 还要求 plan、Linux package、crypto-web 和 web 全部成功，且整次运行未取消；失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。
 
@@ -178,7 +178,7 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 
 `--npm-service` 仅允许无既有 Vibeface 数据或默认服务的 GitHub hosted runner，使用真实 launchd 或 systemd user manager，不能在开发者机器运行。Linux job 显式准备 user manager 和 D-Bus；不可用即失败。验收通过公开 npm CLI 执行安装、启动、停止、重启和卸载，核对服务使用 scoped npm vendor 中的原生程序。
 
-`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。来源相同、基线业务来源超前或 data epoch 不兼容均失败。
+`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。基线与候选是同一个源码提交、基线业务来源不是候选的祖先，或 data epoch 不兼容均失败；基线业务来源等于候选提交是允许的，记为 `business_source_relation=same`。
 
 受控 Node 和 App Server 夹具从不可变的公开基线包创建真实非空消息及附件，安装真实服务并核对运行状态与数据，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。两包都验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝。完整的安装、状态、停止、启动、重启换 PID 和卸载生命周期由最终候选包验收；重启后核对原身份、配置、签名历史和附件字节，并确认已完成的受控调用未重放，卸载保留数据。公开基线不承担完整生命周期验收。收据分别记录两包的真实 version、source、摘要和来源关系；候选声明版本相同或较低时如实标注，不称为 SemVer 升级。只验证当前格式，不做跨历史格式迁移，也不据机械版本变化宣称业务升级或真实 Provider 验收。
 

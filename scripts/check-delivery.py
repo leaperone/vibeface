@@ -570,7 +570,9 @@ def checked_transaction(value):
     integer(value["status"], 0, 1)
     for field in ("gasUsed", "effectiveGasPrice", "nativeCostWei"):
         decimal(value[field])
-    event_types = {"KeyUpdated": ("hash", "amount", "hash", "bool"), "Funded": ("hash", "address", "amount"), "WindowUpdated": ("hash", "amount", "amount"), "DecryptionProven": ("hash", "amount"), "Withdrawn": ("hash", "address", "amount"), "Refunded": ("hash", "address", "amount")}
+    event_types = {"KeyUpdated": ("hash", "amount", "hash", "bool"), "Funded": ("hash", "address", "amount"), "WindowUpdated": ("hash", "amount", "amount"), "DecryptionProven": ("hash", "amount"), "Refunded": ("hash", "address", "amount"),
+        "BudgetOpened": ("hash", "address", "address", "amount"), "BudgetReserved": ("hash", "hash", "amount"), "BudgetEarned": ("hash", "hash", "amount", "amount"),
+        "BudgetWithdrawn": ("hash", "address", "amount"), "BudgetClosed": ("hash",), "BudgetRefunded": ("hash", "address", "amount")}
     if not isinstance(value["events"], list) or len(value["events"]) > 8:
         raise ValueError("Unexpected public event list")
     for event in value["events"]:
@@ -645,10 +647,11 @@ def checked_node_summary(value, item, context, commit):
         checked_transaction(record)
     if value["deployment"] is not None:
         deployment = value["deployment"]
-        object_keys(deployment, ("chainId", "escrow", "asset", "payer", "provider", "profileId", "adapter", "verifier", "tokenDecimals", "orderId", "fundTransaction", "runtimeCodeHashes"))
+        object_keys(deployment, ("chainId", "escrow", "asset", "payer", "provider", "profileId", "adapter", "verifier", "tokenDecimals", "orderId", "budgetId", "allocationTransaction", "runtimeCodeHashes"))
         if context is None or any(deployment[field] != context["deployment"][field] for field in ("chainId", "escrow", "asset", "payer", "provider", "adapter", "verifier", "tokenDecimals", "runtimeCodeHashes")) or deployment["profileId"] != "0x" + context["profileId"] or deployment["orderId"] != "0x" + context["orderId"]:
             raise ValueError("Final deployment differs from reconstructed context")
-        prefixed(deployment["fundTransaction"], 32)
+        for field in ("budgetId", "allocationTransaction"):
+            prefixed(deployment[field], 32)
     if value["failure"] is not None:
         object_keys(value["failure"], ("stage", "kind", "code"))
         for field in ("stage", "kind", "code"):
@@ -1460,6 +1463,23 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec -1"}))
     checked_transaction({"label": "fund", "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1,
         "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2", "events": [{"name": "Funded", "args": ["0x" + "4" * 64, "0x" + "Ab" * 20, "17"]}]})
+    budget, order = "0x" + "5" * 64, "0x" + context["orderId"]
+    accepted_events = (("open-budget", [("BudgetOpened", [budget, addresses[0], addresses[1], "17"])]),
+        ("reserve-batch", [("Funded", [order, addresses[0], "17"]), ("BudgetReserved", [budget, order, "17"])]),
+        ("publish", [("WindowUpdated", [order, "0", "3"]), ("BudgetEarned", [budget, order, "0", "17"])]),
+        ("withdraw", [("BudgetWithdrawn", [budget, addresses[1], "17"])]),
+        ("close", [("BudgetClosed", [budget])]),
+        ("refund", [("Refunded", [order, addresses[0], "17"]), ("BudgetRefunded", [budget, addresses[0], "17"])]))
+    accepted = {**node_summary, "workItem": "accept", "status": "PASS-accept-candidate",
+        "transactions": [{"label": label, "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1, "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2",
+            "events": [{"name": name, "args": arguments} for name, arguments in events]} for label, events in accepted_events],
+        "deployment": {**{field: context["deployment"][field] for field in ("chainId", "escrow", "asset", "payer", "provider", "adapter", "verifier", "tokenDecimals", "runtimeCodeHashes")},
+            "profileId": "0x" + context["profileId"], "orderId": order, "budgetId": budget, "allocationTransaction": "0x" + "6" * 64}}
+    checked_node_summary(accepted, "accept", context, commit)
+    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**{field: value for field, value in accepted["deployment"].items() if field not in ("budgetId", "allocationTransaction")}, "fundTransaction": "0x" + "6" * 64}}, "accept", context, commit))
+    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**accepted["deployment"], "budgetId": "5" * 64}}, "accept", context, commit))
+    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "Withdrawn", "args": [order, addresses[1], "17"]}]}))
+    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "BudgetClosed", "args": [budget, "17"]}]}))
     for field, value in (("sourceCommit", "b" * 40), ("profileId", "f" * 64), ("profileSha256", "f" * 64), ("orderId", "0x" + "4" * 64), ("secret", "private")):
         changed = {**context, field: value}
         must_reject(lambda: checked_context(json_bytes(changed), compiled, vectors["profileId"], commit))

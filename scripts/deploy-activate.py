@@ -628,7 +628,7 @@ def self_test():
             with patch(__name__ + '.docker', return_value=result):
                 with TestCase().assertRaises(ValueError, msg='accepted an ambiguous imported image'):
                     import_image(str(archive), digest)
-        settings = Path(temporary) / 'config.json'
+        settings = Path(temporary).resolve() / 'config.json'
         settings.write_text(json.dumps({'project': 'official-app', 'role': 'app',
                                        'deploy_dir': '/srv/service-control/app', 'listen': '127.0.0.1:8088',
                                        'nginx_config': '/etc/nginx/conf.d/app.conf',

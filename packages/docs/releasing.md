@@ -28,7 +28,7 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 协调入口是 `ci.yml` 的 `daily-nightly`。配置保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每个槽位都发生。仅 main schedule 的 `ci-gate` 成功后启动自动 Nightly。手动 CI 和普通 main push 不触发它，手动扩展检查不能补发 Nightly。
 
-协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对本仓包版本和锁文件。仅路径白名单不能放行发布。
+协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对两个本仓包的清单版本，带 `--no-deps` 时不校验锁文件，`Cargo.lock` 的内容由完整 tree 比对覆盖。仅路径白名单不能放行发布。
 
 原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，不分配新版本覆盖。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
 

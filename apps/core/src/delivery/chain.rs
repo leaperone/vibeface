@@ -359,17 +359,6 @@ impl Chain {
         })
     }
 
-    pub async fn order(&self, order_id: Word) -> Result<OrderState> {
-        self.confirmed_order(order_id).await
-    }
-
-    pub async fn confirmed_order(&self, order_id: Word) -> Result<OrderState> {
-        let position = self.confirmed_position().await?;
-        let result = self.order_at(&position, order_id).await?;
-        self.verify_position(&position).await?;
-        Ok(result)
-    }
-
     pub async fn order_at(&self, position: &ChainPosition, order_id: Word) -> Result<OrderState> {
         let result = self
             .call_at(
@@ -1502,7 +1491,7 @@ pub(super) mod tests {
         Ok(RpcFixture {
             chain: Chain {
                 config,
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder().no_proxy().build()?,
                 request_id: AtomicU64::new(1),
             },
             requests,
@@ -1774,6 +1763,9 @@ pub(super) mod tests {
                 .any(|request| request["method"] == "eth_sendRawTransaction"),
             "configuration changes during awaits cannot reach broadcast"
         );
+        // The RPC fixture's tasks still hold a clone of `delivery`, so dropping
+        // ours would leave the SQLite file open and Windows could not delete it.
+        delivery.store.lock().expect("delivery store").take();
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1894,7 +1886,7 @@ pub(super) mod tests {
         config.rpc_url = format!("http://{}/", listener.local_addr()?);
         let chain = Chain {
             config,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder().no_proxy().build()?,
             request_id: AtomicU64::new(1),
         };
         let policy = super::super::budget::PublicationPolicy {
