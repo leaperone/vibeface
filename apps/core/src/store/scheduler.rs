@@ -169,6 +169,27 @@ fn query_jobs(
     rows.into_iter().map(job_from_row).collect()
 }
 
+fn accepted_steering_jobs(
+    connection: &Connection,
+    job: &SchedulerJob,
+) -> Result<Vec<SchedulerJob>> {
+    let Some(attempt) = job.state.attempt() else {
+        return Ok(vec![]);
+    };
+    let mut inputs = query_jobs(
+        connection,
+        "conversation_id=? AND state IN ('steering','steered')",
+        [&job.conversation_id],
+    )?;
+    inputs.retain(|input| {
+        matches!(&input.state,
+            JobState::Steering { into, receipt: Some(_), .. }
+            | JobState::Steered { into, receipt: Some(_), .. }
+            if into.attempt_id == attempt.id)
+    });
+    Ok(inputs)
+}
+
 fn load_job(
     connection: &Connection,
     conversation: &str,
@@ -941,6 +962,75 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
         .checked_add(1)
         .context("scheduler permission version overflow")?;
     Ok(())
+}
+
+fn invalidate_session(
+    session: &mut SchedulerSession,
+    basis: &VersionVector,
+    config: &SessionConfig,
+    reason: &str,
+) -> Result<SessionInvalidation> {
+    let generation = session
+        .shown
+        .session_generation
+        .checked_add(1)
+        .context("scheduler session generation overflow")?;
+    let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
+        session.stable_fingerprint.as_deref(),
+        &config.stable_fingerprint,
+        session.runtime_fingerprint.as_deref(),
+        &config.runtime_fingerprint,
+        generation,
+        basis,
+    ))?);
+    let invalidation = SessionInvalidation {
+        source_basis: session.covers.clone(),
+        old_stable_fingerprint: session.stable_fingerprint.clone(),
+        new_stable_fingerprint: config.stable_fingerprint.clone(),
+        old_runtime_fingerprint: session.runtime_fingerprint.clone(),
+        new_runtime_fingerprint: config.runtime_fingerprint.clone(),
+        source_provider: session.provider,
+        target_provider: config.provider,
+        reason: reason.into(),
+        generation,
+        handoff_revision,
+    };
+    fence(session)?;
+    session.covers.clear();
+    let mut lineage = std::mem::take(&mut session.shown.session_lineage);
+    if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
+        session.stable_fingerprint.clone(),
+        session.runtime_fingerprint.clone(),
+        session.provider,
+    ) {
+        lineage.push(SessionLineage {
+            source_basis: invalidation.source_basis.clone(),
+            generation: session.shown.session_generation,
+            stable_fingerprint,
+            runtime_fingerprint,
+            provider,
+            reason: reason.into(),
+            handoff_revision: invalidation.handoff_revision.clone(),
+        });
+    }
+    if lineage.len() > 8 {
+        lineage.drain(..lineage.len() - 8);
+    }
+    session.shown = Shown {
+        session_generation: generation,
+        session_lineage: lineage,
+        ..Shown::default()
+    };
+    session.session_generation = generation;
+    session.handoff_revision = session
+        .handoff_revision
+        .checked_add(1)
+        .context("scheduler handoff revision overflow")?;
+    session.handoff_source = basis.clone();
+    session.stable_fingerprint = Some(config.stable_fingerprint.clone());
+    session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
+    session.provider = Some(config.provider);
+    Ok(invalidation)
 }
 
 fn attempt_not_started_from(connection: &Connection, job: &SchedulerJob) -> Result<bool> {
@@ -2419,37 +2509,15 @@ impl Store {
         network: &str,
         job: &SchedulerJob,
     ) -> Result<Vec<HashedEvent>> {
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(vec![]);
-        };
         let mut events = Vec::new();
-        for input in query_jobs(
-            &self.connection,
-            "conversation_id=? AND state IN ('steering','steered')",
-            [&job.conversation_id],
-        )? {
-            let accepted = match &input.state {
-                JobState::Steering {
-                    into,
-                    receipt: Some(_),
-                    ..
-                }
-                | JobState::Steered {
-                    into,
-                    receipt: Some(_),
-                    ..
-                } => into.attempt_id == attempt.id,
-                _ => false,
-            };
-            if accepted
-                && let Some(message) = message_from(
-                    &self.connection,
-                    network,
-                    &job.conversation_id,
-                    &input.reply_to,
-                )?
-                && let Some(event) =
-                    log::event_from(&self.connection, network, &message.event_hash)?
+        for input in accepted_steering_jobs(&self.connection, job)? {
+            if let Some(message) = message_from(
+                &self.connection,
+                network,
+                &job.conversation_id,
+                &input.reply_to,
+            )? && let Some(event) =
+                log::event_from(&self.connection, network, &message.event_hash)?
             {
                 events.push(HashedEvent {
                     hash: message.event_hash,
@@ -2563,29 +2631,8 @@ impl Store {
                 return Ok(Some(job.conversation_id.clone()));
             }
         }
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(None);
-        };
-        for input in query_jobs(
-            &self.connection,
-            "conversation_id=? AND state IN ('steering','steered')",
-            [&job.conversation_id],
-        )? {
-            let accepted = match &input.state {
-                JobState::Steering {
-                    into,
-                    receipt: Some(_),
-                    ..
-                }
-                | JobState::Steered {
-                    into,
-                    receipt: Some(_),
-                    ..
-                } => into.attempt_id == attempt.id,
-                _ => false,
-            };
-            if accepted
-                && let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
+        for input in accepted_steering_jobs(&self.connection, job)? {
+            if let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
                 && effective
                     .input
                     .attachments
@@ -2638,15 +2685,6 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(receipt)
-    }
-
-    pub fn workspace_input_editable(
-        &self,
-        network: &str,
-        conversation: &str,
-        message_id: &str,
-    ) -> Result<bool> {
-        workspace_input_editable_from(&self.connection, network, conversation, message_id)
     }
 
     pub(crate) fn workspace_task_input_allowed(
@@ -4327,18 +4365,6 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn remove_outbox(&mut self, conversation: &str, trigger: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-            params![conversation, trigger],
-        )?;
-        Ok(())
-    }
-
-    pub fn pending_scheduler_conversations(&self) -> Result<Vec<String>> {
-        pending_conversations_from(&self.connection)
-    }
-
     pub fn pending_scheduler_sessions(&self) -> Result<Vec<SessionKey>> {
         let mut jobs = query_jobs(
             &self.connection,
@@ -4762,66 +4788,7 @@ impl Store {
             } else {
                 "runtime_configuration_changed"
             };
-            let generation = session
-                .shown
-                .session_generation
-                .checked_add(1)
-                .context("scheduler session generation overflow")?;
-            let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
-                session.stable_fingerprint.as_deref(),
-                &config.stable_fingerprint,
-                session.runtime_fingerprint.as_deref(),
-                &config.runtime_fingerprint,
-                generation,
-                &job.basis,
-            ))?);
-            let invalidation = SessionInvalidation {
-                source_basis: session.covers.clone(),
-                old_stable_fingerprint: session.stable_fingerprint.clone(),
-                new_stable_fingerprint: config.stable_fingerprint.clone(),
-                old_runtime_fingerprint: session.runtime_fingerprint.clone(),
-                new_runtime_fingerprint: config.runtime_fingerprint.clone(),
-                source_provider: session.provider,
-                target_provider: config.provider,
-                reason: reason.into(),
-                generation,
-                handoff_revision,
-            };
-            fence(&mut session)?;
-            session.covers.clear();
-            let mut lineage = std::mem::take(&mut session.shown.session_lineage);
-            if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
-                session.stable_fingerprint.clone(),
-                session.runtime_fingerprint.clone(),
-                session.provider,
-            ) {
-                lineage.push(SessionLineage {
-                    source_basis: invalidation.source_basis.clone(),
-                    generation: session.shown.session_generation,
-                    stable_fingerprint,
-                    runtime_fingerprint,
-                    provider,
-                    reason: reason.into(),
-                    handoff_revision: invalidation.handoff_revision.clone(),
-                });
-            }
-            if lineage.len() > 8 {
-                lineage.drain(..lineage.len() - 8);
-            }
-            session.shown = Shown {
-                session_generation: generation,
-                session_lineage: lineage,
-                ..Shown::default()
-            };
-            session.session_generation = generation;
-            session.handoff_revision = session
-                .handoff_revision
-                .checked_add(1)
-                .context("scheduler handoff revision overflow")?;
-            session.handoff_source = job.basis.clone();
-            session.stable_fingerprint = Some(config.stable_fingerprint.clone());
-            session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
-            session.provider = Some(config.provider);
+            let invalidation = invalidate_session(&mut session, &job.basis, config, reason)?;
             session.owner_epoch = owner_epoch;
             Some(invalidation)
         } else {
@@ -4942,77 +4909,15 @@ impl Store {
             model: runtime.model.clone(),
             reasoning_effort: runtime.reasoning_effort.clone(),
         });
-        let source_basis = session.covers.clone();
-        let old_stable_fingerprint = session.stable_fingerprint.clone();
-        let old_runtime_fingerprint = session.runtime_fingerprint.clone();
-        let source_provider = session.provider;
-        let reason = if source_provider != Some(config.provider) {
+        let reason = if session.provider != Some(config.provider) {
             "provider_changed"
-        } else if old_stable_fingerprint.as_deref() != Some(config.stable_fingerprint.as_str()) {
+        } else if session.stable_fingerprint.as_deref() != Some(config.stable_fingerprint.as_str())
+        {
             "stable_prompt_changed"
         } else {
             "runtime_configuration_changed"
         };
-        let generation = session
-            .shown
-            .session_generation
-            .checked_add(1)
-            .context("scheduler session generation overflow")?;
-        let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
-            old_stable_fingerprint.as_deref(),
-            &config.stable_fingerprint,
-            old_runtime_fingerprint.as_deref(),
-            &config.runtime_fingerprint,
-            generation,
-            &job.basis,
-        ))?);
-        let invalidation = SessionInvalidation {
-            source_basis: source_basis.clone(),
-            old_stable_fingerprint,
-            new_stable_fingerprint: config.stable_fingerprint.clone(),
-            old_runtime_fingerprint,
-            new_runtime_fingerprint: config.runtime_fingerprint.clone(),
-            source_provider,
-            target_provider: config.provider,
-            reason: reason.into(),
-            generation,
-            handoff_revision: handoff_revision.clone(),
-        };
-        fence(&mut session)?;
-        session.covers.clear();
-        let mut lineage = std::mem::take(&mut session.shown.session_lineage);
-        if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
-            invalidation.old_stable_fingerprint.clone(),
-            invalidation.old_runtime_fingerprint.clone(),
-            invalidation.source_provider,
-        ) {
-            lineage.push(SessionLineage {
-                source_basis: source_basis.clone(),
-                generation: session.shown.session_generation,
-                stable_fingerprint,
-                runtime_fingerprint,
-                provider,
-                reason: reason.into(),
-                handoff_revision: handoff_revision.clone(),
-            });
-        }
-        if lineage.len() > 8 {
-            lineage.drain(..lineage.len() - 8);
-        }
-        session.shown = Shown {
-            session_generation: generation,
-            session_lineage: lineage,
-            ..Shown::default()
-        };
-        session.session_generation = generation;
-        session.handoff_revision = session
-            .handoff_revision
-            .checked_add(1)
-            .context("scheduler handoff revision overflow")?;
-        session.handoff_source = job.basis.clone();
-        session.stable_fingerprint = Some(config.stable_fingerprint.clone());
-        session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
-        session.provider = Some(config.provider);
+        let invalidation = invalidate_session(&mut session, &job.basis, config, reason)?;
         if let JobState::Claimed { attempt } | JobState::Running { attempt } = &mut job.state {
             attempt.permission_version = session.permission_version;
         }
@@ -5154,41 +5059,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn advance_scheduler_lineage(
-        &mut self,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-    ) -> Result<u64> {
-        let mut generation = 0;
-        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
-            ensure!(
-                session.active.as_deref() == Some(trigger)
-                    && matches!(
-                        job.state,
-                        JobState::Claimed { .. } | JobState::Running { .. }
-                    ),
-                "scheduler attempt is no longer active"
-            );
-            session.session_generation = session
-                .session_generation
-                .checked_add(1)
-                .context("scheduler session generation overflow")?;
-            session.handoff_revision = session
-                .handoff_revision
-                .checked_add(1)
-                .context("scheduler handoff revision overflow")?;
-            session.handoff_source = job.basis.clone();
-            generation = session.session_generation;
-            if let Some(runtime) = &mut job.runtime {
-                runtime.session_generation = generation;
-                runtime.stage = ProviderStage::Compact;
-            }
-            Ok(())
-        })?;
-        Ok(generation)
-    }
-
     pub fn record_context_compaction(
         &mut self,
         conversation: &str,
@@ -5215,21 +5085,9 @@ impl Store {
                 .context("scheduler handoff revision overflow")?;
             session.handoff_source = job.basis.clone();
             session.covers.clear();
-            let mut shown = std::mem::take(&mut session.shown);
-            shown.session_generation = session.session_generation;
-            shown.dynamic = None;
-            shown.context = None;
-            session.shown = Shown {
-                bot: shown.bot,
-                works: shown.works,
-                memory: shown.memory,
-                dynamic: None,
-                staged_memories: shown.staged_memories,
-                session_generation: session.session_generation,
-                session_lineage: shown.session_lineage,
-                context: None,
-                memory_conflicts: shown.memory_conflicts,
-            };
+            session.shown.session_generation = session.session_generation;
+            session.shown.dynamic = None;
+            session.shown.context = None;
             generation = session.session_generation;
             if let Some(runtime) = &mut job.runtime {
                 runtime.session_generation = generation;

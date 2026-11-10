@@ -300,6 +300,24 @@ pub(crate) fn held_answer_subject_from(
     Ok(Some(subject))
 }
 
+fn held_delivery_subject_from(
+    connection: &Connection,
+    network: &str,
+    payload: &PeerCommand,
+) -> Result<Option<Subject>> {
+    let PeerCommand::Deliver {
+        conversation_id,
+        trigger,
+    } = payload
+    else {
+        return Ok(None);
+    };
+    let Some(("message", message_id)) = trigger.split_once(':') else {
+        return Ok(None);
+    };
+    held_answer_subject_from(connection, network, conversation_id, message_id)
+}
+
 fn held_answer_target(subject: &Subject) -> String {
     format!(
         "held_request:{}",
@@ -613,21 +631,7 @@ impl Store {
         payload: PeerCommand,
         source: (Option<u64>, u64, Vec<String>),
     ) -> Result<PeerOutbound> {
-        let held = match &payload {
-            PeerCommand::Deliver {
-                conversation_id,
-                trigger,
-            } => match trigger.split_once(':') {
-                Some(("message", message_id)) => held_answer_subject_from(
-                    &self.connection,
-                    network,
-                    conversation_id,
-                    message_id,
-                )?,
-                _ => None,
-            },
-            _ => None,
-        };
+        let held = held_delivery_subject_from(&self.connection, network, &payload)?;
         let owner_epoch = if held.is_some() {
             0
         } else {
@@ -1050,21 +1054,7 @@ impl Store {
         else {
             return Ok(false);
         };
-        let held = match &envelope.payload {
-            PeerCommand::Deliver {
-                conversation_id,
-                trigger,
-            } => match trigger.split_once(':') {
-                Some(("message", message_id)) => held_answer_subject_from(
-                    &self.connection,
-                    network,
-                    conversation_id,
-                    message_id,
-                )?,
-                _ => None,
-            },
-            _ => None,
-        };
+        let held = held_delivery_subject_from(&self.connection, network, &envelope.payload)?;
         ensure!(
             if held.is_some() {
                 envelope.owner_epoch == 0

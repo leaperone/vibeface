@@ -248,26 +248,50 @@ fn store(net: &Net) -> Result<Store> {
     Ok(store)
 }
 
+fn work_spec(local: &DeviceId, trigger: &str, call_ref: &str, provider: Provider) -> WorkSpec {
+    WorkSpec {
+        work_id: WorkSpec::id("c", trigger, call_ref),
+        conversation: "c".into(),
+        trigger: trigger.into(),
+        target: local.clone(),
+        dispatcher: local.clone(),
+        call_ref: call_ref.into(),
+        kind: WorkKind::Agent(provider),
+        model: None,
+        resolved: ResolvedModel {
+            provider,
+            model: None,
+        },
+        cwd: "/tmp".into(),
+        title: "t".into(),
+        prompt: "p".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+    }
+}
+
 fn user(net: &Net, id: &str, text: &str) -> EventBody {
-    net.a
-        .fixture_admin()
-        .attest(
-            &net.network,
-            "c",
-            EventBody::MessagePosted {
-                message_id: id.into(),
-                role: Role::User,
-                text: text.into(),
-                attachments: vec![],
-                report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
-                attestation: None,
-                failure: None,
-            },
-        )
-        .expect("fixture client signs")
+    signed_user(net, id, text, true).expect("fixture client signs")
+}
+
+fn signed_user(net: &Net, id: &str, text: &str, report_results: bool) -> Result<EventBody> {
+    net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::MessagePosted {
+            message_id: id.into(),
+            role: Role::User,
+            text: text.into(),
+            attachments: vec![],
+            report_results: Some(report_results),
+            in_reply_to: None,
+            status: None,
+            answers: None,
+            attestation: None,
+            failure: None,
+        },
+    )
 }
 
 fn signature(net: &Net, id: &str, text: &str) -> Result<Attestation> {
@@ -1066,22 +1090,7 @@ fn a_reply_stopped_before_it_started_is_recorded_once() -> Result<()> {
 }
 
 fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<()> {
-    let signed = net.a.fixture_admin().attest(
-        &net.network,
-        "c",
-        EventBody::MessagePosted {
-            message_id: id.into(),
-            role: Role::User,
-            text: id.into(),
-            attachments: vec![],
-            report_results: Some(report_results),
-            in_reply_to: None,
-            status: None,
-            answers: None,
-            attestation: None,
-            failure: None,
-        },
-    )?;
+    let signed = signed_user(net, id, id, report_results)?;
     store.accept_message(
         &net.a,
         &net.network,
@@ -1109,24 +1118,11 @@ fn native_start_reservations_cover_initial_resume_and_reject_cancelled_work() ->
         ("stopped", None, true),
     ] {
         let spec = WorkSpec {
-            work_id: WorkSpec::id("c", "message:source", reference),
-            conversation: "c".into(),
-            trigger: "message:source".into(),
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: reference.into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/work".into(),
             title: "work".into(),
             prompt: "read only".into(),
-            continues: None,
-            parent: None,
             thread: thread.map(str::to_owned),
+            ..work_spec(&local, "message:source", reference, Provider::Codex)
         };
         store.accept_work_fixture(&net.a, &net.network, spec.clone(), 3)?;
         if stopped {
@@ -1544,29 +1540,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         2,
     )?;
     let trigger = message_trigger("m1");
-    let spec = WorkSpec {
-        work_id: WorkSpec::id("c", &trigger, "call-1"),
-        conversation: "c".into(),
-        trigger: trigger.clone(),
-        target: net.a.device_id()?,
-        dispatcher: net.a.device_id()?,
-        call_ref: "call-1".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        cwd: "/tmp".into(),
-        title: "t".into(),
-        prompt: "p".into(),
-        continues: None,
-        parent: None,
-        thread: None,
-
-        model: None,
-
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-
-            model: None,
-        },
-    };
+    let spec = work_spec(&net.a.device_id()?, &trigger, "call-1", Provider::Codex);
     assert!(
         store
             .accept_work_fixture(&net.a, &net.network, spec.clone(), 3)?
@@ -1783,27 +1757,8 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
     let trigger = message_trigger("m1");
     let spec = |call: &str, target: &LocalIdentity| -> Result<WorkSpec> {
         Ok(WorkSpec {
-            work_id: WorkSpec::id("c", &trigger, call),
-            conversation: "c".into(),
-            trigger: trigger.clone(),
             target: target.device_id()?,
-            dispatcher: net.a.device_id()?,
-            call_ref: call.into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            cwd: "/tmp".into(),
-            title: "t".into(),
-            prompt: "p".into(),
-            continues: None,
-            parent: None,
-            thread: None,
-
-            model: None,
-
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-
-                model: None,
-            },
+            ..work_spec(&net.a.device_id()?, &trigger, call, Provider::Codex)
         })
     };
     let outcome = |store: &Store, id: &str| -> Result<Option<WorkOutcome>> {
@@ -5695,29 +5650,7 @@ fn shared_records_never_carry_a_known_credential() -> Result<()> {
         5,
     )?;
     let trigger = message_trigger("m1");
-    let spec = WorkSpec {
-        work_id: WorkSpec::id("c", &trigger, "call-1"),
-        conversation: "c".into(),
-        trigger,
-        target: net.a.device_id()?,
-        dispatcher: net.a.device_id()?,
-        call_ref: "call-1".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        cwd: "/tmp".into(),
-        title: "t".into(),
-        prompt: "p".into(),
-        continues: None,
-        parent: None,
-        thread: None,
-
-        model: None,
-
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-
-            model: None,
-        },
-    };
+    let spec = work_spec(&net.a.device_id()?, &trigger, "call-1", Provider::Codex);
     let id = spec.work_id.clone();
     origin.accept_work_fixture(&net.a, &net.network, spec, 6)?;
     for (signal, at) in [
@@ -6930,22 +6863,11 @@ fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<(
                 WorkSpec {
                     work_id: id.into(),
                     conversation: conversation.into(),
-                    trigger: trigger.into(),
-                    target: local.clone(),
-                    dispatcher: local.clone(),
-                    call_ref: id.into(),
-                    kind: WorkKind::Agent(Provider::Codex),
-                    model: None,
-                    resolved: ResolvedModel {
-                        provider: Provider::Codex,
-                        model: None,
-                    },
                     cwd: "/workspace/native".into(),
                     title: id.into(),
                     prompt: id.into(),
-                    continues: None,
-                    parent: None,
                     thread: Some("exact-native-thread".into()),
+                    ..work_spec(&local, trigger, id, Provider::Codex)
                 },
                 6,
             )?;
@@ -7360,22 +7282,16 @@ fn targetless_questions_require_current_matching_session_attributions() -> Resul
                 WorkSpec {
                     work_id: "unrelated-native-work".into(),
                     conversation: "d".into(),
-                    trigger: "message:unrelated".into(),
-                    target: identity.device_id()?,
-                    dispatcher: identity.device_id()?,
-                    call_ref: "unrelated".into(),
-                    kind: WorkKind::Agent(provider),
-                    model: None,
-                    resolved: ResolvedModel {
-                        provider,
-                        model: None,
-                    },
                     cwd: "/w".into(),
                     title: "unrelated".into(),
                     prompt: "unrelated".into(),
-                    continues: None,
-                    parent: None,
                     thread: Some("external-thread".into()),
+                    ..work_spec(
+                        &identity.device_id()?,
+                        "message:unrelated",
+                        "unrelated",
+                        provider,
+                    )
                 },
                 5,
             )?;
@@ -7814,23 +7730,11 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
             &net.network,
             WorkSpec {
                 work_id: "answered-external-session".into(),
-                conversation: "c".into(),
-                trigger: trigger.clone(),
-                target: net.a.device_id()?,
-                dispatcher: net.a.device_id()?,
-                call_ref: "answer".into(),
-                kind: WorkKind::Agent(Provider::Codex),
-                model: None,
-                resolved: ResolvedModel {
-                    provider: Provider::Codex,
-                    model: None,
-                },
                 cwd: "/w".into(),
                 title: "answer".into(),
                 prompt: "continue".into(),
-                continues: None,
-                parent: None,
                 thread: Some("t1".into()),
+                ..work_spec(&net.a.device_id()?, &trigger, "answer", Provider::Codex)
             },
             6,
         )?;
@@ -8206,23 +8110,16 @@ fn a_hand_over_from_an_old_version_writes_nothing() -> Result<()> {
     local.claim_session(&net.a, &net.network, "c", &about, 3)?;
     let work = WorkSpec {
         work_id: "handoff-history".into(),
-        conversation: "c".into(),
-        trigger: "message:m1".into(),
-        target: net.a.device_id()?,
-        dispatcher: net.a.device_id()?,
-        call_ref: "handoff-history".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/w".into(),
         title: "handoff".into(),
         prompt: "handoff".into(),
-        continues: None,
-        parent: None,
         thread: Some("s1".into()),
+        ..work_spec(
+            &net.a.device_id()?,
+            "message:m1",
+            "handoff-history",
+            Provider::Codex,
+        )
     };
     local.accept_work_fixture(&net.a, &net.network, work.clone(), 4)?;
     assert!(
@@ -8707,26 +8604,13 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
     for i in 0..30 {
         let spec = WorkSpec {
             work_id: format!("w{i:02}"),
-            conversation: "c".into(),
-            trigger: message_trigger("m49"),
-            target: net.a.device_id()?,
-            dispatcher: net.a.device_id()?,
-            call_ref: format!("call-{i}"),
-            kind: WorkKind::Agent(Provider::Codex),
-            cwd: "/tmp".into(),
-            title: "t".into(),
             prompt: "p".repeat(600),
-            continues: None,
-            parent: None,
-            thread: None,
-
-            model: None,
-
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-
-                model: None,
-            },
+            ..work_spec(
+                &net.a.device_id()?,
+                &message_trigger("m49"),
+                &format!("call-{i}"),
+                Provider::Codex,
+            )
         };
         store.accept_work_fixture(&net.a, &net.network, spec, 200 + i)?;
     }
@@ -9304,26 +9188,13 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     let work = |i: u64| -> Result<WorkSpec> {
         Ok(WorkSpec {
             work_id: format!("w{i}"),
-            conversation: "c".into(),
-            trigger: message_trigger("m1"),
-            target: net.a.device_id()?,
-            dispatcher: net.a.device_id()?,
-            call_ref: format!("call-{i}"),
-            kind: WorkKind::Agent(Provider::Codex),
-            cwd: "/tmp".into(),
-            title: "t".into(),
             prompt: "p".repeat(300),
-            continues: None,
-            parent: None,
-            thread: None,
-
-            model: None,
-
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-
-                model: None,
-            },
+            ..work_spec(
+                &net.a.device_id()?,
+                &message_trigger("m1"),
+                &format!("call-{i}"),
+                Provider::Codex,
+            )
         })
     };
     for i in 0..3 {
@@ -10137,23 +10008,9 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
     let local = net.a.device_id()?;
     let first = WorkSpec {
         work_id: "w0".into(),
-        conversation: "c".into(),
-        trigger: message_trigger("m1"),
-        target: local.clone(),
-        dispatcher: local.clone(),
-        call_ref: "call-0".into(),
-        kind: WorkKind::Agent(Provider::Codex),
         cwd: "/tmp/t-a".into(),
-        title: "t".into(),
-        prompt: "p".into(),
-        continues: None,
-        parent: None,
         thread: Some("t-a".into()),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
+        ..work_spec(&local, &message_trigger("m1"), "call-0", Provider::Codex)
     };
     store.accept_work_fixture(&net.a, &net.network, first.clone(), 10)?;
     store.accept_work_fixture(
@@ -10339,26 +10196,13 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
     for i in 0..30 {
         let spec = WorkSpec {
             work_id: format!("w{i:02}"),
-            conversation: "c".into(),
-            trigger: message_trigger("m"),
-            target: net.a.device_id()?,
-            dispatcher: net.a.device_id()?,
-            call_ref: format!("call-{i}"),
-            kind: WorkKind::Agent(Provider::Codex),
-            cwd: "/tmp".into(),
-            title: "t".into(),
             prompt: "p".repeat(2_000),
-            continues: None,
-            parent: None,
-            thread: None,
-
-            model: None,
-
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-
-                model: None,
-            },
+            ..work_spec(
+                &net.a.device_id()?,
+                &message_trigger("m"),
+                &format!("call-{i}"),
+                Provider::Codex,
+            )
         };
         store.accept_work_fixture(&net.a, &net.network, spec, 10 + i)?;
     }
@@ -11295,26 +11139,15 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
 fn isolated_task(store: &mut Store, net: &Net, work_id: &str) -> Result<WorkSpec> {
     let spec = WorkSpec {
         work_id: work_id.into(),
-        conversation: "c".into(),
-        trigger: message_trigger("m1"),
-        target: net.a.device_id()?,
-        dispatcher: net.a.device_id()?,
-        call_ref: work_id.into(),
         kind: WorkKind::Task,
-        cwd: "/tmp".into(),
         title: work_id.into(),
         prompt: "read the task".into(),
-        continues: None,
-        parent: None,
-        thread: None,
-
-        model: None,
-
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-
-            model: None,
-        },
+        ..work_spec(
+            &net.a.device_id()?,
+            &message_trigger("m1"),
+            work_id,
+            Provider::Codex,
+        )
     };
     assert!(
         store
@@ -11650,6 +11483,49 @@ fn held_tasks_leave_room_for_humans_and_machine_slots_are_real() -> Result<()> {
     Ok(())
 }
 
+fn record_execution_evidence_fixture(
+    store: &mut Store,
+    net: &Net,
+    job: &SchedulerJob,
+    evidence: &str,
+) -> Result<()> {
+    use crate::scheduling::TurnExecution;
+    use vibeface_bridge::failure::ProviderStage;
+
+    let attempt = job.state.attempt().context("attempt")?;
+    match evidence {
+        "unknown" | "started" => {
+            store.update_turn_runtime(
+                "c",
+                &job.trigger,
+                &attempt.id,
+                ProviderStage::TurnStart,
+                if evidence == "unknown" {
+                    TurnExecution::Unknown
+                } else {
+                    TurnExecution::Started
+                },
+            )?;
+        }
+        "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
+        "process" => store.record_manager_process(&attempt.id, 123)?,
+        "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
+        "pending" => {
+            store.connection.execute(
+            "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
+            params![attempt.id, job.trigger])?;
+        }
+        "running" => {
+            store.mark_started("c", &job.trigger, &attempt.id)?;
+        }
+        "cancelling" => {
+            store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[test]
 fn abandoned_claims_requeue_only_without_execution_evidence_and_fence_the_old_attempt() -> Result<()>
 {
@@ -11702,36 +11578,7 @@ fn abandoned_claims_requeue_only_without_execution_evidence_and_fence_the_old_at
                     },
                 )?;
             }
-            match evidence {
-                "unknown" | "started" => {
-                    store.update_turn_runtime(
-                        "c",
-                        &job.trigger,
-                        &attempt.id,
-                        ProviderStage::TurnStart,
-                        if evidence == "unknown" {
-                            TurnExecution::Unknown
-                        } else {
-                            TurnExecution::Started
-                        },
-                    )?;
-                }
-                "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
-                "process" => store.record_manager_process(&attempt.id, 123)?,
-                "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
-                "pending" => {
-                    store.connection.execute(
-                    "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
-                    params![attempt.id, job.trigger])?;
-                }
-                "running" => {
-                    store.mark_started("c", &job.trigger, &attempt.id)?;
-                }
-                "cancelling" => {
-                    store.request_manager_cancel(&net.a, &net.network, "c", &job.trigger)?;
-                }
-                _ => {}
-            }
+            record_execution_evidence_fixture(&mut store, &net, &job, evidence)?;
             let unstarted = matches!(evidence, "missing_runtime" | "not_started");
             if restarted {
                 store.recover_scheduler_jobs(&net.a, &net.network, "next-boot")?;
@@ -11785,9 +11632,6 @@ fn abandoned_claims_requeue_only_without_execution_evidence_and_fence_the_old_at
 
 #[test]
 fn scheduler_refunds_only_live_unstarted_reservations_on_their_original_utc_day() -> Result<()> {
-    use crate::scheduling::TurnExecution;
-    use vibeface_bridge::failure::ProviderStage;
-
     for evidence in [
         "not_started",
         "unknown",
@@ -11805,7 +11649,6 @@ fn scheduler_refunds_only_live_unstarted_reservations_on_their_original_utc_day(
             .claim_next_fixture(&net.a, &net.network, "c", "boot", "budget")?
             .context("claim")?
             .job;
-        let attempt = job.state.attempt().context("attempt")?;
         let reservation = store.reserve_scheduler_budget(&net.network, &job, 3, 5, 86_399_999)?;
         assert!(
             store
@@ -11816,30 +11659,7 @@ fn scheduler_refunds_only_live_unstarted_reservations_on_their_original_utc_day(
             "INSERT INTO budget_days(network_id,day,used) VALUES(?,'1970-01-02',4)",
             [&net.network],
         )?;
-        match evidence {
-            "unknown" | "started" => {
-                store.update_turn_runtime(
-                    "c",
-                    &job.trigger,
-                    &attempt.id,
-                    ProviderStage::TurnStart,
-                    if evidence == "unknown" {
-                        TurnExecution::Unknown
-                    } else {
-                        TurnExecution::Started
-                    },
-                )?;
-            }
-            "tool" => store.record_manager_tool_call("c", &job.trigger, &attempt.id)?,
-            "process" => store.record_manager_process(&attempt.id, 123)?,
-            "native" => store.record_manager_locator(&attempt.id, "system", "thread", None)?,
-            "pending" => {
-                store.connection.execute(
-                "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown',0)",
-                params![attempt.id, job.trigger])?;
-            }
-            _ => {}
-        }
+        record_execution_evidence_fixture(&mut store, &net, &job, evidence)?;
         let refunded = evidence == "not_started";
         assert_eq!(
             store.refund_scheduler_budget(
@@ -13609,6 +13429,39 @@ fn workspace_task_command(id: &str, parent: Option<&str>) -> crate::workspace::W
         reply_only: false,
     }
 }
+fn workspace_assigned_task_fixture(
+    net: &Net,
+    origin: &mut Store,
+    command_id: &str,
+    task_id: &str,
+    input_id: &str,
+    roots: &[String],
+    at: i64,
+) -> Result<(
+    crate::workspace::WorkspaceInput,
+    crate::workspace::Assignment,
+)> {
+    workspace_command_fixture(
+        net,
+        origin,
+        command_id,
+        workspace_task_command(task_id, None),
+        at,
+    )?;
+    let input = workspace_input_fixture(
+        net,
+        origin,
+        input_id,
+        Some(task_id),
+        crate::workspace::InputIntent::Continue,
+        at + 1,
+    )?;
+    let assignment = origin
+        .ensure_workspace_assignment(&net.a, &net.network, task_id, roots, at + 2)?
+        .context("assignment")?;
+    Ok((input, assignment))
+}
+
 fn workspace_input_fixture(
     net: &Net,
     origin: &mut Store,
@@ -13635,7 +13488,7 @@ fn workspace_input_fixture(
     let input = InputRequest {
         message_id: id.into(),
         route: InputRoute {
-            target: target.clone(),
+            target,
             intent,
             sequence: at as u64,
             expected_revision,
@@ -13644,28 +13497,7 @@ fn workspace_input_fixture(
         attachments: vec![],
         report_results: Some(true),
     };
-    let signed = net.a.fixture_admin().attest(
-        &net.network,
-        "c",
-        EventBody::InputPosted {
-            message_id: input.message_id.clone(),
-            target,
-            intent,
-            sequence: at as u64,
-            expected_revision: input.route.expected_revision,
-            text: input.text.clone(),
-            attachments: vec![],
-            report_results: Some(true),
-            attestation: None,
-        },
-    )?;
-    origin.post_workspace_input(
-        &net.a,
-        &net.network,
-        input,
-        signed.attestation().cloned().context("signed input")?,
-        at,
-    )
+    workspace_signed_input_fixture(net, origin, &net.a, input, at)
 }
 
 #[test]
@@ -13918,24 +13750,10 @@ fn workspace_signed_commands_inputs_and_task_history_are_scoped_and_idempotent()
         (message_trigger("main"), "main-work"),
     ] {
         let work = WorkSpec {
-            work_id: WorkSpec::id("c", &trigger, call_ref),
-            conversation: "c".into(),
-            trigger,
-            target: net.a.device_id()?,
-            dispatcher: net.a.device_id()?,
-            call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/workspace/history".into(),
             title: call_ref.into(),
             prompt: "report this work".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..work_spec(&net.a.device_id()?, &trigger, call_ref, Provider::Codex)
         };
         origin.accept_work_fixture(&net.a, &net.network, work.clone(), 19)?;
         origin.apply_work_signal(
@@ -14330,30 +14148,15 @@ fn workspace_old_revision_results_and_unknown_assignments_do_not_release_current
 {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
+    let (input, assignment) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
         "task",
-        workspace_task_command("task", None),
+        "task",
+        "m",
+        &["/workspace/project".into()],
         3,
     )?;
-    let input = workspace_input_fixture(
-        &net,
-        &mut origin,
-        "m",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(
-            &net.a,
-            &net.network,
-            "task",
-            &["/workspace/project".into()],
-            5,
-        )?
-        .context("assignment")?;
     let progress = |state, input_event, evidence_event| WorkspaceCommand::AssignmentProgress {
         execution: None,
         assignment_id: assignment.assignment_id.clone(),
@@ -14425,30 +14228,15 @@ fn workspace_old_revision_results_and_unknown_assignments_do_not_release_current
         origin.workspace_task(&net.network, "task")?.unwrap().state,
         TaskState::UpdatePending
     );
-    workspace_command_fixture(
+    let (_, other) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
         "task2",
-        workspace_task_command("task2", None),
+        "task2",
+        "m2",
+        &["/workspace/project/sub".into()],
         11,
     )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "m2",
-        Some("task2"),
-        InputIntent::Continue,
-        12,
-    )?;
-    let other = origin
-        .ensure_workspace_assignment(
-            &net.a,
-            &net.network,
-            "task2",
-            &["/workspace/project/sub".into()],
-            13,
-        )?
-        .context("assignment2")?;
     origin.apply_workspace_command(
         &net.a,
         &net.network,
@@ -14510,30 +14298,15 @@ fn workspace_old_revision_results_and_unknown_assignments_do_not_release_current
 fn workspace_revision_submission_waits_for_real_completion_evidence() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
+    let (initial, assignment) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
         "create",
-        workspace_task_command("task", None),
+        "task",
+        "m1",
+        &["/workspace/revision".into()],
         3,
     )?;
-    let initial = workspace_input_fixture(
-        &net,
-        &mut origin,
-        "m1",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(
-            &net.a,
-            &net.network,
-            "task",
-            &["/workspace/revision".into()],
-            5,
-        )?
-        .context("assignment")?;
     let command = |revision, state, input_event, evidence_event, result| {
         WorkspaceCommand::AssignmentProgress {
             execution: None,
@@ -14689,23 +14462,15 @@ fn workspace_attached_running_work_does_not_imply_task_revision_adoption() -> Re
     let work_id = WorkSpec::id("c", &trigger, "existing-work");
     let spec = WorkSpec {
         work_id: work_id.clone(),
-        conversation: "c".into(),
-        trigger,
-        target: net.a.device_id()?,
-        dispatcher: net.a.device_id()?,
-        call_ref: "existing-work".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/workspace/work".into(),
         title: "existing work".into(),
         prompt: "original work request".into(),
-        continues: None,
-        parent: None,
-        thread: None,
+        ..work_spec(
+            &net.a.device_id()?,
+            &trigger,
+            "existing-work",
+            Provider::Codex,
+        )
     };
     origin.accept_work_fixture(&net.a, &net.network, spec, 4)?;
     workspace_command_fixture(
@@ -14952,24 +14717,8 @@ fn workspace_concurrent_old_completion_is_preserved_after_a_new_revision() -> Re
 fn workspace_assignment_work_proof_is_frozen_and_requires_current_adoption() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    let input = workspace_input_fixture(
-        &net,
-        &mut origin,
-        "m1",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .context("assignment")?;
+    let (input, assignment) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "m1", &[], 3)?;
     let progress = |revision, state, source| WorkspaceCommand::AssignmentProgress {
         execution: None,
         assignment_id: assignment.assignment_id.clone(),
@@ -15447,24 +15196,8 @@ fn workspace_active_input_fences_removed_channel_members_without_invalidating_ol
 fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "original",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let original = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .unwrap();
+    let (_, original) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "original", &[], 3)?;
     let original_job = origin
         .scheduler_job("c", &message_trigger("original"))?
         .context("original job")?;
@@ -15561,24 +15294,15 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
         AssignmentState::Stopped
     );
     let (net, mut uncertain) = workspace_fixture()?;
-    workspace_command_fixture(
+    let (_, inflight) = workspace_assigned_task_fixture(
         &net,
         &mut uncertain,
         "create",
-        workspace_task_command("task", None),
+        "task",
+        "inflight",
+        &[],
         3,
     )?;
-    workspace_input_fixture(
-        &net,
-        &mut uncertain,
-        "inflight",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let inflight = uncertain
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .unwrap();
     let job = uncertain
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "inflight-revision")?
         .unwrap()
@@ -15657,24 +15381,8 @@ fn workspace_native_start_and_steering_recheck_current_assignment_authority() ->
     use crate::workspace::*;
     for started in [false, true] {
         let (net, mut origin) = workspace_fixture()?;
-        workspace_command_fixture(
-            &net,
-            &mut origin,
-            "create",
-            workspace_task_command("task", None),
-            3,
-        )?;
-        workspace_input_fixture(
-            &net,
-            &mut origin,
-            "input",
-            Some("task"),
-            InputIntent::Continue,
-            4,
-        )?;
-        let assignment = origin
-            .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-            .context("assignment")?;
+        let (_, assignment) =
+            workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "input", &[], 3)?;
         origin.apply_workspace_command(
             &net.a,
             &net.network,
@@ -15699,24 +15407,10 @@ fn workspace_native_start_and_steering_recheck_current_assignment_authority() ->
             .context("task job")?;
         let trigger = origin.scheduler_work_trigger(&net.network, &local, &job)?;
         let make = |call_ref: &str| WorkSpec {
-            work_id: WorkSpec::id("c", &trigger, call_ref),
-            conversation: "c".into(),
-            trigger: trigger.clone(),
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/workspace".into(),
             title: "native work".into(),
             prompt: "perform the accepted task".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..work_spec(&local, &trigger, call_ref, Provider::Codex)
         };
         let active = make(if started { "running" } else { "preparing" });
         let waiting = make("waiting");
@@ -15836,24 +15530,8 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     use crate::workspace::*;
     use vibeface_bridge::failure::ProviderStage;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "initial",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .context("assignment")?;
+    let (_, assignment) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "initial", &[], 3)?;
     let queued = origin
         .scheduler_job("c", &message_trigger("initial"))?
         .context("queued job")?;
@@ -15980,24 +15658,8 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
 fn workspace_cancelled_before_native_start_does_not_claim_revision_adoption() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "initial",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .context("assignment")?;
+    let (_, assignment) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "initial", &[], 3)?;
     let cancelled = origin
         .request_manager_cancel(&net.a, &net.network, "c", &message_trigger("initial"))?
         .context("cancelled job")?;
@@ -16169,24 +15831,10 @@ fn a_reserved_native_input_is_consumed_once_and_a_held_stop_prevents_the_first_w
     let local = net.a.device_id()?;
     for (call_ref, stop) in [("write", false), ("cancelled", true)] {
         let spec = WorkSpec {
-            work_id: WorkSpec::id("c", "message:source", call_ref),
-            conversation: "c".into(),
-            trigger: "message:source".into(),
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Pi),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Pi,
-                model: None,
-            },
             cwd: "/work".into(),
             title: "work".into(),
             prompt: "perform work".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..work_spec(&local, "message:source", call_ref, Provider::Pi)
         };
         origin.accept_work_fixture(&net.a, &net.network, spec.clone(), 3)?;
         assert!(origin.reserve_work_native_submission(&net.network, &spec, &spec.cwd, None)?);
@@ -16348,23 +15996,10 @@ fn workspace_remote_assignment_waits_for_the_target_nodes_ordinary_work_root() -
         &net.network,
         WorkSpec {
             work_id: work_id.clone(),
-            conversation: "c".into(),
-            trigger,
-            target: node_b.clone(),
-            dispatcher: node_b.clone(),
-            call_ref: "ordinary".into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/workspace/shared".into(),
             title: "ordinary work".into(),
             prompt: "existing write".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..work_spec(&node_b, &trigger, "ordinary", Provider::Codex)
         },
         5,
     )?;
@@ -16545,23 +16180,15 @@ fn an_agent_assigned_task_reports_its_real_work_without_reusing_the_main_cause()
     );
     let work = WorkSpec {
         work_id: "automatic-child-work".into(),
-        conversation: "c".into(),
-        trigger: format!("assignment:{}", assignment.assignment_id),
-        target: local.clone(),
-        dispatcher: local.clone(),
-        call_ref: "automatic-child-work".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/workspace/child".into(),
         title: "child".into(),
         prompt: "child".into(),
-        continues: None,
-        parent: None,
-        thread: None,
+        ..work_spec(
+            &local,
+            &format!("assignment:{}", assignment.assignment_id),
+            "automatic-child-work",
+            Provider::Codex,
+        )
     };
     origin.accept_work_fixture(&net.a, &net.network, work.clone(), 6)?;
     let (_, receipt) = origin.apply_work_signal(
@@ -16655,24 +16282,15 @@ fn a_replaced_assignment_cannot_reauthorize_its_running_work_result() -> Result<
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
     let local = net.a.device_id()?;
-    workspace_command_fixture(
+    let (_, first) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
         "create",
-        workspace_task_command("task", None),
+        "task",
+        "original",
+        &["/workspace/a".into()],
         3,
     )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "original",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let first = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &["/workspace/a".into()], 5)?
-        .unwrap();
     let human = origin
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "allocation-fence")?
         .unwrap()
@@ -16703,23 +16321,15 @@ fn a_replaced_assignment_cannot_reauthorize_its_running_work_result() -> Result<
         .event_hash;
     let work = WorkSpec {
         work_id: "fixed-result-work".into(),
-        conversation: "c".into(),
-        trigger: format!("assignment:{}", first.assignment_id),
-        target: local.clone(),
-        dispatcher: local.clone(),
-        call_ref: "fixed-result-work".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/workspace/a".into(),
         title: "result".into(),
         prompt: "result".into(),
-        continues: None,
-        parent: None,
-        thread: None,
+        ..work_spec(
+            &local,
+            &format!("assignment:{}", first.assignment_id),
+            "fixed-result-work",
+            Provider::Codex,
+        )
     };
     origin.accept_work_fixture(&net.a, &net.network, work.clone(), 8)?;
     let (_, receipt) = origin.apply_work_signal(
@@ -16827,24 +16437,8 @@ fn workspace_task_answer_keeps_the_assignment_from_the_signed_question_basis() -
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
     let local = net.a.device_id()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    workspace_input_fixture(
-        &net,
-        &mut origin,
-        "original",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let first = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .unwrap();
+    let (_, first) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "original", &[], 3)?;
     let running = origin
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "question-basis")?
         .unwrap()
@@ -17071,24 +16665,8 @@ fn workspace_release_retries_only_a_shared_proven_startup_failure_on_the_origina
     use crate::scheduling::TurnExecution;
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
-        &net,
-        &mut origin,
-        "create",
-        workspace_task_command("task", None),
-        3,
-    )?;
-    let input = workspace_input_fixture(
-        &net,
-        &mut origin,
-        "initial",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-        .unwrap();
+    let (input, assignment) =
+        workspace_assigned_task_fixture(&net, &mut origin, "create", "task", "initial", &[], 3)?;
     let claimed = origin
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "startup-retry")?
         .context("claimed job")?
@@ -17296,24 +16874,15 @@ fn workspace_release_does_not_infer_no_start_or_undo_a_user_stop() -> Result<()>
     use crate::workspace::*;
     for (explicit_proof, revise_before_release) in [(false, false), (true, false), (true, true)] {
         let (net, mut origin) = workspace_fixture()?;
-        workspace_command_fixture(
+        let (input, assignment) = workspace_assigned_task_fixture(
             &net,
             &mut origin,
             "create",
-            workspace_task_command("task", None),
+            "task",
+            "initial",
+            &[],
             3,
         )?;
-        let input = workspace_input_fixture(
-            &net,
-            &mut origin,
-            "initial",
-            Some("task"),
-            InputIntent::Continue,
-            4,
-        )?;
-        let assignment = origin
-            .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
-            .unwrap();
         let job = origin
             .claim_next_fixture(&net.a, &net.network, "c", "boot", "startup-retry")?
             .unwrap()
@@ -17463,24 +17032,11 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
         say(&mut origin, &net, "source", true)?;
         let local = net.a.device_id()?;
         let make = |call_ref: &str, cwd: &str| WorkSpec {
-            work_id: WorkSpec::id("c", "message:source", call_ref),
-            conversation: "c".into(),
-            trigger: "message:source".into(),
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Pi),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Pi,
-                model: None,
-            },
             cwd: cwd.into(),
             title: "work".into(),
             prompt: "do the work".into(),
-            continues: None,
-            parent: None,
             thread: thread.map(str::to_owned),
+            ..work_spec(&local, "message:source", call_ref, Provider::Pi)
         };
         let winner = make("winner", winner_cwd);
         let waiting = make("waiting", "/same-workspace");
@@ -17589,24 +17145,15 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
 fn assignment_works_reserve_overlapping_directories_individually() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    workspace_command_fixture(
+    let (input, assignment) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
         "create",
-        workspace_task_command("task", None),
+        "task",
+        "input",
+        &["/workspace".into()],
         3,
     )?;
-    let input = workspace_input_fixture(
-        &net,
-        &mut origin,
-        "input",
-        Some("task"),
-        InputIntent::Continue,
-        4,
-    )?;
-    let assignment = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &["/workspace".into()], 5)?
-        .context("assignment")?;
     for (command_id, state, input_event, at) in [
         ("accepted", AssignmentState::Accepted, None, 6),
         (
@@ -17641,24 +17188,10 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
     let local = net.a.device_id()?;
     let trigger = format!("assignment:{}", assignment.assignment_id);
     let make = |call_ref: &str, cwd: &str| WorkSpec {
-        work_id: WorkSpec::id("c", &trigger, call_ref),
-        conversation: "c".into(),
-        trigger: trigger.clone(),
-        target: local.clone(),
-        dispatcher: local.clone(),
-        call_ref: call_ref.into(),
-        kind: WorkKind::Agent(Provider::Pi),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Pi,
-            model: None,
-        },
         cwd: cwd.into(),
         title: "work".into(),
         prompt: "do the work".into(),
-        continues: None,
-        parent: None,
-        thread: None,
+        ..work_spec(&local, &trigger, call_ref, Provider::Pi)
     };
     let winner = make("winner", "/workspace/shared");
     let waiting = make("waiting", "/workspace/shared");
@@ -17747,24 +17280,10 @@ fn codex_shared_reservations_require_a_verified_turn_and_the_same_work_scope() -
         say(&mut origin, &net, "source", true)?;
         let local = net.a.device_id()?;
         let make = |call_ref: &str| WorkSpec {
-            work_id: WorkSpec::id("c", "message:source", call_ref),
-            conversation: "c".into(),
-            trigger: "message:source".into(),
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/shared".into(),
             title: "work".into(),
-            prompt: "p".into(),
-            continues: None,
-            parent: None,
             thread: Some("native".into()),
+            ..work_spec(&local, "message:source", call_ref, Provider::Codex)
         };
         let first = make("first");
         origin.accept_work_fixture(&net.a, &net.network, first.clone(), 3)?;
@@ -18104,23 +17623,10 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 &format!("assignment:{}", assignment.assignment_id),
                 "native",
             ),
-            conversation: "c".into(),
-            trigger: origin.scheduler_work_trigger(&net.network, &local, &manager)?,
-            target: local.clone(),
-            dispatcher: local.clone(),
-            call_ref: "native".into(),
-            kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/workspace".into(),
             title: "native task".into(),
             prompt: "perform the task".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..work_spec(&local, &origin.scheduler_work_trigger(&net.network, &local, &manager)?, "native", Provider::Codex)
         };
         origin.accept_work_fixture(&net.a, &net.network, work.clone(), 10)?;
         assert!(origin.reserve_work_native_submission(&net.network, &work, &work.cwd, None)?);
@@ -18729,24 +18235,15 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
     second_bot(&mut origin, &net, "Waiting Bot")?;
     workspace_input_fixture(&net, &mut origin, "writer", None, InputIntent::Continue, 3)?;
     let writer = WorkSpec {
-        work_id: WorkSpec::id("c", &message_trigger("writer"), "writer"),
-        conversation: "c".into(),
-        trigger: message_trigger("writer"),
-        target: local.clone(),
-        dispatcher: local.clone(),
-        call_ref: "writer".into(),
-        kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/workspace/shared".into(),
         title: "existing writer".into(),
         prompt: "existing writer".into(),
-        continues: None,
-        parent: None,
-        thread: None,
+        ..work_spec(
+            &local,
+            &message_trigger("writer"),
+            "writer",
+            Provider::Codex,
+        )
     };
     origin.accept_work_fixture(&net.a, &net.network, writer.clone(), 4)?;
     origin.apply_work_signal(
