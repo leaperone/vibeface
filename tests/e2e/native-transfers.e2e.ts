@@ -399,7 +399,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(firstProbe.authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
-  await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();
+  await screen.getByRole('button', '复制Codex 登录命令', { exact: true }).click();
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
@@ -624,8 +624,9 @@ test('receives a charity file through a real native pairing and verifies the sav
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   await screen.getByLabel('设置', { exact: true }).click();
-  await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'down' });
-  await screen.getByRole('link', '发送和接收文件', { exact: true }).click();
+  await screen.scrollUntilVisible(screen.getByRole('link', '实验室', { exact: true }), { direction: 'down' });
+  await screen.getByRole('link', '实验室', { exact: true }).click();
+  await screen.getByRole('link', '文件传输', { exact: true }).click();
   await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible();
   await expect(screen.getByText('启用文件传输', { exact: true }).first()).toBeVisible();
   const bytes = randomBytes(96 * 1024), name = 'native-charity-original.bin';

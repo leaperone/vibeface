@@ -35,6 +35,7 @@ use vibeface_secure::link::{Addr, NodeLink};
 
 pub const DEFAULT_NETWORK: &str = "vibeface";
 const MAX_BOOTSTRAP: usize = 16;
+const MAX_ADVERTISE: usize = 8;
 const MAX_MESSAGE: usize = 4096;
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(600);
 /// Changes are announced at most this often; tests wait less, their records still dated 30 s
@@ -50,6 +51,11 @@ const PAGE_RECORDS: usize = 2000;
 const PAGE_BYTES: usize = 4 << 20;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const ANSWERING: usize = 16;
+/// Of those, the ones answered at once for one device, so a single neighbor cannot hold all.
+const ANSWERING_PER_PEER: usize = 4;
+/// Below this many neighbors a Node joins the bootstrap nodes it lacks again. A join displaces
+/// one of the bootstrap node's at most 5 neighbors, so well-connected Nodes leave it alone.
+const FEW_NEIGHBORS: usize = 3;
 const LOOKUP_BUDGET: Duration = Duration::from_secs(8);
 const LOOKUP_NEIGHBORS: usize = 3;
 /// Remembered Nodes tried when joining again, besides the bootstrap nodes.
@@ -76,6 +82,10 @@ const PROBE_EVERY: Duration = if cfg!(test) {
 /// the bootstrap nodes, and pages pulled from them, are not limited.
 const NEW_RECORDS_PER_SECOND: f64 = 20.0;
 const NEW_RECORDS_BURST: f64 = 200.0;
+/// Digest pages answered to every device together, per second and at once, so devices taking
+/// turns cannot keep this Node sending pages of up to 4 MiB.
+const PAGES_PER_SECOND: f64 = 4.0;
+const PAGES_BURST: f64 = 32.0;
 /// Changes to the table are written to `mesh.sqlite3` together, this long after the first.
 const WRITE_WINDOW: Duration = Duration::from_millis(200);
 /// The largest exchange request; a digest's filter takes most of it.
@@ -98,6 +108,11 @@ pub struct MeshConfig {
     /// Use gateways and relays on private and loopback addresses, as a LAN group or test does.
     #[serde(default)]
     pub allow_private: bool,
+    /// UDP addresses others reach this Node at that its interfaces do not show, such as a cloud
+    /// host's public address in front of a container. They go first in the mesh record and the
+    /// node link.
+    #[serde(default)]
+    pub advertise: Vec<SocketAddr>,
 }
 
 fn default_network() -> String {
@@ -111,6 +126,7 @@ impl Default for MeshConfig {
             network: default_network(),
             bootstrap: vec![],
             allow_private: false,
+            advertise: vec![],
         }
     }
 }
@@ -128,6 +144,18 @@ impl MeshConfig {
                 seen.insert(bootstrap_link(value)?.id),
                 "a bootstrap node is listed once"
             );
+        }
+        ensure!(
+            self.advertise.len() <= MAX_ADVERTISE,
+            "at most {MAX_ADVERTISE} advertised addresses"
+        );
+        let mut seen = HashSet::new();
+        for address in &self.advertise {
+            ensure!(
+                !address.ip().is_unspecified() && address.port() != 0,
+                "an advertised address names a host and a UDP port: {address}"
+            );
+            ensure!(seen.insert(address), "an advertised address is listed once");
         }
         Ok(())
     }
@@ -287,6 +315,14 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
     known
 }
 
+/// The `peers` that are not `neighbors`.
+fn absent(peers: Vec<EndpointId>, neighbors: &HashSet<EndpointId>) -> Vec<EndpointId> {
+    peers
+        .into_iter()
+        .filter(|peer| !neighbors.contains(peer))
+        .collect()
+}
+
 /// Whether a current record in `entries` offers `url` as a relay open to any device.
 pub fn open_relay<'a>(entries: impl IntoIterator<Item = &'a Entry>, url: &RelayUrl) -> bool {
     let now = now_ms();
@@ -433,24 +469,31 @@ enum Delivery {
 struct Bucket {
     tokens: f64,
     at: Instant,
+    rate: f64,
+    burst: f64,
     /// When dropping this neighbor's records was last logged.
     logged_at: Option<Instant>,
 }
 
 impl Bucket {
     fn new() -> Self {
+        Self::with(NEW_RECORDS_PER_SECOND, NEW_RECORDS_BURST)
+    }
+
+    fn with(rate: f64, burst: f64) -> Self {
         Self {
-            tokens: NEW_RECORDS_BURST,
+            tokens: burst,
             at: Instant::now(),
+            rate,
+            burst,
             logged_at: None,
         }
     }
 
     fn take(&mut self) -> bool {
         let now = Instant::now();
-        self.tokens = (self.tokens
-            + now.duration_since(self.at).as_secs_f64() * NEW_RECORDS_PER_SECOND)
-            .min(NEW_RECORDS_BURST);
+        self.tokens =
+            (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.burst);
         self.at = now;
         if self.tokens < 1.0 {
             return false;
@@ -464,6 +507,7 @@ pub struct Mesh {
     pub network: String,
     device_id: String,
     allow_private: bool,
+    advertise: Vec<SocketAddr>,
     endpoint: Endpoint,
     /// The Net's address book, where bootstrap nodes' addresses go.
     lookup: MemoryLookup,
@@ -488,9 +532,13 @@ pub struct Mesh {
     /// Asks the announcer to check this Node's record.
     wake: Notify,
     limits: Mutex<HashMap<EndpointId, Limit>>,
+    /// Digest pages answered to every device together.
+    pages: Mutex<Bucket>,
     /// Exchange requests answered at once from every device together, each within 30 s, so
     /// pages nobody reads hold at most these permits' worth of memory.
     answering: Arc<tokio::sync::Semaphore>,
+    /// Each connected device's share of `answering`, dropped with its last connection.
+    answering_peers: Mutex<HashMap<EndpointId, Arc<tokio::sync::Semaphore>>>,
     gateway_checks: Mutex<HashMap<(String, String), (bool, Instant)>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -518,6 +566,7 @@ impl Mesh {
             network: config.network.clone(),
             device_id: own,
             allow_private: config.allow_private,
+            advertise: config.advertise.clone(),
             endpoint: endpoint.clone(),
             lookup: net.lookup.clone(),
             gossip,
@@ -537,7 +586,9 @@ impl Mesh {
             gossip_bucket: Mutex::new(Bucket::new()),
             wake: Notify::new(),
             limits: Mutex::new(HashMap::new()),
+            pages: Mutex::new(Bucket::with(PAGES_PER_SECOND, PAGES_BURST)),
             answering: Arc::new(tokio::sync::Semaphore::new(ANSWERING)),
+            answering_peers: Mutex::new(HashMap::new()),
             gateway_checks: Mutex::new(HashMap::new()),
             tasks: Mutex::new(vec![]),
         });
@@ -929,7 +980,18 @@ impl Mesh {
                 .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
                 .collect()
         };
+        for peer in self.bootstrap_peers().await {
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        peers
+    }
+
+    /// The bootstrap nodes other than this one, whose addresses go to the address book.
+    async fn bootstrap_peers(&self) -> Vec<EndpointId> {
         let bootstrap = self.bootstrap.lock().expect("mesh bootstrap").clone();
+        let mut peers = Vec::new();
         for value in bootstrap {
             let Ok(link) = bootstrap_link(&value) else {
                 continue;
@@ -937,7 +999,7 @@ impl Mesh {
             let Ok(addr) = super::link_addr(&link).await else {
                 continue;
             };
-            if addr.id == self.endpoint.id() || peers.contains(&addr.id) {
+            if addr.id == self.endpoint.id() {
                 continue;
             }
             peers.push(addr.id);
@@ -1122,8 +1184,9 @@ impl Mesh {
         Ok(vibeface_secure::Identity::from_secret_hex(&secret)?.sign(record::DOMAIN, payload)?)
     }
 
-    /// Public addresses first, then local ones. Reachable from anywhere when a public address
-    /// keeps a port this endpoint is bound to: the host has it, or its NAT maps one to one.
+    /// Advertised addresses first, then public and local ones. Reachable from anywhere when a
+    /// public address keeps a port this endpoint is bound to: the host has it, or its NAT or
+    /// container maps one to one.
     fn own_record(&self, now: u64) -> MeshRecord {
         let addr = self.endpoint.addr();
         let ports: Vec<u16> = self
@@ -1135,6 +1198,7 @@ impl Mesh {
         let public = |address: &&SocketAddr| crate::fetch::public(address.ip());
         let mut addrs: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
         addrs.sort_by_key(|address| !crate::fetch::public(address.ip()));
+        let mut addrs = super::advertised_first(&self.advertise, addrs);
         addrs.truncate(8);
         let reachable = if addrs
             .iter()
@@ -1161,18 +1225,28 @@ impl Mesh {
     }
 
     /// Joins again through the remembered and bootstrap Nodes while this Node has no neighbor,
-    /// backing off from 30 s to 5 minutes.
+    /// backing off from 30 s to 5 minutes. With fewer than 3 neighbors, it joins the bootstrap
+    /// nodes that are not among them every 5 minutes, so one that restarted is a neighbor again.
     async fn rejoin(self: Arc<Self>) {
         let mut wait = JOIN_RETRY;
+        let mut bootstrap_at = Instant::now();
         loop {
             tokio::time::sleep(wait).await;
-            if self.neighbors.lock().expect("mesh neighbors").is_empty() {
+            let neighbors = self.neighbors.lock().expect("mesh neighbors").clone();
+            if neighbors.is_empty() {
                 let peers = self.candidates().await;
                 tracing::debug!(event = "mesh.rejoin", peers = peers.len());
                 self.join(peers).await;
                 wait = (wait * 2).min(JOIN_RETRY_MAX);
+                bootstrap_at = Instant::now();
             } else {
                 wait = JOIN_RETRY;
+                if neighbors.len() < FEW_NEIGHBORS && bootstrap_at.elapsed() >= JOIN_RETRY_MAX {
+                    bootstrap_at = Instant::now();
+                    let peers = absent(self.bootstrap_peers().await, &neighbors);
+                    tracing::debug!(event = "mesh.rejoin_bootstrap", peers = peers.len());
+                    self.join(peers).await;
+                }
             }
         }
     }
@@ -1216,8 +1290,16 @@ impl Mesh {
 
     async fn serve(self: Arc<Self>, connection: Connection) {
         let remote = connection.remote_id();
-        let limit = (self.answering.clone(), EXCHANGE_TIMEOUT);
+        let peer = self
+            .answering_peers
+            .lock()
+            .expect("mesh answering")
+            .entry(remote)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(ANSWERING_PER_PEER)))
+            .clone();
+        let limit = (self.answering.clone(), peer, EXCHANGE_TIMEOUT);
         let mesh = Arc::downgrade(&self);
+        let held = mesh.clone();
         drop(self);
         serve_streams_within(
             connection,
@@ -1234,6 +1316,15 @@ impl Mesh {
             },
         )
         .await;
+        if let Some(mesh) = held.upgrade() {
+            let mut peers = mesh.answering_peers.lock().expect("mesh answering");
+            if peers
+                .get(&remote)
+                .is_some_and(|peer| Arc::strong_count(peer) == 1)
+            {
+                peers.remove(&remote);
+            }
+        }
     }
 
     /// Answers one exchange request from `remote`.
@@ -1242,6 +1333,11 @@ impl Mesh {
             Request::Digest { have } => {
                 self.admit(remote, true)?;
                 let (records, more) = self.page(&have)?;
+                // Only pages that carry records cost this Node bandwidth.
+                ensure!(
+                    records.is_empty() || self.pages.lock().expect("mesh pages").take(),
+                    "this Node is answering too many mesh digests; ask again later"
+                );
                 if let Some(limit) = self.limits.lock().expect("mesh limits").get_mut(&remote) {
                     limit.more = more;
                 }
@@ -1565,6 +1661,33 @@ mod tests {
             ..MeshConfig::default()
         };
         assert!(twice.validate().is_err());
+        let advertise = |addrs: &[&str]| MeshConfig {
+            advertise: addrs.iter().map(|addr| addr.parse().unwrap()).collect(),
+            ..MeshConfig::default()
+        };
+        assert!(
+            advertise(&["203.0.113.7:4792", "[2001:db8::1]:4792"])
+                .validate()
+                .is_ok()
+        );
+        for bad in [
+            &["203.0.113.7:4792", "203.0.113.7:4792"][..],
+            &["0.0.0.0:4792"],
+            &["203.0.113.7:0"],
+            &["203.0.113.7:1"; 9],
+        ] {
+            assert!(advertise(bad).validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejoining_takes_the_bootstrap_nodes_that_are_not_neighbors() {
+        let ids: Vec<EndpointId> = (1..=3u8)
+            .map(|n| iroh::SecretKey::from_bytes(&[n; 32]).public())
+            .collect();
+        let neighbors = HashSet::from([ids[1]]);
+        assert_eq!(absent(ids.clone(), &neighbors), [ids[0], ids[2]]);
+        assert!(absent(ids.clone(), &ids.iter().copied().collect()).is_empty());
     }
 
     struct Node {
@@ -1585,6 +1708,7 @@ mod tests {
                 network: "loopback".into(),
                 bootstrap,
                 allow_private: true,
+                advertise: vec![],
             };
             net.start_mesh(&mesh, db).await?;
             let mesh = net.mesh().context("the mesh did not start")?;

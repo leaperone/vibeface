@@ -598,6 +598,7 @@ def expected_asset_names(release_app, version_value, ios_signed=False):
 
 PART_KINDS = ('app', 'native', 'desktop', 'android', 'ios')
 BUILDING_MARKER = 'BUILDING — incomplete'
+FAILED_MARKER = 'FAILED — incomplete'
 
 
 def product_payload_names(version_value, ios_signed=False):
@@ -643,6 +644,12 @@ def progressive_part_inventory(version_value, ios_signed=False):
 
 def product_building_notes(info):
     return (f'{BUILDING_MARKER}; manual verified platform downloads may be available on this Release; '
+            f'automated install or update waits for the global release manifest.\n\n'
+            f"product {info['version']}; source {info['source_commit']}.")
+
+
+def product_failed_notes(info):
+    return (f'{FAILED_MARKER}; the release run failed and rerunning its failed jobs resumes it; '
             f'automated install or update waits for the global release manifest.\n\n'
             f"product {info['version']}; source {info['source_commit']}.")
 
@@ -899,6 +906,21 @@ def begin_product(repo=GITHUB_REPO):
     return expected
 
 
+def fail_product(repo=GITHUB_REPO):
+    """Mark a BUILDING product Release whose run failed before its manifest; a rerun restores it."""
+    expected = require_product_publishing()
+    tag = expected['tag']
+    view = release_view(tag, repo)
+    if view is None or BUILDING_MARKER not in (view.get('body') or ''):
+        return expected
+    if 'release.json' in remote_assets_by_name(list_release_assets(tag, repo)):
+        return expected
+    require(not release_record(tag, repo).get('immutable'), 'release is immutable')
+    subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', product_failed_notes(expected)],
+                   check=True)
+    return expected
+
+
 def publish_part(kind, directory, target=None, repo=GITHUB_REPO):
     """Validate and append one progressive product part without touching the final manifest."""
     part = verify_part_directory(kind, directory, target)
@@ -966,7 +988,7 @@ def finalize_progressive_product(directory, expected, info, repo=GITHUB_REPO):
                 remote_by_name = remote_assets_by_name(list_release_assets(tag, repo))
                 require('release.json' in remote_by_name, 'uploaded manifest missing after write')
             confirm_remote_asset(tag, repo, remote_by_name['release.json'], manifest_sha, manifest_size, scratch)
-    if BUILDING_MARKER in (view.get('body') or ''):
+    if BUILDING_MARKER in (view.get('body') or '') or FAILED_MARKER in (view.get('body') or ''):
         require(not record.get('immutable'), 'release is immutable')
         subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', product_complete_notes(info),
                         '--latest=false', f'--prerelease={str(info["channel"] != "stable").lower()}'], check=True)
@@ -1906,6 +1928,7 @@ def main():
     p.add_argument('app', choices=RELEASES)
     p.add_argument('directory', type=Path)
     sub.add_parser('begin-product')
+    sub.add_parser('fail-product')
     p = sub.add_parser('publish-part')
     p.add_argument('--kind', choices=PART_KINDS, required=True)
     p.add_argument('--input', type=Path, required=True)
@@ -1942,6 +1965,8 @@ def main():
         publish(args.app, args.directory)
     elif args.command == 'begin-product':
         print(json.dumps(begin_product()))
+    elif args.command == 'fail-product':
+        print(json.dumps(fail_product()))
     elif args.command == 'publish-part':
         print(json.dumps(publish_part(args.kind, args.input, target=args.target), sort_keys=True))
     elif args.command == 'verify-public':
