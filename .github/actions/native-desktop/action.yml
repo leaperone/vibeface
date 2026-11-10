@@ -12,7 +12,7 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libasound2-dev libudev-dev libvulkan-dev libclang-dev libssl-dev libzstd-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxext-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-xinput-dev libxcb-cursor-dev libxcb-sync-dev libxcb-present-dev libxcb-dri3-dev xvfb xdotool imagemagick fonts-noto-cjk mesa-vulkan-drivers patchelf squashfs-tools
+        sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libasound2-dev libudev-dev libvulkan-dev libclang-dev libssl-dev libzstd-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxext-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-xinput-dev libxcb-cursor-dev libxcb-sync-dev libxcb-present-dev libxcb-dri3-dev xvfb xauth xdotool imagemagick fonts-noto-cjk mesa-vulkan-drivers patchelf squashfs-tools
         architecture="$(uname -m)"
         case "$architecture" in
           x86_64) digest=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
