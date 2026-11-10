@@ -1860,13 +1860,19 @@ def fixture_manager(run, initial, bot):
         completed = fixture_cli(initial, "tool", name, "--json", json.dumps(arguments),
                                 "--call-ref", arguments["call_ref"], check=False)
         accepted = completed.returncode == 0
+        result = json.loads(completed.stdout) if accepted else None
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"], "trigger": trigger,
                        "name": name, "cli": True, "accepted": accepted, "expected": expected,
-                       "call_ref": arguments["call_ref"], "result": json.loads(completed.stdout) if accepted else None,
+                       "call_ref": arguments["call_ref"], "result": result,
                        "error": completed.stderr[-2048:]})
         require(accepted == expected and (accepted or rejection in completed.stderr),
                 name + " from the Shell has its expected outcome: " + completed.stderr[-300:])
-        return json.loads(completed.stdout) if accepted else None
+        if accepted:
+            record = result["call_record"]
+            require(record["tool"] == name and record["call_ref"] == arguments["call_ref"] and record["stage"] == "result"
+                    and (record["confirmation"] not in {"unknown", "pending"} or record["retry"] == "lookup_same_ref"),
+                    "the Shell preserves call identity and the Node's reconciliation requirement")
+        return result
 
     if directive.get("paid_delivery_security") is True:
         fixture_paid_principals(run, initial, bot, tool)
