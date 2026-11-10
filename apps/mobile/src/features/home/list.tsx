@@ -2,7 +2,7 @@ import { Link, usePathname, type Href } from 'expo-router'
 import { BellRing, Bot, ChevronRight, Inbox, ListChecks, MessagesSquare, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
-import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
+import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { ConnectionMenu, OfflineBar } from '@/components/connection-pill'
@@ -16,21 +16,18 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { offlineCopy, recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
-import { useInbox, useLive } from '@/data/live'
-import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
+import { useLive, useWaiting } from '@/data/live'
 import { emptyHome } from '@vibeface/client/workspace/home.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import { ErrorText } from '@/components/action'
+import { fadeIn, fadeOut, move } from '@/lib/motion'
 import { listTime } from '@/lib/time'
 import { useRun } from '@/lib/use-run'
 import { cn } from '@/lib/utils'
 import { mobilePlatform } from '@/platform'
 
-const Item = withUniwind(Animated.View)
 // A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
-const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMotion(ReduceMotion.System)
-const fadeIn = FadeIn.duration(200).reduceMotion(ReduceMotion.System)
-const fadeOut = FadeOut.duration(150).reduceMotion(ReduceMotion.System)
+const Item = withUniwind(Animated.View)
 
 /**
  * The home list: a 待处理 card while something waits, then every bot by its newest message. As a sidebar it draws its
@@ -48,7 +45,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   useEffect(() => { void latest.current?.readWorkspaceState().catch(() => {}) }, [shared?.generation])
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const empty = emptyHome({ synced: Boolean(shared?.synced), link: device.link })
-  const waiting = waitingItems(useInbox()).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
+  const waiting = useWaiting()
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
@@ -68,7 +65,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
-        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
+        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border px-3 py-2.5 active:bg-muted', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
           <View className={cn('size-11 items-center justify-center rounded-full', device.pendingRecovery ? 'bg-danger/15' : 'bg-warning/15')}><Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={device.pendingRecovery ? 'text-danger' : 'text-warning'} /></View>
           <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
           <Icon as={ChevronRight} className="text-muted-foreground" />
@@ -121,7 +118,7 @@ function NotifyTip() {
   const { busy, error, run } = useRun()
   if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
-    <View className="min-h-16 flex-row items-center gap-3 rounded-2xl border border-border bg-card py-2.5 ps-3 pe-1">
+    <View className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card py-2.5 ps-3 pe-1">
       <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
       <Text className="min-w-0 flex-1 font-medium">{waitingCopy.notifyTip}</Text>
       <Button size="sm" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>

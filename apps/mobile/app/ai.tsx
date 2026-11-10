@@ -117,7 +117,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
   const using = [assistant ? roles.bot : null, execution ? roles.execution : null].filter((role) => role !== null)
   return <View className={cn(!first && 'border-t border-border')}>
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state.label].join('，')}
-      className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted/60" onPress={() => setOpen(!open)}>
+      className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted" onPress={() => setOpen(!open)}>
       <Icon as={providerIcons[item.provider]} className={usable === 'missing' ? 'text-muted-foreground/60' : 'text-muted-foreground'} />
       <Text numberOfLines={1} className={cn('min-w-0 flex-1 font-medium', usable === 'missing' && 'text-muted-foreground')}>{name}</Text>
       {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-muted-foreground" />)}
