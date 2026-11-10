@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use vibeface_control::observation::{hex32, question_lines};
-pub use vibeface_control::observation::{interactive_codex, rollout_meta};
 
 pub const HOOK_ANSWER_WITHIN_SECS: u64 = 30;
 pub const SPOOL_DIR: &str = "hook-spool";

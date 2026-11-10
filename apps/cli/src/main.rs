@@ -16,6 +16,7 @@ use vibeface_bridge::platform::privatefs;
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
+    observation,
 };
 
 mod desktop_node;
@@ -1753,8 +1754,8 @@ fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEve
                     .map(|_| line)
                 })
                 .unwrap_or_default();
-            let meta = triage::rollout_meta(&first);
-            triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+            let meta = observation::rollout_meta(&first);
+            observation::interactive_codex(&meta["source"], meta["originator"].as_str())
                 .then(|| triage::from_hook(agent, input, 0))
                 .flatten()
         }
