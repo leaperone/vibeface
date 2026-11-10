@@ -1,4 +1,5 @@
 import { Bot, CirclePause, CircleX, Clock, Paperclip, RotateCcw } from 'lucide-react-native'
+import { memo } from 'react'
 import { View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
@@ -21,9 +22,10 @@ const ended: Record<string, string> = { stopped: '已中断', interrupted: '已�
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
  * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
- * `retry`: 重试 after this reply failed or was stopped.
+ * `retry`: 重试 after this reply failed or was stopped. Memoised: history messages keep their identity while a reply
+ * streams, so only the streaming one re-renders.
  */
-export function Message({ message, bot, time: shown, offline, retry }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown> }) {
+export const Message = memo(function Message({ message, bot, time: shown, offline, retry }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown> }) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
@@ -62,4 +64,4 @@ export function Message({ message, bot, time: shown, offline, retry }: { message
     {raw ? <Details><Text selectable className="font-mono text-meta text-muted-foreground">{raw}</Text></Details> : null}
     {time ? <View className="-mt-1.5">{time}</View> : null}
   </Rise>
-}
+})
