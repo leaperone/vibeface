@@ -20,12 +20,13 @@ import {
 import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
 import { avatarWrite } from "../avatar/pick.ts"
-import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions, mergeWorkspaceState } from "./records.ts"
+import { mergeConversation, mergeWorkspaceState } from "./records.ts"
+import { HistoryRequests, mergeConversationSnapshot, mergeHistoryPage, readConversationHistory } from "./history.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
-  AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
+  HistorySection, AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
   InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
@@ -119,6 +120,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const dataRef = useRef<ConversationPayload | null>(null)
   const readConnection = useRef<ReadyConnection | null>(null)
   const readSequence = useRef(0)
+  const historyRequests = useRef(new HistoryRequests())
+  const [historyLoading, setHistoryLoading] = useState<ReadonlySet<HistorySection>>(new Set())
   const messagesRef = useRef<PendingMessage[]>([])
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
@@ -221,6 +224,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     activeId.current = id
     readSequence.current += 1
+    historyRequests.current.reset()
+    setHistoryLoading(new Set())
     dataRef.current = null
     onScreen.current = null
     setFresh(new Set<string>())
@@ -231,12 +236,53 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
+    const baseline = dataRef.current
+    const generation = connection.generation
     const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
-    if (activeId.current !== id) throw new Error("对话有更新。再查一次。")
+    if (renderedConnection.current !== connection || connection.generation !== generation || activeId.current !== id) throw new Error("对话有更新。再查一次。")
     // A newer read of this conversation shows its own result; this one is still a fresh read for the caller.
     if (sequence !== readSequence.current) return next
-    return showConversation(id, next)
+    if (dataRef.current && dataRef.current.history_authority !== next.history_authority) {
+      historyRequests.current.reset()
+      setHistoryLoading(new Set())
+    }
+    return showConversation(id, mergeConversationSnapshot(dataRef.current, next, baseline))
+  }
+  const cancelHistory = (section: HistorySection) => {
+    historyRequests.current.cancel(section)
+    setHistoryLoading((previous) => new Set([...previous].filter((item) => item !== section)))
+  }
+  const loadHistory = async (section: HistorySection) => {
+    const shown = requireContext(), id = activeId.current, generation = connection.generation
+    if (shown.history[section].complete) return
+    const request = historyRequests.current.start(section)
+    if (!request) return
+    setHistoryLoading((previous) => new Set([...previous, section]))
+    const valid = () => request.current() && current() && renderedConnection.current === connection && connection.generation === generation && activeId.current === id && dataRef.current?.history_authority === shown.history_authority
+    try {
+      await readConversationHistory({ rpc: (method, params) => connection.rpc(method, params), conversationId: id, section, cursor: shown.history[section].next_cursor, authority: shown.history_authority, current: valid, apply: (page) => {
+        const latest = dataRef.current
+        if (!latest) return
+        const next = mergeHistoryPage(latest, page)
+        dataRef.current = next
+        setData(next)
+      } })
+    } catch (caught) {
+      if (!valid()) return
+      if (messageOf(caught).includes('history changed; refresh the conversation')) {
+        historyRequests.current.reset()
+        setHistoryLoading(new Set())
+        dataRef.current = null
+        setData(null)
+        await readConversation(id)
+        return
+      }
+      throw caught
+    } finally {
+      if (request.current()) cancelHistory(section)
+      request.finish()
+    }
   }
   const notificationForMain = (notification: NotificationRecord, id: string) => notification.conversation_id === id && isMainNotification(notification, botsRef.current.find((bot) => bot.conversation_id === id)?.bot_id)
   const acknowledgeNotification = async (notification: NotificationRecord) => {
@@ -407,16 +453,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   refreshRef.current = refresh
   /** One pushed change merged in place; a full read only when a read races it or it does not parse. */
   const applyRecords = async (value: Record<string, unknown>) => {
-    const parsed = parseRecords(value), records = { ...parsed, notifications: unreadSince(parsed.notifications) }, id = records.conversation_id
+    const records = parseRecords(value), id = records.conversation_id
+    if (records.refresh_metadata) scheduleRefresh()
+    if (id === activeId.current && dataRef.current && records.history_authority !== dataRef.current.history_authority) {
+      readSequence.current += 1; historyRequests.current.reset(); setHistoryLoading(new Set()); dataRef.current = null; setData(null); scheduleRefresh(); return
+    }
     if (refreshingRef.current || viewRef.current === "tasks") scheduleRefresh()
-    setQuestions((previous) => mergeQuestions(previous, records))
-    setBots((previous) => mergeBots(previous, records))
-    openWorksRef.current = mergeOpenWorks(openWorksRef.current, records)
-    setOpenWorks(openWorksRef.current)
-    const fresh = records.notifications.filter((item) => !notificationsRef.current.some((known) => known.notification_id === item.notification_id))
-    notificationsRef.current = mergeNotifications(notificationsRef.current, records)
-    setNotifications(notificationsRef.current)
-    void notify(fresh.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
     const shown = dataRef.current
     if (id === activeId.current && readConnection.current === connection && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
   }
@@ -505,6 +547,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
 
   useEffect(() => {
     alive.current = true
+    historyRequests.current.reset()
+    setHistoryLoading(new Set())
+    dataRef.current = null
+    setData(null)
+    readSequence.current += 1
     inFlight.current = new Set()
     messageTargets.current = new Set()
     messageSaves.current = new Map()
@@ -529,7 +576,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       ignoredNotificationsRef.current = merged
       setIgnoredNotifications(merged)
     })
-    return () => { alive.current = false; stop() }
+    return () => { alive.current = false; historyRequests.current.reset(); stop() }
   }, [connection])
 
   useEffect(() => {
@@ -1095,7 +1142,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
     }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
-    refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
+    historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
     joined, synced,

@@ -75,6 +75,13 @@ pub struct Outbox {
     client: String,
 }
 impl Outbox {
+    pub(crate) fn stored_network(dir:&Path,client:&str)->Result<String> {
+        privatefs::ensure_private(dir,"client outbox directory")?;
+        let path=dir.join("outbox.sqlite3");privatefs::ensure_private(&path,"client outbox")?;drop(privatefs::open_no_follow(&path)?);
+        let db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let (network,owner):(String,String)=db.query_row("SELECT network,client FROM identity",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        ensure!(owner==client,"private pending data belongs to another client");vibeface_secure::membership::validate_hash(&network)?;Ok(network)
+    }
     pub fn open(dir: &Path, network: &str, client: &str) -> Result<Self> {
         privatefs::create_dir(dir)?;
         privatefs::ensure_private(dir, "client outbox")?;
@@ -315,7 +322,7 @@ impl Outbox {
     pub(crate) fn close_unknown_settings(&mut self,review:&crate::SettingsReview,note:&str)->Result<Vec<OperationSnapshot>> {
         ensure!(!note.trim().is_empty() && note.len()<=2048,"record what was reviewed on the original Node");
         let fresh=self.review_settings(&review.operation_id)?;
-        ensure!(fresh.fingerprint==review.fingerprint && fresh.network_id==review.network_id && fresh.client_id==review.client_id && fresh.target_node==review.target_node && fresh.dependent_ids==review.dependent_ids,"settings or dependent drafts changed; review the original group again");
+        ensure!(fresh.fingerprint==review.fingerprint && fresh.kind==review.kind && fresh.fields==review.fields && fresh.has_secret_changes==review.has_secret_changes && fresh.network_id==review.network_id && fresh.client_id==review.client_id && fresh.target_node==review.target_node && fresh.dependent_ids==review.dependent_ids,"settings or dependent drafts changed; review the original group again");
         let operations=self.affected_prepared(&review.operation_id)?;
         let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;let mut closed=vec![];
         for mut operation in operations {

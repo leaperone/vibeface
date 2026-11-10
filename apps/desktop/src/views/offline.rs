@@ -16,7 +16,7 @@ pub struct OfflineProjection{
  conversation_id:Option<String>,conversation:Conversation,questions:Vec<Question>,notifications:Vec<Notification>,
 }
 pub fn encode(snapshot:&Snapshot,scope:&CacheScope,conversation_id:Option<&str>)->Result<Vec<u8>>{
- ensure!(snapshot.online&&snapshot.synced&&snapshot.network.as_deref()==Some(scope.network_id.as_str())&&snapshot.client_id.as_deref()==Some(scope.client_id.as_str()),"只有当前已验证读取才能更新离线视图");
+ ensure!(snapshot.online&&(snapshot.synced||snapshot.projection_valid)&&snapshot.network.as_deref()==Some(scope.network_id.as_str())&&snapshot.client_id.as_deref()==Some(scope.client_id.as_str()),"只有当前已验证读取才能更新离线视图");
  let mut cache=OfflineProjection{version:1,profile_id:scope.profile_id.clone(),network_id:scope.network_id.clone(),client_id:scope.client_id.clone(),target_node:scope.target_node.clone(),observed_at_ms:vibeface_protocol::now_ms(),write_state:snapshot.write_state.clone(),omitted:0,bots:snapshot.bots.clone(),nodes:snapshot.nodes.clone(),tasks:snapshot.tasks.clone(),channels:snapshot.channels.clone(),assignments:snapshot.assignments.clone(),conversation_id:conversation_id.map(str::to_owned),conversation:(*snapshot.conversation).clone(),questions:snapshot.questions.clone(),notifications:snapshot.notifications.clone()};
  loop{let bytes=serde_json::to_vec(&cache)?;if bytes.len()<=MAX_CACHE_BYTES{return Ok(bytes)}cache.omitted+=1;
   if !cache.conversation.messages.is_empty(){cache.conversation.messages.remove(0);}
@@ -42,5 +42,5 @@ pub fn decode(bytes:&[u8],scope:&CacheScope)->Result<OfflineProjection>{
 }
 impl OfflineProjection{
  pub fn conversation_id(&self)->Option<&str>{self.conversation_id.as_deref()}
- pub fn into_snapshot(self,generation:u64,can_save:bool)->Snapshot{let can_save_locally=can_save&&self.write_state=="writable";Snapshot{generation,online:false,synced:false,writable:false,can_save_locally,cached:true,cached_at_ms:Some(self.observed_at_ms),cache_omitted:self.omitted,network:Some(self.network_id),client_id:Some(self.client_id),write_state:self.write_state,bots:self.bots,nodes:self.nodes,tasks:self.tasks,channels:self.channels,assignments:self.assignments,conversation:Arc::new(self.conversation),questions:self.questions,notifications:self.notifications,status:format!("离线缓存，读取于 {}。设备、进度与结果尚未重新确认；{}项历史因大小上限未缓存。输入只存本机，等待连接或核对回执。",self.observed_at_ms,self.omitted),..Default::default()}}
+ pub fn into_snapshot(self,generation:u64,can_save:bool)->Snapshot{let can_save_locally=can_save&&self.write_state!="forked";Snapshot{generation,online:false,synced:false,writable:false,can_save_locally,projection_valid:true,cached:true,cached_at_ms:Some(self.observed_at_ms),cache_omitted:self.omitted,network:Some(self.network_id),client_id:Some(self.client_id),write_state:self.write_state,bots:self.bots,nodes:self.nodes,tasks:self.tasks,channels:self.channels,assignments:self.assignments,conversation:Arc::new(self.conversation),questions:self.questions,notifications:self.notifications,status:format!("离线缓存，读取于 {}。设备、进度与结果尚未重新确认；{}项历史因大小上限未缓存。输入只存本机，等待连接或核对回执。",self.observed_at_ms,self.omitted),..Default::default()}}
 }

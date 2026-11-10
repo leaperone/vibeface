@@ -7,7 +7,7 @@ use crate::outbox::{Operation,OperationState};
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(rename_all="snake_case")]
 pub enum SettingsKind {Node,Provider,Triage,Relay}
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq,Eq)]
 pub struct SettingsField {pub name:String,pub value:String,pub secret:bool}
 #[derive(Clone,Debug)]
 pub struct SettingsReview {
@@ -61,4 +61,30 @@ pub(crate) fn review(operation:&Operation,dependent_ids:Vec<String>)->Result<Set
     if wanted["connect_local"]==true || kind==SettingsKind::Provider && (wanted["bot"]==true || wanted["execution"]==true) {has_secret_changes=true;}
     if let Some(secret)=wanted.get("webhook_secret") {has_secret_changes=true;fields.push(SettingsField {name:"webhook_secret".into(),value:if secret.is_null(){"clear"}else{"set; value hidden"}.into(),secret:true});}
     Ok(SettingsReview {operation_id:operation.snapshot.id.clone(),network_id:operation.snapshot.network_id.clone(),client_id:operation.snapshot.client_id.clone(),target_node:operation.snapshot.target_node.clone(),kind,fields,has_secret_changes,dependent_ids,fingerprint:hex::encode(Sha256::digest(&operation.bytes))})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn positive_readback_requires_the_full_public_goal_and_never_guesses_secret_values() {
+        let wanted=json!({"default_outlet":"record","projects":[],"webhook_url":null,"scan_codex_sessions":false,"codex_sessions":null,"webhook_secret":"synthetic-secret"});
+        let mut current=json!({"default_outlet":"record","projects":[],"webhook_url":null,"scan_codex_sessions":false,"codex_sessions":null,"webhook_secret_set":true});
+        assert!(!goal_matches(SettingsKind::Triage,&wanted,&current));
+        let mut clear=wanted;clear["webhook_secret"]=Value::Null;
+        assert!(!goal_matches(SettingsKind::Triage,&clear,&current));
+        current["webhook_secret_set"]=json!(false);
+        assert!(goal_matches(SettingsKind::Triage,&clear,&current));
+        current["scan_codex_sessions"]=json!(true);
+        assert!(!goal_matches(SettingsKind::Triage,&clear,&current));
+        assert!(!goal_matches(SettingsKind::Provider,&json!({"env":{"KEY":"x"}}),&json!({"env":{"KEY":{"set":true}}})));
+    }
+    #[test]
+    fn local_settings_closure_never_classifies_cumulative_or_signed_actions_as_settings() {
+        for method in ["test_webhook","create_decision_token","revoke_decision_token","delivery","rpc","recover","approve","grant","revoke"] {
+            assert_eq!(kind(&json!({"method":method,"params":{"method":"configure_node"}})),None);
+        }
+        assert_eq!(kind(&json!({"method":"configure_node"})),Some(SettingsKind::Node));
+    }
 }

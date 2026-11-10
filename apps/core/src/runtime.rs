@@ -39,6 +39,7 @@ mod provider_adapter;
 mod provider_probe;
 mod relay;
 mod schedule_delivery;
+mod scheduler_history;
 mod settings;
 mod triage;
 #[cfg(test)]
@@ -652,7 +653,7 @@ pub fn now_ms() -> i64 {
 }
 /// These display requests may use committed WAL snapshots; mutation receipts and controls cannot.
 pub(crate) fn snapshot_rpc(method: &str) -> bool {
-    matches!(method, "conversations" | "open_works" | "workspace_overview"
+    matches!(method, "conversations" | "conversation_history" | "open_works" | "workspace_overview"
         | "workspace_state" | "workspace_history" | "notifications")
 }
 
@@ -1791,6 +1792,7 @@ impl Runtime {
                 Ok(json!(conversation))
             }
             "conversation" => self.conversation_snapshot(&access, &input).await,
+            "conversation_history" => self.conversation_history(&access, &input).await,
             "open_works" => {
                 ensure!(access.human, "only clients list open works");
                 let network = network.clone();

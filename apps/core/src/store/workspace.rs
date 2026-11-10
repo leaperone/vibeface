@@ -3428,41 +3428,33 @@ pub(crate) fn refresh_question_targets(
     Ok(())
 }
 
+fn queued_input_from_control(
+    connection: &Connection,
+    network: &str,
+    index: usize,
+    control: &InputControlState,
+) -> Result<QueuedInput> {
+    let original = log::event_from(connection, network, &control.source_event)?
+        .and_then(|event| input_from_event(&control.source_event, event))
+        .context("queue input source is missing")?;
+    let mut input = original.input;
+    if let Some(text) = &control.text { input.text = text.clone(); }
+    if let Some(attachments) = &control.attachments { input.attachments = attachments.clone(); }
+    if !control.deferred && input.route.intent == InputIntent::Defer { input.route.intent = InputIntent::Continue; }
+    Ok(QueuedInput { input, conversation_id: original.conversation_id,
+        source_event: control.source_event.clone(), control_event: control.control_event.clone(),
+        effective_order: index as u64 + 1, deferred: control.deferred, cancelled: control.cancelled })
+}
+
 fn queued_inputs_from(
     connection: &Connection,
     network: &str,
     graph: &Graph,
 ) -> Result<Vec<QueuedInput>> {
-    let mut inputs = Vec::new();
-    for (index, message_id) in graph.queue_order.iter().enumerate() {
-        let control = graph
-            .inputs
-            .get(message_id)
-            .context("queue input projection is missing")?;
-        let original = log::event_from(connection, network, &control.source_event)?
-            .and_then(|event| input_from_event(&control.source_event, event))
-            .context("queue input source is missing")?;
-        let mut input = original.input;
-        if let Some(text) = &control.text {
-            input.text = text.clone();
-        }
-        if let Some(attachments) = &control.attachments {
-            input.attachments = attachments.clone();
-        }
-        if !control.deferred && input.route.intent == InputIntent::Defer {
-            input.route.intent = InputIntent::Continue;
-        }
-        inputs.push(QueuedInput {
-            input,
-            conversation_id: original.conversation_id,
-            source_event: control.source_event.clone(),
-            control_event: control.control_event.clone(),
-            effective_order: index as u64 + 1,
-            deferred: control.deferred,
-            cancelled: control.cancelled,
-        });
-    }
-    Ok(inputs)
+    graph.queue_order.iter().enumerate().map(|(index, message_id)| {
+        let control = graph.inputs.get(message_id).context("queue input projection is missing")?;
+        queued_input_from_control(connection, network, index, control)
+    }).collect()
 }
 pub(crate) fn queued_workspace_input_from(
     connection: &Connection,
@@ -3470,9 +3462,9 @@ pub(crate) fn queued_workspace_input_from(
     message_id: &str,
 ) -> Result<Option<QueuedInput>> {
     let graph = Graph::read(connection, network)?;
-    Ok(queued_inputs_from(connection, network, &graph)?
-        .into_iter()
-        .find(|input| input.input.message_id == message_id))
+    let Some(index) = graph.queue_order.iter().position(|id| id == message_id) else { return Ok(None); };
+    let control = graph.inputs.get(message_id).context("queue input projection is missing")?;
+    Ok(Some(queued_input_from_control(connection, network, index, control)?))
 }
 
 impl Store {

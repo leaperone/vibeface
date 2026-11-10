@@ -301,6 +301,22 @@ table "messages" {
     columns = [column.network_id, column.conversation_id, column.steered_into, column.rank]
     where   = "steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL"
   }
+  index "messages_history" {
+    columns = [column.network_id, column.conversation_id, column.rank, column.message_id]
+  }
+  index "messages_replies_status" {
+    columns = [column.network_id, column.conversation_id, column.in_reply_to, column.status]
+    where = "in_reply_to IS NOT NULL"
+  }
+  index "messages_bot_sender" {
+    on {
+      column = column.network_id
+    }
+    on {
+      expr = "json_extract(sender,'$.conversation_id')"
+    }
+    where = "role = 'bot'"
+  }
 }
 table "bots" {
   schema = schema.main
@@ -579,6 +595,9 @@ table "bot_changes" {
   index "bot_changes_order" {
     columns = [column.network_id, column.conversation_id, column.rank]
   }
+  index "bot_changes_history" {
+    columns = [column.network_id, column.conversation_id, column.rank, column.change_id]
+  }
 }
 table "works" {
   schema = schema.main
@@ -635,6 +654,10 @@ table "works" {
   }
   index "works_conversation" {
     columns = [column.network_id, column.conversation_id]
+  }
+  index "works_history" {
+    columns = [column.network_id, column.conversation_id, column.dispatch_rank, column.work_id]
+    where = "dispatch IS NOT NULL"
   }
 }
 table "notifications" {
@@ -740,6 +763,9 @@ table "questions" {
   index "questions_conversation" {
     columns = [column.network_id, column.conversation_id, column.rank]
   }
+  index "questions_history" {
+    columns = [column.network_id, column.conversation_id, column.rank, column.question_id]
+  }
 }
 table "session_owners" {
   schema = schema.main
@@ -778,6 +804,10 @@ table "session_owners" {
   }
   primary_key {
     columns = [column.network_id, column.node, column.session_id]
+  }
+  index "session_owners_history" {
+    columns = [column.network_id, column.conversation_id, column.rank, column.node, column.session_id]
+    where = "attribution IS NOT NULL"
   }
 }
 table "budget_days" {
@@ -1117,6 +1147,10 @@ table "scheduler_sessions" {
   primary_key {
     columns = [column.conversation_id, column.scope]
   }
+  index "scheduler_sessions_active" {
+    columns = [column.conversation_id, column.provider, column.scope]
+    where = "active IS NOT NULL"
+  }
 }
 table "scheduler_jobs" {
   schema = schema.main
@@ -1196,6 +1230,15 @@ table "scheduler_jobs" {
   index "scheduler_jobs_state" {
     columns = [column.state, column.conversation_id]
   }
+  index "scheduler_jobs_history" {
+    columns = [column.conversation_id, column.sequence, column.trigger]
+  }
+  index "scheduler_jobs_main_history" {
+    columns = [column.conversation_id, column.scope, column.sequence, column.trigger]
+  }
+  index "scheduler_jobs_hold" {
+    columns = [column.conversation_id, column.scope, column.state, column.sequence]
+  }
 }
 table "scheduler_outbox" {
   schema = schema.main
@@ -1265,6 +1308,12 @@ table "pending_checks" {
   }
   primary_key {
     columns = [column.attempt_id]
+  }
+  index "pending_checks_history" {
+    columns = [column.conversation_id, column.created_at_ms, column.attempt_id]
+  }
+  index "pending_checks_scope" {
+    columns = [column.conversation_id, column.trigger]
   }
 }
 table "manager_processes" {
@@ -1396,6 +1445,14 @@ table "work_dispatches" {
   primary_key {
     columns = [column.work_id]
   }
+  index "work_dispatches_conversation" {
+    on {
+      expr = "json_extract(spec,'$.conversation')"
+    }
+    on {
+      column = column.work_id
+    }
+  }
 }
 table "work_stops" {
   schema = schema.main
@@ -1426,6 +1483,9 @@ table "work_stops" {
   primary_key {
     columns = [column.work_id]
   }
+  index "work_stops_conversation" {
+    columns = [column.conversation_id, column.work_id]
+  }
 }
 schema "main" {
 }
@@ -1442,5 +1502,128 @@ table "workspace_projection" {
   }
   primary_key {
     columns = [column.network_id]
+  }
+}
+table "conversation_setting_writes" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "setting" {
+    null = false
+    type = integer
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "event_hash" {
+    null = false
+    type = text
+  }
+  column "change_id" {
+    null = true
+    type = text
+  }
+  column "by" {
+    null = false
+    type = text
+  }
+  column "saw" {
+    null = false
+    type = text
+  }
+  column "after_value" {
+    null = false
+    type = text
+  }
+  column "built_on_previous" {
+    null = false
+    type = integer
+    default = 0
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.setting, column.rank]
+  }
+  index "conversation_setting_observed" {
+    columns = [column.network_id, column.conversation_id, column.setting, column.rank]
+    where = "built_on_previous = 1"
+  }
+}
+table "memory_history_operations" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "memory_id" {
+    null = false
+    type = text
+  }
+  column "revision" {
+    null = false
+    type = text
+  }
+  column "base" {
+    null = false
+    type = text
+  }
+  column "user_controlled" {
+    null = false
+    type = integer
+  }
+  column "source_event_hash" {
+    null = false
+    type = text
+  }
+  column "winning" {
+    null = false
+    type = integer
+    default = 0
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.memory_id, column.revision]
+  }
+  index "memory_history_conflicts" {
+    columns = [column.network_id, column.conversation_id, column.memory_id, column.revision]
+    where = "winning = 0"
+  }
+}
+table "memory_winner_chain" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "memory_id" {
+    null = false
+    type = text
+  }
+  column "revision" {
+    null = false
+    type = text
+  }
+  column "depth" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.memory_id, column.revision]
+  }
+  index "memory_winner_depth" {
+    columns = [column.network_id, column.conversation_id, column.memory_id, column.depth]
   }
 }

@@ -18,3 +18,5 @@ mod profile;
 
 mod settings;
 pub use settings::{SettingsKind, SettingsField, SettingsReview};
+
+pub use vibeface_protocol::history;

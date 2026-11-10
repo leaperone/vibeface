@@ -481,7 +481,7 @@ fn signed_history_scale() -> Result<()> {
 #[test]
 fn scoped_lists_match_the_complete_previous_output_including_accepted_dispatches() -> Result<()> {
     let net = net()?;
-    let mut store = store(&net)?;
+    let store = store(&net)?;
     for (index, scope, state) in [
         (0, "c", "running"),
         (1, "elsewhere", "queued"),
@@ -523,6 +523,11 @@ fn scoped_lists_match_the_complete_previous_output_including_accepted_dispatches
             Provider::Codex,
         );
         spec.conversation = scope.into();
+        let WorkSpec { work_id, conversation, trigger, target, dispatcher, call_ref, model,
+            cwd, title, prompt, continues, parent, thread, .. } = spec;
+        let spec = WorkRequest { work_id, conversation, trigger, target, dispatcher, call_ref,
+            kind: RequestedWorkKind::Agent(Some(Provider::Codex)), model, cwd, title, prompt,
+            continues, parent, thread };
         store.connection.execute(
             "INSERT INTO work_dispatches(work_id,spec,state) VALUES(?,?,?)",
             params![spec.work_id, serde_json::to_string(&spec)?, state],

@@ -52,6 +52,35 @@ type ApplicationShape = BTreeMap<String, TableShape>;
 
 static EXPECTED_SHAPE: OnceLock<ApplicationShape> = OnceLock::new();
 
+// These objects contain only derived query data. Missing objects may be rebuilt after
+// validating every other application constraint; conflicting definitions are refused.
+const DERIVED_TABLES: &[&str] = &[
+    "conversation_setting_writes",
+    "memory_history_operations",
+    "memory_winner_chain",
+];
+const DERIVED_INDEXES: &[(&str, &str)] = &[
+    ("work_runs", "work_runs_reconcile"),
+    ("messages", "messages_history"),
+    ("messages", "messages_replies_status"),
+    ("messages", "messages_bot_sender"),
+    ("works", "works_history"),
+    ("bot_changes", "bot_changes_history"),
+    ("questions", "questions_history"),
+    ("session_owners", "session_owners_history"),
+    ("scheduler_jobs", "scheduler_jobs_history"),
+    ("scheduler_jobs", "scheduler_jobs_main_history"),
+    ("scheduler_jobs", "scheduler_jobs_hold"),
+    ("pending_checks", "pending_checks_history"),
+    ("pending_checks", "pending_checks_scope"),
+    ("scheduler_sessions", "scheduler_sessions_active"),
+    ("work_stops", "work_stops_conversation"),
+    ("work_dispatches", "work_dispatches_conversation"),
+    ("conversation_setting_writes", "conversation_setting_observed"),
+    ("memory_winner_chain", "memory_winner_depth"),
+    ("memory_history_operations", "memory_history_conflicts"),
+];
+
 fn normalize_type_name(raw: &str) -> String {
     raw.trim().to_ascii_uppercase()
 }
@@ -306,21 +335,45 @@ pub(crate) fn validate_readonly_schema(connection: &Connection) -> Result<()> {
     validate_schema(connection, true)
 }
 
-pub(crate) fn install_derived_indexes(connection: &Connection) -> Result<()> {
+pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     validate_schema(connection, true)?;
-    let present: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='work_runs_reconcile')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !present {
-        let tx = connection.unchecked_transaction()?;
-        tx.execute_batch(
-            "CREATE INDEX work_runs_reconcile ON work_runs(state,send_by_ms,work_id);",
-        )?;
-        validate_application_schema(&tx)?;
-        tx.commit()?;
+    let present = |kind: &str, name: &str| -> Result<bool> {
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=? AND name=?)",
+            [kind, name], |row| row.get(0),
+        )?)
+    };
+    let mut missing = Vec::new();
+    for &table in DERIVED_TABLES {
+        if !present("table", table)? { missing.push(("table", table)); }
     }
+    let rebuild = !missing.is_empty();
+    for &(_, index) in DERIVED_INDEXES {
+        if !present("index", index)? { missing.push(("index", index)); }
+    }
+    if missing.is_empty() { return Ok(()); }
+
+    // Execute the authoritative definitions, rather than a second hand-maintained DDL.
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(super::INITIAL_SCHEMA)?;
+    let tx = connection.unchecked_transaction()?;
+    for (kind, name) in missing {
+        let sql: String = reference.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type=? AND name=?",
+            [kind, name], |row| row.get(0),
+        )?;
+        tx.execute_batch(&sql)?;
+    }
+    validate_application_schema(&tx)?;
+    if rebuild {
+        let mut statement = tx.prepare("SELECT network_id FROM networks ORDER BY network_id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let network: String = row.get(0)?;
+            super::conversation_settings_projection::rebuild_projection(&tx, &network)?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -331,13 +384,15 @@ fn validate_schema(connection: &Connection, allow_missing_derived: bool) -> Resu
 
     for (table, expected_table) in expected {
         let Some(actual_table) = actual.get(table) else {
+            if allow_missing_derived && DERIVED_TABLES.contains(&table.as_str()) {
+                continue;
+            }
             mismatches.push(format!("{table}: missing table"));
             continue;
         };
         for (index, expected_index) in &expected_table.indexes {
             if allow_missing_derived
-                && table == "work_runs"
-                && index == "work_runs_reconcile"
+                && DERIVED_INDEXES.contains(&(table.as_str(), index.as_str()))
                 && !actual_table.indexes.contains_key(index)
             {
                 continue;
@@ -527,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn only_missing_derived_index_is_installed_without_changing_existing_rows() -> Result<()> {
+    fn missing_derived_objects_are_installed_without_changing_existing_rows() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-derived-index-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
@@ -535,7 +590,12 @@ mod tests {
         {
             let db = Connection::open(&path)?;
             init_current_db(&db)?;
-            db.execute_batch("DROP INDEX work_runs_reconcile;")?;
+            for &(_, index) in DERIVED_INDEXES {
+                db.execute_batch(&format!("DROP INDEX {index};"))?;
+            }
+            for &table in DERIVED_TABLES {
+                db.execute_batch(&format!("DROP TABLE {table};"))?;
+            }
             db.execute(
                 "INSERT INTO identity_meta(key,value) VALUES('device','original-device')",
                 [],
@@ -569,7 +629,40 @@ mod tests {
                 "{INITIAL_SCHEMA}\nDROP INDEX work_runs_reconcile; CREATE INDEX work_runs_reconcile ON work_runs(work_id);"
             ),
             "work_runs_reconcile",
+        )?;
+        assert_schema_refused(
+            &format!("{INITIAL_SCHEMA}\nDROP TABLE memory_winner_chain; DROP INDEX events_main;"),
+            "events_main",
+        )?;
+        assert_schema_refused(
+            &INITIAL_SCHEMA.replace("`winning` integer NOT NULL DEFAULT 0", "`winning` text NOT NULL DEFAULT 0"),
+            "memory_history_operations.winning",
         )
+    }
+
+    #[test]
+    fn failed_derived_reconstruction_rolls_back_every_created_object() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        init_current_db(&db)?;
+        for &table in DERIVED_TABLES {
+            db.execute_batch(&format!("DROP TABLE {table};"))?;
+        }
+        db.execute_batch(
+            "INSERT INTO networks(network_id,bundle) VALUES('network','{}');
+             INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind)
+             VALUES('network','author',1,'event','conversation',1,1,1,'invalid signed envelope',1,1,'bot_changed');",
+        )?;
+        assert!(install_derived_objects(&db).is_err());
+        for &table in DERIVED_TABLES {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?)",
+                [table], |row| row.get(0),
+            )?;
+            assert!(!exists, "failed reconstruction retained {table}");
+        }
+        let envelope: String = db.query_row("SELECT envelope FROM events", [], |row| row.get(0))?;
+        assert_eq!(envelope, "invalid signed envelope");
+        Ok(())
     }
 
     #[test]

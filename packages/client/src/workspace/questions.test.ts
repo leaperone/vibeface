@@ -1,3 +1,4 @@
+import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
@@ -10,6 +11,7 @@ const row = (question_id: string, created_at_ms: number, extra: Record<string, u
   choices: [{ label: "继续" }, { label: "看看" }], about, author: "gateway", created_at_ms, answer: null, ...extra,
 })
 const snapshot = (extra: Record<string, unknown>) => ({
+  history_authority: "authority", history: completeHistory(),
   conversation: { conversation_id: "chat", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
   checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [], sessions: [], ...extra,
 })

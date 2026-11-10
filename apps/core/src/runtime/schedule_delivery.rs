@@ -21,7 +21,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(
-        checks
+        job.pending_check || checks
             .iter()
             .any(|check| check.conversation_id == job.conversation_id
                 && check.trigger == job.trigger)
@@ -37,7 +37,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 }
 
 pub(super) struct SchedulerProjection {
-    local: String,
+    pub(super) local: String,
     manager: Option<Provider>,
     limits: crate::config::SchedulingLimits,
     pending: BTreeSet<Provider>,
@@ -1285,198 +1285,65 @@ impl Runtime {
         Ok(json!({"receipts":receipts}))
     }
 
-    /// This Node's latest jobs of a conversation, read by a device that shows it; `replied`
-    /// says whether the job's reply is already written here.
-    pub(super) async fn scheduler_scope_jobs(
-        &self,
-        network: &str,
-        conversation: &str,
-    ) -> Result<Vec<Value>> {
-        let projection = self.scheduler_projection()?;
-        let network = network.to_owned();
-        let conversation = conversation.to_owned();
-        self.store
-            .read("scheduler_scope_jobs", move |store| {
-                let jobs = store.scheduler_jobs(&conversation)?;
-                jobs[jobs.len().saturating_sub(MAX_OWNER_JOBS)..]
-                    .iter()
-                    .map(|job| projection.scope_job(store, &network, job))
-                    .collect()
-            })
-            .await
-    }
-
+    /// The owner's bounded observations. Pagination remains local to this owner; a peer
+    /// cannot cause another owner request from here.
     pub(super) async fn owner_jobs(&self, network: &str, scope: &str) -> Result<Value> {
-        let access = Access {
-            network_id: network.into(),
-            human: false,
-            conversation_id: Some(scope.into()),
-            manager: None,
-        };
-        self.require_scope(&access, scope).await?;
-        let scope_jobs = self.scheduler_scope_jobs(network, scope).await?;
-        let context = self
-            .scheduler_context_observation(
-                network,
-                &SessionKey {
-                    conversation_id: scope.into(),
-                    scope: crate::scheduling::SessionScope::Main,
-                },
-            )
-            .await?;
-        let projection = self.scheduler_projection()?;
-        let query_network = network.to_owned();
-        let query_scope = scope.to_owned();
-        let (jobs, staged, conflicts) = self
-            .store
-            .read("owner_jobs", move |store| {
-                let checks = store.pending_checks()?;
-                let all = chat_jobs(store.scheduler_jobs(&query_scope)?);
-                let mut jobs = Vec::new();
-                for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
-                    let mut value = projection.job(store, &query_network, job, &checks)?;
-                    value["replied"] = json!(
-                        store
-                            .message(&query_network, &query_scope, &job.message_id)?
-                            .is_some()
-                    );
-                    jobs.push(value);
-                }
-                Ok((
-                    jobs,
-                    store.scheduler_memory_staged_count(&query_scope)?,
-                    store.scheduler_memory_conflicts(&query_scope)?,
-                ))
-            })
-            .await?;
-        Ok(
-            json!({"jobs":jobs,"scope_jobs":scope_jobs,"manager":self.scheduler_manager_metadata(),
-            "context":context,"memory_staged_count":staged,"memory_conflicts":conflicts}),
-        )
+        self.scheduler_owner_report(network, scope).await
     }
 
-    /// When another device schedules the conversation, its jobs join `jobs` for display only,
-    /// marked with `source_node`; nothing is stored. Returns that owner, whether it answered
-    /// in time, and its bot's provider.
-    pub(super) async fn merge_owner_jobs(
+    /// Remote observations stay separate from this device's paged arrays. Their own
+    /// coverage routes continuations back to the current owner.
+    pub(super) async fn scheduler_owner_observation(
         &self,
         network: &str,
         scope: &str,
-        jobs: &mut Vec<Value>,
     ) -> Result<Option<(Value, Value)>> {
         let local = self.identity.device_id()?;
-        let Some(owner) = self
-            .store
-            .call("conversation", {
-                let network = network.to_owned();
-                let scope = scope.to_owned();
-                move |store| store.conversation(&network, &scope)
-            })
-            .await?
-            .and_then(|conversation| conversation.owner)
-            .filter(|owner| owner != &local)
-        else {
-            return Ok(None);
-        };
+        let owner = self.store.read("scheduler_owner_observation.owner", {
+            let network = network.to_owned();
+            let scope = scope.to_owned();
+            move |store| Ok(store.conversation(&network, &scope)?.and_then(|c| c.owner))
+        }).await?;
+        let Some(owner) = owner.filter(|owner| owner != &local) else { return Ok(None) };
         let request = json!({"type":"scheduler_jobs","conversation_id":scope});
-        let reply = match tokio::time::timeout(
-            OWNER_READ_WAIT,
-            self.peer_request(network, &owner, request),
-        )
-        .await
-        {
+        let reply = match tokio::time::timeout(OWNER_READ_WAIT, self.peer_request(network, &owner, request)).await {
             Ok(Ok(reply)) => reply,
             outcome => {
                 if let Ok(Err(error)) = outcome {
                     tracing::debug!(%error, "the conversation's owner did not report its jobs");
                 }
-                return Ok(Some((
-                    json!({"owner":owner,"reachable":false}),
-                    Value::Null,
-                )));
+                return Ok(Some((json!({"owner":owner,"reachable":false}), Value::Null)));
             }
         };
-        let remote = reply["jobs"].as_array().cloned().unwrap_or_default();
+        ensure!(serde_json::to_vec(&reply)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
+            "owner observation exceeds the response byte limit");
+        let metadata = reply["manager"].clone();
         let query_network = network.to_owned();
         let query_scope = scope.to_owned();
         let query_owner = owner.clone();
-        let remote = self
-            .store
-            .read("merge_owner_jobs", move |store| {
-                let mut result = Vec::new();
-                for mut job in remote.into_iter().take(MAX_OWNER_JOBS) {
-                    let Some(trigger) = job["trigger"].as_str().map(str::to_owned) else {
-                        continue;
-                    };
-                    // Written there, not synced here yet: the reply is on its way, not lost.
+        let remote = self.store.read("scheduler_owner_observation", move |store| {
+            ensure!(store.conversation(&query_network, &query_scope)?.and_then(|c| c.owner).as_deref() == Some(query_owner.as_str()),
+                "conversation owner changed; refresh the conversation");
+            let mut remote = reply;
+            remote.as_object_mut().context("invalid owner observation")?.remove("manager");
+            if let Some(jobs) = remote["jobs"].as_array_mut() {
+                ensure!(jobs.len() <= MAX_OWNER_JOBS, "owner returned too many jobs");
+                for job in jobs {
                     if job["replied"] == true
-                        && let Some(reply) = job["reply_message_id"].as_str()
-                        && store
-                            .message(&query_network, &query_scope, reply)?
-                            .is_none()
-                    {
+                        && let Some(message) = job["reply_message_id"].as_str()
+                        && store.message(&query_network, &query_scope, message)?.is_none() {
                         job["state"] = json!("publishing");
                     }
                     job["source_node"] = json!(query_owner);
-                    result.push((trigger, job));
                 }
-                Ok(result)
-            })
-            .await?;
-        for (trigger, job) in remote {
-            jobs.retain(|known| {
-                known["trigger"] != trigger.as_str() || known["state"] != "pending_delivery"
-            });
-            jobs.push(job);
-        }
-        Ok(Some((
-            json!({"owner":owner,"reachable":true,"context":reply["context"],
-                "scope_jobs":reply["scope_jobs"],
-                "memory_staged_count":reply["memory_staged_count"],"memory_conflicts":reply["memory_conflicts"]}),
-            reply["manager"].clone(),
-        )))
+            }
+            remote["owner"] = json!(query_owner);
+            remote["reachable"] = json!(true);
+            Ok(remote)
+        }).await?;
+        Ok(Some((remote, metadata)))
     }
 
-    /// The conversation's local jobs, waiting outbox entries and their pending checks.
-    pub(super) async fn scheduler_snapshot_jobs(
-        &self,
-        network: &str,
-        scope: &str,
-    ) -> Result<(Vec<Value>, Vec<PendingCheck>)> {
-        let projection = self.scheduler_projection()?;
-        let manager = self.scheduler_manager_metadata();
-        let network = network.to_owned();
-        let scope = scope.to_owned();
-        self.store
-            .read("scheduler_snapshot_jobs", move |store| {
-                let checks = store
-                    .pending_checks()?
-                    .into_iter()
-                    .filter(|check| check.conversation_id == scope)
-                    .collect::<Vec<_>>();
-                let owner = store
-                    .conversation(&network, &scope)?
-                    .and_then(|conversation| conversation.owner);
-                let mut jobs = Vec::new();
-                for job in chat_jobs(store.scheduler_jobs(&scope)?) {
-                    let mut value = projection.job(store, &network, &job, &checks)?;
-                    value["manager"] = manager.clone();
-                    jobs.push(value);
-                }
-                for entry in store
-                    .scheduler_outbox()?
-                    .into_iter()
-                    .filter(|entry| entry.conversation_id == scope)
-                {
-                    jobs.push(
-                        json!({"trigger":entry.trigger,"owner":owner,"conversation_id":scope,
-                "state":"pending_delivery","message_id":entry.trigger.strip_prefix("message:")}),
-                    );
-                }
-                Ok((jobs, checks))
-            })
-            .await
-    }
 }
 
 /// The most recent jobs a conversation's owner reports to another device.

@@ -845,6 +845,7 @@ mod performance {
                     let (network, state, prelude, events, dependencies) = tokio::task::spawn_blocking(
                         move || signed_fixture(size, cascade.then_some(page * 4)),
                     ).await??;
+                    let measured_events = events.len() + dependencies.len();
                     for repeat in 0..3 {
                         let directory = std::env::temp_dir().join(format!("vibeface-actor-perf-{}", uuid::Uuid::new_v4()));
                         crate::config::private_dir(&directory)?;
@@ -921,9 +922,16 @@ mod performance {
                         let snapshot_samples = snapshots.await??;
                         let admission_samples = admissions.await??;
                         let phases = actor.call("benchmark_phases", |_| Ok(super::super::log::test_metrics::snapshot())).await?;
+                        #[cfg(target_os = "linux")]
+                        let resident_bytes = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+                            status.lines().find_map(|line| {
+                                line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()
+                                    .map(|kibibytes| kibibytes * 1024)
+                            })
+                        });
                         actor.shutdown().await?;
                         timings.extend(actor.take_timings());
-                        eprintln!("workload=actor_signed_assistant size={size} page={page} cascade={cascade} repeat={repeat} elapsed_ns={} events_per_second={}", elapsed.as_nanos(), size as f64 / elapsed.as_secs_f64());
+                        eprintln!("workload=actor_signed_assistant size={size} ingested_events={measured_events} page={page} cascade={cascade} repeat={repeat} elapsed_ns={} events_per_second={}", elapsed.as_nanos(), measured_events as f64 / elapsed.as_secs_f64());
                         report("timer_drift", heartbeats);
                         report("snapshot_roundtrip", snapshot_samples);
                         report("stop_admission", admission_samples);
@@ -935,6 +943,8 @@ mod performance {
                         }
                         report("ingest", phases.ingest_ns); report("validation", phases.validation_ns);
                         report("recompute", phases.recompute_ns); report("projection_rebuild", phases.rebuild_ns);
+                        #[cfg(target_os = "linux")]
+                        if let Some(bytes) = resident_bytes { eprintln!("process_resident_bytes={bytes}"); }
                         #[cfg(unix)] {
                             let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
                             // getrusage initializes the complete structure on success.

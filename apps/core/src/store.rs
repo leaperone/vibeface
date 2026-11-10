@@ -23,11 +23,16 @@ mod attachment_scope;
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod client_receipts;
+pub(crate) mod conversation_history;
+pub(crate) mod conversation_sections;
+pub(crate) mod conversation_settings_history;
+mod conversation_settings_projection;
 mod log;
 pub(crate) mod mailbox;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
+pub(crate) mod scheduler_history;
 pub(crate) mod scope_projection;
 mod sync;
 pub(crate) mod triage;
@@ -270,7 +275,7 @@ impl Store {
                 ))?;
             }
             SCHEMA_VERSION => {
-                schema_guard::install_derived_indexes(&connection)?;
+                schema_guard::install_derived_objects(&connection)?;
             }
             _ => bail!(
                 "unsupported database schema version {version}; initialize a fresh Node data directory"

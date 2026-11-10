@@ -10,6 +10,7 @@ pub use crate::outbox::{OperationSnapshot, OperationState};
 
 #[derive(Clone, Debug)]
 pub enum ReadRequest {
+    ConversationHistory(vibeface_protocol::history::HistoryRequest),
     WriteState, Home, Conversation { conversation_id: String }, Workspace, WorkspaceOverview,
     WorkspaceHistory {channel_id:Option<String>,task_id:Option<String>,limit:usize}, Nodes, NodeSettings,
     Logs, LogsFiltered(LogFilter), Diagnostics, Questions, Notifications, RelaySettings, TriageSettings,
@@ -30,7 +31,9 @@ pub enum LogSource {Node,Web,Agent,Cli,Codex,Cursor}
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]
 pub struct LogFilter {pub since_ms:Option<i64>,pub until_ms:Option<i64>,pub level:Option<LogLevel>,pub sources:Vec<LogSource>,pub conversation_id:Option<String>,pub work_id:Option<String>,pub text:Option<String>,pub limit:Option<usize>}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum ClientAuthority {Membership {can_manage:bool},LocalSession}
+pub enum ClientAuthority {Membership {can_manage:bool},LocalSession,PrivateDataOnly {reason:OfflineBlockReason}}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum OfflineBlockReason {Revoked,Forked,NotEnrolled,NotMember,NodeRemoved}
 #[derive(Clone, Debug)]
 pub enum DeliveryRead { Status, List, Providers, Get { order_id: String }, FindIntent { intent_id: String }, Read { order_id: String } }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,9 +172,9 @@ impl Client {
         }
     }
     pub async fn open_offline(key:Arc<ClientKey>,endpoint:Endpoint,outbox_dir:PathBuf)->Result<Self> {
-        let network=key.network_id().context("offline use needs previously verified membership")?.to_owned();
-        let client_id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();let cache_target=target.clone();let cache_network=network.clone();
-        let (outbox,proof)=tokio::task::spawn_blocking(move||->Result<_>{let db=Outbox::open(&outbox_dir,&cache_network,&client_id)?;let proof=db.cached_profile(&cache_target)?;Ok((db,proof))}).await??;
+        let known_network=key.network_id().map(str::to_owned);
+        let client_id=key.device_id().to_owned();let cache_target=endpoint.node_id().to_owned();
+        let (outbox,proof)=tokio::task::spawn_blocking(move||->Result<_>{let network=match known_network {Some(network)=>network,None=>Outbox::stored_network(&outbox_dir,&client_id)?};let db=Outbox::open(&outbox_dir,&network,&client_id)?;let proof=db.cached_profile(&cache_target)?;Ok((db,proof))}).await??;
         Self::offline_generation(key,endpoint,proof,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new())))
     }
     fn offline_generation(key:Arc<ClientKey>,endpoint:Endpoint,proof:crate::profile::CachedProfile,outbox:Arc<Mutex<Outbox>>,writes:Arc<Semaphore>,decision_tokens:Arc<Mutex<BTreeMap<String,DecisionToken>>>)->Result<Self> {
@@ -194,6 +197,7 @@ impl Client {
     }
     pub fn is_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open()}
     pub fn target_node(&self)->&str {&self.target}
+    pub fn offline_block_reason(&self)->Option<OfflineBlockReason> {match self.authority {ClientAuthority::PrivateDataOnly {reason}=>Some(reason),_=>None}}
     pub async fn open_local(key:Arc<ClientKey>,grant:crate::LocalGrant,outbox_dir:PathBuf)->Result<Self> {
         Self::open(key,Endpoint::Local(grant),outbox_dir).await
     }
@@ -703,6 +707,7 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
 impl ReadRequest {
     fn wire(self)->(bool,&'static str,Value) {
         match self {
+            Self::ConversationHistory(request)=>(true,"conversation_history",serde_json::to_value(request).expect("history request contains only wire fields")),
             Self::WriteState=>(false,"write_state",json!({})),
             Self::Home=>(true,"bots",json!({})),
             Self::Conversation {conversation_id}=>(true,"conversation",json!({"conversation_id":conversation_id})),
@@ -851,7 +856,7 @@ mod offline_tests {
     use crate::connection::tests::{receive,send,server};
     use vibeface_secure::{Identity,membership::{Genesis,Member,NetworkState}};
 
-    struct Evidence {counts:BTreeMap<String,u32>,inputs:BTreeMap<String,Value>,write_state:String,controls:Vec<Value>}
+    struct Evidence {counts:BTreeMap<String,u32>,inputs:BTreeMap<String,Value>,write_state:String,controls:Vec<Value>,settings:Value}
     async fn fixture(node_secret:&str,state:NetworkState,client_id:String,evidence:Arc<Mutex<Evidence>>,drop_message:Option<String>)->Result<(Endpoint,tokio::task::JoinHandle<Result<()>>)> {
         let node=Identity::from_secret_hex(node_secret)?;
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -865,6 +870,17 @@ mod offline_tests {
                     Some("directory")=>json!({"state":state,"now_ms":vibeface_protocol::now_ms()}),
                     Some("subscribe")=>json!({}),
                     Some("write_state")=>json!({"state":evidence.lock().expect("fixture evidence").write_state}),
+                    Some("configure_node")=>{
+                        let settings={let mut saved=evidence.lock().expect("fixture evidence");*saved.counts.entry("configure_node".into()).or_default()+=1;saved.settings=request["params"].clone();saved.settings.clone()};
+                        if drop_message.as_deref()==Some("@configure_node") {socket.close(None).await?;break;}
+                        json!({"settings":settings})
+                    }
+                    Some("configure_provider")=>{
+                        {let mut saved=evidence.lock().expect("fixture evidence");*saved.counts.entry("configure_provider".into()).or_default()+=1;}
+                        if drop_message.as_deref()==Some("@configure_provider") {socket.close(None).await?;break;}
+                        json!({"settings":evidence.lock().expect("fixture evidence").settings})
+                    }
+                    Some("node_settings")=>json!({"settings":evidence.lock().expect("fixture evidence").settings,"providers":[{"provider":"codex","env":{"SYNTHETIC_KEY":{"set":true}}}]}),
                     Some("rpc")=>match request["params"]["method"].as_str() {
                         Some("cancel_manager")=>{
                             let params=&request["params"];evidence.lock().expect("fixture evidence").controls.push(params.clone());
@@ -917,12 +933,54 @@ mod offline_tests {
     fn input(id:&str,target:InputTarget)->Action {
         Action::Input {conversation_id:"chat".into(),input:InputRequest {message_id:id.into(),route:InputRoute {target,intent:InputIntent::Continue,sequence:0,expected_revision:Some(1)},text:format!("input {id}"),attachments:vec![],report_results:Some(true)}}
     }
+    fn provider_change()->ProviderSettings {ProviderSettings {provider:Provider::Codex,bot:None,execution:None,execution_model:None,bin:None,app_server:None,connect_local:false,env:BTreeMap::from([("SYNTHETIC_KEY".into(),Some("synthetic-secret-never-in-review".into()))])}}
+    #[tokio::test]
+    async fn lost_settings_ack_uses_goal_readback_and_private_changes_require_explicit_group_review()->Result<()> {
+        let dir=std::env::temp_dir().join(format!("native-settings-review-{}",uuid::Uuid::new_v4()));
+        let mut key=ClientKey::create(&dir.join("key"),"fixture password")?;let node=Identity::generate()?;
+        let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"writable".into(),controls:vec![],settings:json!({"roots":[],"manager":null})}));
+        let (endpoint,first)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),Some("@configure_node".into())).await?;
+        let Endpoint::Gateway(entry)=&endpoint else {unreachable!()};key.remember(&state.genesis.network_id,entry.clone())?;let key=Arc::new(key);
+        let client=Client::open(key.clone(),endpoint,dir.join("outbox")).await?;
+        let settings=NodeSettings {roots:vec![PathBuf::from("/controlled/project")],manager:None};
+        let request=client.submit(Action::NodeSettings(settings.clone())).await?;
+        assert_eq!(request.state,OperationState::Unknown);drop(client);first.await??;
+        let (endpoint,second)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
+        let client=Client::open(key.clone(),endpoint,dir.join("outbox")).await?;
+        evidence.lock().expect("fixture").settings=json!({"roots":["/different"],"manager":null});
+        assert_eq!(client.reconcile(&request.id).await?.state,OperationState::Unknown,"mismatched public state is not proof");
+        evidence.lock().expect("fixture").settings=serde_json::to_value(settings)?;
+        assert_eq!(client.reconcile(&request.id).await?.state,OperationState::Accepted);
+        assert_eq!(evidence.lock().expect("fixture").counts.get("configure_node"),Some(&1));
+        client.close();drop(client);second.await??;
+        let (endpoint,third)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),Some("@configure_provider".into())).await?;
+        let client=Client::open(key.clone(),endpoint,dir.join("outbox")).await?;
+        let parent=client.submit(Action::ProviderSettings(provider_change())).await?;
+        assert_eq!(parent.state,OperationState::Unknown);drop(client);third.await??;
+        let (endpoint,fourth)=fixture(&node.secret_hex(),state,key.device_id().into(),evidence.clone(),None).await?;
+        let client=Client::open(key,endpoint,dir.join("outbox")).await?;
+        assert_eq!(client.reconcile(&parent.id).await?.state,OperationState::Unknown,"a secret-set flag cannot prove which value was applied");
+        let task=client.stage_after(Action::Workspace {command:WorkspaceCommand::CreateTask {task_id:"later-task".into(),channel_id:None,parent_task_id:None,owner_bot:"bot".into(),title:"held".into(),request:"must not run".into(),expected_result:"none".into(),source_events:vec![],dependencies:vec![],reply_only:false}},vec![parent.id.clone()]).await?;
+        let child=client.stage_after(input("dependent-input",InputTarget::Task {task_id:"later-task".into()}),vec![task.id.clone()]).await?;
+        let same_lane=client.stage(Action::ProviderSettings(provider_change())).await?;
+        let review=client.review_settings(&parent.id).await?;
+        assert!(review.has_secret_changes);assert!(!format!("{review:?}").contains("synthetic-secret-never-in-review"));assert_eq!(review.dependent_ids.len(),3);
+        let mut foreign=review.clone();foreign.target_node="other-node".into();
+        assert!(client.close_unknown_settings(foreign,"wrong target".into()).await.is_err());
+        let closed=client.close_unknown_settings(review,"Reviewed the original Node; do not resend this operation or its queued dependents.".into()).await?;
+        assert_eq!(closed.len(),4);assert!(closed.iter().all(|snapshot|snapshot.state==OperationState::ClosedByUser));
+        let parent_id=parent.id.clone();assert_eq!(client.stored(move|db|db.settle(&parent_id,OperationState::Accepted,json!({"late":true}))).await?.state,OperationState::ClosedByUser);
+        for id in [&task.id,&child.id,&same_lane.id] {assert_eq!(client.send_staged(id).await?.state,OperationState::ClosedByUser);}
+        assert_eq!(evidence.lock().expect("fixture").counts,BTreeMap::from([("configure_node".into(),1),("configure_provider".into(),1)]));
+        client.close();drop(client);fourth.await??;std::fs::remove_dir_all(dir)?;Ok(())
+    }
     #[tokio::test]
     async fn current_member_safety_stops_work_on_read_only_and_forked_nodes_without_starting_work()->Result<()> {
         let dir=std::env::temp_dir().join(format!("native-stop-policy-{}",uuid::Uuid::new_v4()));
         let mut key=ClientKey::create(&dir.join("key"),"fixture password")?;let node=Identity::generate()?;
         let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
-        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"read_only".into(),controls:vec![]}));
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"read_only".into(),controls:vec![],settings:json!({"roots":[],"manager":null})}));
         let (endpoint,server)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
         let Endpoint::Gateway(entry)=&endpoint else {unreachable!()};key.remember(&state.genesis.network_id,entry.clone())?;
         let client=Client::open(Arc::new(key),endpoint,dir.join("outbox")).await?;
@@ -945,7 +1003,7 @@ mod offline_tests {
         let mut key=ClientKey::create(&dir.join("key"),"client fixture password")?;
         let node=Identity::generate()?;
         let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
-        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"writable".into(),controls:vec![]}));
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new(),write_state:"writable".into(),controls:vec![],settings:json!({"roots":[],"manager":null})}));
         let (entry,first)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
         let Endpoint::Gateway(gateway)=&entry else {unreachable!()};key.remember(&state.genesis.network_id,gateway.clone())?;
         let original_endpoint=entry.clone();

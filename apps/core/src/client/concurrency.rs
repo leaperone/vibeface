@@ -239,7 +239,7 @@ impl Lane {
             "rpc" => match request.params["method"].as_str() {
                 Some("interrupt_work" | "cancel_manager") => Self::Control,
                 Some(
-                    "nodes" | "conversations" | "open_works" | "work_detail"
+                    "nodes" | "conversations" | "conversation_history" | "open_works" | "work_detail"
                     | "workspace_overview" | "workspace_state" | "workspace_history" | "workspace_command_receipt" | "signed_receipt"
                     | "input_receipt" | "scope_context" | "read_artifact" | "bots"
                     | "questions" | "memory_state" | "notifications",

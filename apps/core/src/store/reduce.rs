@@ -34,7 +34,7 @@ fn text(value: impl serde::Serialize) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 17] = [
+pub(crate) const TABLES: [&str; 20] = [
     "conversations",
     "messages",
     "bots",
@@ -52,6 +52,9 @@ pub(crate) const TABLES: [&str; 17] = [
     "questions",
     "session_owners",
     "workspace_projection",
+    "conversation_setting_writes",
+    "memory_history_operations",
+    "memory_winner_chain",
 ];
 
 /// Who owns a session, in any order the records arrive: the latest attribution or mute by
@@ -506,6 +509,7 @@ pub(crate) fn apply(
         // Read from the log by rank; see `store::bots::primary_bot_from`.
         EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}
     }
+    super::conversation_settings_projection::apply_projection(connection, network, hash, event, rank)?;
     Ok(())
 }
 

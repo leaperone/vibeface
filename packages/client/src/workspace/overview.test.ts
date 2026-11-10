@@ -1,3 +1,4 @@
+import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import type { SessionScope } from './types.ts'
 import test from "node:test"
@@ -29,7 +30,8 @@ const question = (extra: Partial<Question> = {}): Question => ({
 
 test("the conversation parser keeps WorkProjection relation and phase fields", () => {
   const parsed = parseConversation({
-    conversation: { conversation_id: "chat-1", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [],
+    history_authority: "authority", history: completeHistory(),
+  conversation: { conversation_id: "chat-1", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [],
     works: [work()], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], questions: [], sessions: [], sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 },
     bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }, "chat-1")

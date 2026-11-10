@@ -160,15 +160,31 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
     async fn accepted_work(&self) -> Result<()> {
         use crate::model::{EventBody, FirstOwner, ResolvedModel};
         use crate::work::{RequestedWorkKind, WorkRequest};
+        use crate::workspace::{InputIntent, InputRequest, InputRoute, InputTarget};
         let network = &self.state.genesis.network_id;
         let node_id = self.node.identity.device_id()?;
         let owner = self.admin.attest(network, "scope", EventBody::ConversationOwner {
             scheduler_node: node_id.clone(), epoch: 1, attestation: None, cause: None,
         })?;
-        let message = self.admin.attest(network, "scope", EventBody::MessagePosted {
-            message_id: "fixture-message".into(), role: crate::model::Role::User,
+        let bot = self.admin.attest(network, "scope", EventBody::BotCreated {
+            bot_id: "fixture-bot".into(), name: "Fixture bot".into(),
+            instructions: "Use only controlled fixtures".into(), project: None,
+            attestation: None, cause: None,
+        })?;
+        let input = InputRequest {
+            message_id: "fixture-message".into(),
+            route: InputRoute {
+                target: InputTarget::BotMain { bot_id: "fixture-bot".into() },
+                intent: InputIntent::Continue, sequence: 1, expected_revision: None,
+            },
             text: "Fixture input".into(), attachments: vec![], report_results: Some(true),
-            in_reply_to: None, status: None, failure: None, answers: None, attestation: None,
+        };
+        let signed_input = self.admin.attest(network, "scope", EventBody::InputPosted {
+            message_id: input.message_id.clone(), target: input.route.target.clone(),
+            intent: input.route.intent, sequence: input.route.sequence,
+            expected_revision: input.route.expected_revision, text: input.text.clone(),
+            attachments: input.attachments.clone(), report_results: input.report_results,
+            attestation: None,
         })?;
         let network = network.clone();
         let identity = self.node.identity.clone();
@@ -177,7 +193,10 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         store.create_conversation(&identity, &network, "scope", "Fixture work",
             FirstOwner { scheduler_node: node_id.clone(), attestation: owner.attestation().cloned().context("owner attestation")? },
             crate::runtime::now_ms())?;
-        store.append_event(&identity, &network, "scope", message, vec![], crate::runtime::now_ms())?;
+        store.append_event(&identity, &network, "scope", bot, vec![], crate::runtime::now_ms())?;
+        store.post_workspace_input(&identity, &network, input,
+            signed_input.attestation().cloned().context("fixture input signature")?,
+            crate::runtime::now_ms())?;
         store.accept_work(&identity, &network, WorkRequest {
             work_id: fixture_work_id(), conversation: "scope".into(), trigger: "message:fixture-message".into(),
             target: node_id.clone(), dispatcher: node_id, call_ref: "fixture-call".into(),
@@ -256,11 +275,14 @@ async fn encrypted_workspace_overview_and_history_read_committed_rows_while_writ
         for method in ["conversations", "open_works", "workspace_overview", "workspace_state", "workspace_history", "notifications"] {
             send(&mut client, method, "rpc", json!({"method":method})).await?;
         }
+        send(&mut client, "conversation_history", "rpc", json!({
+            "method":"conversation_history", "conversation_id":"scope", "section":"messages", "limit":1,
+        })).await?;
         send(&mut client, "missing-display-scope", "rpc", json!({
             "method":"workspace_history", "conversation_id":"missing",
         })).await?;
         let mut replies = BTreeMap::new();
-        while replies.len() < 7 {
+        while replies.len() < 8 {
             let reply = receive(&mut client).await?;
             let id = reply["id"].as_str().context("display response ID")?.to_owned();
             assert!(replies.insert(id, reply).is_none(), "duplicate display reply");
@@ -277,6 +299,16 @@ async fn encrypted_workspace_overview_and_history_read_committed_rows_while_writ
         assert_eq!(replies["workspace_history"]["result"]["events"], json!([]));
         assert_eq!(replies["workspace_history"]["result"]["coverage"]["scope"], "workspace");
         assert_eq!(replies["notifications"]["result"]["notifications"], json!([]));
+        let history = &replies["conversation_history"]["result"];
+        assert!(replies["conversation_history"]["error"].is_null(), "{}", replies["conversation_history"]);
+        assert_eq!(history["conversation_id"], "scope");
+        assert_eq!(history["section"], "messages");
+        assert!(history["history_authority"].as_str().is_some_and(|value| !value.is_empty()));
+        assert_eq!(history["items"].as_array().context("history messages")?.len(), 1);
+        assert_eq!(history["items"][0]["message_id"], "fixture-message");
+        assert_eq!(history["items"][0]["text"], "Fixture input");
+        assert_eq!(history["complete"], true);
+        assert!(history["next_cursor"].is_null());
         assert!(replies["missing-display-scope"]["error"].as_str()
             .is_some_and(|error| error.contains("conversation not found")));
         ping_and_heartbeat(&mut client).await?;

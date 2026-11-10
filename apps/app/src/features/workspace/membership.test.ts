@@ -1,3 +1,4 @@
+import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
@@ -16,6 +17,7 @@ const question = {
   about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null, closed: null,
 }
 const conversation = {
+  history_authority: "authority", history: completeHistory(),
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
   checks: [], local_node: entry, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [question], sessions: [],
 }

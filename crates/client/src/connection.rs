@@ -17,11 +17,12 @@ type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 pub enum Endpoint {
     Gateway(Entry),
     Local(crate::LocalGrant),
+    Preferred {gateway:Entry,addresses:Vec<String>},
     Lan { node_id: String, addresses: Vec<String> },
 }
 impl Endpoint {
     pub fn node_id(&self) -> &str {
-        match self { Self::Gateway(e) => &e.node_id, Self::Local(grant)=>&grant.entry().node_id, Self::Lan { node_id, .. } => node_id }
+        match self { Self::Gateway(e) => &e.node_id, Self::Preferred {gateway,..}=>&gateway.node_id, Self::Local(grant)=>&grant.entry().node_id, Self::Lan { node_id, .. } => node_id }
     }
 }
 
@@ -61,7 +62,17 @@ impl Connection {
         Self::open_endpoint(&Endpoint::Gateway(Entry { origin: origin.into(), node_id: target.into() }), identity).await
     }
     pub async fn open_endpoint(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
-        tokio::time::timeout(Duration::from_secs(20), Self::handshake(endpoint, identity)).await.context("client handshake timed out")?
+        if let Endpoint::Preferred {gateway,addresses}=endpoint {
+            if !addresses.is_empty() {
+                let direct=Endpoint::Lan {node_id:gateway.node_id.clone(),addresses:addresses.clone()};
+                if let Ok(Ok(connection))=tokio::time::timeout(Duration::from_secs(3),Self::open_transport(&direct,identity)).await {return Ok(connection);}
+            }
+            return Self::open_transport(&Endpoint::Gateway(gateway.clone()),identity).await;
+        }
+        Self::open_transport(endpoint,identity).await
+    }
+    async fn open_transport(endpoint:&Endpoint,identity:&Identity)->Result<Self> {
+        tokio::time::timeout(Duration::from_secs(20),Self::handshake(endpoint,identity)).await.context("client handshake timed out")?
     }
     async fn handshake(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
         let mut transport = match endpoint {
@@ -71,6 +82,7 @@ impl Connection {
                 Transport::Web(socket)
             }
             Endpoint::Local(grant) => {let (socket,_)=tokio_tungstenite::connect_async(grant.websocket_request(&identity.device_id())?).await?;Transport::Web(socket)},
+            Endpoint::Preferred {..}=>bail!("preferred route was not resolved before Noise handshake"),
             Endpoint::Lan { node_id, addresses } => Transport::Lan(lan_connect(node_id.clone(), addresses.clone(), 10_000).await?),
         };
         let mut handshake = Handshake::signed(true, identity, Some(endpoint.node_id().into()), PROLOGUE)?;

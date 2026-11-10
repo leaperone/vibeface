@@ -590,6 +590,7 @@ impl Runtime {
                 | "progress_read"
                 | "addresses"
                 | "scheduler_jobs"
+                | "scheduler_history"
                 | "join_changed"
                 | "input_receipt"
                 | "scope_context"
@@ -620,6 +621,7 @@ impl Runtime {
                 self.owner_jobs(network, field(input, "conversation_id")?)
                     .await
             }
+            "scheduler_history" => self.owner_history(network, input).await,
             "progress_read" => self.read_progress(network, origin, input).await,
             "dispatch_work" | "interrupt_work" => {
                 self.accept_peer_command(network, origin, input).await

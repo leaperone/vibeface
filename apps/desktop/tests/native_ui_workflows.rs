@@ -111,3 +111,7 @@ fn stale_critical_events_cannot_clear_a_newer_draft_or_copy_an_old_profile_secre
  assert!(h.events.try_send(Event::Scoped{generation:6,profile_id:None,event:Box::new(Event::InputStored("当前档案尚未保存的文字".into()))}).is_ok());
  assert!(h.events.try_send(Event::Scoped{generation:7,profile_id:Some("other-profile".into()),event:Box::new(Event::CopySecret(zeroize::Zeroizing::new("fixture-old-profile-secret".into())))}).is_ok());cx.run_until_parked();assert_eq!(h.view.read_with(cx,|view,cx|view.composer.read(cx).value().to_string()),"当前档案尚未保存的文字");assert!(cx.update(|cx|cx.read_from_clipboard()).is_none());
 }
+#[gpui_kit::test]
+fn a_verified_aligning_projection_can_stage_locally_without_granting_online_writes(cx:&mut TestAppContext){
+ let mut snapshot=fixture();snapshot.synced=false;snapshot.writable=false;snapshot.cached=false;snapshot.projection_valid=true;snapshot.can_save_locally=true;snapshot.write_state="aligning".into();let mut h=open(cx,Route::Chat("chat-a".into()),snapshot);enter_message(&h,cx,"等待状态补齐的输入");click(&h,cx,"send");let(_,command)=scoped(h.commands.try_recv().expect("pure local staging"));assert!(matches!(command,Command::Input{..}));assert!(!h.view.read_with(cx,|view,_|view.snapshot.writable));
+}

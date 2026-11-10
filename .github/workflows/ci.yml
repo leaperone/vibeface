@@ -1254,10 +1254,10 @@ jobs:
           for package in vibeface-protocol vibeface-bridge vibeface-client; do
             if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
-          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
+          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
             if ! cargo test --locked -p vibeface-core --lib "$filter" -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
-          if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --no-fail-fast -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           exit "$result"
       - name: Record exact preparation outcomes even when the compiler rejects the source
         if: always()

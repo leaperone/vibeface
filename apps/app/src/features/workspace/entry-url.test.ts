@@ -1,3 +1,6 @@
+import { parseChanged } from '@vibeface/client/lib/progress.ts'
+import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
+import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
@@ -9,7 +12,7 @@ import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, pr
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
-import type { InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
+import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
@@ -42,9 +45,11 @@ test("bulk inbox actions re-arm focus after an intervening list update", () => {
 })
 
 const context = {
+  history_authority: "authority", history: completeHistory(),
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
   works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [], sessions: [],
 }
+const historyActions = { historyLoading: new Set<HistorySection>(), loadHistory: async (_section: HistorySection) => {}, cancelHistory(_section: HistorySection) {} }
 test("attachment names are signed clean and files once each in content order", () => {
   assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
   assert.equal(attachmentName("/\\"), "file", "a name with nothing left falls back")
@@ -226,11 +231,12 @@ test("workspace preserves bot and message requests while routing native decision
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   let knownNodes: ReturnType<typeof parseNodes> = []
+  let push: Parameters<ReadyConnection["subscribe"]>[0] = () => {}
   const connection: ReadyConnection = {
     generation: 1, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
-    isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
+    isCurrent: () => activeConnection === connection, subscribe: (listener) => { push = listener; return () => {} }, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: knownNodes }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
@@ -308,6 +314,62 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    await t.test('shared public history API fences late results, preserves pushed rows and restarts after authority changes', async () => {
+      const originalRpc = connection.rpc
+      const row = (message_id: string, at: number, text = message_id) => ({ message_id, event_hash: message_id, rank: String(at).padStart(20, '0'), role: 'user', text, created_at_ms: at })
+      let authority = 'authority', reads = 0
+      let held: ReturnType<typeof deferred> | null = null
+      const calls: Record<string, unknown>[] = []
+      connection.rpc = async (method, params = {}) => {
+        if (method === 'conversation') return { ...context, history_authority: authority, messages: [row('latest', 10)], history: { ...completeHistory(), messages: { next_cursor: 'first', complete: false } } }
+        if (method !== 'conversation_history') return originalRpc(method, params)
+        calls.push(params)
+        if (held) return held.promise
+        reads++
+        return { conversation_id: 'chat', section: 'messages', history_authority: authority, items: reads === 1 ? [] : [row('old', 1), row('latest', 10, 'stale')], next_cursor: reads === 1 ? 'second' : 'third', complete: false }
+      }
+      try {
+        await render().refresh()
+        await render().loadHistory('messages')
+        assert.deepEqual(calls.map((call) => call.cursor), ['first', 'second'])
+        assert.deepEqual(Array.from(render().data?.messages ?? [], (item) => item.message_id), ['old', 'latest'])
+        await render().refresh()
+        assert.deepEqual(Array.from(render().data?.messages ?? [], (item) => item.message_id), ['old', 'latest'])
+        assert.equal(render().data?.history.messages.next_cursor, 'third')
+        held = deferred()
+        const pending = render().loadHistory('messages')
+        assert.equal(render().historyLoading.has('messages'), true)
+        render().cancelHistory('messages')
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('cancelled', 0)], next_cursor: null, complete: true })
+        await pending
+        assert.equal(render().data?.messages.some((item) => item.message_id === 'cancelled'), false)
+        held = deferred()
+        const paging = render().loadHistory('messages')
+        push(parseChanged({ type: 'records', conversation_id: 'chat', history_authority: authority, refresh_metadata: true, messages: [row('latest', 10, 'pushed')], works: [] }))
+        await new Promise(setImmediate)
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('latest', 10, 'stale')], next_cursor: 'fourth', complete: false })
+        await paging
+        assert.equal(render().data?.messages.find((item) => item.message_id === 'latest')?.text, 'pushed')
+        await render().refresh()
+        held = deferred()
+        const invalidated = render().loadHistory('messages')
+        authority = 'fork-authority'
+        held.reject(new Error('history changed; refresh the conversation'))
+        await invalidated
+        assert.equal(render().data?.history_authority, 'fork-authority')
+        assert.deepEqual(Array.from(render().data?.messages ?? [], (item) => item.message_id), ['latest'])
+        held = deferred()
+        const previousVisit = render().loadHistory('messages')
+        await render().selectBot({ ...bot, conversation_id: 'another-chat' })
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-visit', 0)], next_cursor: null, complete: true })
+        await previousVisit
+        assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-visit'), false)
+      } finally {
+        connection.rpc = originalRpc
+        await render().selectBot(bot)
+        await render().refresh()
+      }
+    })
     const retryMessage = { message_id: "retry-1", event_hash: "retry-event", role: "user", text: "改 README", created_at_ms: 1 }
     const retryScheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
     transcript = [retryMessage]
@@ -1405,6 +1467,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     })
   }
   const require = (specifier: string): unknown => {
+    if (specifier === '@vibeface/client/workspace/model.ts') {
+      const override = dependencies[specifier]
+      return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
+    }
+    if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -1979,7 +2046,7 @@ const parityWork = (extra: Partial<WorkRecord> = {}) => {
 }
 const paritySnapshot = (value: unknown) => value === null ? null : parseConversation(value)
 const parityShared = () => ({
-  generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
+  ...historyActions, generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
   writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), pendingMessages: [], canSaveMessages: true, workspaceState: null,
@@ -2942,7 +3009,7 @@ test('context on both platforms separates compilation, sending, native cache and
     }
     shared.data = parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [], unanswered: [], context: projection }, bot_settings: {
       skills: [], schedules: [], memory_staged_count: 2, memory_sync_conflicts: { items: [], has_more: false },
-      memory_conflicts: [{ call_ref: 'remember', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: 'old', actual_revision: 'new', reason: 'revision_changed' }],
+      memory_conflicts: [{ history_id: 'conflict', call_ref: 'remember', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: 'old', actual_revision: 'new', reason: 'revision_changed' }],
       memory: [{ memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 1, revision: 'a'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: true, source_event_hash: 'b'.repeat(64) } }],
     } })
     const dependencies = {
@@ -2978,7 +3045,7 @@ test('context on both platforms separates compilation, sending, native cache and
       shared.data!.scheduler!.context!.session_status = null
       elements = render()
       assert.match(JSON.stringify(elements), /续接状态未知/)
-      shared.data!.scheduler!.remote = { owner: 'owner', reachable: false }
+      shared.data!.scheduler!.remote = { owner: 'owner', reachable: false, jobs: [], scope_jobs: [], memory_conflicts: [] }
       assert.match(JSON.stringify(render()), /当前状态未知/)
     } finally { app.close() }
   }
@@ -3500,7 +3567,7 @@ test("bot projects use online manager capabilities and preserve device names", (
 test("bot drafts survive a new connection while old create completion cannot close or unlock its form", async () => {
   let generation = 1, work = pendingResult()
   const closed: boolean[] = []
-  const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [], pendingBot: null, writable: true, createBot: () => work.promise } }
+  const workspace = () => { const owner = generation; return { ...historyActions, generation: owner, isCurrent: () => owner === generation, nodes: [], pendingBot: null, writable: true, createBot: () => work.promise } }
   let currentWorkspace = workspace()
   const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message } })
   const render = () => app.render('BotForm', { open: true, onOpenChange: (open: boolean) => closed.push(open), restoreFocus() {} })
@@ -3526,7 +3593,7 @@ test("bot drafts survive a new connection while old create completion cannot clo
 test("conversation keeps unknown and newly edited drafts across connection changes", async () => {
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
-    generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
+    ...historyActions, generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
@@ -3596,7 +3663,7 @@ test("connection form keeps current errors and busy ownership when an earlier co
 test("artifact reads retain their offset while old responses cannot append or unlock newer reads", async () => {
   let generation = 1, work = pendingResult()
   const offsets: number[] = []
-  const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, connectionOnline: true,
+  const workspace = () => { const owner = generation; return { ...historyActions, generation: owner, isCurrent: () => owner === generation, connectionOnline: true,
     readArtifact: (_hash: string, offset: number) => { offsets.push(offset); return work.promise }, run: async (action: () => Promise<void>) => { try { await action() } catch {} } } }
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/elements/artifact.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/workspace/model.ts': { formatSize } })
@@ -4059,7 +4126,7 @@ test('native composer preserves local input and visible blockers with compact ch
 test("conversation preserves local input while execution devices are unavailable", () => {
   let sent = 0, refreshed = 0
   const workspace = (nodes: unknown[]) => ({
-    generation: 1, isCurrent: () => true, refresh: async () => { refreshed++ }, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
+    ...historyActions, generation: 1, isCurrent: () => true, refresh: async () => { refreshed++ }, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
@@ -4102,7 +4169,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
   const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
   let messages: object[] = [ask]
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
+    ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
   }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
@@ -4121,7 +4188,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     about: { node: "gateway", agent: "codex", session_id: "s", cwd: "/w", summary: "", request_id: "r" }, author: "gateway", created_at_ms: 2, answer: null, closed })
   let questions = [question("lost", "request_lost")]
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
+    ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
   }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
@@ -4139,7 +4206,7 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
   const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
     about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const workspace = () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: [], canSaveMessages: connectionOnline, workspaceState: null,
+    ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: [], canSaveMessages: connectionOnline, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', name: '本机', online: true, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
     liveProgress: [], interrupted: [], writable: connectionOnline, selectedBot: parityBot, connectionOnline, answered: {},
     data: { ...parseConversation(context, 'chat'), questions: [question], scheduler: null, messages: [] },
@@ -4167,7 +4234,7 @@ test('merged and in-flight user messages show honest status labels and refresh-o
   let connectionOnline = true
   const baseAsk = { message_id: 'm0', event_hash: 'm0', role: 'user' as const, text: 'first', created_at_ms: 0 }
   const build = (jobs: object[], messages: object[], pending: PendingMessage | null = null) => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: pending ? [pending] : [], canSaveMessages: true, workspaceState: null,
+    ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: pending ? [pending] : [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: connectionOnline, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
     liveProgress: [], interrupted: [], writable: true, selectedBot: parityBot, connectionOnline,
     data: { ...parseConversation(context, 'chat'), messages, scheduler: { jobs, unanswered: [], capabilities: { streaming: true, cancel: true, steer: true } } },
@@ -4277,7 +4344,7 @@ test('unknown task detail reads its exact work without starting a Main request a
     ...parityShared(),
     readWork: async (input: unknown) => { reads.push(JSON.parse(JSON.stringify(input))); return { work: { ...work, conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } } },
     refresh: async () => { refreshed++ },
-    generation: 1, isCurrent: () => true, connectionOnline, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
+    ...historyActions, generation: 1, isCurrent: () => true, connectionOnline, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
     data: parseConversation({ ...context, works: [work] }),
     liveProgress: [],
     sendMessage: async () => { sent++; return false },

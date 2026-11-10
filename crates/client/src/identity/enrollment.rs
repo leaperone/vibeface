@@ -8,6 +8,13 @@ struct Journal {
     request:Vec<u8>,sent:bool,joined:Option<String>,terminal:bool,
 }
 impl Journal {
+    fn endpoint(&self)->Result<Endpoint> {
+        let ticket=Ticket::from_link(&self.link)?;
+        let addresses=ticket.entry.addrs.iter().filter(|addr|matches!(&addr.host,vibeface_secure::link::Host::Ip(_))).map(ToString::to_string).collect::<Vec<_>>();
+        if self.entry.origin.is_empty() {ensure!(!addresses.is_empty(),"invitation needs a numeric direct address or a Gateway origin");Ok(Endpoint::Lan {node_id:self.entry.node_id.clone(),addresses})}
+        else if addresses.is_empty() {Ok(Endpoint::Gateway(self.entry.clone()))}
+        else {Ok(Endpoint::Preferred {gateway:self.entry.clone(),addresses})}
+    }
     fn password(key:&ClientKey)->Zeroizing<String> {Zeroizing::new(key.identity.secret_hex())}
     fn load(key:&ClientKey)->Result<Self> {
         let encrypted=privatefs::read_private_bounded(&key.dir.join(FILE),MAX_FILE,"pending enrollment")?;
@@ -37,8 +44,8 @@ impl<'a> Enrollment<'a> {
         } else {
             ensure!(key.network_id().is_none(),"client already belongs to a personal network");
             vibeface_secure::membership::validate_name(name)?;
-            crate::connection::client_url(origin)?;
             let ticket=Ticket::from_link(link)?;
+            if !origin.is_empty() {crate::connection::client_url(origin)?;} else {ensure!(ticket.entry.addrs.iter().any(|addr|matches!(&addr.host,vibeface_secure::link::Host::Ip(_))),"invitation has no direct address; choose a Gateway origin");}
             let nonce=Zeroizing::new(hex::encode(rand::random::<[u8;32]>()));
             let join_id=invite_id(&ticket.invite_hash())?;
             let request=serde_json::to_vec(&json!({"id":format!("join-{join_id}"),"method":"join","params":{"secret":hex::encode(ticket.secret),"public_key":key.device_id(),"kind":"client","name":name,"commit":join_commit(key.device_id(),&nonce)?}}))?;
@@ -49,7 +56,7 @@ impl<'a> Enrollment<'a> {
     }
     pub async fn resume(key:&'a ClientKey)->Result<Self> {
         let mut journal=Journal::load(key)?;
-        let mut session=key.connect(Some(&journal.entry)).await?;
+        let mut session=key.connect_endpoint(&journal.endpoint()?).await?;
         if !journal.sent {
             let authenticated=session.call("authenticate",json!({})).await?;
             ensure!(authenticated["revoked"]!=true,"client was revoked; this enrollment cannot proceed");
@@ -94,6 +101,8 @@ impl<'a> Enrollment<'a> {
             _=>bail!("enrollment has no recognized status; original request retained"),
         }
     }
+    pub fn endpoint(&self)->Endpoint {self.session.entry.clone()}
+    pub fn node_link(&self)->Result<String> {Ok(Ticket::from_link(&self.journal.link)?.entry.to_string())}
     pub fn finish(self)->Result<(String,Entry)> {
         let network=self.journal.joined.context("enrollment has not been confirmed joined")?;
         Ok((network,self.journal.entry))

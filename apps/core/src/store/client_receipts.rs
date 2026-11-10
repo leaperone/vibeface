@@ -181,7 +181,7 @@ mod tests {
             expected_result: "receipt".into(),
             source_events: vec![],
             dependencies: vec![],
-            reply_only: true,
+            reply_only: false,
         };
         let (store, network, client, signed) = fixture(
             EventBody::WorkspaceCommanded {

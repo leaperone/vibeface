@@ -88,3 +88,7 @@ fn offline_projection_is_bounded_and_never_grants_live_write_authority(){
 fn explicit_manual_unlock_keeps_identity_sealed_without_a_vault_daemon(){
  let directory=std::env::temp_dir().join(format!("vibeface-native-unlock-fixture-{}",uuid::Uuid::new_v4()));let password="controlled-device-passphrase";let key=vibeface_client::ClientKey::create(&directory,password).unwrap();let id=key.device_id().to_owned();drop(key);let bytes=std::fs::read(directory.join("client.json")).unwrap();let file:serde_json::Value=serde_json::from_slice(&bytes).unwrap();assert!(file.get("envelope").is_some());assert!(!String::from_utf8(bytes).unwrap().contains(password));assert!(vibeface_client::ClientKey::open(&directory,"wrong-password").is_err());assert_eq!(vibeface_client::ClientKey::open(&directory,password).unwrap().device_id(),id);std::fs::remove_dir_all(directory).unwrap();
 }
+#[test]
+fn explicit_node_selection_is_not_replaced_by_the_remembered_node(){
+ let remembered=vibeface_client::Entry{origin:"https://gateway-old.invalid".into(),node_id:"a".repeat(64)};let target=ui::connection_entry("",&"b".repeat(64),Some(&remembered),true).unwrap();assert_eq!(target.origin,"https://gateway-old.invalid");assert_eq!(target.node_id,"b".repeat(64));let route=ui::connection_entry("https://gateway-new.invalid","",Some(&remembered),true).unwrap();assert_eq!(route.origin,"https://gateway-new.invalid");assert_eq!(route.node_id,"a".repeat(64));assert!(ui::connection_entry("https://user:password@gateway.invalid",&"a".repeat(64),None,true).is_err());
+}

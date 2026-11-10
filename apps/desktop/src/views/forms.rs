@@ -9,7 +9,7 @@ impl Form{
  let specs:&[(&str,&str,bool)]=match &editor{
  Editor::CreateProfile=>&[("label","个人网络档案名称",false)],
  Editor::ConnectLocal=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true)],
- Editor::Connect=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("transport","接入方式 gateway 或 lan",false),("addresses","LAN 地址，每行一个，可留空",false),("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false)],
+ Editor::Connect=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("transport","接入方式 gateway 或 lan",false),("addresses","LAN 地址，每行一个，可留空",false),("origin","Gateway地址，空白使用档案保存入口",false),("node_id","目标Node公钥，空白使用档案保存目标",false)],
  Editor::Join=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("origin","Gateway 地址",false),("ticket","邀请链接",true),("name","设备名称",false)],
  Editor::CreateNetwork=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("name","本设备名称",false),("node_name","Node 名称",false),("password","新恢复文件口令",true),("new_file","恢复文件保存路径",false)],
  Editor::Recovery=>&[("unlock_mode","设备解锁方式 vault 或 manual",false),("unlock_password","manual 方式的设备解锁口令，每次启动输入",true),("origin","Gateway 地址",false),("node_id","目标 Node 公钥",false),("name","设备名称",false),("password","恢复文件口令",true),("old_file","原恢复文件路径",false),("new_file","新恢复文件保存路径",false)],

@@ -49,3 +49,5 @@ mod tests {
 }
 
 pub mod workspace;
+
+pub mod history;
