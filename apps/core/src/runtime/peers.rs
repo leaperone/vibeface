@@ -5508,14 +5508,25 @@ mod tests {
                 other
                     .ingest_events(&network, &store.events_from(&network, &device(&il), 1, 10)?)?;
                 for i in 0..long {
-                    store.append_event(
-                        f1,
-                        &network,
-                        "c",
-                        posted(&il, &network, "c", &format!("f{i}"), i as u64 + 1)?,
-                        vec![],
-                        i as i64,
-                    )?;
+                    let id = format!("f{i}");
+                    // Only the first event needs an input graph; the rest fill fork pages.
+                    let body = if i == 0 {
+                        posted(&il, &network, "c", &id, 1)?
+                    } else {
+                        EventBody::MessagePosted {
+                            message_id: id.clone(),
+                            role: Role::Assistant,
+                            text: id,
+                            in_reply_to: None,
+                            status: Some(ReplyStatus::Completed),
+                            failure: None,
+                            attachments: vec![],
+                            report_results: None,
+                            answers: None,
+                            attestation: None,
+                        }
+                    };
+                    store.append_event(f1, &network, "c", body, vec![], i as i64)?;
                 }
                 store.append_event(
                     f2,
