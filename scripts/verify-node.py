@@ -4806,7 +4806,7 @@ def npm_service_acceptance(options):
     def stopped():
         wait_for("npm service stops its Node", lambda: node_status(node)["status"] == "stopped")
         if sys.platform == "darwin":
-            require(manager_absent(units[0]), "launchd unloaded the stopped Node")
+            wait_for("launchd unloads the stopped Node", lambda: manager_absent(units[0]))
         else:
             state = dict(line.split("=", 1) for line in command([
                 "/usr/bin/systemctl", "--user", "show", units[0], "--property=MainPID,LoadState"], check=False).stdout.splitlines())
