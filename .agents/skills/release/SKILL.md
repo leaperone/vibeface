@@ -32,18 +32,22 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 ## 每 4 小时自动 Nightly
 
-`ci.yml` 的 main schedule 使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起扩展检查，在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。每四小时机械版本 PR 的自动 squash 已授权并默认开启，需配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
+`ci.yml` 保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。仅 main schedule 的 `ci-gate` 成功后运行 `scripts/daily-nightly.py`；手动 CI 和普通 main push 不自动发布 Nightly。
 
-协调器将原 run 的 `created_at` 转为 UTC，向下取整到 00、04、08、12、16、20 时的批次，用 `bot/daily-nightly/YYYYMMDDHH` 恢复该批次唯一 PR、版本和真实 squash SHA。发布版本日期仍取原 run 的 `YYYYMMDD`，不同批次独立创建 PR 并递增同日序号、Android versionCode 与 iOS buildNumber。即使业务源码未变化，每个批次仍递增产品组和官网 Nightly；各产品组件使用同一版本，保留 marketing version 和依赖解析结果，Android versionCode 与 iOS buildNumber 各递增一次。协调器保持全局串行。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本，以及这两个原生构建号。iOS 递增 CFBundleVersion 的末段数字，超出 Apple 分段上限时停止，不重置或自动进位。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
+协调器只用 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，不合入 main。以原 schedule run 的精确 main SHA 作唯一 parent，生成普通机械版本提交，只改七个版本文件中的发行版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号，保留 marketing version、依赖和其他内容。共享验证器对比完整 tree，并运行 `cargo metadata --locked --no-deps`，不以路径白名单放行。
 
-合并后仅实际 SHA 的 main push CI success 放行。产品先创建标明构建中的公开 Release；各平台独立完成校验后追加自己的附件，产品与官网运行可并行。`collect` 在后台继续完整审计，最终 `publish-product` 核对全套已公开字节并最后追加 `release.json`，之后才放行自动消费。产品 Nightly 自动发布 npm，Nightly 不发站，也不上传 TestFlight 或 App Store；仍构建 iOS 设备归档，签名配置完整时导出 IPA。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败不能当作成功；原产品与 npm artifact 完整时，协调器可重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。延迟启动或跨日重跑原 schedule run 仍恢复原批次任务，不另建版本 PR，不重新分配版本。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则停止初始化，避免版本倒退。不要在人工发版会话中无授权调用此自动协调入口。
+原 run 的 UTC `created_at` 向下取整到四小时批次，版本日期仍取该 run 的 `YYYYMMDD`。提交记录原 schedule run ID、批次和上一可信产品 Nightly 来源。移动构建号从 main 与上一可信 Nightly 取数值上界后加一；iOS 按数字分段比较，末段溢出时停止，不回绕。协调器全局串行。同批次、延迟或跨日恢复保持原版本、构建号、提交与 artifact；上一来源完整发布且 npm 成功、main 无新提交时跳过。部分 Tag、Release 或 npm 必须先恢复原来源，不新建版本覆盖。
+
+所有发布入口统一验证 main 来源或精确机械 Nightly。detached 提交仅允许 Nightly；Stable/RC 仍要求 main。机械 Nightly 的 CI 证明必须是原 schedule run 的精确仓库、workflow path、main、parent SHA 和成功 `ci-gate`，不等待包含协调 job 的整个 run success。正常 main Tag 仍要求同一 SHA 的 main push CI success。Tag、制品与 provenance 的 source 始终是实际版本提交，不替换为 parent。
+
+产品与官网并行发布，产品最终完整清单和 npm 分别核对。Tag 只创建，冲突立即停止；未知响应先读远端对账，不重复写入。仅从原运行的完整不可变 artifact 重跑失败 publisher；原产品和 npm artifact 完整时可恢复原 npm 发布。缺失、过期或字节冲突时停止。自动 Nightly 不部署、不上传 TestFlight 或 App Store；仍构建设备归档，签名配置完整时导出 IPA。不要在人工会话中无授权调用自动协调入口。
 
 ## 准备并验证版本
 
 1. 在任务 worktree 中同步各产品组件版本及 `Cargo.lock` 的本仓包版本，或只修改独立官网版本。Mobile marketing version 和原生 build number 按目标分发规则处理。准备好的精确版本可直接发布，不为打 tag 再自动递增一次。
 2. Web、macOS、Windows、Linux x64、Linux ARM64 原生程序、Android 和 iOS 在同一运行并行构建。桌面 App 只等待本平台完整运行包。每个平台组包只等自己的原生输入和 Web，以不可变 artifact ID 验证同一源码、版本与目标。不得等待或拉取独立公开组件 Release。每组校验通过即可追加并供手动下载；完整产品集通过才追加全局 `release.json`，标记整套发布完成。
 3. 在同一 PR 完成相关检查和独立审查，再按已有授权合并。不得直接在 main 上修改、commit 或 push 版本。
-4. 固定包含版本修改的完整 `SOURCE_SHA`。在指向该提交的干净 worktree 中验证；保留主 checkout 的无关修改。提交必须已进入远端 main，版本必须与 tag 完全一致。
+4. 固定包含版本修改的完整 `SOURCE_SHA`。在指向该提交的干净 worktree 中验证；保留主 checkout 的无关修改。人工准备的提交必须已进入远端 main，版本必须与 tag 完全一致；自动机械 Nightly 使用前述共享来源门。
 5. 核对该 SHA 的必要检查与 main CI 均已通过。`pending`、缺少检查或只有其他 SHA 的成功记录均不能放行。失败先修复，不用打 tag 探测构建是否能过。
 
 打 tag 前使用现有只读校验入口，`APP` 取 `product` 或 `www`，`VERSION` 取已确认的版本：
@@ -71,7 +75,7 @@ git tag -a "$TAG" "$SOURCE_SHA" -m "$TAG"
 git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
 ```
 
-GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Tag，禁止更新和删除，没有绕过者。创建时的完整格式由预检和 CI 验证，CI 还核对版本文件与 main 归属。规则保护不代替打 tag 前的检查。
+GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Tag，禁止更新和删除，没有绕过者。创建时的完整格式由预检和 CI 验证，CI 还核对版本文件与共享来源规则。规则保护不代替打 tag 前的检查。
 
 ## 处理现存 tag 与失败
 
@@ -90,7 +94,7 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 
 官网发布同样不自动部署。部署官方站点时，在本仓库执行 `deploy www <精确官网 Tag>`，与产品服务使用相同的独立部署流水线。核对实际运行版本、镜像和线上页面，不能把 workflow 启动当作上线。
 
-npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在产品 `publish-product` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
+npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在产品 `publish-product` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口允许同 Tag、同 SHA 的唯一已完成 release run，只要 `collect` 和 `publish-product` 成功，即使总 run 因 npm 标红。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
 
 iOS 默认使用 `app-store-connect` 分发方式，先通过 TestFlight 内测，再准备 App Store 发布。签名 IPA 的 `testflight_eligible=true` 只代表导出方式和描述文件通过校验，不代表 Apple 已接收或内测已可安装。TestFlight 上传、Apple 处理、内部测试组分配、App Store 提交和真机验收另行完成；不能把未签名设备归档或 CI 成功报告成可安装的 iOS App。
 
@@ -100,6 +104,6 @@ iOS 默认使用 `app-store-connect` 分发方式，先通过 TestFlight 内测�
 
 手动 `release.yml` 默认 `publish=false`，可从开发分支执行产品或官网完整构建，不要求真实 Tag。该结果只证明构建与验收，不代表公开发布、部署、npm registry 写入或升级已发生。使用 `gh workflow run release.yml --ref <branch> -f app=product -F publish=false` 验证实际并行与最终完整 artifact。
 
-真正发布必须使用现存精确 Tag 作为 workflow ref，显式 `publish=true`；身份检查还要求该源码的 main push CI success。`release-start` 只负责创建或确认一个公开 Release，各平台发布任务仅写自己独占的附件名称，最终 `publish-product` 最后写入全局 `release.json` 和完成状态；生产者与 `collect` 仍只上传 Actions 制品。
+真正发布必须使用现存精确 Tag 作为 workflow ref，显式 `publish=true`；身份检查对 main 来源要求同一 SHA 的 main push CI success，对机械 Nightly 要求原 schedule parent 的成功 `ci-gate`。`release-start` 只负责创建或确认一个公开 Release，各平台发布任务仅写自己独占的附件名称，最终 `publish-product` 最后写入全局 `release.json` 和完成状态；生产者与 `collect` 仍只上传 Actions 制品。
 
 旧 CLI 只识别旧 `cli-v` 格式，首次切换按安装说明手动安装新版完整包，之后由新版跟踪产品 `v`。不创建兼容 Tag、不自动覆盖已有安装或迁移数据。

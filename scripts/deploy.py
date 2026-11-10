@@ -81,8 +81,12 @@ def plan(tag):
     else:
         raise ValueError('tag nesting is too deep')
     source = obj['sha']
-    comparison = json.loads(gh('api', f'repos/{REPOSITORY}/compare/{source}...main'))
-    release.require(comparison['merge_base_commit']['sha'] == source, 'release is not on main')
+    fetch = ['git', 'fetch', '--tags']
+    if release.run('git', 'rev-parse', '--is-shallow-repository') == 'true':
+        fetch.append('--unshallow')
+    subprocess.run([*fetch, 'origin', 'main', 'refs/tags/' + tag], cwd=release.ROOT, check=True)
+    release.require(release.run('git', 'rev-parse', tag + '^{commit}') == source, 'fetched release tag source mismatch')
+    release.validate_source(source, kind)
     return verify(tag, manifest, published, source)
 
 
@@ -239,13 +243,12 @@ def self_test():
         f'repos/{REPOSITORY}/releases/assets/1': content,
         f'repos/{REPOSITORY}/git/ref/tags/{tag}': json.dumps({'object': {'type': 'tag', 'sha': 'd' * 40}}),
         f'repos/{REPOSITORY}/git/tags/{"d" * 40}': json.dumps({'object': {'type': 'commit', 'sha': sha}}),
-        f'repos/{REPOSITORY}/compare/{sha}...main': json.dumps({'merge_base_commit': {'sha': sha}}),
     }
-    with patch(__name__ + '.gh', side_effect=lambda *args: routes[args[-1]]):
+    with patch(__name__ + '.gh', side_effect=lambda *args: routes[args[-1]]), \
+            patch('release.run', return_value=sha), patch('subprocess.run'), patch('release.validate_source') as source_gate:
         assert plan(tag)['source_sha'] == sha
-        for route, bad in ((f'repos/{REPOSITORY}/releases/assets/1', content + ' '),
-                           (f'repos/{REPOSITORY}/compare/{sha}...main',
-                            json.dumps({'merge_base_commit': {'sha': 'e' * 40}}))):
+        source_gate.assert_called_once_with(sha, 'product')
+        for route, bad in ((f'repos/{REPOSITORY}/releases/assets/1', content + ' '),):
             saved = routes[route]; routes[route] = bad
             try:
                 plan(tag)

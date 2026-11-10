@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real producer directories for progressive publication tests (local fixtures only)."""
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -50,7 +51,7 @@ def build_collected_tree(source=None):
     expo = json.loads((ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']
     badging = (f"package: name='{expo['android']['package']}' versionCode='{expo['android']['versionCode']}'"
                f" versionName='{expo['version']}'")
-    scratch = ROOT / '.artifacts/progressive-publication-tests'
+    scratch = Path(os.environ.get('VIBEFACE_RELEASE_SCRATCH', ROOT / '.artifacts/progressive-publication-tests'))
     scratch.mkdir(parents=True, exist_ok=True)
     installers = scratch / 'installers'
     installers.mkdir(exist_ok=True)

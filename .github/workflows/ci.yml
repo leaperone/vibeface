@@ -120,7 +120,7 @@ jobs:
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py", "scripts/nightly_source.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
@@ -1192,22 +1192,16 @@ jobs:
     permissions:
       contents: write
       actions: write
-      pull-requests: read
     steps:
-      - name: Require the Nightly release token
-        env:
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
-        run: test -n "$NIGHTLY_RELEASE_TOKEN" || { echo '::error::NIGHTLY_RELEASE_TOKEN is missing'; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-      - name: Reconcile four-hour version PR and immutable Nightly archives
+      - name: Reconcile tag-only Nightly sources and immutable archives
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
         run: |
           gh auth setup-git
           python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"

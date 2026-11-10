@@ -5,6 +5,7 @@ import base64
 import fnmatch
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -184,7 +185,7 @@ def check(repo, component):
 
 
 def self_test():
-    scratch = ROOT / ".artifacts/build-inputs-test"
+    scratch = Path(os.environ.get("VIBEFACE_RELEASE_SCRATCH", ROOT / ".artifacts/build-inputs-test"))
     scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="fixture-", dir=scratch) as directory:
         repo = Path(directory)

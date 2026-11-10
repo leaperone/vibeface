@@ -48,13 +48,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B - <<'PY'
-          import json, os, subprocess
+          import json, os, subprocess, sys
+          sys.path.insert(0, 'scripts')
+          import release
           scope, tag = os.environ['RELEASE_APP'], os.environ['RELEASE_TAG']
           publish = os.environ['PUBLISH'] == 'true'
           command = ['python3', '-B', 'scripts/release.py', 'plan', '--app', scope]
           if tag:
               command += ['--tag', tag]
           if publish:
+              if os.environ['GITHUB_REPOSITORY'] != release.GITHUB_REPO:
+                  raise SystemExit('Publication requires the official release repository')
               if not tag or os.environ['GITHUB_REF'] != 'refs/tags/' + tag:
                   raise SystemExit('Publishing requires the exact existing tag as the workflow ref')
               command += ['--require-main', '--publish']
@@ -66,15 +70,7 @@ jobs:
           if result['source_commit'] != os.environ['GITHUB_SHA']:
               raise SystemExit('Build source differs from the workflow commit')
           if publish:
-              runs = json.loads(subprocess.check_output([
-                  'gh', 'run', 'list', '--repo', os.environ['GITHUB_REPOSITORY'],
-                  '--workflow', 'ci.yml', '--commit', result['source_commit'],
-                  '--json', 'event,headBranch,headSha,status,conclusion',
-              ], text=True))
-              if not any(run['event'] == 'push' and run['headBranch'] == 'main' and
-                         run['headSha'] == result['source_commit'] and run['status'] == 'completed' and
-                         run['conclusion'] == 'success' for run in runs):
-                  raise SystemExit('The exact source must have a successful main push CI before publication')
+              release.require_ci(result)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               for key in ('app', 'version', 'tag', 'source_commit', 'channel'):
                   value = result[key]
