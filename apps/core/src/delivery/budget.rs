@@ -2645,7 +2645,8 @@ mod tests {
     #[tokio::test]
     async fn review_regression_foreign_quote_keeps_private_budget_and_receiver_capacity_unchanged()
     -> Result<()> {
-        use super::super::{DeliveryConfig, types::ServiceRequest, wallet::SecretString};
+        use super::super::{DeliveryConfig, types::ServiceRequest};
+        use vibeface_control::maintenance::SecretString;
         let mut fixture = PublicationFixture::with_current_orders([0, 0]).await?;
         let identity = crate::crypto::LocalIdentity {
             secret_key_hex: hex::encode([3; 32]),

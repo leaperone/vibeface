@@ -1,5 +1,5 @@
-//! Incremental projections. Each event updates its rows and their dependents; every rule is
-//! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
+//! Incremental projections update rows by rank or epoch. Workspace history is rebuilt when
+//! earlier-ranked events arrive late, so different arrival orders converge.
 //! Bot settings, skills and schedules use rank. Memories permanently prefer signed user
 //! control and its stable counter; removals remain as tombstones.
 use crate::model::*;

@@ -25,6 +25,7 @@ import zipfile
 # Local helper imports must not dirty the checkout before provenance checks.
 sys.dont_write_bytecode = True
 from release import verify_build_info
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1672,12 +1673,8 @@ def self_test_exports(directory, report):
                                       (service_name, "private_alpns", ["rpc", "sync"]), (service_name, "status", "skipped")):
         changed = deepcopy(report)
         changed["cases"][case_name][field] = invalid
-        try:
+        with TestCase().assertRaises(ValueError, msg='Missing, untrusted or state-changing authority checks cannot become public PASS evidence'):
             principal_evidence(changed, bundle)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Missing, untrusted or state-changing authority checks cannot become public PASS evidence")
     private_marker = "private-principal-fixture-must-not-export"
     report["cases"][client_name]["private_diagnostic"] = private_marker
     assert private_marker not in json.dumps(principal_evidence(report, bundle))
@@ -1844,53 +1841,33 @@ def self_test_exports(directory, report):
             changed = deepcopy(manifest)
             changed["inspections"][position][field] = value
             (run / "ui-inspections.json").write_text(json.dumps(changed))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Inspection must show the actual unknown state, correct Node and exact public PNG'):
                 public_exports(run, report, {"imageId": "b" * 64})
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Inspection must show the actual unknown state, correct Node and exact public PNG")
         (run / "ui-inspections.json").write_text(json.dumps(manifest))
         for field, value in (("rawBroadcastDelta", False), ("walletLocked", 1), ("canonicalRestored", False)):
             changed = deepcopy(manifest)
             changed["inspections"][2]["checks"][field] = value
             (run / "ui-inspections.json").write_text(json.dumps(changed))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Inspection requires exact boolean safeguards, integer zero broadcasts and restored transport'):
                 public_exports(run, report, {"imageId": "b" * 64})
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Inspection requires exact boolean safeguards, integer zero broadcasts and restored transport")
         (run / "ui-inspections.json").write_text(json.dumps(manifest))
         changed = deepcopy(report)
         changed["cases"]["real-paid-held-and-key-published-sigkill-recovery"]["points"][0]["nodes"][1]["role"] = "R"
-        try:
+        with TestCase().assertRaises(ValueError, msg='Recovery must include both actual receiver and provider, not duplicate roles'):
             public_exports(run, changed, {"imageId": "b" * 64})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Recovery must include both actual receiver and provider, not duplicate roles")
         mixed_source = run / "key-lifecycle/mixed-held.json"
         original_mixed = mixed_source.read_bytes()
         unprefixed = json.loads(original_mixed)
         unprefixed["nodeObservations"][0]["checkpointId"] = "mixed-held-result"
         mixed_source.write_text(json.dumps(unprefixed))
-        try:
+        with TestCase().assertRaises(ValueError, msg='An unprefixed legacy checkpoint must not replace the actual command-owned mixed-held result'):
             mixed_held_export(mixed_source.parent, checked_capacity_case(report), lifecycle)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("An unprefixed legacy checkpoint must not replace the actual command-owned mixed-held result")
         mixed_source.write_bytes(original_mixed)
         assert len(list((public / "branches").iterdir())) == len(BRANCH_CASES) + 5
         for field, value in (("coreRestored", False), ("cases", case_entries[:-1]), ("requiredCases", list(BRANCH_CASES)[:-1])):
             (branch_directory / "index.json").write_text(json.dumps({**index, field: value}))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Missing cases or incomplete canonical restoration must block full paid acceptance'):
                 public_exports(run, report, {"imageId": "b" * 64})
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Missing cases or incomplete canonical restoration must block full paid acceptance")
         (branch_directory / "index.json").write_text(json.dumps(index))
         changed = deepcopy(core)
         changed["state"]["order"]["withdrawn"] = "28"
@@ -1898,24 +1875,16 @@ def self_test_exports(directory, report):
         changed_index = deepcopy(index)
         changed_index["restore"]["fileSha256"] = digest(branch_directory / "core-restored.json")
         (branch_directory / "index.json").write_text(json.dumps(changed_index))
-        try:
+        with TestCase().assertRaises(ValueError, msg='A matching file checksum cannot replace actual complete core ledger restoration'):
             public_exports(run, report, {"imageId": "b" * 64})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A matching file checksum cannot replace actual complete core ledger restoration")
         (branch_directory / "core-restored.json").write_text(json.dumps(core, indent=2) + "\n")
         (branch_directory / "index.json").write_text(json.dumps(index))
         proof_file = run / "key-lifecycle/rotate.json"
         original_proof = json.loads(proof_file.read_bytes())
         for seal in (original_proof["seal"][:-2], original_proof["seal"] + "00", "00000000" + original_proof["seal"][8:]):
             proof_file.write_text(json.dumps({**original_proof, "seal": seal}))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Short, long or foreign-selector public seals must fail'):
                 public_proof(proof_file.parent, "rotate", 1)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Short, long or foreign-selector public seals must fail")
         proof_file.write_text(json.dumps(original_proof))
         safe_mixed = json.loads((public / "key-lifecycle/mixed-held.json").read_text())
         assert safe_mixed["nodeObservations"][0]["keyRotation"] is False and safe_mixed["restoreRequired"] is True
@@ -1924,32 +1893,20 @@ def self_test_exports(directory, report):
         changed_serial["operations"][0]["serial"] = 20
         for changed in ({**lifecycle, "generatedProofs": 10}, {**lifecycle, "finalRegistrationId": "another-register"}, changed_serial):
             (run / "key-lifecycle/summary.json").write_text(json.dumps(changed))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Incorrect lifecycle count or active registration must fail'):
                 public_exports(run, report, {"imageId": "b" * 64})
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Incorrect lifecycle count or active registration must fail")
         (run / "key-lifecycle/summary.json").write_text(json.dumps(lifecycle))
         original_observation = (run / "ordinary-settlement/settlement-observation.json").read_bytes()
         (run / "ordinary-settlement/settlement-observation.json").write_bytes((run / "settlement/settlement-observation.json").read_bytes())
-        try:
+        with TestCase().assertRaises(ValueError, msg="A strict observer cannot stand in for the ordinary order's independent receipt"):
             public_exports(run, report, {"imageId": "b" * 64})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A strict observer cannot stand in for the ordinary order's independent receipt")
         (run / "ordinary-settlement/settlement-observation.json").write_bytes(original_observation)
         (run / "ordinary-settlement/relation-2-window-0.receipt").write_bytes((run / "settlement/relation-2-window-0.receipt").read_bytes())
         matching_observer = json.loads(original_observation)
         matching_observer["proofs"][1]["receiptSha256"] = "0x" + digest(run / "ordinary-settlement/relation-2-window-0.receipt")
         (run / "ordinary-settlement/settlement-observation.json").write_text(json.dumps(matching_observer))
-        try:
+        with TestCase().assertRaises(ValueError, msg='A reused receipt cannot count as a newly generated ordinary proof'):
             public_exports(run, report, {"imageId": "b" * 64})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A reused receipt cannot count as a newly generated ordinary proof")
 
 
 def self_test_partial_evidence(directory):
@@ -1994,23 +1951,15 @@ def self_test_partial_evidence(directory):
         for wrong in ({**profile, "max_windows": 3}, profile):
             host.side_effect = actual_host_command if wrong is not profile else None
             host.return_value = Mock(returncode=1, stdout=b"")
-            try:
+            with TestCase().assertRaises(ValueError, msg='A foreign profile or failed actual host verify must not export partial receipts'):
                 preserve_strict_evidence(run, {"imageId": "b" * 64}, wrong, Path("/fixture-current-host"))
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("A foreign profile or failed actual host verify must not export partial receipts")
             assert not list(public.iterdir())
         host.side_effect = actual_host_command
         observation = source / "settlement-observation.json"
         contents = observation.read_bytes()
         observation.unlink()
-        try:
+        with TestCase().assertRaises((OSError, ValueError), msg='Strict-only evidence requires its actual successful independent observer'):
             preserve_strict_evidence(run, {"imageId": "b" * 64}, profile, Path("/fixture-current-host"))
-        except (OSError, ValueError):
-            pass
-        else:
-            raise AssertionError("Strict-only evidence requires its actual successful independent observer")
         assert not list(public.iterdir())
         observation.write_bytes(contents)
         real_replace, calls = os.replace, []
@@ -2022,12 +1971,8 @@ def self_test_partial_evidence(directory):
             return real_replace(source_file, destination)
 
         with patch("os.replace", side_effect=failed_move):
-            try:
+            with TestCase().assertRaises(OSError, msg='Failed partial publication must retain its original error'):
                 preserve_strict_evidence(run, {"imageId": "b" * 64}, profile, Path("/fixture-current-host"))
-            except OSError:
-                pass
-            else:
-                raise AssertionError("Failed partial publication must retain its original error")
         assert not list(public.iterdir())
 
 
@@ -2065,21 +2010,13 @@ def self_test_videos(directory):
         for role, changed in bad:
             file = ui / "public" / (role + "-video.json")
             file.write_text(json.dumps(changed))
-            try:
+            with TestCase().assertRaises(ValueError, msg='Missing pairing, foreign recording metadata, bad hash or failed stop must block video acceptance'):
                 video_exports(ordinary)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Missing pairing, foreign recording metadata, bad hash or failed stop must block video acceptance")
             file.write_text(json.dumps(receipts[role]))
         for probed in (Mock(returncode=1, stdout=b""), Mock(returncode=0, stdout=json.dumps({**media, "format": {**media["format"], "duration": "2.0"}}).encode())):
             probe.return_value = probed
-            try:
+            with TestCase().assertRaises(ValueError, msg='The host must independently inspect the actual MP4 and matching duration'):
                 video_exports(ordinary)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("The host must independently inspect the actual MP4 and matching duration")
 
 
 def self_test_source_cli(directory):
@@ -2160,12 +2097,8 @@ def self_test():
         changed = {"memory.events": snapshot["memory.events"].replace(f"{name} {before}\n", f"{name} {before + 1}\n")}
         assert oom_delta(snapshot, changed)[name] == 1
     for events in ("oom 1\noom_kill 1\n", "oom 2\n", "oom 2\noom_kill -1\n"):
-        try:
+        with TestCase().assertRaises(ValueError, msg='Decreasing, missing or invalid OOM counters must fail'):
             oom_delta(snapshot, {"memory.events": events})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Decreasing, missing or invalid OOM counters must fail")
     case_name = "two-window-source-hold-open-and-original-file"
     report = {"status": "passed", "cases": {case_name: {"bytes": 130_816, "max_file_bytes": 130_816, "capacity_boundary": True,
               "sha256": "a" * 64, "name": "private-name", "content_base64": "private-content", "witness": "private-witness",
@@ -2177,12 +2110,8 @@ def self_test():
         changed["cases"][case_name][field] = value
         invalid_reports.append(changed)
     for changed in invalid_reports:
-        try:
+        with TestCase().assertRaises(ValueError, msg='Failed, old-size or invalid capacity evidence must not be exported as success'):
             checked_capacity_case(changed)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Failed, old-size or invalid capacity evidence must not be exported as success")
     with tempfile.TemporaryDirectory(prefix="live-self-test-", dir=ARTIFACTS) as directory:
         self_test_source_cli(Path(directory))
         paid = self_test_ui(Path(directory))
@@ -2226,12 +2155,8 @@ def self_test():
         log.write_text("vibeface: symbol lookup error: lib.so: undefined symbol: function, version GLIBC_2.39")
         assert glibc_failure(Path(directory))
         with patch(f"{__name__}.command", side_effect=RuntimeError("business failure")), patch(f"{__name__}.glibc_failure", return_value=False):
-            try:
+            with TestCase().assertRaises(RuntimeError, msg='Business failures must not enable a source-build fallback'):
                 runtime(Path("/binary"), Path("/module"), Path(directory), log, {})
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("Business failures must not enable a source-build fallback")
         with patch(f"{__name__}.command", side_effect=RuntimeError("loader failure")), patch(f"{__name__}.glibc_failure", return_value=True):
             assert runtime(Path("/binary"), Path("/module"), Path(directory), log, {}) is False
         with patch(f"{__name__}.ROOT", Path(directory)):
@@ -2254,20 +2179,12 @@ def self_test():
             for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"},
                               {**info, "core_source_commit": "2" * 40}, {**info, "app_source_commit": "3" * 40}):
                 (sample / "BUILD-INFO.json").write_text(json.dumps(malformed))
-                try:
+                with TestCase().assertRaises(ValueError, msg='Stale or foreign package provenance must fail'):
                     checked_package(sample, "1" * 40)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError("Stale or foreign package provenance must fail")
             (sample / "BUILD-INFO.json").write_text(json.dumps(info))
             (sample / "web/vibeface_secure.js").write_bytes(b"different-build")
-            try:
+            with TestCase().assertRaises(ValueError, msg='A different crypto artifact must fail'):
                 checked_package(sample, "1" * 40)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("A different crypto artifact must fail")
     assert len(PROOFS) == len(set(PROOFS)) == 7
     self_test_protected(original)
     protected_selfcheck()

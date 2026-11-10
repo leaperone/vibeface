@@ -3,13 +3,13 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createContext, Script } from 'node:vm'
-import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
+import { createContext } from 'node:vm'
 import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
 import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
+import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -54,8 +54,8 @@ const until = async (ready: () => boolean) => {
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
 function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '', entryAddrs = [] as string[] } = {}) {
-  const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
-  const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
+  const hooks = hookHarness(true), { effects, afterRender } = hooks
+  const timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
@@ -80,22 +80,10 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const location = { hash, pathname, href: `${pageOrigin}${pathname}${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
   const hashListeners = new Set<() => void>()
   const openHash = (path: string, next: string) => { Object.assign(location, { pathname: path, hash: next, href: `${pageOrigin}${path}${next}` }); hashListeners.forEach(listener => listener()) }
-  let cursor = 0, nextTimer = 0
+  let nextTimer = 0
   const react = {
-    createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
-    useState(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
-      return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
-    },
-    useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
-    useMemo(read: () => unknown) { cursor++; return read() },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
+    ...hooks.react, useCallback: (fn: unknown) => fn,
+    useMemo(read: () => unknown) { hooks.next(); return read() },
   }
   if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser', pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
@@ -182,25 +170,16 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
-  const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
+  const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
-  function load(filename: string): Record<string, unknown> {
-    if (extname(filename) === '.json') return { __esModule: true, default: JSON.parse(readFileSync(filename, 'utf8')) }
-    const cached = modules.get(filename)
-    if (cached) return cached.exports
-    const module = { exports: {} }; modules.set(filename, module)
-    const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-    const require = (specifier: string) => {
-      if (specifier === 'react') return react
-      if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
-      if (specifier.endsWith('/lib/transport.ts')) return transport
-      if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure, recoveryCode: async () => 'ABCDEF12', recoveryFileName: (code: string) => `vibeface-recovery-${code}.json` }
-      const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
-      return load(extname(path) ? path : `${path}.ts`)
-    }
-    new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
-    return module.exports
-  }
+  const load = moduleLoader(sandbox, (specifier, filename) => {
+    if (specifier === 'react') return react
+    if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
+    if (specifier.endsWith('/lib/transport.ts')) return transport
+    if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure, recoveryCode: async () => 'ABCDEF12', recoveryFileName: (code: string) => `vibeface-recovery-${code}.json` }
+    const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
+    return load(extname(path) ? path : `${path}.ts`)
+  })
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
@@ -209,7 +188,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   assert.equal(typeof Provider, 'function')
   type Device = ReturnType<typeof import('@vibeface/client/identity/context.tsx').useDevice>
   const render = (): Device => {
-    cursor = 0
+    hooks.reset()
     assert.ok(typeof Provider === 'function')
     const props = Provider({ platform, children: null, restart: () => { restarts++ } })
     afterRender.splice(0).forEach(run => run())
@@ -231,14 +210,19 @@ function approvedDirectory(app: ReturnType<typeof recoveryApprovalHarness>, chan
   app.directory.view = { ...app.directory.view, epoch: 3, pending: null, ...change }
   return app.receipt()
 }
+async function pendingRecoveryApproval(app: ReturnType<typeof recoveryApprovalHarness>) {
+  const reply = deferred()
+  app.holds.set('approve_recovery', reply)
+  const approval = app.render().approveRecovery(recoveryCheckpoint)
+  await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+  return { reply, approval }
+}
 
 for (const detached of [false, true]) test(`recovery approval verifies its signed receipt${detached ? ' even after this manager is removed' : ''}`, async () => {
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app, detached ? { members: [] } : {})
     if (detached) {
       const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('this manager was removed'))
@@ -260,9 +244,7 @@ for (const landed of [true, false]) test(`a lost recovery approval reply ${lande
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     if (landed) approvedDirectory(app)
     const cause = new Error('approval reply lost')
     reply.reject(cause)
@@ -295,9 +277,7 @@ for (const principal of [null, { network_id: network }]) test(`a lost recovery a
   try {
     app.render(); await settle(); app.render()
     const authentications = app.calls.filter(call => call === 'authenticate').length
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const read = deferred(), auth = deferred(); read.promise.catch(() => {}); read.reject(new Error('directory unavailable')); auth.resolve({ principal })
     app.holds.set('directory', read); app.holds.set('authenticate', auth)
     const cause = new Error('approval reply lost'); reply.reject(cause)
@@ -314,9 +294,7 @@ for (const lost of [false, true]) test(`a ${lost ? 'lost' : 'successful'} recove
     const before = app.directory.state, verify = app.secure.verifyState
     app.secure.verifyState = (state = app.directory.state) => { if (state !== before) throw new Error('invalid signed state'); return verify(state) }
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app), cause = new Error('approval reply lost')
     if (lost) reply.reject(cause)
     else reply.resolve(answer)
@@ -342,9 +320,7 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     let answer: unknown = app.receipt()
     if (outcome === 'unsigned-state') answer = { principal: null, view: { ...app.directory.view, epoch: 3, pending: null } }
     else if (outcome === 'unsigned-view') answer = { ...app.receipt(), view: { ...app.directory.view, epoch: 3, pending: null } }

@@ -1,5 +1,6 @@
 //! Temporary progress is read from its source; it never becomes a command or shared history.
 
+use super::provider_adapter::bounded as bounded_text;
 use super::{Access, Runtime, Update, field};
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
@@ -170,13 +171,6 @@ fn valid_progress(event: &Value, scope: &str, source: &str) -> bool {
             .is_some_and(|sequence| sequence > 0)
         && (event["type"] != "native_progress" || event["target_node"].as_str() == Some(source))
         && serde_json::to_vec(event).is_ok_and(|bytes| bytes.len() <= MAX_EVENT_BYTES)
-}
-
-fn bounded_text(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
-        .take(limit)
-        .collect()
 }
 
 /// Provider tool arguments, raw outputs and reasoning never enter the live UI protocol.
@@ -567,6 +561,11 @@ mod tests {
             &json!({"method":"item/reasoning/textDelta","params":{"delta":"private-value"}}),
         );
         assert!(!reasoning.to_string().contains("private-value"));
+        let bounded = native_progress(&json!({"method":"item/agentMessage/delta",
+            "params":{"itemId":"界".repeat(129),"delta":format!("\0{}", "界".repeat(8001))}}));
+        assert_eq!(bounded["item_id"], "界".repeat(128));
+        assert_eq!(bounded["text"], "界".repeat(8000));
+        assert_eq!(bounded_text("\0界\n\t\r文", 4), "界\n\t文");
     }
 
     #[test]

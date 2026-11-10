@@ -1,6 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import type { BotRecord, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
-import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
@@ -113,8 +112,6 @@ export function sharedProject(cwd: string, node: string, nodes: readonly Pick<No
   const path = root ? rest ? `${root.replace(/[\\/]+$/, "")}/${rest}` : root : cwd
   return { name: projectName(path), path }
 }
-
-export const agentName = (agent: ProviderId) => providerNames[agent]
 
 export function attentionLabel(question: Pick<Question, 'attention'>): string {
   switch (question.attention?.kind) {

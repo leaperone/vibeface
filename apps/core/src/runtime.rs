@@ -55,6 +55,131 @@ pub use triage::{
     AGENT_ANSWER_WITHIN, HOOK_ANSWER_WITHIN, SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV,
 };
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::{
+        identity::{Genesis, Member},
+        work::{WorkRecord, WorkSpec, WorkState},
+    };
+
+    #[track_caller]
+    pub(super) fn assert_work_outcome(record: &WorkRecord, outcome: WorkOutcome) {
+        assert_eq!(record.state, WorkState::Finished { outcome });
+    }
+
+    pub(super) fn provider_work(
+        provider: Provider,
+        target: &str,
+        cwd: &Path,
+        prompt: &str,
+    ) -> WorkSpec {
+        WorkSpec {
+            work_id: "w-1".into(),
+            conversation: "c".into(),
+            trigger: "message:m1".into(),
+            target: target.into(),
+            dispatcher: target.into(),
+            call_ref: "w-1".into(),
+            kind: WorkKind::Agent(provider),
+            model: None,
+            resolved: ResolvedModel {
+                provider,
+                model: None,
+            },
+            cwd: cwd.display().to_string(),
+            title: "t".into(),
+            prompt: prompt.into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        }
+    }
+
+    pub(crate) fn initialize_node(
+        dir: &Path,
+        configuration: &Config,
+        identity: &LocalIdentity,
+    ) -> Result<()> {
+        config::private_dir(dir)?;
+        configuration.save(dir)?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)
+    }
+
+    pub(super) async fn open_node(dir: &Path, configuration: &Config) -> Result<Arc<Runtime>> {
+        initialize_node(dir, configuration, &LocalIdentity::generate())?;
+        Ok(Arc::new(Runtime::open(dir).await?))
+    }
+
+    pub(crate) fn access(
+        network_id: String,
+        human: bool,
+        conversation_id: Option<String>,
+    ) -> Access {
+        Access {
+            network_id,
+            human,
+            conversation_id,
+            manager: None,
+        }
+    }
+
+    pub(crate) fn signed_main_input(
+        admin: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        id: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        sequence: u64,
+    ) -> Result<EventBody> {
+        admin.attest(
+            network,
+            scope,
+            EventBody::InputPosted {
+                message_id: id.into(),
+                target: crate::workspace::InputTarget::BotMain {
+                    bot_id: scope.into(),
+                },
+                intent: crate::workspace::InputIntent::Continue,
+                sequence,
+                expected_revision: None,
+                text: text.into(),
+                attachments,
+                report_results: Some(true),
+                attestation: None,
+            },
+        )
+    }
+
+    pub(crate) fn manager_settings(
+        provider: Provider,
+        workspace: PathBuf,
+        model: String,
+    ) -> config::ManagerSettings {
+        config::ManagerSettings {
+            provider,
+            workspace,
+            model,
+            reasoning_effort: None,
+            backup: Default::default(),
+        }
+    }
+
+    pub(super) async fn join_network(node: &Runtime) -> Result<(LocalIdentity, String)> {
+        let admin = LocalIdentity::generate();
+        let state = NetworkState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state).await?;
+        Ok((admin, network))
+    }
+}
+
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
     for member in bundle.genesis.members().iter().chain(

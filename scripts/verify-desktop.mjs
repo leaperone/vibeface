@@ -3,10 +3,10 @@
 // receipt, the packaged application layout, and the sealed runtime inside the shipped application.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hash, relativeFiles, readSealedRuntime } from './sealed-runtime.mjs';
 import { inspectAuthenticode, requireAuthenticode } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -22,14 +22,6 @@ const PLATFORMS = {
 
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
-const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-
-function relativeFiles(directory) {
-  return fs.readdirSync(directory, { recursive: true, withFileTypes: true })
-    .filter(entry => entry.isFile() || entry.isSymbolicLink())
-    .map(entry => path.relative(directory, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
-    .sort();
-}
 
 function readReceipt(input, target, version) {
   const platform = PLATFORMS[target];
@@ -84,18 +76,7 @@ function verifyApplication(root, target, receipt) {
       'the macOS bundle has no Electron framework');
   }
   const runtime = path.join(resources, 'runtime');
-  const sealed = new Map();
-  for (const line of fs.readFileSync(path.join(runtime, 'FILES.sha256'), 'utf8').trimEnd().split('\n')) {
-    const match = /^([a-f0-9]{64})  ([a-zA-Z0-9._/-]+)$/.exec(line);
-    assert(match && match[2] !== 'FILES.sha256' && !sealed.has(match[2]), 'invalid or duplicate bundled runtime checksum');
-    sealed.set(match[2], match[1]);
-  }
-  assert.deepEqual(relativeFiles(runtime).filter(name => name !== 'FILES.sha256'), [...sealed.keys()].sort(),
-    'the bundled runtime contains files its checksums do not cover');
-  for (const [name, expected] of sealed) {
-    assert(!fs.lstatSync(path.join(runtime, name)).isSymbolicLink(), 'the bundled runtime must not contain links');
-    assert.equal(hash(path.join(runtime, name)), expected, `packaging or signing changed the sealed runtime file ${name}`);
-  }
+  const sealed = readSealedRuntime(runtime);
   for (const name of [`vibeface${platform.exe}`, `vibeface-core${platform.exe}`, 'web/index.html',
     'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) {
     assert(sealed.has(name), `the bundled runtime is missing ${name}`);
@@ -236,7 +217,7 @@ function selfTest() {
 
     const { root, receipt, runtime } = buildFixture('aarch64-apple-darwin');
     fs.writeFileSync(path.join(runtime, 'extra.txt'), 'x');
-    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /checksums do not cover/);
+    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /changed the set of runtime files/);
     fs.rmSync(path.join(runtime, 'extra.txt'));
     fs.writeFileSync(path.join(runtime, 'BUILD-INFO.json'),
       `${JSON.stringify({ version, target: 'aarch64-apple-darwin', source_commit: 'c'.repeat(40) }, null, 2)}\n`);

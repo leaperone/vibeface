@@ -20,11 +20,6 @@ type SendGate = {
   loaded: boolean
   busy: boolean
 }
-export function roleLabel(role: string): string {
-  if (role === 'user') return '你'
-  if (role === 'assistant') return 'Bot'
-  return role
-}
 export function canSend(input: SendGate): boolean {
   return Boolean(input.hasConversation && input.loaded && !input.busy)
 }

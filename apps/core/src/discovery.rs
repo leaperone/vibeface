@@ -380,18 +380,6 @@ pub fn runnable(program: &Path, path: Option<&OsString>) -> bool {
     })
 }
 
-/// Where Codex's running App Server listens: the desktop app and `codex app-server proxy` keep
-/// this link to the live socket.
-pub fn control_socket(codex_home: &Path) -> Option<PathBuf> {
-    let socket = codex_home.join("app-server-control/app-server-control.sock");
-    socket.symlink_metadata().is_ok().then_some(socket)
-}
-
-pub fn sessions_dir(codex_home: &Path) -> Option<PathBuf> {
-    let sessions = codex_home.join("sessions");
-    sessions.is_dir().then_some(sessions)
-}
-
 /// Provider paths for this device, each `None` when it stays as it is, and the providers to
 /// turn execution on for. Variables with keys never pass through here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]

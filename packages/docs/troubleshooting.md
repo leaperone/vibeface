@@ -69,7 +69,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
 - Codex App Server 和 Codex SDK 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
 
-每条外来记录不超过 8 KiB，一次最多 20 条，每个来源每分钟最多 120 条，超出整批拒绝。
+每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝。浏览器按设备身份分别计数，本机 Agent 和 CLI 各自共享额度。
 
 查看日志：
 

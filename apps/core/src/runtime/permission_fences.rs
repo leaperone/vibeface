@@ -150,10 +150,9 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, manager_settings, provider_work};
     use crate::{
-        config::ManagerSettings,
         crypto::LocalIdentity,
-        model::ResolvedModel,
         runtime::{
             Access,
             triage::tests::{bot, node, start_reply},
@@ -201,13 +200,11 @@ mod tests {
         {
             let mut settings = node.settings.lock().unwrap();
             settings.roots = vec![directory.clone()];
-            settings.manager = Some(ManagerSettings {
-                provider: Provider::Codex,
-                workspace: directory,
-                model: "fixture".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            });
+            settings.manager = Some(manager_settings(
+                Provider::Codex,
+                directory,
+                "fixture".into(),
+            ));
         }
         {
             let mut providers = node.providers.lock().unwrap();
@@ -222,12 +219,7 @@ mod tests {
         let cancel = node
             .register_manager_attempt_fixture(
                 "permission-token".into(),
-                Access {
-                    network_id: network,
-                    human: false,
-                    conversation_id: Some("c".into()),
-                    manager: None,
-                },
+                test_access(network, false, Some("c".into())),
                 &attempt,
                 &trigger,
                 Provider::Codex,
@@ -270,23 +262,11 @@ mod tests {
         }
         let spec = WorkSpec {
             work_id: work_id.into(),
-            conversation: "c".into(),
-            trigger: "message:m1".into(),
-            target: local.clone(),
-            dispatcher: local,
             call_ref: work_id.into(),
-            kind: WorkKind::Agent(provider),
-            model: None,
-            resolved: ResolvedModel {
-                provider,
-                model: None,
-            },
             cwd: cwd.to_string_lossy().into_owned(),
             title: work_id.into(),
-            prompt: "work".into(),
-            continues: None,
-            parent: None,
             thread: Some(target.thread_id.clone()),
+            ..provider_work(provider, &local, cwd, "work")
         };
         let mut store = node.store.lock().await;
         store.accept_work_fixture(&node.identity, network, spec.clone(), now_ms())?;

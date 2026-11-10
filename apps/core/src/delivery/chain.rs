@@ -304,16 +304,6 @@ impl Chain {
         )
     }
 
-    pub async fn balance(&self, wallet: Address) -> Result<String> {
-        Ok(self
-            .call(
-                address(&self.config.asset)?,
-                abi::balanceOfCall { owner: wallet },
-            )
-            .await?
-            .to_string())
-    }
-
     pub async fn native_balance(&self, wallet: Address) -> Result<String> {
         Ok(quantity(
             &self
@@ -321,19 +311,6 @@ impl Chain {
                 .await?,
         )?
         .to_string())
-    }
-
-    pub async fn allowance(&self, wallet: Address) -> Result<String> {
-        Ok(self
-            .call(
-                address(&self.config.asset)?,
-                abi::allowanceCall {
-                    owner: wallet,
-                    spender: address(&self.config.escrow)?,
-                },
-            )
-            .await?
-            .to_string())
     }
 
     pub async fn budget_at(
@@ -445,17 +422,6 @@ impl Chain {
             )
             .await?,
         )
-    }
-
-    pub async fn public_values(
-        &self,
-        order_id: Word,
-        index: u16,
-        relation: Relation,
-    ) -> Result<Statement> {
-        let position = self.confirmed_position().await?;
-        self.public_values_at(&position, order_id, index, relation)
-            .await
     }
 
     pub async fn public_values_at(
@@ -1670,12 +1636,12 @@ pub(super) mod tests {
     #[tokio::test]
     async fn changing_deployment_during_nonce_or_receipt_wait_stops_signing_and_rebroadcast()
     -> Result<()> {
-        use super::super::wallet::SecretString;
         use super::super::{
             Delivery, DeliveryConfig,
             budget::{BudgetSnapshot, BudgetTerms},
         };
         use std::sync::{Arc, atomic::AtomicBool};
+        use vibeface_control::maintenance::SecretString;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("chain-configuration-{}", uuid::Uuid::new_v4()));

@@ -1489,6 +1489,7 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, signed_main_input};
     use crate::runtime::triage::tests::{bot, claim_reply, node, start_reply};
 
     async fn post(
@@ -1499,30 +1500,17 @@ mod tests {
         id: &str,
         text: &str,
     ) -> Result<HashedEvent> {
-        let body = admin.attest(
+        let mut store = node.store.lock().await;
+        let body = signed_main_input(
+            admin,
             network,
             scope,
-            EventBody::MessagePosted {
-                message_id: id.into(),
-                role: Role::User,
-                text: text.into(),
-                attachments: vec![],
-                report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
-                attestation: None,
-                failure: None,
-            },
-        )?;
-        let signed = node.store.lock().await.append_event(
-            &node.identity,
-            network,
-            scope,
-            body,
+            id,
+            text,
             vec![],
-            now_ms(),
+            store.messages(network, scope)?.len() as u64 + 1,
         )?;
+        let signed = store.append_event(&node.identity, network, scope, body, vec![], now_ms())?;
         Ok(HashedEvent {
             hash: signed.hash,
             event: serde_json::from_str(&signed.canonical_body)?,
@@ -1548,32 +1536,15 @@ mod tests {
         }
         let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "tools-history".into(),
-            idle,
-            &attempt,
-            &trigger,
-            Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let access = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("tools-history")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture("tools-history", idle, &attempt, &trigger, Provider::Codex)
+            .await?;
         post(&node, &admin, &network, "c", "late", "needle-late").await?;
         let mut before = Value::Null;
         let mut ids = Vec::new();
         loop {
-            let mut args = json!({"query":"needle","types":["message_posted"],"limit":50});
+            let mut args = json!({"query":"needle","types":["input_posted"],"limit":50});
             if !before.is_null() {
                 args["before"] = before;
             }
@@ -1659,27 +1630,16 @@ mod tests {
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.store.lock().await.network()?.context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "tools-replay".into(),
-            idle.clone(),
-            &attempt,
-            &trigger,
-            Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let access = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("tools-replay")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture(
+                "tools-replay",
+                idle.clone(),
+                &attempt,
+                &trigger,
+                Provider::Codex,
+            )
+            .await?;
         assert!(
             node.tool(
                 idle,
@@ -1760,12 +1720,7 @@ mod tests {
                 .execution,
             TurnExecution::NotStarted
         );
-        let idle = Access {
-            network_id: network.clone(),
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
+        let idle = test_access(network.clone(), false, Some("c".into()));
         let mut runtime = TurnRuntime {
             provider: Provider::Codex,
             model: Some("primary".into()),

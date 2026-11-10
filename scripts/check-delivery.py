@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1291,12 +1292,8 @@ def self_test():
     for field, value in (("max_windows", 16), ("max_total_bytes", 1_048_576), ("crypto_suite", True), ("guest_image_id", [102] * 32), ("statement_schema_hash", [102] * 32), ("extra", 1)):
         changed = deepcopy(profile)
         changed[field] = value
-        try:
+        with TestCase().assertRaises(ValueError, msg='Unsupported product profiles must fail'):
             checked_profile_vectors(vectors, changed, compiled, profile_proofs)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Unsupported product profiles must fail")
     changed = deepcopy(profile_proofs)
     for proof in changed:
         proof["profileId"] = "66" * 32
@@ -1304,22 +1301,14 @@ def self_test():
         journal[4 * 32:5 * 32] = b"\x66" * 32
         proof["journal"], proof["journalHash"] = journal.hex(), hashlib.sha256(journal).hexdigest()
     checked_metadata(manifest, changed, compiled)
-    try:
+    with TestCase().assertRaises(ValueError, msg='Self-consistent receipt profiles outside the product trust root must fail'):
         checked_profile_vectors(vectors, profile, compiled, changed)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Self-consistent receipt profiles outside the product trust root must fail")
     verified = {"verified": True, "kind": "groth16", "seal": proofs[0]["seal"], "imageId": compiled["imageId"], "journalHash": proofs[0]["journalHash"]}
     checked_verification(verified, compiled, proofs[0])
     for field, value in (("kind", "succinct"), ("seal", "66" * 260), ("imageId", "66" * 32), ("journalHash", "66" * 32), ("verified", 1), ("extra", "unexpected")):
         changed = dict(verified, **{field: value})
-        try:
+        with TestCase().assertRaises(ValueError, msg='A mismatched receipt export must fail'):
             checked_verification(changed, compiled, proofs[0])
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A mismatched receipt export must fail")
     build, container = sandbox_commands(Path("/context"))
     assert build[:5] == ["docker", "build", "--platform", "linux/amd64", "--file"]
     assert build[-1] == "/context" and build[5] == "/context/crates/delivery/proof/Sandbox.Dockerfile"
@@ -1348,12 +1337,8 @@ def self_test():
         assert optional_fixtures() is None
         loader.assert_not_called()
     with patch(f"{__name__}.FIXTURES", ROOT), patch(f"{__name__}.load_fixtures", side_effect=ValueError("missing fixture")), patch(f"{__name__}.run") as operation:
-        try:
+        with TestCase().assertRaises(ValueError, msg='A broken fixture must stop sandbox dispatch'):
             sandbox()
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A broken fixture must stop sandbox dispatch")
         operation.assert_not_called()
     with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.subprocess.check_output", return_value=b" M uncommitted-source"), patch(f"{__name__}.run") as operation:
         try:

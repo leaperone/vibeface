@@ -3,6 +3,7 @@
 //! Node never leaves an unmanaged one behind: the next start ends the recorded tree, once the
 //! record proves the tree is still that very App Server.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::safe_model_text;
 use super::*;
 use crate::providers::{
     Authentication, CatalogCoverage, CodexLaunch, CodexTarget, EffortOptions, ModelCatalog,
@@ -1256,13 +1257,6 @@ fn model_choices(page: &Value) -> Vec<ModelChoice> {
             })
         })
         .collect()
-}
-
-fn safe_model_text(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= 256
-        && !value.chars().any(char::is_control)
-        && !crate::model::looks_secret(value)
 }
 
 impl Runtime {

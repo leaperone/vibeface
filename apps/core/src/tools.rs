@@ -1,5 +1,4 @@
-//! The coordination tools of a bot turn: one table for the schemas the SDK offers, the
-//! Node's handler and the `vibeface tool` CLI.
+//! Bot coordination tool schemas, permission rules and Node handlers.
 use crate::{
     model::{
         HUES, MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS,
@@ -33,46 +32,61 @@ const EVENT_TYPES: [&str; 14] = [
     "session_attributed",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tool {
-    Search,
-    Describe,
-    Call,
-    Nodes,
-    Context,
-    DispatchWork,
-    WorkStatus,
-    InterruptWork,
-    CallLookup,
-    UpdateProfile,
-    SaveSkill,
-    RemoveSkill,
-    SaveSchedule,
-    RemoveSchedule,
-    ReadSkill,
-    Remember,
-    Forget,
-    Recall,
-    Remind,
-    MessageBot,
-    FetchUrl,
-    ListBots,
-    ReadBot,
-    CreateBot,
-    ConfigureBot,
-    DeleteBot,
-    HandOverSession,
-    ListSessions,
-    ProposeProviderConfig,
-    ApplyProviderConfig,
-    TrackWork,
-    BindWork,
-    WaitWork,
-    HistorySearch,
-    HistoryRead,
-    WorkspaceState,
-    WorkspaceHistory,
-    WorkspaceCommand,
+macro_rules! tools {
+    ($($variant:ident => ($name:literal, $effect:ident)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Tool { $($variant),+ }
+        impl Tool {
+            pub const ALL: [Self; 38] = [$(Self::$variant),+];
+            pub fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+            pub fn effect(self) -> Effect {
+                match self { $(Self::$variant => Effect::$effect),+ }
+            }
+        }
+    };
+}
+
+tools! {
+    WorkspaceState => ("workspace_state", Read),
+    WorkspaceHistory => ("workspace_history", Read),
+    WorkspaceCommand => ("workspace_command", Work),
+    Search => ("tool_search", Read),
+    Describe => ("tool_describe", Read),
+    Call => ("tool_call", Read),
+    Nodes => ("nodes", Read),
+    Context => ("context", Read),
+    DispatchWork => ("dispatch_work", Work),
+    WorkStatus => ("work_status", Read),
+    InterruptWork => ("interrupt_work", Work),
+    CallLookup => ("call_lookup", Read),
+    UpdateProfile => ("update_profile", Settings),
+    SaveSkill => ("save_skill", Settings),
+    RemoveSkill => ("remove_skill", Settings),
+    SaveSchedule => ("save_schedule", Settings),
+    RemoveSchedule => ("remove_schedule", Settings),
+    ReadSkill => ("read_skill", Read),
+    Remember => ("remember", Settings),
+    Forget => ("forget", Settings),
+    Recall => ("recall", Read),
+    Remind => ("remind", Wake),
+    MessageBot => ("message_bot", Wake),
+    FetchUrl => ("fetch_url", Read),
+    ListBots => ("list_bots", Read),
+    ReadBot => ("read_bot", Read),
+    CreateBot => ("create_bot", Settings),
+    ConfigureBot => ("configure_bot", Settings),
+    DeleteBot => ("delete_bot", Settings),
+    HandOverSession => ("hand_over_session", Work),
+    ListSessions => ("list_sessions", Read),
+    ProposeProviderConfig => ("propose_provider_config", Work),
+    ApplyProviderConfig => ("apply_provider_config", Work),
+    TrackWork => ("track_work", Work),
+    BindWork => ("bind_work", Work),
+    WaitWork => ("wait_work", Read),
+    HistorySearch => ("history_search", Read),
+    HistoryRead => ("history_read", Read),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -130,133 +144,8 @@ struct ToolCall {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 38] = [
-        Tool::WorkspaceState,
-        Tool::WorkspaceHistory,
-        Tool::WorkspaceCommand,
-        Tool::Search,
-        Tool::Describe,
-        Tool::Call,
-        Tool::Nodes,
-        Tool::Context,
-        Tool::DispatchWork,
-        Tool::WorkStatus,
-        Tool::InterruptWork,
-        Tool::CallLookup,
-        Tool::UpdateProfile,
-        Tool::SaveSkill,
-        Tool::RemoveSkill,
-        Tool::SaveSchedule,
-        Tool::RemoveSchedule,
-        Tool::ReadSkill,
-        Tool::Remember,
-        Tool::Forget,
-        Tool::Recall,
-        Tool::Remind,
-        Tool::MessageBot,
-        Tool::FetchUrl,
-        Tool::ListBots,
-        Tool::ReadBot,
-        Tool::CreateBot,
-        Tool::ConfigureBot,
-        Tool::DeleteBot,
-        Tool::HandOverSession,
-        Tool::ListSessions,
-        Tool::ProposeProviderConfig,
-        Tool::ApplyProviderConfig,
-        Tool::TrackWork,
-        Tool::BindWork,
-        Tool::WaitWork,
-        Tool::HistorySearch,
-        Tool::HistoryRead,
-    ];
-
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::WorkspaceState => "workspace_state",
-            Tool::WorkspaceHistory => "workspace_history",
-            Tool::WorkspaceCommand => "workspace_command",
-            Tool::Search => "tool_search",
-            Tool::Describe => "tool_describe",
-            Tool::Call => "tool_call",
-            Tool::HistorySearch => "history_search",
-            Tool::HistoryRead => "history_read",
-            Tool::Nodes => "nodes",
-            Tool::Context => "context",
-            Tool::DispatchWork => "dispatch_work",
-            Tool::WorkStatus => "work_status",
-            Tool::InterruptWork => "interrupt_work",
-            Tool::CallLookup => "call_lookup",
-            Tool::UpdateProfile => "update_profile",
-            Tool::SaveSkill => "save_skill",
-            Tool::RemoveSkill => "remove_skill",
-            Tool::SaveSchedule => "save_schedule",
-            Tool::RemoveSchedule => "remove_schedule",
-            Tool::ReadSkill => "read_skill",
-            Tool::Remember => "remember",
-            Tool::Forget => "forget",
-            Tool::Recall => "recall",
-            Tool::Remind => "remind",
-            Tool::MessageBot => "message_bot",
-            Tool::FetchUrl => "fetch_url",
-            Tool::ListBots => "list_bots",
-            Tool::ReadBot => "read_bot",
-            Tool::CreateBot => "create_bot",
-            Tool::ConfigureBot => "configure_bot",
-            Tool::DeleteBot => "delete_bot",
-            Tool::HandOverSession => "hand_over_session",
-            Tool::ListSessions => "list_sessions",
-            Tool::ProposeProviderConfig => "propose_provider_config",
-            Tool::ApplyProviderConfig => "apply_provider_config",
-            Tool::TrackWork => "track_work",
-            Tool::BindWork => "bind_work",
-            Tool::WaitWork => "wait_work",
-        }
-    }
-
-    pub fn effect(self) -> Effect {
-        match self {
-            Tool::Search
-            | Tool::Describe
-            | Tool::Call
-            | Tool::HistorySearch
-            | Tool::HistoryRead
-            | Tool::Nodes
-            | Tool::Context
-            | Tool::WorkStatus
-            | Tool::CallLookup
-            | Tool::ReadSkill
-            | Tool::Recall
-            | Tool::FetchUrl
-            | Tool::ListBots
-            | Tool::ReadBot
-            | Tool::ListSessions
-            | Tool::WaitWork => Effect::Read,
-            Tool::WorkspaceState | Tool::WorkspaceHistory => Effect::Read,
-            Tool::DispatchWork
-            | Tool::InterruptWork
-            | Tool::HandOverSession
-            | Tool::ProposeProviderConfig
-            | Tool::ApplyProviderConfig
-            | Tool::TrackWork
-            | Tool::BindWork
-            | Tool::WorkspaceCommand => Effect::Work,
-            Tool::Remind | Tool::MessageBot => Effect::Wake,
-            Tool::UpdateProfile
-            | Tool::SaveSkill
-            | Tool::RemoveSkill
-            | Tool::SaveSchedule
-            | Tool::RemoveSchedule
-            | Tool::Remember
-            | Tool::Forget
-            | Tool::CreateBot
-            | Tool::ConfigureBot
-            | Tool::DeleteBot => Effect::Settings,
-        }
     }
 
     pub fn initially_exposed(self) -> bool {
@@ -589,12 +478,6 @@ impl Tool {
     pub fn needs_call_ref(self) -> bool {
         self.schema()
             .is_some_and(|(_, _, required)| required.contains(&"call_ref"))
-    }
-
-    pub fn available(self, kind: Option<TriggerKind>) -> bool {
-        self.schema().is_some()
-            && (self.effect() == Effect::Read
-                || kind.is_some_and(|kind| self.effect().offered(kind)))
     }
 
     pub fn input_schema(self) -> Option<Value> {

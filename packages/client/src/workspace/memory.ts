@@ -27,7 +27,7 @@ export function parseMemoryBase(value: unknown): MemoryBase {
 }
 function metadata(value: unknown): MemoryMetadata {
   const data = record(value), origin = data.origin
-  if (origin !== 'agent' && origin !== 'user' && origin !== 'review') throw new Error('未知的记忆来源。')
+  if (origin !== 'agent' && origin !== 'user') throw new Error('未知的记忆来源。')
   return {
     epoch: epoch(data.epoch), revision: hash(data.revision), control_revision: counter(data.control_revision),
     source_event_hash: hash(data.source_event_hash), origin, user_controlled: boolean(data.user_controlled), essential: boolean(data.essential),

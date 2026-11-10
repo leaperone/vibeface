@@ -58,7 +58,6 @@ WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "package.json"
 MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
-    "store::tests::append_100k_stays_flat",
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
 PLATFORMS = (

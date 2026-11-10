@@ -147,6 +147,7 @@ fn domain_limit(input: &Value) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::access as test_access;
     use crate::{
         model::EventBody,
         runtime::triage::tests::{bot, node},
@@ -187,7 +188,7 @@ mod tests {
                 })?;
                 Ok(json!({"command_id":command_id,"command":command,"attestation":signed.attestation().context("control signature")?}))
             };
-            let access = Access { network_id: network.clone(), human: true, conversation_id: None, manager: None };
+            let access = test_access(network.clone(), true, None);
             let before = node.store.lock().await.version_vector(&network)?;
             let stale = control("stale-release", &crate::crypto::digest(b"other control"))?;
             let rejected = node.workspace_command(&access, &stale).await?;

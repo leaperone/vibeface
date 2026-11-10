@@ -418,13 +418,12 @@ function workKind(value: unknown): WorkRecord["kind"] {
 function optionalWorkFields(data: Record<string, unknown>): Partial<Omit<WorkRecord, "state" | "resolved">> {
   const fields: Partial<Omit<WorkRecord, "state" | "resolved">> = {}
   if (data.target != null) fields.target = parseInputTarget(data.target)
-  for (const key of ["dispatcher", "call_ref", "continues", "parent", "thread", "thread_id", "turn_id"] as const) {
+  for (const key of ["dispatcher", "call_ref", "thread_id", "turn_id"] as const) {
     if (data[key] != null) fields[key] = text(data[key])
   }
   const kind = workKind(data.kind)
   if (kind !== undefined) fields.kind = kind
   if (typeof data.model === "string") fields.model = data.model
-  if (data.phase != null) fields.phase = workPhase(data.phase)
   if (data.coordination_job !== undefined) fields.coordination_job = data.coordination_job === null ? null : scopeJob(data.coordination_job)
   return fields
 }
@@ -438,7 +437,10 @@ function work(value: unknown): WorkRecord {
   const state = workState(data.state)
   if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") return { ...common, state }
   const resolved = record(data.resolved)
-  return { ...common, state, resolved: { provider: provider(resolved.provider), model: resolved.model === null ? null : text(resolved.model) } }
+  return { ...common, state, resolved: { provider: provider(resolved.provider), model: resolved.model === null ? null : text(resolved.model) },
+    dispatcher: text(data.dispatcher), call_ref: text(data.call_ref),
+    continues: data.continues === null ? null : text(data.continues), parent: data.parent === null ? null : text(data.parent),
+    thread: data.thread === null ? null : text(data.thread), phase: data.phase === null ? null : workPhase(data.phase) }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
@@ -682,8 +684,6 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
     tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], relations: [], sessions: [], coverage, truncated: false, next_cursor: null,
   }
 }
-
-export const workspaceOverview = overviewFromWorkspace
 
 function parseOverviewBot(value: unknown): OverviewBot {
   const data = record(value)
