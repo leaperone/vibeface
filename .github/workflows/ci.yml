@@ -56,6 +56,8 @@ jobs:
     outputs:
       plan: ${{ steps.select.outputs.plan }}
       web: ${{ steps.select.outputs.web }}
+      web_tests: ${{ steps.select.outputs.web_tests }}
+      crypto: ${{ steps.select.outputs.crypto }}
       www: ${{ steps.select.outputs.www }}
       mobile: ${{ steps.select.outputs.mobile }}
       desktop: ${{ steps.select.outputs.desktop }}
@@ -170,7 +172,7 @@ jobs:
 
   crypto-web:
     needs: plan
-    if: needs.plan.outputs.web == 'true'
+    if: needs.plan.outputs.crypto == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -234,6 +236,36 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+
+  web-tests:
+    needs: [plan, crypto-web]
+    if: needs.plan.outputs.web_tests == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: apps/app/generated
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Verify crypto inputs and run Web and shared client tests
+        run: |
+          python3 -B scripts/build-inputs.py check crypto
+          pnpm install --frozen-lockfile --filter 'vibeface-web...' --filter 'vibeface-mobile...'
+          pnpm --filter vibeface-web generate-routes
+          pnpm --filter vibeface-web test
+          pnpm --filter vibeface-web typecheck
+          pnpm --filter @vibeface/client test
+          pnpm --filter @vibeface/client typecheck
 
   mobile-check:
     needs: plan
@@ -325,7 +357,15 @@ jobs:
       - name: Run affected Rust tests except the exact heavy scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
-        run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
+        run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN --timings-file .artifacts/ci-timings/rust-fast.json
+      - name: Keep Rust fast timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-fast-timing-${{ github.sha }}
+          path: .artifacts/ci-timings/rust-fast.json
+          if-no-files-found: warn
+          retention-days: 7
 
   rust-slow:
     needs: plan
@@ -348,7 +388,15 @@ jobs:
       - name: Run the exact heavy Node scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
-        run: /usr/bin/time -v python3 scripts/ci.py test --tier slow --plan-env CI_PLAN
+        run: /usr/bin/time -v python3 scripts/ci.py test --tier slow --plan-env CI_PLAN --timings-file .artifacts/ci-timings/rust-slow.json
+      - name: Keep Rust slow timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-slow-timing-${{ github.sha }}
+          path: .artifacts/ci-timings/rust-slow.json
+          if-no-files-found: warn
+          retention-days: 7
 
   delivery:
     needs: plan
@@ -433,7 +481,10 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: package-${{ matrix.target }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
+          key: package-with-probe-${{ matrix.target }}-${{ hashFiles('scripts/release-rustflags.py') }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
+          workspaces: |
+            . -> target
+            tests/fixtures/delivery-probe -> ../../../.artifacts/delivery-probe/target
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -1163,7 +1214,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: ${{ (always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small)) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    needs: [plan, quick-check, crypto-web, web, mobile-check, desktop-check, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke, windows-native, desktop-macos, desktop-windows]
+    needs: [plan, quick-check, crypto-web, web, web-tests, mobile-check, desktop-check, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke, windows-native, desktop-macos, desktop-windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

@@ -31,6 +31,8 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
+| `apps/app/src/lib/*.test.ts`、`apps/app/src/features/*/*.test.ts`，限定单层目录 | 浏览器密码学互通和独立 `web-tests`，不组包或构建静态页面 |
+| 五个默认浏览器 E2E：chat-confidence、mesh、onboarding、transfers、workspace | Web 构建与真实 Linux 包 E2E，不额外选无关的 Rust workspace 测试或 proof |
 | `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的桌面类型检查、单测和 main/preload 打包，不构建 Rust 或运行网页制品验收 |
 | `apps/desktop/src/shared/` | 桌面源码检查，以及直接导入这些文件的 Web 检查和网页制品验收 |
 | `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
@@ -46,6 +48,8 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的超出待补依赖上限的 4 万事件追平测试。
 
 `desktop-check` 在 Linux 上运行桌面 `typecheck`、`test` 和 `build`，不下载 Electron 程序、不启动窗口，也不替代手动平台验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
+
+`web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试、原生或付费 E2E、公共 fixture 和 E2E 配置保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
 
 `mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
@@ -181,6 +185,10 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本，POSIX 平台另执行 `--web-only` 冒烟 |
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
+
+Rust 测试额外记录 `compile`、`enumerate` 和 `execute` 三阶段。先以同一包和测试配置运行 `cargo test --no-run`，再枚举并验证慢测试分组，最后执行原有快、慢测试命令。执行阶段仍包含 Cargo 校验和文档测试准备，不能当作精确的纯测试 CPU 时间。`--timings-file` 将阶段时长和退出码写为 JSON；CI 上传该文件并写入 job summary。编译失败或测试失败继续使 job 失败。
+
+iOS Rust cache 同时覆盖默认 `target/` 和 Host Node 的 `.artifacts/native/target`；Linux 组包 cache 另外覆盖独立 probe workspace 的 `.artifacts/delivery-probe/target`，保留各自 Cargo.lock 的失效规则。Rust/App 缓存键包含实际使用的 `release-rustflags.py`。缓存命中只复用编译输入与依赖，不跳过类型、签名、真实进程或 UI 验收。
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
