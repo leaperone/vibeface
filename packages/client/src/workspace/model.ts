@@ -1,6 +1,6 @@
 import type { Attachment, PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { OutboxItem } from "../lib/outbox.ts"
-import { parseProviderReadiness } from "../lib/node.ts"
+import { array, boolean, isRecord, isSafeInteger, isText, parseProviderReadiness } from "../lib/node.ts"
 import { providerStages, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
@@ -25,25 +25,19 @@ export function inputText(value: string, label: string, maxBytes: number): strin
 }
 
 export function record(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("设备返回的内容格式不对。")
-  return value as Record<string, unknown>
+  if (!isRecord(value)) throw new Error("设备返回的内容格式不对。")
+  return value
 }
 function text(value: unknown): string {
-  if (typeof value !== "string") throw new Error("设备返回的内容缺少文字。")
+  if (!isText(value)) throw new Error("设备返回的内容缺少文字。")
   return value
 }
 function number(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("设备返回的数字不对。")
+  if (!isSafeInteger(value) || value < 0) throw new Error("设备返回的数字不对。")
   return value
 }
-function flag(value: unknown): boolean {
-  if (typeof value !== "boolean") throw new Error("设备返回的内容缺少开关值。")
-  return value
-}
-function list(value: unknown): unknown[] {
-  if (!Array.isArray(value)) throw new Error("设备返回的内容缺少列表。")
-  return value
-}
+function flag(value: unknown): boolean { return boolean(value, "设备返回的内容缺少开关值。") }
+function list(value: unknown): unknown[] { return array(value, "设备返回的内容缺少列表。") }
 function texts(value: unknown): string[] { return list(value).map(text) }
 function conversation(value: unknown): ConversationSummary {
   const data = record(value)

@@ -1,3 +1,5 @@
+import { isRecord, isSafeInteger, isText } from './node.ts'
+
 type ProgressUpdate =
   | { type: 'text_snapshot' | 'text_delta'; item_id?: string; text: string }
   | { type: 'status' | 'tool'; item_id?: string; text?: string; status?: string; name?: string }
@@ -23,11 +25,8 @@ export type LiveProgress = LiveProgressFields & (
   | { kind: 'native'; work_id: string; target_node: string }
 )
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
 function requiredText(value: unknown): string {
-  if (typeof value !== 'string' || !value) throw new Error('无效的实时进度编号。')
+  if (!isText(value) || !value) throw new Error('无效的实时进度编号。')
   return value
 }
 function optionalText(value: unknown): string | undefined {
@@ -37,7 +36,7 @@ function parseProgress(value: unknown): ProgressUpdate {
   if (!isRecord(value)) throw new Error('无效的实时进度。')
   const item_id = optionalText(value.item_id)
   if (value.type === 'text_snapshot' || value.type === 'text_delta') {
-    if (typeof value.text !== 'string') throw new Error('无效的实时文本。')
+    if (!isText(value.text)) throw new Error('无效的实时文本。')
     return { type: value.type, item_id, text: value.text }
   }
   if (value.type === 'status' || value.type === 'tool') {
@@ -57,7 +56,7 @@ export function parseChanged(value: unknown): ChangedEvent {
     if (value.type !== 'manager_progress' && value.type !== 'native_progress') return { type: 'invalidate' }
     const conversation_id = requiredText(value.conversation_id), progress = parseProgress(value.progress)
     const sequence = value.sequence
-    if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1) return { type: 'invalidate' }
+    if (!isSafeInteger(sequence) || sequence < 1) return { type: 'invalidate' }
     if (value.type === 'manager_progress') return { type: value.type, conversation_id, progress, sequence, trigger: requiredText(value.trigger), source_node: requiredText(value.source_node), invocation_id: optionalText(value.invocation_id) }
     return { type: value.type, conversation_id, progress, sequence, work_id: requiredText(value.work_id), target_node: requiredText(value.target_node) }
   } catch { return { type: 'invalidate' } }
