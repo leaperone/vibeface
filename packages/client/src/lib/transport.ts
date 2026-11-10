@@ -8,8 +8,8 @@ export type DeviceChannel = {
   idle(): boolean
   close(): void
 }
-/** The ticket names the entry Node only by its device ID. */
-export type JoinLink = { entryId: string; inviteId: string; inviteHash: string; secret: string }
+/** The ticket's entry Node: its device ID, and the `ip:port`s it listens on when this device can dial it directly. */
+export type JoinLink = { entryId: string; entryAddrs: string[]; inviteId: string; inviteHash: string; secret: string }
 /** This device's Ed25519 key as its platform keeps it: made once, it only ever signs. */
 export type DeviceKeys = {
   /** The key, made on first use. Throws an error with `code: 'key_lost'` when a key this device made is gone, unless replacing it. */
@@ -245,7 +245,9 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     const found = joinTicket(value)
     if (!found) throw new Error('这不是 Vibeface 加入链接。')
     const ticket = JSON.parse(secure.ticketDecode(found))
-    return { entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret }
+    // The node link's relay is not passed on: the app's direct dial takes addresses only.
+    const entryAddrs = dialLan ? lanAddrs(new URL(ticket.entry).searchParams.getAll('addr')) : []
+    return { entryId: ticket.entry_id, entryAddrs, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret }
   }
 
   async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
