@@ -444,25 +444,10 @@ mod tests {
         let binary = package.join(PROGRAMS[0]);
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
-        let install = command(&root, &data, &binary, Action::Install).unwrap();
-        let mut expected = expected_script_call(&package.join(SERVICE_SCRIPT));
-        expected.extend([
-            "install".into(),
-            "--data-dir".into(),
-            script_os_argument(&data).into_os_string(),
-            "--binary".into(),
-            script_os_argument(&binary).into_os_string(),
-        ]);
-        assert_eq!(whole_call(&install), expected);
-        assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
-        assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
-        assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
         let running = update::lock_data_dir(&data).unwrap();
         assert!(command(&root, &data, &binary, Action::Install).is_err());
         assert!(command(&root, &data, &binary, Action::Stop).is_ok());
         drop(running);
-        let pending = data.join("update-pending.json");
-        std::fs::write(&pending, b"{}").unwrap();
         // A child another test thread is spawning may still hold the released lock, as in
         // `Runtime::reopen`.
         let install = || {
@@ -481,6 +466,21 @@ mod tests {
                 }
             }
         };
+        let installation = install().unwrap();
+        let mut expected = expected_script_call(&package.join(SERVICE_SCRIPT));
+        expected.extend([
+            "install".into(),
+            "--data-dir".into(),
+            script_os_argument(&data).into_os_string(),
+            "--binary".into(),
+            script_os_argument(&binary).into_os_string(),
+        ]);
+        assert_eq!(whole_call(&installation), expected);
+        assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
+        assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
+        assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
+        let pending = data.join("update-pending.json");
+        std::fs::write(&pending, b"{}").unwrap();
         let error = install().unwrap_err();
         assert!(error.to_string().contains("recover the pending update"));
         assert!(command(&root, &data, &binary, Action::Status).is_ok());
