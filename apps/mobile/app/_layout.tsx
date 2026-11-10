@@ -120,13 +120,14 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
-        {ready && !wide && tabs.some(([href]) => href === pathname) ? <View role="tablist" className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
+        {ready && !wide && tabs.some(([href]) => href === pathname) ? <View accessibilityRole="tabbar" className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
           {tabs.map(([href, label, icon]) => {
             const selected = pathname === href
             const tint = selected ? 'text-foreground' : 'text-muted-foreground'
-            // `role` rather than `accessibilityRole`: the Link hands its child role="link", which only a `role` overrides.
+            // iOS reads buttons inside a tabbar as tabs ("tab, 1 of 4"); RN's role="tab" maps to no trait. `role` because only it
+            // overrides the role="link" the Link hands its child.
             return <Link key={href} href={{ pathname: href, params: { tab: '1' } }} replace asChild>
-              <Pressable role="tab" accessibilityState={{ selected }} accessibilityLabel={href === '/inbox' && waiting ? `${label}，${waiting} 件事等你决定` : label} className="min-h-14 flex-1 items-center justify-center gap-1">
+              <Pressable role="button" accessibilityState={{ selected }} accessibilityLabel={href === '/inbox' && waiting ? `${label}，${waiting} 件事等你决定` : label} className="min-h-14 flex-1 items-center justify-center gap-1">
                 <View>
                   <Icon as={icon} className={cn('size-5', tint)} />
                   {href === '/inbox' ? <View className="absolute start-3 -top-1.5"><Badge count={waiting} /></View> : null}
