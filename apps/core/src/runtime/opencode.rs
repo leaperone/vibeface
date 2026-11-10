@@ -193,9 +193,6 @@ struct Live {
     /// Its first message, which steers name as the turn.
     turn: String,
     conn: Conn,
-    directory: String,
-    /// What every message of the turn carries besides its own: agent, system and model.
-    body: Value,
     /// Our messages in the order sent: the turn's, then the steered ones.
     sent: Vec<String>,
     last_post_ms: i64,
@@ -1101,7 +1098,7 @@ impl Opencode {
             })?,
             None => None,
         };
-        let (session, directory, prompt) = match (resumed, previous) {
+        let (session, prompt) = match (resumed, previous) {
             (Some(found), Some(id)) => {
                 let busy = self
                     .busy(&conn, id)
@@ -1120,7 +1117,6 @@ impl Opencode {
                         ),
                     ));
                 }
-                let directory = found["location"]["directory"].as_str().unwrap_or(workspace);
                 if let Some(model) = model.as_ref()
                     && found["model"] != *model
                 {
@@ -1131,7 +1127,7 @@ impl Opencode {
                         )
                     })?;
                 }
-                (id.to_owned(), directory.to_owned(), prompt)
+                (id.to_owned(), prompt)
             }
             _ => {
                 let id = (self.create(&conn, workspace, model.as_ref()).await)
@@ -1140,7 +1136,7 @@ impl Opencode {
                 let fresh = previous
                     .and(config.codex_turn.as_ref())
                     .and_then(|turn| turn.fresh_prompt.as_deref());
-                (id, workspace.to_owned(), fresh.unwrap_or(prompt))
+                (id, fresh.unwrap_or(prompt))
             }
         };
         let native = Some(session.as_str());
@@ -1194,17 +1190,14 @@ impl Opencode {
             &config.custom_tools,
             &config.instructions,
         );
-        let body = json!({"id":message,"text":if instructions.is_empty() {
+        let first = json!({"id":message,"text":if instructions.is_empty() {
             prompt.to_owned()
         } else {
             format!("{instructions}\n\n{prompt}")
         }});
-        let first = body.clone();
         let live = Live {
             turn: message.clone(),
             conn: conn.clone(),
-            directory: directory.clone(),
-            body,
             sent: vec![message.clone()],
             last_post_ms: now_ms(),
             open: true,
@@ -1387,9 +1380,9 @@ impl Opencode {
         }
         let reply = match &last.reply {
             None => {
-                let failure = seen.error.take().unwrap_or_else(|| {
-                    own("opencode ended the run without an answer; check that the model exists and its provider is signed in")
-                });
+                let failure = own(
+                    "opencode ended the run without an answer; check that the model exists and its provider is signed in",
+                );
                 return Err(failed(native, failure));
             }
             Some(reply) if reply["error"]["type"] == "aborted" => {
@@ -1491,7 +1484,6 @@ fn session_of(event: &Value) -> Option<&str> {
 /// opencode reported.
 #[derive(Default)]
 struct Seen {
-    texts: BTreeSet<String>,
     tools: HashMap<String, &'static str>,
     tool_names: HashMap<String, &'static str>,
     error: Option<ExecFailure>,
@@ -1508,7 +1500,6 @@ impl Seen {
                     data["assistantMessageID"].as_str()?,
                     data["ordinal"].as_u64().unwrap_or_default()
                 );
-                self.texts.insert(id.clone());
                 Some(
                     json!({"type":"text_delta","item_id":bounded(&id, 128),"text":bounded(data["delta"].as_str()?, 8000)}),
                 )
@@ -2036,15 +2027,13 @@ impl Executor for Opencode {
                     .map(|turn| {
                         turn.sent.push(id.clone());
                         turn.last_post_ms = now_ms();
-                        (turn.conn.clone(), turn.directory.clone(), turn.body.clone())
+                        turn.conn.clone()
                     })
             };
-            let Some((conn, _directory, mut body)) = joined else {
+            let Some(conn) = joined else {
                 return SteerAck::Refused("the reply already ended".into());
             };
-            body["id"] = json!(id);
-            body["text"] = json!(input.message(message_id));
-            body.as_object_mut().expect("prompt body").remove("files");
+            let mut body = json!({"id":id,"text":input.message(message_id)});
             if !input.files.is_empty() {
                 let mut files = Vec::new();
                 for file in &input.files {

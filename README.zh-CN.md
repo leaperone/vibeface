@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Windows%20x64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
 
 </div>
 
@@ -81,7 +81,7 @@ vibeface join '<加入链接>' --name '<设备名称>'
 每台 Node 默认加入同一张全网表：宣告一条自己签名的记录，内容是设备编号、直连地址、home relay 和它提供的角色，并保存其他 Node 的记录。官方公共节点是一台不加入任何个人网络的普通 Node，是默认的 bootstrap 节点，同时提供开放 Relay 和浏览器接入，各有很小的上限。它的设备编号、UDP 地址和 Relay 固定在 [`config/public-bootstrap.json`](config/public-bootstrap.json)：
 
 ```text
-vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3340
+vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:3340
 ```
 
 新建的个人 Node 默认经它入网，直连不通时用全网表里经验证的开放 Relay 连通。`https://app.vibeface.dev` 直接连它的浏览器接入地址 `gateway_url`（`https://node.vibeface.dev:4792`），再按设备编号连到你的 Node，也可以在连接设置里换成自己的 Gateway；局域网直连仍优先。它只转发密文，能看到地址、设备编号和流量大小。首次初始化时可用 `--no-mesh` 不加入全网，或用 `--bootstrap <节点链接>` 经你认识的第一台 Node 入网（`vibeface mesh share` 打印运行中 Node 的节点链接）。配置方法、可见元数据和连接限制见[全网](packages/docs/node.md#全网)。加入个人网络仍需邀请和批准。
@@ -136,14 +136,18 @@ bash scripts/package-node.sh
 │   ├── app/         # 网页应用
 │   ├── cli/         # 命令行
 │   ├── core/        # Node 本机服务
+│   ├── desktop/     # 桌面应用
 │   ├── mobile/      # iOS 和 Android 应用
 │   └── www/         # 公共网站
 ├── crates/          # 共享 Rust 库
 ├── packages/
 │   ├── client/      # 共享应用客户端
 │   ├── docs/        # 用户和开发者指南
+│   ├── secure-native/ # 移动应用使用的 Rust 加密绑定
 │   └── theme/       # 共享样式
+├── config/          # 官方公共节点地址
 ├── contracts/       # 实验性文件交付合约
+├── deploy/          # 官方服务的容器部署
 ├── scripts/         # 构建、打包和验证工具
 ├── tests/           # 测试夹具和端到端测试
 └── install.sh       # 安装脚本

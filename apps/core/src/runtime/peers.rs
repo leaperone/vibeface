@@ -582,13 +582,12 @@ impl Runtime {
                 self.merge_addresses(network, records).await?;
                 Ok(json!({"records":self.store.lock().await.address_book()?}))
             }
-            "deliver" => self.accept_delivery(network, origin, input).await,
             "scheduler_jobs" => {
                 self.owner_jobs(network, field(input, "conversation_id")?)
                     .await
             }
             "progress_read" => self.read_progress(network, origin, input).await,
-            "dispatch_work" | "interrupt_work" => {
+            "deliver" | "dispatch_work" | "interrupt_work" => {
                 self.accept_peer_command(network, origin, input).await
             }
             "input_receipt" => self.read_input_receipt(network, input).await,
@@ -1236,7 +1235,6 @@ impl Runtime {
         true
     }
 
-    /// The write state, and the conflicts kept aside here, for the web.
     /// Each other member Node with whether the last sync reached it and when one last finished.
     pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
         let Ok(view) = self
@@ -1323,6 +1321,7 @@ impl Runtime {
         }))
     }
 
+    /// The write state, and the conflicts kept aside here, for the web.
     pub(crate) async fn write_status(&self, network: &str) -> Result<Value> {
         let state = *self.write_state.borrow();
         let conflicts = self.store.lock().await.conflicts(network)?;
@@ -2025,10 +2024,6 @@ impl Runtime {
                     detail,
                     now_ms(),
                 )?;
-                ensure!(
-                    matches!(state, "saved" | "waiting_dependencies"),
-                    "invalid owner admission state"
-                );
                 self.store
                     .lock()
                     .await
@@ -2047,15 +2042,6 @@ impl Runtime {
                 Err(error)
             }
         }
-    }
-
-    async fn accept_delivery(
-        self: &Arc<Self>,
-        network: &str,
-        origin: &str,
-        input: &Value,
-    ) -> Result<Value> {
-        self.accept_peer_command(network, origin, input).await
     }
 
     async fn accept_peer_command(
@@ -2365,14 +2351,6 @@ impl Runtime {
             let size = blob.size;
             tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&part)
-            .await?;
-        file.set_len(committed).await?;
-        file.seek(std::io::SeekFrom::Start(committed)).await?;
         let connection = self.net()?.connect(peer, net::BLOB).await?;
         let (mut send, mut recv) = connection
             .open_bi()
@@ -2390,6 +2368,14 @@ impl Runtime {
         if let Some(error) = header["error"].as_str() {
             bail!("{error}");
         }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)
+            .await?;
+        file.set_len(committed).await?;
+        file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
         while let Some(chunk) = recv
@@ -4603,6 +4589,14 @@ mod tests {
             assert_eq!(
                 b.store.lock().await.missing_blobs(&network)?,
                 std::slice::from_ref(&lacked.1)
+            );
+            assert!(
+                !b.store
+                    .lock()
+                    .await
+                    .partial_blob_file(&lacked.1.hash)?
+                    .exists(),
+                "an attachment the peer lacks stages nothing"
             );
             a.store.lock().await.put_blob(&lacked.1, &lacked.0)?;
             b.sync_peer(&network, &ia.device_id()?).await?;

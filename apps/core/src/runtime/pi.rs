@@ -926,7 +926,10 @@ impl Pi {
             if state["sessionId"] != session {
                 return Err(own(format!("pi opened session {}", state["sessionId"])));
             }
-            let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
+            let Some(file) = state["sessionFile"].as_str().filter(|f| !f.is_empty()) else {
+                return Err(own("pi reported no session file".into()));
+            };
+            let file = PathBuf::from(file);
             self.keep(session, &file, &launch.cwd, process.tree.token())
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         };

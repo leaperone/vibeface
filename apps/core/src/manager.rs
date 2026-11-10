@@ -328,7 +328,7 @@ where
             "manager workspace must be an existing absolute directory"
         );
         ensure!(
-            !prompt.trim().is_empty() && prompt.len() <= 65_536,
+            !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT,
             "management prompt must be nonempty and at most 65536 bytes"
         );
         if let Some(id) = previous_session_id {
@@ -1010,13 +1010,7 @@ pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
         .collect();
     values.extend(
         std::env::vars()
-            .filter(|(key, value)| {
-                value.len() >= 8
-                    && (key.ends_with("_KEY")
-                        || key.ends_with("_TOKEN")
-                        || key.ends_with("_SECRET")
-                        || key.ends_with("_PASSWORD"))
-            })
+            .filter(|(key, value)| value.len() >= 8 && crate::logging::credential_name(key))
             .map(|(_, value)| value),
     );
     if let Ok(keys) = config.sdk.provider().key_variables(&config.provider_env) {

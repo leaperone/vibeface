@@ -276,17 +276,8 @@ async fn inspect(data: &Path, bundled: &Path) -> Result<InspectResult> {
 }
 
 fn verify_bundled_source(package: &Path) -> Result<()> {
-    let build = crate::update::release::verify_sealed_package(
-        package,
-        env!("CARGO_PKG_VERSION"),
-        &target()?,
-    )?;
-    crate::update::validate_desktop_package(package)?;
-    ensure!(
-        build.version == env!("CARGO_PKG_VERSION"),
-        "bundled runtime version mismatch"
-    );
-    Ok(())
+    crate::update::release::verify_sealed_package(package, env!("CARGO_PKG_VERSION"), &target()?)?;
+    crate::update::validate_desktop_package(package)
 }
 
 /// The package that contains this signed executable. Callers pass that directory onward;
@@ -973,11 +964,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                                 Some(receipt),
                                 Some(true),
                                 Some("running".into()),
-                                if inspected.status == "running" {
-                                    Some(running_core_version(&inspected)?)
-                                } else {
-                                    None
-                                },
+                                Some(running_core_version(&inspected)?),
                                 bundled,
                             )?;
                             return Ok(());
@@ -1081,8 +1068,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     }
                     match update_meta.availability {
                         "current" => {
-                            if native.installed
-                                && native.running
+                            if native.running
                                 && (fresh.status != "running"
                                     || running_core_version(&fresh)?
                                         != bundled_package_version(&source)?)
@@ -1115,7 +1101,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         }
                         _ => anyhow::bail!(OperationFailure::UpdateRefused),
                     }
-                    if !native.installed || (fresh.status == "running") != native.running {
+                    if (fresh.status == "running") != native.running {
                         anyhow::bail!(OperationFailure::UpdateRefused);
                     }
                     let bundled_version = bundled_package_version(&source)?;

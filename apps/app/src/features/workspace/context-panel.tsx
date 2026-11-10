@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Details, SettingsGroup, SettingsRow, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { Input } from '@/components/ui/input'
-import { messageOf } from "@vibeface/client/lib/node.ts"
+import { messageOf, providerNames } from "@vibeface/client/lib/node.ts"
 import { newId } from "@vibeface/client/workspace/storage.ts"
 import { memoryBase, memoryResultLabel, memorySaved, memorySyncConflictLabel, type MemoryControls } from "@vibeface/client/workspace/memory.ts"
 import { formatWhen, changeTitle, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
@@ -28,7 +28,6 @@ type ContextPanelProps = {
   memory: MemoryControls
 }
 
-const continuityProviderLabels: Record<string, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude Code", pi: "pi", opencode: "opencode" }
 
 export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: ContextPanelProps) {
   const workspace = useWorkspace()
@@ -289,7 +288,7 @@ export function MemorySummary({ settings, context, memory }: { settings: BotSett
 }
 
 function providerLabel(provider: string) {
-  return continuityProviderLabels[provider] ?? provider
+  return (providerNames as Record<string, string>)[provider] ?? provider
 }
 
 function ContinuityLayer({ step, label, detail, tone, status }: { step: string; label: string; detail: string; tone: Tone; status: string }) {
@@ -365,4 +364,3 @@ function CheckSummary({ check }: { check: CoordinationCheck }) {
   </li>
 }
 
-export type { ContextPanelProps }

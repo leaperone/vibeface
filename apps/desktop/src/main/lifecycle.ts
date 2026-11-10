@@ -10,7 +10,7 @@ import { PARENT_STDIN_FLAG } from '../shared/contract.js'
 export type Ownership =
   | { kind: 'idle' }
   | { kind: 'attached'; dataDir: string }
-  | { kind: 'owned'; dataDir: string; startedAt: number }
+  | { kind: 'owned'; dataDir: string }
 
 export type OwnedExit = { code: number | null; signal: NodeJS.Signals | null }
 
@@ -62,9 +62,6 @@ export class CoreLifecycle {
     this.ownership = { kind: 'attached', dataDir }
   }
 
-  detach(): void {
-    if (this.ownership.kind === 'attached') this.ownership = { kind: 'idle' }
-  }
 
   /**
    * Start a Core this app owns. The child keeps the parent's stdin pipe open; closing it, or
@@ -90,7 +87,7 @@ export class CoreLifecycle {
       this.finish(child, { code, signal })
     })
     this.child = child
-    this.ownership = { kind: 'owned', dataDir, startedAt: Date.now() }
+    this.ownership = { kind: 'owned', dataDir }
   }
 
   private finish(child: ChildProcess, exit: OwnedExit): void {

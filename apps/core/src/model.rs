@@ -797,10 +797,8 @@ pub fn looks_secret(text: &str) -> bool {
         "hf_",
         "npm_",
     ];
-    if MARKERS
-        .iter()
-        .any(|marker| text.to_lowercase().contains(marker))
-    {
+    let lower = text.to_lowercase();
+    if MARKERS.iter().any(|marker| lower.contains(marker)) {
         return true;
     }
     text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))

@@ -10,8 +10,6 @@ export type ControlRequest =
   | { command: 'inspect'; data_dir: string }
   | { command: 'access'; data_dir: string; json: boolean }
   | { command: 'local_setup'; data_dir: string }
-  | { command: 'set_local_access'; data_dir: string; enabled: boolean }
-  | { command: 'join'; data_dir: string; link: string; name: string }
 
 /** `vibeface_core::control::InitOptions` with only the fields the desktop sets. */
 export type InitOptions = { data_dir: string }

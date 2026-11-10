@@ -159,7 +159,7 @@ struct Init {
     #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
     /// Address for the local control API.
-    #[arg(long, default_value_t = local_listen())]
+    #[arg(long, default_value_t = DEFAULT_LOCAL_LISTEN)]
     local_listen: SocketAddr,
     /// Public browser entry URL.
     #[arg(long)]
@@ -705,10 +705,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => {
-            let data_dir = data_dir_or_home(
-                cli.data_dir
-                    .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from)),
-            )?;
+            let data_dir = data_dir_or_home(cli.data_dir)?;
             let mut args = vec![
                 "--data-dir".to_owned(),
                 data_dir.to_string_lossy().into_owned(),
@@ -735,12 +732,9 @@ async fn main() -> Result<()> {
             exec_core(&args.iter().map(String::as_str).collect::<Vec<_>>())
         }
         Some(Action::Init(options)) => {
-            let result = control(
-                &options.data_dir,
-                ControlRequest::Init {
-                    options: serde_json::to_value(&*options)?,
-                },
-            )
+            let result = control(ControlRequest::Init {
+                options: serde_json::to_value(&*options)?,
+            })
             .await?;
             println!("Vibeface 已就绪");
             if let Some(open) = result["open"].as_str() {
@@ -791,9 +785,9 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 Ok(())
             }
-            None => post_triage(&options.local, serde_json::to_value(options.action)?).await,
+            None => triage_post(&options.local, serde_json::to_value(options.action)?).await,
         },
-        Some(Action::Requests(local)) => post_triage(&local, json!({"action":"requests"})).await,
+        Some(Action::Requests(local)) => triage_post(&local, json!({"action":"requests"})).await,
         Some(Action::Respond {
             request_id,
             result,
@@ -801,7 +795,7 @@ async fn main() -> Result<()> {
             local,
         }) => {
             let result: Value = serde_json::from_str(&result).context("result must be JSON")?;
-            post_triage(
+            triage_post(
                 &local,
                 json!({"action":"respond","request_id":request_id,"result":result,"node":node}),
             )
@@ -849,17 +843,14 @@ fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
 
-async fn control(_data_dir: &Path, request: ControlRequest) -> Result<Value> {
+async fn control(request: ControlRequest) -> Result<Value> {
     vibeface_control::request(&core_binary()?, &request).await
 }
 
 async fn inspect_socket(data_dir: &Path) -> Result<PathBuf> {
-    let info = control(
-        data_dir,
-        ControlRequest::Inspect {
-            data_dir: data_dir.to_owned(),
-        },
-    )
+    let info = control(ControlRequest::Inspect {
+        data_dir: data_dir.to_owned(),
+    })
     .await?;
     info["maintenance_socket"]
         .as_str()
@@ -868,12 +859,9 @@ async fn inspect_socket(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn status(options: Access) -> Result<()> {
-    let mut result = control(
-        &options.data_dir,
-        ControlRequest::Inspect {
-            data_dir: options.data_dir.clone(),
-        },
-    )
+    let mut result = control(ControlRequest::Inspect {
+        data_dir: options.data_dir.clone(),
+    })
     .await?;
     result["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
     if options.json {
@@ -952,13 +940,10 @@ async fn mesh(options: MeshOptions) -> Result<()> {
             command: BootstrapAction::Remove { nodes },
         } => json!({"op":"bootstrap","remove":nodes}),
     };
-    let result = control(
-        &options.data_dir,
-        ControlRequest::Mesh {
-            data_dir: options.data_dir.clone(),
-            operation,
-        },
-    )
+    let result = control(ControlRequest::Mesh {
+        data_dir: options.data_dir.clone(),
+        operation,
+    })
     .await?;
     match options.command {
         MeshAction::Status { json: true } | MeshAction::Records { json: true, .. } => {
@@ -1027,13 +1012,10 @@ async fn mesh(options: MeshOptions) -> Result<()> {
 
 async fn access(options: LocalEntry) -> Result<()> {
     if options.enable || options.disable {
-        let result = control(
-            &options.access.data_dir,
-            ControlRequest::SetLocalAccess {
-                data_dir: options.access.data_dir.clone(),
-                enabled: options.enable,
-            },
-        )
+        let result = control(ControlRequest::SetLocalAccess {
+            data_dir: options.access.data_dir.clone(),
+            enabled: options.enable,
+        })
         .await?;
         let running = result["running"].as_bool().unwrap_or(true);
         if options.disable || !running {
@@ -1047,13 +1029,10 @@ async fn access(options: LocalEntry) -> Result<()> {
             return Ok(());
         }
     }
-    let result = control(
-        &options.access.data_dir,
-        ControlRequest::Access {
-            data_dir: options.access.data_dir.clone(),
-            json: options.access.json,
-        },
-    )
+    let result = control(ControlRequest::Access {
+        data_dir: options.access.data_dir.clone(),
+        json: options.access.json,
+    })
     .await?;
     if options.access.json {
         let mut output = json!({
@@ -1081,25 +1060,19 @@ async fn access(options: LocalEntry) -> Result<()> {
 
 async fn join(options: Join) -> Result<()> {
     let data_dir = options.data_dir.clone();
-    let running = control(
-        &data_dir,
-        ControlRequest::Inspect {
-            data_dir: data_dir.clone(),
-        },
-    )
+    let running = control(ControlRequest::Inspect {
+        data_dir: data_dir.clone(),
+    })
     .await
     .ok()
     .and_then(|value| value["status"].as_str().map(|status| status == "running"))
     .unwrap_or(false);
     if !running {
-        let result = control(
-            &data_dir,
-            ControlRequest::Join {
-                data_dir: data_dir.clone(),
-                link: options.link.clone(),
-                name: options.name.clone(),
-            },
-        )
+        let result = control(ControlRequest::Join {
+            data_dir: data_dir.clone(),
+            link: options.link.clone(),
+            name: options.name.clone(),
+        })
         .await?;
         match result["status"].as_str() {
             Some("joined") => {
@@ -1278,13 +1251,10 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             key_operation(&dir, "revoke", intent_id, gas_cap).await
         }
         WalletAction::Backup { output } => {
-            let result = control(
-                &dir,
-                ControlRequest::Wallet {
-                    data_dir: dir.clone(),
-                    operation: json!({"op":"backup","output":output}),
-                },
-            )
+            let result = control(ControlRequest::Wallet {
+                data_dir: dir.clone(),
+                operation: json!({"op":"backup","output":output}),
+            })
             .await?;
             if result.is_null() {
                 println!("Encrypted delivery wallet backup saved.");
@@ -2136,7 +2106,7 @@ async fn logs(options: Logs) -> Result<()> {
         }
         Ok(())
     };
-    let mut records = Vec::new();
+    let mut records = std::collections::VecDeque::new();
     for path in log_files(&options.data_dir) {
         let file = fs::File::open(path)?;
         for line in std::io::BufReader::new(file).split(b'\n') {
@@ -2147,9 +2117,9 @@ async fn logs(options: Logs) -> Result<()> {
             if let Ok(record) = serde_json::from_slice::<LogValue>(&line)
                 && log_matches(&record, &options, since)
             {
-                records.push(record);
+                records.push_back(record);
                 if records.len() > options.limit.max(1) {
-                    records.remove(0);
+                    records.pop_front();
                 }
             }
         }
@@ -2276,10 +2246,6 @@ async fn triage_post(local: &LocalNode, mut body: Value) -> Result<()> {
     Ok(())
 }
 
-async fn post_triage(local: &LocalNode, body: Value) -> Result<()> {
-    triage_post(local, body).await
-}
-
 async fn post_local(local: &LocalNode, path: &str, body: &Value, total: Duration) -> Result<Value> {
     let credential = vibeface_control::LocalHttpCredential::read(&local.data_dir)?;
     let url = origin(local.node_url.as_deref().unwrap_or(&credential.origin))?;
@@ -2386,9 +2352,6 @@ fn data_dir_or_home(dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn local_listen() -> SocketAddr {
-    DEFAULT_LOCAL_LISTEN
-}
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -1,4 +1,4 @@
-import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
+import { HeadContent, Outlet, Scripts, createRootRoute, useRouter } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { Toaster } from '@/components/app/kit'
 import { DeviceProvider } from '@vibeface/client/identity/context.tsx'
@@ -46,10 +46,11 @@ function RootLayout() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
+  const router = useRouter()
   useEffect(registerShell, [])
   useEffect(installErrorReporting, [])
   useEffect(installValidityMessages, [])
-  useEffect(installDesktopNavigation, [])
+  useEffect(() => installDesktopNavigation(router), [router])
   return (
     <html lang="zh-CN">
       <head>

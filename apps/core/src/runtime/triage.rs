@@ -2642,6 +2642,11 @@ impl Runtime {
                     |r| r.get(0),
                 )
                 .optional()?;
+            if let Some(mark) = mark
+                && std::fs::metadata(&path).is_ok_and(|meta| meta.len() == mark as u64)
+            {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };

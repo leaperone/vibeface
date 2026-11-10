@@ -1109,9 +1109,9 @@ fn cursor_models(response: &Value, env: &BTreeMap<String, String>) -> CursorCata
             !value.is_empty()
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)
-                && !env
-                    .values()
-                    .any(|secret| !secret.is_empty() && value.contains(secret))
+                && !env.iter().any(|(name, secret)| {
+                    credential_value(name, secret) && value.contains(secret.as_str())
+                })
         };
         let Some(id) = model["modelId"].as_str().filter(valid) else {
             return CursorCatalog::Unavailable;

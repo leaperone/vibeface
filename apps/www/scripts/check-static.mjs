@@ -16,6 +16,7 @@ const required = [
   'docs/user-guide/index.html',
   'docs/comparison/index.html',
   'docs/install/index.html',
+  'docs/ios/index.html',
   'docs/bot-and-execution/index.html',
   'docs/history-sync/index.html',
   'docs/privacy-security/index.html',

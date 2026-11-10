@@ -149,7 +149,7 @@ PY
   export IOS_SIGNING_TEAM="$team" IOS_SIGNING_PROFILE_UUID="$profile_uuid" IOS_SIGNING_IDENTITY="$identity"
 fi
 
-scripts/build-mobile-secure.sh ios
+"$root/scripts/build-mobile-secure.sh" ios
 cd "$root/apps/mobile"
 npx expo prebuild --platform ios --no-install
 (cd ios && pod install)

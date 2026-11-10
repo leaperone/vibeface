@@ -11,7 +11,7 @@ import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { newId } from '@vibeface/client/workspace/storage.ts'
 import type { WorkspaceCommand, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 
-export const workspaceTaskLabels: Record<WorkspaceTask['state'], string> = {
+const workspaceTaskLabels: Record<WorkspaceTask['state'], string> = {
   not_started: '未开始', running: '执行中', waiting_dependencies: '等待依赖', waiting_user: '等待你决定',
   update_pending: '更新待承接', stop_pending: '停止待确认', needs_reconciliation: '结果待确认',
   completed: '已完成', cancelled: '已取消', deferred: '稍后处理',

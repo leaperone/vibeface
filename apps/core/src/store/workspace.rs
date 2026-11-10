@@ -1376,7 +1376,7 @@ impl Graph {
         hash: &str,
         event: &Event,
         rank: &str,
-        basis: VersionVector,
+        basis: impl FnOnce() -> Result<VersionVector>,
     ) -> Result<()> {
         if let EventBody::InputPosted {
             message_id,
@@ -1404,7 +1404,12 @@ impl Graph {
             self.last_rank = rank.into();
             return Ok(());
         }
-        let EventBody::WorkspaceCommanded { command_id, .. } = &event.body else {
+        let EventBody::WorkspaceCommanded {
+            command_id,
+            command,
+            ..
+        } = &event.body
+        else {
             return Ok(());
         };
         let key = request_key(
@@ -1416,6 +1421,12 @@ impl Graph {
         if self.commands.contains_key(command_id) {
             return Ok(());
         }
+        // Only an assignment stores its causal basis, and computing one walks the whole history.
+        let basis = if matches!(command, WorkspaceCommand::AssignTask { .. }) {
+            basis()?
+        } else {
+            VersionVector::new()
+        };
         let mut next = self.clone();
         let error = next
             .apply(hash, event, basis)
@@ -1455,6 +1466,16 @@ fn ancestors(
     }
     Ok(result)
 }
+fn basis(connection: &Connection, network: &str, event: &Event) -> Result<VersionVector> {
+    Ok(ancestors(connection, network, event)?.values().fold(
+        VersionVector::new(),
+        |mut vector, event| {
+            let seq = vector.entry(event.author.clone()).or_default();
+            *seq = (*seq).max(event.seq);
+            vector
+        },
+    ))
+}
 fn graph_at(
     connection: &Connection,
     network: &str,
@@ -1477,15 +1498,9 @@ fn graph_at(
         }
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let basis = ancestors(connection, network, &event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        );
-        graph.record(&hash, &event, &super::rank(lamport, created, &hash), basis)?;
+        graph.record(&hash, &event, &super::rank(lamport, created, &hash), || {
+            basis(connection, network, &event)
+        })?;
     }
     Ok(graph)
 }
@@ -1500,15 +1515,7 @@ pub(crate) fn apply_projection(
     if rank < graph.last_rank.as_str() {
         graph = graph_at(connection, network, None)?;
     } else {
-        let basis = ancestors(connection, network, event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        );
-        graph.record(hash, event, rank, basis)?;
+        graph.record(hash, event, rank, || basis(connection, network, event))?;
     }
     graph.save(connection, network)?;
     if let EventBody::WorkspaceCommanded {
@@ -2560,6 +2567,19 @@ pub(crate) fn additional_dependencies(
     network: &str,
     body: &EventBody,
 ) -> Result<Vec<String>> {
+    if !matches!(
+        body,
+        EventBody::InputPosted { .. }
+            | EventBody::WorkspaceCommanded { .. }
+            | EventBody::MessagePosted {
+                in_reply_to: Some(_),
+                role: Role::Assistant,
+                ..
+            }
+            | EventBody::MessageSteered { .. }
+    ) {
+        return Ok(Vec::new());
+    }
     let graph = Graph::read(connection, network)?;
     let mut hashes = BTreeSet::new();
     let mut scopes = BTreeSet::new();
@@ -3404,36 +3424,46 @@ fn queued_inputs_from(
     network: &str,
     graph: &Graph,
 ) -> Result<Vec<QueuedInput>> {
-    let mut inputs = Vec::new();
-    for (index, message_id) in graph.queue_order.iter().enumerate() {
-        let control = graph
-            .inputs
-            .get(message_id)
-            .context("queue input projection is missing")?;
-        let original = log::event_from(connection, network, &control.source_event)?
-            .and_then(|event| input_from_event(&control.source_event, event))
-            .context("queue input source is missing")?;
-        let mut input = original.input;
-        if let Some(text) = &control.text {
-            input.text = text.clone();
-        }
-        if let Some(attachments) = &control.attachments {
-            input.attachments = attachments.clone();
-        }
-        if !control.deferred && input.route.intent == InputIntent::Defer {
-            input.route.intent = InputIntent::Continue;
-        }
-        inputs.push(QueuedInput {
-            input,
-            conversation_id: original.conversation_id,
-            source_event: control.source_event.clone(),
-            control_event: control.control_event.clone(),
-            effective_order: index as u64 + 1,
-            deferred: control.deferred,
-            cancelled: control.cancelled,
-        });
+    graph
+        .queue_order
+        .iter()
+        .enumerate()
+        .map(|(index, message_id)| queued_input_at(connection, network, graph, index, message_id))
+        .collect()
+}
+fn queued_input_at(
+    connection: &Connection,
+    network: &str,
+    graph: &Graph,
+    index: usize,
+    message_id: &str,
+) -> Result<QueuedInput> {
+    let control = graph
+        .inputs
+        .get(message_id)
+        .context("queue input projection is missing")?;
+    let original = log::event_from(connection, network, &control.source_event)?
+        .and_then(|event| input_from_event(&control.source_event, event))
+        .context("queue input source is missing")?;
+    let mut input = original.input;
+    if let Some(text) = &control.text {
+        input.text = text.clone();
     }
-    Ok(inputs)
+    if let Some(attachments) = &control.attachments {
+        input.attachments = attachments.clone();
+    }
+    if !control.deferred && input.route.intent == InputIntent::Defer {
+        input.route.intent = InputIntent::Continue;
+    }
+    Ok(QueuedInput {
+        input,
+        conversation_id: original.conversation_id,
+        source_event: control.source_event.clone(),
+        control_event: control.control_event.clone(),
+        effective_order: index as u64 + 1,
+        deferred: control.deferred,
+        cancelled: control.cancelled,
+    })
 }
 pub(crate) fn queued_workspace_input_from(
     connection: &Connection,
@@ -3441,9 +3471,12 @@ pub(crate) fn queued_workspace_input_from(
     message_id: &str,
 ) -> Result<Option<QueuedInput>> {
     let graph = Graph::read(connection, network)?;
-    Ok(queued_inputs_from(connection, network, &graph)?
-        .into_iter()
-        .find(|input| input.input.message_id == message_id))
+    graph
+        .queue_order
+        .iter()
+        .position(|id| id == message_id)
+        .map(|index| queued_input_at(connection, network, &graph, index, message_id))
+        .transpose()
 }
 
 impl Store {
@@ -3671,15 +3704,6 @@ impl Store {
             at,
         )?;
         self.workspace_assignment(network, &assignment_id)
-    }
-    pub fn started_workspace_assignment(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        job: &crate::scheduling::SchedulerJob,
-        at: i64,
-    ) -> Result<()> {
-        self.settle_workspace_assignment(identity, network, job, at)
     }
     pub fn settle_workspace_assignment(
         &mut self,
@@ -5218,11 +5242,15 @@ pub(crate) fn bind_waiting_workspace_inputs_from(
     assignment: &Assignment,
 ) -> Result<()> {
     let mut statement =
-        connection.prepare("SELECT key,value FROM identity_meta WHERE key LIKE ?")?;
+        connection.prepare("SELECT key,value FROM identity_meta WHERE key>=?1 AND key<?2")?;
     let bindings = statement
-        .query_map([format!("workspace-input-assignment:{network}:%")], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            [
+                format!("workspace-input-assignment:{network}:"),
+                format!("workspace-input-assignment:{network};"),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let graph = Graph::read(connection, network)?;
     for (key, value) in bindings {

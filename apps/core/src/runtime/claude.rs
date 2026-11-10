@@ -4,6 +4,7 @@
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -642,15 +643,8 @@ fn tool_kind(name: &str) -> &'static str {
     }
 }
 
-fn clip(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .take(limit)
-        .collect()
-}
-
 fn tool_progress(id: &str, name: &str, status: &str) -> Value {
-    json!({"type":"tool","item_id":clip(id, 128),"name":name,"status":status})
+    json!({"type":"tool","item_id":bounded(id, 128),"name":name,"status":status})
 }
 
 /// What the frames of one turn said so far.
@@ -671,7 +665,7 @@ impl Turn {
                 Some(json!({"type":"status","status":"running"}))
             }
             Frame::Text { id, text } => Some(
-                json!({"type":"text_snapshot","item_id":clip(&id, 128),"text":clip(&text, 8000)}),
+                json!({"type":"text_snapshot","item_id":bounded(&id, 128),"text":bounded(&text, 8000)}),
             ),
             Frame::ToolStarted { id, name } => {
                 let progress = tool_progress(&id, name, "running");
@@ -1399,10 +1393,6 @@ where
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
         }
-        if turn.session.is_some() {
-            stage.enter(ProviderStage::Run);
-            *start.lock().unwrap() = manager::StartEvidence::Started;
-        }
         if let Some(next) = turn.ending.take() {
             processes.close_input(process.tree.token());
             Ending::append(&mut ending, next);
@@ -1600,6 +1590,7 @@ async fn follow(
     node: Weak<Runtime>,
     network: String,
     work_id: String,
+    conversation: String,
     session: String,
     message: String,
     mut process: Process,
@@ -1642,12 +1633,11 @@ async fn follow(
             };
             if let Some(progress) = turn.apply(frame)
                 && let Ok(target_node) = node.identity.device_id()
-                && let Ok(Some(record)) = node.store.lock().await.work_record(&work_id)
             {
                 let sequence = node.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":record.conversation,
+                    json!({"type":"native_progress","conversation_id":conversation,
                         "work_id":work_id,"target_node":target_node,"sequence":sequence,
                         "progress":progress}),
                 );
@@ -1853,6 +1843,7 @@ impl Executor for Claude {
                 Arc::downgrade(node),
                 network.to_owned(),
                 work_id.to_owned(),
+                work.conversation.clone(),
                 session,
                 message,
                 process,

@@ -411,12 +411,7 @@ fn signal_group(group: i32, signal: i32) -> bool {
 pub fn root_is_running(process: u32) -> bool {
     #[cfg(unix)]
     {
-        let Ok(group) = libc::pid_t::try_from(process) else {
-            return false;
-        };
-        // SAFETY: kill with signal 0 performs only the existence and permission check.
-        let result = unsafe { libc::kill(-group, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        libc::pid_t::try_from(process).is_ok_and(|group| signal_group(group, 0))
     }
     #[cfg(windows)]
     {

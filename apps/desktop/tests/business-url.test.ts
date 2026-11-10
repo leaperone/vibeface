@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { businessNavigation, businessUrl, parsePrivateOrigin } from '../src/main/business-url.js'
+import { businessUrl, parsePrivateOrigin } from '../src/main/business-url.js'
 import type { Access, Inspect } from '../src/main/control-types.js'
 
 const DEVICE = 'a'.repeat(64)
@@ -89,13 +89,3 @@ describe('businessUrl', () => {
   })
 })
 
-describe('businessNavigation', () => {
-  const invite = { ticket: 'vibeface1qq2ww3ee4' }
-
-  it('opens an invite at the selected Node\'s join form', () => {
-    expect(businessNavigation(access(), inspect(), invite)).toEqual({
-      kind: 'business',
-      url: 'http://127.0.0.1:4791/join#vibeface1qq2ww3ee4',
-    })
-  })
-})

@@ -361,11 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn wallet_passphrase_is_not_debug_or_cloneable() {
+    fn wallet_passphrase_is_sent_as_plain_text_in_the_command() {
         let command = WalletCommand::Create {
             passphrase: SecretString::new("a secure passphrase".into()),
         };
-        let bytes = serde_json::to_vec(&command).unwrap();
-        assert!(std::str::from_utf8(&bytes).unwrap().contains("passphrase"));
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            serde_json::json!({"op": "create", "passphrase": "a secure passphrase"})
+        );
     }
 }

@@ -197,7 +197,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
  * person confirms it is kept apart from its password, which drops the copy.
  * `landing`: where the focus goes once confirming takes the file, and the box ticked, off the page.
  */
-export function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | undefined }) {
+function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | undefined }) {
   const { unsavedRecovery: file, downloadUnsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const [error, setError] = useState('')
   if (!file) return null

@@ -397,7 +397,7 @@ impl CursorExecutor {
             return Ok(owner);
         }
         let projections = node.store.lock().await.works(network, &work.conversation)?;
-        let mut by_id: HashMap<_, _> = projections
+        let by_id: HashMap<_, _> = projections
             .into_iter()
             .map(|projection| (projection.work_id.clone(), projection))
             .collect();
@@ -410,10 +410,10 @@ impl CursorExecutor {
                 "Cursor continuation lineage contains a cycle"
             );
             let projection = by_id
-                .remove(&previous)
+                .get(&previous)
                 .context("continued Cursor work is not on this device")?;
             root = projection.work_id.clone();
-            next = projection.continues;
+            next = projection.continues.clone();
         }
         let workspace = self
             .owner_for_work(&root)
@@ -502,7 +502,10 @@ impl CursorExecutor {
         cancel: watch::Receiver<bool>,
     ) {
         let WorkSpec {
-            work_id, prompt, ..
+            work_id,
+            prompt,
+            conversation,
+            ..
         } = work;
         let bridge = match self.bridge() {
             Ok(bridge) => bridge,
@@ -597,6 +600,7 @@ impl CursorExecutor {
             let node = progress_node.clone();
             let network = progress_network.clone();
             let work_id = progress_work.clone();
+            let conversation = conversation.clone();
             let text = progress_text.clone();
             async move {
                 let Some(node) = node.upgrade() else {
@@ -635,7 +639,7 @@ impl CursorExecutor {
                 let target_node = node.identity.device_id()?;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":node.store.lock().await.work_record(&work_id)?.map(|r| r.conversation).unwrap_or_default(),"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
+                    json!({"type":"native_progress","conversation_id":conversation,"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
                 );
                 Ok(())
             }

@@ -5440,15 +5440,6 @@ fn shared_records_never_carry_a_known_credential() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn autonomy_is_not_an_event() {
-    let body = serde_json::json!({"type":"autonomy_set","mode":"off","version":1});
-    assert!(
-        serde_json::from_value::<EventBody>(body).is_err(),
-        "the coordination Agent always runs with full permission; there is no autonomy setting"
-    );
-}
-
 struct Fleet {
     net: Net,
     x: LocalIdentity,
@@ -14774,7 +14765,7 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
         vibeface_bridge::failure::ProviderStage::TurnStart,
         crate::scheduling::TurnExecution::Unknown,
     )?;
-    uncertain.started_workspace_assignment(&net.a, &net.network, &job, 6)?;
+    uncertain.settle_workspace_assignment(&net.a, &net.network, &job, 6)?;
     assert_eq!(
         assignment_state(&uncertain, &net, &inflight.assignment_id)?,
         AssignmentState::Proposed
@@ -14990,16 +14981,16 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     let queued = origin
         .scheduler_job("c", &message_trigger("initial"))?
         .context("queued job")?;
-    origin.started_workspace_assignment(&net.a, &net.network, &queued, 6)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &queued, 6)?;
     assert_eq!(task_state(&origin, &net, "task")?, TaskState::NotStarted);
     let claimed = origin
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "workspace-start")?
         .context("claimed job")?
         .job;
     let attempt = claimed.state.attempt().context("attempt")?.id.clone();
-    origin.started_workspace_assignment(&net.a, &net.network, &claimed, 7)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 7)?;
     origin.mark_started("c", &claimed.trigger, &attempt)?;
-    origin.started_workspace_assignment(&net.a, &net.network, &claimed, 8)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 8)?;
     assert_eq!(
         assignment_state(&origin, &net, &assignment.assignment_id)?,
         AssignmentState::Proposed
@@ -15024,7 +15015,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
         ProviderStage::Run,
         TurnExecution::Started,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &claimed, 10)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 10)?;
     let started = origin
         .workspace_assignment(&net.network, &assignment.assignment_id)?
         .unwrap();
@@ -15035,7 +15026,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     assert!(started.result.is_none());
     assert_eq!(task_state(&origin, &net, "task")?, TaskState::Running);
     let recorded = origin.version_vector(&net.network)?;
-    origin.started_workspace_assignment(&net.a, &net.network, &claimed, 11)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 11)?;
     assert_eq!(
         origin.version_vector(&net.network)?,
         recorded,
@@ -15062,7 +15053,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
         InputIntent::Continue,
         13,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &claimed, 14)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 14)?;
     let unchanged = origin
         .workspace_assignment(&net.network, &assignment.assignment_id)?
         .unwrap();
@@ -15719,7 +15710,7 @@ fn a_replaced_assignment_cannot_reauthorize_its_running_work_result() -> Result<
         .job;
     let human_attempt = human.state.attempt().unwrap().id.clone();
     origin.mark_started("c", &human.trigger, &human_attempt)?;
-    origin.started_workspace_assignment(&net.a, &net.network, &human, 6)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &human, 6)?;
     assert!(origin.manager_attempt_allowed_with_version(
         &net.network,
         &local,
@@ -15877,7 +15868,7 @@ fn workspace_task_answer_keeps_the_assignment_from_the_signed_question_basis() -
         vibeface_bridge::failure::ProviderStage::Run,
         TurnExecution::Started,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &running, 6)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &running, 6)?;
     origin.save_scheduler_native_id(
         "c",
         &running.trigger,
@@ -16027,7 +16018,7 @@ fn workspace_task_answer_keeps_the_assignment_from_the_signed_question_basis() -
         vibeface_bridge::failure::ProviderStage::Run,
         TurnExecution::Started,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &answering, 12)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &answering, 12)?;
     let answered = origin.finish_job(
         &net.a,
         &net.network,
@@ -16252,7 +16243,7 @@ fn workspace_release_retries_only_a_shared_proven_startup_failure_on_the_origina
         vibeface_bridge::failure::ProviderStage::Run,
         TurnExecution::Started,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &retry, 11)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &retry, 11)?;
     let completed = origin.finish_job(
         &net.a,
         &net.network,
@@ -16872,7 +16863,7 @@ fn workspace_started_job_fixture(net: &Net, origin: &mut Store, at: i64) -> Resu
         vibeface_bridge::failure::ProviderStage::Run,
         crate::scheduling::TurnExecution::Started,
     )?;
-    origin.started_workspace_assignment(&net.a, &net.network, &job, at)?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &job, at)?;
     origin
         .scheduler_job("c", &job.trigger)?
         .context("started job")
@@ -17878,7 +17869,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
             vibeface_bridge::failure::ProviderStage::Run,
             TurnExecution::Started,
         )?;
-        origin.started_workspace_assignment(&net.a, &net.network, &job, 17 + index as i64)?;
+        origin.settle_workspace_assignment(&net.a, &net.network, &job, 17 + index as i64)?;
         let ended = origin.finish_job(
             &net.a,
             &net.network,

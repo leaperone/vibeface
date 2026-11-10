@@ -12,7 +12,7 @@ python3 deploy/static-config.py --role app --component .artifacts/deploy/app/com
 
 App 使用制品内 `_headers` 的 CSP 和缓存规则，保留 `/_shell.html` 回退，缺失 API、SDK 和资源返回 404。静态容器以 UID/GID 101 运行，只监听容器内 8080，由 Compose 映射到配置中的宿主回环端口。
 
-远端需有 Docker Compose、Python 3.12 或更新版本和 systemd；静态角色另需 Nginx。脚本只用 `systemctl is-active`、`is-enabled`、`start`、`stop`、`enable`、`disable`，systemd 219（CentOS 7）即可。先导入镜像，再在宿主以 root 执行 `scripts/deploy-activate.py`。将 `deploy/` 放在该脚本同级目录或父目录。镜像参数必须是已导入的 `sha256:` image ID，不使用可移动 tag。
+远端需有 Docker Compose、Python 3.12 或更新版本和 systemd；静态角色另需 Nginx。脚本不启停宿主 systemd 服务；首次安装时只按文本读取 unit 文件和 drop-in 检查是否引用 `data_dir`，静态角色切换后执行 `systemctl reload nginx.service`，systemd 219（CentOS 7）即可。先导入镜像，再在宿主以 root 执行 `scripts/deploy-activate.py`。将 `deploy/` 放在该脚本同级目录或父目录。镜像参数必须是已导入的 `sha256:` image ID，不使用可移动 tag。
 
 ```sh
 python3 scripts/deploy-activate.py --config /run/private/deploy.json \

@@ -15,7 +15,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
 | PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
 | 合并后检查 | 经明确授权合并，再核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
-| 制品发布 | 显式应用 tag 与 `release.yml` | 校验产品制品和发布记录，不更新线上服务 |
+| 制品发布 | 显式产品或官网 Tag 与 `release.yml` | 校验产品制品和发布记录，不更新线上服务 |
 | 服务部署 | 独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
 
 ## main 与 merge queue 的核心检查
@@ -294,11 +294,11 @@ Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检�
 
 ## 缓存与并发
 
-`ci` 按事件类型和 Git ref 分组，仅 `main` push 的首次运行自动取消旧的同组运行，累计覆盖范围保留旧运行尚未通过的改动。每次手动运行和 `run_attempt > 1` 的重跑再按 `run_id` 分组，因此重跑旧提交不会挤掉新提交的检查，显式 `delivery_live` 不会被后续 push 取消，也不会被另一条手动运行替换其 pending 位置。定时和 merge queue 不取消正在执行的同组运行，同组仍最多保留一个等待运行。主分支核心检查可以与定时完整检查同时进行。应用 tag 不触发普通 `ci`，发布与部署工作流使用各自的并发规则。 `delivery_small` 仍使用前文的跨 ref 串行分组，不按 `run_id` 拆组，也不取消正在执行的实验。
+`ci` 按事件类型和 Git ref 分组，仅 `main` push 的首次运行自动取消旧的同组运行，累计覆盖范围保留旧运行尚未通过的改动。每次手动运行和 `run_attempt > 1` 的重跑再按 `run_id` 分组，因此重跑旧提交不会挤掉新提交的检查，显式 `delivery_live` 不会被后续 push 取消，也不会被另一条手动运行替换其 pending 位置。定时和 merge queue 不取消正在执行的同组运行，同组仍最多保留一个等待运行。主分支核心检查可以与定时完整检查同时进行。产品或官网 Tag 不触发普通 `ci`，发布与部署工作流使用各自的并发规则。 `delivery_small` 仍使用前文的跨 ref 串行分组，不按 `run_id` 拆组，也不取消正在执行的实验。
 
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 
-`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。应用 tag 使用独立发布工作流，不属于本节缓存保存规则。
+`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。产品或官网 Tag 使用独立发布工作流，不属于本节缓存保存规则。
 
 Rust 缓存命中不表示当前 workspace 无需编译。每次仍由 Cargo 核对源码和构建参数；评估缓存时同时记录编译、保存与还原的耗时。
 
@@ -310,7 +310,7 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 `ci-gate` 要求选中的任务成功，选中任务失败、取消、缺失或跳过均拒绝通过。未选中的任务允许跳过或缺失；若它们实际报告失败或取消，仍拒绝通过。gate 核对冻结提交范围并重新计算计划，拒绝缩小 `scopes`、必需任务或其他选取结果。它服务于 main、merge queue、定时和手动运行，不是开发分支 PR 的必需检查。
 
-GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与应用 tag 的制品、发布和部署检查分别记录。
+GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与产品或官网 Tag 的制品、发布和部署检查分别记录。
 
 产品与官网 Tag 由 `release.yml` 独立校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
 

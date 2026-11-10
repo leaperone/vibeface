@@ -1372,16 +1372,27 @@ mod tests {
 
     #[test]
     fn app_server_reasons_are_scrubbed_bounded_and_control_free() {
-        let link = Link::LaunchFailed {
-            reason: format!("Authorization: Bearer fixture-secret\n{}", "x".repeat(800)),
+        let link = Link::Connected {
+            socket: PathBuf::from("/fixture.sock"),
+            user_agent: format!("Authorization: Bearer fixture-secret\n{}", "x".repeat(800)),
         }
         .sanitized();
-        let Link::LaunchFailed { reason } = link else {
+        let Link::Connected { user_agent, .. } = link else {
             panic!("wrong link state")
         };
-        assert!(!reason.contains("fixture-secret"));
-        assert!(!reason.chars().any(char::is_control));
-        assert!(reason.chars().count() <= 512);
+        assert!(!user_agent.contains("fixture-secret"));
+        assert!(!user_agent.chars().any(char::is_control));
+        assert_eq!(user_agent.chars().count(), 512);
+        let failed = Link::LaunchFailed {
+            reason: "Authorization: Bearer fixture-secret".into(),
+        }
+        .sanitized();
+        assert_eq!(
+            failed,
+            Link::LaunchFailed {
+                reason: "Codex App Server could not start; check the local Node log".into()
+            }
+        );
     }
 
     #[test]

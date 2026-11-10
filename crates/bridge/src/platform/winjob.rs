@@ -286,9 +286,14 @@ impl std::str::FromStr for Record {
 /// because the caller uses the answer to decide whether to refuse rather than to end anything.
 pub fn process_is_running(process: u32) -> bool {
     use windows_sys::Win32::{Foundation::STATUS_PENDING, System::Threading::GetExitCodeProcess};
-    let Ok(handle) = open_for_query(process) else {
-        return io::Error::last_os_error().raw_os_error()
-            != Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+    let handle = match open_for_query(process) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+                != Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+        }
     };
     let mut status = 0_u32;
     // SAFETY: the handle is open and the status is a live local.
