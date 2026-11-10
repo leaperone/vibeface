@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import type { Readable } from 'node:stream'
+import { readBounded } from './bounded-read.js'
 
 const MAX_RESULT_BYTES = 64 * 1024
 const STATUS_COMMAND_TIMEOUT_MS = 30_000
@@ -53,17 +53,7 @@ type Options = {
   commandTimeoutMs?: (action: string) => number
 }
 
-async function readBounded(stream: Readable, limit: number): Promise<string> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of stream) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
-    size += bytes.length
-    if (size > limit) throw new Error('desktop Node result exceeds its size limit')
-    chunks.push(bytes)
-  }
-  return Buffer.concat(chunks, size).toString('utf8')
-}
+const RESULT_OVERFLOW = 'desktop Node result exceeds its size limit'
 
 function runtimeUpdateAvailability(value: unknown): RuntimeUpdateAvailability {
   if (value === 'not_installed' || value === 'current' || value === 'newer_available' || value === 'immutable_conflict' || value === 'downgrade_refused') {
@@ -166,8 +156,8 @@ async function invoke(program: ManagedNodeProgram, args: readonly string[], time
   const child = spawn(program.command, [...(program.args ?? []), ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   const { stdout, stderr } = child
   if (!stdout || !stderr) throw new Error('desktop Node command streams are unavailable')
-  const outputPromise = readBounded(stdout, MAX_RESULT_BYTES)
-  const errorDrain = readBounded(stderr, MAX_RESULT_BYTES).catch(() => '')
+  const outputPromise = readBounded(stdout, MAX_RESULT_BYTES, RESULT_OVERFLOW)
+  const errorDrain = readBounded(stderr, MAX_RESULT_BYTES, RESULT_OVERFLOW).catch(() => '')
   void errorDrain.catch(() => undefined)
   const closePromise = once(child, 'close').then(([code, signal]: unknown[]) => ({
     code: typeof code === 'number' || code === null ? code : null,
