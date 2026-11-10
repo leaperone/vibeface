@@ -299,12 +299,16 @@ fn input_projection_omits_basis_walks_in_arrival_order_and_full_rebuild() -> Res
                 inputs.reverse();
             }
             workspace::reset_projection_ancestor_walks();
-            log::test_metrics::with_legacy(legacy, || -> Result<()> {
-                replica.ingest_events_at(&net.network, &inputs, 50)?;
-                if reversed {
-                    replica.ingest_events_at(&net.network, &events[base_len..], 50)?;
-                }
-                Ok(())
+            // This test isolates projection basis work. Force general authorization so its
+            // ancestor counter remains meaningful independently of the fresh-input shortcut.
+            log::test_metrics::with_full_workspace_authorization(|| {
+                log::test_metrics::with_legacy(legacy, || -> Result<()> {
+                    replica.ingest_events_at(&net.network, &inputs, 50)?;
+                    if reversed {
+                        replica.ingest_events_at(&net.network, &events[base_len..], 50)?;
+                    }
+                    Ok(())
+                })
             })?;
             if legacy {
                 assert!(workspace::projection_ancestor_walks() >= 6);

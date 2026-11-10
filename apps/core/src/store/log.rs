@@ -358,7 +358,26 @@ fn place(
             return pending(connection, view, envelope, &event.author, dep);
         }
     }
-    let authorization = super::workspace::authorize_event(connection, network, event)
+    let main = match &event.prev {
+        Some(prev) => *prev == head_hash,
+        None => max == 0,
+    };
+    // Dependencies are present and signatures were checked at admission, including pending
+    // events. Keep authorization failures inside input_rejection so one bad row cannot abort
+    // an otherwise valid batch. SQL/decoding failures still propagate as storage failures.
+    let authorization = (|| {
+        let fresh_main_input = main && event.seq == max + 1
+            && matches!(&event.body, EventBody::InputPosted { target: crate::workspace::InputTarget::BotMain { .. }, .. })
+            && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
+        #[cfg(test)]
+        let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+        if fresh_main_input && super::workspace::authorize_fresh_bot_main(connection, network, event)? {
+            Ok(())
+        } else {
+            super::workspace::authorize_event(connection, network, event)
+        }
+    })()
         .and_then(|()| authorize_memory(connection, network, event))
         .and_then(|()| authorize_cause(connection, view, event))
         .and_then(|()| authorize_owner(connection, view, event));
@@ -366,10 +385,6 @@ fn place(
         tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    let main = match &event.prev {
-        Some(prev) => *prev == head_hash,
-        None => max == 0,
-    };
     placed.stale |= !insert_event(connection, view, envelope, event, seen_at_ms, main)?;
     if !main {
         return Ok(IngestStatus::Conflict);
@@ -985,14 +1000,14 @@ pub(crate) fn append_from(
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     // This branch is only for this transaction's freshly signed local head extension.
-    // Forked/cutoff authors and every sync/recompute admission retain causal authorization.
+    // Forked/cutoff authors retain causal authorization, as does full recomputation.
     let fresh_main_input = matches!(&event.body, EventBody::InputPosted { target: crate::workspace::InputTarget::BotMain { .. }, .. })
         && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
         && first_fork(connection, network, &event.author)?.is_none();
     #[cfg(test)]
     let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
     let fresh_main_input = fresh_main_input
-        && super::workspace::authorize_fresh_local_bot_main(connection, network, &event)?;
+        && super::workspace::authorize_fresh_bot_main(connection, network, &event)?;
     if !fresh_main_input {
         super::workspace::authorize_event(connection, network, &event)?;
     }

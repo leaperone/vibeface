@@ -1546,7 +1546,7 @@ fn graph_at(
 thread_local! {
     static PROJECTION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AUTHORIZATION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FRESH_LOCAL_MAIN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FRESH_MAIN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 pub(crate) fn projection_ancestor_walks() -> usize {
@@ -1562,9 +1562,9 @@ pub(crate) fn authorization_ancestor_walks() -> usize {
     AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
-pub(crate) fn fresh_local_main_inputs() -> usize { FRESH_LOCAL_MAIN_INPUTS.with(std::cell::Cell::get) }
+pub(crate) fn fresh_main_inputs() -> usize { FRESH_MAIN_INPUTS.with(std::cell::Cell::get) }
 #[cfg(test)]
-pub(crate) fn reset_fresh_local_main_inputs() { FRESH_LOCAL_MAIN_INPUTS.with(|count| count.set(0)); }
+pub(crate) fn reset_fresh_main_inputs() { FRESH_MAIN_INPUTS.with(|count| count.set(0)); }
 
 
 fn projection_basis(
@@ -1773,11 +1773,12 @@ fn assignment_reply_source_matches_from(
             || submitted))
 }
 
-/// Local appends have already checked the event shape, client attestation and membership.
+/// The log boundary has already checked the event shape, client attestation and membership.
 /// A new BotMain input has no task/channel/assignment dependency. Without any stored input
 /// for this ID, neither the causal nor current Graph can contain its input-control state.
-/// Incoming sync events and non-fresh IDs always retain the full causal authorization path.
-pub(crate) fn authorize_fresh_local_bot_main(
+/// Callers additionally require an unlimited, unforked author extending its current head.
+/// Every non-fresh ID retains the full causal authorization path.
+pub(crate) fn authorize_fresh_bot_main(
     connection: &Connection,
     network: &str,
     event: &Event,
@@ -1792,7 +1793,7 @@ pub(crate) fn authorize_fresh_local_bot_main(
     if exists { return Ok(false); }
     authorize_input_target_at_graph(connection, network, event, &Graph::default())?;
     #[cfg(test)]
-    FRESH_LOCAL_MAIN_INPUTS.with(|count| count.set(count.get() + 1));
+    FRESH_MAIN_INPUTS.with(|count| count.set(count.get() + 1));
     Ok(true)
 }
 
