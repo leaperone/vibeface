@@ -176,7 +176,9 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 `--npm-service` 仅允许无既有 Vibeface 数据或默认服务的 GitHub hosted runner，使用真实 launchd 或 systemd user manager，不能在开发者机器运行。Linux job 显式准备 user manager 和 D-Bus；不可用即失败。验收通过公开 npm CLI 执行安装、启动、停止、重启和卸载，核对服务使用 scoped npm vendor 中的原生程序。
 
-受控 Node 和 App Server 夹具产生真实非空消息及附件，验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝，再停服并在独立 prefix 安装同一不可变 CI 包后重装原 prefix。重启后核对身份、配置、签名历史和附件字节，卸载保留数据。收据包含 source SHA、包和原生程序摘要及 manager 结果，只证明当前格式下同版本重装，不代表跨历史版本迁移或真实 Provider 验收。
+`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。来源相同、基线业务来源超前或 data epoch 不兼容均失败。
+
+受控 Node 和 App Server 夹具从公开基线包创建真实非空消息及附件并安装服务，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。两包都验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝，以及真实服务生命周期。候选重启后核对原身份、配置、签名历史和附件字节，卸载保留数据。收据分别记录两包的真实 version、source、摘要和来源关系；候选声明版本相同或较低时如实标注，不称为 SemVer 升级。只验证当前格式，不做跨历史格式迁移，也不据机械版本变化宣称业务升级或真实 Provider 验收。
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
 

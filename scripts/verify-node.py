@@ -14,7 +14,7 @@ processes and controlled provider protocol fixtures.
 --memory-sync checks signed user Memory controls, concurrent Agent changes, receipts,
 provenance and replay across two isolated Nodes with the same controlled fixtures.
 --web-only checks packaged Web resources through one isolated Node process.
---npm-service checks native npm service management and same-package replacement
+--npm-service checks native npm service management and published-to-candidate replacement
 only on fresh GitHub-hosted POSIX runners, never a developer's user services.
 --auto-route checks the entry: joins, origins, revocation, unknown writes, recovery and forwarding
 through another member Gateway.
@@ -4551,12 +4551,114 @@ def memory_sync_acceptance(options):
             raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
 
 
+def pin_npm_baseline(options):
+    import release
+
+    source = Path(__file__).resolve().parents[1]
+    output = options.artifacts.resolve()
+    require(output.is_relative_to(source / ".artifacts") and not output.exists(),
+            "npm baseline pinning requires a fresh checkout artifact directory")
+    candidate = release.run("git", "rev-parse", "HEAD", cwd=source)
+    require(os.environ.get("GITHUB_SHA", candidate) == candidate, "npm baseline pins this exact candidate source")
+    with urllib.request.urlopen("https://registry.npmjs.org/@leaperone%2fvibeface", timeout=30) as response:
+        encoded = response.read(4 * 1024 * 1024 + 1)
+    require(len(encoded) <= 4 * 1024 * 1024, "npm metadata is bounded")
+    registry = json.loads(encoded)
+    version = registry["dist-tags"]["nightly"]
+    require(release.version(version) == "nightly", "the public baseline is a real Nightly")
+    metadata = registry["versions"][version]
+    require(metadata["name"] == "@leaperone/vibeface" and metadata["version"] == version,
+            "the pinned registry version matches its package")
+    tarball = f"https://registry.npmjs.org/@leaperone/vibeface/-/vibeface-{version}.tgz"
+    integrity = metadata["dist"]["integrity"]
+    require(metadata["dist"]["tarball"] == tarball and re.fullmatch(r"sha512-[A-Za-z0-9+/]{86}==", integrity),
+            "the baseline has an immutable registry tarball and SHA-512 integrity")
+    tag = "v" + version
+    record = release.release_record(tag)
+    require(not record["draft"] and record["published_at"] and record["tag_name"] == tag
+            and not any(marker in (record.get("body") or "") for marker in (release.BUILDING_MARKER, release.FAILED_MARKER)),
+            "the baseline product release is public and complete")
+    remote = release.remote_assets_by_name(record["assets"])
+    require("release.json" in remote and all(release.remote_asset_sha256(asset) for asset in remote.values()),
+            "baseline product assets require immutable GitHub SHA-256 metadata")
+    baseline_source = json.loads(release.run("gh", "api", f"repos/{release.GITHUB_REPO}/commits/{tag}"))["sha"]
+    context = release.validate_source(baseline_source, "product", root=source)
+    require(baseline_source != candidate, "baseline and candidate must have different real source commits")
+    require(subprocess.run(["git", "merge-base", "--is-ancestor", context["ci_source_commit"], candidate],
+                           cwd=source, capture_output=True).returncode == 0,
+            "the baseline business source must be an ancestor of the candidate; future baselines are refused")
+    output.mkdir(parents=True, mode=0o700)
+    with tempfile.TemporaryDirectory(dir=output, prefix=".verify-") as scratch:
+        scratch = Path(scratch)
+
+        def download_asset(name):
+            for _ in range(3):
+                (scratch / name).unlink(missing_ok=True)
+                result = subprocess.run(["gh", "release", "download", tag, f"--repo={release.GITHUB_REPO}",
+                                         "--pattern", name, "--dir", str(scratch)], cwd=source, capture_output=True)
+                if result.returncode == 0:
+                    require(file_sha256(scratch / name) == release.remote_asset_sha256(remote[name]),
+                            "the pinned public product asset matches its immutable digest")
+                    return
+            raise AssertionError("cannot download pinned public product asset " + name)
+
+        expected = {"app": "product", "tag": tag, "version": version, "source_commit": baseline_source, "channel": "nightly"}
+        download_asset("release.json")
+        release.verify_remote_product_manifest(tag, release.GITHUB_REPO, expected, remote, scratch)
+        archive = output / "baseline.tgz"
+        for attempt in range(3):
+            digest = hashlib.sha512()
+            archive.unlink(missing_ok=True)
+            try:
+                with urllib.request.urlopen(tarball, timeout=90) as response, archive.open("xb") as stream:
+                    require(response.geturl() == tarball, "the pinned npm download does not redirect")
+                    size = 0
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        size += len(chunk)
+                        require(size <= release.MAX_ARCHIVE, "the npm baseline archive is bounded")
+                        stream.write(chunk)
+                        digest.update(chunk)
+                break
+            except (OSError, http.client.HTTPException):
+                require(attempt < 2, "cannot download the pinned public npm baseline")
+        require("sha512-" + base64.b64encode(digest.digest()).decode() == integrity, "the baseline tarball matches registry integrity")
+        unpacked = release.unpack(archive, scratch / "npm")
+        npm = json.loads((unpacked / "package.json").read_text())
+        require(npm["name"] == "@leaperone/vibeface" and npm["version"] == version
+                and npm["bin"] == {"vibeface": "bin/vibeface.mjs"}
+                and not any(npm.get(key) for key in ("scripts", "dependencies", "optionalDependencies"))
+                and {path.name for path in (unpacked / "vendor").iterdir()} == set(release.TARGETS),
+                "the published npm baseline is a complete package without install hooks or downloaded dependencies")
+        builds = {}
+        for target in release.TARGETS:
+            vendor = unpacked / "vendor" / target
+            build = json.loads((vendor / "BUILD-INFO.json").read_text())
+            release.verify_build_info(build)
+            require(build["source_commit"] == baseline_source and build["version"] == version and build["target"] == target,
+                    "every baseline vendor belongs to the complete product source and current data epoch")
+            name = f"vibeface-{version}-{target}.tar.gz"
+            download_asset(name)
+            native = release.unpack(scratch / name, scratch / target)
+            require(release.files(native) == release.files(vendor), "npm vendor bytes equal the published native product bundle")
+            builds[target] = build
+        shutil.copyfile(scratch / "release.json", output / "release.json")
+        pin = {"version": version, "source_commit": baseline_source, "source_context": context,
+               "candidate_source": candidate, "published_at": registry["time"][version], "release_id": record["id"],
+               "integrity": integrity, "tarball": tarball, "sha256": file_sha256(archive),
+               "manifest_sha256": file_sha256(output / "release.json"), "builds": builds,
+               "business_source_relation": "same" if context["ci_source_commit"] == candidate else "ancestor"}
+        private_json(output / "pin.json", pin)
+    print("PASS pinned public npm baseline " + json.dumps({key: pin[key] for key in
+          ("version", "source_commit", "source_context", "candidate_source", "sha256", "manifest_sha256")}), flush=True)
+
+
 def npm_service_acceptance(options):
     require(os.environ.get("GITHUB_ACTIONS") == "true"
             and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
             "npm service acceptance requires a disposable GitHub-hosted runner")
     require(sys.platform in ("darwin", "linux"), "npm service acceptance requires launchd or systemd")
     import fcntl
+    import tarfile
 
     source = Path(__file__).resolve().parents[1]
     artifacts = options.artifacts.resolve()
@@ -4622,6 +4724,15 @@ def npm_service_acceptance(options):
     require(all(manager_absent(unit) for unit in units), "the disposable manager has no existing default Vibeface service")
     require(not any(path.exists() or path.is_symlink() for path in service_files),
             "the disposable runner has no existing default service files")
+    require(options.npm_baseline is not None, "npm service acceptance requires a pinned public baseline")
+    baseline = options.npm_baseline.resolve(strict=True)
+    require(baseline.is_relative_to(source / ".artifacts"), "the pinned npm baseline stays in checkout artifacts")
+    pin = json.loads((baseline / "pin.json").read_text())
+    require(pin["candidate_source"] == build["source_commit"] and pin["source_commit"] != build["source_commit"]
+            and file_sha256(baseline / "baseline.tgz") == pin["sha256"]
+            and file_sha256(baseline / "release.json") == pin["manifest_sha256"]
+            and pin["builds"][target]["data_epoch"] == build["data_epoch"],
+            "the immutable baseline pins a different real source, this exact candidate and the current data format")
 
     artifacts.mkdir(parents=True, exist_ok=True)
     run = artifacts / ("npm-service-" + uuid.uuid4().hex[:10])
@@ -4631,14 +4742,22 @@ def npm_service_acceptance(options):
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     cleanup_script = run / "cleanup-service.sh"
-    shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-    report = {"status": "running", "target": target, "version": build["version"],
-              "source_commit": build["source_commit"], "package_sha256": file_sha256(package),
-              "binary_sha256": file_sha256(native), "core_sha256": file_sha256(core),
+    candidate_checksums = {name: file_sha256(vendor / name) for name in
+                           ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
+    nightly_order = lambda value: tuple(map(int, re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-nightly\.(\d{8})\.(\d+)", value).groups()))
+    baseline_version, candidate_version = nightly_order(pin["version"]), nightly_order(build["version"])
+    version_order = (candidate_version > baseline_version) - (candidate_version < baseline_version)
+    report = {"status": "running", "target": target,
+              "candidate": {"version": build["version"], "source_commit": build["source_commit"],
+                            "package_sha256": file_sha256(package), "binary_sha256": file_sha256(native), "core_sha256": file_sha256(core)},
               "manager": "launchd" if sys.platform == "darwin" else "systemd --user", "cases": [],
               "native_path": str(native.relative_to(root)), "native_pids": [],
-              "real_provider_calls": 0, "replacement": "same immutable current-format package reinstalled",
-              "not_checked": ["historical-format migration", "cross-version upgrade", "real AI Providers"]}
+              "baseline": {key: pin[key] for key in ("version", "source_commit", "source_context", "sha256", "manifest_sha256")},
+              "baseline_artifact_id": os.environ.get("NPM_BASELINE_ARTIFACT_ID", ""),
+              "candidate_declared_version": {1: "higher", 0: "same", -1: "lower"}[version_order],
+              "business_source_relation": pin["business_source_relation"], "real_provider_calls": 0,
+              "replacement": "public current-format baseline to a different-source immutable CI candidate",
+              "not_checked": ["historical-format migration", "real AI Providers"]}
     node, owned = None, False
 
     def service(action, *, check=True):
@@ -4647,6 +4766,10 @@ def npm_service_acceptance(options):
     def passed(name):
         report["cases"].append(name)
         print("PASS npm service " + name, flush=True)
+
+    def reinstall(destination, archive):
+        command(["npm", "install", "--global", "--prefix", destination, "--cache", run / "npm-cache",
+                 "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--force", archive])
 
     def persistent():
         files = {name: file_sha256(node.directory / name) for name in
@@ -4664,6 +4787,21 @@ def npm_service_acceptance(options):
         require(persistent() == before and service_before == [path.read_bytes() if path.exists() else None
                                                              for path in service_files],
                 "refused npm service operations preserve existing data and service files")
+
+    def idle_guards():
+        rejected("install-updater", "npm installations are updated with npm")
+        with (node.directory / "update.lock").open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rejected("install", "wait for the updater before installing the npm service")
+        private_json(node.directory / "update-pending.json", {"fixture": "pending"})
+        rejected("install", "recover the pending update")
+        (node.directory / "update-pending.json").unlink()
+        before = persistent()
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
+        command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
+        require(persistent() == before, "npm automatic update exits without changing persistent data")
 
     def stopped():
         wait_for("npm service stops its Node", lambda: node_status(node)["status"] == "stopped")
@@ -4701,6 +4839,22 @@ def npm_service_acceptance(options):
         return pid
 
     try:
+        candidate = run / "candidate-prefix"
+        reinstall(candidate, package)
+        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+        require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
+                "the independent npm prefix contains the exact immutable CI candidate")
+        reinstall(prefix, baseline / "baseline.tgz")
+        require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
+                and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
+                "the first installed service package is the verified public baseline")
+        import release
+        with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
+            checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
+        expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
+        require(release.files(vendor, ("FILES.sha256",)) == expected_files,
+                "every installed baseline vendor byte matches the immutable published package")
+        shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
         node = Node(run, "NPM", binary, workspace, helper)
         node.configure(bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                        manager=fixture_manager_settings(run, workspace), app_server=SPAWN_APP_SERVER)
@@ -4732,16 +4886,7 @@ def npm_service_acceptance(options):
         node.client.close()
         node.stop()
         stopped()
-        rejected("install-updater", "npm installations are updated with npm")
-        with (node.directory / "update.lock").open("r+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            rejected("install", "wait for the updater before installing the npm service")
-        private_json(node.directory / "update-pending.json", {"fixture": "pending"})
-        rejected("install", "recover the pending update")
-        (node.directory / "update-pending.json").unlink()
-        before = persistent()
-        command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
-        require(persistent() == before, "npm automatic update exits without changing persistent data")
+        idle_guards()
         passed("second updater, OS-held updater lock and pending journal refuse without mutation")
         saved_files, saved_events = persistent()
 
@@ -4768,33 +4913,37 @@ def npm_service_acceptance(options):
         service("restart")
         require(running() != previous, "native manager restart replaces the running PID")
         preserved()
-        passed("real install, status, stop, start and restart use the scoped npm native path")
+        passed("public baseline install, status, stop, start and restart use the scoped npm native path")
         service("stop")
         stopped()
+        node.client.close()
         definition = service_files[0].read_bytes()
-        candidate = run / "candidate-prefix"
-
-        def reinstall(destination):
-            command(["npm", "install", "--global", "--prefix", destination, "--cache", run / "npm-cache",
-                     "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--force", package])
-
-        reinstall(candidate)
-        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
-        checksums = {name: file_sha256(vendor / name) for name in
-                     ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
-        require(checksums == {name: file_sha256(candidate_vendor / name) for name in checksums},
-                "the independent npm prefix contains the same immutable native candidate")
         previous_inode = core.stat().st_ino
-        reinstall(prefix)
-        require(core.stat().st_ino != previous_inode and checksums == {name: file_sha256(vendor / name) for name in checksums},
-                "npm really replaces the stopped package with the same verified candidate")
-        require(file_sha256(package) == report["package_sha256"] and service_files[0].read_bytes() == definition,
+        reinstall(prefix, package)
+        require(core.stat().st_ino != previous_inode and candidate_checksums == {name: file_sha256(vendor / name) for name in candidate_checksums},
+                "npm replaces the stopped public baseline with the exact different-source CI candidate")
+        require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
                 "npm replacement preserves the immutable input and installed service definition")
         stopped()
         service("start")
         running()
         preserved()
-        passed("same-version npm replacement preserves identity, config, signed history and attachment bytes")
+        passed("published-to-candidate npm replacement preserves identity, config, signed history and attachment bytes")
+        rejected("install", "stop the node before installing its npm service")
+        service("stop")
+        stopped()
+        idle_guards()
+        service("install")
+        running()
+        service("status")
+        service("stop")
+        stopped()
+        service("start")
+        previous = running()
+        service("restart")
+        require(running() != previous, "the candidate's native manager restart replaces its PID")
+        preserved()
+        passed("candidate install, stop, start, restart and concurrency guards preserve baseline data")
         service("uninstall")
         stopped()
         require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
@@ -9480,7 +9629,7 @@ if __name__ == "__main__":
         fixture_codex(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("--binary", type=Path, required=True,
+        parser.add_argument("--binary", type=Path,
                             help="the vibeface CLI binary used to create and run the isolated Nodes")
         parser.add_argument("--core-binary", type=Path,
                             help="the sibling vibeface-core binary to verify; defaults to --binary's sibling")
@@ -9489,9 +9638,11 @@ if __name__ == "__main__":
         parser.add_argument("--artifacts", type=Path, required=True)
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
         parser.add_argument("--npm-package", type=Path, help="the immutable CI npm artifact for --npm-service replacement")
+        parser.add_argument("--npm-baseline", type=Path, help="the public baseline artifact pinned once for this candidate")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--npm-service", action="store_true", help="check real npm user services only on a fresh GitHub-hosted POSIX runner")
+        modes.add_argument("--npm-baseline-pin", action="store_true", help="pin one public current-format npm baseline and its complete product provenance")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
@@ -9518,8 +9669,9 @@ if __name__ == "__main__":
         arguments = parser.parse_args()
         try:
             needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
-                                 or arguments.native_clipboard_selfcheck)
+                                 or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin)
             if needs_process:
+                require(arguments.binary is not None, "--binary is required for Node process acceptance")
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
                 require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
                 launcher = Path(program)
@@ -9540,7 +9692,9 @@ if __name__ == "__main__":
                 require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
                 os.environ["VIBEFACE_APP_DIR"] = str(arguments.app_dir)
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
-            if arguments.native_provider_selfcheck:
+            if arguments.npm_baseline_pin:
+                pin_npm_baseline(arguments)
+            elif arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)
             elif arguments.native_clipboard_selfcheck:
                 native_clipboard_selfcheck(arguments)
