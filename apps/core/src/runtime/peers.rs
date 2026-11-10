@@ -2454,7 +2454,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::test_support::{
-        access as test_access, initialize_node, manager_settings, signed_main_input,
+        access as test_access, initialize_node, manager_settings, provider_work, signed_main_input,
     };
 
     use crate::{config, crypto::LocalIdentity};
@@ -4148,7 +4148,7 @@ mod tests {
     async fn a_recovery_undone_by_a_late_veto_adds_nothing_to_the_shared_log() -> Result<()> {
         use crate::{
             identity::{GovernanceEvent, Revocation},
-            model::{WorkKind, WorkOutcome},
+            model::WorkOutcome,
             work::WorkSpec,
         };
         let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4158,25 +4158,13 @@ mod tests {
         let result = async {
             a.install_membership(state.clone()).await?;
             let trigger = crate::scheduling::message_trigger("m1");
+            let target = ib.device_id()?;
             let work = WorkSpec {
                 work_id: WorkSpec::id("c", &trigger, "remote"),
-                conversation: "c".into(),
                 trigger: trigger.clone(),
-                target: ib.device_id()?,
                 dispatcher: ia.device_id()?,
                 call_ref: "remote".into(),
-                kind: WorkKind::Agent(crate::providers::Provider::Codex),
-                model: None,
-                resolved: crate::model::ResolvedModel {
-                    provider: crate::providers::Provider::Codex,
-                    model: None,
-                },
-                cwd: "/tmp".into(),
-                title: "t".into(),
-                prompt: "p".into(),
-                continues: None,
-                parent: None,
-                thread: None,
+                ..provider_work(Provider::Codex, &target, Path::new("/tmp"), "p")
             };
             {
                 let mut store = a.store.lock().await;
