@@ -276,7 +276,7 @@ def rehearse(output):
                'relay_max_clients': 128, 'relay_max_clients_per_ip': 8, 'forward_any': True,
                'forward_sessions': 32, 'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
                'mesh_network': 'deploy-fixture'}
-    project = 'vibeface-rehearsal-' + uuid.uuid4().hex
+    project = 'vibeface-rehearsal-' + uuid.uuid4().hex[:24]
     fixtures, receipts = {}, []
 
     def initialize(identity, directory):
@@ -370,7 +370,9 @@ def self_test():
             pass
         else:
             raise AssertionError('accepted invalid transport')
+    import runpy
     from unittest.mock import patch
+    validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']
     for has_previous, failure in ((True, None), (False, None), (True, 'activation'), (True, 'data')):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary).resolve()
@@ -424,7 +426,7 @@ def self_test():
                     return subprocess.CompletedProcess(args, 0)
                 assert args[2] == str(ROOT / 'scripts/deploy-activate.py')
                 settings = json.loads(kwargs['input'])
-                assert settings['project'].startswith('vibeface-rehearsal-')
+                validate_config(settings)
                 identity = args[args.index('--image') + 1]
                 expected = old if has_previous and not activated else current
                 assert identity == images[expected['images']['core']]
