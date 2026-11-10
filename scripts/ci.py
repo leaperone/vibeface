@@ -897,8 +897,8 @@ def coverage_self_test(directory, base, nonancestor):
     event_file = Path(directory) / "event.json"
     event_file.unlink(missing_ok=True)
 
-    def commit(message):
-        git("add", "-A", cwd=directory)
+    def commit(message, paths=(".",)):
+        git("add", "-A", "--", *paths, cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", message, cwd=directory)
         return git("rev-parse", "HEAD", cwd=directory).decode().strip()
 
@@ -956,7 +956,7 @@ def coverage_self_test(directory, base, nonancestor):
         unit = Path(directory) / "apps/app/src/lib/example.test.ts"
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text("test-only change\n")
-        unit_head = commit("test-only change after unverified Rust")
+        unit_head = commit("test-only change after unverified Rust", ("apps/app/src/lib/example.test.ts",))
         event_file.write_text(json.dumps({"before": head, "after": unit_head}))
         with patch.dict(os.environ, {"GITHUB_SHA": unit_head}):
             with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [successful]}).encode())):
