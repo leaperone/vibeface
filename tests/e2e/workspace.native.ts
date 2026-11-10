@@ -8,7 +8,7 @@ import { join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/native/workspace');
@@ -148,7 +148,11 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await expect(openConfirmation).toHaveCount(0);
     await app.open();
   }
-  await invitationField.fill(secrets.get('nativeInvitation'), { timeout: 30000 });
+  // Opened as a scanned link, the way the stray back button to the join page appeared.
+  const invitation = (await readFile(process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt'), 'utf8')).trim();
+  await device.openLink(invitation.startsWith('vibeface://join/') ? invitation : `vibeface://join/${invitation.replace(/^.*\/join\//, '')}`);
+  const consent = screen.getByRole('alert', /Open in.*Vibeface/);
+  if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
   await textbox('这台设备的名字').fill('VDP native receiver');
   await textbox('这台设备的名字').press('Enter');
@@ -160,6 +164,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  // The join page must not stay under the tabs as a back button.
+  await screen.getByLabel('任务', { exact: true }).click();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
+  await screen.getByLabel('消息', { exact: true }).click();
   const inspect = async () => {
     const value = await network.call({ op: 'workspace_inspect' });
     return {

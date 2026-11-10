@@ -56,7 +56,8 @@ function Screens() {
     if (!ready || !link || url === answered) return
     answered = url
     if (device.linkTarget(link) === 'other') router.push({ pathname: '/switch-network', params: { link } })
-    else router.navigate('/')
+    // Not navigate: that stacks home on the focused join page, which the protected group then cannot drop, leaving a back button to it.
+    else router.dismissTo('/')
   }, [url, ready])
   const wide = useWide()
   const pathname = usePathname()

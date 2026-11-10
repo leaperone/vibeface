@@ -181,7 +181,7 @@ cp -R .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibefac
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
 VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
 VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
-VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
+VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
 AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
 AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
 pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a charity file'
