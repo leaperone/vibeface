@@ -53,6 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from unittest import TestCase
 
 
 def definitions_of(bots):
@@ -570,6 +571,18 @@ class Client:
         requests = self.call("join_status")["requests"]
         return next((item for item in requests if item["device_id"] == device_id), None)
 
+    def revealed_join(self, request):
+        if request and request["status"] == "pending":
+            self.start_approval(request["join_id"])
+            return None
+        return request if request and request.get("joiner_nonce") else None
+
+    def named_pairing(self, name):
+        request = next((item for item in self.call("join_status")["requests"]
+                        if item["name"] == name and item["kind"] == "client"
+                        and item["status"] in ("pending", "confirming")), None)
+        return self.revealed_join(request)
+
     def start_approval(self, join_id):
         request = self.call("approve", {"join_id": join_id, "admin_nonce": uuid.uuid4().hex + uuid.uuid4().hex})
         require(request["status"] == "confirming", "the manager's nonce moves the request to confirming")
@@ -800,11 +813,7 @@ class Node:
             def revealed():
                 if process.poll() is not None:
                     raise RuntimeError(f"{self.name}: CLI join exited {process.returncode}; see {log_path}")
-                request = owner.pending_join(self.device_id)
-                if request and request["status"] == "pending":
-                    owner.start_approval(request["join_id"])
-                    return None
-                return request if request and request.get("joiner_nonce") else None
+                return owner.revealed_join(owner.pending_join(self.device_id))
             request = wait_for(f"{self.name} reveals its join nonce", revealed)
             code = owner.command("short_code", request=request)
             shown = wait_for("the CLI shows its short code", lambda: code.encode() in log_path.read_bytes())
@@ -1143,13 +1152,9 @@ def native_clipboard_selfcheck(options):
         marker.unlink()
         marker.symlink_to(target)
         calls.clear()
-        try:
+        with TestCase().assertRaises(AssertionError, msg='native clipboard must reject a symlinked marker'):
             native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
                                       system="darwin", xcrun_path="/usr/bin/xcrun")
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("native clipboard must reject a symlinked marker")
         require(not calls, "a symlinked marker is refused before invoking xcrun")
         marker.unlink()
         marker.write_text(simulator + "\n")
@@ -1855,13 +1860,19 @@ def fixture_manager(run, initial, bot):
         completed = fixture_cli(initial, "tool", name, "--json", json.dumps(arguments),
                                 "--call-ref", arguments["call_ref"], check=False)
         accepted = completed.returncode == 0
+        result = json.loads(completed.stdout) if accepted else None
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"], "trigger": trigger,
                        "name": name, "cli": True, "accepted": accepted, "expected": expected,
-                       "call_ref": arguments["call_ref"], "result": json.loads(completed.stdout) if accepted else None,
+                       "call_ref": arguments["call_ref"], "result": result,
                        "error": completed.stderr[-2048:]})
         require(accepted == expected and (accepted or rejection in completed.stderr),
                 name + " from the Shell has its expected outcome: " + completed.stderr[-300:])
-        return json.loads(completed.stdout) if accepted else None
+        if accepted:
+            record = result["call_record"]
+            require(record["tool"] == name and record["call_ref"] == arguments["call_ref"] and record["stage"] == "result"
+                    and (record["confirmation"] not in {"unknown", "pending"} or record["retry"] == "lookup_same_ref"),
+                    "the Shell preserves call identity and the Node's reconciliation requirement")
+        return result
 
     if directive.get("paid_delivery_security") is True:
         fixture_paid_principals(run, initial, bot, tool)
@@ -3478,9 +3489,9 @@ def phase1_acceptance(options):
              if row["event"] == "turn_started" and row["thread_id"] == thread), None))
         return thread, turn
 
-    def native_inputs(labels):
+    def native_inputs(labels, *, event="input"):
         return [row for row in fixture_records(run, "codex-inputs.jsonl")
-                if row["event"] == "input" and row["message_id"] in labels]
+                if row["event"] == event and row["message_id"] in labels]
 
     def inputs_before_completion(thread, turn, labels, *, acknowledged=True):
         rows = native_inputs(labels)
@@ -3654,8 +3665,7 @@ def phase1_acceptance(options):
         labels = ["steer-m1", "steer-m2", "steer-m3"]
         joined, texts = batch_inputs(name, labels)
         wait_for("three concurrent messages reach the current native turn", lambda: len(native_inputs(labels)) == 3)
-        wait_for("the native server acknowledges every input", lambda: sum(row["event"] == "input_ack"
-                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 3)
+        wait_for("the native server acknowledges every input", lambda: len(native_inputs(labels, event="input_ack")) == 3)
         inputs_before_completion(thread, turn, labels)
         target = {"kind": "bot_main", "bot_id": "bot-" + name}
         proofs = [wait_for("the owner reports actual provider acceptance", lambda label=label:
@@ -3689,9 +3699,7 @@ def phase1_acceptance(options):
         thread, turn = native_turn(name)
         (run / "fixture-codex-drop-steer-ack").write_text("ack-lost-input")
         joined, text = send(name, "ack-lost-input", report_results=True)
-        wait_for("the provider accepts the input before losing its ACK", lambda: any(
-            row["event"] == "ack_dropped" and row["message_id"] == "ack-lost-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("the provider accepts the input before losing its ACK", lambda: native_inputs(["ack-lost-input"], event="ack_dropped"))
         inputs_before_completion(thread, turn, ["ack-lost-input"], acknowledged=False)
         duplicate = a.client.rpc("message", conversation_id=name, message_id="ack-lost-input", text=text, report_results=True)
         require(duplicate["trigger"] == joined["trigger"], "client retry preserves the uncertain input's identity")
@@ -3719,9 +3727,7 @@ def phase1_acceptance(options):
         dropped_ack = run / "fixture-codex-drop-steer-ack"
         dropped_ack.write_text("slow-read-input")
         slow_joined, _ = send(slow, "slow-read-input", report_results=True)
-        wait_for("A's input is persisted before its ACK is lost", lambda: any(
-            row["event"] == "ack_dropped" and row["message_id"] == "slow-read-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("A's input is persisted before its ACK is lost", lambda: native_inputs(["slow-read-input"], event="ack_dropped"))
         wait_for("A's native read-back is held without completing its turn", lambda: any(
             row["event"] == "read_blocked" and row["thread_id"] == slow_thread
             for row in fixture_records(run, "codex-inputs.jsonl")))
@@ -3729,9 +3735,7 @@ def phase1_acceptance(options):
         dropped_ack.unlink()
         fast_joined, _ = send(fast, "independent-read-input", report_results=True)
         wait_for("B's input reaches its active turn while A's read is held", lambda: native_inputs(["independent-read-input"]))
-        wait_for("B gets its native input receipt independently", lambda: any(
-            row["event"] == "input_ack" and row["message_id"] == "independent-read-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("B gets its native input receipt independently", lambda: native_inputs(["independent-read-input"], event="input_ack"))
         inputs_before_completion(fast_thread, fast_turn, ["independent-read-input"])
         require(not read_gate.exists() and state(slow_first, "running") and state(fast_first, "running"),
                 "the blocked target remains live when the other target's provider accepts its input")
@@ -3764,9 +3768,7 @@ def phase1_acceptance(options):
         barrier = run / "fixture-codex-steer-barrier.json"
         private_json(barrier, {"message_id": "attachment-order-m1", "gate": str(native_gate)})
         with_image, _ = send(name, "attachment-order-m1", attachments=[attachment], report_results=True)
-        wait_for("the complete image waits at its controlled native input gate", lambda: any(
-            row["event"] == "input_blocked" and row["message_id"] == "attachment-order-m1"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("the complete image waits at its controlled native input gate", lambda: native_inputs(["attachment-order-m1"], event="input_blocked"))
         text_only, _ = send(name, "attachment-order-m2", report_results=True)
         labels = ["attachment-order-m1", "attachment-order-m2"]
         saved = conversation(name)["messages"]
@@ -3776,8 +3778,7 @@ def phase1_acceptance(options):
         native_gate.touch()
         barrier.unlink()
         wait_for("the complete image and following text reach the provider", lambda: len(native_inputs(labels)) == 2)
-        wait_for("both ordered inputs receive native ACKs", lambda: sum(row["event"] == "input_ack"
-                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 2)
+        wait_for("both ordered inputs receive native ACKs", lambda: len(native_inputs(labels, event="input_ack")) == 2)
         rows = inputs_before_completion(thread, turn, labels)
         expected_image = "data:image/png;base64," + base64.b64encode(image).decode()
         require([part["url"] for part in rows[0]["input"] if part["type"] == "image"] == [expected_image]
@@ -3836,9 +3837,7 @@ def phase1_acceptance(options):
             label = task_id + "-follow"
             joined, _ = send(name, label, target=target, expected_revision=1, report_results=True)
             wait_for("each follow-up reaches its own Task turn", lambda label=label: native_inputs([label]))
-            wait_for("each Task's provider ACK is visible", lambda label=label: any(
-                row["event"] == "input_ack" and row["message_id"] == label
-                for row in fixture_records(run, "codex-inputs.jsonl")))
+            wait_for("each Task's provider ACK is visible", lambda label=label: native_inputs([label], event="input_ack"))
             inputs_before_completion(thread, turn, [label])
             gate.touch()
             wait_for("the Task completes before the same workspace is used by its sibling", lambda: completed(first))
@@ -4606,18 +4605,23 @@ def gateway_refusal(client, device_id):
     return refused["error"]
 
 
-def acceptance(options):
-    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
-            "packaged browser WASM is available")
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("node-acceptance-" + uuid.uuid4().hex[:10])
+def acceptance_workspace(artifacts, module, prefix):
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts.resolve() / (prefix + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
+    return run, workspace, helper
+
+
+def acceptance(options):
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "packaged browser WASM is available")
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'node-acceptance-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "five real Node processes over iroh (four members and one outsider) with a member relay; WASM browser client; fixture SDK",
@@ -4895,14 +4899,7 @@ def phase4_acceptance(options):
     uses every entrance.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase4-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase4-')
     nodes, clients, roots = [], [], {}
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh (A, B and C each with a fixture coordination Agent and "
@@ -5407,14 +5404,7 @@ def public_node_acceptance(options):
     relay R with an operator token then carries A's traffic to an IPv6-only X while X holds the token, and
     nothing once it holds a wrong one."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("public-node-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'public-node-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "public node P (not a member) as a mesh bootstrap node, an open relay limited per address "
@@ -5645,12 +5635,8 @@ def public_node_acceptance(options):
         nodes += [t, t2]
         t.start()
         require(pinned_info(t)["device_id"] == t.device_id, "T answers over TLS pinned to its own certificate")
-        try:
+        with TestCase().assertRaises(ssl.SSLCertVerificationError, msg="another Node's certificate verifies T"):
             pinned_info(t, t2.directory / "tls-cert.pem")
-        except ssl.SSLCertVerificationError:
-            pass
-        else:
-            raise AssertionError("another Node's certificate verifies T")
         answer = b""
         with socket.create_connection(("127.0.0.1", t.port), timeout=5) as raw, contextlib.suppress(ConnectionResetError):
             raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
@@ -5683,14 +5669,7 @@ def mesh_acceptance(options):
     path is gone; D joins through B alone, gets all four records, then rejoins from its old table with B gone
     and no bootstrap node configured; A stops volunteering and B, C and D drop its relay."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("mesh-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'mesh-')
     nodes = []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "not_checked": ["public NAT types and UDP-blocked networks", "public HTTPS gateways",
@@ -5882,14 +5861,7 @@ def phase5_acceptance(options):
     data directory is copied and run as A' while A is stopped. One browser identity opens A and B.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase5-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase5-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "two real Node processes over iroh plus a copy of A's data directory; WASM browser client",
@@ -6860,11 +6832,8 @@ class DeliveryUiControl:
             require(len(pending) <= 1, "one actual browser or mobile client owns its UI pairing")
             if not pending:
                 return None
-            request = pending[0]
-            if request["status"] == "pending":
-                client.start_approval(request["join_id"])
-                return None
-            if not request.get("joiner_nonce"):
+            request = client.revealed_join(pending[0])
+            if not request:
                 return None
             pairing = {"peer": request["device_id"], "code": client.command("short_code", request=request), "approved": False}
             require(re.fullmatch(r"[0-9a-f]{64}", pairing["peer"]) and re.fullmatch(r"[0-9]{6}", pairing["code"]),
@@ -9013,15 +8982,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                 elif op == "mesh_pairing":
                     require(mesh_kind, "mesh pairing belongs to its controlled fixture")
                     owner = nodes["member"].client
-                    def revealed_mesh():
-                        pending = next((item for item in owner.call("join_status")["requests"]
-                                        if item["name"] == "Mesh browser" and item["kind"] == "client"
-                                        and item["status"] in ("pending", "confirming")), None)
-                        if pending and pending["status"] == "pending":
-                            owner.start_approval(pending["join_id"])
-                            return None
-                        return pending if pending and pending.get("joiner_nonce") else None
-                    pending = wait_for("browser reveals its real pairing nonce", revealed_mesh, timeout=20)
+                    pending = wait_for("browser reveals its real pairing nonce", lambda: owner.named_pairing("Mesh browser"), timeout=20)
                     result = {"peer": pending["device_id"], "code": owner.command("short_code", request=pending)}
                 elif op == "mesh_approve":
                     require(mesh_kind, "mesh approval belongs to its controlled fixture")
@@ -9056,16 +9017,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                     require(native_ready, "native pairing requires the controlled initialized Node")
                     client = nodes["source" if workspace_gates else "receiver"].client
 
-                    def revealed():
-                        entries = client.call("join_status")["requests"]
-                        pending = next((item for item in entries if item["name"] == "VDP native receiver"
-                                        and item["kind"] == "client" and item["status"] in ("pending", "confirming")), None)
-                        if pending and pending["status"] == "pending":
-                            client.start_approval(pending["join_id"])
-                            return None
-                        return pending if pending and pending.get("joiner_nonce") else None
-
-                    pending = wait_for("native client reveals its actual pairing nonce", revealed)
+                    pending = wait_for("native client reveals its actual pairing nonce", lambda: client.named_pairing("VDP native receiver"))
                     result = {"peer": pending["device_id"], "code": client.command("short_code", request=pending)}
                 elif op == "native_approve":
                     require(native_ready, "native approval belongs to the controlled initialized Node")

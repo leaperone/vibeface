@@ -38,16 +38,10 @@ pub(crate) struct MailboxRecord {
     pub last_error: Option<String>,
 }
 
-fn key(record: &MailboxRecord) -> String {
+fn key(network: &str, conversation: &str, trigger: &str) -> String {
     format!(
         "{KEY_PREFIX}{}",
-        crate::crypto::digest(
-            format!(
-                "{}\0{}\0{}",
-                record.network_id, record.conversation_id, record.trigger
-            )
-            .as_bytes()
-        )
+        crate::crypto::digest(format!("{network}\0{conversation}\0{trigger}").as_bytes())
     )
 }
 
@@ -69,7 +63,10 @@ fn save(connection: &Connection, record: &MailboxRecord) -> Result<()> {
     connection.execute(
         "INSERT INTO identity_meta(key,value) VALUES(?,?)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![key(record), serde_json::to_string(record)?],
+        params![
+            key(&record.network_id, &record.conversation_id, &record.trigger),
+            serde_json::to_string(record)?
+        ],
     )?;
     Ok(())
 }
@@ -82,7 +79,14 @@ fn records(connection: &Connection) -> Result<Vec<MailboxRecord>> {
 }
 
 fn delete(connection: &Connection, record: &MailboxRecord) -> Result<()> {
-    connection.execute("DELETE FROM identity_meta WHERE key=?", [key(record)])?;
+    connection.execute(
+        "DELETE FROM identity_meta WHERE key=?",
+        [key(
+            &record.network_id,
+            &record.conversation_id,
+            &record.trigger,
+        )],
+    )?;
     Ok(())
 }
 
@@ -121,17 +125,14 @@ pub(crate) fn queue(
         next_attempt_ms: now_ms,
         last_error: None,
     };
-    if let Some(existing) = load_key(connection, &key(&candidate))? {
+    if let Some(existing) = load_key(connection, &key(network, conversation, trigger))? {
         if existing.state.active() {
             connection.execute(
                 "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
                 params![conversation, trigger],
             )?;
-            return Ok(existing);
         }
-        if matches!(existing.state, MailboxState::Dead | MailboxState::Delivered) {
-            return Ok(existing);
-        }
+        return Ok(existing);
     }
     let active = records(connection)?
         .into_iter()
@@ -147,7 +148,7 @@ pub(crate) fn queue(
     )?;
     save(connection, &candidate)?;
     reconcile(connection, network, now_ms)?;
-    Ok(load_key(connection, &key(&candidate))?.unwrap_or(candidate))
+    Ok(load_key(connection, &key(network, conversation, trigger))?.unwrap_or(candidate))
 }
 
 impl Store {
@@ -169,17 +170,11 @@ impl Store {
             next_attempt_ms: now_ms,
             last_error: None,
         };
-        let Some(mut record) = load_key(&self.connection, &key(&candidate))? else {
+        let Some(mut record) = load_key(&self.connection, &key(network, conversation, trigger))?
+        else {
             save(&self.connection, &candidate)?;
             return Ok(true);
         };
-        if record.state == MailboxState::Delivered {
-            self.connection.execute(
-                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-                params![conversation, trigger],
-            )?;
-            return Ok(false);
-        }
         if !record.state.active() {
             self.connection.execute(
                 "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
@@ -206,20 +201,10 @@ impl Store {
         detail: &str,
         now_ms: i64,
     ) -> Result<()> {
-        let candidate = MailboxRecord {
-            network_id: network.into(),
-            conversation_id: conversation.into(),
-            trigger: trigger.into(),
-            state: MailboxState::Queued,
-            attempts: 0,
-            queued_at_ms: now_ms,
-            next_attempt_ms: now_ms,
-            last_error: None,
-        };
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(mut record) = load_key(&tx, &key(&candidate))? else {
+        let Some(mut record) = load_key(&tx, &key(network, conversation, trigger))? else {
             tx.commit()?;
             return Ok(());
         };
@@ -242,20 +227,10 @@ impl Store {
         trigger: &str,
         now_ms: i64,
     ) -> Result<()> {
-        let candidate = MailboxRecord {
-            network_id: network.into(),
-            conversation_id: conversation.into(),
-            trigger: trigger.into(),
-            state: MailboxState::Delivered,
-            attempts: 0,
-            queued_at_ms: now_ms,
-            next_attempt_ms: now_ms,
-            last_error: None,
-        };
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(mut record) = load_key(&tx, &key(&candidate))? {
+        if let Some(mut record) = load_key(&tx, &key(network, conversation, trigger))? {
             record.state = MailboxState::Delivered;
             record.next_attempt_ms = now_ms;
             save(&tx, &record)?;
@@ -289,7 +264,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut record = load_key(&tx, &key(&candidate))?.unwrap_or(candidate);
+        let mut record = load_key(&tx, &key(network, conversation, trigger))?.unwrap_or(candidate);
         record.state = MailboxState::Dead;
         record.next_attempt_ms = now_ms;
         record.last_error = Some(crate::logging::scrub(detail).chars().take(512).collect());
@@ -309,17 +284,7 @@ impl Store {
         conversation: &str,
         trigger: &str,
     ) -> Result<Option<MailboxRecord>> {
-        let candidate = MailboxRecord {
-            network_id: network.into(),
-            conversation_id: conversation.into(),
-            trigger: trigger.into(),
-            state: MailboxState::Queued,
-            attempts: 0,
-            queued_at_ms: 0,
-            next_attempt_ms: 0,
-            last_error: None,
-        };
-        load_key(&self.connection, &key(&candidate))
+        load_key(&self.connection, &key(network, conversation, trigger))
     }
 }
 
@@ -344,11 +309,15 @@ mod tests {
         let connection = connection();
         let queued = queue(&connection, "n", "c", "message:m", 1).unwrap();
         assert_eq!(queued.state, MailboxState::Queued);
-        let mut record = load_key(&connection, &key(&queued)).unwrap().unwrap();
+        let mut record = load_key(&connection, &key("n", "c", "message:m"))
+            .unwrap()
+            .unwrap();
         record.state = MailboxState::Unknown;
         record.attempts = 1;
         save(&connection, &record).unwrap();
-        let reopened = load_key(&connection, &key(&queued)).unwrap().unwrap();
+        let reopened = load_key(&connection, &key("n", "c", "message:m"))
+            .unwrap()
+            .unwrap();
         assert_eq!(reopened.state, MailboxState::Unknown);
         assert_eq!(reopened.attempts, 1);
         assert_eq!(
@@ -445,8 +414,10 @@ mod tests {
     #[test]
     fn delivered_rows_left_by_an_older_crash_are_reconciled_before_attempt() {
         let mut store = Store::open(":memory:").unwrap();
-        let queued = queue(&store.connection, "n", "c", "message:m", 1).unwrap();
-        let mut delivered = load_key(&store.connection, &key(&queued)).unwrap().unwrap();
+        queue(&store.connection, "n", "c", "message:m", 1).unwrap();
+        let mut delivered = load_key(&store.connection, &key("n", "c", "message:m"))
+            .unwrap()
+            .unwrap();
         delivered.state = MailboxState::Delivered;
         save(&store.connection, &delivered).unwrap();
         store
@@ -475,8 +446,10 @@ mod tests {
     #[test]
     fn retry_limit_keeps_the_scheduler_outbox_for_reconciliation() {
         let mut store = Store::open(":memory:").unwrap();
-        let queued = queue(&store.connection, "n", "c", "message:m", 1).unwrap();
-        let mut record = load_key(&store.connection, &key(&queued)).unwrap().unwrap();
+        queue(&store.connection, "n", "c", "message:m", 1).unwrap();
+        let mut record = load_key(&store.connection, &key("n", "c", "message:m"))
+            .unwrap()
+            .unwrap();
         record.state = MailboxState::Sending;
         record.attempts = MAX_ATTEMPT_COUNT;
         save(&store.connection, &record).unwrap();

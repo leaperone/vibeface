@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+use vibeface_control::observation::{hex32, question_lines};
 
 pub const HOOK_ANSWER_WITHIN_SECS: u64 = 30;
 pub const SPOOL_DIR: &str = "hook-spool";
@@ -134,15 +135,6 @@ fn string(input: &Value, key: &str) -> String {
     input[key].as_str().unwrap_or_default().to_owned()
 }
 
-fn hex32(parts: &[&str]) -> String {
-    let mut hash = Sha256::new();
-    for part in parts {
-        hash.update(part.as_bytes());
-        hash.update([0]);
-    }
-    hex::encode(hash.finalize())[..32].to_owned()
-}
-
 pub fn from_hook(agent: Provider, input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
     match agent {
         Provider::Codex => from_codex_hook(input),
@@ -171,28 +163,6 @@ fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         detail,
         ..Default::default()
     })
-}
-
-fn question_lines(questions: &Value) -> Vec<String> {
-    questions
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|question| {
-            let text = question["question"].as_str().unwrap_or_default();
-            let options: Vec<&str> = question["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|option| option["label"].as_str())
-                .collect();
-            if options.is_empty() {
-                text.to_owned()
-            } else {
-                format!("{text} [{}]", options.join(" | "))
-            }
-        })
-        .collect()
 }
 
 fn request_kind(input: &Value) -> RequestKind {
@@ -345,27 +315,8 @@ fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
     })
 }
 
-pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
-    let background = match source {
-        Value::String(source) => matches!(source.to_ascii_lowercase().as_str(), "exec" | "mcp"),
-        Value::Object(source) => source
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("subagent")),
-        _ => false,
-    };
-    !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
-}
-
 pub fn interactive_claude(entrypoint: Option<&str>) -> bool {
     !entrypoint.is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
-}
-
-pub fn rollout_meta(first_line: &str) -> Value {
-    serde_json::from_str::<Value>(first_line)
-        .ok()
-        .filter(|line| line["type"] == "session_meta")
-        .map(|line| line["payload"].clone())
-        .unwrap_or(Value::Null)
 }
 
 pub struct HookFile {
@@ -527,5 +478,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event.hold, Some(RequestKind::Continue));
+    }
+
+    #[test]
+    fn hook_install_appends_once_and_removes_only_its_own_entries() {
+        let home = Path::new("/home/u");
+        let codex_home = Path::new("/srv/codex");
+        let [codex, claude] =
+            &hook_files_with_claude_root(home, &home.join(".claude"), codex_home)[..]
+        else {
+            panic!("Codex and Claude Code take hooks");
+        };
+        assert_eq!(codex.path, codex_home.join("hooks.json"));
+        assert_eq!(
+            claude.path,
+            home.join(".claude/settings.json"),
+            "CODEX_HOME moves only Codex's hooks"
+        );
+        let custom_claude = home.join("custom-claude");
+        let custom = hook_files_with_claude_root(home, &custom_claude, codex_home);
+        assert_eq!(custom[0].path, codex.path);
+        assert_eq!(custom[1].path, custom_claude.join("settings.json"));
+        let command = hook_command(
+            Path::new("/opt/vibeface"),
+            Provider::Claude,
+            Path::new("/d'x"),
+        );
+        assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
+        let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
+        let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
+        assert_eq!(
+            add_hooks(&mut settings, claude, &command).unwrap(),
+            ["Stop", "StopFailure", "Notification", "PermissionRequest"]
+        );
+        assert!(
+            add_hooks(&mut settings, claude, &command)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(settings["hooks"]["Stop"][0], other);
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 45,
+            "a permission request outlasts the wait for the bot's answer"
+        );
+        assert_eq!(installed(&settings, claude).len(), 4);
+        assert!(installed(&settings, codex).is_empty());
+        assert_eq!(remove_hooks(&mut settings, claude).len(), 4);
+        assert_eq!(
+            settings,
+            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[],
+                "PermissionRequest":[]}})
+        );
+        assert!(add_hooks(&mut json!([]), codex, &command).is_err());
     }
 }

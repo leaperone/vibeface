@@ -4,6 +4,7 @@ import argparse
 import ast
 from pathlib import Path
 import re
+from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGETS = ('macos', 'linux-x64', 'linux-arm64', 'windows')
@@ -263,12 +264,8 @@ def self_test(source, helpers):
                                         *((source, {**helpers, 'release-publish-part.yml': item}) for item in broken_helpers)]:
         require(candidate != source or candidate_helper != helpers,
                 'self-test mutation did not reach the workflow')
-        try:
+        with TestCase().assertRaises((ValueError, SyntaxError, KeyError), msg='Unsafe release dependency or gate was accepted'):
             check(candidate, candidate_helper)
-        except (ValueError, SyntaxError, KeyError):
-            pass
-        else:
-            raise AssertionError('Unsafe release dependency or gate was accepted')
 
 
 def check_deployment(source):
@@ -314,12 +311,8 @@ def main():
                           deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
                           deployment.replace("if: matrix.service == 'node'",
                                              "if: matrix.service == 'node'\n        continue-on-error: true")):
-            try:
+            with TestCase().assertRaises(ValueError, msg='unsafe deployment gate was accepted'):
                 check_deployment(candidate)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('unsafe deployment gate was accepted')
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
           'exact artifacts, progressive uploads and complete-only automatic consumption')
 

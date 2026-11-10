@@ -4,6 +4,7 @@
 //! reads the turn back from that file and never sends it again.
 use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -214,13 +215,6 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn bounded(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
-        .take(limit)
-        .collect()
 }
 
 /// pi's own wording first, then what the model provider said.
@@ -986,21 +980,7 @@ impl Pi {
         let secrets = crate::manager::secret_values(config);
         let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
         let stage = vibeface_bridge::failure::ProviderTrace::new("pi", ProviderStage::SessionStart);
-        let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-            ManagerError {
-                stage: stage.current(),
-                outcome,
-                start: *start
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                session_id: session.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: crate::manager::redact_string(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-            .into()
-        };
+        let error = ManagerError::reporter(&stage, &start, &secrets);
         let own = |detail: String| ExecFailure::new(FailureKind::Unknown, detail);
         let stopped = |session: Option<&str>| {
             error(
@@ -1772,9 +1752,10 @@ impl Executor for Pi {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, Member, NetworkState};
     use crate::manager::{CodexTurn, Sdk, run_manager};
+    use crate::runtime::test_support::{
+        assert_work_outcome, join_network, open_node, provider_work,
+    };
     use crate::work::WorkState;
 
     type Turns = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -1914,30 +1895,88 @@ mod tests {
         std::fs::File::create(dir.join("concurrent-release")).unwrap();
     }
 
-    fn concurrent_pi_turns(
+    async fn concurrent_pi_turns(
         dir: &Path,
         pi: &Arc<Pi>,
-        modes: impl IntoIterator<Item = String>,
-    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
-        modes
-            .into_iter()
-            .enumerate()
-            .map(|(index, mode)| {
-                let config = gated_bot(dir, pi, &mode, &format!("client-{index}"));
-                let prompt = format!("marker-{index}");
-                tokio::spawn(async move {
-                    run_manager(
-                        &config,
-                        &prompt,
-                        None,
-                        |_| async { anyhow::Ok(()) },
-                        tokio::sync::watch::channel(false).1,
-                        |_| async { anyhow::Ok(()) },
-                    )
-                    .await
-                })
-            })
-            .collect()
+        first: Option<ManagerFailure>,
+    ) -> Result<()> {
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for index in 0..16 {
+            let config = gated_bot(
+                dir,
+                pi,
+                if index == 0 && first == Some(ManagerFailure::Failed) {
+                    "fail"
+                } else {
+                    "reply"
+                },
+                &format!("client-{index}"),
+            );
+            let prompt = format!("marker-{index}");
+            let (stop, cancel) = tokio::sync::watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                crate::manager::run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        let gated = async {
+            wait_for_gate(dir).await?;
+            if first == Some(ManagerFailure::Cancelled) {
+                stops[0].send(true)?;
+                wait_for_abort(dir).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        release(dir);
+        let mut results = Vec::with_capacity(16);
+        for task in tasks {
+            results.push(task.await);
+        }
+        gated?;
+        let mut sessions = std::collections::HashSet::new();
+        for (index, result) in results.into_iter().enumerate() {
+            let result = result?;
+            if index == 0 && first.is_some() {
+                let error = result.err().context("first pi turn")?;
+                let error = error
+                    .downcast_ref::<ManagerError>()
+                    .context("manager error")?;
+                if first == Some(ManagerFailure::Cancelled) {
+                    assert!(error.cancelled());
+                } else {
+                    assert_eq!(error.outcome, ManagerFailure::Failed);
+                }
+            } else {
+                let result = result?;
+                if first.is_none() {
+                    sessions.insert(result.session_id.context("pi session")?);
+                }
+                assert_eq!(result.output, format!("done: marker-{index}"));
+            }
+        }
+        if first.is_none() {
+            assert_eq!(sessions.len(), 16);
+        }
+        if first == Some(ManagerFailure::Cancelled) {
+            assert_eq!(
+                log(dir)
+                    .iter()
+                    .filter(|entry| entry["abort"] == true)
+                    .count(),
+                1
+            );
+        }
+        Ok(())
     }
 
     /// The turn the bot recorded once pi took its prompt.
@@ -1963,45 +2002,18 @@ mod tests {
     fn spec(work_id: &str, target: &str, cwd: &Path) -> WorkSpec {
         WorkSpec {
             work_id: work_id.into(),
-            conversation: "c".into(),
-            trigger: "message:m1".into(),
-            target: target.into(),
-            dispatcher: target.into(),
             call_ref: work_id.into(),
-            kind: WorkKind::Agent(Provider::Pi),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Pi,
-                model: None,
-            },
-            cwd: cwd.display().to_string(),
-            title: "t".into(),
-            prompt: "do it".into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Pi, target, cwd, "do it")
         }
     }
 
     /// A Node in a network of its own whose pi is the fake, and that network.
     async fn node(dir: &Path, mode: &str) -> Result<(Arc<Runtime>, String)> {
         let data = dir.join("node");
-        config::private_dir(&data)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![dir.to_owned()], false);
         configuration.providers.execution = [Provider::Pi].into();
-        configuration.save(&data)?;
-        config::private_write(&data.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&data.join("identity.json"), &serde_json::to_vec(&identity)?)?;
-        let node = Arc::new(Runtime::open(&data).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        let network = state.genesis.network_id.clone();
-        node.install_membership(state).await?;
+        let node = open_node(&data, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         let mut local = node.providers.lock().unwrap();
         local.bins.insert(Provider::Pi, fake());
@@ -2394,16 +2406,7 @@ mod tests {
     async fn sixteen_pi_turns_overlap_and_keep_their_outputs() -> Result<()> {
         let dir = scratch("concurrent");
         let pi = Arc::new(Pi::new(&dir).await);
-        let tasks = concurrent_pi_turns(&dir, &pi, (0..16).map(|_| String::from("reply")));
-        wait_for_gate(&dir).await?;
-        release(&dir);
-        let mut sessions = std::collections::HashSet::new();
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await??;
-            sessions.insert(result.session_id.context("pi session")?);
-            assert_eq!(result.output, format!("done: marker-{index}"));
-        }
-        assert_eq!(sessions.len(), 16);
+        concurrent_pi_turns(&dir, &pi, None).await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2464,50 +2467,7 @@ mod tests {
     async fn cancelling_one_of_sixteen_pi_turns_leaves_the_others_running() -> Result<()> {
         let dir = scratch("concurrent-cancel");
         let pi = Arc::new(Pi::new(&dir).await);
-        let mut tasks = Vec::with_capacity(16);
-        let mut stops = Vec::with_capacity(16);
-        for index in 0..16 {
-            let config = gated_bot(&dir, &pi, "reply", &format!("client-{index}"));
-            let prompt = format!("marker-{index}");
-            let (stop, cancel) = tokio::sync::watch::channel(false);
-            stops.push(stop);
-            tasks.push(tokio::spawn(async move {
-                run_manager(
-                    &config,
-                    &prompt,
-                    None,
-                    |_| async { anyhow::Ok(()) },
-                    cancel,
-                    |_| async { anyhow::Ok(()) },
-                )
-                .await
-            }));
-        }
-        wait_for_gate(&dir).await?;
-        stops[0].send(true)?;
-        wait_for_abort(&dir).await?;
-        release(&dir);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("cancelled pi turn")?;
-                assert!(
-                    error
-                        .downcast_ref::<ManagerError>()
-                        .context("manager error")?
-                        .cancelled()
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
-        assert_eq!(
-            log(&dir)
-                .iter()
-                .filter(|entry| entry["abort"] == true)
-                .count(),
-            1
-        );
+        concurrent_pi_turns(&dir, &pi, Some(ManagerFailure::Cancelled)).await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2516,31 +2476,7 @@ mod tests {
     async fn one_failed_pi_turn_does_not_stop_the_other_fifteen() -> Result<()> {
         let dir = scratch("concurrent-failure");
         let pi = Arc::new(Pi::new(&dir).await);
-        let modes = (0..16).map(|index| {
-            if index == 0 {
-                String::from("fail")
-            } else {
-                String::from("reply")
-            }
-        });
-        let tasks = concurrent_pi_turns(&dir, &pi, modes);
-        wait_for_gate(&dir).await?;
-        release(&dir);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("failed pi turn")?;
-                assert_eq!(
-                    error
-                        .downcast_ref::<ManagerError>()
-                        .context("manager error")?
-                        .outcome,
-                    ManagerFailure::Failed
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
+        concurrent_pi_turns(&dir, &pi, Some(ManagerFailure::Failed)).await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2551,12 +2487,7 @@ mod tests {
         let (node, network) = node(&dir, "reply").await?;
         dispatch(&node, &network, &dir).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Completed);
         assert_eq!(record.text, "Hello");
         assert_eq!(prompts(&dir), ["do it"]);
         std::fs::remove_dir_all(&dir)?;
@@ -2819,12 +2750,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Completed);
         assert_eq!(prompts(&dir), ["do it", "again"]);
         assert_eq!(node.pi.pointer(&session)?.context("pointer")?.file, file);
         let users = entries(&file)?
@@ -2844,12 +2770,7 @@ mod tests {
         let running = work(&node, |state| state.handle().is_some()).await?;
         node.pi.interrupt(&running).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Interrupted);
         assert_eq!(record.text, "Working");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -2920,12 +2841,7 @@ mod tests {
         .await
         .context("the stop retry sent another native abort")?;
         let finished = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Interrupted);
         assert_eq!(
             node.pi.probe(&running).await?,
             Probe::Terminal {
@@ -2957,12 +2873,7 @@ mod tests {
         let (node, network) = node(&dir, "crash").await?;
         dispatch(&node, &network, &dir).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Interrupted);
         assert_eq!(prompts(&dir), ["do it"]);
         std::fs::remove_dir_all(&dir)?;
         Ok(())

@@ -512,26 +512,6 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
         .with_state(app)
 }
 
-pub fn router(node: Arc<Runtime>) -> Router {
-    let sites = node
-        .config
-        .browser_origins()
-        .ok()
-        .and_then(|origins| {
-            origins
-                .into_iter()
-                .map(|origin| Site::parse(&origin))
-                .collect::<Result<Vec<_>>>()
-                .ok()
-        })
-        .unwrap_or_default();
-    router_with_sites(node, sites)
-}
-
-fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    browser_router_with_assets(node, sites, false, None)
-}
-
 #[cfg(test)]
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     browser_router_with_assets(node, sites, local, None)
@@ -1336,6 +1316,7 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, initialize_node};
 
     #[test]
     fn a_renewed_certificate_is_served_without_a_restart() -> Result<()> {
@@ -1508,21 +1489,14 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {
-        use crate::runtime::{
-            Access, test_bot as bot, test_node as node, test_start_reply as start_reply,
-        };
+        use crate::runtime::{test_bot as bot, test_node as node, test_start_reply as start_reply};
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.store.lock().await.network()?.context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
         node.register_manager_attempt_fixture(
             "mcp-current-attempt".into(),
-            Access {
-                network_id: network.clone(),
-                human: false,
-                conversation_id: Some("c".into()),
-                manager: None,
-            },
+            test_access(network.clone(), false, Some("c".into())),
             &attempt,
             &trigger,
             crate::providers::Provider::Cursor,
@@ -1791,15 +1765,7 @@ mod tests {
             .join(format!("local-setup-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let config = Config::local(address, vec![], false);
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let store = crate::store::Store::open(dir.join("node.sqlite3"))?;
         let capability = store.bootstrap_capability()?;
         config::private_write(

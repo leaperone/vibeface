@@ -1318,6 +1318,9 @@ fn attachment_mime(name: &str, bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{
+        access as test_access, manager_settings, signed_main_input,
+    };
 
     #[tokio::test]
     async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {
@@ -1332,10 +1335,7 @@ mod tests {
                 {
                     let mut settings = node.settings.lock().unwrap();
                     settings.roots = vec![directory.clone()];
-                    settings.manager = Some(crate::config::ManagerSettings {
-                        provider: Provider::Pi, workspace: directory.clone(), model: "fixture".into(),
-                        reasoning_effort: None, backup: Default::default(),
-                    });
+                    settings.manager = Some(manager_settings(Provider::Pi, directory.clone(), "fixture".into()));
                     let mut providers = node.providers.lock().unwrap();
                     providers.switches.execution = [Provider::Pi].into();
                     let binary = if case == "needs_setup" { directory.join("missing-pi") } else {
@@ -1351,9 +1351,7 @@ mod tests {
                 let work_id = WorkSpec::id("c", "message:origin", case);
                 {
                     let mut store = node.store.lock().await;
-                    let posted = admin.attest(&network, "c", serde_json::from_value(json!({
-                        "type":"message_posted","message_id":"origin","role":"user","text":"fixture","report_results":true
-                    }))?)?;
+                    let posted = signed_main_input(&admin, &network, "c", "origin", "fixture", vec![], 1)?;
                     store.append_event(&node.identity, &network, "c", posted, vec![], now_ms())?;
                     store.accept_work_fixture(&node.identity, &network, WorkSpec {
                         work_id: work_id.clone(), conversation: "c".into(), trigger: "message:origin".into(),
@@ -1370,8 +1368,7 @@ mod tests {
                 }
                 let (running_node, running_network, running_id) = (node.clone(), network.clone(), work_id.clone());
                 let running = tokio::spawn(async move {
-                    crate::scheduler::run(running_node, Access { network_id: running_network, human: false,
-                        conversation_id: Some("c".into()), manager: None }, "c".into(),
+                    crate::scheduler::run(running_node, test_access(running_network, false, Some("c".into())), "c".into(),
                         crate::scheduling::SessionScope::Task { work_id: running_id }).await
                 });
                 if case == "registration" {
@@ -1418,10 +1415,7 @@ mod tests {
         for case in ["runtime", "runtime_and_finish", "failure_record"] {
             let (node, admin, directory) = node().await?;
             let result = async {
-                node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-                    provider: Provider::Codex, workspace: directory.clone(), model: "fixture".into(),
-                    reasoning_effort: None, backup: Default::default(),
-                });
+                node.settings.lock().unwrap().manager = Some(manager_settings(Provider::Codex, directory.clone(), "fixture".into()));
                 node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
                 bot(&node, &admin, "c", "Preparation", &[]).await?;
                 let network = node.network_id().await?;
@@ -1454,8 +1448,7 @@ mod tests {
                     }
                 }
                 let invocation = tokio::time::timeout(Duration::from_secs(5), crate::scheduler::run(
-                    node.clone(), Access { network_id: network.clone(), human: false,
-                        conversation_id: Some("c".into()), manager: None },
+                    node.clone(), test_access(network.clone(), false, Some("c".into())),
                     "c".into(), crate::scheduling::SessionScope::Main,
                 )).await?;
                 if case == "runtime" {
@@ -1480,8 +1473,9 @@ mod tests {
                 if case != "runtime" {
                     let mut store = node.store.lock().await;
                     assert_eq!(store.scheduler_job("c", &trigger)?.context("recovered job")?.state, JobState::Queued);
-                    assert!(!store.manager_attempt_allowed(&network, &node.identity.device_id()?, "c", &trigger,
-                        &abandoned.state.attempt().context("old attempt")?.id)?);
+                    let previous = abandoned.state.attempt().context("old attempt")?;
+                    assert!(!store.manager_attempt_allowed_with_version(&network, &node.identity.device_id()?, "c", &trigger,
+                        &previous.id, previous.permission_version)?);
                     store.request_manager_cancel(&node.identity, &network, "c", &trigger)?;
                 }
                 node.store.lock().await.scheduler_maintenance_idle()?;
@@ -1814,7 +1808,6 @@ mod tests {
     async fn stopping_an_unacknowledged_main_input_never_requeues_after_native_not_arrived()
     -> Result<()> {
         use crate::{
-            model::{EventBody, Role},
             runtime::triage::tests::{bot, node, scripted_app_server, start_reply},
             scheduling::{SessionScope, message_trigger},
         };
@@ -1834,12 +1827,7 @@ mod tests {
             let pending = {
                 let mut store = node.store.lock().await;
                 store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
-                let signed = admin.attest(&network, "c", EventBody::MessagePosted {
-                    message_id:"unacknowledged".into(), role:Role::User, text:"supplement".into(), attachments:vec![],
-                    report_results:Some(true), in_reply_to:None, status:None, answers:None, attestation:None, failure:None,
-                })?;
-                store.accept_message(&node.identity, &network, "c", "unacknowledged", "supplement", vec![], true,
-                    signed.attestation().cloned().context("input signature")?, now_ms())?;
+                store.post_input_fixture(&node.identity, &network, signed_main_input(&admin, &network, "c", "unacknowledged", "supplement", vec![], 2)?, now_ms())?;
                 let candidate = store.steer_candidates(&network, &local, "boot")?.into_iter()
                     .find(|candidate| candidate.message_id=="unacknowledged").context("Main steer candidate")?;
                 assert_eq!(candidate.scope, SessionScope::Main);
@@ -1851,7 +1839,7 @@ mod tests {
                 assert!(!store.steer_host_active("c", &attempt)?);
                 pending
             };
-            node.cancel_manager(&Access { network_id:network.clone(), human:true, conversation_id:Some("c".into()), manager:None },
+            node.cancel_manager(&test_access(network.clone(), true, Some("c".into())),
                 &json!({"conversation_id":"c","trigger":trigger})).await?;
             let mut requests = scripted_app_server(&node, |request| {
                 if request["method"] == "thread/read" {

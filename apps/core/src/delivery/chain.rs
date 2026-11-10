@@ -121,9 +121,6 @@ pub enum Call {
     RefundBonus {
         order_id: Word,
     },
-    Cancel {
-        order_id: Word,
-    },
     Withdraw {
         order_id: Word,
     },
@@ -208,10 +205,6 @@ impl Chain {
         };
         chain.verify_deployment().await?;
         Ok(chain)
-    }
-
-    pub fn config(&self) -> &ChainConfig {
-        &self.config
     }
 
     async fn verify_deployment(&self) -> Result<()> {
@@ -331,38 +324,6 @@ impl Chain {
         )
     }
 
-    pub async fn balance(&self, wallet: Address) -> Result<String> {
-        Ok(self
-            .call(
-                address(&self.config.asset)?,
-                abi::balanceOfCall { owner: wallet },
-            )
-            .await?
-            .to_string())
-    }
-
-    pub async fn native_balance(&self, wallet: Address) -> Result<String> {
-        Ok(quantity(
-            &self
-                .rpc("eth_getBalance", json!([address_hex(wallet), "latest"]))
-                .await?,
-        )?
-        .to_string())
-    }
-
-    pub async fn allowance(&self, wallet: Address) -> Result<String> {
-        Ok(self
-            .call(
-                address(&self.config.asset)?,
-                abi::allowanceCall {
-                    owner: wallet,
-                    spender: address(&self.config.escrow)?,
-                },
-            )
-            .await?
-            .to_string())
-    }
-
     pub async fn current_key(&self, receiver_peer: Word) -> Result<KeyRecord> {
         let position = self.confirmed_position().await?;
         let result = self
@@ -440,17 +401,6 @@ impl Chain {
             )
             .await?,
         )
-    }
-
-    pub async fn public_values(
-        &self,
-        order_id: Word,
-        index: u16,
-        relation: Relation,
-    ) -> Result<Statement> {
-        let position = self.confirmed_position().await?;
-        self.public_values_at(&position, order_id, index, relation)
-            .await
     }
 
     pub async fn public_values_at(
@@ -1126,13 +1076,6 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
         Call::RefundBonus { order_id } => {
             validate_order_index(order_id, 0)?;
             abi::refundBonusCall {
-                id: order_id.into(),
-            }
-            .abi_encode()
-        }
-        Call::Cancel { order_id } => {
-            validate_order_index(order_id, 0)?;
-            abi::cancelCall {
                 id: order_id.into(),
             }
             .abi_encode()

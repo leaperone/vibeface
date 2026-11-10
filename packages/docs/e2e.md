@@ -191,7 +191,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a ch
 
 ## 验证原生工作台
 
-`workspace.native.ts` 使用同一任务构建的 iOS App 和受控 Node。先新建名称以 `vibeface-workspace-` 开头的专属模拟器并启动，把 UUID 写入 `.artifacts/native/workspace/simulator.txt`。不得复用其他任务的模拟器。邀请文件保持在同一目录，权限为 `0600`。
+`workspace.native.ts` 使用同一任务构建的 iOS App 和受控 Node。先核对 Apple 官方最新稳定、与本次 Xcode、SDK 和设备类型兼容的 runtime；缺少时先安装，不能只选本机已安装版本的最大值。用该 runtime 新建名称以 `vibeface-workspace-` 开头的专属模拟器并启动，把 UDID 写入 `.artifacts/native/workspace/simulator.txt`。验收前按该 UDID 核对 runtime，并记录版本、build、设备名称和 UDID。不得复用其他任务的模拟器。邀请文件保持在同一目录，权限为 `0600`。
 
 ```sh
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
@@ -199,7 +199,7 @@ VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
 VIBEFACE_E2E_SOURCE_COMMIT="$TASK_SOURCE_COMMIT" \
 VIBEFACE_E2E_BINARY=/absolute/task/target/debug/vibeface \
 VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
-pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts:123 --retries 0 --video off
+pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts --retries 0 --video off
 ```
 
 `VIBEFACE_E2E_BINARY` 同目录下还必须有 `vibeface-core`，先运行 `cargo build -p vibeface -p vibeface-core --locked`。`VIBEFACE_E2E_CRYPTO_MODULE` 指向的 WASM 由 `scripts/build-web-crypto.sh` 和 `scripts/build-web.sh` 生成。

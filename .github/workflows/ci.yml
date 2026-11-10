@@ -22,24 +22,20 @@ on:
         type: string
         default: ''
       windows_only:
-        description: 'Run native Windows checks; optionally diagnose a prior Windows package when windows_package_run is set'
+        description: 'Run native Rust checks for the current Windows source'
         type: boolean
         default: false
-      windows_package_run:
-        description: 'For windows_only diagnostics, reuse a prior completed ci.yml run whose Windows package producer succeeded'
-        type: string
-        default: ''
       mobile_apps:
         description: 'Build native mobile apps independently, without the desktop acceptance jobs'
         type: choice
         options: [none, ios, android, both]
         default: none
       desktop_only:
-        description: 'Run only independent Mac and Windows native builds, desktop windows and Windows platform checks'
+        description: 'Run only Mac, Windows and Linux desktop builds and acceptance, plus Windows platform checks'
         type: boolean
         default: false
       desktop:
-        description: 'Also run the hosted Windows native checks and the real Mac and Windows desktop window tests'
+        description: 'Also run Windows platform checks and real Mac, Windows and Linux desktop tests'
         type: boolean
         default: false
 
@@ -118,7 +114,6 @@ jobs:
           python3 scripts/release.py self-test
           python3 -B scripts/test_progressive_publication.py
           python3 scripts/package-node-windows.py --self-test
-          python3 scripts/windows-diagnostic-input.py --self-test
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
@@ -1127,25 +1122,6 @@ jobs:
           print('Selected native mobile application builds passed')
           PYTHON
 
-  windows-package-input:
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_package_run != ''
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Restrict package diagnostics to windows_only
-        env:
-          WINDOWS_ONLY: ${{ inputs.windows_only }}
-          DESKTOP_ONLY: ${{ inputs.desktop_only }}
-          PACKAGE_RUN_ID: ${{ inputs.windows_package_run }}
-        run: |
-          [[ "$WINDOWS_ONLY" == true && "$DESKTOP_ONLY" != true ]] || {
-            echo '::error::windows_package_run is only allowed with windows_only=true and desktop_only=false.'
-            exit 1
-          }
-          [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]{0,18}$ ]] || {
-            echo '::error::windows_package_run must be a positive decimal workflow run ID.'
-            exit 1
-          }
-
   windows-platform:
     if: github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only)
     uses: ./.github/workflows/ci-windows-native.yml
@@ -1154,26 +1130,17 @@ jobs:
       actions: read
     with:
       source_sha: ${{ github.sha }}
-      package_run_id: ${{ inputs.windows_only && !inputs.desktop_only && inputs.windows_package_run || '' }}
-      rust_checks: ${{ !inputs.windows_only || inputs.desktop_only || inputs.windows_package_run == '' }}
 
   windows-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.windows_only || inputs.windows_package_run != '') }}
-    needs: [windows-platform, windows-package-input]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.windows_only }}
+    needs: windows-platform
     runs-on: ubuntu-24.04
     steps:
       - name: Require the native Windows checks
         env:
           RESULT: ${{ needs.windows-platform.result }}
-          INPUT_RESULT: ${{ needs.windows-package-input.result }}
-          WINDOWS_ONLY: ${{ inputs.windows_only }}
-          PACKAGE_RUN_ID: ${{ inputs.windows_package_run }}
         run: |
           test "$RESULT" = success
-          if [[ -n "$PACKAGE_RUN_ID" ]]; then
-            [[ "$WINDOWS_ONLY" == true && "$INPUT_RESULT" == success ]] || exit 1
-            echo 'The prior-package Windows diagnostic succeeded; it is not current-source acceptance.'
-          fi
 
   desktop-gate:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.desktop_only }}

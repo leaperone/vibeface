@@ -1,4 +1,4 @@
-//! Owner-only Unix maintenance wire values and client.
+//! Owner-only maintenance wire values and client.
 //!
 //! The server remains in `apps/core`; this module intentionally owns no Core, Store, or wallet
 //! runtime types. It keeps the admitted request stream open for an acquired lease.

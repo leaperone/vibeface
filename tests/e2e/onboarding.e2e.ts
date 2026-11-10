@@ -42,6 +42,8 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
   await app.open(node.entry);
+  await expect(screen.getByRole('button', '新建我的网络')).toBeVisible();
+  await expect(screen.getByRole('button', '加入已有网络')).toBeVisible();
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();

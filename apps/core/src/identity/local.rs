@@ -139,16 +139,6 @@ impl Store {
         Ok(view)
     }
 
-    pub fn init_network(&self, state: NetworkState) -> Result<AuthorizationView> {
-        let view = state.project()?;
-        self.transaction(|tx| {
-            ensure!(!has_network_in(tx)?, "network already installed");
-            save_state(tx, &state)?;
-            Ok(())
-        })?;
-        Ok(view)
-    }
-
     pub fn public_state(&self) -> Result<NetworkState> {
         let state = load_state(&self.connection)?;
         state.project()?;

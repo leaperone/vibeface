@@ -169,6 +169,27 @@ fn query_jobs(
     rows.into_iter().map(job_from_row).collect()
 }
 
+fn accepted_steering_jobs(
+    connection: &Connection,
+    job: &SchedulerJob,
+) -> Result<Vec<SchedulerJob>> {
+    let Some(attempt) = job.state.attempt() else {
+        return Ok(vec![]);
+    };
+    let mut inputs = query_jobs(
+        connection,
+        "conversation_id=? AND state IN ('steering','steered')",
+        [&job.conversation_id],
+    )?;
+    inputs.retain(|input| {
+        matches!(&input.state,
+            JobState::Steering { into, receipt: Some(_), .. }
+            | JobState::Steered { into, receipt: Some(_), .. }
+            if into.attempt_id == attempt.id)
+    });
+    Ok(inputs)
+}
+
 fn load_job(
     connection: &Connection,
     conversation: &str,
@@ -941,6 +962,75 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
         .checked_add(1)
         .context("scheduler permission version overflow")?;
     Ok(())
+}
+
+fn invalidate_session(
+    session: &mut SchedulerSession,
+    basis: &VersionVector,
+    config: &SessionConfig,
+    reason: &str,
+) -> Result<SessionInvalidation> {
+    let generation = session
+        .shown
+        .session_generation
+        .checked_add(1)
+        .context("scheduler session generation overflow")?;
+    let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
+        session.stable_fingerprint.as_deref(),
+        &config.stable_fingerprint,
+        session.runtime_fingerprint.as_deref(),
+        &config.runtime_fingerprint,
+        generation,
+        basis,
+    ))?);
+    let invalidation = SessionInvalidation {
+        source_basis: session.covers.clone(),
+        old_stable_fingerprint: session.stable_fingerprint.clone(),
+        new_stable_fingerprint: config.stable_fingerprint.clone(),
+        old_runtime_fingerprint: session.runtime_fingerprint.clone(),
+        new_runtime_fingerprint: config.runtime_fingerprint.clone(),
+        source_provider: session.provider,
+        target_provider: config.provider,
+        reason: reason.into(),
+        generation,
+        handoff_revision,
+    };
+    fence(session)?;
+    session.covers.clear();
+    let mut lineage = std::mem::take(&mut session.shown.session_lineage);
+    if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
+        session.stable_fingerprint.clone(),
+        session.runtime_fingerprint.clone(),
+        session.provider,
+    ) {
+        lineage.push(SessionLineage {
+            source_basis: invalidation.source_basis.clone(),
+            generation: session.shown.session_generation,
+            stable_fingerprint,
+            runtime_fingerprint,
+            provider,
+            reason: reason.into(),
+            handoff_revision: invalidation.handoff_revision.clone(),
+        });
+    }
+    if lineage.len() > 8 {
+        lineage.drain(..lineage.len() - 8);
+    }
+    session.shown = Shown {
+        session_generation: generation,
+        session_lineage: lineage,
+        ..Shown::default()
+    };
+    session.session_generation = generation;
+    session.handoff_revision = session
+        .handoff_revision
+        .checked_add(1)
+        .context("scheduler handoff revision overflow")?;
+    session.handoff_source = basis.clone();
+    session.stable_fingerprint = Some(config.stable_fingerprint.clone());
+    session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
+    session.provider = Some(config.provider);
+    Ok(invalidation)
 }
 
 fn attempt_not_started_from(connection: &Connection, job: &SchedulerJob) -> Result<bool> {
@@ -1770,7 +1860,7 @@ fn admit_ended_from(
         },
     )?;
     // What reaches a deleted bot is recorded as cancelled, so a sender's retry reads it back.
-    // An agent task waits for `claim_next`, which also ends its work.
+    // An agent task waits for `claim_next_in_session`, which also ends its work.
     let deleted = kind != TriggerKind::AgentTask
         && super::bots::bot_deleted_from(connection, network, conversation)?;
     let ended = declined.or(deleted.then_some(BOT_DELETED));
@@ -1839,7 +1929,6 @@ fn stage_memory_from(
     trigger: &str,
     call_ref: &str,
     request: super::bot_settings::ChangeRequest,
-    review_revision: Option<(u32, &str)>,
 ) -> Result<Value> {
     use super::bot_settings::ChangeRequest;
     vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
@@ -1861,29 +1950,16 @@ fn stage_memory_from(
         super::bot_settings::user_cause(connection, network, conversation, trigger)?.is_some(),
         super::bot_settings::NOT_FROM_USER
     );
-    let origin = if review_revision.is_some() {
-        AutomaticMemoryOrigin::Review
-    } else {
-        AutomaticMemoryOrigin::Agent
-    };
     let staged = &session.shown.staged_memories;
     if let Some(previous) = staged.get(call_ref) {
         ensure!(
-            request.matches_memory(&previous.memory_id, previous.after.as_deref())
-                && previous.origin == origin
-                && review_revision.is_none_or(|(epoch, revision)| previous.base.epoch == epoch
-                    && previous
-                        .base
-                        .version
-                        .as_ref()
-                        .map_or("", |version| version.revision.as_str())
-                        == revision),
+            request.matches_memory(&previous.memory_id, previous.after.as_deref()),
             "call_ref {call_ref} already staged a different memory mutation"
         );
         return Ok(staged_memory_result(previous));
     }
     let committed = super::bot_settings::memory_records_from(connection, network, conversation)?;
-    let (memory_id, mut before, after, mut base, essential) = match request {
+    let (memory_id, before, after, base, essential) = match request {
         ChangeRequest::Remember { memory_id, text } => {
             validate_memory(&text)?;
             let memory_id = memory_id.unwrap_or_else(|| {
@@ -1958,39 +2034,13 @@ fn stage_memory_from(
         !staged.values().any(|entry| entry.memory_id == memory_id),
         "memory {memory_id} already has a staged mutation in this turn"
     );
-    if let Some((epoch, revision)) = review_revision {
-        base.epoch = epoch;
-        if base
-            .version
-            .as_ref()
-            .is_some_and(|version| version.revision != revision)
-        {
-            let source = super::log::event_from(connection, network, revision)?
-                .context("memory review base is not stored here")?;
-            let operation = super::bot_settings::memory_operation(network, revision, &source)?
-                .context("memory review base is not a memory operation")?;
-            ensure!(
-                source.scope_id == *conversation
-                    && operation.memory_id == memory_id
-                    && !operation.user_controlled,
-                "memory review base belongs to another note"
-            );
-            before = operation.after;
-            base.version = Some(operation.version);
-        } else if base.version.is_none() {
-            ensure!(
-                revision.is_empty(),
-                "a review update needs a committed base"
-            );
-        }
-    }
     let mutation = StagedMemory {
         call_ref: call_ref.into(),
         memory_id,
         before,
         after,
         base,
-        origin,
+        origin: AutomaticMemoryOrigin::Agent,
         essential,
     };
     let result = staged_memory_result(&mutation);
@@ -2419,37 +2469,15 @@ impl Store {
         network: &str,
         job: &SchedulerJob,
     ) -> Result<Vec<HashedEvent>> {
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(vec![]);
-        };
         let mut events = Vec::new();
-        for input in query_jobs(
-            &self.connection,
-            "conversation_id=? AND state IN ('steering','steered')",
-            [&job.conversation_id],
-        )? {
-            let accepted = match &input.state {
-                JobState::Steering {
-                    into,
-                    receipt: Some(_),
-                    ..
-                }
-                | JobState::Steered {
-                    into,
-                    receipt: Some(_),
-                    ..
-                } => into.attempt_id == attempt.id,
-                _ => false,
-            };
-            if accepted
-                && let Some(message) = message_from(
-                    &self.connection,
-                    network,
-                    &job.conversation_id,
-                    &input.reply_to,
-                )?
-                && let Some(event) =
-                    log::event_from(&self.connection, network, &message.event_hash)?
+        for input in accepted_steering_jobs(&self.connection, job)? {
+            if let Some(message) = message_from(
+                &self.connection,
+                network,
+                &job.conversation_id,
+                &input.reply_to,
+            )? && let Some(event) =
+                log::event_from(&self.connection, network, &message.event_hash)?
             {
                 events.push(HashedEvent {
                     hash: message.event_hash,
@@ -2563,29 +2591,8 @@ impl Store {
                 return Ok(Some(job.conversation_id.clone()));
             }
         }
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(None);
-        };
-        for input in query_jobs(
-            &self.connection,
-            "conversation_id=? AND state IN ('steering','steered')",
-            [&job.conversation_id],
-        )? {
-            let accepted = match &input.state {
-                JobState::Steering {
-                    into,
-                    receipt: Some(_),
-                    ..
-                }
-                | JobState::Steered {
-                    into,
-                    receipt: Some(_),
-                    ..
-                } => into.attempt_id == attempt.id,
-                _ => false,
-            };
-            if accepted
-                && let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
+        for input in accepted_steering_jobs(&self.connection, job)? {
+            if let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
                 && effective
                     .input
                     .attachments
@@ -2640,35 +2647,12 @@ impl Store {
         Ok(receipt)
     }
 
-    pub fn workspace_input_editable(
-        &self,
-        network: &str,
-        conversation: &str,
-        message_id: &str,
-    ) -> Result<bool> {
-        workspace_input_editable_from(&self.connection, network, conversation, message_id)
-    }
-
     pub(crate) fn workspace_task_input_allowed(
         &self,
         network: &str,
         task_id: &str,
     ) -> Result<bool> {
         super::workspace::task_input_allowed_from(&self.connection, network, task_id)
-    }
-
-    pub fn apply_workspace_input_control(
-        &mut self,
-        network: &str,
-        local: &str,
-        message_id: &str,
-    ) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        apply_workspace_input_control_from(&tx, network, local, message_id)?;
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn input_receipt(
@@ -2869,100 +2853,10 @@ impl Store {
                 .is_some_and(|attempt| attempt.id == attempt_id),
             "scheduler attempt does not match"
         );
-        let result =
-            stage_memory_from(&tx, &mut session, network, trigger, call_ref, request, None)?;
+        let result = stage_memory_from(&tx, &mut session, network, trigger, call_ref, request)?;
         save_session(&tx, &session)?;
         tx.commit()?;
         Ok(result)
-    }
-
-    /// Stages a data-only review atomically; the normal turn completion owns its commit.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the opt-in review and its active turn"
-    )]
-    pub fn stage_memory_review(
-        &mut self,
-        network: &str,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-        call_ref: &str,
-        policy: super::bot_settings::MemoryReviewPolicy,
-        review: &super::bot_settings::MemoryReview,
-    ) -> Result<Vec<Value>> {
-        use super::bot_settings::{ChangeRequest, MemoryReviewOperation, MemoryReviewPolicy};
-        ensure!(
-            policy == MemoryReviewPolicy::ReadOnly,
-            "memory review is disabled"
-        );
-        review.validate()?;
-        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
-        let mut session = load_job_session(&tx, &job)?;
-        ensure!(
-            job.state
-                .attempt()
-                .is_some_and(|attempt| attempt.id == attempt_id),
-            "scheduler attempt does not match"
-        );
-        let mut results = Vec::with_capacity(review.operations.len());
-        for (index, operation) in review.operations.iter().enumerate() {
-            let (request, expected) = match operation {
-                MemoryReviewOperation::Add { text } => (
-                    ChangeRequest::Remember {
-                        memory_id: None,
-                        text: text.clone(),
-                    },
-                    (crate::config::DATA_EPOCH, ""),
-                ),
-                MemoryReviewOperation::Update {
-                    memory_id,
-                    epoch,
-                    expected_revision,
-                    text,
-                } => (
-                    ChangeRequest::Remember {
-                        memory_id: Some(memory_id.clone()),
-                        text: text.clone(),
-                    },
-                    (*epoch, expected_revision.as_str()),
-                ),
-                MemoryReviewOperation::Forget {
-                    memory_id,
-                    epoch,
-                    expected_revision,
-                } => (
-                    ChangeRequest::Forget {
-                        memory_id: memory_id.clone(),
-                    },
-                    (*epoch, expected_revision.as_str()),
-                ),
-            };
-            let operation_ref = format!(
-                "review-{}",
-                super::bot_settings::change_digest(
-                    conversation,
-                    trigger,
-                    &format!("{call_ref}-{index}"),
-                )
-            );
-            results.push(stage_memory_from(
-                &tx,
-                &mut session,
-                network,
-                trigger,
-                &operation_ref,
-                request,
-                Some(expected),
-            )?);
-        }
-        save_session(&tx, &session)?;
-        tx.commit()?;
-        Ok(results)
     }
 
     /// The user messages of a conversation this Node schedules that no device answered, in
@@ -3435,20 +3329,6 @@ fn report_origin_from(
                                 report_results: report_results.unwrap_or(true),
                             })
                         }
-                        (
-                            Some(input),
-                            EventBody::MessagePosted {
-                                message_id,
-                                role: Role::User,
-                                answers: None,
-                                attestation: Some(_),
-                                report_results,
-                                ..
-                            },
-                        ) if input == message_id => Some(ReportOrigin {
-                            reply_to: assignment.assignment_id,
-                            report_results: report_results.unwrap_or(true),
-                        }),
                         (
                             None,
                             EventBody::WorkspaceCommanded {
@@ -4001,87 +3881,6 @@ fn recover_session(
 }
 
 impl Store {
-    /// Stores the user's message once per `message_id` and queues it on the owner.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a user message and its admission"
-    )]
-    pub fn accept_message(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        conversation: &str,
-        message_id: &str,
-        text: &str,
-        attachments: Vec<Attachment>,
-        report_results: bool,
-        attestation: Attestation,
-        created_at_ms: i64,
-    ) -> Result<(Message, AdmissionReceipt)> {
-        let local = identity.device_id()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &local)?;
-        ensure!(
-            !super::bots::bot_deleted_from(&tx, network, conversation)?,
-            "this bot was deleted"
-        );
-        let owner = conversation_from(&tx, network, conversation)?
-            .context("conversation not found")?
-            .owner
-            .context("conversation has no scheduling Node")?;
-        if let Some(existing) = message_from(&tx, network, conversation, message_id)? {
-            ensure!(
-                existing.role == Role::User
-                    && existing.answers.is_none()
-                    && existing.text == text
-                    && existing.attachments == attachments
-                    && existing.report_results == Some(report_results),
-                "message ID reused with different content"
-            );
-        } else {
-            log::append_from(
-                &tx,
-                &self.blob_dir,
-                identity,
-                network,
-                conversation,
-                EventBody::MessagePosted {
-                    message_id: message_id.into(),
-                    role: Role::User,
-                    text: text.into(),
-                    attachments: attachments.clone(),
-                    report_results: Some(report_results),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: Some(attestation),
-                    failure: None,
-                },
-                attachments.iter().map(Attachment::blob).collect(),
-                created_at_ms,
-            )?;
-        }
-        let trigger = message_trigger(message_id);
-        let receipt = if owner == local {
-            admit_from(
-                &tx,
-                network,
-                conversation,
-                &trigger,
-                TriggerKind::Human,
-                message_id,
-            )?
-        } else {
-            queue_delivery_from(&tx, network, conversation, &trigger)?
-        };
-        let message =
-            message_from(&tx, network, conversation, message_id)?.context("message missing")?;
-        tx.commit()?;
-        Ok((message, receipt))
-    }
-
     pub fn admit_due_schedules(
         &mut self,
         identity: &LocalIdentity,
@@ -4117,26 +3916,6 @@ impl Store {
             provider,
             limits,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scheduler_queue_hold(
-        &self,
-        network: &str,
-        local: &str,
-        conversation: &str,
-        state: &JobState,
-    ) -> Result<Option<QueueHoldReason>> {
-        let session = load_session(&self.connection, conversation)?;
-        let steering = conversation_from(&self.connection, network, conversation)?
-            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
-            && !query_jobs(
-                &self.connection,
-                "conversation_id=? AND state='steering'",
-                [conversation],
-            )?
-            .is_empty();
-        Ok(queue_hold_reason(state, session.active.is_some(), steering))
     }
 
     pub(crate) fn scheduler_job_context_projection(
@@ -4325,18 +4104,6 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn remove_outbox(&mut self, conversation: &str, trigger: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-            params![conversation, trigger],
-        )?;
-        Ok(())
-    }
-
-    pub fn pending_scheduler_conversations(&self) -> Result<Vec<String>> {
-        pending_conversations_from(&self.connection)
     }
 
     pub fn pending_scheduler_sessions(&self) -> Result<Vec<SessionKey>> {
@@ -4558,36 +4325,6 @@ impl Store {
         Ok(ended)
     }
 
-    #[cfg(test)]
-    pub fn claim_next(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        conversation: &str,
-        boot: &str,
-        fingerprint: &str,
-    ) -> Result<Option<ClaimedJob>> {
-        self.recover_scheduler_jobs(identity, network, boot)?;
-        let mut queued = queued_jobs(&self.connection, conversation)?;
-        queued.sort_by(|a, b| a.priority().cmp(&b.priority()));
-        let Some(job) = queued.first() else {
-            return Ok(None);
-        };
-        let config = SessionConfig {
-            stable_fingerprint: fingerprint.into(),
-            runtime_fingerprint: fingerprint.into(),
-            provider: Provider::Codex,
-        };
-        self.claim_next_in_session(
-            identity,
-            network,
-            &job.session_key(),
-            boot,
-            &config,
-            &crate::config::SchedulingLimits::default(),
-        )
-    }
-
     /// Claim and every resource gate share one transaction. A held background candidate never
     /// blocks a runnable human message, and ties remain stable across concurrent consumers.
     pub fn claim_next_in_session(
@@ -4762,66 +4499,7 @@ impl Store {
             } else {
                 "runtime_configuration_changed"
             };
-            let generation = session
-                .shown
-                .session_generation
-                .checked_add(1)
-                .context("scheduler session generation overflow")?;
-            let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
-                session.stable_fingerprint.as_deref(),
-                &config.stable_fingerprint,
-                session.runtime_fingerprint.as_deref(),
-                &config.runtime_fingerprint,
-                generation,
-                &job.basis,
-            ))?);
-            let invalidation = SessionInvalidation {
-                source_basis: session.covers.clone(),
-                old_stable_fingerprint: session.stable_fingerprint.clone(),
-                new_stable_fingerprint: config.stable_fingerprint.clone(),
-                old_runtime_fingerprint: session.runtime_fingerprint.clone(),
-                new_runtime_fingerprint: config.runtime_fingerprint.clone(),
-                source_provider: session.provider,
-                target_provider: config.provider,
-                reason: reason.into(),
-                generation,
-                handoff_revision,
-            };
-            fence(&mut session)?;
-            session.covers.clear();
-            let mut lineage = std::mem::take(&mut session.shown.session_lineage);
-            if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
-                session.stable_fingerprint.clone(),
-                session.runtime_fingerprint.clone(),
-                session.provider,
-            ) {
-                lineage.push(SessionLineage {
-                    source_basis: invalidation.source_basis.clone(),
-                    generation: session.shown.session_generation,
-                    stable_fingerprint,
-                    runtime_fingerprint,
-                    provider,
-                    reason: reason.into(),
-                    handoff_revision: invalidation.handoff_revision.clone(),
-                });
-            }
-            if lineage.len() > 8 {
-                lineage.drain(..lineage.len() - 8);
-            }
-            session.shown = Shown {
-                session_generation: generation,
-                session_lineage: lineage,
-                ..Shown::default()
-            };
-            session.session_generation = generation;
-            session.handoff_revision = session
-                .handoff_revision
-                .checked_add(1)
-                .context("scheduler handoff revision overflow")?;
-            session.handoff_source = job.basis.clone();
-            session.stable_fingerprint = Some(config.stable_fingerprint.clone());
-            session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
-            session.provider = Some(config.provider);
+            let invalidation = invalidate_session(&mut session, &job.basis, config, reason)?;
             session.owner_epoch = owner_epoch;
             Some(invalidation)
         } else {
@@ -4942,77 +4620,15 @@ impl Store {
             model: runtime.model.clone(),
             reasoning_effort: runtime.reasoning_effort.clone(),
         });
-        let source_basis = session.covers.clone();
-        let old_stable_fingerprint = session.stable_fingerprint.clone();
-        let old_runtime_fingerprint = session.runtime_fingerprint.clone();
-        let source_provider = session.provider;
-        let reason = if source_provider != Some(config.provider) {
+        let reason = if session.provider != Some(config.provider) {
             "provider_changed"
-        } else if old_stable_fingerprint.as_deref() != Some(config.stable_fingerprint.as_str()) {
+        } else if session.stable_fingerprint.as_deref() != Some(config.stable_fingerprint.as_str())
+        {
             "stable_prompt_changed"
         } else {
             "runtime_configuration_changed"
         };
-        let generation = session
-            .shown
-            .session_generation
-            .checked_add(1)
-            .context("scheduler session generation overflow")?;
-        let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
-            old_stable_fingerprint.as_deref(),
-            &config.stable_fingerprint,
-            old_runtime_fingerprint.as_deref(),
-            &config.runtime_fingerprint,
-            generation,
-            &job.basis,
-        ))?);
-        let invalidation = SessionInvalidation {
-            source_basis: source_basis.clone(),
-            old_stable_fingerprint,
-            new_stable_fingerprint: config.stable_fingerprint.clone(),
-            old_runtime_fingerprint,
-            new_runtime_fingerprint: config.runtime_fingerprint.clone(),
-            source_provider,
-            target_provider: config.provider,
-            reason: reason.into(),
-            generation,
-            handoff_revision: handoff_revision.clone(),
-        };
-        fence(&mut session)?;
-        session.covers.clear();
-        let mut lineage = std::mem::take(&mut session.shown.session_lineage);
-        if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
-            invalidation.old_stable_fingerprint.clone(),
-            invalidation.old_runtime_fingerprint.clone(),
-            invalidation.source_provider,
-        ) {
-            lineage.push(SessionLineage {
-                source_basis: source_basis.clone(),
-                generation: session.shown.session_generation,
-                stable_fingerprint,
-                runtime_fingerprint,
-                provider,
-                reason: reason.into(),
-                handoff_revision: handoff_revision.clone(),
-            });
-        }
-        if lineage.len() > 8 {
-            lineage.drain(..lineage.len() - 8);
-        }
-        session.shown = Shown {
-            session_generation: generation,
-            session_lineage: lineage,
-            ..Shown::default()
-        };
-        session.session_generation = generation;
-        session.handoff_revision = session
-            .handoff_revision
-            .checked_add(1)
-            .context("scheduler handoff revision overflow")?;
-        session.handoff_source = job.basis.clone();
-        session.stable_fingerprint = Some(config.stable_fingerprint.clone());
-        session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
-        session.provider = Some(config.provider);
+        let invalidation = invalidate_session(&mut session, &job.basis, config, reason)?;
         if let JobState::Claimed { attempt } | JobState::Running { attempt } = &mut job.state {
             attempt.permission_version = session.permission_version;
         }
@@ -5154,41 +4770,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn advance_scheduler_lineage(
-        &mut self,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-    ) -> Result<u64> {
-        let mut generation = 0;
-        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
-            ensure!(
-                session.active.as_deref() == Some(trigger)
-                    && matches!(
-                        job.state,
-                        JobState::Claimed { .. } | JobState::Running { .. }
-                    ),
-                "scheduler attempt is no longer active"
-            );
-            session.session_generation = session
-                .session_generation
-                .checked_add(1)
-                .context("scheduler session generation overflow")?;
-            session.handoff_revision = session
-                .handoff_revision
-                .checked_add(1)
-                .context("scheduler handoff revision overflow")?;
-            session.handoff_source = job.basis.clone();
-            generation = session.session_generation;
-            if let Some(runtime) = &mut job.runtime {
-                runtime.session_generation = generation;
-                runtime.stage = ProviderStage::Compact;
-            }
-            Ok(())
-        })?;
-        Ok(generation)
-    }
-
     pub fn record_context_compaction(
         &mut self,
         conversation: &str,
@@ -5215,21 +4796,9 @@ impl Store {
                 .context("scheduler handoff revision overflow")?;
             session.handoff_source = job.basis.clone();
             session.covers.clear();
-            let mut shown = std::mem::take(&mut session.shown);
-            shown.session_generation = session.session_generation;
-            shown.dynamic = None;
-            shown.context = None;
-            session.shown = Shown {
-                bot: shown.bot,
-                works: shown.works,
-                memory: shown.memory,
-                dynamic: None,
-                staged_memories: shown.staged_memories,
-                session_generation: session.session_generation,
-                session_lineage: shown.session_lineage,
-                context: None,
-                memory_conflicts: shown.memory_conflicts,
-            };
+            session.shown.session_generation = session.session_generation;
+            session.shown.dynamic = None;
+            session.shown.context = None;
             generation = session.session_generation;
             if let Some(runtime) = &mut job.runtime {
                 runtime.session_generation = generation;
@@ -5462,31 +5031,6 @@ impl Store {
             Ok(())
         })?;
         Ok(())
-    }
-
-    pub fn manager_attempt_allowed(
-        &self,
-        network: &str,
-        local: &str,
-        conversation: &str,
-        trigger: &str,
-        attempt_id: &str,
-    ) -> Result<bool> {
-        let Some(job) = self.scheduler_job(conversation, trigger)? else {
-            return Ok(false);
-        };
-        let session = load_job_session(&self.connection, &job)?;
-        let Some(attempt) = job.state.attempt() else {
-            return Ok(false);
-        };
-        Ok(session.active.as_deref() == Some(trigger)
-            && attempt.id == attempt_id
-            && attempt.permission_version == session.permission_version
-            && matches!(
-                job.state,
-                JobState::Claimed { .. } | JobState::Running { .. }
-            )
-            && holds_turn(&self.connection, network, local, &session, &job)?)
     }
 
     pub fn manager_attempt_allowed_with_version(

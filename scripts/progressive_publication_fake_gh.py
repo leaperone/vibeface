@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal gh/git stub for progressive publication CLI subprocess tests."""
+"""Shared gh/git transport for progressive publication tests and CLI subprocesses."""
 import base64
 import hashlib
 import json
@@ -8,108 +8,112 @@ import subprocess
 import sys
 from pathlib import Path
 
-STATE_PATH = Path(os.environ['VIBEFACE_TEST_GH_STATE'])
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
 
 
-def load():
-    state = json.loads(STATE_PATH.read_text(encoding='utf-8'))
-    state['assets'] = {name: base64.b64decode(data) for name, data in state.get('assets', {}).items()}
-    return state
+class FakeRelease:
+    def __init__(self, tag, source):
+        self.tag = tag
+        self.source = source
+        self.exists = False
+        self.draft = False
+        self.body = ''
+        self.immutable = False
+        self.assets = {}
+        self.uploads = []
+        self.edits = []
 
+    def asset_records(self):
+        return [{'name': name, 'size': len(data), 'digest': f'sha256:{digest_bytes(data)}'}
+                for name, data in sorted(self.assets.items())]
 
-def save(state):
-    payload = dict(state)
-    payload['assets'] = {name: base64.b64encode(data).decode('ascii') for name, data in state['assets'].items()}
-    STATE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    def view_json(self):
+        return json.dumps(dict(isDraft=self.draft, body=self.body,
+                               assets=[{'name': name} for name in sorted(self.assets)]))
+
+    def api_payload(self):
+        return json.dumps(dict(assets=self.asset_records(), immutable=self.immutable))
 
 
 def digest_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def gh_main(argv):
-    state = load()
-    if argv[0] != 'gh':
-        raise AssertionError(argv)
-    if argv[1] == 'api':
-        path = argv[2]
-        if path.endswith(f"/commits/{state['tag']}"):
-            print(json.dumps(dict(sha=state['source'])))
-            return 0
-        if path.endswith(f"/releases/tags/{state['tag']}"):
-            if not state.get('exists'):
-                sys.stderr.write('release not found\n')
-                return 1
-            assets = []
-            for name, data in sorted(state['assets'].items()):
-                assets.append(dict(name=name, size=len(data), digest=f'sha256:{digest_bytes(data)}'))
-            print(json.dumps(dict(assets=assets, immutable=state.get('immutable', False))))
-            return 0
-        raise AssertionError(path)
-    if argv[1:2] == ['release'] and len(argv) > 2:
-        action = argv[2]
-    else:
-        action = argv[1]
-    if action == 'view':
-        if not state.get('exists'):
-            sys.stderr.write('release not found\n')
-            return 1
-        print(json.dumps(dict(isDraft=state.get('draft', False), body=state.get('body', ''),
-                              assets=[{'name': name} for name in sorted(state['assets'])])))
-        return 0
-    if action == 'create':
-        state['exists'] = True
-        state['draft'] = '--draft=false' not in argv
-        if '--notes' in argv:
-            state['body'] = argv[argv.index('--notes') + 1]
-        save(state)
-        return 0
-    if argv[1:3] == ['release', 'upload']:
-        for arg in argv[3:]:
-            if arg.startswith('-') or arg == state['tag']:
-                continue
-            path = Path(arg)
-            state['assets'][path.name] = path.read_bytes()
-        save(state)
-        return 0
-    if action == 'download':
-        name = argv[argv.index('--pattern') + 1]
-        dest = Path(argv[argv.index('--dir') + 1])
-        (dest / name).write_bytes(state['assets'][name])
-        return 0
-    if action == 'edit':
-        if '--notes' in argv:
-            state['body'] = argv[argv.index('--notes') + 1]
-        save(state)
-        return 0
-    raise AssertionError(argv)
+def gh_handler(state, calls):
+    def runner(args, **kwargs):
+        command = list(args)
+        calls.append(command)
+        if command[:2] == ['git', 'merge-base']:
+            return subprocess.CompletedProcess(command, 0, '', '')
+        if command[:2] == ['git', 'rev-parse']:
+            if command[-1].endswith('^{commit}'):
+                return subprocess.CompletedProcess(command, 0, state.source, '')
+            if command[2] == 'HEAD':
+                return subprocess.CompletedProcess(command, 0, state.source, '')
+            return subprocess.CompletedProcess(command, 0, 'clean', '')
+        if command[0] == 'git' and command[1] == 'status':
+            return subprocess.CompletedProcess(command, 0, '', '')
+        require(command[0] == 'gh', 'unexpected command')
+        if command[1] == 'api':
+            path = command[2]
+            if path.endswith(f'/commits/{state.tag}'):
+                return subprocess.CompletedProcess(command, 0, json.dumps(dict(sha=state.source)), '')
+            if path.endswith(f'/releases/tags/{state.tag}'):
+                require(state.exists, 'release missing')
+                return subprocess.CompletedProcess(command, 0, state.api_payload(), '')
+            raise AssertionError(path)
+        action = command[2] if command[1] == 'release' else command[1]
+        if action == 'view':
+            if not state.exists:
+                return subprocess.CompletedProcess(command, 1, '', 'release not found')
+            return subprocess.CompletedProcess(command, 0, state.view_json(), '')
+        if action == 'create':
+            state.exists = True
+            state.draft = '--draft=false' not in command
+            if '--notes' in command:
+                state.body = command[command.index('--notes') + 1]
+            return subprocess.CompletedProcess(command, 0, '', '')
+        if action == 'upload':
+            for path in (Path(arg) for arg in command[3:] if not arg.startswith('-') and arg != state.tag):
+                state.uploads.append(path.name)
+                state.assets[path.name] = path.read_bytes()
+            return subprocess.CompletedProcess(command, 0, '', '')
+        if action == 'download':
+            name = command[command.index('--pattern') + 1]
+            destination = Path(command[command.index('--dir') + 1])
+            (destination / name).write_bytes(state.assets[name])
+            return subprocess.CompletedProcess(command, 0, '', '')
+        if action == 'edit':
+            if '--notes' in command:
+                state.body = command[command.index('--notes') + 1]
+            state.edits.append(command)
+            return subprocess.CompletedProcess(command, 0, '', '')
+        raise AssertionError(command)
 
+    def runner_output(*args, **kwargs):
+        return runner(args, **kwargs).stdout
 
-def git_main(argv):
-    state = load()
-    if argv[1] == 'merge-base':
-        return 0
-    if argv[1] == 'rev-parse':
-        target = argv[2] if len(argv) > 2 else ''
-        if target.endswith('^{commit}') or target == 'HEAD':
-            print(state['source'])
-            return 0
-        print('clean')
-        return 0
-    if argv[1] == 'status' and len(argv) > 2 and argv[2] == '--porcelain':
-        return 0
-    raise AssertionError(argv)
+    return runner, runner_output
 
 
 def main():
+    path = Path(os.environ['VIBEFACE_TEST_GH_STATE'])
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    state = FakeRelease(payload.pop('tag'), payload.pop('source'))
+    vars(state).update(payload)
+    state.assets = {name: base64.b64decode(data) for name, data in state.assets.items()}
     role = os.environ.get('VIBEFACE_TEST_TRANSPORT_ROLE') or Path(sys.argv[0]).name
-    argv = ['gh' if role == 'gh' else 'git', *sys.argv[1:]]
-    if role == 'gh':
-        raise SystemExit(gh_main(argv))
-    if role == 'git':
-        raise SystemExit(git_main(argv))
-    raise AssertionError(argv)
+    require(role in ('gh', 'git'), 'unexpected transport role')
+    result = gh_handler(state, [])[0]([role, *sys.argv[1:]])
+    payload = dict(vars(state), assets={name: base64.b64encode(data).decode('ascii') for name, data in state.assets.items()})
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

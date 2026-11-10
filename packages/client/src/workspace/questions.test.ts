@@ -124,8 +124,16 @@ test("only an open question waits on the person: a closed one is no count and no
 
 test("an approval card names the task its request holds and leaves the device this screen goes through unnamed", () => {
   const works = parseOpenWorks({ works: [
-    { work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
-    { work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
+    {
+      dispatcher: 'gateway', call_ref: 'dispatch',
+      continues: null, parent: null,
+      thread: null, phase: null,
+      work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
+    {
+      dispatcher: 'gateway', call_ref: 'dispatch',
+      continues: null, parent: null,
+      thread: null, phase: null,
+      work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
   ] })
   const bots = [{ bot_id: "bot", conversation_id: "chat" }]
   const [approval, question] = parseQuestions({ questions: [row("s1", 1, { about: { ...about, request_id: "r" } }), row("q1", 2)] })
@@ -157,7 +165,11 @@ test('question details keep labels as readable text', () => {
 })
 
 test("work approval belongs to an unfinished work in the same Bot, target device and session", () => {
-  const [work] = parseOpenWorks({ works: [{ work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s", resolved: { provider: "codex", model: null } }] })
+  const [work] = parseOpenWorks({ works: [{
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s", resolved: { provider: "codex", model: null } }] })
   const [approval] = parseQuestions({ questions: [row("approval", 2, { about: { ...about, request_id: "request" } })] })
   const input = { work, conversationId: "chat", questions: [approval], answered: {} }
   assert.equal(workApproval(input), approval)

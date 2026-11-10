@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from release import verify_build_info
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -491,12 +492,8 @@ def self_test():
     fixture[1]["message"]["observer"]["maximum_observed_interval_seconds"] = 0.3
     require(summarize(fixture)["status"] == "inconclusive", "A coarse observer cannot claim the 20 percent bound")
     fixture[1]["status"] = "failed"
-    try:
+    with TestCase().assertRaises(AssertionError, msg='Rejected or failed work cannot become a fast sample'):
         summarize(fixture)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError("Rejected or failed work cannot become a fast sample")
     require(process_stats({os.getpid(): "self-test"})[os.getpid()]["rss_bytes"] > 0,
             "The task process has a real OS RSS counter")
     print("PASS free network performance parser, range, threshold and OS counter checks; no Node or benchmark ran")

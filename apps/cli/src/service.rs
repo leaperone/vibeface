@@ -262,6 +262,7 @@ pub async fn run(options: Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mark_runnable;
     #[cfg(windows)]
     use std::ffi::OsStr;
     use vibeface_bridge::platform::privatefs;
@@ -286,19 +287,6 @@ mod tests {
             strip_verbatim_windows_path(r"\\?\Volume{fixture}\path"),
             r"\\?\Volume{fixture}\path"
         );
-    }
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
     }
 
     /// What `command` is expected to start to run the service script at `script`.

@@ -446,6 +446,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::model::{Eyes, Hue, Outline};
+    use crate::runtime::test_support::access as test_access;
     use crate::runtime::triage::tests::{bot, node, start_reply};
 
     #[tokio::test]
@@ -465,12 +466,8 @@ mod tests {
             face(Outline::Cloud, Eyes::Wide, 285)?,
             face(Outline::Bean, Eyes::Dot, 155)?,
         );
-        let client = |scope: Option<&str>| Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: scope.map(Into::into),
-            manager: None,
-        };
+        let client =
+            |scope: Option<&str>| test_access(network.clone(), true, scope.map(Into::into));
         let request =
             |scope: &str, version: Option<String>, avatar: Option<Avatar>| -> Result<Value> {
                 let signed = admin.attest(
@@ -634,27 +631,16 @@ mod tests {
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.membership_state().await?.genesis.network_id;
         let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-        let idle = Access {
-            network_id: network,
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "token".into(),
-            idle.clone(),
-            &attempt,
-            &trigger,
-            crate::providers::Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network, false, Some("c".into()));
         let live = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("token")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture(
+                "token",
+                idle.clone(),
+                &attempt,
+                &trigger,
+                crate::providers::Provider::Codex,
+            )
+            .await?;
         let created = node
             .tool(
                 live.clone(),

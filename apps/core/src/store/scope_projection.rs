@@ -178,12 +178,7 @@ fn target_from(
                         answers: Some(question),
                         ..
                     }) => Source::Question(question),
-                    Some(EventBody::MessagePosted {
-                        role: Role::User,
-                        attestation: Some(_),
-                        ..
-                    })
-                    | Some(EventBody::BotMessaged { .. }) => {
+                    Some(EventBody::BotMessaged { .. }) => {
                         return main_target_from(connection, network, &conversation);
                     }
                     Some(EventBody::MessagePosted {

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from runtime import component_info, regular, require
+from unittest import TestCase
 
 
 def quoted(value):
@@ -146,18 +147,10 @@ def self_test():
         assert 'X-Vibeface-Source "' + 'a' * 40 + '"' in result
         assert 'Content-Security-Policy "default-src \'self\'" always;' in result
         (web / '_shell.html').write_text('changed')
-        try:
+        with TestCase().assertRaises(ValueError, msg='changed published component accepted'):
             generate(component, 'app')
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('changed published component accepted')
-        try:
+        with TestCase().assertRaises(ValueError, msg='nginx header injection accepted'):
             quoted('header\ninjection')
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('nginx header injection accepted')
     print('static container configuration self-test passed')
 
 

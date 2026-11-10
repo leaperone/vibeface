@@ -117,43 +117,32 @@ Keep a backup of the Node data directory and its identity. This database needs o
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{SCHEMA_VERSION, Store};
+    use crate::store::{INITIAL_SCHEMA, SCHEMA_VERSION, Store};
 
-    const OLD_EPOCH1_SCHEMA: &str = include_str!("fixtures/epoch1_1c3f1463.sql");
-
-    fn init_epoch1_db(connection: &Connection, ddl: &str) -> rusqlite::Result<()> {
-        connection.execute_batch(ddl)?;
-        connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-        Ok(())
+    fn init_current_db(connection: &Connection) -> rusqlite::Result<()> {
+        connection.execute_batch(INITIAL_SCHEMA)?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)
     }
 
     #[test]
-    fn stale_epoch1_layout_refused_without_mutating_database_bytes() -> Result<()> {
+    fn missing_current_columns_are_refused_without_mutating_database_bytes() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-schema-guard-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
             let db = Connection::open(&path)?;
-            init_epoch1_db(&db, OLD_EPOCH1_SCHEMA)?;
+            init_current_db(&db)?;
+            db.execute_batch(
+                "ALTER TABLE messages RENAME COLUMN target TO missing_target;
+                 ALTER TABLE scheduler_jobs RENAME COLUMN scope TO missing_scope;",
+            )?;
             db.execute(
                 "INSERT INTO identity_meta(key,value) VALUES('device','test-device')",
                 [],
             )?;
         }
         let before = std::fs::read(&path)?;
-
-        let legacy = Connection::open(&path)?;
-        let err = legacy
-            .query_row("SELECT target FROM messages LIMIT 1", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("no such column"),
-            "stale layout used to pass open then fail queries"
-        );
-        drop(legacy);
 
         let open_result = Store::open(&path);
         assert!(open_result.is_err());
@@ -168,28 +157,19 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_additively_upgraded_current_shape_opens() -> Result<()> {
+    fn current_schema_allows_extra_user_tables() -> Result<()> {
         let store = Store::open(":memory:")?;
         drop(store);
 
         let dir = std::env::temp_dir().join(format!(
-            "vibeface-schema-guard-upgraded-{}",
+            "vibeface-schema-guard-current-{}",
             uuid::Uuid::new_v4()
         ));
         crate::config::private_dir(&dir)?;
         let path = dir.join("node.sqlite3");
         {
             let db = Connection::open(&path)?;
-            init_epoch1_db(&db, OLD_EPOCH1_SCHEMA)?;
-            db.execute_batch(
-                "ALTER TABLE messages ADD COLUMN target text NULL;
-                 ALTER TABLE scheduler_jobs ADD COLUMN scope text NOT NULL DEFAULT 'main';
-                 ALTER TABLE pending_events ADD COLUMN author text NOT NULL DEFAULT '';
-                 CREATE INDEX pending_events_author ON pending_events (network_id, author);
-                 CREATE TABLE workspace_projection (`network_id` text NOT NULL, `state` text NOT NULL, PRIMARY KEY (`network_id`));
-                 CREATE INDEX messages_replies ON messages (network_id, conversation_id, in_reply_to) WHERE in_reply_to IS NOT NULL;
-                 CREATE INDEX messages_steered ON messages (network_id, conversation_id, steered_into, rank) WHERE steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL;",
-            )?;
+            init_current_db(&db)?;
             db.execute("CREATE TABLE \"用户备注-1\" (note text NOT NULL)", [])?;
         }
         let store = Store::open(&path)?;

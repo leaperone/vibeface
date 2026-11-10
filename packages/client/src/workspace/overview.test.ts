@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import type { SessionScope } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks, workspaceActivities } from "./labels.ts"
+import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
@@ -37,8 +37,12 @@ test("the conversation parser keeps WorkProjection relation and phase fields", (
     dispatcher: parsed.works[0].dispatcher, call_ref: parsed.works[0].call_ref, parent: parsed.works[0].parent,
     continues: parsed.works[0].continues, thread: parsed.works[0].thread, phase: parsed.works[0].phase,
   }, { dispatcher: "gateway", call_ref: "dispatch-1", parent: "parent-work", continues: "continued-work", thread: "provider-thread", phase: "running" })
-  const old = parseOpenWorks({ works: [{ ...work(), dispatcher: undefined, call_ref: undefined, parent: undefined, continues: undefined, thread: undefined, phase: undefined }] })[0]
-  assert.equal(old?.parent, undefined, "older Nodes do not invent relations")
+  for (const key of ["dispatcher", "call_ref", "parent", "continues", "thread", "phase"]) {
+    assert.throws(() => parseOpenWorks({ works: [{ ...work(), [key]: undefined }] }), `${key} is present in every full work projection`)
+  }
+  const unrelated = work({ parent: null, continues: null, thread: null, phase: null })
+  assert.equal(unrelated.parent, null)
+  assert.equal(unrelated.phase, null)
 })
 
 test("the overview separates work, check, question and dispatch rows", () => {
@@ -206,32 +210,38 @@ test("unordered work snapshots retain terminal outcomes and leave ambiguous resu
   assert.equal(merged[0], running, "display reconciliation never rewrites complete request, output or causal fields")
 })
 
-test("overview task checks only fold into a visible unverified work on this conversation and device", () => {
+test("workspace activity checks keep their conversation and device boundaries", () => {
   const known = work({ kind: "task", state: "unverified", outcome: "unverified", target_node: "entry" })
   const nodes = [node("entry", true, true), node("worker")]
   const overview = parseWorkspaceOverview({ checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }, { check_id: "process-chat", conversation_id: known.conversation_id, trigger: "message:one" }] })
   assert.equal(overview.tasks[0]?.work_id, known.work_id)
   assert.deepEqual(overview.tasks[0]?.kind === "check" && overview.tasks[0].work_ids, [known.work_id])
-  const ids = (works: OpenWork[], available = nodes) => unrepresentedOverviewChecks(overview, works, available).map((check) => check.check_id)
+  const activities = (works: OpenWork[], available = nodes) => workspaceActivities({ works, nodes: available, overview, questions: [], checks: [], read: true, connected: true }).activities
+  const ids = (works: OpenWork[], available = nodes) => activities(works, available).flatMap((activity) => activity.kind === "attention" && "check_id" in activity.attention ? [activity.attention.check_id] : [])
   assert.deepEqual(ids([known]), ["process-chat"])
   assert.deepEqual(ids([]), ["process-work", "process-chat"], "a bounded-out work cannot hide the only available check")
   assert.deepEqual(ids([{ ...known, conversation_id: "other-chat" }]), ["process-work", "process-chat"])
   assert.deepEqual(ids([{ ...known, target_node: "worker" }]), ["process-work", "process-chat"])
-  assert.deepEqual(ids([known], []), ["process-work", "process-chat"], "the check device must be known, not guessed")
+  const unidentified = activities([known], []).find((activity) => activity.kind === "work")
+  assert.deepEqual(unidentified?.facts.overviewChecks.map((check) => check.check_id), ["process-work"], "an unconfirmed device retains its process observation on the work")
+  assert.equal(unidentified?.state, "awaiting_confirmation")
   assert.deepEqual(ids([work({ ...known, state: "running", outcome: null })]), ["process-work", "process-chat"], "an active task does not replace a separate process check")
   const bounded = parseWorkspaceOverview({ tasks: [{ ...known, kind: "task" }], checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }] })
-  assert.deepEqual(unrepresentedOverviewChecks(bounded, openWorksFromOverview(bounded, []), nodes), [], "an overview-only unverified work also represents its local task check")
+  const observed = workspaceActivities({ overview: bounded, works: openWorksFromOverview(bounded, []), nodes, questions: [], checks: [], read: true, connected: true })
+  assert.equal(observed.activities.filter((activity) => activity.kind === "attention").length, 0, "an overview-only unverified work also represents its local task check")
+  assert.deepEqual(observed.activities[0]?.facts.overviewChecks.map((check) => check.check_id), ["process-work"])
 })
 
 test("bounded check identities use the complete known Bot catalog without changing the received snapshot", () => {
   const bots = Array.from({ length: 257 }, (_, index) => bot(`chat-${index + 1}`))
   const overview = parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: "only-check", conversation_id: "chat-257", trigger: "message:one" }], truncated: true })
-  const checks = unrepresentedOverviewChecks(overview, [], [], bots)
+  const checksFor = (knownBots: typeof bots) => workspaceActivities({ overview, works: [], nodes: [], knownBots, questions: [], checks: [], read: true, connected: true }).activities.flatMap((activity) => activity.kind === "attention" && "check_id" in activity.attention && "bot" in activity.attention ? [activity.attention] : [])
+  const checks = checksFor(bots)
   assert.deepEqual(checks[0]?.bot, bots[256])
   assert.deepEqual(checks[0]?.navigation, { bot_id: "bot-chat-257", conversation_id: "chat-257" })
   assert.equal(overview.tasks[0]?.bot, null, "the bounded snapshot remains the actual received observation")
-  assert.equal(unrepresentedOverviewChecks(overview, [], [], bots.slice(0, 256))[0]?.bot, null)
-  assert.equal(unrepresentedOverviewChecks(overview, [], [], [bot("other-chat", "bot-chat-257")])[0]?.navigation, null, "identity is matched by conversation, never by a coincident Bot id")
+  assert.equal(checksFor(bots.slice(0, 256))[0]?.bot, null)
+  assert.equal(checksFor([bot("other-chat", "bot-chat-257")])[0]?.navigation, null, "identity is matched by conversation, never by a coincident Bot id")
 })
 
 test("workspace activities attach approval facts, keep task checks with work, and leave other turns separate", () => {

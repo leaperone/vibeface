@@ -1,23 +1,15 @@
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, readdir, readlink, unlink, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
-import { join, relative, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
+import { execFile } from 'node:child_process';
+import { readFile, writeFile } from 'node:fs/promises';
+import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
 import { expect } from 'e2e';
+import { bundleManifest as nativeBundleManifest, nativeFixture, record, text } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/native/workspace');
 const execute = promisify(execFile);
-function record(value: unknown): Record<string, unknown> {
-  assert(value !== null && typeof value === 'object' && !Array.isArray(value), 'Expected fixture JSON');
-  return Object.fromEntries(Object.entries(value));
-}
-function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
 function rows(value: unknown) { assert(Array.isArray(value)); return value.map(record); }
 type NativeWorkspace = {
   gates: { main: string; taskA: string; channel: string };
@@ -25,56 +17,7 @@ type NativeWorkspace = {
 };
 const test = base.extend<{ network: NativeWorkspace }>({
   network: async ({}, use) => {
-    const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
-    assert(binary && crypto, 'Native workspace acceptance needs the current Node and matching WASM');
-    await mkdir(artifacts, { recursive: true, mode: 0o700 });
-    for (const name of ['acceptance.json', 'cleanup.json']) {
-      await unlink(resolve(artifacts, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    }
-    const invitation = process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt');
-    const inside = relative(artifacts, resolve(invitation));
-    assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Only this task can receive an invitation');
-    await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    const listener = createServer();
-    await new Promise<void>((done, fail) => { listener.once('error', fail); listener.listen(0, '127.0.0.1', done); });
-    const address = listener.address();
-    assert(address && typeof address === 'object');
-    await new Promise<void>((done, fail) => listener.close(error => error ? fail(error) : done()));
-    const args = [resolve(root, 'scripts/verify-node.py'), '--e2e-fixture', '--fixture-kind', 'workspace',
-      '--fixture-port', String(address.port), '--binary', binary, '--crypto-module', crypto, '--artifacts', artifacts];
-    if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
-    const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
-    const log = createWriteStream(resolve(artifacts, `fixture-${randomUUID()}.log`), { flags: 'wx', mode: 0o600 });
-    child.stderr.pipe(log);
-    let pending: { resolve(value: Record<string, unknown>): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | null = null;
-    const wait = () => new Promise<Record<string, unknown>>((resolveValue, reject) => {
-      assert(!pending, 'The fixture accepts one operation at a time');
-      const timer = setTimeout(() => { pending = null; reject(new Error('Workspace fixture operation timed out')); }, 45000);
-      pending = { resolve: resolveValue, reject, timer };
-    });
-    const fail = (error: Error) => { if (pending) { clearTimeout(pending.timer); pending.reject(error); pending = null; } };
-    child.once('error', fail);
-    child.once('exit', () => fail(new Error('Workspace fixture stopped before its request completed')));
-    const ready = wait();
-    createInterface({ input: child.stdout }).on('line', line => {
-      const current = pending;
-      if (!current) return;
-      pending = null; clearTimeout(current.timer);
-      try {
-        assert(line.length <= 65536, 'Fixture JSON is bounded');
-        const value = record(JSON.parse(line));
-        assert('ready' in value || value.ok === true, 'The controlled fixture operation succeeds');
-        current.resolve(record(value.ready ?? value.result));
-      } catch { current.reject(new Error('Invalid workspace fixture response')); }
-    });
-    const call = async (request: Record<string, unknown>) => {
-      const result = wait();
-      child.stdin.write(`${JSON.stringify(request)}\n`);
-      return result;
-    };
-    const cancelPending = () => { if (pending) { clearTimeout(pending.timer); pending = null; } };
-    try {
-      const fixture = await ready;
+    await nativeFixture('workspace', artifacts, async ({ fixture, invitation, call }) => {
       const source = record(record(fixture.nodes).source), url = new URL(text(source.url));
       assert(url.protocol === 'http:' && url.hostname === '127.0.0.1', 'The native app connects only to this isolated Node');
       const gate = (name: string) => {
@@ -85,37 +28,12 @@ const test = base.extend<{ network: NativeWorkspace }>({
       };
       await call({ op: 'workspace_native_setup', invitation_file: invitation });
       await use({ gates: { main: gate('main'), taskA: gate('taskA'), channel: gate('channel') }, call });
-    } finally {
-      cancelPending();
-      child.stdin.end();
-      const exited = (timeout: number) => new Promise<boolean>(done => {
-        if (child.exitCode !== null || child.signalCode !== null) return done(true);
-        const ended = () => { clearTimeout(timer); done(true); };
-        const timer = setTimeout(() => { child.removeListener('exit', ended); done(false); }, timeout);
-        child.once('exit', ended);
-      });
-      if (!await exited(30000)) {
-        child.kill('SIGTERM');
-        if (!await exited(30000)) { child.kill('SIGKILL'); await exited(5000); }
-      }
-      log.end();
-      await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
-      assert.equal(child.exitCode, 0, 'The fixture stops its own Node and controlled CLI');
-      await writeFile(resolve(artifacts, 'cleanup.json'), `${JSON.stringify({ fixture_stopped: true })}\n`, { mode: 0o600 });
-    }
+    });
   },
 });
 
 async function bundleManifest(directory: string): Promise<Record<string, string>> {
-  const files: Record<string, string> = {};
-  async function visit(path: string): Promise<void> {
-    for (const entry of (await readdir(path, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-      const file = join(path, entry.name), name = relative(directory, file);
-      if (entry.isDirectory()) await visit(file);
-      else files[name] = entry.isSymbolicLink() ? `link:${await readlink(file)}` : createHash('sha256').update(await readFile(file)).digest('hex');
-    }
-  }
-  await visit(directory);
+  const files = await nativeBundleManifest(directory);
   assert(Object.keys(files).some(name => name.endsWith('.jsbundle')), 'Acceptance uses packaged native JavaScript');
   return files;
 }

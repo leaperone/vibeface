@@ -437,9 +437,7 @@ fn authorize_cause(connection: &Connection, view: &AuthorizationView, event: &Ev
         let Some(parent) = event_from(connection, network, parent)? else {
             continue;
         };
-        let signed_request = matches!(&parent.body, EventBody::MessagePosted {
-                message_id, role: Role::User, answers: None, attestation: Some(_), ..
-            } | EventBody::InputPosted {
+        let signed_request = matches!(&parent.body, EventBody::InputPosted {
                 message_id, target: crate::workspace::InputTarget::BotMain { .. },
                 attestation: Some(_), ..
             } if *message_id == cause.message_id)
