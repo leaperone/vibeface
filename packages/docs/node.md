@@ -227,9 +227,9 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 ### 官方公共节点
 
-官方公共节点是一台不加入任何个人网络的普通 Node，域名 `node.vibeface.dev` 只是指向 `8.217.72.118` 的 DNS-only A 记录，没有代理。它是全网的默认 bootstrap 节点，同时在全网记录里宣告 `relay` 和 `gateway` 角色，各有上限：
+官方公共节点是一台不加入任何个人网络的普通 Node，域名 `node.vibeface.dev` 只是指向 `84.54.3.78` 的 DNS-only A 记录，没有代理。它是全网的默认 bootstrap 节点，同时在全网记录里宣告 `relay` 和 `gateway` 角色，各有上限：
 
-- **Bootstrap 节点**：UDP `8.217.72.118:4792`。它的设备编号、地址和 relay 固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
+- **Bootstrap 节点**：UDP `84.54.3.78:4792`。它的设备编号、地址和 relay 固定在仓库的 `config/public-bootstrap.json`，Core 编入同一文件。
 - **开放 relay**：`http://node.vibeface.dev:3340`，显式开放，不要求令牌；每个连接每秒最多上行 16 KiB，同时最多 128 个连接，同一来源地址（IPv6 按 /56 计）最多 8 个；整台 relay 的出口另限 500 kbit/s。
 - **浏览器接入**：`https://node.vibeface.dev:4792`，即 `config/public-bootstrap.json` 的 `gateway_url`。`https://app.vibeface.dev` 只提供静态网页，网页里的 `/api/client`、`/api/info` 和 `/api/decision` 直接连这个地址，它的 `allowed_origins` 包含 App 的 origin。这个端口只接受 TLS，证书是 Let's Encrypt 签给这个域名的证书，由宿主续期后写进数据目录，Node 不重启就换用新证书。浏览器直连，限额按 TCP 对端地址计。它把浏览器会话转发给任何设备，同时转发 32 个，另有 192 个排队，同一浏览器地址最多保持 8 个连接，每个会话每秒最多 256 KiB。
 
@@ -500,7 +500,7 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 `init` 和首次直接启动把官方公共节点写成默认 bootstrap 节点，地址由 `config/public-bootstrap.json` 的 `issuer`、`udp_host`、`udp_port` 和 `relay_url` 生成：
 
 ```text
-vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3340
+vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:3340
 ```
 
 表保存在数据目录的 `mesh.sqlite3`。重启后先用旧表里的 Node 入网，bootstrap 节点不可达也能回到全网。任何在表里的 Node 都能当入网起点，官方公共节点只是默认值。
