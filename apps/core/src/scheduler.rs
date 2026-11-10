@@ -1811,23 +1811,20 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             } => {
                 let speaker = if *role == Role::User { "用户" } else { "Bot" };
                 lines.push(format!("{speaker}：{}", prefix(text, 280)));
-                match answers {
-                    Some(question_id) => {
-                        let asked = events.iter().find_map(|event| match &event.event.body {
-                            EventBody::QuestionAsked {
-                                question_id: id,
-                                text,
-                                ..
-                            } if id == question_id => Some(prefix(text, 200)),
-                            _ => None,
-                        });
-                        decisions.push(format!(
-                            "用户回答问题 {question_id}（{}）：{}",
-                            asked.unwrap_or("问题在更早的记录里"),
-                            prefix(text, 300)
-                        ));
-                    }
-                    None => {}
+                if let Some(question_id) = answers {
+                    let asked = events.iter().find_map(|event| match &event.event.body {
+                        EventBody::QuestionAsked {
+                            question_id: id,
+                            text,
+                            ..
+                        } if id == question_id => Some(prefix(text, 200)),
+                        _ => None,
+                    });
+                    decisions.push(format!(
+                        "用户回答问题 {question_id}（{}）：{}",
+                        asked.unwrap_or("问题在更早的记录里"),
+                        prefix(text, 300)
+                    ));
                 }
             }
             EventBody::BotMessaged { from, text, .. } => {
