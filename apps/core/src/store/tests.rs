@@ -313,6 +313,107 @@ fn work_spec(local: &DeviceId, trigger: &str, call_ref: &str, provider: Provider
     }
 }
 
+fn start_work(
+    store: &mut Store,
+    net: &Net,
+    author: &LocalIdentity,
+    work_id: &str,
+    thread: (&str, i64),
+    turn: (&str, i64),
+) -> Result<()> {
+    store.apply_work_signal(
+        author,
+        &net.network,
+        work_id,
+        Signal::ThreadCreated(thread.0.into()),
+        thread.1,
+    )?;
+    store.apply_work_signal(
+        author,
+        &net.network,
+        work_id,
+        Signal::TurnStarted {
+            turn_id: turn.0.into(),
+            epoch: 1,
+        },
+        turn.1,
+    )?;
+    Ok(())
+}
+
+fn complete_work(
+    store: &mut Store,
+    net: &Net,
+    author: &LocalIdentity,
+    work_id: &str,
+    turn: &str,
+    text: &str,
+    at: i64,
+) -> Result<Option<crate::scheduling::AdmissionReceipt>> {
+    Ok(store
+        .apply_work_signal(
+            author,
+            &net.network,
+            work_id,
+            Signal::TurnCompleted {
+                turn_id: turn.into(),
+                status: vibeface_bridge::turn::TurnStatus::Completed,
+                text: text.into(),
+                error: None,
+            },
+            at,
+        )?
+        .1)
+}
+
+fn task_state(store: &Store, net: &Net, id: &str) -> Result<crate::workspace::TaskState> {
+    Ok(store.workspace_task(&net.network, id)?.unwrap().state)
+}
+
+fn assignment_state(
+    store: &Store,
+    net: &Net,
+    id: &str,
+) -> Result<crate::workspace::AssignmentState> {
+    Ok(store.workspace_assignment(&net.network, id)?.unwrap().state)
+}
+
+fn adopt_initial_assignment(
+    store: &mut Store,
+    net: &Net,
+    author: &LocalIdentity,
+    assignment_id: &str,
+    source: String,
+    accepted: (&str, i64),
+    adopted: (&str, i64),
+) -> Result<()> {
+    use crate::workspace::{AssignmentState, WorkspaceCommand};
+    for ((command_id, at), state, input_event) in [
+        (accepted, AssignmentState::Accepted, None),
+        (adopted, AssignmentState::Adopted, Some(source)),
+    ] {
+        store.apply_workspace_command(
+            author,
+            &net.network,
+            command_id,
+            WorkspaceCommand::AssignmentProgress {
+                execution: None,
+                assignment_id: assignment_id.into(),
+                revision: 1,
+                state,
+                input_event,
+                evidence_event: None,
+                result: None,
+            },
+            None,
+            None,
+            None,
+            at,
+        )?;
+    }
+    Ok(())
+}
+
 fn user(net: &Net, id: &str, text: &str) -> EventBody {
     signed_user(net, id, text, true).expect("fixture client signs")
 }
@@ -1571,35 +1672,8 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         "the same work ID into another thread is a different request"
     );
     let id = spec.work_id.clone();
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::ThreadCreated("t".into()),
-        5,
-    )?;
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::TurnStarted {
-            turn_id: "u".into(),
-            epoch: 1,
-        },
-        6,
-    )?;
-    let (_, receipt) = store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &id,
-        Signal::TurnCompleted {
-            turn_id: "u".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "done".into(),
-            error: None,
-        },
-        9,
-    )?;
+    start_work(&mut store, &net, &net.a, &id, ("t", 5), ("u", 6))?;
+    let receipt = complete_work(&mut store, &net, &net.a, &id, "u", "done", 9)?;
     assert!(receipt.is_some());
     let job = store
         .scheduler_job("c", &work_trigger(&id))?
@@ -1965,18 +2039,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         "a device that can report is waited for"
     );
     settle(true)?.context("the settled result reports back")?;
-    let (_, receipt) = store.apply_work_signal(
-        &net.a,
-        &net.network,
-        &running.work_id,
-        Signal::TurnCompleted {
-            turn_id: "tu".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "late".into(),
-            error: None,
-        },
-        15,
-    )?;
+    let receipt = complete_work(&mut store, &net, &net.a, &running.work_id, "tu", "late", 15)?;
     assert!(receipt.is_none(), "a late result does not report twice");
     assert_eq!(
         outcome(&store, &running.work_id)?,
@@ -6030,22 +6093,13 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
         origin.trigger_input_target(&net.network, "c", "assignment:missing")?,
         None
     );
-    origin.apply_work_signal(
+    start_work(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
         &derived.work_id,
-        Signal::ThreadCreated("assignment-native-thread".into()),
-        8,
-    )?;
-    origin.apply_work_signal(
-        &net.a,
-        &net.network,
-        &derived.work_id,
-        Signal::TurnStarted {
-            turn_id: "assignment-native-turn".into(),
-            epoch: 1,
-        },
-        9,
+        ("assignment-native-thread", 8),
+        ("assignment-native-turn", 9),
     )?;
     assert_eq!(
         origin.native_input_target(&net.network, "c", "assignment-native-thread", "")?,
@@ -6111,22 +6165,13 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
             ..main_work.clone()
         };
         origin.accept_work_fixture(&net.a, &net.network, work.clone(), 10)?;
-        origin.apply_work_signal(
+        start_work(
+            &mut origin,
+            &net,
             &net.a,
-            &net.network,
             &work.work_id,
-            Signal::ThreadCreated("main-native-thread".into()),
-            11,
-        )?;
-        origin.apply_work_signal(
-            &net.a,
-            &net.network,
-            &work.work_id,
-            Signal::TurnStarted {
-                turn_id: format!("main-native-turn-{index}"),
-                epoch: 1,
-            },
-            12,
+            ("main-native-thread", 11),
+            (&format!("main-native-turn-{index}"), 12),
         )?;
         assert_eq!(
             origin.native_input_target(
@@ -6173,22 +6218,13 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
         ..main_work.clone()
     };
     origin.accept_work_fixture(&net.a, &net.network, conflicting.clone(), 10)?;
-    origin.apply_work_signal(
+    start_work(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
         &conflicting.work_id,
-        Signal::ThreadCreated("assignment-native-thread".into()),
-        11,
-    )?;
-    origin.apply_work_signal(
-        &net.a,
-        &net.network,
-        &conflicting.work_id,
-        Signal::TurnStarted {
-            turn_id: "conflicting-native-turn".into(),
-            epoch: 1,
-        },
-        12,
+        ("assignment-native-thread", 11),
+        ("conflicting-native-turn", 12),
     )?;
     assert!(
         origin
@@ -9606,18 +9642,7 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
         },
         14,
     )?;
-    store.apply_work_signal(
-        &net.a,
-        &net.network,
-        "w1",
-        Signal::TurnCompleted {
-            turn_id: "u-b".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "done".into(),
-            error: None,
-        },
-        15,
-    )?;
+    complete_work(&mut store, &net, &net.a, "w1", "u-b", "done", 15)?;
     assert!(on(&store, "t-a")?.is_empty());
     assert!(
         on(&store, "t-b")?.is_empty(),
@@ -13294,38 +13319,26 @@ fn workspace_signed_commands_inputs_and_task_history_are_scoped_and_idempotent()
             ..work_spec(&net.a.device_id()?, &trigger, call_ref, Provider::Codex)
         };
         origin.accept_work_fixture(&net.a, &net.network, work.clone(), 19)?;
-        origin.apply_work_signal(
+        start_work(
+            &mut origin,
+            &net,
             &net.a,
-            &net.network,
             &work.work_id,
-            Signal::ThreadCreated(format!("{call_ref}-thread")),
-            20,
-        )?;
-        origin.apply_work_signal(
-            &net.a,
-            &net.network,
-            &work.work_id,
-            Signal::TurnStarted {
-                turn_id: format!("{call_ref}-turn"),
-                epoch: 1,
-            },
-            21,
+            (&format!("{call_ref}-thread"), 20),
+            (&format!("{call_ref}-turn"), 21),
         )?;
         works.push(work);
     }
     for ended in [false, true] {
         if ended {
             for work in &works {
-                origin.apply_work_signal(
+                complete_work(
+                    &mut origin,
+                    &net,
                     &net.a,
-                    &net.network,
                     &work.work_id,
-                    Signal::TurnCompleted {
-                        turn_id: format!("{}-turn", work.call_ref),
-                        status: vibeface_bridge::turn::TurnStatus::Completed,
-                        text: format!("{} result", work.call_ref),
-                        error: None,
-                    },
+                    &format!("{}-turn", work.call_ref),
+                    &format!("{} result", work.call_ref),
                     22,
                 )?;
             }
@@ -13672,10 +13685,7 @@ fn workspace_dependencies_reply_depth_and_automatic_dispatch_are_bounded() -> Re
         assert_eq!(result.is_ok(), index < 8, "{result:?}");
     }
     assert_eq!(
-        origin
-            .workspace_task(&net.network, "parallel8")?
-            .unwrap()
-            .state,
+        task_state(&origin, &net, "parallel8")?,
         TaskState::WaitingUser
     );
     Ok(())
@@ -13762,10 +13772,7 @@ fn workspace_old_revision_results_and_unknown_assignments_do_not_release_current
         None,
         10,
     )?;
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::UpdatePending
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::UpdatePending);
     let (_, other) = workspace_assigned_task_fixture(
         &net,
         &mut origin,
@@ -13794,7 +13801,7 @@ fn workspace_old_revision_results_and_unknown_assignments_do_not_release_current
         14,
     )?;
     assert_eq!(
-        origin.workspace_task(&net.network, "task2")?.unwrap().state,
+        task_state(&origin, &net, "task2")?,
         TaskState::NeedsReconciliation
     );
     assert!(
@@ -13856,31 +13863,14 @@ fn workspace_revision_submission_waits_for_real_completion_evidence() -> Result<
             result,
         }
     };
-    origin.apply_workspace_command(
+    adopt_initial_assignment(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
-        "accepted",
-        command(1, AssignmentState::Accepted, None, None, None),
-        None,
-        None,
-        None,
-        6,
-    )?;
-    origin.apply_workspace_command(
-        &net.a,
-        &net.network,
-        "adopt-r1",
-        command(
-            1,
-            AssignmentState::Adopted,
-            Some(initial.source_event),
-            None,
-            None,
-        ),
-        None,
-        None,
-        None,
-        7,
+        &assignment.assignment_id,
+        initial.source_event,
+        ("accepted", 6),
+        ("adopt-r1", 7),
     )?;
     workspace_command_fixture(
         &net,
@@ -13941,10 +13931,7 @@ fn workspace_revision_submission_waits_for_real_completion_evidence() -> Result<
     assert_eq!(pending.state, AssignmentState::Adopted);
     assert_eq!(pending.submitted_result.as_ref().unwrap().revision, 2);
     assert!(pending.result.is_none());
-    assert_ne!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::Completed
-    );
+    assert_ne!(task_state(&origin, &net, "task")?, TaskState::Completed);
     assert!(
         origin
             .workspace_resource_conflicts(
@@ -13984,10 +13971,7 @@ fn workspace_revision_submission_waits_for_real_completion_evidence() -> Result<
         .unwrap();
     assert_eq!(completed.result.as_deref(), Some("actual final result"));
     assert_eq!(completed.completed_revision, Some(2));
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::Completed
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::Completed);
     Ok(())
 }
 
@@ -14041,17 +14025,11 @@ fn workspace_attached_running_work_does_not_imply_task_revision_adoption() -> Re
         .unwrap();
     origin.settle_workspace_work_assignment(&net.a, &net.network, &assignment, 7)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, "attached-assignment")?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, "attached-assignment")?,
         AssignmentState::Proposed
     );
     assert_eq!(
-        origin
-            .workspace_task(&net.network, "attached")?
-            .unwrap()
-            .state,
+        task_state(&origin, &net, "attached")?,
         TaskState::NotStarted
     );
     origin.apply_work_signal(
@@ -14063,10 +14041,7 @@ fn workspace_attached_running_work_does_not_imply_task_revision_adoption() -> Re
     )?;
     origin.settle_workspace_work_assignment(&net.a, &net.network, &assignment, 9)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, "attached-assignment")?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, "attached-assignment")?,
         AssignmentState::Proposed,
         "a native locator is not an accepted turn"
     );
@@ -14091,16 +14066,13 @@ fn workspace_attached_running_work_does_not_imply_task_revision_adoption() -> Re
             .scheduler_job("c", "assignment:attached-assignment")?
             .is_none()
     );
-    origin.apply_work_signal(
+    complete_work(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
         &work_id,
-        Signal::TurnCompleted {
-            turn_id: "turn".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "original work finished".into(),
-            error: None,
-        },
+        "turn",
+        "original work finished",
         12,
     )?;
     origin.settle_workspace_work_assignment(&net.a, &net.network, &accepted, 13)?;
@@ -14179,25 +14151,14 @@ fn workspace_concurrent_old_completion_is_preserved_after_a_new_revision() -> Re
         evidence_event,
         result: None,
     };
-    b.apply_workspace_command(
+    adopt_initial_assignment(
+        &mut b,
+        &net,
         &net.b,
-        &net.network,
-        "accepted-b",
-        progress(AssignmentState::Accepted, None, None),
-        None,
-        None,
-        None,
-        7,
-    )?;
-    b.apply_workspace_command(
-        &net.b,
-        &net.network,
-        "adopted-b",
-        progress(AssignmentState::Adopted, Some(assignment.event_hash), None),
-        None,
-        None,
-        None,
-        8,
+        "assignment-b",
+        assignment.event_hash,
+        ("accepted-b", 7),
+        ("adopted-b", 8),
     )?;
     workspace_command_fixture(
         &net,
@@ -14266,25 +14227,14 @@ fn workspace_assignment_work_proof_is_frozen_and_requires_current_adoption() -> 
         evidence_event: None,
         result: None,
     };
-    origin.apply_workspace_command(
+    adopt_initial_assignment(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
-        "accepted",
-        progress(1, AssignmentState::Accepted, None),
-        None,
-        None,
-        None,
-        6,
-    )?;
-    origin.apply_workspace_command(
-        &net.a,
-        &net.network,
-        "adopt-r1",
-        progress(1, AssignmentState::Adopted, Some(input.source_event)),
-        None,
-        None,
-        None,
-        7,
+        &assignment.assignment_id,
+        input.source_event,
+        ("accepted", 6),
+        ("adopt-r1", 7),
     )?;
     let local = net.a.device_id()?;
     assert!(workspace::assignment_work_allowed_from(
@@ -14643,41 +14593,14 @@ fn workspace_active_input_fences_removed_channel_members_without_invalidating_ol
     let assignment = origin
         .ensure_workspace_assignment(&net.a, &net.network, "channel-task", &[], 8)?
         .unwrap();
-    origin.apply_workspace_command(
+    adopt_initial_assignment(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
-        "channel-accepted",
-        WorkspaceCommand::AssignmentProgress {
-            execution: None,
-            assignment_id: assignment.assignment_id.clone(),
-            revision: 1,
-            state: AssignmentState::Accepted,
-            input_event: None,
-            evidence_event: None,
-            result: None,
-        },
-        None,
-        None,
-        None,
-        9,
-    )?;
-    origin.apply_workspace_command(
-        &net.a,
-        &net.network,
-        "channel-adopted",
-        WorkspaceCommand::AssignmentProgress {
-            execution: None,
-            assignment_id: assignment.assignment_id.clone(),
-            revision: 1,
-            state: AssignmentState::Adopted,
-            input_event: Some(input.source_event),
-            evidence_event: None,
-            result: None,
-        },
-        None,
-        None,
-        None,
-        10,
+        &assignment.assignment_id,
+        input.source_event,
+        ("channel-accepted", 9),
+        ("channel-adopted", 10),
     )?;
     let (revision, refs) = workspace::assignment_work_source_from(
         &origin.connection,
@@ -14825,10 +14748,7 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
         "c"
     )?);
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &original.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &original.assignment_id)?,
         AssignmentState::Stopped
     );
     let (net, mut uncertain) = workspace_fixture()?;
@@ -14856,10 +14776,7 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
     )?;
     uncertain.started_workspace_assignment(&net.a, &net.network, &job, 6)?;
     assert_eq!(
-        uncertain
-            .workspace_assignment(&net.network, &inflight.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&uncertain, &net, &inflight.assignment_id)?,
         AssignmentState::Proposed
     );
     workspace_command_fixture(
@@ -15074,10 +14991,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
         .scheduler_job("c", &message_trigger("initial"))?
         .context("queued job")?;
     origin.started_workspace_assignment(&net.a, &net.network, &queued, 6)?;
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::NotStarted
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::NotStarted);
     let claimed = origin
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "workspace-start")?
         .context("claimed job")?
@@ -15087,10 +15001,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     origin.mark_started("c", &claimed.trigger, &attempt)?;
     origin.started_workspace_assignment(&net.a, &net.network, &claimed, 8)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &assignment.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &assignment.assignment_id)?,
         AssignmentState::Proposed
     );
     origin.update_turn_runtime(
@@ -15102,10 +15013,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     )?;
     origin.settle_workspace_assignment(&net.a, &net.network, &claimed, 9)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &assignment.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &assignment.assignment_id)?,
         AssignmentState::Proposed,
         "an in-flight native start has no accepted turn yet"
     );
@@ -15125,10 +15033,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
     assert_eq!(started.adopted_revision, Some(1));
     assert!(started.completed_revision.is_none());
     assert!(started.result.is_none());
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::Running
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::Running);
     let recorded = origin.version_vector(&net.network)?;
     origin.started_workspace_assignment(&net.a, &net.network, &claimed, 11)?;
     assert_eq!(
@@ -15163,10 +15068,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
         .unwrap();
     assert_eq!(unchanged.started_revision, 1);
     assert_eq!(unchanged.adopted_revision, Some(1));
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::UpdatePending
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::UpdatePending);
     let completed = origin.finish_job(
         &net.a,
         &net.network,
@@ -15185,10 +15087,7 @@ fn workspace_lifecycle_waits_for_native_start_and_keeps_revision_adoption_explic
             .completed_revision,
         Some(1)
     );
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::UpdatePending
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::UpdatePending);
     Ok(())
 }
 
@@ -15546,22 +15445,13 @@ fn workspace_remote_assignment_waits_for_the_target_nodes_ordinary_work_root() -
         },
         5,
     )?;
-    b.apply_work_signal(
+    start_work(
+        &mut b,
+        &net,
         &net.b,
-        &net.network,
         &work_id,
-        Signal::ThreadCreated("ordinary-thread".into()),
-        6,
-    )?;
-    b.apply_work_signal(
-        &net.b,
-        &net.network,
-        &work_id,
-        Signal::TurnStarted {
-            turn_id: "ordinary-turn".into(),
-            epoch: 1,
-        },
-        7,
+        ("ordinary-thread", 6),
+        ("ordinary-turn", 7),
     )?;
     sync(&b, &mut a, &net)?;
     workspace_command_fixture(
@@ -15630,18 +15520,7 @@ fn workspace_remote_assignment_waits_for_the_target_nodes_ordinary_work_root() -
             .state,
         JobState::Queued
     );
-    b.apply_work_signal(
-        &net.b,
-        &net.network,
-        &work_id,
-        Signal::TurnCompleted {
-            turn_id: "ordinary-turn".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "done".into(),
-            error: None,
-        },
-        10,
-    )?;
+    complete_work(&mut b, &net, &net.b, &work_id, "ordinary-turn", "done", 10)?;
     assert!(workspace::assignment_resources_available_from(
         &b.connection,
         &net.network,
@@ -16123,10 +16002,7 @@ fn workspace_task_answer_keeps_the_assignment_from_the_signed_question_basis() -
     )?;
     origin.settle_workspace_assignment(&net.a, &net.network, &completed, 10)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &first.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &first.assignment_id)?,
         AssignmentState::Adopted,
         "the accepted answer still needs its own result before the allocation can finish"
     );
@@ -16343,10 +16219,7 @@ fn workspace_release_retries_only_a_shared_proven_startup_failure_on_the_origina
         "an explicit retry keeps the old failed reply as history"
     );
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &assignment.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &assignment.assignment_id)?,
         AssignmentState::Proposed
     );
     assert_eq!(
@@ -16359,10 +16232,7 @@ fn workspace_release_retries_only_a_shared_proven_startup_failure_on_the_origina
     );
     sync(&origin, &mut replica, &net)?;
     assert_eq!(
-        replica
-            .workspace_assignment(&net.network, &assignment.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&replica, &net, &assignment.assignment_id)?,
         AssignmentState::Proposed
     );
     assert!(
@@ -16394,10 +16264,7 @@ fn workspace_release_retries_only_a_shared_proven_startup_failure_on_the_origina
         12,
     )?;
     origin.settle_workspace_assignment(&net.a, &net.network, &completed, 13)?;
-    assert_eq!(
-        origin.workspace_task(&net.network, "task")?.unwrap().state,
-        TaskState::Completed
-    );
+    assert_eq!(task_state(&origin, &net, "task")?, TaskState::Completed);
     assert_eq!(
         origin
             .message(&net.network, "c", &failed.message_id)?
@@ -16550,10 +16417,7 @@ fn workspace_release_does_not_infer_no_start_or_undo_a_user_stop() -> Result<()>
         assert!(!origin.workspace_command_recorded(&net.network, "forbidden-retry")?);
         assert_eq!(origin.version_vector(&net.network)?, before);
         assert_eq!(
-            origin
-                .workspace_assignment(&net.network, &assignment.assignment_id)?
-                .unwrap()
-                .state,
+            assignment_state(&origin, &net, &assignment.assignment_id)?,
             AssignmentState::Stopped
         );
         assert_eq!(
@@ -16665,16 +16529,13 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
                 .is_err()
         );
         assert!(!origin.work_native_submission_reserved(&waiting.work_id)?);
-        origin.apply_work_signal(
+        complete_work(
+            &mut origin,
+            &net,
             &net.a,
-            &net.network,
             &winner.work_id,
-            Signal::TurnCompleted {
-                turn_id: "winner-turn".into(),
-                status: vibeface_bridge::turn::TurnStatus::Completed,
-                text: "done".into(),
-                error: None,
-            },
+            "winner-turn",
+            "done",
             6,
         )?;
         assert!(origin.reserve_work_native_submission(
@@ -16689,7 +16550,6 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
 
 #[test]
 fn assignment_works_reserve_overlapping_directories_individually() -> Result<()> {
-    use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
     let (input, assignment) = workspace_assigned_task_fixture(
         &net,
@@ -16700,34 +16560,15 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
         &["/workspace".into()],
         3,
     )?;
-    for (command_id, state, input_event, at) in [
-        ("accepted", AssignmentState::Accepted, None, 6),
-        (
-            "adopted",
-            AssignmentState::Adopted,
-            Some(input.source_event),
-            7,
-        ),
-    ] {
-        origin.apply_workspace_command(
-            &net.a,
-            &net.network,
-            command_id,
-            WorkspaceCommand::AssignmentProgress {
-                execution: None,
-                assignment_id: assignment.assignment_id.clone(),
-                revision: 1,
-                state,
-                input_event,
-                evidence_event: None,
-                result: None,
-            },
-            None,
-            None,
-            None,
-            at,
-        )?;
-    }
+    adopt_initial_assignment(
+        &mut origin,
+        &net,
+        &net.a,
+        &assignment.assignment_id,
+        input.source_event,
+        ("accepted", 6),
+        ("adopted", 7),
+    )?;
     let assignment = origin
         .workspace_assignment(&net.network, &assignment.assignment_id)?
         .context("adopted assignment")?;
@@ -16791,16 +16632,13 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
             &assignment
         )?);
     }
-    origin.apply_work_signal(
+    complete_work(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
         &winner.work_id,
-        Signal::TurnCompleted {
-            turn_id: "winner-turn".into(),
-            status: vibeface_bridge::turn::TurnStatus::Completed,
-            text: "done".into(),
-            error: None,
-        },
+        "winner-turn",
+        "done",
         11,
     )?;
     assert!(origin.reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)?);
@@ -17238,14 +17076,11 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
         let mut earlier = vec![parent];
         if !work_first || reports {
             assert_eq!(
-                origin
-                    .workspace_assignment(&net.network, &assignment.assignment_id)?
-                    .unwrap()
-                    .state,
+                assignment_state(&origin, &net, &assignment.assignment_id)?,
                 AssignmentState::Adopted
             );
             assert_eq!(
-                origin.workspace_task(&net.network, "task")?.unwrap().state,
+                task_state(&origin, &net, "task")?,
                 TaskState::Running
             );
         }
@@ -17350,7 +17185,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
             );
             assert!(pending.result.is_none());
             assert_eq!(
-                origin.workspace_task(&net.network, "task")?.unwrap().state,
+                task_state(&origin, &net, "task")?,
                 TaskState::Running
             );
             assert_eq!(
@@ -17378,7 +17213,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 pending
             );
             assert_eq!(
-                pending_replica.workspace_task(&net.network, "task")?.unwrap().state,
+                task_state(&pending_replica, &net, "task")?,
                 TaskState::Running
             );
             assert!(pending_replica.scheduler_jobs_all()?.is_empty());
@@ -17417,10 +17252,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                         .is_none()
                 );
                 assert_eq!(
-                    origin
-                        .workspace_assignment(&net.network, &assignment.assignment_id)?
-                        .unwrap()
-                        .state,
+                    assignment_state(&origin, &net, &assignment.assignment_id)?,
                     AssignmentState::Adopted
                 );
                 assert!(
@@ -17441,10 +17273,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 origin.settle_workspace_assignment(&net.a, &net.network, job, 21)?;
             }
             assert_eq!(
-                origin
-                    .workspace_assignment(&net.network, &assignment.assignment_id)?
-                    .unwrap()
-                    .state,
+                assignment_state(&origin, &net, &assignment.assignment_id)?,
                 AssignmentState::Adopted
             );
             let result = workspace_started_job_fixture(&net, &mut origin, 22)?;
@@ -17504,22 +17333,19 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 origin.settle_workspace_assignment(&net.a, &net.network, job, 26)?;
             }
             assert_eq!(
-                origin
-                    .workspace_assignment(&net.network, &assignment.assignment_id)?
-                    .unwrap()
-                    .state,
+                assignment_state(&origin, &net, &assignment.assignment_id)?,
                 AssignmentState::Adopted,
                 "an older completed reply cannot steal the final settlement"
             );
             let final_job = if answer_last {
                 origin.settle_workspace_assignment(&net.a, &net.network, &summarized, 27)?;
-                assert_eq!(origin.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap().state, AssignmentState::Adopted);
+                assert_eq!(assignment_state(&origin, &net, &assignment.assignment_id)?, AssignmentState::Adopted);
                 let answer = workspace_started_job_fixture(&net, &mut origin, 28)?;
                 assert_eq!(answer.kind, TriggerKind::Answer);
                 let answered = origin.finish_job(&net.a, &net.network, "c", &answer.trigger,
                     &answer.state.attempt().unwrap().id, JobOutcome::Completed, "answer final summary", 29)?;
                 origin.settle_workspace_assignment(&net.a, &net.network, &summarized, 30)?;
-                assert_eq!(origin.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap().state, AssignmentState::Adopted);
+                assert_eq!(assignment_state(&origin, &net, &assignment.assignment_id)?, AssignmentState::Adopted);
                 answered
             } else {
                 summarized
@@ -17532,7 +17358,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 assert_eq!(final_assignment.adopted_revision, Some(1));
                 assert!(final_assignment.completed_revision.is_none());
                 assert_eq!(
-                    origin.workspace_task(&net.network, "task")?.unwrap().state,
+                    task_state(&origin, &net, "task")?,
                     TaskState::UpdatePending
                 );
                 assert!(
@@ -17577,7 +17403,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
         assert_eq!(final_assignment.state, AssignmentState::Completed);
         assert_eq!(final_assignment.completed_revision, Some(1));
         assert_eq!(
-            origin.workspace_task(&net.network, "task")?.unwrap().state,
+            task_state(&origin, &net, "task")?,
             TaskState::Completed
         );
         let mut replica = store(&net)?;
@@ -17678,10 +17504,7 @@ fn an_owner_freezes_a_partial_dag_followup_to_its_first_assignment() -> Result<(
     )?;
     origin.settle_workspace_assignment(&net.a, &net.network, &ended, 9)?;
     assert_eq!(
-        origin
-            .workspace_assignment(&net.network, &first.assignment_id)?
-            .unwrap()
-            .state,
+        assignment_state(&origin, &net, &first.assignment_id)?,
         AssignmentState::Adopted
     );
     let proof = origin
@@ -17792,22 +17615,13 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
         )
     };
     origin.accept_work_fixture(&net.a, &net.network, writer.clone(), 4)?;
-    origin.apply_work_signal(
+    start_work(
+        &mut origin,
+        &net,
         &net.a,
-        &net.network,
         &writer.work_id,
-        Signal::ThreadCreated("writer-thread".into()),
-        5,
-    )?;
-    origin.apply_work_signal(
-        &net.a,
-        &net.network,
-        &writer.work_id,
-        Signal::TurnStarted {
-            turn_id: "writer-turn".into(),
-            epoch: 1,
-        },
-        6,
+        ("writer-thread", 5),
+        ("writer-turn", 6),
     )?;
     let mut task = workspace_task_command("waiting", None);
     if let WorkspaceCommand::CreateTask { owner_bot, .. } = &mut task {
@@ -18077,10 +17891,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
         )?;
         origin.settle_workspace_assignment(&net.a, &net.network, &ended, 22 + index as i64)?;
         assert_eq!(
-            origin
-                .workspace_assignment(&net.network, &assignment.assignment_id)?
-                .unwrap()
-                .state,
+            assignment_state(&origin, &net, &assignment.assignment_id)?,
             if index == 0 {
                 AssignmentState::Adopted
             } else {
@@ -18238,9 +18049,7 @@ fn waiting_inputs_do_not_borrow_a_replacement_after_the_owner_returns() -> Resul
             )?;
             b.settle_workspace_assignment(&net.b, &net.network, &ended, 9)?;
             assert_eq!(
-                b.workspace_assignment(&net.network, &first.assignment_id)?
-                    .unwrap()
-                    .state,
+                assignment_state(&b, &net, &first.assignment_id)?,
                 AssignmentState::Completed
             );
             Some(first)
