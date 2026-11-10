@@ -515,6 +515,7 @@ mod tests {
             network: format!("relay-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
             bootstrap: vec![],
             allow_private: true,
+            advertise: vec![],
         };
         let config = |mesh| NetworkConfig {
             bind: Some("127.0.0.1:0".parse().unwrap()),

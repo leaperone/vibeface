@@ -445,9 +445,17 @@ impl Runtime {
                 return Ok(());
             }
             Err(error) => {
-                tracing::debug!(%remote, "refused a connection from a non-member");
+                tracing::debug!(%remote, error = %format!("{error:#}"), "refused a connection from a non-member");
                 connection.close(1u32.into(), b"not a member Node of this personal network");
-                return Err(error);
+                // Refusing a device outside the personal network is the answer, not a failure.
+                let outsider = !self.has_membership().await?
+                    || self
+                        .membership_state()
+                        .await?
+                        .project()?
+                        .node(&remote)
+                        .is_err();
+                return if outsider { Ok(()) } else { Err(error) };
             }
         };
         self.close_when_removed(connection.clone(), remote.clone());

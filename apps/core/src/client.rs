@@ -2600,6 +2600,7 @@ mod tests {
             network: "join-test".into(),
             bootstrap,
             allow_private: true,
+            advertise: vec![],
         };
         // An ordinary Node the others join the mesh through.
         let service = Arc::new(

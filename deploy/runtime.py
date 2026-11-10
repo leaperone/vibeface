@@ -214,7 +214,7 @@ def self_test():
                               'relay_open': True, 'relay_operator_token': None, 'relay_rate': 16384,
                               'relay_max_clients': 128, 'relay_max_clients_per_ip': 8,
                               'mesh': {'enabled': True, 'network': 'vibeface', 'bootstrap': [],
-                                       'allow_private': False}}}
+                                       'allow_private': False, 'advertise': ['203.0.113.7:4792']}}}
         (data / 'config.json').write_text(json.dumps(config))
         env = {'VIBEFACE_ROLE': 'node', 'VIBEFACE_LISTEN': config['listen'],
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',

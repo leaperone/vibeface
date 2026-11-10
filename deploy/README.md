@@ -56,9 +56,12 @@ vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --t
   --relay-open --relay-rate 16384 --relay-max-clients 128 --relay-max-clients-per-ip 8 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
+vibeface config set --data-dir /opt/apps/vibeface-node/state mesh.advertise '["8.217.72.118:4792"]'
 touch /opt/apps/vibeface-node/state/node.lock
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
+
+容器里看不到宿主公网 IP，`mesh.advertise`（即 `network.mesh.advertise`）写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。已部署的节点在容器里执行 `vibeface config set --data-dir /data mesh.advertise '["8.217.72.118:4792"]'` 后重启容器。
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 

@@ -5453,7 +5453,7 @@ def public_node_acceptance(options):
         nodes.append(m)
         configured = json.loads((m.directory / "config.json").read_text())["network"]
         require(configured["mesh"] == {"enabled": True, "network": mesh, "bootstrap": [p.mesh_address],
-                                       "allow_private": False} and configured["relays"] == [],
+                                       "allow_private": False, "advertise": []} and configured["relays"] == [],
                 "M configures nothing but P as its bootstrap node")
         m.configure_mesh(mesh, [p.mesh_address])
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
@@ -5698,7 +5698,8 @@ def mesh_acceptance(options):
         nodes.append(node)
         node_cli(node, "config", "set", "mesh.allow_private", "true")
         mesh = json.loads((node.directory / "config.json").read_text())["network"]["mesh"]
-        require(mesh == {"enabled": True, "network": network, "bootstrap": list(bootstrap), "allow_private": True},
+        require(mesh == {"enabled": True, "network": network, "bootstrap": list(bootstrap), "allow_private": True,
+                         "advertise": []},
                 f"{name}: init joins the named mesh through exactly its bootstrap nodes")
         return node
 

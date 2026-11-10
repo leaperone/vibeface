@@ -153,7 +153,8 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
 }
 
 /// `vibeface config set`: the running Node saves it under its config lock; a stopped one's
-/// file is edited here. Either way it takes effect when the Node starts.
+/// file is edited here. Either way it takes effect when the Node starts, so a running one
+/// reports `restart_required`.
 async fn config_set(data_dir: &Path, key: &str, value: Value) -> Result<Value> {
     validate_data_dir(data_dir)?;
     let data_dir = fs::canonicalize(data_dir)
@@ -166,7 +167,7 @@ async fn config_set(data_dir: &Path, key: &str, value: Value) -> Result<Value> {
         }
         Err(error) => return Err(error),
     };
-    Ok(json!({"running":running}))
+    Ok(json!({"running":running,"restart_required":running}))
 }
 
 /// The socket is missing or refuses: the Node is not running.
