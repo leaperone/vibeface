@@ -76,7 +76,7 @@ jobs:
   ios:
     if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -95,49 +95,70 @@ jobs:
           node-version: '24'
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
+      # The app embeds no commit, so a rerun or an unrelated change reuses the app built from the
+      # same inputs, Xcode image and Rust toolchain instead of spending its build again.
+      - name: Key the simulator app by its inputs
+        id: app
+        run: echo "key=ios-simulator-app-$ImageOS-$ImageVersion-$( (rustc -V; node -v) | shasum -a 256 | cut -c1-16)-${{ hashFiles('apps/mobile/**', 'packages/**', '!packages/docs/**', 'crates/**', 'config/**', 'package.json', 'pnpm-workspace.yaml', 'Cargo.toml', 'Cargo.lock', 'pnpm-lock.yaml', 'scripts/build-mobile-secure.sh', '!**/node_modules/**') }}" >> "$GITHUB_OUTPUT"
+      - name: Restore the simulator app built from the same inputs
+        id: app_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app
+          key: ${{ steps.app.outputs.key }}
       - run: pnpm install --frozen-lockfile
-      - run: scripts/build-mobile-secure.sh ios
+      - if: steps.app_cache.outputs.cache-hit != 'true'
+        run: scripts/build-mobile-secure.sh ios
       - name: Build the simulator app
+        if: steps.app_cache.outputs.cache-hit != 'true'
         working-directory: apps/mobile
         run: |
-          mkdir -p ../../.artifacts/native
           npx expo prebuild --platform ios
           xcodebuild -workspace ios/Vibeface.xcworkspace -scheme Vibeface -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
             -derivedDataPath ../../.artifacts/native/ios-build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build
+          # Only an app built from the committed sources, including the regenerated bindings, may be cached.
+          test -z "$(git status --porcelain --untracked-files=normal)"
+      - name: Save the simulator app for the same inputs
+        if: steps.app_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app
+          key: ${{ steps.app.outputs.key }}
+      - name: Package the simulator app
+        run: |
+          mkdir -p .artifacts/native
           # Ad-hoc signing writes the simulator entitlements into the binary; without them the Keychain refuses SecureStore.
-          otool -l ../../.artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app/Vibeface | grep -q "sectname __entitlements"
-          cd ../../.artifacts/native/ios-build/Build/Products/Release-iphonesimulator
+          otool -l .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app/Vibeface | grep -q "sectname __entitlements"
+          cd .artifacts/native/ios-build/Build/Products/Release-iphonesimulator
           zip -qry "$GITHUB_WORKSPACE/.artifacts/native/vibeface-ios-simulator.zip" Vibeface.app
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vibeface-ios-simulator-${{ github.sha }}
           path: .artifacts/native/vibeface-ios-simulator.zip
           if-no-files-found: error
-      - name: Build the same-source host Node and browser cryptography
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
+      # Booting the simulator before the host build overlaps its remaining startup work with the build
+      # instead of the UI run. The runner's own Spotlight indexing only adds load.
+      - name: Sample runner load until the job ends
         run: |
-          umask 077
-          mkdir -p .artifacts/native/private
-          chmod 700 .artifacts/native .artifacts/native/private
-          printf '%s\n' host-source > .artifacts/native/private/stage.txt
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          test -z "$(git status --porcelain --untracked-files=normal)"
-          test "$(uname -m)" = arm64
-          printf '%s\n' host-build > .artifacts/native/private/stage.txt
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
-          bash scripts/build-web-crypto.sh
-          bash scripts/build-web.sh
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
-          .artifacts/native/target/release/vibeface --version
-          .artifacts/native/target/release/vibeface-core --version
+          sudo mdutil -a -i off > /dev/null || true
+          nohup scripts/ci-runner-load.sh > .artifacts/native/runner-load.log 2>&1 &
+      - name: Install simslim
+        run: |
+          mkdir -p .artifacts/native/simslim
+          cd .artifacts/native/simslim
+          curl -fsSLo simslim.tar.gz https://github.com/MobAI-App/simslim/releases/download/v0.14.0/simslim-v0.14.0-macos-arm64.tar.gz
+          echo "a3db0de6f428f9f8fd5dff256b122f98791c138521dc1330d99643719d8fe9ff  simslim.tar.gz" | shasum -a 256 -c
+          tar -xzf simslim.tar.gz simslim
+          echo "SIMSLIM=$PWD/simslim" >> "$GITHUB_ENV"
       - name: Create the dedicated iOS Provider simulator
         env:
+          SIMSLIM_BOOT_TIMEOUT: 15m
+          SIMSLIM_SPAWN_TIMEOUT: 5m
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           umask 077
+          mkdir -p .artifacts/native/private
           python3 - <<'PY'
           import json, os, pathlib, platform, re, subprocess
           pathlib.Path(".artifacts/native/private/stage.txt").write_text("simulator-create\n")
@@ -161,9 +182,30 @@ jobs:
                                  "VIBEFACE_E2E_APP_DIR": str(pathlib.Path("apps/app/dist/client").resolve()),
                                  "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("apps/app/dist/client/vibeface_secure.js").resolve())}.items():
                   output.write(key + "=" + value + "\n")
-          subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
+          # Boots once, turns off the widget, search and other daemons the app does not use, then boots slim.
+          # Keeps photos, push, keychain, links, connectivity and assets that the app or its tests rely on.
+          subprocess.run([os.environ["SIMSLIM"], "on", simulator, "--except", "photos,store,icloud,web,connectivity,other,mdm"], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
           PY
+      - name: Build the same-source host Node and browser cryptography
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
+        run: |
+          umask 077
+          mkdir -p .artifacts/native/private
+          chmod 700 .artifacts/native .artifacts/native/private
+          printf '%s\n' host-source > .artifacts/native/private/stage.txt
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(uname -m)" = arm64
+          printf '%s\n' host-build > .artifacts/native/private/stage.txt
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          bash scripts/build-web-crypto.sh
+          bash scripts/build-web.sh
+          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
+          .artifacts/native/target/release/vibeface --version
+          .artifacts/native/target/release/vibeface-core --version
       - name: Prepare the task simulator's XCTest runner
         env:
           AGENT_DEVICE_HOME: ${{ github.workspace }}/.artifacts/native/agent-device
@@ -289,6 +331,9 @@ jobs:
           set -e
           echo "Native Provider e2e exit code: $result"
           exit "$result"
+      - name: Show runner load during the run
+        if: always()
+        run: cat .artifacts/native/runner-load.log 2>/dev/null || true
       - name: Remove only this task simulator and private acceptance state
         id: native_cleanup
         if: always()

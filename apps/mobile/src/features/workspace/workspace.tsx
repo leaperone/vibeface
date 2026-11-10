@@ -3,8 +3,8 @@ import { Link, Stack, router, useFocusEffect } from 'expo-router'
 import { BrainCircuit, ChevronRight, CircleQuestionMark, Clock, ListChecks, ListPlus, MessagesSquare, Plus, Reply, Settings, SlidersHorizontal, X } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useReducedMotion } from 'react-native-reanimated'
-import { Modal, Pressable, ScrollView, View } from 'react-native'
-import { KeyboardAvoidingView, KeyboardAwareScrollView, KeyboardController, KeyboardStickyView } from 'react-native-keyboard-controller'
+import { Modal, Platform, Pressable, ScrollView, View } from 'react-native'
+import { KeyboardAwareScrollView, KeyboardController, KeyboardStickyView } from 'react-native-keyboard-controller'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
@@ -151,10 +151,9 @@ export function InputLocation({ target, conversationId }: { target: InputTarget;
   return href ? <Link href={href} asChild><Button variant="ghost" className="self-start"><Text>{target.kind === 'task' || target.kind === 'channel_task' ? '打开所属任务' : target.kind === 'work' ? '打开所属工作' : target.kind === 'channel_member' ? '打开所属频道' : '打开所属 Bot'}</Text></Button></Link> : null
 }
 
-function InputQueue({ targets }: { targets: InputTarget[] }) {
+function InputQueue({ targets, editing, setEditing }: { targets: InputTarget[]; editing: string | null; setEditing: (id: string | null) => void }) {
   const shared = useLive()
   const { busy, error, run } = useRun()
-  const [editing, setEditing] = useState<string | null>(null)
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<NonNullable<PendingMessage['attachments']>>([])
   const queued = (shared?.workspaceState?.inputs ?? []).filter((item) => item.deferred && !item.cancelled && targets.some((target) => sameTarget(item.input.target, target))).sort((left, right) => left.effective_order - right.effective_order)
@@ -178,6 +177,8 @@ function InputQueue({ targets }: { targets: InputTarget[] }) {
 
 export function InputOptions({ label, options, selected, onSelect, intent, onIntent, pending }: { label: string; options: TargetOption[]; selected: string; onSelect: (option: TargetOption) => void; intent: InputIntent; onIntent: (intent: InputIntent) => void; pending: PendingMessage[] }) {
   const [open, setOpen] = useState(false)
+  // Lifted from the queue so a swipe cannot close the sheet over an unsaved edit.
+  const [editing, setEditing] = useState<string | null>(null)
   const shared = useLive()
   const [scopeContext, setScopeContext] = useState<ScopeContext | null>(null)
   const [contextError, setContextError] = useState('')
@@ -192,13 +193,13 @@ export function InputOptions({ label, options, selected, onSelect, intent, onInt
     <Icon as={shown} className={intent === 'continue' ? 'text-muted-foreground' : 'text-foreground'} />
     {pending.length ? <View className="absolute end-1 top-1 size-2 rounded-full bg-warning" /> : null}
   </Button>
-    <Modal transparent visible={open} animationType={reducedMotion ? 'none' : 'slide'} onRequestClose={() => setOpen(false)}><KeyboardAvoidingView behavior="height" automaticOffset style={{ flex: 1 }}><View className="flex-1 justify-end bg-black/30"><Pressable className="flex-1" onPress={() => setOpen(false)} accessibilityRole="button" accessibilityLabel="关闭目标和队列" /><View testID="input-options-sheet" accessibilityViewIsModal className="max-h-[80%] rounded-t-2xl bg-background px-4 pt-4" style={{ paddingBottom: insets.bottom + 16 }}><View className="mb-3 flex-row items-center"><Text role="heading" className="flex-1 text-heading font-semibold">目标和队列</Text><Button variant="ghost" size="icon" accessibilityLabel="关闭目标和队列" onPress={() => setOpen(false)}><Icon as={X} /></Button></View><KeyboardAwareScrollView bottomOffset={16} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 pb-4"><View className="gap-2"><Text className="text-meta font-medium">发送给</Text>{options.map((option) => <Button key={option.key} variant={selected === option.key ? 'default' : 'outline'} accessibilityState={{ selected: selected === option.key }} onPress={() => onSelect(option)}><Text className="shrink">{option.label}</Text></Button>)}</View><View className="gap-2"><Text className="text-meta font-medium">发送方式</Text>{intents.map((item) => <Button key={item.value} variant={intent === item.value ? 'default' : 'outline'} accessibilityState={{ selected: intent === item.value }} onPress={() => { onIntent(item.value); setOpen(false) }}><Text>{item.label}</Text></Button>)}</View><Button variant="outline" disabled={!shared || contextBusy} onPress={() => {
+    <Modal visible={open} presentationStyle="pageSheet" allowSwipeDismissal={!editing} animationType={reducedMotion ? 'none' : 'slide'} onRequestClose={() => { if (!editing) setOpen(false) }}>{/* Android ignores pageSheet and draws this full screen under the status bar. */}<View testID="input-options-sheet" accessibilityViewIsModal className="flex-1 bg-background px-4" style={{ paddingTop: (Platform.OS === 'android' ? insets.top : 0) + 16, paddingBottom: insets.bottom + 16 }}><View className="mb-3 flex-row items-center"><Text role="heading" className="flex-1 text-heading font-semibold">目标和队列</Text><Button variant="ghost" size="icon" accessibilityLabel="关闭目标和队列" onPress={() => setOpen(false)}><Icon as={X} /></Button></View><ScrollView automaticallyAdjustKeyboardInsets keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 pb-4"><View className="gap-2"><Text className="text-meta font-medium">发送给</Text>{options.map((option) => <Button key={option.key} variant={selected === option.key ? 'default' : 'outline'} accessibilityState={{ selected: selected === option.key }} onPress={() => onSelect(option)}><Text className="shrink">{option.label}</Text></Button>)}</View><View className="gap-2"><Text className="text-meta font-medium">发送方式</Text>{intents.map((item) => <Button key={item.value} variant={intent === item.value ? 'default' : 'outline'} accessibilityState={{ selected: intent === item.value }} onPress={() => { onIntent(item.value); setOpen(false) }}><Text>{item.label}</Text></Button>)}</View><Button variant="outline" disabled={!shared || contextBusy} onPress={() => {
       const option = options.find((item) => item.key === selected)
       if (!option || !shared) return
       const ticket = ++contextRead.current
       setContextBusy(true); setScopeContext(null); setContextError('')
       void shared.readScopeContext({ target: option.target }).then((value) => { if (ticket === contextRead.current) setScopeContext(value) }, (cause) => { if (ticket === contextRead.current) setContextError(messageOf(cause)) }).finally(() => { if (ticket === contextRead.current) setContextBusy(false) })
-    }}><Icon as={BrainCircuit} /><Text>{contextBusy ? '正在查询目标上下文' : '查看目标上下文'}</Text></Button>{contextError ? <ErrorText error={contextError} /> : null}{scopeContext?.available ? <ScopeSources context={scopeContext.context} /> : scopeContext ? <Text className="text-meta text-muted-foreground">{scopeContext.reason || '这个目标尚无已编译的上下文。'}</Text> : null}<InputQueue targets={options.map((option) => option.target)} /><View className="gap-2"><Text role="heading" className="text-meta font-medium">已保存输入</Text>{pending.length ? pending.map((item) => <View key={item.message_id} className="gap-2"><Text numberOfLines={3} className="text-meta">{item.text}</Text><InputStatus pending={item} /></View>) : <Text className="text-meta text-muted-foreground">没有待确认的本地输入。</Text>}</View></KeyboardAwareScrollView></View></View></KeyboardAvoidingView></Modal>
+    }}><Icon as={BrainCircuit} /><Text>{contextBusy ? '正在查询目标上下文' : '查看目标上下文'}</Text></Button>{contextError ? <ErrorText error={contextError} /> : null}{scopeContext?.available ? <ScopeSources context={scopeContext.context} /> : scopeContext ? <Text className="text-meta text-muted-foreground">{scopeContext.reason || '这个目标尚无已编译的上下文。'}</Text> : null}<InputQueue targets={options.map((option) => option.target)} editing={editing} setEditing={setEditing} /><View className="gap-2"><Text role="heading" className="text-meta font-medium">已保存输入</Text>{pending.length ? pending.map((item) => <View key={item.message_id} className="gap-2"><Text numberOfLines={3} className="text-meta">{item.text}</Text><InputStatus pending={item} /></View>) : <Text className="text-meta text-muted-foreground">没有待确认的本地输入。</Text>}</View></ScrollView></View></Modal>
   </>
 }
 

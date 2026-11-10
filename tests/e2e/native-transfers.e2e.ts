@@ -443,10 +443,22 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
   expect((await inspect()).total_invocations).toBe(1);
   const cancel = optionsSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
-  const deferredScroll = device.locator('role=scroll-area').filter({ has: cancel });
+  // `has` searches inside each pane, so it takes a root locator that is not limited to visible elements;
+  // the button can still be below the fold.
+  const deferredScroll = device.locator('role=scroll-area').filter({
+    has: screen.getByRole('button', '取消稍后输入', { exact: true }),
+  });
   await expect(deferredScroll).toHaveCount(1);
   await deferredScroll.scrollUntilVisible(cancel, { direction: 'down' });
   await expect(cancel).toBeEnabled();
+  let previousCancelBounds = '';
+  await expect.poll(async () => {
+    const bounds = await cancel.boundingBox(), pane = await deferredScroll.boundingBox();
+    assert(bounds && pane, 'Deferred Cancel and its scroll pane expose bounds');
+    const observed = JSON.stringify([bounds, pane]), stable = observed === previousCancelBounds;
+    previousCancelBounds = observed;
+    return stable && bounds.x >= pane.x && bounds.y >= pane.y && bounds.x + bounds.width <= pane.x + pane.width && bounds.y + bounds.height <= pane.y + pane.height;
+  }).toBe(true);
   await cancel.click();
   await expect.poll(async () => (await inspect()).deferred_input).toEqual({
     message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: true,
