@@ -3054,12 +3054,14 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
+    use crate::runtime::test_support::{
+        access as test_access, initialize_node, manager_settings, signed_main_input,
+    };
     use crate::{
         config::Config,
         crypto::LocalIdentity,
         identity::Member,
-        model::{ResolvedModel, Role, VersionVector},
+        model::{ResolvedModel, VersionVector},
     };
     use std::{collections::BTreeMap, sync::atomic::Ordering};
     use vibeface_bridge::failure::FailureKind;
@@ -6165,33 +6167,15 @@ pub(super) mod tests {
         boot: &str,
     ) -> Result<(String, String)> {
         let network = node.network_id().await?;
-        let posted = admin.attest(
-            &network,
-            scope,
-            EventBody::MessagePosted {
-                message_id: id.into(),
-                role: crate::model::Role::User,
-                text: id.into(),
-                attachments: vec![],
-                report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
-                attestation: None,
-                failure: None,
-            },
-        )?;
-        let signed = posted.attestation().cloned().context("signed")?;
         let mut store = node.store.lock().await;
-        store.accept_message(
+        let sequence = match store.workspace_input(&network, id)? {
+            Some(existing) => existing.input.route.sequence,
+            None => store.messages(&network, scope)?.len() as u64 + 1,
+        };
+        store.post_input_fixture(
             &node.identity,
             &network,
-            scope,
-            id,
-            id,
-            vec![],
-            true,
-            signed,
+            signed_main_input(admin, &network, scope, id, id, vec![], sequence)?,
             now_ms(),
         )?;
         let claimed = store
@@ -6238,7 +6222,8 @@ pub(super) mod tests {
             assert_eq!(node.codex.server(), "system");
             let mut foreign_attempt = String::new();
             for (scope, server) in [("c", "own:"), ("d", "system")] {
-                let (trigger, attempt) = start_reply_in(&node, &admin, scope, "m1").await?;
+                let (trigger, attempt) =
+                    start_reply_in(&node, &admin, scope, &format!("{scope}-m1")).await?;
                 if server == "own:" {
                     foreign_attempt = attempt.clone();
                 }
@@ -6287,7 +6272,7 @@ pub(super) mod tests {
             );
             let store = node.store.lock().await;
             let foreign = store
-                .scheduler_job("c", "message:m1")?
+                .scheduler_job("c", "message:c-m1")?
                 .context("foreign job")?;
             assert!(matches!(
                 foreign.state,
@@ -6296,7 +6281,7 @@ pub(super) mod tests {
             assert!(store.message(&network, "c", &foreign.message_id)?.is_none());
             assert!(matches!(
                 store
-                    .scheduler_job("d", "message:m1")?
+                    .scheduler_job("d", "message:d-m1")?
                     .context("local job")?
                     .state,
                 crate::scheduling::JobState::Completed { .. }
@@ -9006,31 +8991,18 @@ pub(super) mod tests {
                 bot(&node, &admin, "c", "Bot", &[]).await?;
                 let network = node.network_id().await?;
                 let trigger = if kind == "human" {
-                    let posted = admin.attest(
-                        &network,
-                        "c",
-                        EventBody::MessagePosted {
-                            message_id: "human".into(),
-                            role: Role::User,
-                            text: "controlled request".into(),
-                            attachments: vec![],
-                            report_results: Some(true),
-                            in_reply_to: None,
-                            status: None,
-                            failure: None,
-                            answers: None,
-                            attestation: None,
-                        },
-                    )?;
-                    node.store.lock().await.accept_message(
+                    node.store.lock().await.post_input_fixture(
                         &node.identity,
                         &network,
-                        "c",
-                        "human",
-                        "controlled request",
-                        vec![],
-                        true,
-                        posted.attestation().cloned().context("signature")?,
+                        signed_main_input(
+                            &admin,
+                            &network,
+                            "c",
+                            "human",
+                            "controlled request",
+                            vec![],
+                            1,
+                        )?,
                         now_ms(),
                     )?;
                     "message:human".into()

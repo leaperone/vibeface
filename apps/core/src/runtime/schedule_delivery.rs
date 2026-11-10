@@ -1318,7 +1318,9 @@ fn attachment_mime(name: &str, bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, manager_settings};
+    use crate::runtime::test_support::{
+        access as test_access, manager_settings, signed_main_input,
+    };
 
     #[tokio::test]
     async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {
@@ -1808,7 +1810,6 @@ mod tests {
     async fn stopping_an_unacknowledged_main_input_never_requeues_after_native_not_arrived()
     -> Result<()> {
         use crate::{
-            model::{EventBody, Role},
             runtime::triage::tests::{bot, node, scripted_app_server, start_reply},
             scheduling::{SessionScope, message_trigger},
         };
@@ -1828,12 +1829,7 @@ mod tests {
             let pending = {
                 let mut store = node.store.lock().await;
                 store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
-                let signed = admin.attest(&network, "c", EventBody::MessagePosted {
-                    message_id:"unacknowledged".into(), role:Role::User, text:"supplement".into(), attachments:vec![],
-                    report_results:Some(true), in_reply_to:None, status:None, answers:None, attestation:None, failure:None,
-                })?;
-                store.accept_message(&node.identity, &network, "c", "unacknowledged", "supplement", vec![], true,
-                    signed.attestation().cloned().context("input signature")?, now_ms())?;
+                store.post_input_fixture(&node.identity, &network, signed_main_input(&admin, &network, "c", "unacknowledged", "supplement", vec![], 2)?, now_ms())?;
                 let candidate = store.steer_candidates(&network, &local, "boot")?.into_iter()
                     .find(|candidate| candidate.message_id=="unacknowledged").context("Main steer candidate")?;
                 assert_eq!(candidate.scope, SessionScope::Main);

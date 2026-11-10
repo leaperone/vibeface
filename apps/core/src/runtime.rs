@@ -120,6 +120,34 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn signed_main_input(
+        admin: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        id: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        sequence: u64,
+    ) -> Result<EventBody> {
+        admin.attest(
+            network,
+            scope,
+            EventBody::InputPosted {
+                message_id: id.into(),
+                target: crate::workspace::InputTarget::BotMain {
+                    bot_id: scope.into(),
+                },
+                intent: crate::workspace::InputIntent::Continue,
+                sequence,
+                expected_revision: None,
+                text: text.into(),
+                attachments,
+                report_results: Some(true),
+                attestation: None,
+            },
+        )
+    }
+
     pub(crate) fn manager_settings(
         provider: Provider,
         workspace: PathBuf,

@@ -874,7 +874,7 @@ mod tests {
     use super::*;
     use crate::runtime::test_support::{
         access as test_access, initialize_node, join_network, manager_settings, open_node,
-        provider_work,
+        provider_work, signed_main_input,
     };
     use crate::{
         config::{self, Config},
@@ -1234,32 +1234,15 @@ mod tests {
             crate::scheduling::SchedulerJob,
             Arc<std::sync::Mutex<Shown>>,
         )> {
-            let event = admin.attest(
-                network,
-                "start-state",
-                crate::model::EventBody::MessagePosted {
-                    message_id: id.into(),
-                    role: crate::model::Role::User,
-                    text: id.into(),
-                    attachments: vec![],
-                    report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: None,
-                    failure: None,
-                },
-            )?;
             let mut store = node.store.lock().await;
-            store.accept_message(
+            let sequence = match store.workspace_input(network, id)? {
+                Some(existing) => existing.input.route.sequence,
+                None => store.messages(network, "start-state")?.len() as u64 + 1,
+            };
+            store.post_input_fixture(
                 &node.identity,
                 network,
-                "start-state",
-                id,
-                id,
-                vec![],
-                true,
-                event.attestation().cloned().context("signed message")?,
+                signed_main_input(admin, network, "start-state", id, id, vec![], sequence)?,
                 now_ms(),
             )?;
             let key = SessionKey {

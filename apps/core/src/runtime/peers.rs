@@ -2453,7 +2453,9 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
+    use crate::runtime::test_support::{
+        access as test_access, initialize_node, manager_settings, signed_main_input,
+    };
 
     use crate::{config, crypto::LocalIdentity};
 
@@ -2504,7 +2506,8 @@ mod tests {
                 let mut store = a.store.lock().await;
                 store.create_conversation(&entry, &network, "c", "Settlement",
                     entry.owner_fixture(&network, "c", &entry_id)?, now_ms())?;
-                store.append_event(&entry, &network, "c", posted(&entry, &network, "c", "m1")?, vec![], now_ms())?;
+                create_input_bot(&mut store, &entry, &entry.fixture_admin(), &network, "c", now_ms())?;
+                store.append_event(&entry, &network, "c", posted(&entry, &network, "c", "m1", 1)?, vec![], now_ms())?;
             }
             b.sync_peer(&network, &entry_id).await?;
             let spec = WorkSpec {
@@ -2725,23 +2728,26 @@ mod tests {
                     grant,
                     now_ms(),
                 )?;
+                create_input_bot(
+                    &mut store,
+                    &sender,
+                    &sender.fixture_admin(),
+                    &network,
+                    "c",
+                    now_ms(),
+                )?;
                 store.append_event(
                     &sender,
                     &network,
                     "c",
-                    posted(&sender, &network, "c", "peer-shutdown-input")?,
+                    posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
                     vec![],
                     now_ms(),
                 )?;
-                store.accept_message(
+                store.post_input_fixture(
                     &sender,
                     &network,
-                    "c",
-                    "peer-shutdown-input",
-                    "peer-shutdown-input",
-                    vec![],
-                    true,
-                    user(&sender, &network, "peer-shutdown-input")?,
+                    posted(&sender, &network, "c", "peer-shutdown-input", 1)?,
                     now_ms(),
                 )?;
                 let command =
@@ -2856,6 +2862,14 @@ mod tests {
                 for scope in ["slow", "active"] {
                     let grant = sender.owner_fixture(&network, scope, &owner_id)?;
                     store.create_conversation(&sender, &network, scope, scope, grant, now_ms())?;
+                    create_input_bot(
+                        &mut store,
+                        &sender,
+                        &sender.fixture_admin(),
+                        &network,
+                        scope,
+                        now_ms(),
+                    )?;
                 }
             }
             let initial = a
@@ -2864,41 +2878,25 @@ mod tests {
                 .await
                 .events_from(&network, &sender_id, 1, 10)?;
             r.store.lock().await.ingest_events(&network, &initial)?;
-            a.store.lock().await.accept_message(
+            a.store.lock().await.post_input_fixture(
                 &sender,
                 &network,
-                "slow",
-                "slow-input",
-                "slow-input",
-                vec![],
-                true,
-                posted(&sender, &network, "slow", "slow-input")?
-                    .attestation()
-                    .cloned()
-                    .context("attestation")?,
+                posted(&sender, &network, "slow", "slow-input", 1)?,
                 now_ms(),
             )?;
             let active = r.store.lock().await.append_event(
                 &owner,
                 &network,
                 "active",
-                posted(&sender, &network, "active", "active-input")?,
+                posted(&sender, &network, "active", "active-input", 1)?,
                 vec![],
                 now_ms(),
             )?;
             a.store.lock().await.ingest_events(&network, &[active])?;
-            a.store.lock().await.accept_message(
+            a.store.lock().await.post_input_fixture(
                 &sender,
                 &network,
-                "active",
-                "active-input",
-                "active-input",
-                vec![],
-                true,
-                posted(&sender, &network, "active", "active-input")?
-                    .attestation()
-                    .cloned()
-                    .context("attestation")?,
+                posted(&sender, &network, "active", "active-input", 1)?,
                 now_ms(),
             )?;
             assert!(r.store.lock().await.scheduler_jobs("active")?.is_empty());
@@ -3458,11 +3456,19 @@ mod tests {
                 let mut store = node.store.lock().await;
                 let grant = sender.owner_fixture(&network, "c", &sender_id)?;
                 store.create_conversation(&sender, &network, "c", "Task", grant, now_ms())?;
+                create_input_bot(
+                    &mut store,
+                    &sender,
+                    &sender.fixture_admin(),
+                    &network,
+                    "c",
+                    now_ms(),
+                )?;
                 store.append_event(
                     &sender,
                     &network,
                     "c",
-                    posted(&sender, &network, "c", "m1")?,
+                    posted(&sender, &network, "c", "m1", 1)?,
                     vec![],
                     now_ms(),
                 )?;
@@ -3646,39 +3652,6 @@ mod tests {
         result
     }
 
-    fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
-        user_with(identity, network, id, vec![])
-    }
-
-    fn user_with(
-        identity: &LocalIdentity,
-        network: &str,
-        id: &str,
-        attachments: Vec<Attachment>,
-    ) -> Result<Attestation> {
-        identity
-            .fixture_admin()
-            .attest(
-                network,
-                "c",
-                EventBody::MessagePosted {
-                    message_id: id.into(),
-                    role: Role::User,
-                    text: id.into(),
-                    attachments,
-                    report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: None,
-                    failure: None,
-                },
-            )?
-            .attestation()
-            .cloned()
-            .context("signed message")
-    }
-
     #[tokio::test]
     async fn diverged_logs_walk_back_to_the_fork_and_converge() -> Result<()> {
         use std::sync::Mutex;
@@ -3691,32 +3664,45 @@ mod tests {
             store.install_trust_bundle(&network, &state)?;
             Ok(store)
         };
-        let message = |id: &str| -> Result<EventBody> {
-            Ok(EventBody::MessagePosted {
-                message_id: id.into(),
-                role: Role::User,
-                text: id.into(),
-                attachments: vec![],
-                report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
-                attestation: Some(user(&ia, &network, id)?),
-                failure: None,
-            })
-        };
         let (mut p, mut q) = (replica()?, replica()?);
-        let created = EventBody::ConversationCreated { title: "t".into() };
-        let shared = vec![
-            p.append_event(&ix, &network, "c", created, vec![], 1)?,
-            p.append_event(&ix, &network, "c", message("x2")?, vec![], 2)?,
-        ];
-        for id in ["a3", "a4", "a5"] {
-            p.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        p.create_conversation(
+            &ix,
+            &network,
+            "c",
+            "t",
+            ia.owner_fixture(&network, "c", &author)?,
+            1,
+        )?;
+        create_input_bot(&mut p, &ix, &ia.fixture_admin(), &network, "c", 1)?;
+        p.append_event(
+            &ix,
+            &network,
+            "c",
+            posted(&ia, &network, "c", "x2", 1)?,
+            vec![],
+            2,
+        )?;
+        let shared = p.events_from(&network, &author, 1, 10)?;
+        for (index, id) in ["a3", "a4", "a5"].into_iter().enumerate() {
+            p.append_event(
+                &ix,
+                &network,
+                "c",
+                posted(&ia, &network, "c", id, index as u64 + 2)?,
+                vec![],
+                3,
+            )?;
         }
         q.ingest_events(&network, &shared)?;
-        for id in ["b3", "b4", "b5", "b6"] {
-            q.append_event(&ix, &network, "c", message(id)?, vec![], 3)?;
+        for (index, id) in ["b3", "b4", "b5", "b6"].into_iter().enumerate() {
+            q.append_event(
+                &ix,
+                &network,
+                "c",
+                posted(&ia, &network, "c", id, index as u64 + 2)?,
+                vec![],
+                3,
+            )?;
         }
         let (p, q) = (Mutex::new(p), Mutex::new(q));
         let pulls = Mutex::new(0);
@@ -3766,7 +3752,7 @@ mod tests {
             ))
         };
         let (stored, effective, forks) = evidence(&p)?;
-        assert_eq!((stored.len(), effective.len()), (9, 2));
+        assert_eq!((stored.len(), effective.len()), (11, 4));
         assert!(!forks.is_empty());
         assert_eq!(evidence(&q)?, (stored, effective, forks));
         Ok(())
@@ -4162,7 +4148,7 @@ mod tests {
     async fn a_recovery_undone_by_a_late_veto_adds_nothing_to_the_shared_log() -> Result<()> {
         use crate::{
             identity::{GovernanceEvent, Revocation},
-            model::{EventBody, Role, WorkKind, WorkOutcome},
+            model::{EventBody, WorkKind, WorkOutcome},
             work::WorkSpec,
         };
         let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4196,24 +4182,13 @@ mod tests {
                 let mut store = a.store.lock().await;
                 let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
                 store.create_conversation(&ia, &network, "c", "t", owner, 1)?;
-                let posted = ia.fixture_admin().attest(
+                create_input_bot(&mut store, &ia, &ia.fixture_admin(), &network, "c", 1)?;
+                store.post_input_fixture(
+                    &ia,
                     &network,
-                    "c",
-                    EventBody::MessagePosted {
-                        message_id: "m1".into(),
-                        role: Role::User,
-                        text: "go".into(),
-                        attachments: vec![],
-                        report_results: Some(true),
-                        in_reply_to: None,
-                        status: None,
-                        answers: None,
-                        attestation: None,
-                        failure: None,
-                    },
+                    signed_main_input(&ia.fixture_admin(), &network, "c", "m1", "go", vec![], 1)?,
+                    2,
                 )?;
-                let signature = posted.attestation().cloned().context("signed message")?;
-                store.accept_message(&ia, &network, "c", "m1", "go", vec![], true, signature, 2)?;
                 store.accept_work_fixture(&ib, &network, work.clone(), 3)?;
             }
             let shared = async || -> Result<(i64, Option<WorkOutcome>)> {
@@ -4509,16 +4484,27 @@ mod tests {
                 let mut store = a.store.lock().await;
                 let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
                 store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
-                store.put_blob(&blob, &content)?;
-                store.accept_message(
+                create_input_bot(
+                    &mut store,
                     &ia,
+                    &ia.fixture_admin(),
                     &network,
                     "c",
-                    "m1",
-                    "m1",
-                    vec![attached.clone()],
-                    true,
-                    user_with(&ia, &network, "m1", vec![attached])?,
+                    now_ms(),
+                )?;
+                store.put_blob(&blob, &content)?;
+                store.post_input_fixture(
+                    &ia,
+                    &network,
+                    signed_main_input(
+                        &ia.fixture_admin(),
+                        &network,
+                        "c",
+                        "m1",
+                        "m1",
+                        vec![attached],
+                        1,
+                    )?,
                     now_ms(),
                 )?;
             }
@@ -4600,18 +4586,21 @@ mod tests {
                 let mut store = a.store.lock().await;
                 let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
                 store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
+                create_input_bot(
+                    &mut store,
+                    &ia,
+                    &ia.fixture_admin(),
+                    &network,
+                    "c",
+                    now_ms(),
+                )?;
                 for (content, blob) in &files {
                     store.put_blob(blob, content)?;
                 }
-                store.accept_message(
+                store.post_input_fixture(
                     &ia,
                     &network,
-                    "c",
-                    "m1",
-                    "m1",
-                    attached.clone(),
-                    true,
-                    user_with(&ia, &network, "m1", attached)?,
+                    signed_main_input(&ia.fixture_admin(), &network, "c", "m1", "m1", attached, 1)?,
                     now_ms(),
                 )?;
                 std::fs::remove_file(store.blob_file(&lacked.1.hash)?)?;
@@ -4907,9 +4896,9 @@ mod tests {
                 let mut store = a.store.lock().await;
                 let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
                 store.create_conversation(&ia, &network, "c", "Sync", owner, now_ms())?;
+                create_input_bot(&mut store, &ia, &ia.fixture_admin(), &network, "c", now_ms())?;
                 store.put_blob(&blob, &content)?;
-                store.accept_message(&ia, &network, "c", "m1", "m1", vec![attached.clone()], true,
-                    user_with(&ia, &network, "m1", vec![attached.clone()])?, now_ms())?;
+                store.post_input_fixture(&ia, &network, signed_main_input(&ia.fixture_admin(), &network, "c", "m1", "m1", vec![attached.clone()], 1)?, now_ms())?;
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
@@ -4934,8 +4923,7 @@ mod tests {
             assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
 
             for id in ["m2", "m3"] {
-                a.store.lock().await.accept_message(&ia, &network, "c", id, id, vec![], true,
-                    user(&ia, &network, id)?, now_ms())?;
+                a.store.lock().await.post_input_fixture(&ia, &network, posted(&ia, &network, "c", id, if id == "m2" { 2 } else { 3 })?, now_ms())?;
             }
             let mut updates = b.events.subscribe();
             b.sync_peer(&network, &ia.device_id()?).await?;
@@ -4964,8 +4952,7 @@ mod tests {
             a.sync_peer(&network, &ib.device_id()?).await?;
 
             ready_member_rpc(&b, &network, &peer_a).await?;
-            b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
-                user(&ia, &network, "m4")?, now_ms())?;
+            b.store.lock().await.post_input_fixture(&ib, &network, posted(&ia, &network, "c", "m4", 4)?, now_ms())?;
             assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
             b.deliver_outbox().await?;
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -5046,28 +5033,6 @@ mod tests {
         let (l, dir_l) = node(&il).await?;
         let (h, dir_h) = node(&ih).await?;
         let (c, dir_c) = node(&ic).await?;
-        let message = |scope: &str, id: &str| -> Result<Attestation> {
-            admin
-                .attest(
-                    &network,
-                    scope,
-                    EventBody::MessagePosted {
-                        message_id: id.into(),
-                        role: Role::User,
-                        text: id.into(),
-                        attachments: vec![],
-                        report_results: Some(true),
-                        in_reply_to: None,
-                        status: None,
-                        answers: None,
-                        attestation: None,
-                        failure: None,
-                    },
-                )?
-                .attestation()
-                .cloned()
-                .context("signed message")
-        };
         let result = async {
             for node in [&l, &h, &c] {
                 node.install_membership(state.clone()).await?;
@@ -5089,15 +5054,10 @@ mod tests {
                     },
                 )?;
                 store.append_event(&ic, &network, "bot", bot, vec![], now_ms())?;
-                store.accept_message(
+                store.post_input_fixture(
                     &ic,
                     &network,
-                    "bot",
-                    "m1",
-                    "m1",
-                    vec![],
-                    true,
-                    message("bot", "m1")?,
+                    posted(&il, &network, "bot", "m1", 1)?,
                     now_ms(),
                 )?;
                 let claimed = store
@@ -5122,6 +5082,14 @@ mod tests {
                 .lock()
                 .await
                 .create_conversation(&ih, &network, "s", "S", owner, now_ms())?;
+            create_input_bot(
+                &mut *h.store.lock().await,
+                &ih,
+                &admin,
+                &network,
+                "s",
+                now_ms(),
+            )?;
             let from_h = log_of(&h, &ih).await?;
             l.store.lock().await.ingest_events(&network, &from_h)?;
             let deleted = admin
@@ -5138,15 +5106,10 @@ mod tests {
                 .context("signed deletion")?;
             let (posted, deletion) = {
                 let mut store = l.store.lock().await;
-                let (posted, _) = store.accept_message(
+                let (posted, _) = store.post_input_fixture(
                     &il,
                     &network,
-                    "s",
-                    "l1",
-                    "l1",
-                    vec![],
-                    true,
-                    message("s", "l1")?,
+                    posted(&il, &network, "s", "l1", 1)?,
                     now_ms(),
                 )?;
                 let deletion = store
@@ -5373,32 +5336,29 @@ mod tests {
             a.net()?.learn(&x.net()?.addr()).await;
             b.net()?.learn(&a.net()?.addr()).await;
             x.stop_network().await;
-            let message = |scope: &str, id: &str| -> Result<Attestation> {
-                posted(&ia, &network, scope, id)?
-                    .attestation()
-                    .cloned()
-                    .context("signed message")
-            };
             {
                 let mut store = a.store.lock().await;
                 for (scope, owner) in [("a1", &ix), ("a2", &ix), ("c", &ib)] {
                     let owner = ia.owner_fixture(&network, scope, &device(owner))?;
                     store.create_conversation(&ia, &network, scope, scope, owner, now_ms())?;
+                    create_input_bot(
+                        &mut store,
+                        &ia,
+                        &ia.fixture_admin(),
+                        &network,
+                        scope,
+                        now_ms(),
+                    )?;
                 }
             }
             first_sync(&b, &device(&ia)).await?;
             {
                 let mut store = a.store.lock().await;
                 for (scope, id) in [("a1", "x1"), ("a2", "x2"), ("c", "b1")] {
-                    store.accept_message(
+                    store.post_input_fixture(
                         &ia,
                         &network,
-                        scope,
-                        id,
-                        id,
-                        vec![],
-                        true,
-                        message(scope, id)?,
+                        posted(&ia, &network, scope, id, 1)?,
                         now_ms(),
                     )?;
                 }
@@ -5424,23 +5384,45 @@ mod tests {
         result
     }
 
-    fn posted(identity: &LocalIdentity, network: &str, scope: &str, id: &str) -> Result<EventBody> {
-        identity.fixture_admin().attest(
+    fn posted(
+        identity: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        id: &str,
+        sequence: u64,
+    ) -> Result<EventBody> {
+        signed_main_input(
+            &identity.fixture_admin(),
             network,
             scope,
-            EventBody::MessagePosted {
-                message_id: id.into(),
-                role: Role::User,
-                text: id.into(),
-                attachments: vec![],
-                report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
-                attestation: None,
-                failure: None,
-            },
+            id,
+            id,
+            vec![],
+            sequence,
         )
+    }
+
+    fn create_input_bot(
+        store: &mut Store,
+        author: &LocalIdentity,
+        admin: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        at: i64,
+    ) -> Result<SignedEvent> {
+        let body = admin.attest(
+            network,
+            scope,
+            EventBody::BotCreated {
+                bot_id: scope.into(),
+                name: format!("Bot {scope}"),
+                instructions: String::new(),
+                project: None,
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        store.append_event(author, network, scope, body, vec![], at)
     }
 
     /// A Node that missed a join notice while its sync still looked fine is told once more, so
@@ -5514,12 +5496,23 @@ mod tests {
             let long = MAX_FORK_PAGES * crate::store::MAX_PULL_EVENTS + 100;
             {
                 let mut store = l.store.lock().await;
+                store.create_conversation(
+                    &il,
+                    &network,
+                    "c",
+                    "Fork",
+                    il.owner_fixture(&network, "c", &device(&il))?,
+                    0,
+                )?;
+                create_input_bot(&mut store, &il, &il.fixture_admin(), &network, "c", 0)?;
+                other
+                    .ingest_events(&network, &store.events_from(&network, &device(&il), 1, 10)?)?;
                 for i in 0..long {
                     store.append_event(
                         f1,
                         &network,
                         "c",
-                        posted(&il, &network, "c", &format!("f{i}"))?,
+                        posted(&il, &network, "c", &format!("f{i}"), i as u64 + 1)?,
                         vec![],
                         i as i64,
                     )?;
@@ -5528,7 +5521,7 @@ mod tests {
                     f2,
                     &network,
                     "c",
-                    posted(&il, &network, "c", "g")?,
+                    posted(&il, &network, "c", "g", 1)?,
                     vec![],
                     0,
                 )?;
@@ -5537,7 +5530,7 @@ mod tests {
                         author,
                         &network,
                         "c",
-                        posted(&il, &network, "c", id)?,
+                        posted(&il, &network, "c", id, 1)?,
                         vec![],
                         0,
                     )?;
@@ -5628,13 +5621,22 @@ mod tests {
             }
             {
                 let mut store = l.store.lock().await;
+                store.create_conversation(
+                    &il,
+                    &network,
+                    "c",
+                    "Catch up",
+                    il.owner_fixture(&network, "c", &device(&il))?,
+                    0,
+                )?;
+                create_input_bot(&mut store, &il, &il.fixture_admin(), &network, "c", 0)?;
                 for i in 0..40_000 {
                     let author = if i % 2 == 0 { &ih } else { &ij };
                     store.append_event(
                         author,
                         &network,
                         "c",
-                        posted(&il, &network, "c", &format!("m{i}"))?,
+                        posted(&il, &network, "c", &format!("m{i}"), i as u64 + 1)?,
                         vec![],
                         i,
                     )?;
@@ -5748,15 +5750,18 @@ mod tests {
             let mut store = node.store.lock().await;
             let owner = sender.owner_fixture(&network, "c", &sender.device_id()?)?;
             store.create_conversation(&sender, &network, "c", "Task", owner, now_ms())?;
-            store.accept_message(
+            create_input_bot(
+                &mut store,
                 &sender,
+                &sender.fixture_admin(),
                 &network,
                 "c",
-                "m1",
-                "m1",
-                vec![],
-                true,
-                user(&sender, &network, "m1")?,
+                now_ms(),
+            )?;
+            store.post_input_fixture(
+                &sender,
+                &network,
+                posted(&sender, &network, "c", "m1", 1)?,
                 now_ms(),
             )?;
         }
