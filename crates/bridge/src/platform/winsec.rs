@@ -985,8 +985,6 @@ pub fn owner_of_path(path: &Path) -> io::Result<Sid> {
 pub enum Disposition {
     /// Refuse the call.
     New,
-    /// Empty it.
-    Truncate,
     /// Keep its content.
     Keep,
 }
@@ -997,8 +995,8 @@ pub fn create_private_file(path: &Path, disposition: Disposition) -> io::Result<
     use windows_sys::Win32::{
         Foundation::{GENERIC_READ, GENERIC_WRITE},
         Storage::FileSystem::{
-            CREATE_ALWAYS, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
         },
     };
     let owner_only = OwnerOnly::new(false)?;
@@ -1013,7 +1011,6 @@ pub fn create_private_file(path: &Path, disposition: Disposition) -> io::Result<
             &attributes,
             match disposition {
                 Disposition::New => CREATE_NEW,
-                Disposition::Truncate => CREATE_ALWAYS,
                 Disposition::Keep => OPEN_ALWAYS,
             },
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,

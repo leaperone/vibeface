@@ -242,21 +242,6 @@ fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
     value
 }
 
-pub async fn status(
-    node: &Runtime,
-    network: &str,
-    conversation: &str,
-    trigger: &str,
-) -> Result<Value> {
-    let _work = node.maintenance.enter()?;
-    let mut store = node.store.lock().await;
-    store.recover_scheduler_jobs(&node.identity, network, boot_id())?;
-    Ok(match store.scheduler_job(conversation, trigger)? {
-        Some(job) => invocation_value(&job, network),
-        None => json!({"state":"not_found","trigger":trigger}),
-    })
-}
-
 /// The reply text streamed so far, rebuilt from SDK progress: a snapshot replaces an item's
 /// text and a delta extends it. A stopped turn keeps this text.
 #[derive(Default)]
@@ -1826,24 +1811,20 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             } => {
                 let speaker = if *role == Role::User { "用户" } else { "Bot" };
                 lines.push(format!("{speaker}：{}", prefix(text, 280)));
-                match answers {
-                    None if *role == Role::User => requests.push(prefix(text, 300).to_owned()),
-                    Some(question_id) => {
-                        let asked = events.iter().find_map(|event| match &event.event.body {
-                            EventBody::QuestionAsked {
-                                question_id: id,
-                                text,
-                                ..
-                            } if id == question_id => Some(prefix(text, 200)),
-                            _ => None,
-                        });
-                        decisions.push(format!(
-                            "用户回答问题 {question_id}（{}）：{}",
-                            asked.unwrap_or("问题在更早的记录里"),
-                            prefix(text, 300)
-                        ));
-                    }
-                    None => {}
+                if let Some(question_id) = answers {
+                    let asked = events.iter().find_map(|event| match &event.event.body {
+                        EventBody::QuestionAsked {
+                            question_id: id,
+                            text,
+                            ..
+                        } if id == question_id => Some(prefix(text, 200)),
+                        _ => None,
+                    });
+                    decisions.push(format!(
+                        "用户回答问题 {question_id}（{}）：{}",
+                        asked.unwrap_or("问题在更早的记录里"),
+                        prefix(text, 300)
+                    ));
                 }
             }
             EventBody::BotMessaged { from, text, .. } => {
@@ -2464,6 +2445,7 @@ pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::manager_settings;
     use crate::tools::Effect;
 
     fn context_fixture() -> (TurnHistory, SchedulerJob) {
@@ -2485,17 +2467,16 @@ mod tests {
                         deps: vec![],
                         scope_id: "c".into(),
                         created_at_ms: seq as i64,
-                        body: EventBody::MessagePosted {
+                        body: EventBody::InputPosted {
                             message_id: format!("m{seq}"),
-                            role: Role::User,
+                            target: crate::workspace::InputTarget::BotMain { bot_id: "c".into() },
+                            intent: crate::workspace::InputIntent::Continue,
+                            sequence: seq,
+                            expected_revision: None,
                             text: "长".repeat(1_500),
                             attachments: vec![file.clone()],
-                            report_results: None,
-                            in_reply_to: None,
-                            status: None,
-                            answers: None,
+                            report_results: Some(true),
                             attestation: None,
-                            failure: None,
                         },
                         blobs: vec![file.blob()],
                     },
@@ -2760,17 +2741,16 @@ mod tests {
             deps: vec![],
             scope_id: "c".into(),
             created_at_ms: 0,
-            body: EventBody::MessagePosted {
+            body: EventBody::InputPosted {
                 message_id: "m".into(),
-                role: Role::User,
+                target: crate::workspace::InputTarget::BotMain { bot_id: "c".into() },
+                intent: crate::workspace::InputIntent::Continue,
+                sequence: 1,
+                expected_revision: None,
                 text: "看附件".into(),
                 attachments: vec![file.clone()],
                 report_results: Some(true),
-                in_reply_to: None,
-                status: None,
-                answers: None,
                 attestation: None,
-                failure: None,
             },
             blobs: vec![file.blob()],
         };
@@ -3129,13 +3109,8 @@ mod tests {
     #[test]
     fn the_session_key_follows_what_the_native_session_holds() -> Result<()> {
         use crate::providers::Provider;
-        let settings = |provider, model: &str| crate::config::ManagerSettings {
-            provider,
-            workspace: "/w".into(),
-            model: model.into(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        };
+        let settings =
+            |provider, model: &str| manager_settings(provider, "/w".into(), model.into());
         let codex_a = selection_identity(&settings(Provider::Codex, "a"), "guide", None)?;
         let codex_b = selection_identity(&settings(Provider::Codex, "b"), "guide", None)?;
         assert_ne!(codex_a.stable_fingerprint, codex_b.stable_fingerprint);

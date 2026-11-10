@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,10 +15,9 @@ use vibeface_bridge::platform::{
 };
 use zeroize::Zeroizing;
 
-const PROTOCOL: u32 = 1;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// A `Client` answer carries a whole RPC result, such as diagnostics or a bot list.
-const MAX_PACKET: usize = 1024 * 1024;
+use vibeface_control::maintenance::{
+    MAX_PACKET, MaintenanceStatus as Status, PROTOCOL, REQUEST_TIMEOUT,
+};
 const SOCKET_NAME: &str = "maintenance.sock";
 /// Names the maintenance endpoint in the message a person reads.
 const LABEL: &str = "the maintenance socket";
@@ -206,12 +204,6 @@ pub struct PeerHealth {
     pub reachable: Option<bool>,
     pub synced_ms: Option<i64>,
 }
-#[derive(Debug)]
-#[must_use]
-pub struct Lease {
-    pub health: Health,
-    _stream: Stream,
-}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Command {
@@ -225,7 +217,7 @@ enum Command {
         link: String,
         name: String,
     },
-    DeliveryWallet(crate::delivery::wallet::WalletCommand),
+    DeliveryWallet(vibeface_control::maintenance::WalletCommand),
     DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
     DeliveryKeyOperation {
         action: crate::delivery::KeyAction,
@@ -254,15 +246,6 @@ struct Request {
     protocol: u32,
     command: Command,
 }
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Status {
-    Ready,
-    Healthy,
-    Committed,
-    Busy,
-    Error,
-}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Response {
@@ -281,13 +264,7 @@ struct Response {
 }
 
 async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut Stream) -> Result<T> {
-    read_packet_timeout(stream, REQUEST_TIMEOUT).await
-}
-async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
-    stream: &mut Stream,
-    timeout: Duration,
-) -> Result<T> {
-    tokio::time::timeout(timeout, async {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
         let mut packet = Zeroizing::new(Vec::new());
         let mut chunk = Zeroizing::new([0u8; 8192]);
         loop {
@@ -366,16 +343,6 @@ pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn request(data_dir: &Path, command: Command) -> Result<(Stream, Response)> {
-    let response_timeout = if matches!(&command, Command::DeliveryKeyOperation { .. }) {
-        Duration::from_secs(
-            crate::delivery::proof::INFO_TIMEOUT_SECS
-                + crate::delivery::proof::PROVE_TIMEOUT_SECS
-                + crate::delivery::proof::VERIFY_TIMEOUT_SECS
-                + 60,
-        )
-    } else {
-        REQUEST_TIMEOUT
-    };
     let endpoint = endpoint(data_dir)?;
     endpoint.ensure_private(LABEL)?;
     let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, Stream::connect(&endpoint))
@@ -390,7 +357,7 @@ async fn request(data_dir: &Path, command: Command) -> Result<(Stream, Response)
         },
     )
     .await?;
-    let response: Response = read_packet_timeout(&mut stream, response_timeout).await?;
+    let response: Response = read_packet(&mut stream).await?;
     ensure!(
         response.protocol == PROTOCOL,
         "unsupported maintenance protocol"
@@ -412,19 +379,6 @@ async fn request(data_dir: &Path, command: Command) -> Result<(Stream, Response)
     }
     Ok((stream, response))
 }
-pub async fn acquire(data_dir: &Path) -> Result<Lease> {
-    let (stream, response) = request(data_dir, Command::Acquire).await?;
-    ensure!(
-        response.status == Status::Ready,
-        "maintenance lease was not granted"
-    );
-    Ok(Lease {
-        health: response
-            .health
-            .context("maintenance response has no identity")?,
-        _stream: stream,
-    })
-}
 pub async fn probe(data_dir: &Path) -> Result<Health> {
     let (_, response) = request(data_dir, Command::Probe).await?;
     ensure!(
@@ -435,15 +389,6 @@ pub async fn probe(data_dir: &Path) -> Result<Health> {
         .health
         .context("maintenance response has no identity")
 }
-pub async fn commit(data_dir: &Path) -> Result<()> {
-    let (_, response) = request(data_dir, Command::Commit).await?;
-    ensure!(
-        response.status == Status::Committed,
-        "node activation was not committed"
-    );
-    Ok(())
-}
-
 /// Applies the setting in the running Node; only this user can reach the socket.
 pub async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<()> {
     let (_, response) = request(data_dir, Command::LocalAccess(enabled)).await?;
@@ -489,48 +434,6 @@ pub async fn config_set(data_dir: &Path, key: &str, value: serde_json::Value) ->
     )
     .await?;
     Ok(())
-}
-
-pub async fn delivery_wallet(
-    data_dir: &Path,
-    command: crate::delivery::wallet::WalletCommand,
-) -> Result<crate::delivery::wallet::WalletStatus> {
-    let (_, response) = request(data_dir, Command::DeliveryWallet(command)).await?;
-    response
-        .wallet
-        .context("node did not return its delivery wallet status")
-}
-
-pub async fn configure_delivery(
-    data_dir: &Path,
-    config: crate::delivery::DeliveryConfig,
-) -> Result<()> {
-    let (_, response) = request(data_dir, Command::DeliveryConfig(Box::new(config))).await?;
-    ensure!(
-        response.status == Status::Healthy,
-        "node did not apply delivery settings"
-    );
-    Ok(())
-}
-
-pub async fn delivery_key_operation(
-    data_dir: &Path,
-    action: crate::delivery::KeyAction,
-    intent_id: String,
-    gas_cap: String,
-) -> Result<serde_json::Value> {
-    let (_, response) = request(
-        data_dir,
-        Command::DeliveryKeyOperation {
-            action,
-            intent_id,
-            gas_cap,
-        },
-    )
-    .await?;
-    response
-        .delivery
-        .context("node did not return its receiving key operation")
 }
 
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
@@ -751,6 +654,10 @@ mod tests {
         crypto::LocalIdentity,
     };
     use anyhow::bail;
+    use std::time::Duration;
+    use vibeface_control::maintenance::{
+        self as maintenance_client, MaintenanceCommand, MaintenanceStatus,
+    };
 
     #[tokio::test]
     async fn inspecting_a_stopped_node_does_not_create_or_restrict_its_endpoint_directory()
@@ -869,7 +776,7 @@ mod tests {
                 }
             })
             .await?;
-            acquire(&dir).await
+            maintenance_client::acquire(&socket_path(&dir)?).await
         }
         .await;
         server.abort();
@@ -990,37 +897,51 @@ mod tests {
                     "and saves it"
                 );
             }
-            assert!(commit(&dir).await.is_err());
+            assert!(
+                maintenance_client::request(&socket_path(&dir)?, MaintenanceCommand::Commit)
+                    .await
+                    .is_err()
+            );
             config::private_write(
                 &dir.join("update-pending.json"),
                 br#"{"phase":"confirmed"}"#,
             )?;
-            commit(&dir).await?;
+            assert!(matches!(
+                maintenance_client::request(&socket_path(&dir)?, MaintenanceCommand::Commit)
+                    .await?
+                    .status,
+                MaintenanceStatus::Committed
+            ));
             assert!(!dir.join("update-pending.json").exists());
             let work = node.maintenance.enter()?;
             assert!(
-                acquire(&dir)
+                maintenance_client::acquire(&socket_path(&dir)?)
                     .await
-                    .unwrap_err()
-                    .downcast_ref::<Busy>()
+                    .err()
+                    .context("active work refuses maintenance")?
+                    .downcast_ref::<maintenance_client::Busy>()
                     .is_some()
             );
             drop(work);
-            let lease = acquire(&dir).await?;
-            assert_eq!(lease.health.device_id, health.device_id);
+            let lease = maintenance_client::acquire(&socket_path(&dir)?).await?;
+            assert_eq!(lease.health["device_id"], health.device_id);
             assert!(node.maintenance.enter().is_err());
-            assert!(
-                crate::scheduler::status(&node, "test", "chat", "trigger")
-                    .await
-                    .is_err()
-            );
+            let refused = crate::scheduler::run(
+                node.clone(),
+                crate::runtime::test_support::access("test".into(), false, Some("chat".into())),
+                "chat".into(),
+                crate::scheduling::SessionScope::Main,
+            )
+            .await
+            .expect_err("maintenance refuses a real scheduler turn");
+            assert!(refused.downcast_ref::<Busy>().is_some());
             drop(lease);
             let resumed =
                 tokio::time::timeout(Duration::from_secs(1), node.maintenance.enter_when_open())
                     .await?;
             drop(resumed);
             assert!(node.maintenance.enter().is_ok());
-            let lease = acquire(&dir).await?;
+            let lease = maintenance_client::acquire(&socket_path(&dir)?).await?;
             config::private_write(&dir.join("update-pending.json"), b"{}")?;
             drop(lease);
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -1038,7 +959,12 @@ mod tests {
                 &dir.join("update-pending.json"),
                 br#"{"phase":"confirmed"}"#,
             )?;
-            commit(&dir).await?;
+            assert!(matches!(
+                maintenance_client::request(&socket_path(&dir)?, MaintenanceCommand::Commit)
+                    .await?
+                    .status,
+                MaintenanceStatus::Committed
+            ));
             assert!(!dir.join("update-pending.json").exists());
             assert!(node.maintenance.enter().is_ok());
             Ok::<_, anyhow::Error>(())

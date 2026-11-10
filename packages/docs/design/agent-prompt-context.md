@@ -54,7 +54,7 @@ The local shown state records a bounded ContextProjection with network and scope
 
 Conversation snapshots, records and owner RPC expose that bounded projection. Shared Web/Mobile parsing preserves safe expected and actual turn references. It excludes resume tokens, private transcripts, credentials, prompt text and Memory contents. An unreachable owner has unavailable context; local observations cannot replace the remote owner's observation. Queue metadata distinguishes main, task, schedule_routine and bot_message. Main and bot-message turns share the main session. Workspace tasks use stable task-specific sessions across turns. Work tasks use work-specific sessions; routines use trigger-specific ephemeral sessions. Claims atomically apply active_turn, steering_settlement, provider_serial, task_limit, machine_slot and pending_check gates. Attachment preparation and earlier input order remain separate queue holds. Backend configuration changes defer claims as backend_config_pending. Only Codex currently declares parallel coordination turns. Scheduling limits count local coordination turns; they do not claim to cap every external coding process. Routines discard their native session after completion. Unknown turns retain their reconciliation boundary instead of running again.
 
-The essential Memory budget covers the entire serialized block. A data-only Memory review accepts at most 20 add/update/forget operations, rejects tools and secrets, and is disabled by default. Its proposals use the same staging and revision checks. Completion records conflict identifiers and revision metadata locally without copying candidate text into the diagnostic projection.
+The essential Memory budget covers the entire serialized block.
 
 ## Data format
 

@@ -115,20 +115,8 @@ type WorkFields = {
   failure?: FailureKind
   /** A provider: a turn on it that its device watches; `task`: a task run by its device's coordination Agent. */
   kind?: ProviderId | "task"
-  /** The device that signed the dispatch; absent in snapshots from older Nodes. */
-  dispatcher?: string
-  /** The caller's idempotency key; absent in snapshots from older Nodes. */
-  call_ref?: string
   /** The dispatcher's optional model override. */
   model?: string
-  /** A follow-up work continues the prior work's provider session. */
-  continues?: string
-  /** The causal parent work, if this was dispatched as a child. */
-  parent?: string
-  /** The existing provider thread that received this dispatch, when applicable. */
-  thread?: string
-  /** The durable phase from the latest WorkProgress event. */
-  phase?: WorkPhase
   /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
   turn_id?: string
@@ -136,9 +124,17 @@ type WorkFields = {
   stop?: StopState
   coordination_job?: ScopeJob | null
 }
+type WorkRelations = {
+  dispatcher: string
+  call_ref: string
+  continues: string | null
+  parent: string | null
+  thread: string | null
+  phase: WorkPhase | null
+}
 export type WorkRecord = WorkFields & (
-  | { state: WorkState; resolved: ResolvedModel }
-  | { state: DispatchState; resolved?: never }
+  | (WorkRelations & { state: WorkState; resolved: ResolvedModel })
+  | (Partial<WorkRelations> & { state: DispatchState; resolved?: never })
 )
 /** The fields a task card can read from either full work or an overview summary. */
 export type WorkCard = Pick<WorkRecord, "work_id" | "target" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
@@ -299,7 +295,7 @@ export type BotSchedule = { name: string; prompt: string; first_run_at_ms: numbe
 export type MemoryVersion = { revision: string; control_revision: number; source_event_hash: string }
 export type MemoryBase = { epoch: number; version: MemoryVersion | null }
 export type MemoryMetadata = MemoryVersion & {
-  epoch: number; origin: 'agent' | 'user' | 'review'; user_controlled: boolean; essential: boolean
+  epoch: number; origin: 'agent' | 'user'; user_controlled: boolean; essential: boolean
 }
 export type MemoryState = { memory_id: string; text: string | null; metadata: MemoryMetadata }
 export type MemoryEntry = MemoryState & { text: string }

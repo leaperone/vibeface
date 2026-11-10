@@ -4,6 +4,7 @@
 //! never sent again. v2 keeps a shell environment per session; each turn replaces it before
 //! prompting with platform basics, private provider roots and that turn's Node tool credentials.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -1050,21 +1051,7 @@ impl Opencode {
         let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
         let stage =
             vibeface_bridge::failure::ProviderTrace::new("opencode", ProviderStage::Validate);
-        let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-            ManagerError {
-                stage: stage.current(),
-                outcome,
-                start: *start
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                session_id: session.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: manager::redact_string(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-            .into()
-        };
+        let error = ManagerError::reporter(&stage, &start, &secrets);
         let failed =
             |session: Option<&str>, failure| error(ManagerFailure::Failed, session, failure);
         // Faults of this Node's own bookkeeping, not of opencode.
@@ -1578,14 +1565,6 @@ fn tool_name(tool: &str) -> &'static str {
         "webfetch" | "websearch" => "web search",
         _ => "tool",
     }
-}
-
-/// At most `limit` characters, without control characters but line breaks and tabs.
-fn bounded(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .take(limit)
-        .collect()
 }
 
 /// One message we sent and what answered it.
@@ -2156,9 +2135,8 @@ impl Executor for Opencode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::crypto::LocalIdentity;
-    use crate::identity::{Genesis, Member, NetworkState};
     use crate::manager::{CodexTurn, Sdk, run_manager};
+    use crate::runtime::test_support::{join_network, open_node, provider_work};
     use axum::extract::{Path as UrlPath, Query, Request, State};
     use axum::http::{StatusCode, header};
     use axum::response::sse::{Event, Sse};
@@ -2768,57 +2746,31 @@ mod tests {
 
     fn spec(target: &str, place: &Place, prompt: &str) -> WorkSpec {
         WorkSpec {
-            work_id: "w-1".into(),
-            conversation: "c".into(),
-            trigger: "message:m1".into(),
-            target: target.into(),
-            dispatcher: target.into(),
-            call_ref: "w-1".into(),
-            kind: WorkKind::Agent(Provider::Opencode),
             model: Some("fake/m".into()),
             resolved: crate::model::ResolvedModel {
                 provider: Provider::Opencode,
                 model: Some("fake/m".into()),
             },
-            cwd: place.dir.join("work").display().to_string(),
-            title: "t".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Opencode, target, &place.dir.join("work"), prompt)
         }
     }
 
     /// A Node in a network of its own whose opencode is the fixture, and that network.
     async fn node(place: &Place) -> Result<(Arc<Runtime>, String)> {
         let data = place.dir.join("node");
-        config::private_dir(&data)?;
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         configuration.providers.execution = [Provider::Opencode].into();
         configuration.bins.insert(Provider::Opencode, fixture());
-        configuration.save(&data)?;
-        config::private_write(&data.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&data.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let mut env = crate::providers::ProviderEnv::default();
         let variables = place
             .env()
             .into_iter()
             .map(|(name, value)| (name, Some(value)));
         env.apply(Provider::Opencode, variables.collect())?;
-        let mut configuration = Config::load(&data)?;
         configuration.provider_env = env;
-        configuration.save(&data)?;
-        let node = Arc::new(Runtime::open(&data).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        let network = state.genesis.network_id.clone();
-        node.install_membership(state).await?;
+        let node = open_node(&data, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         Ok((node, network))
     }

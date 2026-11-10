@@ -2,7 +2,6 @@ use crate::crypto::LocalIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::OsString,
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
@@ -10,7 +9,7 @@ use std::{
 use vibeface_bridge::platform::privatefs;
 use zeroize::Zeroizing;
 
-/// Bumped whenever stored data stops being readable by the previous build.
+/// Fixed at 1 before the first stable release; schema changes update the fingerprint below.
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
@@ -103,46 +102,6 @@ impl Forwarding {
             crate::api::MAX_CLIENT_SOCKETS
         );
         Ok(())
-    }
-}
-
-pub const NO_HOME: &str =
-    "no data directory: HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
-
-/// `$HOME/.vibeface`, or empty when HOME is unset or relative so that `data_dir` reports it.
-pub fn default_data_dir() -> PathBuf {
-    home_data_dir(std::env::var_os("HOME"))
-}
-
-pub fn home_data_dir(home: Option<OsString>) -> PathBuf {
-    home.map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .map(|home| home.join(".vibeface"))
-        .unwrap_or_default()
-}
-
-/// The chosen data directory, or `$HOME/.vibeface` when none was named.
-pub fn data_dir_or_home(dir: Option<PathBuf>, home: Option<OsString>) -> Result<PathBuf> {
-    let dir = dir.unwrap_or_else(|| home_data_dir(home));
-    ensure!(!dir.as_os_str().is_empty(), NO_HOME);
-    ensure!(dir.is_absolute(), "specify an absolute data directory");
-    Ok(dir)
-}
-
-pub fn data_dir(value: &str) -> std::result::Result<PathBuf, String> {
-    if value.is_empty() {
-        Err(NO_HOME.into())
-    } else {
-        absolute_path(value)
-    }
-}
-
-pub fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err("specify an absolute path".into())
     }
 }
 

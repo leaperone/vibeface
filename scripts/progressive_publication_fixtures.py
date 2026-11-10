@@ -10,9 +10,8 @@ from unittest.mock import patch
 
 import release as rel
 from release import (
-    DESKTOP_TARGETS, ROOT, TARGETS, compose_offline, desktop_basename, desktop_payload_names,
-    digest, ELECTRON_VERSION, manifest, pack_component, program_names,
-    require_version_cohort, SCHEMA_VERSION, stage_native, version, write_json,
+    DESKTOP_TARGETS, ROOT, TARGETS, compose_offline, manifest, pack_component, program_names,
+    require_version_cohort, stage_native, version,
 )
 
 
@@ -40,6 +39,26 @@ def native_programs(directory, target, reported):
         binary = directory / name
         binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {reported}"\n', encoding='utf-8')
         binary.chmod(0o755)
+    return directory
+
+
+def stage_desktop(api, destination, target, product, runtime_archive, *, content="fixture payload", **changes):
+    """Use the caller's patched release module, including when it runs as __main__."""
+    destination.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+    for name in api.desktop_payload_names(product['version'], target):
+        payload = destination / name
+        payload.write_bytes(f'{name} {content}'.encode())
+        payload.with_name(name + '.sha256').write_text(f'{api.digest(payload)}  {name}\n', encoding='utf-8')
+        artifacts[name] = api.digest(payload)
+    receipt = dict(product, schema=api.SCHEMA_VERSION, app='desktop', target=target, electron=api.ELECTRON_VERSION,
+        signed=target == 'aarch64-apple-darwin',
+        signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
+        else 'platform-checksums' if target.endswith('-unknown-linux-gnu') else 'unsigned-development-preview',
+        runtime={'archive': runtime_archive.name, 'sha256': api.digest(runtime_archive)}, artifacts=artifacts)
+    receipt.update(changes)
+    api.write_json(destination / f"{api.desktop_basename(product['version'], target)}.provenance.json", receipt)
+    return destination
 
 
 def build_collected_tree(source=None):
@@ -87,23 +106,7 @@ def build_collected_tree(source=None):
         manifest('product', collected / 'native' / target)
         desktop_target = DESKTOP_TARGETS[0]
         desktop_dir = collected / 'desktop' / desktop_target
-        desktop_dir.mkdir(parents=True)
         runtime = collected / 'native' / desktop_target / f'vibeface-{product_version}-{desktop_target}.tar.gz'
-        artifacts = {}
-        for name in desktop_payload_names(product_version, desktop_target):
-            payload = desktop_dir / name
-            payload.write_bytes(f'{name} desktop fixture'.encode())
-            (desktop_dir / (name + '.sha256')).write_text(f'{digest(payload)}  {name}\n', encoding='utf-8')
-            artifacts[name] = digest(payload)
-        write_json(desktop_dir / f'{desktop_basename(product_version, desktop_target)}.provenance.json', dict(
-            schema=SCHEMA_VERSION, app='desktop', target=desktop_target, version=product_version,
-            tag=product_tag, channel=channel, source_commit=source, electron=ELECTRON_VERSION,
-            signed=desktop_target == 'aarch64-apple-darwin',
-            signing='developer-id-notarized' if desktop_target == 'aarch64-apple-darwin'
-            else 'platform-checksums' if desktop_target.endswith('-unknown-linux-gnu')
-            else 'unsigned-development-preview',
-            runtime={'archive': runtime.name, 'sha256': digest(runtime)} if runtime.is_file()
-            else {'archive': f'vibeface-{product_version}-{desktop_target}.tar.gz', 'sha256': digest(runtime)},
-            artifacts=artifacts))
+        stage_desktop(rel, desktop_dir, desktop_target, product, runtime, content='desktop fixture')
         manifest('product', desktop_dir)
         return collected, product

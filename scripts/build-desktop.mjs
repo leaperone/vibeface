@@ -3,10 +3,10 @@
 // Build only: this script never publishes and never rebuilds or re-signs the bundled CLI and Core.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hash, relativeFiles, readSealedRuntime, verifySealedRuntime } from './sealed-runtime.mjs';
 import { createRequire } from 'node:module';
 import { requireAuthenticode } from './windows-signing.mjs';
 import { prefetchElectronArchive } from '../apps/desktop/scripts/prefetch-electron.mjs';
@@ -27,7 +27,6 @@ const HOST_OUTPUTS = ['dist/main/index.cjs', 'dist/preload/client.cjs'];
 
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
-const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const writeJson = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 
 function controlConstant(name) {
@@ -44,13 +43,6 @@ function productVersion() {
   return version;
 }
 
-function relativeFiles(directory) {
-  return fs.readdirSync(directory, { recursive: true, withFileTypes: true })
-    .filter(entry => entry.isFile())
-    .map(entry => path.relative(directory, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
-    .sort();
-}
-
 /** Read a sealed runtime bundle and prove every byte still matches its own FILES.sha256. */
 function readRuntime(directory, target, version, sourceCommit) {
   const { exe } = PLATFORMS[target];
@@ -62,20 +54,7 @@ function readRuntime(directory, target, version, sourceCommit) {
     'the bundled runtime is not this platform, version and source');
   for (const field of ['core_version', 'app_version']) assert.equal(info[field], version, 'mixed component versions in the runtime');
   for (const field of ['core_source_commit', 'app_source_commit']) assert.equal(info[field], sourceCommit, 'mixed component sources in the runtime');
-  const sealed = new Map();
-  for (const line of fs.readFileSync(path.join(directory, 'FILES.sha256'), 'utf8').trimEnd().split('\n')) {
-    const match = /^([a-f0-9]{64})  ([a-zA-Z0-9._/-]+)$/.exec(line);
-    assert(match && match[2] !== 'FILES.sha256' && !sealed.has(match[2]), 'invalid or duplicate runtime checksum entry');
-    assert(match[2].split('/').every(part => part && part !== '.' && part !== '..'), 'unsafe runtime checksum path');
-    sealed.set(match[2], match[1]);
-  }
-  assert.deepEqual(relativeFiles(directory).filter(name => name !== 'FILES.sha256'), [...sealed.keys()].sort(),
-    'the runtime contains files its checksums do not cover');
-  for (const [name, expected] of sealed) {
-    const file = path.join(directory, name);
-    assert(!fs.lstatSync(file).isSymbolicLink(), 'the runtime must not contain links');
-    assert.equal(hash(file), expected, `runtime content changed: ${name}`);
-  }
+  const sealed = readSealedRuntime(directory);
   for (const name of [`vibeface${exe}`, `vibeface-core${exe}`, 'web/index.html', 'web/vibeface_secure.js',
     'web/vibeface_secure_bg.wasm', 'README.md', 'RUNTIME-REQUIREMENTS.md']) {
     assert(sealed.has(name), `the runtime is missing ${name}`);
@@ -142,14 +121,6 @@ function packagedRuntime(outputRoot, target) {
   return found;
 }
 
-function verifySealedRuntime(directory, sealed) {
-  assert.deepEqual(relativeFiles(directory).filter(name => name !== 'FILES.sha256'), [...sealed.keys()].sort(),
-    'packaging changed the set of runtime files');
-  for (const [name, expected] of sealed) {
-    assert.equal(hash(path.join(directory, name)), expected, `packaging or signing changed the sealed runtime file ${name}`);
-  }
-}
-
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const platform = PLATFORMS[target];
   assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
@@ -171,7 +142,6 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   if (signed && target === 'x86_64-pc-windows-msvc') {
     for (const program of ['vibeface.exe', 'vibeface-core.exe']) requireAuthenticode(path.join(runtimeDir, program));
   }
-
 
   const stage = path.join(desktop, '.build');
   fs.rmSync(stage, { recursive: true, force: true });
@@ -300,7 +270,7 @@ function selfTest() {
     writeJson(path.join(bundle, 'BUILD-INFO.json'), info);
     seal();
     fs.appendFileSync(path.join(bundle, 'web/index.html'), 'tampered');
-    assert.throws(() => readRuntime(bundle, target, version, commit), /runtime content changed: web\/index.html/);
+    assert.throws(() => readRuntime(bundle, target, version, commit), /changed the sealed runtime file web\/index.html/);
 
     assert.deepEqual(signingState('x86_64-pc-windows-msvc', false), { signed: false, signing: 'unsigned-development-preview' });
     assert.deepEqual(signingState('aarch64-apple-darwin', false), { signed: false, signing: 'unsigned-development-preview' });

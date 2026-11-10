@@ -16,6 +16,7 @@ use vibeface_bridge::platform::privatefs;
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
+    observation,
 };
 
 mod desktop_node;
@@ -629,14 +630,6 @@ enum LogLevel {
     Error,
 }
 
-impl std::str::FromStr for LogLevel {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("level is one of trace, debug, info, warn, error")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum LogSource {
@@ -646,14 +639,6 @@ enum LogSource {
     Cli,
     Codex,
     Cursor,
-}
-
-impl std::str::FromStr for LogSource {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, cursor")
-    }
 }
 
 #[derive(Args)]
@@ -1579,12 +1564,16 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from);
         dispatch_work(&tools, &arguments, call_id, socket.as_deref()).await
     };
-    let result = result
+    let mut result = result
         .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
-    println!(
-        "{}",
-        serde_json::to_string(&annotate_tool(&name, &arguments, result))?
-    );
+    let record = result
+        .get_mut("call_record")
+        .and_then(Value::as_object_mut)
+        .context("dispatch response has no valid result record")
+        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
+    record.insert("tool".into(), json!(name));
+    record.insert("call_ref".into(), json!(call_id));
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -1749,75 +1738,6 @@ fn report_tool_failure(
     )
 }
 
-fn annotate_tool(name: &str, args: &Value, mut value: Value) -> Value {
-    if !value.is_object() {
-        value = json!({"value": value});
-    }
-    let state = value["state"]
-        .as_str()
-        .or_else(|| value["state"]["state"].as_str());
-    let outcome = value["outcome"]
-        .as_str()
-        .or_else(|| value["state"]["outcome"].as_str());
-    let unverified = value["found"] == false
-        || state.is_some_and(|state| state.contains("unverified"))
-        || outcome == Some("unverified");
-    let read = matches!(
-        name,
-        "search"
-            | "tool_search"
-            | "tool_describe"
-            | "history_search"
-            | "history_read"
-            | "nodes"
-            | "context"
-            | "work_status"
-            | "call_lookup"
-            | "read_skill"
-            | "recall"
-            | "fetch_url"
-            | "list_bots"
-            | "read_bot"
-            | "list_sessions"
-            | "wait_work"
-    );
-    let (execution, confirmation) = if unverified {
-        ("unknown", "unknown")
-    } else if value.get("work_id").is_some() {
-        match (state, outcome) {
-            (Some("dispatch_rejected"), _) | (_, Some("rejected")) => ("not_started", "confirmed"),
-            (_, Some("completed" | "failed" | "interrupted")) => ("completed", "confirmed"),
-            (Some("running" | "interrupting"), _) => ("started", "confirmed"),
-            _ => ("unknown", "pending"),
-        }
-    } else if read && name != "call_lookup" {
-        ("read", "confirmed")
-    } else if value.get("event_hash").is_some()
-        || value.get("bot_id").is_some()
-        || value.get("message").is_some()
-        || value["deleted"] == true
-        || value["status"] == "applied"
-    {
-        ("applied", "confirmed")
-    } else if matches!(
-        value["status"].as_str(),
-        Some("asked" | "declined" | "unchanged")
-    ) {
-        ("not_started", "confirmed")
-    } else {
-        ("unknown", "unknown")
-    };
-    let approval = match value["status"].as_str() {
-        Some("asked") => "pending",
-        Some("applied") => "allowed",
-        Some("declined") => "denied",
-        _ if confirmation == "unknown" || value.get("work_id").is_some() => "unknown",
-        _ => "not_required",
-    };
-    value["call_record"] = json!({"tool":name,"call_ref":args.get("call_ref").or_else(|| value.get("call_ref")),"stage":if name == "call_lookup" { "lookup" } else { "result" },"execution":execution,"confirmation":confirmation,"approval":approval,"retry":if matches!(confirmation, "unknown" | "pending") { "lookup_same_ref" } else { "none"}});
-    value
-}
-
 fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEvent> {
     match agent {
         triage::Provider::Codex => {
@@ -1834,8 +1754,8 @@ fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEve
                     .map(|_| line)
                 })
                 .unwrap_or_default();
-            let meta = triage::rollout_meta(&first);
-            triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+            let meta = observation::rollout_meta(&first);
+            observation::interactive_codex(&meta["source"], meta["originator"].as_str())
                 .then(|| triage::from_hook(agent, input, 0))
                 .flatten()
         }
@@ -2478,6 +2398,18 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(vibeface_bridge::platform::privatefs::is_executable(path));
+    }
 
     const TEST_PRIVATE_NODE: &str = if cfg!(windows) {
         r"C:\vibeface\private\node"

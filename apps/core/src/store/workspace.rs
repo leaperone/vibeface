@@ -607,6 +607,34 @@ impl Graph {
     fn channel(&self, channel_id: &str) -> Result<&Channel> {
         self.channels.get(channel_id).context("channel not found")
     }
+    fn work_ready(&self, assignment: &Assignment, task: &WorkspaceTask) -> bool {
+        task.action == TaskAction::Continue
+            && !task.reply_only
+            && matches!(
+                assignment.state,
+                AssignmentState::Accepted | AssignmentState::Adopted
+            )
+            && (task.revision == assignment.started_revision
+                || assignment.adopted_revision == Some(task.revision))
+            && task.dependencies.iter().all(|id| {
+                self.tasks
+                    .get(id)
+                    .is_some_and(|task| task.state == TaskState::Completed)
+            })
+            && (!assignment.automatic
+                || self
+                    .assignments
+                    .values()
+                    .filter(|other| {
+                        other.automatic
+                            && self
+                                .tasks
+                                .get(&other.task_id)
+                                .is_some_and(|other| other.root_task_id == task.root_task_id)
+                    })
+                    .count()
+                    <= MAX_AUTOMATIC_ASSIGNMENTS)
+    }
     fn dependencies(&self, task_id: &str, dependencies: &[String]) -> Result<()> {
         for dependency in dependencies {
             ensure!(dependency != task_id, "a task cannot depend on itself");
@@ -1914,13 +1942,6 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                             && match &parent.body {
                                 EventBody::InputPosted {
                                     message_id,
-                                    attestation: Some(_),
-                                    ..
-                                }
-                                | EventBody::MessagePosted {
-                                    message_id,
-                                    role: Role::User,
-                                    answers: None,
                                     attestation: Some(_),
                                     ..
                                 } => message_id == &cause.message_id,
@@ -4311,38 +4332,12 @@ pub(crate) fn assignment_work_allowed_from(
     let Some(task) = graph.tasks.get(&assignment.task_id) else {
         return Ok(false);
     };
-    if !assignment_snapshot_allowed_from(connection, network, &graph, assignment)?
-        || assignment.execution_node != dispatcher
-        || bot_scope(connection, network, &assignment.bot_id)? != conversation
-        || task.reply_only
-        || !matches!(
-            assignment.state,
-            AssignmentState::Accepted | AssignmentState::Adopted
-        )
-        || (task.revision != assignment.started_revision
-            && assignment.adopted_revision != Some(task.revision))
-        || task.dependencies.iter().any(|id| {
-            graph
-                .tasks
-                .get(id)
-                .is_none_or(|task| task.state != TaskState::Completed)
-        })
-    {
-        return Ok(false);
-    }
-    Ok(!assignment.automatic
-        || graph
-            .assignments
-            .values()
-            .filter(|other| {
-                other.automatic
-                    && graph
-                        .tasks
-                        .get(&other.task_id)
-                        .is_some_and(|other| other.root_task_id == task.root_task_id)
-            })
-            .count()
-            <= MAX_AUTOMATIC_ASSIGNMENTS)
+    Ok(
+        assignment_snapshot_allowed_from(connection, network, &graph, assignment)?
+            && assignment.execution_node == dispatcher
+            && bot_scope(connection, network, &assignment.bot_id)? == conversation
+            && graph.work_ready(assignment, task),
+    )
 }
 
 fn assignment_proof_events(
@@ -4575,38 +4570,12 @@ pub(crate) fn assignment_work_source_matches_from(
     };
     if task.revision != revision
         || task.current_assignment.as_deref() != Some(assignment_id)
-        || task.action != TaskAction::Continue
-        || task.reply_only
-        || !matches!(
-            assignment.state,
-            AssignmentState::Accepted | AssignmentState::Adopted
-        )
-        || (revision != assignment.started_revision
-            && assignment.adopted_revision != Some(revision))
+        || !graph.work_ready(assignment, task)
         || !refs.contains(&assignment.event_hash)
         || !assignment
             .source_event
             .as_ref()
             .is_some_and(|source| refs.contains(source))
-        || task.dependencies.iter().any(|id| {
-            graph
-                .tasks
-                .get(id)
-                .is_none_or(|task| task.state != TaskState::Completed)
-        })
-        || (assignment.automatic
-            && graph
-                .assignments
-                .values()
-                .filter(|other| {
-                    other.automatic
-                        && graph
-                            .tasks
-                            .get(&other.task_id)
-                            .is_some_and(|other| other.root_task_id == task.root_task_id)
-                })
-                .count()
-                > MAX_AUTOMATIC_ASSIGNMENTS)
     {
         return Ok(false);
     }

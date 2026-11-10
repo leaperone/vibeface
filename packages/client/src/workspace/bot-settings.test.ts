@@ -223,7 +223,7 @@ test('Memory state, result and metadata fail closed on malformed or mismatched r
   assert.throws(() => parseMemoryControlResult({ ...result, operation_id: 'f'.repeat(64) }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: memoryState() }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, memory_id: 'other' } }, 'memory', operationId))
-  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { epoch: 0 }, { epoch: 2 }, { epoch: 12 }]) {
+  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { origin: 'review' }, { epoch: 0 }, { epoch: 2 }, { epoch: 12 }]) {
     assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, metadata: { ...result.current.metadata, ...invalid } } }, 'memory', operationId))
   }
   assert.throws(() => parseMemoryControlResult({ ...result, state: 'success' }, 'memory', operationId))

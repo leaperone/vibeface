@@ -7,7 +7,6 @@ use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
-use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
 use std::collections::HashSet;
@@ -1182,21 +1181,7 @@ where
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
     let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
-    let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-        ManagerError {
-            stage: stage.current(),
-            outcome,
-            start: *start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            session_id: session.map(str::to_owned),
-            failure: ExecFailure {
-                detail: manager::redact_string(failure.detail, &secrets),
-                ..failure
-            },
-        }
-        .into()
-    };
+    let error = ManagerError::reporter(&stage, &start, &secrets);
     // Faults of this Node's own bookkeeping, not of Claude Code.
     let own = |detail: &str| ExecFailure::new(FailureKind::Unknown, detail);
     let stopped = |session: Option<&str>| {
@@ -2082,70 +2067,13 @@ impl Executor for Claude {
     }
 }
 
-/// What a `PermissionRequest` of the owner's own session asks, for the bot: the tool and what
-/// the model said it is for, never the command or the file contents, and how to answer.
-pub(crate) fn describe_request(input: &Value) -> String {
-    let tool = input["tool_name"].as_str().unwrap_or("a tool");
-    let tool_input = &input["tool_input"];
-    if request_kind(input) == RequestKind::Question {
-        let questions = crate::triage::question_lines(&tool_input["questions"]);
-        return format!(
-            "Claude Code asks: {}. Answer with {{\"answers\":{{\"QUESTION\":\"ANSWER\"}}}}.",
-            questions.join("; ")
-        );
-    }
-    let what = tool_input["description"]
-        .as_str()
-        .or_else(|| tool_input["file_path"].as_str())
-        .map(|what| format!(": {what}"))
-        .unwrap_or_default();
-    format!(
-        "{tool}{what}. Answer with {{\"behavior\":\"allow\"}} or {{\"behavior\":\"deny\",\"message\":\"WHY\"}}."
-    )
-}
-
-/// `AskUserQuestion` asks a question; every other tool asks permission.
-pub(crate) fn request_kind(input: &Value) -> RequestKind {
-    match input["tool_name"] == "AskUserQuestion" {
-        true => RequestKind::Question,
-        false => RequestKind::Permission,
-    }
-}
-
-/// What `vibeface hook claude` prints for the answer to its `PermissionRequest`: allow, with
-/// the question's answers filled in, or deny. An allow never changes the tool's input. `None`
-/// prints nothing, which leaves the decision to the session, as for `{"decision":null}`, an
-/// allow that carries `updatedInput`, or an answer that fits neither.
-pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
-    if input["hook_event_name"] != "PermissionRequest" {
-        return None;
-    }
-    let decision = match (&answer["answers"], answer["behavior"].as_str()) {
-        (Value::Object(answers), _) if request_kind(input) == RequestKind::Question => {
-            if !answers.values().all(Value::is_string) {
-                return None;
-            }
-            let mut updated = input["tool_input"].clone();
-            updated.as_object_mut()?;
-            updated["answers"] = Value::Object(answers.clone());
-            json!({"behavior":"allow","updatedInput":updated})
-        }
-        // What was approved is what runs: an allow that rewrites the input is not this
-        // approval, so it prints nothing and the session asks again.
-        (_, Some("allow")) if answer.get("updatedInput").is_some() => return None,
-        (_, Some("allow")) => json!({"behavior":"allow"}),
-        (_, Some("deny")) => json!({"behavior":"deny",
-            "message":answer["message"].as_str().unwrap_or("The owner's bot declined this."),
-            "interrupt":answer["interrupt"] == true}),
-        _ => return None,
-    };
-    Some(json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":decision}}))
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::identity::{Genesis, Member, NetworkState};
+    use crate::runtime::test_support::{
+        assert_work_outcome, join_network, manager_settings, open_node, provider_work,
+    };
+    use crate::triage::{RequestKind, cli_hooks::hook_output};
     use crate::work::WorkState;
 
     fn fixture() -> PathBuf {
@@ -2545,28 +2473,83 @@ pub(super) mod tests {
         std::fs::File::create(place.dir.join("concurrent-release")).unwrap();
     }
 
-    fn concurrent_claude_turns(
-        place: &Place,
-        prompts: Vec<String>,
-    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
-        prompts
-            .into_iter()
-            .enumerate()
-            .map(|(index, prompt)| {
-                let config = gated_config(place, &format!("client-{index}"));
-                tokio::spawn(async move {
-                    manager::run_manager(
-                        &config,
-                        &prompt,
-                        None,
-                        |_| async { Ok(()) },
-                        tokio::sync::watch::channel(false).1,
-                        |_| async { Ok(()) },
-                    )
-                    .await
-                })
-            })
-            .collect()
+    async fn concurrent_claude_turns(place: &Place, first: Option<ManagerFailure>) -> Result<()> {
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for index in 0..16 {
+            let config = gated_config(place, &format!("client-{index}"));
+            let prompt = if index == 0 && first == Some(ManagerFailure::Failed) {
+                "fail marker-0".into()
+            } else {
+                format!("marker-{index}")
+            };
+            let (stop, cancel) = tokio::sync::watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                crate::manager::run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        let gated = async {
+            wait_for_gate(place).await?;
+            if first.is_none() {
+                assert_eq!(place.user_frames(), 16);
+            }
+            if first == Some(ManagerFailure::Cancelled) {
+                stops[0].send(true)?;
+                wait_for_interrupt(place).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        release(place);
+        let mut results = Vec::with_capacity(16);
+        for task in tasks {
+            results.push(task.await);
+        }
+        gated?;
+        let mut sessions = std::collections::HashSet::new();
+        for (index, result) in results.into_iter().enumerate() {
+            let result = result?;
+            if index == 0 && first.is_some() {
+                let error = result.err().context("first claude turn")?;
+                let error = error
+                    .downcast_ref::<ManagerError>()
+                    .context("manager error")?;
+                if first == Some(ManagerFailure::Cancelled) {
+                    assert!(error.cancelled());
+                } else {
+                    assert_eq!(error.outcome, ManagerFailure::Failed);
+                }
+            } else {
+                let result = result?;
+                if first.is_none() {
+                    sessions.insert(result.session_id.context("claude session")?);
+                }
+                assert_eq!(result.output, format!("done: marker-{index}"));
+            }
+        }
+        if first.is_none() {
+            assert_eq!(sessions.len(), 16);
+        }
+        if first == Some(ManagerFailure::Cancelled) {
+            assert_eq!(
+                place
+                    .log()
+                    .iter()
+                    .filter(|entry| entry["subtype"] == "interrupt")
+                    .count(),
+                1
+            );
+        }
+        Ok(())
     }
 
     /// One bot turn; returns its result, the session saved first, and the progress shown.
@@ -3241,103 +3224,19 @@ time.sleep(0.05)
     #[tokio::test]
     async fn sixteen_claude_turns_overlap_and_keep_their_outputs() -> Result<()> {
         let place = Place::new()?;
-        let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
-        let tasks = concurrent_claude_turns(&place, prompts.clone());
-        wait_for_gate(&place).await?;
-        assert_eq!(place.user_frames(), 16);
-        release(&place);
-        let mut sessions = std::collections::HashSet::new();
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await??;
-            sessions.insert(result.session_id.context("Claude session")?);
-            assert_eq!(result.output, format!("done: marker-{index}"));
-        }
-        assert_eq!(sessions.len(), 16);
-        Ok(())
+        concurrent_claude_turns(&place, None).await
     }
 
     #[tokio::test]
     async fn cancelling_one_of_sixteen_claude_turns_leaves_the_others_running() -> Result<()> {
         let place = Place::new()?;
-        let mut tasks = Vec::with_capacity(16);
-        let mut stops = Vec::with_capacity(16);
-        for index in 0..16 {
-            let config = gated_config(&place, &format!("client-{index}"));
-            let prompt = format!("marker-{index}");
-            let (stop, cancel) = tokio::sync::watch::channel(false);
-            stops.push(stop);
-            tasks.push(tokio::spawn(async move {
-                manager::run_manager(
-                    &config,
-                    &prompt,
-                    None,
-                    |_| async { Ok(()) },
-                    cancel,
-                    |_| async { Ok(()) },
-                )
-                .await
-            }));
-        }
-        wait_for_gate(&place).await?;
-        stops[0].send(true)?;
-        wait_for_interrupt(&place).await?;
-        release(&place);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("cancelled Claude turn")?;
-                assert!(
-                    error
-                        .downcast_ref::<manager::ManagerError>()
-                        .context("manager error")?
-                        .cancelled()
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
-        assert_eq!(
-            place
-                .log()
-                .iter()
-                .filter(|entry| entry["subtype"] == "interrupt")
-                .count(),
-            1
-        );
-        Ok(())
+        concurrent_claude_turns(&place, Some(ManagerFailure::Cancelled)).await
     }
 
     #[tokio::test]
     async fn one_failed_claude_turn_does_not_stop_the_other_fifteen() -> Result<()> {
         let place = Place::new()?;
-        let prompts: Vec<_> = (0..16)
-            .map(|i| {
-                if i == 0 {
-                    "fail marker-0".into()
-                } else {
-                    format!("marker-{i}")
-                }
-            })
-            .collect();
-        let tasks = concurrent_claude_turns(&place, prompts);
-        wait_for_gate(&place).await?;
-        release(&place);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("failed Claude turn")?;
-                assert_eq!(
-                    error
-                        .downcast_ref::<manager::ManagerError>()
-                        .context("manager error")?
-                        .outcome,
-                    ManagerFailure::Failed
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
-        Ok(())
+        concurrent_claude_turns(&place, Some(ManagerFailure::Failed)).await
     }
 
     #[tokio::test]
@@ -3384,7 +3283,6 @@ time.sleep(0.05)
 
     async fn node(place: &Place) -> Result<(Arc<Runtime>, LocalIdentity, String)> {
         let dir = place.dir.join("node");
-        config::private_dir(&dir)?;
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
@@ -3401,10 +3299,6 @@ time.sleep(0.05)
         configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [Provider::Claude].into();
         configuration.bins.insert(Provider::Claude, fixture());
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let mut env = crate::providers::ProviderEnv::default();
         env.apply(
             Provider::Claude,
@@ -3414,18 +3308,9 @@ time.sleep(0.05)
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
-        let mut configuration = Config::load(&dir)?;
         configuration.provider_env = env;
-        configuration.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        node.install_membership(state).await?;
-        let network = node.membership_state().await?.genesis.network_id;
+        let node = open_node(&dir, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         conversation(&node, &admin, &network, "c", "m").await?;
         Ok((node, admin, network))
     }
@@ -3514,23 +3399,9 @@ time.sleep(0.05)
         let local = node.identity.device_id()?;
         Ok(WorkSpec {
             work_id: WorkSpec::id("c", "message:m", call_ref),
-            conversation: "c".into(),
             trigger: "message:m".into(),
-            target: local.clone(),
-            dispatcher: local,
             call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Claude),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Claude,
-                model: None,
-            },
-            cwd: place.dir.join("work").display().to_string(),
-            title: "t".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Claude, &local, &place.dir.join("work"), prompt)
         })
     }
 
@@ -3585,12 +3456,7 @@ time.sleep(0.05)
             "the Node sends it, not the Agent"
         );
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "done: build it");
         let session = derived(SESSION_SEED, &spec.work_id);
         let unsure = WorkRecord {
@@ -3655,12 +3521,7 @@ time.sleep(0.05)
         );
         drop(store);
         let finished = until(&node, &work.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(
             finished.text,
             format!("initial finished\n\ndone: {}", input.message("work-input"))
@@ -3749,12 +3610,7 @@ time.sleep(0.05)
         assert!(!pidfile.exists(), "the restart ended the process it left");
         node.probe_work(&network, &spec.work_id, true).await?;
         let finished = record(&node, &spec.work_id).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "finished while unwatched");
         assert_eq!(place.user_frames(), 1, "the prompt was sent once");
         Ok(())
@@ -3793,12 +3649,7 @@ time.sleep(0.05)
         .await?;
         node.executor(Provider::Claude)?.interrupt(&running).await?;
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Interrupted);
         Ok(())
     }
 
@@ -3945,13 +3796,11 @@ time.sleep(0.05)
     async fn a_permission_request_waits_for_the_bot_and_gets_its_answer() -> Result<()> {
         let place = Place::new()?;
         let (node, _, _) = node(&place).await?;
-        node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-            provider: Provider::Claude,
-            workspace: place.dir.join("work"),
-            model: String::new(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        });
+        node.settings.lock().unwrap().manager = Some(manager_settings(
+            Provider::Claude,
+            place.dir.join("work"),
+            String::new(),
+        ));
         let input = asks(
             "Bash",
             json!({"command":"rm -rf build","description":"Clean the build"}),

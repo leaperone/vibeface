@@ -272,6 +272,28 @@ impl ManagerError {
         }
         .into()
     }
+    /// Snapshots the current attempt evidence and redacts the failure when it is reported.
+    pub(crate) fn reporter<'a>(
+        stage: &'a vibeface_bridge::failure::ProviderTrace,
+        start: &'a std::sync::Mutex<StartEvidence>,
+        secrets: &'a [String],
+    ) -> impl Fn(ManagerFailure, Option<&str>, ExecFailure) -> anyhow::Error + 'a {
+        move |outcome, session_id: Option<&str>, failure: ExecFailure| {
+            Self {
+                stage: stage.current(),
+                outcome,
+                start: *start
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                session_id: session_id.map(str::to_owned),
+                failure: ExecFailure {
+                    detail: redact_string(failure.detail, secrets),
+                    ..failure
+                },
+            }
+            .into()
+        }
+    }
     pub fn uncertain(&self) -> bool {
         self.outcome == ManagerFailure::Unknown
     }
@@ -711,21 +733,7 @@ where
     let secrets = secret_values(config);
     let start = std::sync::Mutex::new(StartEvidence::NotStarted);
     let stage = vibeface_bridge::failure::ProviderTrace::new("codex", ProviderStage::Launch);
-    let error = |outcome, session_id: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-        ManagerError {
-            stage: stage.current(),
-            outcome,
-            start: *start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            session_id: session_id.map(str::to_owned),
-            failure: ExecFailure {
-                detail: redact_string(failure.detail, &secrets),
-                ..failure
-            },
-        }
-        .into()
-    };
+    let error = ManagerError::reporter(&stage, &start, &secrets);
     let failed = |session_id: Option<&str>, failure: ExecFailure| {
         error(ManagerFailure::Failed, session_id, failure)
     };

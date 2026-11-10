@@ -368,10 +368,7 @@ fn validate_attestation(event: &Event) -> Result<()> {
         EventBody::ConversationOwner { cause: Some(_), .. }
         | EventBody::BotCreated { cause: Some(_), .. }
         | EventBody::BotDeleted { cause: Some(_), .. } => UserSignature::Forbidden,
-        EventBody::MessagePosted {
-            role: Role::User, ..
-        }
-        | EventBody::ConversationOwner { .. }
+        EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
         | EventBody::BotDeleted { .. }
         | EventBody::NotificationAcked { .. }
@@ -591,6 +588,14 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(message_id)?;
             match role {
                 Role::User => {
+                    let question = answers
+                        .as_ref()
+                        .context("ordinary user messages use InputPosted")?;
+                    question_id(question)?;
+                    ensure!(
+                        *message_id == format!("a-{question}"),
+                        "an answer's message ID is derived from its question"
+                    );
                     ensure!(
                         report_results.is_some()
                             && in_reply_to.is_none()
@@ -610,13 +615,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                                 .all(|attachment| valid_attachment_name(&attachment.name)),
                         "attachments are ordered by content, once each, with clean file names"
                     );
-                    if let Some(question) = answers {
-                        question_id(question)?;
-                        ensure!(
-                            *message_id == format!("a-{question}"),
-                            "an answer's message ID is derived from its question"
-                        );
-                    }
                 }
                 Role::Assistant => {
                     ensure!(
@@ -1112,17 +1110,18 @@ mod tests {
             let body = client.attest(
                 &network,
                 "conversation",
-                EventBody::MessagePosted {
+                EventBody::InputPosted {
                     message_id: "m-1".into(),
-                    role: Role::User,
+                    target: crate::workspace::InputTarget::BotMain {
+                        bot_id: "conversation".into(),
+                    },
+                    intent: crate::workspace::InputIntent::Continue,
+                    sequence: 1,
+                    expected_revision: None,
                     text: "see files".into(),
                     attachments,
                     report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
                     attestation: None,
-                    failure: None,
                 },
             )?;
             identity.sign_event(Event {
@@ -1141,7 +1140,7 @@ mod tests {
         let blobs = |files: &[Attachment]| files.iter().map(Attachment::blob).collect::<Vec<_>>();
         let signed = sign(files.clone(), blobs(&files))?;
         match verify_signed_event(&network, &signed)?.body {
-            EventBody::MessagePosted { attachments, .. } => assert_eq!(attachments, files),
+            EventBody::InputPosted { attachments, .. } => assert_eq!(attachments, files),
             _ => unreachable!(),
         }
         assert!(
@@ -1181,11 +1180,20 @@ mod tests {
         };
         let network = identity.fixture_network_id()?;
         let client = identity.fixture_admin();
-        let signed_user = client.attest(
-            &network,
-            "conversation",
-            message(Role::User, Some(true), None),
-        )?;
+        let input = || EventBody::InputPosted {
+            message_id: "m-1".into(),
+            target: crate::workspace::InputTarget::BotMain {
+                bot_id: "conversation".into(),
+            },
+            intent: crate::workspace::InputIntent::Continue,
+            sequence: 1,
+            expected_revision: None,
+            text: "hi".into(),
+            attachments: vec![],
+            report_results: Some(true),
+            attestation: None,
+        };
+        let signed_user = client.attest(&network, "conversation", input())?;
         let mut event = Event {
             version: WIRE_VERSION,
             network_id: network.clone(),
@@ -1202,10 +1210,10 @@ mod tests {
         let verified = verify_signed_event(&event.network_id, &signed)?;
         assert_eq!(verified.deps.len(), 2);
         assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
-        event.body = message(Role::User, Some(true), None);
+        event.body = input();
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = signed_user.clone();
-        if let EventBody::MessagePosted { text, .. } = &mut event.body {
+        if let EventBody::InputPosted { text, .. } = &mut event.body {
             *text = "rm -rf".into();
         }
         assert!(identity.sign_event(event.clone()).is_err());
@@ -1229,6 +1237,12 @@ mod tests {
             "bot replies carry no device signature"
         );
         event.body = message(Role::User, None, None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = client.attest(
+            &network,
+            "conversation",
+            message(Role::User, Some(true), None),
+        )?;
         assert!(identity.sign_event(event.clone()).is_err());
         let answer = |id: &str, role, report_results, status| {
             let mut body = message(role, report_results, status);

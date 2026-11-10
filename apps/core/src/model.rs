@@ -446,29 +446,24 @@ pub struct Sender {
 }
 
 /// Where a memory came from. Agent writes are staged until the turn completes; user-controlled
-/// values cannot be replaced by an automatic review.
+/// values cannot be replaced by automatic writes.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryOrigin {
     #[default]
     Agent,
     User,
-    Review,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomaticMemoryOrigin {
     Agent,
-    Review,
 }
 
 impl From<AutomaticMemoryOrigin> for MemoryOrigin {
-    fn from(origin: AutomaticMemoryOrigin) -> Self {
-        match origin {
-            AutomaticMemoryOrigin::Agent => Self::Agent,
-            AutomaticMemoryOrigin::Review => Self::Review,
-        }
+    fn from(_: AutomaticMemoryOrigin) -> Self {
+        Self::Agent
     }
 }
 

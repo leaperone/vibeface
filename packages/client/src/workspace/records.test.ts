@@ -14,6 +14,9 @@ const mainScope: SessionScope = { kind: 'main' }
 const rank = (lamport: number) => `${String(lamport).padStart(20, "0")}:${"0".repeat(20)}:h${lamport}`
 const message = (message_id: string, lamport: number) => ({ message_id, role: "user", text: message_id, event_hash: `e-${message_id}`, created_at_ms: lamport, rank: rank(lamport) })
 const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
+  dispatcher: 'gateway', call_ref: 'dispatch',
+  continues: null, parent: null,
+  thread: null, phase: null,
   work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null }, ...extra,
 })
 const question = (question_id: string, conversation_id: string, answer: unknown = null) => ({

@@ -3,7 +3,7 @@ import test from 'node:test'
 import { availability, canSetProviderEnvironment, parseNodeSettings, probeIssueText, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type WorkCard, type WorkRecord } from './types.ts'
+import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type ResolvedModel, type WorkCard, type WorkRecord } from './types.ts'
 import { parseNotifications } from './model.ts'
 
 const question = (id: string, closed = false): Question => ({
@@ -82,8 +82,16 @@ test('a different pending recovery gets a fresh confirmation card', () => {
 
 test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
   const failed = source(false)
-  const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
-  failed.workspace.openWorks = [{ ...work, resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
+  const work = {
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
+  failed.workspace.openWorks = [
+    { ...work, resolved: { provider: 'codex', model: null } satisfies ResolvedModel },
+    { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } satisfies ResolvedModel },
+    { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' },
+  ]
   failed.workspace.bots = [botRecord]
   assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
 })
@@ -241,7 +249,11 @@ test('scheduler observations distinguish waiting, stopping, publishing, history 
 })
 
 test('losing the entry makes active tasks stale without claiming every target is offline', () => {
-  const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
+  const work: WorkRecord = {
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
   const state = cardState(work, [unready], { state: 'running', outcome: null })
   assert.equal(state, 'running', 'the last target report is still online')
   assert.equal(taskStale(state, false), true)

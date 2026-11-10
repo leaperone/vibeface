@@ -474,6 +474,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::initialize_node;
 
     async fn node(network: NetworkConfig) -> Result<(Arc<Runtime>, PathBuf)> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -483,13 +484,7 @@ mod tests {
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.network = network;
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         node.start_network().await?;
         Ok((node, dir))

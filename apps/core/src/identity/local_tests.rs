@@ -31,7 +31,8 @@ fn fixture() -> Result<Fixture> {
         Member::client(&admin, "admin", true)?,
         Member::node(&LocalIdentity::generate(), "local")?,
     )?)?;
-    store.init_network(state.clone())?;
+    let capability = store.bootstrap_capability()?.capability;
+    store.bootstrap_network(state.clone(), &capability, &admin.device_id()?)?;
     Ok(Fixture {
         dir,
         store,

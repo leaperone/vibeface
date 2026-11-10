@@ -43,7 +43,9 @@ PATH_RULES = (
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
     ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
+    ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
+    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
@@ -55,8 +57,9 @@ PATH_RULES = (
     ("cli", ("apps/cli/*",)),
 )
 WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
-    "store::tests::append_100k_stays_flat",
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
 PLATFORMS = (
@@ -65,7 +68,7 @@ PLATFORMS = (
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+JOBS = ("quick-check", "crypto-web", "web", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 # Only an explicit dispatch runs the hosted Windows and desktop application checks.
 DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
@@ -99,13 +102,19 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly")
         scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
+            scopes.add("mobile")
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
+            scopes.add("desktop")
+        if path.startswith("apps/desktop/src/shared/"):
+            scopes.add("web")
     plan = scope_plan(scopes, event, ref_type, channel)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
 def scope_plan(scopes, event, ref_type, channel):
     if (
-        scopes - {"full", "docs", "web", "www", *DEPENDENTS}
+        scopes - {"full", "docs", "web", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
@@ -122,8 +131,11 @@ def scope_plan(scopes, event, ref_type, channel):
                 affected.add(dependent)
                 pending.extend(DEPENDENTS[dependent])
     packages = [package for crate, package in CRATES.items() if crate in affected]
-    web = full or "web" in scopes or bool(affected & {"node", "cli", "control"})
+    # Mobile behavior tests still live in the Web suite.
+    web = full or bool(scopes & {"web", "mobile"}) or bool(affected & {"node", "cli", "control"})
     www = full or "www" in scopes
+    mobile = full or "mobile" in scopes
+    desktop = full or "desktop" in scopes
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
     platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
@@ -131,13 +143,15 @@ def scope_plan(scopes, event, ref_type, channel):
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
-        "docs_only": not web and not packages,
+        "docs_only": not web and not packages and not mobile and not desktop,
         "event": event,
         "ref_type": ref_type,
         "channel": channel,
         "scopes": sorted(scopes),
         "web": web,
         "www": www,
+        "mobile": mobile,
+        "desktop": desktop,
         "node": "node" in affected,
         "delivery": delivery,
         "rust_packages": packages,
@@ -149,6 +163,10 @@ def scope_plan(scopes, event, ref_type, channel):
     required = {"quick-check"}
     if web:
         required.update(("crypto-web", "web", "package"))
+    if mobile:
+        required.add("mobile-check")
+    if desktop:
+        required.add("desktop-check")
     if packages:
         required.update(("rust-check", "rust-fast"))
     if slow:
@@ -278,6 +296,8 @@ def write_plan(plan, output=None):
             "plan": encoded,
             "web": str(plan["web"]).lower(),
             "www": str(plan["www"]).lower(),
+            "mobile": str(plan["mobile"]).lower(),
+            "desktop": str(plan["desktop"]).lower(),
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
@@ -439,8 +459,25 @@ def self_test():
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]
-    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web", "www"]
-    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web", "www"]
+    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["desktop", "mobile", "web", "www"]
+    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["mobile", "web", "www"]
+    for path in ("apps/desktop/src/main/bounded-read.ts", "apps/desktop/tests/bounded-read.test.ts"):
+        desktop = make_plan([path], "push")
+        assert desktop["scopes"] == ["desktop"] and not desktop["full"]
+        assert desktop["required_jobs"] == ["quick-check", "desktop-check"]
+        assert not desktop["rust_packages"] and not desktop["web"] and not desktop["delivery"]
+        assert not desktop["docs_only"] and not desktop["local_process_modes"]
+    for name in ("contract.ts", "client-contract.ts", "node-view.ts"):
+        shared = make_plan(["apps/desktop/src/shared/" + name])
+        assert shared["scopes"] == ["desktop", "web"]
+        assert shared["required_jobs"] == ["quick-check", "crypto-web", "web", "desktop-check", "package"]
+    for path in ("apps/mobile/app/_layout.tsx", "packages/secure-native/src/index.ts"):
+        mobile = make_plan([path])
+        assert mobile["scopes"] == ["mobile"] and mobile["web"]
+        assert mobile["required_jobs"] == ["quick-check", "crypto-web", "web", "mobile-check", "package"]
+        assert not mobile["rust_packages"] and not mobile["docs_only"]
+    for path in ("packages/client/src/lib/transport.ts", "packages/client/src/avatar/face.ts", "packages/client/src/avatar/derived-faces.json", "packages/theme/theme.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"):
+        assert make_plan([path])["mobile"], path
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
@@ -505,9 +542,10 @@ def self_test():
     assert make_plan(["install.sh"])["node"]
     for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):
         shared = make_plan([path])
-        assert shared["scopes"] == ["node"] and shared["rust_packages"] == ["vibeface-core"] and shared["web"]
+        assert shared["scopes"] == ["mobile", "node"] and shared["rust_packages"] == ["vibeface-core"] and shared["web"]
     for event in ("schedule", "workflow_dispatch", "merge_group"):
         assert make_plan(["README.md"], event)["rust_packages"] == list(PACKAGES)
+        assert make_plan(["README.md"], event)["mobile"] and make_plan(["README.md"], event)["desktop"]
     assert make_plan(["README.md"], "push")["docs_only"]
     assert make_plan(["apps/app/src/a.tsx"], "push")["rust_packages"] == []
     assert make_plan(["README.md"], "push", ref_type="tag")["test_tiers"] == ["fast", "slow"]
@@ -526,6 +564,18 @@ def self_test():
         assert extended["package_matrix"]["include"] == list(PLATFORMS)
         assert extended["package_mode"] == "node"
     needs = {job: {"result": "success" if job in web["required_jobs"] else "skipped"} for job in JOBS}
+    for source, check in (("apps/desktop/src/main/bounded-read.ts", "desktop-check"), ("apps/mobile/app/_layout.tsx", "mobile-check")):
+        selected = make_plan([source])
+        selected_needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
+        selected_needs["plan"] = {"result": "success"}
+        gate(selected_needs, selected)
+        for outcome in ("skipped", "failure", "cancelled"):
+            rejected = json.loads(json.dumps(selected_needs))
+            rejected[check]["result"] = outcome
+            expect_failure(lambda: gate(rejected, selected))
+        rejected = dict(selected_needs)
+        del rejected[check]
+        expect_failure(lambda: gate(rejected, selected))
     needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(web)}}
     gate(needs)
     for result in ("failure", "cancelled", "skipped", "missing"):
@@ -669,6 +719,20 @@ def self_test():
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
     workflow = (root / ".github/workflows/ci.yml").read_text()
+    ci_gate = workflow.split("\n  ci-gate:\n", 1)[1]
+    for job, output in (("mobile-check", "mobile"), ("desktop-check", "desktop")):
+        assert f"{output}: ${{{{ steps.select.outputs.{output} }}}}" in workflow
+        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
+        assert "    needs: plan\n" in block and f"needs.plan.outputs.{output} == 'true'" in block
+        assert job in ci_gate.split("    runs-on:", 1)[0]
+    web_build = (root / "scripts/build-web.sh").read_text()
+    assert '--filter "vibeface-mobile..."' in web_build, "Web behavior tests read Mobile package helpers"
+    assert "pnpm --filter @vibeface/secure-native run typecheck" not in web_build
+    assert "pnpm --filter vibeface-mobile run typecheck" not in web_build
+    for name in ("mobile.yml", "release.yml"):
+        standalone = (root / ".github/workflows" / name).read_text()
+        assert "pnpm --filter @vibeface/secure-native run typecheck" in standalone
+        assert "pnpm --filter vibeface-mobile run typecheck" in standalone
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
     assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency

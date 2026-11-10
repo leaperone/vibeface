@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { Link, type Href } from 'expo-router'
-import { Asterisk, Braces, Check, ChevronRight, Copy, MousePointer2, Pi, SquareTerminal, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
-import { Children, Fragment, isValidElement, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Asterisk, Braces, Check, ChevronRight, CircleAlert, CircleCheck, Copy, Info, MousePointer2, Pi, SquareTerminal, TriangleAlert, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { Children, Fragment, isValidElement, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { AccessibilityInfo, Pressable, View } from 'react-native'
 import Animated, { LayoutAnimationConfig, useAnimatedStyle, useReducedMotion, useSharedValue, withTiming } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
@@ -10,7 +10,7 @@ import type { ProviderId } from '@vibeface/client/lib/node.ts'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
-import { fadeIn, glide } from '@/lib/motion'
+import { fadeIn, fadeOut, glide, move } from '@/lib/motion'
 import { cn } from '@/lib/utils'
 
 const AnimatedView = withUniwind(Animated.View)
@@ -176,4 +176,33 @@ export function botTint(hue: number, dark: boolean) {
   return dark
     ? { fill: oklch(0.78, 0.09, hue), ink: oklch(0.2, 0.03, hue), edge: oklch(0.42, 0.05, hue), glow }
     : { fill: oklch(0.45, 0.1, hue), ink: '#fff', edge: oklch(0.86, 0.04, hue), glow }
+}
+
+type ToastItem = { id: number; text: string; tone: Tone }
+let toasts: ToastItem[] = []
+let toastId = 0
+const toastListeners = new Set<() => void>()
+const emitToasts = () => { for (const listener of toastListeners) listener() }
+const subscribeToasts = (listener: () => void) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }
+const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
+
+/** A passing word about what just happened, as the web's toast: two at most, gone after 3 s, read out by VoiceOver. Anything to act on goes to 待处理 instead. */
+export function toast(text: string, tone: Tone = 'neutral') {
+  const item = { id: ++toastId, text, tone }
+  toasts = [...toasts, item].slice(-2)
+  emitToasts()
+  // Queued, so the focus change that usually follows the action does not cut it off.
+  AccessibilityInfo.announceForAccessibilityWithOptions(text, { queue: true })
+  setTimeout(() => { toasts = toasts.filter((entry) => entry.id !== item.id); emitToasts() }, 3000)
+}
+
+/** Mounted once at the root, `bottom` clear of the tab bar. */
+export function Toaster({ bottom }: { bottom: number }) {
+  const items = useSyncExternalStore(subscribeToasts, () => toasts)
+  return <View pointerEvents="none" className="absolute inset-x-0 items-center gap-2 px-4" style={{ bottom }}>
+    {items.map((item) => <AnimatedView key={item.id} entering={fadeIn} exiting={fadeOut} layout={move} accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
+      className="w-full max-w-sm flex-row items-center gap-2 rounded-xl border border-border bg-popover px-3 py-2 shadow-lg">
+      <Icon as={toastIcon[item.tone]} className={cn('size-4', toneText[item.tone])} /><Text className="min-w-0 flex-1 text-meta text-popover-foreground">{item.text}</Text>
+    </AnimatedView>)}
+  </View>
 }

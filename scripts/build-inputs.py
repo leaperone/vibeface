@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,7 +19,7 @@ OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("apps/app/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
+    "web": ("apps/app/", "apps/desktop/src/shared/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 CACHE_POLICIES = (
@@ -195,6 +196,15 @@ def self_test():
         defaults = repo / "config/public-bootstrap.json"
         defaults.parent.mkdir()
         defaults.write_text('{"issuer":"fixture-one"}')
+        shared = repo / "apps/desktop/src/shared"
+        shared.mkdir(parents=True)
+        shared_sources = [shared / name for name in ("node-view.ts", "contract.ts", "client-contract.ts")]
+        for path in shared_sources:
+            path.write_text("export const fixture = 'original'\n")
+        desktop_main = repo / "apps/desktop/src/main/index.ts"
+        desktop_main.parent.mkdir(parents=True)
+        desktop_main.write_text("desktop main original\n")
+        subprocess.run(["git", "add", "apps/desktop/src"], cwd=repo, check=True)
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
@@ -229,59 +239,50 @@ def self_test():
         public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")
-        try:
+        with TestCase().assertRaises(ValueError, msg='untracked public asset was accepted'):
             sources(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("untracked public asset was accepted")
         (public / ".env").unlink()
         receipt = repo / OUTPUTS["crypto"] / RECEIPT
         saved_receipt = receipt.read_bytes()
         receipt.unlink()
-        try:
+        with TestCase().assertRaises(ValueError, msg='missing receipt was accepted'):
             check(repo, "crypto")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("missing receipt was accepted")
         receipt.write_bytes(saved_receipt)
         output = repo / OUTPUTS["web"]
         (output / "private-note").write_text("must not ship")
-        try:
+        with TestCase().assertRaises(ValueError, msg='extra output was accepted'):
             check(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("extra output was accepted")
         (output / "private-note").unlink()
         defaults.write_text('{"issuer":"fixture-two"}')
         check(repo, "crypto")
-        try:
+        with TestCase().assertRaises(ValueError, msg='changed public bootstrap defaults reused stale web output'):
             check(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("changed public bootstrap defaults reused stale web output")
         defaults.write_text('{"issuer":"fixture-one"}')
+        check(repo, "web")
+        for path in shared_sources:
+            original = path.read_text()
+            path.write_text("export const fixture = 'changed'\n")
+            check(repo, "crypto")
+            try:
+                check(repo, "web")
+            except ValueError as error:
+                assert str(error) == "web source inputs changed; run its build script"
+            else:
+                raise AssertionError(f"changed {path.relative_to(repo)} reused stale web output")
+            path.write_text(original)
+            check(repo, "web")
+        desktop_main.write_text("desktop main changed\n")
+        check(repo, "crypto")
         check(repo, "web")
         (repo / "Cargo.toml").write_text("changed source")
         for component in OUTPUTS:
-            try:
+            with TestCase().assertRaises(ValueError, msg='stale source was accepted'):
                 check(repo, component)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("stale source was accepted")
         prepare(repo, "crypto")
         assert not (repo / OUTPUTS["crypto"] / "asset").exists()
         (repo / "Cargo.toml").write_text("changed while building")
-        try:
+        with TestCase().assertRaises(ValueError, msg='mid-build source change was accepted'):
             finish(repo, "crypto")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("mid-build source change was accepted")
     print("Build input self-test passed")
 
 

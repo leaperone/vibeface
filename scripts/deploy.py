@@ -14,6 +14,7 @@ import shutil
 from unittest.mock import patch
 
 import release
+from unittest import TestCase
 
 SERVICES = ('all', 'node', 'app', 'www')
 REPOSITORY = 'leaperone/vibeface'
@@ -216,23 +217,15 @@ def self_test():
     assert verify(tag, historical, historical_public, sha)
     for field, value in [('draft', True), ('prerelease', False), ('tag_name', 'v0.0.1')]:
         bad = dict(published, **{field: value})
-        try:
+        with TestCase().assertRaises(ValueError, msg=field):
             verify(tag, manifest, bad, sha)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(field)
     for mutate in (lambda m: m['assets'].pop(),
                    lambda m: m.update(source_commit='c' * 40),
                    lambda m: m['assets'].append(m['assets'][0]),
                    lambda m: m['assets'][0].update(sha256='invalid')):
         bad = copy.deepcopy(manifest); mutate(bad)
-        try:
+        with TestCase().assertRaises(ValueError, msg='accepted invalid manifest'):
             verify(tag, bad, published, sha)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('accepted invalid manifest')
     content = json.dumps(historical)
     remote = copy.deepcopy(historical_public)
     manifest_asset = next(a for a in remote['assets'] if a['name'] == 'release.json')
@@ -250,12 +243,8 @@ def self_test():
         source_gate.assert_called_once_with(sha, 'product')
         for route, bad in ((f'repos/{REPOSITORY}/releases/assets/1', content + ' '),):
             saved = routes[route]; routes[route] = bad
-            try:
+            with TestCase().assertRaises(ValueError, msg='accepted changed manifest or non-main source'):
                 plan(tag)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('accepted changed manifest or non-main source')
             routes[route] = saved
     def listed(name, date, draft=False, complete=True):
         names = {f'vibeface-core-{name[1:]}-x86_64-unknown-linux-gnu.tar.gz',
@@ -327,12 +316,8 @@ def self_test():
     assert selection('all', tag) == ['node', 'app']
     assert selection('www', 'www-v0.0.1') == ['www']
     for service, wrong_tag in (('www', tag), ('app', 'www-v0.0.1'), ('all', 'www-v0.0.1')):
-        try:
+        with TestCase().assertRaises(ValueError, msg='accepted wrong deployment group'):
             selection(service, wrong_tag)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('accepted wrong deployment group')
     scratch = release.ROOT / '.artifacts'
     scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=scratch, prefix='deploy-check-') as temp:

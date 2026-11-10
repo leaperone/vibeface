@@ -19,6 +19,7 @@ import uuid
 
 import deploy
 import release
+from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -364,12 +365,8 @@ def self_test():
     assert transport(base) == ('host.example', 'deploy', '22')
     for key, value in (('DEPLOY_HOST', '-oProxyCommand=bad'), ('DEPLOY_USER', 'x;id'),
                        ('DEPLOY_PORT', '0'), ('DEPLOY_PORT', '65536'), ('DEPLOY_SSH_KEY', '')):
-        try:
+        with TestCase().assertRaises(ValueError, msg='accepted invalid transport'):
             transport(dict(base, **{key: value}))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('accepted invalid transport')
     import runpy
     from unittest.mock import patch
     validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']

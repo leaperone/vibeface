@@ -133,24 +133,6 @@ pub struct SessionConfig {
     pub provider: Provider,
 }
 
-#[cfg(test)]
-pub fn queue_hold_reason(
-    state: &JobState,
-    active: bool,
-    steering_unsettled: bool,
-) -> Option<QueueHoldReason> {
-    if !matches!(state, JobState::Queued) {
-        return None;
-    }
-    if active {
-        return Some(QueueHoldReason::ActiveTurn);
-    }
-    if steering_unsettled {
-        return Some(QueueHoldReason::SteeringSettlement);
-    }
-    None
-}
-
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
 }
@@ -838,28 +820,5 @@ mod lane_tests {
         assert_eq!(TriggerKind::AgentTask.lane(), AgentLane::Task);
         assert_eq!(TriggerKind::Schedule.lane(), AgentLane::ScheduleRoutine);
         assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
-    }
-
-    #[test]
-    fn queued_jobs_explain_their_wait_boundary() {
-        assert_eq!(
-            queue_hold_reason(&JobState::Queued, true, false),
-            Some(QueueHoldReason::ActiveTurn)
-        );
-        assert_eq!(
-            queue_hold_reason(&JobState::Queued, false, true),
-            Some(QueueHoldReason::SteeringSettlement)
-        );
-        assert_eq!(
-            queue_hold_reason(
-                &JobState::Cancelled {
-                    attempt: None,
-                    evidence: "stopped".into()
-                },
-                true,
-                false
-            ),
-            None
-        );
     }
 }

@@ -13,9 +13,6 @@ fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     let value = tracked
         .get("resolved")
         .context("the Node returned no frozen model selection")?;
-    value
-        .get("model")
-        .context("the frozen model selection has no model")?;
     let resolved_model = value
         .get("model")
         .context("the frozen model selection has no model")?;

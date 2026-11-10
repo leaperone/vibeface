@@ -164,6 +164,25 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn manager_access_fixture(
+        &self,
+        token: &str,
+        access: Access,
+        attempt_id: &str,
+        trigger: &str,
+        provider: crate::providers::Provider,
+    ) -> Result<Access> {
+        self.register_manager_attempt_fixture(token.into(), access, attempt_id, trigger, provider)
+            .await?;
+        self.agent_tokens
+            .lock()
+            .await
+            .get(token)
+            .cloned()
+            .context("registered tool token")
+    }
+
     /// The provider a reply of this process runs on.
     #[cfg(test)]
     pub(super) async fn attempt_provider(
@@ -755,6 +774,7 @@ impl Runtime {
 #[cfg(all(test, unix))]
 pub(super) mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, manager_settings};
 
     pub(in crate::runtime) async fn pending_manager(
         node: &Runtime,
@@ -789,15 +809,7 @@ pub(super) mod tests {
             .into_iter()
             .find(|check| check.attempt_id == attempt)
             .context("fixture pending check")?;
-        Ok((
-            Access {
-                network_id: network,
-                human: true,
-                conversation_id: Some("c".into()),
-                manager: None,
-            },
-            check,
-        ))
+        Ok((test_access(network, true, Some("c".into())), check))
     }
 
     #[tokio::test]
@@ -816,13 +828,7 @@ pub(super) mod tests {
             {
                 let mut settings = node.settings.lock().unwrap();
                 settings.roots = vec![root.clone()];
-                settings.manager = Some(crate::config::ManagerSettings {
-                    provider: crate::providers::Provider::Codex,
-                    workspace: root,
-                    model: "fixture".into(),
-                    reasoning_effort: None,
-                    backup: Default::default(),
-                });
+                settings.manager = Some(manager_settings(crate::providers::Provider::Codex, root, "fixture".into()));
             }
             super::super::triage::tests::bot(&node, &admin, "c", "Task Bot", &[]).await?;
             let network = node.store.lock().await.network()?.context("network")?;
@@ -853,9 +859,7 @@ pub(super) mod tests {
                 store.started_workspace_assignment(&node.identity, &network, &job, now_ms())?;
                 (job, first, attempt)
             };
-            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), Access {
-                network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None,
-            }, &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
+            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), test_access(network.clone(), false, Some("c".into())), &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
             drop(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await?);
             {
                 let mut store = node.store.lock().await;

@@ -327,8 +327,6 @@ pub enum Signal {
     InterruptTimedOut,
     /// The DAG already holds a settled result (the user's signed choice); no event is implied.
     Settled(WorkOutcome),
-    /// The coordination process of an unverified agent task is gone; its turn did not finish.
-    ProcessExited,
     /// An agent task's coordination turn ended; its reply is the result. `failure` names the
     /// execution failure that ended it, if one did.
     Concluded {
@@ -681,12 +679,6 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 )
             }
         },
-        (Unverified { handle: None, .. }, Signal::ProcessExited) => finish(
-            record,
-            WorkOutcome::Interrupted,
-            Some("Bot 进程已退出，任务没有做完".into()),
-            Some(FailureKind::Lost),
-        ),
         (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
             None

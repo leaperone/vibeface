@@ -23,8 +23,18 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 
 [[domain_check]]
 name = "Web build and packaged resources"
-trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
+trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "apps/desktop/src/shared/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
+
+[[domain_check]]
+name = "Mobile types"
+trigger_paths = ["apps/mobile/**", "packages/secure-native/**", "packages/client/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+command = "pnpm --filter @vibeface/client run typecheck && pnpm --filter @vibeface/secure-native run typecheck && pnpm --filter vibeface-mobile run typecheck"
+
+[[domain_check]]
+name = "Desktop source"
+trigger_paths = ["apps/desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+command = "pnpm --dir apps/desktop typecheck && pnpm --dir apps/desktop test && pnpm --dir apps/desktop build"
 
 [[domain_check]]
 name = "Static www portal"

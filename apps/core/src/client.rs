@@ -3,8 +3,9 @@
 //! Both ends prove their device key inside the Noise handshake. Membership is read again for
 //! every request, so a device that joins mid-session gains access and a revoked one loses it.
 
+#[cfg(test)]
+use crate::crypto::LocalIdentity;
 use crate::{
-    crypto::LocalIdentity,
     identity::{
         AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, LAST_MANAGER, Member,
         NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
@@ -34,6 +35,7 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc, time::Instant};
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
 use vibeface_protocol::valid_business_id;
 use vibeface_secure::{
@@ -58,6 +60,7 @@ const QUEUED_FRAMES: usize = 4;
 static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 const GUEST_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
 type NativeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -65,6 +68,7 @@ type NativeSocket =
 /// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
 pub enum ClientSocket {
     Server(Box<WebSocket>),
+    #[cfg(test)]
     Client(Box<NativeSocket>),
     Forwarded(Box<Forwarded>),
 }
@@ -111,6 +115,7 @@ impl ClientSocket {
     pub async fn next(&mut self) -> Option<Result<Message>> {
         match self {
             Self::Server(socket) => socket.next().await.map(|frame| frame.map_err(Into::into)),
+            #[cfg(test)]
             Self::Client(socket) => loop {
                 let frame = match socket.next().await? {
                     Ok(frame) => frame,
@@ -132,6 +137,7 @@ impl ClientSocket {
     pub async fn send(&mut self, message: Message) -> Result<()> {
         match self {
             Self::Server(socket) => socket.send(message).await.map_err(Into::into),
+            #[cfg(test)]
             Self::Client(socket) => socket
                 .send(match message {
                     Message::Text(text) => NativeMessage::Text(text.as_str().to_owned().into()),
@@ -234,26 +240,13 @@ struct Principal {
     can_manage: bool,
 }
 
-pub struct Client {
+#[cfg(test)]
+struct FrameClient {
     socket: ClientSocket,
     channel: Channel,
 }
-impl Client {
-    /// Connects through the Gateway at `origin` and pins `target`'s device key.
-    pub async fn connect(origin: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
-        let (socket, _) = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::connect_async(client_url(origin)?),
-        )
-        .await
-        .context("Gateway connection timed out")??;
-        let mut socket = ClientSocket::Client(Box::new(socket));
-        let connect = serde_json::to_string(&Connect::Connect {
-            target: target.to_owned(),
-        })?;
-        socket.send(Message::Text(connect.into())).await?;
-        Self::from_socket(socket, identity, target).await
-    }
+#[cfg(test)]
+impl FrameClient {
     async fn from_socket(
         mut socket: ClientSocket,
         identity: &LocalIdentity,
@@ -274,7 +267,7 @@ impl Client {
         .context("client handshake timed out")??;
         Ok(Self { socket, channel })
     }
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = Request {
             id: id.clone(),
@@ -1692,26 +1685,6 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     Ok(())
 }
 
-/// `http(s)://host` → `ws(s)://host/api/client`.
-fn client_url(origin: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(origin)?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => bail!("Gateway URL must be HTTP or HTTPS"),
-    };
-    ensure!(
-        url.host_str().is_some() && url.username().is_empty() && url.password().is_none(),
-        "Gateway URL must not contain credentials"
-    );
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("invalid Gateway URL"))?;
-    url.set_path("/api/client");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.into())
-}
-
 /// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
     Ok(Ticket::from_link(link)?)
@@ -2260,6 +2233,7 @@ async fn send_value<T: Serialize>(
     }
     Ok(())
 }
+#[cfg(test)]
 async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
         if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
@@ -2272,6 +2246,17 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
+
+    fn test_session(device_id: String) -> Session {
+        Session {
+            device_id,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+            operator: false,
+        }
+    }
 
     /// A ticket entry known only by device ID, found on the mesh or through relays.
     fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
@@ -2285,7 +2270,7 @@ mod tests {
         async fn connect(
             node: Arc<Runtime>,
             admin: &LocalIdentity,
-        ) -> Result<(Client, tokio::task::JoinHandle<Result<()>>)> {
+        ) -> Result<(FrameClient, tokio::task::JoinHandle<Result<()>>)> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let (client, accepted) = tokio::join!(
                 tokio::net::TcpStream::connect(listener.local_addr()?),
@@ -2311,7 +2296,8 @@ mod tests {
                 None,
             ));
             Ok((
-                Client::from_socket(ClientSocket::Client(Box::new(client)), admin, &target).await?,
+                FrameClient::from_socket(ClientSocket::Client(Box::new(client)), admin, &target)
+                    .await?,
                 serving,
             ))
         }
@@ -2321,7 +2307,7 @@ mod tests {
         /// pong is back it has read every frame in order, even one whose dispatch then blocks.
         /// Returns whether a heartbeat ping arrived first: tungstenite answers that with a pong
         /// of its own, which is then still on the wire.
-        async fn ping(client: &mut Client, frames: &[Vec<u8>]) -> Result<bool> {
+        async fn ping(client: &mut FrameClient, frames: &[Vec<u8>]) -> Result<bool> {
             let ClientSocket::Client(socket) = &mut client.socket else {
                 unreachable!()
             };
@@ -2458,12 +2444,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
             assert!(!node.has_membership().await?);
@@ -2555,12 +2536,7 @@ mod tests {
             let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
             configuration.network = network;
             configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-            configuration.save(dir)?;
-            config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&LocalIdentity::generate())?,
-            )?;
+            initialize_node(dir, &configuration, &LocalIdentity::generate())?;
             Ok(Arc::new(Runtime::open(dir).await?))
         }
 
@@ -2891,7 +2867,7 @@ mod tests {
     }
 
     /// The payload of the next push this client receives.
-    async fn next_push(client: &mut Client) -> Result<Value> {
+    async fn next_push(client: &mut FrameClient) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let value: Value = serde_json::from_slice(
@@ -2916,15 +2892,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member, local) = (
             LocalIdentity::generate(),
@@ -2944,16 +2912,7 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state.clone()).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         assert_eq!(
             dispatch(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
             false
@@ -2988,7 +2947,7 @@ mod tests {
             &network,
             &local.device_id()?,
         )?;
-        let mut local_session = session(&local)?;
+        let mut local_session = test_session(local.device_id()?);
         local_session.cookie = Some(cookie);
         assert_eq!(
             dispatch(&node, &mut local_session, "authenticate", json!({})).await?["principal"]["source"],
@@ -2999,7 +2958,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager, "delivery", change).await?["enabled"],
             true
@@ -3054,15 +3013,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member) = (
             LocalIdentity::generate(),
@@ -3080,25 +3031,16 @@ mod tests {
             Member::client(&member, "browser", false)?,
         )?)?;
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         let record =
             json!({"level":"error","event":"web.uncaught","message":"TypeError: x is undefined"});
-        let mut stranger = session(&LocalIdentity::generate())?;
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(&node, &mut stranger, "log", json!({"records":[record]}))
                 .await
                 .is_err(),
             "a browser outside the network cannot write"
         );
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         let oversized =
             json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
         assert!(
@@ -3116,7 +3058,7 @@ mod tests {
                 .is_err(),
             "reading needs management"
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert!(
             dispatch(&node, &mut manager, "logs", json!({"level":"warn"})).await?["records"]
                 .is_array()
@@ -3135,7 +3077,7 @@ mod tests {
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
     -> Result<()> {
-        use crate::config::{self, Config, ManagerSettings};
+        use crate::config::{self, Config};
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
@@ -3143,15 +3085,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -3168,17 +3102,8 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         for identity in [&client, &LocalIdentity::generate()] {
-            let mut unauthorized = session(identity)?;
+            let mut unauthorized = test_session(identity.device_id()?);
             assert!(
                 dispatch(&node, &mut unauthorized, "node_settings", json!({}))
                     .await
@@ -3195,7 +3120,7 @@ mod tests {
                 .is_err()
             );
         }
-        let mut manager_session = session(&admin)?;
+        let mut manager_session = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
             json!({"address":"http://127.0.0.1:4790","device_id":node.identity.device_id()?})
@@ -3253,13 +3178,11 @@ mod tests {
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
             roots: vec![project.clone(), project.join(".")],
-            manager: Some(ManagerSettings {
-                provider: crate::providers::Provider::Cursor,
-                workspace: workspace.clone(),
-                model: "auto".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            }),
+            manager: Some(manager_settings(
+                crate::providers::Provider::Cursor,
+                workspace.clone(),
+                "auto".into(),
+            )),
         };
         let refused = dispatch(
             &node,
@@ -3338,15 +3261,7 @@ mod tests {
         );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(
             nodes["nodes"][0]["capabilities"]["roots"],
@@ -3437,15 +3352,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -3462,15 +3369,6 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            })
-        };
         let codex_key = "fixture-codex-secret-0123456789";
         let cursor_key = "fixture-cursor-secret-0123456789";
         let user_codex_home = dir.join("user-codex-home");
@@ -3482,7 +3380,7 @@ mod tests {
         )?;
         let set_codex = json!({"provider":"codex","connect_local":true,"bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
-        let mut member = session(&client)?;
+        let mut member = test_session(client.device_id()?);
         assert!(
             dispatch(&node, &mut member, "configure_provider", set_codex.clone())
                 .await
@@ -3490,7 +3388,7 @@ mod tests {
             "only the owner changes providers"
         );
 
-        let mut owner = session(&admin)?;
+        let mut owner = test_session(admin.device_id()?);
         let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
         let before_config = std::fs::read(dir.join("config.json"))?;
         let before_settings = serde_json::to_value(node.settings_snapshot())?;
@@ -3757,15 +3655,7 @@ mod tests {
                 .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
         );
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
         let moved = dispatch(
@@ -3862,15 +3752,7 @@ mod tests {
         crate::config::private_dir(&dir)?;
         let mut config = crate::config::Config::local("127.0.0.1:4791".parse()?, vec![], false);
         config.local_listen = "127.0.0.1:4792".parse()?;
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
             let (root, admin, browser) = (
@@ -3894,20 +3776,9 @@ mod tests {
             let cookie =
                 node.local_access
                     .exchange(&token, &node_id, &network, &browser.device_id()?)?;
-            let mut local = Session {
-                device_id: browser.device_id()?,
-                cookie: Some(cookie),
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
-            let mut remote_manager = Session {
-                device_id: admin.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
+            let mut local = test_session(browser.device_id()?);
+            local.cookie = Some(cookie);
+            let mut remote_manager = test_session(admin.device_id()?);
             assert!(
                 dispatch(&node, &mut local, "rejoin", json!({}))
                     .await
@@ -3953,15 +3824,7 @@ mod tests {
             url: "http://127.0.0.1:9".into(),
             token: None,
         }];
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
@@ -3972,13 +3835,7 @@ mod tests {
                 "link": format!("vibeface://join/{}", ticket.encode()?),
                 "name": "工作室 Mac",
             });
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-                operator: false,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
             assert_eq!(
                 status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
@@ -4088,13 +3945,7 @@ mod tests {
                 Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-operator: false,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let nonce = || -> Result<String> {
                 let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
                 Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
@@ -4142,12 +3993,12 @@ operator: false,
             target: &str,
             cookie: &str,
             identity: &LocalIdentity,
-        ) -> Result<Client> {
+        ) -> Result<FrameClient> {
             let endpoint = origin.replace("http://", "ws://") + "/api/local/ws";
             let mut request = endpoint.into_client_request()?;
             request.headers_mut().insert("cookie", cookie.parse()?);
             let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-            Client::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
+            FrameClient::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
         }
 
         async fn browser_node(
@@ -4284,11 +4135,8 @@ operator: false,
             assert_eq!(auth["principal"]["can_manage"], true);
             let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
             let browser_id = browser.device_id()?;
-            let mut local_session = Session {
-                device_id: browser_id.clone(), cookie: Some(cookie.into()),
-                subscribed: None, observation: None,
-operator: false,
-            };
+            let mut local_session = test_session(browser_id.clone());
+            local_session.cookie = Some(cookie.into());
             let save = node.config_save.lock().await;
             let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
             assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
@@ -4307,11 +4155,7 @@ operator: false,
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
             node.local_access.set_enabled(false)?;
-            let mut manager_session = Session {
-                device_id: manager.device_id()?, cookie: None,
-                subscribed: None, observation: None,
-operator: false,
-            };
+            let mut manager_session = test_session(manager.device_id()?);
             let save = node.config_save.lock().await;
             let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
             assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
@@ -4369,15 +4213,7 @@ operator: false,
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
 
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, manager) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4398,13 +4234,7 @@ operator: false,
         state.recover_at(checkpoint.clone(), now)?;
         node.install_membership(state.clone()).await?;
 
-        let mut session = Session {
-            device_id: manager.device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-            operator: false,
-        };
+        let mut session = test_session(manager.device_id()?);
         let view = state.project_at(now)?.clone();
         let event = GovernanceEvent::unsigned(
             &view,
@@ -4445,13 +4275,7 @@ operator: false,
             assert_eq!(node.membership_state().await?.events.len(), 0);
             assert_eq!(node.membership_state().await?.project()?.epoch, 1);
         }
-        let mut stranger = Session {
-            device_id: LocalIdentity::generate().device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-            operator: false,
-        };
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(
                 &node,
@@ -4520,13 +4344,21 @@ operator: false,
             let connect = |identity: LocalIdentity| {
                 let (origin, node_id) = (origin.clone(), node_id.clone());
                 async move {
+                    let open = || async {
+                        let (socket, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT,
+                            tokio_tungstenite::connect_async(format!("{}/api/client", origin.replace("http://", "ws://"))))
+                            .await.context("Gateway connection timed out")??;
+                        let mut socket = ClientSocket::Client(Box::new(socket));
+                        socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
+                        FrameClient::from_socket(socket, &identity, &node_id).await
+                    };
                     for _ in 0..100 {
-                        match Client::connect(&origin, &identity, &node_id).await {
+                        match open().await {
                             Ok(client) => return Ok(client),
                             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
                         }
                     }
-                    Client::connect(&origin, &identity, &node_id).await
+                    open().await
                 }
             };
             let (root, admin) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4773,7 +4605,7 @@ operator: false,
             assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
-            assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
+            assert!(vibeface_control::client::Connection::open(&origin, &vibeface_secure::Identity::from_secret_hex(&admin.secret_key_hex)?, &LocalIdentity::generate().device_id()?).await.is_err());
 
             let ws = |page: &str| -> Result<_> {
                 let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;
@@ -4783,7 +4615,7 @@ operator: false,
             let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
             let mut socket = ClientSocket::Client(Box::new(socket));
             socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
-            let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
+            let mut cross = FrameClient::from_socket(socket, &admin, &node_id).await?;
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
             // A target outside the network is refused before it would wait for a slot.
@@ -4853,7 +4685,8 @@ operator: false,
             let origin = &origin;
             // The trusted proxy on loopback names each browser's address.
             let request = |address: &'static str| -> Result<_> {
-                let mut request = client_url(origin)?.into_client_request()?;
+                let mut request = format!("{}/api/client", origin.replace("http://", "ws://"))
+                    .into_client_request()?;
                 request.headers_mut().insert("x-real-ip", address.parse()?);
                 Ok(request)
             };
