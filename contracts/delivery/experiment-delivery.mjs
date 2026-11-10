@@ -38,7 +38,7 @@ const result = { schemaVersion: 1, sourceCommit: /^[0-9a-f]{40}$/.test(sourceCom
   wrongJournals: [], reused: false, replayChecks: 0, proofs: [], branches: [], transactions: [], processes: [],
   limits: { memoryBytes: 11 * 1024 ** 3, swapBytes: 0, pids: 64 },
   resourceScope: 'CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS',
-  coverage: 'synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality',
+  coverage: 'synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality',
   deployment: null, corruptERejectedWithoutOutput: false, failure: null };
 function progress(stage) {
   result.stage = stage;
@@ -357,6 +357,10 @@ async function run() {
   assert.equal(canonical(await escrow.previewBinding(key)), `0x${proofs[0].journal}`);
   assert.equal(canonical((await escrow.preview(source, [spec]))[0]), `0x${proofs[1].journal}`);
   const id = source.orderId, capsule = `0x${vectors.windows[0].capsule}`;
+  const budgetSalt = sha256(Buffer.from('cached-genuine-protected-budget'));
+  const budgetId = sha256(coder.encode(['bytes32','uint256','address','address','bytes32'],
+    [sha256(Buffer.from('vibeface-delivery-budget-v1')), 31337, deployment.escrow, payer, budgetSalt]));
+  const reveal = value => [budgetId, [{ orderId: id, index: 0, capsule: value }]];
   async function mine(timestamp = clock + 1) {
     assert(Number.isSafeInteger(timestamp) && timestamp > clock);
     await rpc('evm_mine', [timestamp]); clock = Number(BigInt((await latest()).timestamp)); assert.equal(clock, timestamp);
@@ -383,15 +387,16 @@ async function run() {
   const signature = await rpc('eth_signTypedData_v4', [relay, quote]);
   const balance = async () => ({ payer: await token.balanceOf(payer), provider: await token.balanceOf(relay), escrow: await token.balanceOf(deployment.escrow) });
   const beforeFund = await balance();
-  const funded = await send('fund', escrow, 'fund', [source, [spec], [`0x${proofs[1].seal}`], signature], payer);
+  await send('open-budget', escrow, 'openBudget', [budgetSalt, relay, source.providerPeer, deployment.asset, 17n], payer);
+  const funded = await send('reserve-batch', escrow, 'reserveBatch', [budgetId, [{ input: source, specs: [spec], seals: [`0x${proofs[1].seal}`], walletSignature: signature }]], payer);
   assert(result.transactions.at(-1).events.some(event => event.name === 'Funded' && event.args[2] === 17n));
-  await send('hold', escrow, 'hold', [id, 0, `0x${proofs[2].seal}`]);
+  await send('hold-batch', escrow, 'holdBatch', [budgetId, [{ orderId: id, index: 0, seal: `0x${proofs[2].seal}` }]]);
   const heldBalances = await balance();
   assert.deepEqual(heldBalances, { payer: beforeFund.payer - 17n, provider: beforeFund.provider, escrow: beforeFund.escrow + 17n });
   async function state() {
-    const order = await escrow.getOrder(id), window = await escrow.getWindow(id, 0), block = await latest();
+    const order = await escrow.getOrder(id), budget = await escrow.getBudget(budgetId), window = await escrow.getWindow(id, 0), block = await latest();
     return { block: { number: Number(BigInt(block.number)), hash: block.hash, timestamp: Number(BigInt(block.timestamp)) },
-      earned: order.earned, withdrawn: order.withdrawn, refunded: order.refunded, phase: window.phase, decryptionProven: window.decryptionProven,
+      earned: budget.earned, withdrawn: budget.withdrawn, refunded: budget.refunded, phase: window.phase, decryptionProven: window.decryptionProven,
       capsuleBytes: getBytes(window.capsule).length, token: await balance(),
       nativeWei: { payer: await rpc('eth_getBalance', [payer, 'latest']), provider: await rpc('eth_getBalance', [relay, 'latest']) } };
   }
@@ -410,8 +415,9 @@ async function run() {
     const transaction = await rpc('eth_getTransactionByHash', [hash]); assert(transaction);
     if (pending) { assert.equal(transaction.blockHash, null); assert.equal(await rpc('eth_getTransactionReceipt', [hash]), null); }
     const parsed = escrow.interface.parseTransaction({ data: transaction.input, value: transaction.value });
-    assert.equal(parsed.name, 'publish'); assert.equal(parsed.args[0], id); assert.equal(parsed.args[1], 0n);
-    const observed = getBytes(parsed.args[2]); assert.equal(observed.length, 80); assert.equal(sha256(observed), source.capsuleHash);
+    assert.equal(parsed.name, 'revealBatch'); assert.equal(parsed.args[0], budgetId); assert.equal(parsed.args[1].length, 1);
+    assert.equal(parsed.args[1][0].orderId, id); assert.equal(parsed.args[1][0].index, 0n);
+    const observed = getBytes(parsed.args[1][0].capsule); assert.equal(observed.length, 80); assert.equal(sha256(observed), source.capsuleHash);
     return { observed: Buffer.from(observed), source: { transactionHash: hash, wasPending: pending, capsuleSha256: digest(observed) } };
   }
   async function recovery(branch, observation) {
@@ -425,32 +431,33 @@ async function run() {
       claim: 'separate offline recovery program receives only two input paths; no OS access or network sandbox claimed' };
   }
   progress('normal');
-  const published = await send('normal-publish', escrow, 'publish', [id, 0, capsule]);
+  const published = await send('normal-publish', escrow, 'revealBatch', reveal(capsule));
   const ordinaryE = await observe(published.transactionHash, false);
   const earned = await state(); assert.equal(earned.earned, 17n); assert.equal(earned.withdrawn, 0n);
   await send('normal-open', escrow, 'open', [id, 0, `0x${proofs[3].seal}`]);
   const opened = await state(); assert.equal(opened.earned, 17n); assert.equal(opened.decryptionProven, true);
-  await send('normal-withdraw', escrow, 'withdraw', [id]);
+  await send('normal-withdraw', escrow, 'withdrawBudget', [budgetId]);
   const normal = await state();
   assert.equal(normal.withdrawn, 17n); assert.equal(normal.refunded, 0n); assert.equal(normal.phase, 3n);
   assert.deepEqual(normal.token, { payer: heldBalances.payer, provider: heldBalances.provider + 17n, escrow: heldBalances.escrow - 17n });
   result.branches.push({ name: 'normal', held, final: normal, recovery: await recovery('normal', ordinaryE), laterRestoredByExperiment: true });
   await restore();
   progress('pending-late');
-  await escrow.publish.staticCall(id, 0, capsule);
-  const pendingCall = call(escrow, 'publish', [id, 0, capsule]);
+  await escrow.revealBatch.staticCall(...reveal(capsule));
+  const pendingCall = call(escrow, 'revealBatch', reveal(capsule));
   const pendingHash = await rpc('eth_sendTransaction', [pendingCall]);
   const pendingE = await observe(pendingHash, true);
   await mine(Number(source.keyDeadline) + 1);
   const failed = await rpc('eth_getTransactionReceipt', [pendingHash]); assert.equal(failed.status, '0x0');
   assert(BigInt(failed.gasUsed) < BigInt(pendingCall.gas));
-  await assert.rejects(escrow.publish.staticCall(id, 0, capsule, { blockTag: Number(BigInt(failed.blockNumber)) }),
+  await assert.rejects(escrow.revealBatch.staticCall(...reveal(capsule), { blockTag: Number(BigInt(failed.blockNumber)) }),
     error => error.code === 'CALL_EXCEPTION' && escrow.interface.parseError(error.data)?.name === 'Deadline');
   record('pending-late-publish', failed);
   const rejected = await state(); assert.equal(rejected.phase, 1n); assert.equal(rejected.capsuleBytes, 0);
   assert.equal(rejected.earned, 0n); assert.equal(rejected.withdrawn, 0n); assert.equal(rejected.refunded, 0n); assert.deepEqual(rejected.token, heldBalances);
   async function refund(label) {
-    await send(label, escrow, 'refund', [id, 0]);
+    await send(`${label}-close`, escrow, 'closeBudget', [budgetId], payer);
+    await send(label, escrow, 'refundBudget', [budgetId, [{ orderId: id, index: 0 }]]);
     const final = await state(); assert.equal(final.phase, 4n); assert.equal(final.refunded, 17n); assert.equal(final.earned, 0n); assert.equal(final.withdrawn, 0n);
     assert.deepEqual(final.token, { payer: heldBalances.payer + 17n, provider: heldBalances.provider, escrow: heldBalances.escrow - 17n });
     assert(result.transactions.at(-1).events.some(event => event.name === 'Refunded' && event.args[2] === 17n));
@@ -460,7 +467,7 @@ async function run() {
     recovery: await recovery('pending', pendingE), laterRestoredByExperiment: true });
   await restore();
   progress('reorg');
-  const removed = await send('reorg-publish', escrow, 'publish', [id, 0, capsule]);
+  const removed = await send('reorg-publish', escrow, 'revealBatch', reveal(capsule));
   const reorgE = await observe(removed.transactionHash, false);
   assert.equal((await state()).earned, 17n);
   await restore();
@@ -477,7 +484,7 @@ async function run() {
   result.corruptERejectedWithoutOutput = true;
   result.deployment = { chainId: 31337, escrow: deployment.escrow, asset: deployment.asset, payer, provider: relay,
     profileId: deployment.profile_id, adapter: deployment.adapter, verifier: deployment.verifier, tokenDecimals: 6,
-    orderId: id, fundTransaction: funded.transactionHash, runtimeCodeHashes: deployment.runtime_code_hashes };
+    orderId: id, budgetId, allocationTransaction: funded.transactionHash, runtimeCodeHashes: deployment.runtime_code_hashes };
   assert.equal(result.proofs.length, 4); assert.equal(result.branches.length, 3);
   result.status = 'PASS-accept-candidate'; progress('complete');
 }

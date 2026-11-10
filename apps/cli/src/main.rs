@@ -323,6 +323,11 @@ struct WalletOptions {
 
 #[derive(Subcommand)]
 enum WalletAction {
+    /// Run the manually enabled local protected-budget experiment.
+    Budget {
+        #[command(subcommand)]
+        command: WalletBudgetAction,
+    },
     /// Show wallet and receiving-key status.
     Status,
     /// Create a wallet using a protected passphrase descriptor.
@@ -439,6 +444,65 @@ enum MeshRole {
     Relay,
     Gateway,
     Service,
+}
+
+#[derive(Subcommand)]
+enum WalletBudgetAction {
+    /// Lock one exact local test-token deposit for a fixed Provider; retry the same UUID.
+    Open {
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        payee: String,
+        #[arg(long)]
+        provider_peer: String,
+        #[arg(long)]
+        deposit: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Allocate up to two already confirmed/proved windows in one irreversible batch.
+    Reserve {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long, required = true, num_args = 1..=2)]
+        order_ids: Vec<String>,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Authorize the fixed Provider to batch its ready Holds and durable reveals.
+    Flush {
+        #[arg(long)]
+        budget_id: String,
+    },
+    /// Withdraw cumulative earned funds to the immutable payee.
+    Withdraw {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Stop new allocations without reclaiming any live rights.
+    Close {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Refund free and expired allocations; each window is ORDER_ID:INDEX.
+    Refund {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long, num_args = 0..=2)]
+        windows: Vec<String>,
+    },
+    /// Read confirmed accounting and redacted durable claim status, even while locked/off.
+    Status {
+        #[arg(long)]
+        budget_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1234,6 +1298,7 @@ fn join_failure_text(reason: &str) -> String {
 async fn wallet(options: WalletOptions) -> Result<()> {
     let dir = options.data_dir.clone();
     match options.command {
+        WalletAction::Budget { command } => wallet_budget(&dir, command).await,
         WalletAction::Status => wallet_request(&dir, WalletCommand::Status).await,
         WalletAction::Create { passphrase_fd } => {
             wallet_request(
@@ -1294,6 +1359,70 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn wallet_budget(dir: &Path, command: WalletBudgetAction) -> Result<()> {
+    let command = match command {
+        WalletBudgetAction::Open {
+            intent_id,
+            payee,
+            provider_peer,
+            deposit,
+            gas_cap,
+        } => {
+            json!({"op":"open","intent_id":intent_id,"payee":payee,"provider_peer":provider_peer,"deposit":deposit,"gas_cap":gas_cap})
+        }
+        WalletBudgetAction::Reserve {
+            budget_id,
+            order_ids,
+            intent_id,
+        } => {
+            json!({"op":"reserve","budget_id":budget_id,"order_ids":order_ids,"intent_id":intent_id})
+        }
+        WalletBudgetAction::Flush { budget_id } => json!({"op":"flush","budget_id":budget_id}),
+        WalletBudgetAction::Withdraw {
+            budget_id,
+            intent_id,
+        } => json!({"op":"withdraw","budget_id":budget_id,"intent_id":intent_id}),
+        WalletBudgetAction::Close {
+            budget_id,
+            intent_id,
+        } => json!({"op":"close","budget_id":budget_id,"intent_id":intent_id}),
+        WalletBudgetAction::Refund {
+            budget_id,
+            windows,
+            intent_id,
+        } => {
+            let windows = windows
+                .into_iter()
+                .map(|value| -> Result<Value> {
+                    let (order_id, index) = value
+                        .split_once(':')
+                        .context("window must be ORDER_ID:INDEX")?;
+                    ensure!(
+                        order_id.len() == 64
+                            && order_id
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "invalid window order id"
+                    );
+                    let index: u16 = index.parse()?;
+                    ensure!(index < 2, "window index must be 0 or 1");
+                    Ok(json!({"order_id":order_id,"index":index}))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            json!({"op":"refund","budget_id":budget_id,"windows":windows,"intent_id":intent_id})
+        }
+        WalletBudgetAction::Status { budget_id } => json!({"op":"status","budget_id":budget_id}),
+    };
+    let socket = inspect_socket(dir).await?;
+    let response =
+        maintenance::request(&socket, MaintenanceCommand::DeliveryBudget(command)).await?;
+    let value = response
+        .delivery
+        .context("Node returned no protected budget result")?;
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
 }
 
 async fn wallet_request(dir: &Path, command: WalletCommand) -> Result<()> {
