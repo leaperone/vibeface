@@ -5,7 +5,7 @@ pub const HISTORY_DEFAULT_LIMIT: usize = 50;
 pub const HISTORY_MAX_LIMIT: usize = 100;
 pub const HISTORY_PAGE_BYTES: usize = 512 * 1024;
 /// Leaves room for RPC metadata and encrypted transport framing below 4 MiB.
-pub const HISTORY_RESPONSE_BYTES: usize = 3 * 1024 * 1024 - 64 * 1024;
+pub const HISTORY_RESPONSE_BYTES: usize = 3 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

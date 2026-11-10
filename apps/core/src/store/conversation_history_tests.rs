@@ -258,13 +258,39 @@ fn maximal_signed_work_events_measure_the_complete_history_response() -> Result<
     let mut raw_response = response.clone();
     raw_response["items"][0].as_object_mut().context("work object")?.remove("coordination_job");
     let raw_response_bytes = serde_json::to_vec(&raw_response)?.len();
-    let rpc_bytes = serde_json::to_vec(&json!({"id":"r".repeat(128),"ok":response}))?.len();
+    let rpc_bytes = serde_json::to_vec(&json!({"id":"r".repeat(128),"result":raw_response}))?.len();
     eprintln!("maximal signed work: history_payload_bytes={response_bytes} raw_history_payload_bytes={raw_response_bytes} rpc_envelope_bytes={rpc_bytes} history_cap={HISTORY_RESPONSE_BYTES}");
     assert!(response_bytes > 3 * 1024 * 1024 - 64 * 1024, "regresses the overly conservative reserve");
     assert!(rpc_bytes < 4 * 1024 * 1024);
+    let client_identity = vibeface_secure::Identity::generate()?;
+    let server_identity = vibeface_secure::Identity::generate()?;
+    let mut client = vibeface_secure::Handshake::signed(true, &client_identity, Some(server_identity.device_id()), b"history-byte-proof")?;
+    let mut server = vibeface_secure::Handshake::signed(false, &server_identity, Some(client_identity.device_id()), b"history-byte-proof")?;
+    assert!(server.read(&client.write(&[])?)?.is_empty());
+    assert!(client.read(&server.write(&[])?)?.is_empty());
+    assert!(server.read(&client.write(&[])?)?.is_empty());
+    let mut sender = server.finish()?;
+    let mut receiver = client.finish()?;
+    let rpc_payload = serde_json::to_vec(&json!({"id":"r".repeat(128),"result":raw_response}))?;
+    let records = sender.seal_message(&rpc_payload)?;
+    assert!(records.iter().all(|record| record.len() <= 65_535));
+    assert!(records.iter().map(Vec::len).sum::<usize>() < 4 * 1024 * 1024);
+    let mut recovered = None;
+    for record in &records {
+        if let Some(payload) = receiver.open_record(record)? { assert!(recovered.replace(payload).is_none()); }
+    }
+    assert_eq!(recovered.context("reassembled maximal work RPC")?, rpc_payload);
     // Keep the legal record accessible; the actual API limit must accommodate this signed fixture.
     let page = origin.conversation_works_page(&net.network, "c", None, 1)?;
     assert_eq!(page.items.len(), 1);
+    assert!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES);
+    assert_eq!(serde_json::to_value(&page)?, raw_response);
+    let older = origin.conversation_works_page(&net.network, "c", page.next_cursor.as_deref(), 1)?;
+    assert_eq!(older.items.iter().map(|work| work.work_id.as_str()).collect::<Vec<_>>(), ["older-work"]);
+    let observations = origin.conversation_scheduler_page(&net.network, "c", &net.a.device_id()?,
+        vibeface_protocol::history::HistorySection::ScopeJobs, None, 100, |_, job| Ok(serde_json::to_value(job)?))?;
+    assert!(observations.items.iter().any(|job| job["trigger"] == "task:maximal-work" && job["reply_to"] == "maximal-work"),
+        "the non-null coordination observation remains available in its own section");
     assert_eq!(serde_json::to_value(&page.items[0])?["prompt"], response["items"][0]["prompt"]);
     assert_eq!(serde_json::to_value(&page.items[0])?["summary"], response["items"][0]["summary"]);
     assert_eq!(serde_json::to_value(&page.items[0])?["result_text"], response["items"][0]["result_text"]);

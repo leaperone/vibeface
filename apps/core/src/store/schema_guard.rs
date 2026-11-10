@@ -413,7 +413,7 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
                 // This is local cache metadata, not part of the signed shared state.
                 // A new random starting epoch cannot reuse a prior zero cursor after repair.
                 tx.execute(
-                    "INSERT INTO conversation_history_revisions(network_id,conversation_id,revision) VALUES(?,'',random() & 0x3fffffffffffffff)",
+                    "INSERT INTO conversation_history_revisions(network_id,conversation_id,revision) VALUES(?,'',(random() & 0x3fffffffffffffff)+1)",
                     [&network],
                 )?;
             }

@@ -16,11 +16,13 @@ pub(super) struct HistoryBoundary {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
-    network: String,
-    conversation: String,
-    section: HistorySection,
-    authority: String,
+    binding: String,
     before: Option<HistoryBoundary>,
+}
+
+// The digest binds all request context without copying those strings into each cursor.
+fn cursor_binding(network: &str, conversation: &str, section: HistorySection, authority: &str) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&(network, conversation, section, authority))?))
 }
 
 pub(super) fn history_page<T: Serialize>(
@@ -34,10 +36,7 @@ pub(super) fn history_page<T: Serialize>(
 ) -> Result<HistoryPage<T>> {
     let next_cursor = if has_more {
         Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Cursor {
-            network: network.into(),
-            conversation: conversation.into(),
-            section,
-            authority: authority.clone(),
+            binding: cursor_binding(network, conversation, section, &authority)?,
             before: Some(boundary.context("history continuation has no boundary")?),
         })?))
     } else {
@@ -144,9 +143,8 @@ impl Store {
             ensure!(cursor.len() <= 8192, "history cursor is too large");
             let cursor: Cursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)
                 .context("invalid history cursor")?).context("invalid history cursor")?;
-            ensure!(cursor.network == network && cursor.conversation == conversation
-                && cursor.section == section, "history cursor belongs to another scope");
-            ensure!(cursor.authority == authority, "history changed; refresh the conversation");
+            ensure!(cursor.binding == cursor_binding(network, conversation, section, &authority)?,
+                "history changed; refresh the conversation");
             if let Some(before) = &cursor.before {
                 ensure!(!before.rank.is_empty() && !before.id.is_empty(), "history cursor has an empty boundary");
             }
@@ -164,7 +162,7 @@ impl Store {
     ) -> Result<String> {
         let (authority, _) = self.history_cursor(network, conversation, section, None)?;
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Cursor {
-            network: network.into(), conversation: conversation.into(), section, authority, before: None,
+            binding: cursor_binding(network, conversation, section, &authority)?, before: None,
         })?))
     }
 

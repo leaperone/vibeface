@@ -266,9 +266,9 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 | `skills`、`schedules`、`memory`、`memory_conflicts` | `bot_settings` 下的同名列表 |
 | `memory_sync_conflicts` | `bot_settings.memory_sync_conflicts.items` |
 
-`conversation_history` 的 `cursor` 省略或为 `null` 时从该分区的首页开始；后续请求原样传回 `next_cursor`。使用服务端提供的稳定边界向较早记录读取，不发送 offset，不解析或自行拼接游标。不同分区有各自的稳定顺序，客户端按记录的稳定业务身份去重，不能用列表下标识别记录。
+`conversation_history` 的 `cursor` 省略或为 `null` 时从该分区的首页开始；后续请求原样传回 `next_cursor`。使用服务端提供的稳定边界向较早记录读取，不发送 offset，不解析或自行拼接游标。不同分区有各自的稳定顺序，客户端按记录的稳定业务身份去重，不能用列表下标识别记录。`works` 历史页返回完整工作投影；协调观察从 `scope_jobs`、`owner_scope_jobs` 或详情接口读取，避免在一条大记录中重复嵌入。
 
-条数上限与字节预算同时生效。默认 limit 为 50，最大 100；单分区选取预算为 512 KiB，完整响应须小于 `3 MiB - 64 KiB`，为 RPC 元数据和加密帧留出空间。单条大记录可以独占一页，但仍须满足响应上限，超限返回错误，不截断正文。首页合计过大时，服务端延后整个分区，并给出该分区的起始游标；空列表不表示分区没有记录。经过范围筛选的空页也可能带有继续游标。
+条数上限与字节预算同时生效。默认 limit 为 50，最大 100；单分区选取预算为 512 KiB，完整响应须小于 `3 MiB`，低于 4 MiB 的客户端应用消息上限。Noise 使用二进制分帧，不对整份响应做 Base64 扩展。单条大记录可以独占一页，但仍须满足响应上限，超限返回错误，不截断正文。首页合计过大时，服务端延后整个分区，并给出该分区的起始游标；空列表不表示分区没有记录。经过范围筛选的空页也可能带有继续游标。
 
 `complete=false` 必须有非空 `next_cursor`；`complete=true` 时游标为 `null`。完成只表示在当前读取依据下，该入口对这个分区没有更多可读记录，不表示全网已同步、远端负责人已在线、工作已完成或客户端取得写权限。负责人暂不可达时，其分区保留未完成覆盖状态和可重试的起始游标。
 

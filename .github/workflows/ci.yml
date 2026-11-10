@@ -17,6 +17,10 @@ on:
         description: 'Run controlled tests for each successfully compiled native package'
         type: boolean
         default: false
+      native_frames:
+        description: 'Measure native async frames after compilation without running the full runtime suite'
+        type: boolean
+        default: false
       native_benchmarks:
         description: 'With native_prepare, run signed performance comparisons at 1k or the full 1k/10k/100k matrix'
         type: choice
@@ -1256,11 +1260,11 @@ jobs:
           exit "$result"
       - name: Measure native async frame sizes before the runtime suite
         id: native-frames
-        if: ${{ always() && inputs.native_tests && steps.compile.outputs.vibeface-desktop == 'success' }}
+        if: ${{ always() && (inputs.native_tests || inputs.native_frames) && steps.compile.outputs.vibeface-desktop == 'success' }}
         run: |
           xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --test native_ui_frames -- --nocapture 2>&1 | tee .artifacts/native-prepare/native-frames.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ always() && inputs.native_tests && steps.compile.outputs.vibeface-desktop == 'success' }}
+        if: ${{ always() && (inputs.native_tests || inputs.native_frames) && steps.compile.outputs.vibeface-desktop == 'success' }}
         with:
           name: native-frames-${{ github.sha }}-${{ github.run_id }}
           path: .artifacts/native-prepare/native-frames.log

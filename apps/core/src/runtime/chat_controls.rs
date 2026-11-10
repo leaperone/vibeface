@@ -441,14 +441,9 @@ impl Runtime {
                 HistorySection::Messages => Ok(serde_json::to_value(store.conversation_messages_page(
                     &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
                 )?)?),
-                HistorySection::Works => {
-                    let page = store.conversation_works_page(&network, &request.conversation_id, request.cursor.as_deref(), request.limit)?;
-                    let jobs = task_observations(store, &request.conversation_id, &page.items)?;
-                    let items = page.items.iter().map(|work| work_view(work, &jobs)).collect::<Result<Vec<_>>>()?;
-                    let mut value = serde_json::to_value(&page)?;
-                    value["items"] = json!(items);
-                    Ok(value)
-                },
+                HistorySection::Works => Ok(serde_json::to_value(store.conversation_works_page(
+                    &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
+                )?)?),
                 HistorySection::Changes => Ok(serde_json::to_value(store.conversation_changes_page(
                     &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
                 )?)?),
