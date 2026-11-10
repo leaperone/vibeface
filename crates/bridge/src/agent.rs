@@ -1545,9 +1545,17 @@ fn url_with_password(word: &str) -> bool {
 }
 
 pub fn redact_text(text: String, secrets: &[impl AsRef<str>]) -> String {
-    let mut clean = String::with_capacity(text.len());
-    let mut redacted_until = 0;
-    for (index, ch) in text.char_indices() {
+    redact_prefix(&text, secrets, text.len(), 0).0
+}
+
+fn redact_prefix(
+    text: &str,
+    secrets: &[impl AsRef<str>],
+    split: usize,
+    mut redacted_until: usize,
+) -> (String, usize) {
+    let mut clean = String::with_capacity(split);
+    for (index, ch) in text[..split].char_indices() {
         let end = secrets
             .iter()
             .map(AsRef::as_ref)
@@ -1564,7 +1572,7 @@ pub fn redact_text(text: String, secrets: &[impl AsRef<str>]) -> String {
             clean.push(ch);
         }
     }
-    clean
+    (clean, redacted_until.saturating_sub(split))
 }
 
 pub fn redact_progress(value: Value, secrets: &[impl AsRef<str>]) -> Value {
@@ -1586,10 +1594,16 @@ pub fn redact_progress(value: Value, secrets: &[impl AsRef<str>]) -> Value {
     }
 }
 
+#[derive(Default)]
+struct PendingRedaction {
+    text: String,
+    redacted_until: usize,
+}
+
 fn redact_stream_progress(
     mut value: Value,
     secrets: &[&str],
-    pending: &mut BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, PendingRedaction>,
 ) -> Value {
     if let Some(item) = value
         .get("item_id")
@@ -1603,35 +1617,31 @@ fn redact_stream_progress(
             && let Some(text) = value.get("text").and_then(Value::as_str)
         {
             let buffered = pending.entry(item).or_default();
-            buffered.push_str(text);
+            buffered.text.push_str(text);
             let max_prefix = secrets
                 .iter()
                 .map(|secret| secret.len().saturating_sub(1))
                 .max()
                 .unwrap_or(0);
-            let mut split = buffered
+            let split = buffered
+                .text
                 .char_indices()
                 .map(|(index, _)| index)
-                .filter(|index| buffered.len() - index <= max_prefix)
+                .filter(|index| buffered.text.len() - index <= max_prefix)
                 .find(|index| {
                     secrets.iter().any(|secret| {
-                        secret.len() > buffered.len() - index
-                            && secret.starts_with(&buffered[*index..])
+                        secret.len() > buffered.text.len() - index
+                            && secret.starts_with(&buffered.text[*index..])
                     })
                 })
-                .unwrap_or(buffered.len());
-            // Keep complete matches intact when they overlap the unfinished secret suffix.
-            for (index, _) in buffered.char_indices().rev() {
-                if index < split
-                    && secrets.iter().any(|secret| {
-                        index + secret.len() > split && buffered[index..].starts_with(secret)
-                    })
-                {
-                    split = index;
-                }
-            }
-            value["text"] = json!(&buffered[..split]);
-            *buffered = buffered[split..].to_owned();
+                .unwrap_or(buffered.text.len());
+            let (text, redacted_until) =
+                redact_prefix(&buffered.text, secrets, split, buffered.redacted_until);
+            buffered.text = buffered.text[split..].to_owned();
+            buffered.redacted_until = redacted_until;
+            value = redact_progress(value, secrets);
+            value["text"] = json!(text);
+            return value;
         }
     }
     redact_progress(value, secrets)
@@ -1726,6 +1736,58 @@ mod credential_tests {
             assert_eq!(snapshot["text"], "before [redacted] after");
             assert!(pending.is_empty());
         }
+    }
+
+    #[test]
+    fn redaction_keeps_periodic_overlap_streams_bounded() {
+        let secrets = ["aba"];
+        let mut pending = BTreeMap::new();
+        let mut streamed = String::new();
+        for ch in format!("{}a end", "ab".repeat(4096)).chars() {
+            let update = redact_stream_progress(
+                json!({"type": "text_delta", "item_id": "reply", "text": ch.to_string()}),
+                &secrets,
+                &mut pending,
+            );
+            let buffered = pending["reply"].text.len();
+            assert!(buffered <= 2, "pending grew to {buffered} bytes");
+            streamed.push_str(update["text"].as_str().unwrap());
+        }
+        assert_eq!(streamed, "[redacted] end");
+    }
+
+    #[test]
+    fn redaction_keeps_items_separate_and_does_not_reprocess_stream_markers() {
+        let secrets = ["aba", "秘密🙂", "redacted"];
+        let mut pending = BTreeMap::new();
+        let mut streamed = BTreeMap::<&str, String>::new();
+        for (item, chunk) in [
+            ("left", "ab"),
+            ("right", "秘"),
+            ("left", "aba"),
+            ("right", "密🙂 "),
+            ("left", " "),
+        ] {
+            let update = redact_stream_progress(
+                json!({"type": "text_delta", "item_id": item, "text": chunk}),
+                &secrets,
+                &mut pending,
+            );
+            streamed
+                .entry(item)
+                .or_default()
+                .push_str(update["text"].as_str().unwrap());
+        }
+        assert_eq!(streamed["left"], "[redacted] ");
+        assert_eq!(streamed["right"], "[redacted] ");
+        let snapshot = redact_stream_progress(
+            json!({"type": "text_snapshot", "item_id": "left", "text": "ababa"}),
+            &secrets,
+            &mut pending,
+        );
+        assert_eq!(snapshot["text"], "[redacted]");
+        assert!(!pending.contains_key("left"));
+        assert!(pending.contains_key("right"));
     }
 
     #[test]
