@@ -1229,7 +1229,7 @@ jobs:
         run: cargo fmt --all 2>&1 | tee .artifacts/native-prepare/rustfmt.log
       - name: Compile all native callers and test targets
         id: compile
-        run: cargo check --all-targets -p vibeface-client -p vibeface-desktop -p vibeface -p vibeface-core 2>&1 | tee .artifacts/native-prepare/compiler.log
+        run: cargo check --all-targets -p vibeface-client -p vibeface-desktop -p vibeface -p vibeface-core --features vibeface-desktop/native-ui-tests 2>&1 | tee .artifacts/native-prepare/compiler.log
       - name: Record exact preparation outcomes even when the compiler rejects the source
         if: always()
         env:
