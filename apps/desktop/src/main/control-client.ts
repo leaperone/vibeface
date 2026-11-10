@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import type { Readable } from 'node:stream'
+import { readBounded } from './bounded-read.js'
 import { MAX_CONTROL_PACKET } from './limits.js'
 import { type ControlRequest, parseControlResponse } from './control-types.js'
 
@@ -16,17 +16,7 @@ function encodeRequest(request: ControlRequest): Buffer {
   return line
 }
 
-async function readBounded(stream: Readable, limit: number): Promise<string> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of stream) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
-    size += bytes.length
-    if (size > limit) throw new Error('core control response exceeds its size limit')
-    chunks.push(bytes)
-  }
-  return Buffer.concat(chunks, size).toString('utf8')
-}
+const CONTROL_OVERFLOW = 'core control response exceeds its size limit'
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -85,7 +75,10 @@ export async function runControl(program: CoreProgram, request: ControlRequest):
   })
   stdin.end(encodeRequest(request))
   const streams = withTimeout(
-    Promise.all([readBounded(stdout, MAX_CONTROL_PACKET), readBounded(stderr, MAX_CONTROL_PACKET)]),
+    Promise.all([
+      readBounded(stdout, MAX_CONTROL_PACKET, CONTROL_OVERFLOW),
+      readBounded(stderr, MAX_CONTROL_PACKET, CONTROL_OVERFLOW),
+    ]),
     CONTROL_TIMEOUT_MS,
     () => {
       try {

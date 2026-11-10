@@ -8,7 +8,7 @@ import { join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/native/workspace');
@@ -148,16 +148,39 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await expect(openConfirmation).toHaveCount(0);
     await app.open();
   }
-  await invitationField.fill(secrets.get('nativeInvitation'), { timeout: 30000 });
-  await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
+  // Opened as a scanned link, the way the stray back button to the join page appeared.
+  const raw = (await readFile(process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt'), 'utf8')).trim();
+  const invitation = raw.startsWith('vibeface://join/') ? raw : `vibeface://join/${raw.replace(/^.*\/join\//, '')}`;
+  await device.openLink(invitation);
+  const filled = screen.getByText('已填入加入链接', { exact: true });
+  await expect.poll(async () => await openConfirmation.isVisible() || await filled.isVisible(), { timeout: 30000 }).toBe(true);
+  if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
+  await expect(filled).toBeVisible({ timeout: 30000 });
   await textbox('这台设备的名字').fill('VDP native receiver');
-  await device.dismissKeyboard();
+  await textbox('这台设备的名字').press('Enter');
+  await expect(textbox('这台设备的名字')).toHaveValue('VDP native receiver');
+  await expect(keyboard).toHaveCount(0);
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' }), code = text(pairing.code);
   assert(/^[0-9]{6}$/.test(code));
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  // The join page must not stay under the tabs as a back button.
+  await screen.getByLabel('任务', { exact: true }).click();
+  await expect(screen.getByTestId('任务', { visible: true })).toBeVisible();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
+  // Opening the same network's link again from a page deep in another tab lands on home alone.
+  await screen.getByLabel('设置', { exact: true }).click();
+  const lab = screen.getByRole('link', '实验室', { exact: true });
+  await screen.scrollUntilVisible(lab, { direction: 'down' });
+  await lab.click();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(1);
+  await device.openLink(invitation);
+  await expect.poll(async () => await openConfirmation.isVisible() || await screen.getByTestId('BackButton', { visible: true }).count() === 0, { timeout: 30000 }).toBe(true);
+  if (await openConfirmation.isVisible()) await openConfirmation.getByRole('button', 'Open', { exact: true }).click();
+  await expect(screen.getByTestId('BackButton', { visible: true })).toHaveCount(0);
+  await screen.getByRole('button', '消息', { exact: true }).click();
   const inspect = async () => {
     const value = await network.call({ op: 'workspace_inspect' });
     return {
@@ -180,7 +203,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await textbox('名称').fill(name);
     await screen.getByRole('button', '创建', { exact: true }).click();
     await expect(textbox('给 Bot 发消息')).toBeVisible();
-    await expect(backButton).toHaveAccessibleName('消息');
+    await expect(backButton).toHaveAccessibleName(/^(消息|Back)$/);
     await backButton.click();
     await expect(screen.getByLabel('设置', { exact: true })).toBeVisible();
   }
@@ -206,8 +229,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
   const mainHistory = device.locator('role=scroll-area').filter({ has: screen.getByText(/^原生滚动记录 /) });
   const olderMarker = screen.getByText(/^原生滚动记录 2\s/);
   const latestMarker = screen.getByText(/^原生滚动记录 8\s/);
-  const latestReply = screen.getByText(/^native-workspace-scroll:\d+/, { visible: true }).first();
-  const mainResult = screen.getByText(/^native-workspace-scroll:complete/, { visible: true }).first();
+  // Only the reply's own text node: iOS 27 also names the list's wrapper after its children. The mobile engine matches iOS StaticText as `text`, a role e2e's types leave out.
+  const replyText = (name: RegExp) => screen.getByRole('text' as never, name, { visible: true }).first();
+  const latestReply = replyText(/^native-workspace-scroll:\d+/);
+  const mainResult = replyText(/^native-workspace-scroll:complete/);
   await expect(mainHistory).toHaveCount(1);
   await expect(keyboard).toHaveCount(1);
   let keyboardReadingBottom = 0, previousTargetBounds = '';
@@ -295,7 +320,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(mainComposer).toHaveValue('');
   await mainHistory.swipe({ direction: 'up', momentum: 'slow' });
   await expect(toLatest).toBeVisible();
-  await expect(backButton).toHaveAccessibleName('消息');
+  await expect(backButton).toHaveAccessibleName(/^(消息|Back)$/);
   await backButton.click();
   await screen.getByRole('link', /^Native Reviewer，/, { visible: true }).click();
   await expect(screen.getByRole('button', /^输入目标 Native Reviewer · 主聊天，/, { visible: true })).toBeVisible();
@@ -352,7 +377,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await screen.scrollUntilVisible(receipt, { direction: 'down' });
   await expect(receipt).toBeVisible();
   await app.screenshot('workspace-native-task-context');
-  await expect(backButton).toHaveAccessibleName('原生导航检查');
+  await expect(backButton).toHaveAccessibleName(/^(原生导航检查|Back)$/);
   await backButton.click();
   const target = screen.getByRole('button', /^输入目标 Native Builder · 原生导航检查，/, { visible: true });
   const targetSheet = screen.getByTestId('input-options-sheet', { visible: true });
@@ -381,7 +406,12 @@ test('native workspace routes preserve Task input, queue controls and directed C
     const keyboardTop = await keyboard.count() === 0 ? Infinity : (await keyboard.boundingBox())?.y;
     assert(saveBounds && scrollBounds && keyboardTop !== undefined, 'Queue Save and its visible area expose bounds');
     const reachable = saveBounds.y >= scrollBounds.y && saveBounds.y + saveBounds.height <= Math.min(scrollBounds.y + scrollBounds.height, keyboardTop);
-    if (!reachable) await queueScroll.swipe({ direction: saveBounds.y < scrollBounds.y ? 'up' : 'down', momentum: 'slow' });
+    // A path inside the visible part: on iOS 27 a direction swipe on this sheet's scroll area does not move it.
+    if (!reachable) {
+      const top = scrollBounds.y, bottom = Math.min(scrollBounds.y + scrollBounds.height, keyboardTop), x = scrollBounds.x + scrollBounds.width / 2;
+      const high = { x, y: top + (bottom - top) * 0.25 }, low = { x, y: top + (bottom - top) * 0.75 };
+      await screen.swipe(saveBounds.y < scrollBounds.y ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
+    }
     return reachable;
   }, { timeout: 5000 }).toBe(true);
   await app.screenshot('workspace-native-queue-edit-keyboard');
@@ -417,7 +447,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
     .toEqual([{ message_id: queuedMessageId, text: '原生稍后条目已编辑', cancelled: true }]);
   await expect(targetSheet).toHaveCount(1);
   await expect(queued).toHaveCount(0);
-  await targetSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
+  // Swiped down from its title, the sheet closes like the button does.
+  const sheetTop = await targetSheet.getByText('目标和队列', { exact: true }).boundingBox();
+  assert(sheetTop, 'The sheet title exposes bounds');
+  await screen.swipe({ from: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y }, to: { x: sheetTop.x + sheetTop.width / 2, y: sheetTop.y + 600 } });
   await expect(targetSheet).toHaveCount(0);
   await composer.fill('停止后保留的原生草稿');
   await expect(screen.getByRole('button', '补充当前工作', { exact: true, visible: true })).toBeEnabled();
@@ -436,16 +469,16 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(target).toBeVisible();
   await expect(composer).toHaveValue('停止后保留的原生草稿');
   expect(await inspect()).toEqual(stopped);
-  await expect(backButton).toHaveAccessibleName('任务');
+  await expect(backButton).toHaveAccessibleName(/^(任务|Back)$/);
   await backButton.click();
   const persistedTask = screen.getByRole('link', /^原生导航检查，/);
   await screen.scrollUntilVisible(persistedTask, { direction: 'down' });
   await persistedTask.click();
   await expect(composer).toHaveValue('停止后保留的原生草稿');
 
-  await expect(backButton).toHaveAccessibleName('任务');
+  await expect(backButton).toHaveAccessibleName(/^(任务|Back)$/);
   await backButton.click();
-  await screen.getByLabel('消息', { exact: true }).click();
+  await screen.getByRole('button', '消息', { exact: true }).click();
   await screen.getByRole('link', '管理频道', { exact: true }).click();
   await screen.getByRole('link', '新频道', { exact: true }).click();
   await textbox('频道目标').fill('手机定向交给本人 Reviewer', { timeout: 30000 });
@@ -484,7 +517,13 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(targetSheet).toHaveCount(0);
   const channelComposer = textbox('发给 Native Reviewer · 新频道任务');
   await channelComposer.fill(JSON.stringify({ phase1: true, label: 'native-workspace-channel', gate: network.gates.channel }), { timeout: 30000 });
-  await screen.getByRole('button', '发送', { exact: true, visible: true }).click();
+  await expect(keyboard).toHaveCount(1);
+  const channelSend = screen.getByRole('button', '发送', { exact: true, visible: true });
+  await expect.poll(async () => {
+    const send = await channelSend.boundingBox(), keys = await keyboard.boundingBox();
+    return Boolean(send && keys && send.y + send.height <= keys.y);
+  }).toBe(true);
+  await channelSend.click();
   const directed = await invocation('native-workspace-channel');
   expect(directed.conversation).not.toBe(task.conversation);
   expect(directed.thread).not.toBe(task.thread);
