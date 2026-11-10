@@ -536,9 +536,10 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
   expect((await inspect()).total_invocations).toBe(1);
   const cancel = optionsSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
-  // The pane is found by a button that may still be below the fold; only the click needs it visible.
+  // `has` searches inside each pane, so it takes a root locator that is not limited to visible elements;
+  // the button can still be below the fold.
   const deferredScroll = device.locator('role=scroll-area').filter({
-    has: optionsSheet.getByRole('button', '取消稍后输入', { exact: true }),
+    has: screen.getByRole('button', '取消稍后输入', { exact: true }),
   });
   await expect(deferredScroll).toHaveCount(1);
   await deferredScroll.scrollUntilVisible(cancel, { direction: 'down' });
