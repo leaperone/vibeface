@@ -1,7 +1,8 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
 import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
-import { Alert, Pressable, ScrollView, View } from 'react-native'
+import { Alert, Pressable, View } from 'react-native'
+import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { botCopy, botModelRows, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
 import { asProvider, messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
@@ -45,7 +46,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
   const place = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : ''
   const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
     <View className="flex-row items-center gap-3">
       <BotFace bot={{ bot_id: bot.bot_id, avatar: look.avatar }} mood={botMood(bot, workspace, shared)} size={48} />
@@ -115,7 +116,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         {skill.description ? <Text className="text-meta text-muted-foreground">{skill.description}</Text> : null}
       </View>)}
     </Section> : null}
-  </ScrollView>
+  </KeyboardAwareScrollView>
 }
 
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {

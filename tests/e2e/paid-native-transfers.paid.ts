@@ -41,8 +41,8 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       assert(joined);
       await expect(screen.getByLabel(`安全码 ${joined.code.split('').join(' ')}`, { exact: true })).toBeVisible();
       await request('/approve', { role: 'android', peer: joined.peer, code: joined.code });
-      await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-      await screen.getByRole('link', '设置', { exact: true }).click();
+      await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+      await screen.getByLabel('设置', { exact: true }).click();
       await screen.scrollUntilVisible(screen.getByRole('link', '实验室', { exact: true }), { direction: 'down' });
       await screen.getByRole('link', '实验室', { exact: true }).click();
       await screen.getByRole('switch', '实验功能', { exact: true }).click();

@@ -202,7 +202,11 @@ VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.j
 pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts --retries 0 --video off
 ```
 
+`VIBEFACE_E2E_BINARY` 同目录下还必须有 `vibeface-core`，先运行 `cargo build -p vibeface -p vibeface-core --locked`。
+
 用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
+
+这个用例目前在 iOS 27.2 模拟器上走不完：键盘没有收起键，`dismissKeyboard` 失败；返回按钮的名称读成 `Back`；消息列表外层容器合并了子节点名称，滚动可见性断言会命中它。最近一次完整通过是在 iOS 26.5 上。
 
 ## 验证原生 Provider 设置和队列取消
 
@@ -210,7 +214,7 @@ pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.na
 
 宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
 
-本地运行使用上节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。
+本地运行使用上节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。Node 端的 `native_provider_clipboard` 总是核对 CI 身份：要设置 `GITHUB_RUN_ID` 和 `GITHUB_RUN_ATTEMPT`，模拟器名为 `vibeface-provider-<run>-<attempt>`，并把它的 UUID 写入 `.artifacts/native/simulator.txt`，否则本地运行在这一步失败。
 
 ```sh
 umask 077

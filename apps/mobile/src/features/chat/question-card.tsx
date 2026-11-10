@@ -89,7 +89,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
       {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1"><Icon as={ListChecks} className="size-4 text-muted-foreground" /><Text className="text-meta underline">打开所属任务</Text></Pressable></Link> : null}
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
-        <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">
+        <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} className="min-h-11 min-w-0 flex-row items-center gap-1 active:opacity-60">
           <Icon as={ListChecks} className="size-4 text-muted-foreground" />
           <Text numberOfLines={1} className="text-meta text-muted-foreground underline">{task.title}</Text>
         </Pressable>

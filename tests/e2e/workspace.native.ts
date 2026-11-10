@@ -75,7 +75,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   assert(/^[0-9]{6}$/.test(code));
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
-  await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   const inspect = async () => {
     const value = await network.call({ op: 'workspace_inspect' });
     return {
@@ -100,7 +100,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await expect(textbox('给 Bot 发消息')).toBeVisible();
     await expect(backButton).toHaveAccessibleName('消息');
     await backButton.click();
-    await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible();
+    await expect(screen.getByLabel('设置', { exact: true })).toBeVisible();
   }
   await screen.getByRole('link', /^Native Builder，/, { visible: true }).click();
   const mainComposer = textbox('给 Bot 发消息');
@@ -231,7 +231,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByText(/^原生滚动记录 /)).toHaveCount(0);
   await app.screenshot('workspace-native-scroll-short-chat');
   await backButton.click();
-  await screen.getByRole('link', '任务', { exact: true, visible: true }).first().click();
+  await screen.getByLabel('任务', { exact: true, visible: true }).first().click();
   const newTask = screen.getByRole('link', '新任务', { exact: true });
   await screen.scrollUntilVisible(newTask, { direction: 'down' });
   await newTask.click();
@@ -363,7 +363,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
 
   await expect(backButton).toHaveAccessibleName('任务');
   await backButton.click();
-  await screen.getByRole('link', '消息', { exact: true }).click();
+  await screen.getByLabel('消息', { exact: true }).click();
   await screen.getByRole('link', '管理频道', { exact: true }).click();
   await screen.getByRole('link', '新频道', { exact: true }).click();
   await textbox('频道目标').fill('手机定向交给本人 Reviewer', { timeout: 30000 });

@@ -61,7 +61,7 @@ touch /opt/apps/vibeface-node/state/node.lock
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
 
-容器里看不到宿主公网 IP，`mesh.advertise`（即 `network.mesh.advertise`）写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。已部署的节点在容器里执行 `vibeface config set --data-dir /data mesh.advertise '["8.217.72.118:4792"]'` 后重启容器。
+容器里看不到宿主公网 IP，`mesh.advertise`（即 `network.mesh.advertise`）写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。镜像里只有 `vibeface-core`，没有 `vibeface` CLI，所以已部署的节点在容器里用 `python3` 读出 `/data/config.json`，加上 `network.mesh.advertise`，写临时文件后原子替换，保留原权限，再重启容器。先升级到认识这个字段的版本，再改配置；旧版读到未知字段会拒绝启动。
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 

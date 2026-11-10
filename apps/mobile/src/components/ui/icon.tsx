@@ -49,7 +49,7 @@ const StyledIcon = withUniwind(IconImpl, {
  * @example
  * ```tsx
  * import { ArrowRight } from 'lucide-react-native';
- * import { Icon } from '@/registry/components/ui/icon';
+ * import { Icon } from '@/components/ui/icon';
  *
  * <Icon as={ArrowRight} className="text-red-500 size-4" />
  * ```
