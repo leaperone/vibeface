@@ -1188,6 +1188,7 @@ def plan(release_app, tag=None, require_main=False, publishing=False, github_out
 
 def self_test():
     from unittest.mock import patch
+    from progressive_publication_fixtures import native_programs, stage_desktop as fixture_desktop
     real_run = run
     product_version = canonical_product_version()
     channel = version(product_version)
@@ -1348,15 +1349,7 @@ def self_test():
                 'the App producer stages the product release')
 
         # Native staging: real executable fixtures reporting the cohort version, per platform basename.
-        def native_programs(directory, target, reported=product_version):
-            directory.mkdir(parents=True, exist_ok=True)
-            for name in program_names(target):
-                binary = directory / name
-                binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {reported}"\n')
-                binary.chmod(0o755)
-            return directory
-
-        native_bin = {target: native_programs(tmp / f'native-bin-{target}', target) for target in TARGETS}
+        native_bin = {target: native_programs(tmp / f'native-bin-{target}', target, product_version) for target in TARGETS}
         wrong_bin = native_programs(tmp / 'wrong-bin', TARGETS[0], '9.9.9')
         for target in TARGETS:
             receipt = accepts(lambda target=target: stage_native(target, native_bin[target], tmp / f'stage-{target}'))
@@ -1396,24 +1389,8 @@ def self_test():
 
         # Desktop producers: installer and archive payloads bound to this platform's released runtime.
         def stage_desktop(destination, target, **changes):
-            destination.mkdir(parents=True, exist_ok=True)
             runtime = collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz'
-            artifacts = {}
-            for name in desktop_payload_names(product_version, target):
-                payload = destination / name
-                payload.write_bytes(f'{name} fixture payload'.encode())
-                payload.with_name(name + '.sha256').write_text(f'{digest(payload)}  {name}\n')
-                artifacts[name] = digest(payload)
-            receipt = dict(schema=SCHEMA_VERSION, app='desktop', target=target, version=product_version,
-                           tag=product_tag, channel=channel, source_commit=source, electron=ELECTRON_VERSION,
-                           signed=target == 'aarch64-apple-darwin',
-                           signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
-                           else 'platform-checksums' if target.endswith('-unknown-linux-gnu')
-                           else 'unsigned-development-preview',
-                           runtime={'archive': runtime.name, 'sha256': digest(runtime)}, artifacts=artifacts)
-            receipt.update(changes)
-            write_json(destination / f'{desktop_basename(product_version, target)}.provenance.json', receipt)
-            return destination
+            return fixture_desktop(sys.modules[__name__], destination, target, product, runtime, **changes)
 
         desktop_pins = dict(version=product_version, tag=product_tag, source_commit=source, channel=channel)
         for target in DESKTOP_TARGETS:
