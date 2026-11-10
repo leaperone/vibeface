@@ -829,18 +829,35 @@ pub async fn create_network(
         },
         password,
     )?;
-    let created = session
+    let network = genesis.network_id.clone();
+    let reply = session
         .call(
             "recover",
             json!({"genesis":genesis,"capability":capability}),
         )
-        .await?;
+        .await;
+    drop(session);
+    let created = match reply {
+        Ok(created) => created,
+        // The reply may be lost after the Node installed the network: ask it before failing.
+        Err(error) => {
+            match async {
+                key.connect(Some(&entry))
+                    .await?
+                    .call("authenticate", json!({}))
+                    .await
+            }
+            .await
+            {
+                Ok(created) if created["network_id"] == network.as_str() => created,
+                _ => return Err(error),
+            }
+        }
+    };
     ensure!(
         created["principal"]["can_manage"] == true,
         "the Node did not make this client a manager"
     );
-    let network = genesis.network_id.clone();
-    drop(session);
     key.remember(&network, entry)?;
     Ok(created)
 }

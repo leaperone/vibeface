@@ -357,9 +357,9 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 | 命令 | 身份 | 用途 |
 |---|---|---|
 | `call <method> [json]` | 本机操作者 | 直接调用一个客户端方法；需要管理客户端签名的 `invite`、`approve`、`grant`、`revoke`、`veto`、`approve_recovery`、`recover`、`recovery_state`、`join`、`join_withdraw` 和不带 `join_id` 的 `join_status` 被拒绝，`subscribe`、`log`、`local_access`、`node_join` 不经维护 socket 提供 |
-| `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；`mesh.` 即 `network.mesh.`。按加载时的规则校验，不接受 token，Node 运行中时重启后生效 |
+| `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；`mesh.` 即 `network.mesh.`。按加载时的规则校验，不接受 token 和 `provider_env`；值写 `-` 时从标准输入读。Node 运行中时回复带 `restart_required: true`，重启后生效 |
 | `node settings / configure / write-state / confirm-writable / diagnostics / rejoin` | 本机操作者 | 项目目录（`--root`、`--no-roots`）、本机 Bot（`--manager <JSON>`、`--no-manager`）、恢复后确认可写、诊断包、被移出后重新开始 |
-| `provider configure / probe / models / test-codex` | 本机操作者 | 改 Provider（`codex`、`claude`、`opencode`、`cursor`、`pi`）设置、检查就绪、列模型、测 App Server |
+| `provider configure / probe / models / test-codex` | 本机操作者 | 改 Provider（`codex`、`claude`、`opencode`、`cursor`、`pi`）设置、检查就绪、列模型、测 App Server；`configure` 的 JSON 写 `-` 时从标准输入读，带 API key 的 `env` 用这种方式传 |
 | `bots list / memory` | 本机操作者 | 列 Bot、读一条记忆 |
 | `bots create / delete / set-primary / set-project / schedule / remember / forget` | 管理客户端 | 用客户端密钥签名的 Bot 写操作 |
 | `delivery status / list / get / providers` | 本机操作者 | 交付状态、订单和全网里提供交付的 Node |
@@ -380,13 +380,13 @@ vibeface client create-network --recovery-file /absolute/path/vibeface-recovery.
 vibeface provider probe codex
 ```
 
-`create-network` 用 `init` 留下的一次性本机授权，只能在 Node 所在电脑运行；恢复文件路径必须不存在，口令和恢复包口令都在终端输入。
+`create-network` 用 `init` 留下的一次性本机授权，只能在 Node 所在电脑运行；恢复文件路径必须不存在，口令和恢复包口令都在终端输入。建网应答丢失时，客户端改问 Node 是否已用这次的网络编号建好，是就照常记下，否则报原错误。
 
 让另一台电脑上的 CLI 成为管理客户端：
 
 ```sh
 vibeface client invite                             # 已有管理客户端，输出十分钟内有效的一次性链接
-vibeface client enroll '<邀请链接>' --name 笔记本    # 新电脑，显示短码并等待批准
+vibeface client enroll - --name 笔记本 < 链接文件   # 新电脑，链接写 - 时从标准输入读；显示短码并等待批准
 vibeface client requests                           # 已有管理客户端
 vibeface client approve <join_id> --code <短码>     # 加 --manage 授予管理权限，--reject 拒绝
 ```
@@ -522,6 +522,8 @@ vibeface mesh bootstrap remove <设备编号>
 `mesh bootstrap add|remove` 写入 `config.json` 的 `network.mesh.bootstrap`，Node 运行时立即改用新列表。开关全网或换网络名时，用 `vibeface config set mesh.enabled false` 或 `vibeface config set mesh.network <名称>` 后重启 Node，不要重新运行 `init`，也不需要重新创建个人网络。
 
 Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数、再按延迟取最好的 8 台加入候选，同一网段（IPv4 /24、IPv6 /48）只取 1 台，iroh 从中选 home relay。配置的 relay、本个人网络成员的 relay、bootstrap 节点的 relay 和自己的 relay 始终保留。私网和回环地址上的 relay 与网关默认不用，`network.mesh.allow_private` 打开后才用，供局域网和测试使用。
+
+网卡上看不到公网地址的 Node（如云主机上的容器）用 `vibeface config set mesh.advertise '["<公网 IP>:<UDP 端口>"]'` 宣告它，最多 8 条，排在全网记录和节点链接的最前面，重启后生效。见[两种链接](design/mesh.md#两种链接)。
 
 全网不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，业务流量经 relay 转发，Node 自动选择。
 

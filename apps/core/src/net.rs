@@ -326,11 +326,24 @@ pub struct Net {
     /// Open relays the mesh announces, adopted while they rank among the best.
     adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
+    /// `network.mesh.advertise`, listed first in the node link.
+    advertise: Vec<SocketAddr>,
 }
 impl std::fmt::Debug for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Net")
     }
+}
+
+/// `advertise`, then the `found` addresses not among them.
+fn advertised_first(advertise: &[SocketAddr], found: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut addrs = advertise.to_vec();
+    addrs.extend(
+        found
+            .into_iter()
+            .filter(|address| !advertise.contains(address)),
+    );
+    addrs
 }
 
 /// Relay configurations by URL. The first configuration of a URL stays unless it carried no
@@ -415,6 +428,7 @@ impl Net {
             bootstrap: Default::default(),
             adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
+            advertise: config.mesh.advertise.clone(),
         })
     }
 
@@ -422,8 +436,8 @@ impl Net {
         self.endpoint.addr()
     }
 
-    /// This Node's node link: public addresses first, then local and loopback ones, at most
-    /// four, and its home relay.
+    /// This Node's node link: advertised addresses first, then public, local and loopback ones,
+    /// at most four, and its home relay.
     pub fn share_link(&self) -> Result<NodeLink> {
         let addr = self.endpoint.addr();
         let mut addrs: Vec<SocketAddr> = addr
@@ -437,6 +451,7 @@ impl Net {
                 !crate::fetch::public(address.ip()),
             )
         });
+        let mut addrs = advertised_first(&self.advertise, addrs);
         addrs.truncate(vibeface_secure::link::MAX_ADDRS);
         Ok(NodeLink::new(
             &device_id(&self.endpoint.id()),
@@ -794,10 +809,14 @@ where
     serve_streams_within(connection, None, MAX_FRAME, handle).await
 }
 
-/// Bounds a protocol anyone may call: at most the semaphore's permits of streams are answered
-/// at once across every connection sharing it, each within the duration; a stream past either
-/// is closed unanswered.
-pub type StreamLimit = (Arc<tokio::sync::Semaphore>, Duration);
+/// Bounds a protocol anyone may call: at most the first semaphore's permits of streams are
+/// answered at once across every connection sharing it, the second's from the one remote, each
+/// within the duration; a stream past any is closed unanswered.
+pub type StreamLimit = (
+    Arc<tokio::sync::Semaphore>,
+    Arc<tokio::sync::Semaphore>,
+    Duration,
+);
 
 /// [`serve_streams`] under `limit`, for requests of at most `max_request` bytes, each read
 /// straight into `T`.
@@ -817,9 +836,12 @@ pub async fn serve_streams_within<T, F, Fut>(
             stream = connection.accept_bi() => {
                 let Ok((mut send, mut recv)) = stream else { break };
                 let (permit, within) = match &limit {
-                    Some((open, within)) => match open.clone().try_acquire_owned() {
-                        Ok(permit) => (Some(permit), Some(*within)),
-                        Err(_) => continue,
+                    Some((open, remote, within)) => match (
+                        remote.clone().try_acquire_owned(),
+                        open.clone().try_acquire_owned(),
+                    ) {
+                        (Ok(remote), Ok(open)) => (Some((remote, open)), Some(*within)),
+                        _ => continue,
                     },
                     None => (None, None),
                 };
@@ -1183,6 +1205,18 @@ mod tests {
             .context("a connection the relay closed kept its share")?;
         relay.shutdown().await;
         Ok(())
+    }
+
+    #[test]
+    fn advertised_addresses_come_first_once() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            advertised_first(
+                &[addr("203.0.113.7:4792")],
+                vec![addr("172.17.0.2:4792"), addr("203.0.113.7:4792")]
+            ),
+            [addr("203.0.113.7:4792"), addr("172.17.0.2:4792")]
+        );
     }
 
     #[test]

@@ -944,6 +944,7 @@ mod tests {
                 "vibeface://node/{boot}?relay=http://boot.example:3340"
             )],
             allow_private: true,
+            advertise: vec![],
         };
         net.start_mesh(&mesh_config, &dir.join("mesh.sqlite3"))
             .await?;
