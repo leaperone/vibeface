@@ -97,10 +97,10 @@ BotMessaged {
 | `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill ID（启用全部时为 `null`，`uses_all_skills` 为真）、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
 | `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的每个 skill 的 `{skill_id, name}`（启用全部时是整个库）、实际显示的长相、schedule、笔记；没有任何密钥 |
 | `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话，返回的 bot 同样给出实际显示的长相 |
-| `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
+| `configure_bot {call_ref, bot, name?, instructions?, model?, reasoning_effort?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、推理档位、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
 
-- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，删除的 skill 从各 bot 的集合里去掉，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
+- 可配项是名称、说明、模型、推理档位、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，删除的 skill 从各 bot 的集合里去掉，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改；设备的可用文件夹等本机设置经 `propose_provider_config` 提议、本人同意后写入。
 - 删除 bot：见第 5.1 节。不提供改本人或设备权限的工具。
 - 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `BotChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
 - `configure_bot` 写一条 `BotChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
@@ -115,12 +115,12 @@ BotMessaged {
 
 ## 6. 轮次与门控
 
-| 工具类别 | 工具 | 本人 | 回答 | 工作结果 | schedule | bot 消息 | Agent 任务、路由 |
-|---|---|---|---|---|---|---|---|
-| 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` `list_sessions` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 工作 | `dispatch_work` `interrupt_work` `hand_over_session` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | |
+| 工具类别 | 工具 | 本人 | 回答 | 工作结果 | schedule | bot 消息 | Agent 任务 | 工作区 Task |
+|---|---|---|---|---|---|---|---|---|
+| 读 | `workspace_state` `workspace_history` `tool_search` `tool_describe` `tool_call` `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` `list_sessions` `history_search` `history_read` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 工作 | `workspace_command` `dispatch_work` `interrupt_work` `hand_over_session` `propose_provider_config` `apply_provider_config` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | | |
 
 提供给模型的工具表由 `Effect::offered` 决定；Node 执行工具时再按这一轮任务的类型核对一次，CLI 直接调用也绕不过。
 
@@ -128,7 +128,7 @@ BotMessaged {
 
 `remind` 在本人轮次写的事件 `cause` 指向本人的消息；其他轮次 `cause` 为空，入库时只接受“新建一次性 schedule”这一种无 `cause` 的修改。
 
-**防循环。** 每个轮次有一个深度：本人消息、回答和路由为 0；schedule 轮取该 schedule 的 `depth`；bot 消息轮取消息的 `hops`；工作结果和 Agent 任务沿派发链取源头轮次的深度。`remind` 新建的提醒深度为当前轮次加 1，`message_bot` 的 `hops` 同样加 1，超过 4 拒绝。于是一条本人消息之后，提醒与互发消息最多再自动唤醒 4 层。另有三道上限：
+**防循环。** 每个轮次有一个深度：本人消息和回答为 0；schedule 轮取该 schedule 的 `depth`；bot 消息轮取消息的 `hops`；工作结果和 Agent 任务沿派发链取源头轮次的深度。`remind` 新建的提醒深度为当前轮次加 1，`message_bot` 的 `hops` 同样加 1，超过 4 拒绝。于是一条本人消息之后，提醒与互发消息最多再自动唤醒 4 层。另有三道上限：
 
 - 每个 bot 最多 20 个活动 schedule；
 - 每个 bot 每小时最多发 10 条消息给其他 bot；

@@ -4646,20 +4646,7 @@ mod tests {
                     .cloned()
                     .context("the peer is listed")
             };
-            a.wake_sync(&peer);
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !a
-                    .sync_peers
-                    .lock()
-                    .expect("sync peers")
-                    .get(&peer)
-                    .is_some_and(|state| state.synced_ms.is_some() && state.failures == 0)
-                {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .context("first sync")?;
+            first_sync(&a, &peer).await?;
             let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
             assert_eq!(online["online"], true);
             assert_eq!(online["capabilities"]["manager"], "cursor");
@@ -5670,14 +5657,18 @@ mod tests {
                     .collect())
             };
             let mut settled = Vec::new();
-            loop {
-                let now = vec![book(&l).await?, book(&c).await?];
-                if now.iter().all(|records| records.len() == 1) && now == settled {
-                    break;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let now = vec![book(&l).await?, book(&c).await?];
+                    if now.iter().all(|records| records.len() == 1) && now == settled {
+                        break anyhow::Ok(());
+                    }
+                    settled = now;
+                    tokio::time::sleep(Duration::from_secs(6)).await;
                 }
-                settled = now;
-                tokio::time::sleep(Duration::from_secs(6)).await;
-            }
+            })
+            .await
+            .context("the address books settle")??;
             let records = l.store.lock().await.address_book()?;
             c.merge_addresses(&network, records).await?;
             c.sync_peers

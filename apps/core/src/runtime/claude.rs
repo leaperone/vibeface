@@ -2405,9 +2405,7 @@ pub(super) mod tests {
     }
 
     fn gated_config(place: &Place, client: &str) -> ManagerConfig {
-        let (record, _) = recorder();
-        let mut config = bot_config(place, record);
-        config.timeout_secs = 30;
+        let mut config = bot_config(place, Arc::new(|_, _| Box::pin(async { Ok(()) })));
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
             started: None,
@@ -2698,7 +2696,6 @@ pub(super) mod tests {
             Probe::Missing
         );
         let locator_path = reader.processes.reply_locator_path("attempt-a")?;
-        let locator = std::fs::read(&locator_path)?;
         std::fs::remove_file(&locator_path)?;
         assert_eq!(
             reader.probe_reply(&session, None, "attempt-a").await?,
@@ -2709,7 +2706,6 @@ pub(super) mod tests {
             reader.probe_reply(&session, None, "attempt-a").await?,
             Probe::Missing
         );
-        config::private_write(&locator_path, &locator)?;
         Ok(())
     }
 
@@ -3040,7 +3036,7 @@ pub(super) mod tests {
         assert_eq!(
             log[0]["env"],
             json!({"VIBEFACE_TOOL_TOKEN":true,"VIBEFACE_NODE_URL":true,"CLAUDECODE":false,
-                "CLAUDE_CODE_ENTRYPOINT":false,"FAKE_MARK":false})
+                "CLAUDE_CODE_ENTRYPOINT":false})
         );
         assert_eq!(log[1]["uuid"], message.as_str());
         assert!(
@@ -3358,22 +3354,14 @@ time.sleep(0.05)
             vec![],
             now_ms(),
         )?;
-        let input = admin.attest(
+        let input = crate::runtime::test_support::signed_main_input(
+            admin,
             network,
             conversation_id,
-            EventBody::InputPosted {
-                message_id: message_id.into(),
-                target: crate::workspace::InputTarget::BotMain {
-                    bot_id: conversation_id.into(),
-                },
-                intent: crate::workspace::InputIntent::Continue,
-                sequence: 1,
-                expected_revision: None,
-                text: "Run the provider fixture work".into(),
-                attachments: vec![],
-                report_results: Some(true),
-                attestation: None,
-            },
+            message_id,
+            "Run the provider fixture work",
+            vec![],
+            1,
         )?;
         store.append_event(
             &node.identity,

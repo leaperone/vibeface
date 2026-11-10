@@ -150,7 +150,7 @@
 | `thread/unarchived` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
 | `thread/closed` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
 | `thread/reverted` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
-| `skills/changed` | Skills | 记录技能变化时间，网页重新 skills/list |
+| `skills/changed` | Skills | 记录技能变化时间 |
 | `thread/name/updated` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
 | `thread/attachment/updated` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
 | `thread/goal/updated` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
@@ -175,7 +175,7 @@
 | `autoApprovalReview/strictReviewRequired` | Review | 记录最近一次同名事件 |
 | `item/completed` | Item | 条目按 id 存入当前回合；最终回答进入 last_assistant |
 | `item/agentMessage/delta` | Item | 条目按 id 存入当前回合；最终回答进入 last_assistant |
-| `item/plan/delta` | Plan | 计划步骤与说明进入线程观察状态，并节流写入 WorkProgress |
+| `item/plan/delta` | Plan | 追加到该条目的文本 |
 | `command/exec/outputDelta` | Output | 存入 `hidden`，sanitize 后不送网页 |
 | `process/outputDelta` | Output | 存入 `hidden`，sanitize 后不送网页 |
 | `process/exited` | Output | 存入 `hidden`，sanitize 后不送网页 |
@@ -185,11 +185,11 @@
 | `item/fileChange/patchUpdated` | Output | 存入 `hidden`，sanitize 后不送网页 |
 | `serverRequest/resolved` | Request | 从待答请求中移除 |
 | `item/mcpToolCall/progress` | Item | 条目按 id 存入当前回合；最终回答进入 last_assistant |
-| `mcpServer/oauthLogin/completed` | Mcp | MCP 启动状态按服务器名进入全局观察状态 |
+| `mcpServer/oauthLogin/completed` | Mcp | 记录最近一次同名事件 |
 | `mcpServer/startupStatus/updated` | Mcp | MCP 启动状态按服务器名进入全局观察状态 |
-| `mcpServer/event/stream/notification` | Mcp | MCP 启动状态按服务器名进入全局观察状态 |
+| `mcpServer/event/stream/notification` | Mcp | 记录最近一次同名事件 |
 | `account/updated` | Account | 账户类型与套餐进入全局观察状态，不含凭证 |
-| `account/gatewayOAuth/changed` | Account | 账户类型与套餐进入全局观察状态，不含凭证 |
+| `account/gatewayOAuth/changed` | Account | 记录最近一次同名事件 |
 | `account/rateLimits/updated` | RateLimits | 额度进入全局观察状态 |
 | `app/list/updated` | Apps | 应用列表进入全局观察状态 |
 | `remoteControl/status/changed` | Platform | 记录最近一次同名事件 |
@@ -198,12 +198,12 @@
 | `fs/changed` | Output | 存入 `hidden`，sanitize 后不送网页 |
 | `item/reasoning/summaryTextDelta` | Reasoning | 推理摘要按段累积进入线程观察状态 |
 | `item/reasoning/summaryPartAdded` | Reasoning | 推理摘要按段累积进入线程观察状态 |
-| `item/reasoning/textDelta` | Reasoning | 推理摘要按段累积进入线程观察状态 |
+| `item/reasoning/textDelta` | Reasoning | 记录最近一次同名事件 |
 | `thread/compacted` | Thread | 线程状态、名称、归档、设置、目标等进入线程观察状态 |
 | `model/rerouted` | Model | 记录最近一次同名事件 |
 | `model/verification` | Model | 记录最近一次同名事件 |
-| `modelProvider/authRecoveryStarted` | Account | 账户类型与套餐进入全局观察状态，不含凭证 |
-| `modelProvider/authRecoveryCompleted` | Account | 账户类型与套餐进入全局观察状态，不含凭证 |
+| `modelProvider/authRecoveryStarted` | Account | 记录最近一次同名事件 |
+| `modelProvider/authRecoveryCompleted` | Account | 记录最近一次同名事件 |
 | `turn/moderationMetadata` | Turn | 回合开始、结束、错误进入线程观察状态，驱动工作状态机 |
 | `model/safetyBuffering/updated` | Model | 记录最近一次同名事件 |
 | `warning` | Warning | 进入最近 20 条警告 |
@@ -225,4 +225,4 @@
 | `thread/realtime/closed` | Realtime | 记录最近一次同名事件 |
 | `windows/worldWritableWarning` | Platform | 记录最近一次同名事件 |
 | `windowsSandbox/setupCompleted` | Platform | 记录最近一次同名事件 |
-| `account/login/completed` | Account | 账户类型与套餐进入全局观察状态，不含凭证 |
+| `account/login/completed` | Account | 记录最近一次同名事件 |

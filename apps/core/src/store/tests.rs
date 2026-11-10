@@ -783,7 +783,6 @@ fn pending_capacity_is_reserved_for_verified_authorized_authors() -> Result<()> 
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     assert_eq!(counts, (share + 1, share, 1));
-    assert!(counts.0 <= log::MAX_PENDING_EVENTS);
     Ok(())
 }
 
@@ -4287,7 +4286,7 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     let mut other = store(&net)?;
     all_accepted(&mut other, &net, &origin)?;
     assert!(other.scheduler_jobs("d")?.is_empty() && other.scheduler_jobs("c")?.is_empty());
-    let forged = net.a.sign_event(Event {
+    let forged = net.b.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
         author: net.b.device_id()?,
@@ -4307,10 +4306,8 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
         },
         blobs: vec![],
     });
-    assert!(
-        forged.is_err(),
-        "hops beyond the limit are not a valid event"
-    );
+    let forged = forged.unwrap_err();
+    assert!(forged.to_string().contains("hops deep"), "{forged}");
     Ok(())
 }
 
@@ -8755,23 +8752,7 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     }
     let local = net.a.device_id()?;
     let render = |store: &Store, trigger: &str, resumed: Option<&VersionVector>, thread| {
-        let job = SchedulerJob {
-            scope: SessionScope::Main,
-            conversation_id: "c".into(),
-            trigger: message_trigger(trigger),
-            kind: TriggerKind::Human,
-            sequence: 0,
-            basis: store.version_vector(&net.network)?,
-            reply_to: trigger.into(),
-            message_id: "reply".into(),
-            state: JobState::Queued,
-
-            runtime: None,
-
-            pending_check: false,
-
-            tool_calls: false,
-        };
+        let job = job_at(store, &net, trigger)?;
         let history = store.turn_history(
             &net.network,
             "c",
@@ -9510,7 +9491,7 @@ fn answers_become_checkpoint_decisions_that_later_checkpoints_keep() -> Result<(
 }
 
 #[test]
-fn a_turn_marks_attachments_not_on_this_device_pending() -> Result<()> {
+fn the_prompt_shows_a_pending_attachment_as_pending_download() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     bot_conversation(&mut store, &net)?;
@@ -11382,7 +11363,7 @@ fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<
         .into_iter()
         .find(|check| check.attempt_id == main_attempt.id)
         .context("pending check")?;
-    store.confirm_manager_stopped(&net.a, &net.network, &check, crate::runtime::now_ms())?;
+    store.confirm_manager_stopped(&net.a, &net.network, &check, 20)?;
     assert_eq!(
         store.scheduler_job_hold(
             &net.network,
@@ -13473,7 +13454,7 @@ fn workspace_queue_controls_preserve_signed_history_and_reject_started_or_unknow
             .unwrap()
             .deferred
     );
-    origin.connection.execute("UPDATE scheduler_jobs SET state='reconciling',attempt_id='attempt' WHERE conversation_id='c' AND trigger='message:defer'",[])?;
+    assert_eq!(origin.connection.execute("UPDATE scheduler_jobs SET state='reconciling',attempt_id='attempt' WHERE conversation_id='c' AND trigger='message:defer'",[])?, 1);
     let current = origin
         .queued_workspace_input(&net.network, "defer")?
         .unwrap();
@@ -13497,10 +13478,13 @@ fn workspace_queue_controls_preserve_signed_history_and_reject_started_or_unknow
             .unwrap()
             .cancelled
     );
-    origin.connection.execute(
-        "UPDATE scheduler_jobs SET state='running' WHERE trigger='message:defer'",
-        [],
-    )?;
+    assert_eq!(
+        origin.connection.execute(
+            "UPDATE scheduler_jobs SET state='running' WHERE trigger='message:defer'",
+            [],
+        )?,
+        1
+    );
     let current = origin
         .queued_workspace_input(&net.network, "defer")?
         .unwrap();

@@ -1744,7 +1744,7 @@ mod tests {
             &bin,
             r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
-names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME', 'CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']
+names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME', 'OPENCODE_DISABLE_PROJECT_CONFIG', 'OPENCODE_CONFIG_PROJECT_DISABLE', 'OPENCODE_DISABLE_CLAUDE_CODE', 'CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']
 pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args': sys.argv[1:], 'env': {name: os.environ.get(name) for name in names}, 'auth': os.environ.get('FAKE_LOGIN_AUTH')}))
 "#,
         )?;
@@ -1810,9 +1810,7 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
                 );
             }
             for (name, value) in roots.env(provider) {
-                if observed["env"].get(&name).is_some() {
-                    assert_eq!(observed["env"][name], value);
-                }
+                assert_eq!(observed["env"][&name], value, "{name}");
             }
             if provider == Provider::Opencode {
                 for name in [

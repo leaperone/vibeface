@@ -13,14 +13,14 @@
 | 客户端请求 | `read` | 只读，可重试，失败不算结果不明 |
 | | `write` | 有副作用，连接中断时结果不明，不自动重发 |
 | | `hidden` | 客户端能发，但不经 Node 暴露给网页（文件读写、任意命令执行、凭证刷新） |
-| 服务端通知 | 归约类别 | 每个通知归入一个类别（线程、回合、条目、计划、推理摘要、用量、额度、账户、配置、技能、插件、MCP、应用、文件监视、进程、实时、警告等），由观察状态的归约函数处理 |
+| 服务端通知 | 归约类别 | 每个通知归入一个类别（线程、回合、条目、计划、推理摘要、用量、额度、账户、技能、应用、MCP、hook、审查、模型、警告、搜索、实时、平台、导入、请求、执行输出），由观察状态的归约函数处理 |
 | 服务端请求 | 交给协调 Agent | Node 挂起请求并唤醒协调 Agent，由它回答或提问，见 1.2 |
 
 ### 1.1 观察状态
 
-客户端把每条通知归约进 `Observed`：每个线程的状态、名称、模型和推理强度、进行中的回合、最近回合的结果、最后一段回答、计划步骤、推理摘要、token 用量、目标和归档状态，以及全局的账户类型、额度、模型列表、技能、插件、MCP 状态和最近的警告。账户状态只保留类型、套餐和登录与否，不保留任何 token。
+客户端把每条通知归约进观察状态：每个线程的状态、名称、模型和推理强度、进行中的回合、最近回合的结果、最后一段回答、计划步骤、推理摘要、token 用量、目标和归档状态，以及全局的账户类型、额度、模型列表、技能、插件、MCP 状态和最近的警告。账户状态只保留类型、套餐和登录与否，不保留任何 token。
 
-送往网页之前，Node 用 `sanitize` 去掉执行内容：`commandExecution` 只留 `id`、`type`、`status`；`fileChange` 去掉 `changes`；`turn/diff/updated`、命令输出和进程输出的增量不送出。状态里保留原始内容，供对账和 Agent 使用。
+送往网页之前，Node 用 `sanitize` 去掉执行内容：`commandExecution`、`fileChange`、`functionCallOutput` 只留 `id`、`type`、`status`；`turn/diff/updated`、命令输出和进程输出的增量不送出。状态里保留原始内容，供对账和 Agent 使用。
 
 ### 1.2 服务端请求
 
@@ -149,20 +149,22 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 | 来源 | 方式 |
 |---|---|
 | Codex hook | `Stop`、`PermissionRequest` 调用 `vibeface hook codex` |
-| Claude Code hook | `Stop`、`StopFailure`、`Notification` 调用 `vibeface hook claude` |
+| Claude Code hook | `Stop`、`StopFailure`、`Notification`、`PermissionRequest` 调用 `vibeface hook claude` |
+| pi 扩展 | `~/.pi/agent/extensions/vibeface.ts` 调用 `vibeface hook pi` |
+| OpenCode 插件 | `~/.config/opencode/plugins/vibeface.ts` 调用 `vibeface hook opencode` |
 | App Server | 本机 App Server 报告的所有线程的 `turn/completed`（完成、失败、中断） |
 | 会话扫描 | 默认关闭；显式启用后，每 5 分钟扫描 `triage.codex_sessions` 配置目录下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
 
-`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 和转发头、并带所有者 bearer 的 JSON 请求：`vibeface hook` 读取数据目录私有的 `local-access.json`，按其中记录的 origin 发请求并附 capability，浏览器跨站请求和读不到该目录的进程一律拒绝；同一 OS 账户的完整 Shell 不在此隔离之内。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
+`vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 和转发头、并带所有者 bearer 的 JSON 请求：`vibeface hook` 读取数据目录私有的 `local-access.json`，按其中记录的 origin 发请求并附 capability，浏览器跨站请求和读不到该目录的进程一律拒绝；同一 OS 账户的完整 Shell 不在此隔离之内。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，上报总超时 5 秒；事件带 `hold`（会话挂着请求等回答：Claude Code 的 `PermissionRequest`、pi 的回合结束、OpenCode 的 `permission.asked` 和 `question.asked`）时，hook 再向 `/api/hooks/wait` 等最多 40 秒，Node 给这类请求的回答期限是 30 秒（`HOOK_ANSWER_WITHIN`）。
 
 统一事件格式（schema_version 1）：
 
 ```text
 { schema_version, event_id, source, host, node, agent, event, status, session_id, turn_id,
-  cwd, repo, git_branch, git_head, last_message, detail, ts_ms, test }
+  cwd, repo, git_branch, git_head, last_message, detail, ts_ms, test, request_id, hold }
 ```
 
-- `agent`：`codex` 或 `claude`。`event`：`turn_end`、`needs_input`、`notification`。`status`：`completed`、`failed`、`interrupted` 或空。
+- `agent`：`codex`、`claude`、`pi` 或 `opencode`。`event`：`turn_end`、`needs_input`、`notification`。`status`：`completed`、`failed`、`interrupted` 或空。
 - `event_id = sha256(node, agent, session_id, turn_key, event)` 的前 32 个十六进制字符。`turn_key` 是回合编号；Claude 没有回合编号，用 transcript 的字节长度。同一回合从 hook、App Server 和扫描进来得到同一个 `event_id`，只处理一次。
 - `last_message` 最多 4000 字，`detail` 最多 2000 字。
 
@@ -190,7 +192,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 密钥只存在数据目录的 `triage-webhook.key`（0600），不进 `config.json`、DAG、日志和诊断包。网页只能设置或清除，读不回来。
 
-设置是本机的，只有管理设备或本机会话能改，经浏览器会话的方法调用：
+设置是本机的，只有管理设备或本机会话能改，经浏览器会话的方法调用，或在本机用 `vibeface triage settings|configure|test-webhook|create-token|revoke-token`：
 
 | 方法 | 参数 | 返回 |
 |---|---|---|

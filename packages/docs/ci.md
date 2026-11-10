@@ -160,7 +160,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-定时检查保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。定时和 Actions 手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。手动 `ci` 只验证和生成制品，不自动补发 Nightly。
+定时检查保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。定时和 Actions 手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。手动 `ci` 只验证和生成制品，不自动补发 Nightly。
 
 `daily-nightly` 接在同一 main schedule run 的 `ci-gate` 后，要求 `!cancelled()` 和 gate success，不增加第二套定时全量 CI。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
 

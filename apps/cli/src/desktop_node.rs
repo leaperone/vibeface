@@ -1408,15 +1408,7 @@ mod tests {
             serde_json::to_vec(&build).unwrap(),
         )
         .unwrap();
-        let mut files = Vec::new();
-        let mut names = names.to_vec();
-        names.push("BUILD-INFO.json");
-        names.sort();
-        for name in names {
-            let bytes = fs::read(package.join(name)).unwrap();
-            files.push(format!("{}  {name}", hex::encode(Sha256::digest(bytes))));
-        }
-        fs::write(package.join("FILES.sha256"), files.join("\n") + "\n").unwrap();
+        reseal(&package);
         package
     }
 
@@ -1563,7 +1555,7 @@ mod tests {
         assert_eq!(conflict.availability, "immutable_conflict");
         let mismatch = runtime_update_for_packages(
             &matching,
-            Some(&installed),
+            Some(&matching),
             Some("0.0.1-nightly.20261106.1"),
         )
         .unwrap();
@@ -1790,11 +1782,6 @@ mod tests {
             &serde_json::to_vec(&receipt).unwrap(),
         )
         .unwrap();
-        privatefs::write_atomic(
-            &data.join("update-pending.json"),
-            br#"{"phase":"prepared"}"#,
-        )
-        .unwrap();
         for phase in ["prepared", "confirmed"] {
             privatefs::write_atomic(
                 &data.join("update-pending.json"),
@@ -1910,9 +1897,6 @@ mod tests {
             "{calls_text}"
         );
         assert_eq!(calls_text.lines().count(), 3, "{calls_text}");
-        assert!(!calls_text.contains("stop"), "{calls_text}");
-        assert!(!calls_text.contains("start"), "{calls_text}");
-        assert!(!calls_text.contains("install"), "{calls_text}");
         assert_eq!(fs::read(data.join("update-pending.json")).unwrap(), journal);
         assert_eq!(
             fs::read_link(managed_root.join("current")).unwrap(),

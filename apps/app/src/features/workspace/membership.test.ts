@@ -61,7 +61,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   }
   const connection = {
     generation: 1, entry: { address: 'https://node.example', device_id: entry },
-    principal: source === 'membership' ? { source, network_id: network, device_id: browser, epoch: 1, can_manage: false } : { source, network_id: network, device_id: browser, epoch: 1, can_manage: false },
+    principal: { source, network_id: network, device_id: browser, epoch: 1, can_manage: false },
     info: { device_id: entry, name: 'node', version: 'test', initialized: true, network_id: network },
     isCurrent: () => true, subscribe: () => () => {},
     async request(method: string) { if (method === 'write_state') return { state: 'writable', conflicts: [] }; return {} },

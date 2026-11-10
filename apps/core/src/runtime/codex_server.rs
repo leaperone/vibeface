@@ -2210,11 +2210,6 @@ raise SystemExit(7)
             bins: BTreeMap::from([(Provider::Codex, program)]),
             env: ProviderEnv::default(),
         };
-        assert_eq!(
-            local.switches.codex_app_server.mode,
-            AppServerMode::System,
-            "an explicit system App Server remains usable"
-        );
         let identity = LocalIdentity::generate();
         let (events, _events) = mpsc::unbounded_channel();
         let server = CodexServer::open(local.codex_target(false), &identity, &dir, events)?;

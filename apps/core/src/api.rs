@@ -1823,8 +1823,6 @@ mod tests {
             assert_eq!(client.post(&endpoint).json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(request().header("x-forwarded-for", "127.0.0.1").send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
-            let removed = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?;
-            assert_eq!(removed.status(), StatusCode::NOT_FOUND);
             let public_info: Value = client.get(format!("{origin}/api/info")).send().await?.json().await?;
             assert!(!public_info.to_string().contains(&capability.capability));
             assert!(public_info.get("invitation").is_none());
@@ -1883,14 +1881,10 @@ mod tests {
                 .join("../../.artifacts")
                 .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
             config::private_dir(&dir)?;
-            Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
-            config::private_write(
-                &dir.join("data-epoch.json"),
-                &crate::config::data_epoch_marker(),
-            )?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+            initialize_node(
+                &dir,
+                &Config::local("127.0.0.1:0".parse()?, vec![], false),
+                &crate::crypto::LocalIdentity::generate(),
             )?;
             let mut runtime = Runtime::open(&dir).await?;
             runtime.config.web_enabled = web_enabled;

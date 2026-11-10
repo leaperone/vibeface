@@ -1634,6 +1634,21 @@ mod tests {
                 );
             }
         }
+        let root = work(&node, &workspace, "not-started", "fixture prompt")?;
+        let follow = WorkSpec {
+            continues: Some(root.work_id.clone()),
+            cwd: dir.join("elsewhere").display().to_string(),
+            ..work(&node, &workspace, "follow", "more")?
+        };
+        let owner = node
+            .cursor_executor
+            .lineage(&node, &network, &follow)
+            .await?;
+        assert_eq!(
+            (owner.root_work, owner.workspace),
+            (root.work_id, workspace.clone()),
+            "a follow-up runs where its root work ran"
+        );
         node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
