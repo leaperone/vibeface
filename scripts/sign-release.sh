@@ -2,7 +2,7 @@
 set -euo pipefail
 keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
 trap 'security delete-keychain "$keychain" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/vibeface-signing.p12" "$RUNNER_TEMP/vibeface-notary.p8"' EXIT
-GITHUB_ENV="${GITHUB_ENV:-/dev/null}" source "${BASH_SOURCE[0]%/*}/import-mac-identity.sh"
+GITHUB_ENV="${GITHUB_ENV:-/dev/null}" source "$(dirname "${BASH_SOURCE[0]}")/import-mac-identity.sh"
 [[ "$1" == product ]] || { echo 'Expected the product native programs.' >&2; exit 1; }
 binaries=("$2/vibeface" "$2/vibeface-core")
 notary_inputs=$(mktemp -d "$RUNNER_TEMP/vibeface-notary-product.XXXXXX")
