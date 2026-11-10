@@ -64,7 +64,7 @@ export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { 
 export type WorkspaceCommandNotSaved = { accepted: false; code: 'workspace_command_not_saved'; stored: false; command_id: string; reason: string }
 export type WorkspaceInputBody = {
   type: 'input_posted'; message_id: string; target: InputTarget; intent: InputIntent; sequence: number; expected_revision?: number
-  text: string; attachments?: Attachment[]; report_results?: boolean
+  text: string; attachments?: Attachment[]; report_results: boolean
 }
 export type WorkspaceHistoryBody =
   | WorkspaceInputBody

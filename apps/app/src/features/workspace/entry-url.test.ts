@@ -315,6 +315,38 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    await t.test('malformed signed Unknown inputs survive reload and recovery attempts without rewriting or resubmission', async () => {
+      const originalOutbox = platform.outbox
+      const mutations: string[] = []
+      platform.outbox = { all: originalOutbox.all, put: async (item) => { mutations.push('put'); await originalOutbox.put(item) }, delete: async (key) => { mutations.push('delete'); await originalOutbox.delete(key) } }
+      try {
+        for (const report_results of [undefined, null, 'false', 0]) {
+          const invalid: OutboxItem = { key: 'network.client:message:legacy', method: 'message', created_at_ms: 1, delivery: 'unknown',
+            params: { conversation_id: 'chat', message_id: 'legacy', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原签名请求', ...(report_results === undefined ? {} : { report_results }), attestation: { device_id: 'client', signature: 'must-stay-original' } },
+            uploads: [{ hash: 'a'.repeat(64), size: 3, name: 'original.txt', data: 'YWJj' }],
+          }
+          await originalOutbox.put(invalid)
+          const bytes = JSON.stringify(await originalOutbox.all()), signatures = signed.length, submissions = messages.length, queries = inputReceiptQueries.length
+          mutations.length = 0
+          await reload()
+          assert.match(render().error?.text ?? '', /report_results/)
+          assert.equal(render().canSaveMessages, false)
+          await render().refresh()
+          await new Promise(setImmediate)
+          await assert.rejects(render().retryPendingMessage('legacy'), /report_results/)
+          await assert.rejects(render().releaseMessagePending('legacy'), /report_results/)
+          assert.equal(JSON.stringify(await originalOutbox.all()), bytes, 'raw ID, signature, delivery and upload bytes survive every failed boundary')
+          assert.deepEqual(mutations, [], 'invalid durable wire is neither pruned nor rewritten')
+          assert.deepEqual([signed.length, messages.length, inputReceiptQueries.length], [signatures, submissions, queries], 'no signing, write or input reconciliation is attempted')
+          await originalOutbox.delete(invalid.key)
+        }
+      } finally {
+        platform.outbox = originalOutbox
+        await originalOutbox.delete('network.client:message:legacy')
+        await reload()
+        await render().refresh()
+      }
+    })
     await t.test('shared public history API fences late results, preserves pushed rows and restarts after authority changes', async () => {
       const originalRpc = connection.rpc
       const row = (message_id: string, at: number, text = message_id) => ({ message_id, event_hash: message_id, rank: String(at).padStart(20, '0'), role: 'user', text, created_at_ms: at })
@@ -847,7 +879,7 @@ test("workspace preserves bot and message requests while routing native decision
       let delayedMainRead: ReturnType<typeof deferred> | null = null
       let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
       current.rpc = async (method, body = {}) => {
-        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
         if (method === 'read_artifact') {
           calls.push(JSON.parse(JSON.stringify(body)))
           if (delayedMainRead) return delayedMainRead.promise
@@ -1143,7 +1175,7 @@ test("workspace preserves bot and message requests while routing native decision
           let saving = Promise.resolve()
           actions.send = (_id, text, _files, options) => {
             assert.ok(options)
-            saving = accepted.promise.then(() => { options.onSaved?.({ message_id: 'native-saved', conversation_id: 'chat', target: { kind: 'task', task_id: 'native-created-task' }, intent: 'continue', expected_revision: 1, sequence: 1, text, attachments: [], created_at_ms: 1, delivery: 'saved' }) })
+            saving = accepted.promise.then(() => { options.onSaved?.({ report_results: true, message_id: 'native-saved', conversation_id: 'chat', target: { kind: 'task', task_id: 'native-created-task' }, intent: 'continue', expected_revision: 1, sequence: 1, text, attachments: [], created_at_ms: 1, delivery: 'saved' }) })
             return saving
           }
           try {
@@ -2107,7 +2139,7 @@ const parityShared = () => ({
 test('both pending input controls retry only a matching safe refusal and keep all scope targets', async () => {
   const targets: InputTarget[] = [{ kind: 'bot_main', bot_id: 'bot' }, { kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }, { kind: 'routine', bot_id: 'bot', trigger: 'schedule:one' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }]
   for (const platform of ['web', 'native']) for (const target of targets) {
-    let pending: PendingMessage = { message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
+    let pending: PendingMessage = { report_results: true, message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
     const retries: string[] = [], closed: string[] = []
     const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
       queryInput: async () => { pending = { ...pending, delivery: 'accepted', receipt: { message_id: pending.message_id, target, stage: 'refused', retry_safe: true, control_event: 'c'.repeat(64), actual_turn_id: null, reason: '可以重试原输入' } } },
@@ -2154,7 +2186,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
       pending = { ...pending, rejected: '尚未确认' }; assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
       pending = accepted
       shared.writable = false; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'), 'closing only the local reminder needs no write permission'); shared.writable = true
-      const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: pending.message_id, target, intent: 'defer', sequence: 1, text: pending.text }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
+      const queued: WorkspaceDomainState['inputs'][number] = { input: { report_results: true, message_id: pending.message_id, target, intent: 'defer', sequence: 1, text: pending.text }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
       shared.workspaceState.inputs = [queued]; assert.equal(button('重试原输入'), undefined)
       assert.ok(button('关闭提醒'), 'the matched refused receipt determines closure, not a queue flag')
       shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'))
@@ -2253,7 +2285,7 @@ test('composers save each pending draft once and let edited drafts save independ
         const taskId = `created-task-${attempts.length}`
         const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => {
           saved.push({ text, attachments })
-          if (options.intent === 'new_task') options.onSaved?.({ message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
+          if (options.intent === 'new_task') options.onSaved?.({ report_results: true, message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
           return true
         })
         saves.push(save)
@@ -2353,7 +2385,7 @@ test('both channel composers retain the durable task target before the domain sn
       channels: [{ channel_id: 'channel', title: '官网改版', purpose: '', members: ['bot', 'other'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 1, owner_epoch: 1, event_hash: 'channel-event', created_at_ms: 1 }],
       tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
     }
-    const durable: PendingMessage = { message_id: 'locally-saved', conversation_id: 'chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'stable-task', bot_id: 'bot' }, intent: 'continue', expected_revision: 1, sequence: 1, text: 'first', created_at_ms: 1, delivery: 'saved' }
+    const durable: PendingMessage = { report_results: true, message_id: 'locally-saved', conversation_id: 'chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'stable-task', bot_id: 'bot' }, intent: 'continue', expected_revision: 1, sequence: 1, text: 'first', created_at_ms: 1, delivery: 'saved' }
     const pendingMessages: PendingMessage[] = []
     const sends: InputOptions[] = []
     const shared = { ...parityShared(), workspaceState: domain, pendingMessages,
@@ -4286,7 +4318,7 @@ test('merged and in-flight user messages show honest status labels and refresh-o
     data: { ...parseConversation(context, 'chat'), messages, scheduler: { jobs, unanswered: [], capabilities: { streaming: true, cancel: true, steer: true } } },
     refresh: async () => { refreshed++ }, sendMessage: async () => { sent++; return true },
   })
-  let current = build([], [], { message_id: 'pending', text: 'sending', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, created_at_ms: 1, delivery: 'submitting' })
+  let current = build([], [], { report_results: true, message_id: 'pending', text: 'sending', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, created_at_ms: 1, delivery: 'submitting' })
   const harness = conversationHarness(() => current)
   try {
     assert.match(componentText(harness.messageTree('pending')), /正在确认送达/)
@@ -4317,7 +4349,7 @@ test('merged and in-flight user messages show honest status labels and refresh-o
 
 test('queued input edits and cancellation use the exact input CAS and leave the chat draft alone', async () => {
   const target: InputTarget = { kind: 'bot_main', bot_id: parityBot.bot_id }
-  const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: 'queued', target, intent: 'defer', sequence: 1, text: 'original queued text' }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
+  const queued: WorkspaceDomainState['inputs'][number] = { input: { report_results: true, message_id: 'queued', target, intent: 'defer', sequence: 1, text: 'original queued text' }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
   const controls: unknown[] = [], queries: unknown[] = []
   let stage: InputReceipt['stage'] = 'entry_accepted', error: unknown = null
   const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [queued], coverage: { limit: 128, truncated: false } },

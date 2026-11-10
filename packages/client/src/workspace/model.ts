@@ -1,4 +1,4 @@
-import type { Attachment, PendingMessage, TranscriptMessage } from "../chat/types.ts"
+import type { Attachment, MessageRequest, PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { OutboxItem } from "../lib/outbox.ts"
 import { parseProviderReadiness } from "../lib/node.ts"
 import { providerStages, type ProviderStage, type TurnRuntime } from "./types.ts"
@@ -123,7 +123,7 @@ export function parseInputIntent(value: unknown): InputIntent {
 function workspaceInputFields(value: unknown): Omit<WorkspaceInputBody, 'type'> {
   const data = record(value), sequence = number(data.sequence)
   if (!sequence) throw new Error('输入顺序必须为正整数。')
-  return { message_id: text(data.message_id), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), text: text(data.text), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results) }
+  return { message_id: text(data.message_id), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), text: text(data.text), attachments: attachments(data.attachments), report_results: reportResults(data.report_results) }
 }
 function queuedInput(value: unknown): QueuedInput {
   const data = record(value)
@@ -164,13 +164,20 @@ export function parseScopeContext(value: unknown): ScopeContext {
   return { ...base, available: true, context, reason: null }
 }
 export function parsePendingMessage(item: OutboxItem): PendingMessage {
-  const data = record(item.params), delivery = item.delivery ?? 'unknown'
+  const request = parseMessageRequest(item.params), delivery = item.delivery ?? 'unknown'
   if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(delivery)) throw new Error('本地输入状态无法识别。')
   if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict') throw new Error('本地输入拒绝原因无法识别。')
-  const sequence = number(data.sequence)
-  if (!sequence) throw new Error('本地输入顺序无效。')
-  return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results), created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
+  return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
 }
+export function parseMessageRequest(value: unknown): MessageRequest {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), ...workspaceInputFields(data) }
+}
+function reportResults(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw new Error('输入的 report_results 必须明确为 true 或 false。')
+  return value
+}
+
 function taskAction(value: unknown): WorkspaceTask['action'] {
   if (value === 'continue' || value === 'stop' || value === 'cancel' || value === 'defer') return value
   throw new Error('任务操作无法识别。')

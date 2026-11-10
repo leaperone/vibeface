@@ -70,7 +70,7 @@ test('an Assignment result declaration does not become a verified completed resu
 })
 
 test('workspace history validates the exact event kind and verified speaker', () => {
-  const body = { type: 'input_posted', message_id: 'm', target: { kind: 'task', task_id: 'one' }, intent: 'continue', sequence: 1, expected_revision: 1, text: '只属于此任务' }
+  const body = { type: 'input_posted', report_results: true, message_id: 'm', target: { kind: 'task', task_id: 'one' }, intent: 'continue', sequence: 1, expected_revision: 1, text: '只属于此任务' }
   const event = { event_hash: 'event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', body, speaker: { kind: 'human', device_id: 'client' } }
   const history = parseWorkspaceHistory({ events: [event], coverage: { limit: 20, truncated: true, scope: 'task' } })
   assert.equal(history.coverage.truncated, true)

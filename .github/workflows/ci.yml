@@ -1301,17 +1301,19 @@ jobs:
           thread = gdb.selected_thread()
           if thread is not None:
               frame = gdb.newest_frame()
-              for index in range(2):
-                  if frame is None: break
-                  frame.select()
-                  print('native poll frame %s: %s' % (index, (frame.name() or '?')[:140]))
-                  gdb.execute('info frame')
-                  gdb.execute('info registers rsp rbp rip')
-                  block = frame.block()
-                  while block is not None and block.function is None:
-                      block = block.superblock
-                  if block is not None:
-                      gdb.execute('disassemble /r 0x%x,0x%x' % (block.start, block.start + 160))
+              measured = 0
+              while frame is not None and measured < 3:
+                  if (frame.name() or '').startswith('native_ui_offline::views::backend::'):
+                      frame.select()
+                      print('native poll frame %s: %s' % (measured, (frame.name() or '?')[:140]))
+                      gdb.execute('info frame')
+                      gdb.execute('info registers rsp rbp rip')
+                      block = frame.block()
+                      while block is not None and block.function is None:
+                          block = block.superblock
+                      if block is not None:
+                          gdb.execute('disassemble /r 0x%x,0x%x' % (block.start, block.start + 160))
+                      measured += 1
                   frame = frame.older()
           end
           thread apply all bt 16
