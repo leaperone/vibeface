@@ -142,12 +142,13 @@ jobs:
           sudo mdutil -a -i off > /dev/null
           nohup scripts/ci-runner-load.sh > .artifacts/native/runner-load.log 2>&1 &
       - name: Install simslim
-        env:
-          GOTOOLCHAIN: auto
-          GOBIN: ${{ github.workspace }}/.artifacts/native/simslim
         run: |
-          go install github.com/mobai-app/simslim/cmd/simslim@v0.14.0
-          echo "SIMSLIM=$GOBIN/simslim" >> "$GITHUB_ENV"
+          mkdir -p .artifacts/native/simslim
+          cd .artifacts/native/simslim
+          curl -fsSLo simslim.tar.gz https://github.com/MobAI-App/simslim/releases/download/v0.14.0/simslim-v0.14.0-macos-arm64.tar.gz
+          echo "a3db0de6f428f9f8fd5dff256b122f98791c138521dc1330d99643719d8fe9ff  simslim.tar.gz" | shasum -a 256 -c
+          tar -xzf simslim.tar.gz simslim
+          echo "SIMSLIM=$PWD/simslim" >> "$GITHUB_ENV"
       - name: Create the dedicated iOS Provider simulator
         env:
           SIMSLIM_BOOT_TIMEOUT: 15m
