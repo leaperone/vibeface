@@ -110,6 +110,8 @@ jobs:
             npm install --global binaryen@132.0.0
             scripts/build-web-crypto.sh
             scripts/build-web.sh
+            pnpm --filter @vibeface/secure-native run typecheck
+            pnpm --filter vibeface-mobile run typecheck
             python3 -B scripts/release.py component app --input apps/app/dist/client --output .artifacts/static
           else
             pnpm --dir apps/www typecheck

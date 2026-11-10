@@ -31,7 +31,11 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
-| 共享主题、根 JS package、pnpm workspace 或 lockfile | Node Web 检查与门户检查 |
+| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的桌面类型检查、单测和 main/preload 打包，不构建 Rust 或运行网页制品验收 |
+| `apps/desktop/src/shared/` | 桌面源码检查，以及直接导入这些文件的 Web 检查和网页制品验收 |
+| `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
+| `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
+| 根 JS package、pnpm workspace 或 lockfile | Web、Mobile、桌面源码和门户检查 |
 | Node Rust、迁移、安装、打包或进程验收脚本 | Node 快速测试、Clippy、Web 和 Linux x64 制品启动验收 |
 | Bridge | Bridge、Control、CLI 和 Node 的核心检查 |
 | Protocol | Protocol、Bridge、Control、CLI 和 Node 的核心检查 |
@@ -40,6 +44,10 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | Cargo manifest、`Cargo.lock`、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试和超出待补依赖上限的 4 万事件追平测试。
+
+`desktop-check` 在 Linux 上运行桌面 `typecheck`、`test` 和 `build`，不下载 Electron 程序、不启动窗口，也不替代手动平台验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
+
+`mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
 `www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
@@ -130,9 +138,9 @@ prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute �
 
 `delivery_live` 仍只在手动 workflow_dispatch 且输入为 true 时执行，默认 false。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。现有 gate 在显式选中该模式时仍要求 job success；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
 
-该选项选择专门的 native-only 实验：package matrix 只含 Linux x86_64，保留 `package_mode=node` 的全部制品、真实进程与 Chromium 验收，以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。非 Linux 包、npm 与桌面未选，其跳过不代表这些平台已验收。普通 CI、普通手动运行、定时及产品 Tag 的选择保持原样。计划摘要列出实际 target 和未选范围。
+该选项选择专门的 native-only 实验：package matrix 只含 Linux x86_64，保留 `package_mode=node` 的全部制品、真实进程与 Chromium 验收，以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 CI、普通手动运行、定时及产品 Tag 的选择保持原样。计划摘要列出实际 target 和未选范围。
 
-同时设置附加 `desktop=true` 时，`delivery_live` 现在优先选择 native-only，桌面不执行；这改变了原先同时执行两者的组合行为。`desktop_only`、`windows_only` 或非 `none` 的 `mobile_apps` 保持各专门入口优先，native 未选。`delivery_small=true` 与 `delivery_live=true` 仍被 small-prepare 的单模式检查拒绝，不会启动 native。native job 还要求 plan、Linux package、crypto-web 和 web 全部成功，且整次运行未取消；失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。
+同时设置附加 `desktop=true` 时，`delivery_live` 现在优先选择 native-only，托管的 Mac/Windows 桌面窗口及 Windows native 验收不执行；这改变了原先同时执行两者的组合行为。`desktop_only`、`windows_only` 或非 `none` 的 `mobile_apps` 保持各专门入口优先，native 未选。`delivery_small=true` 与 `delivery_live=true` 仍被 small-prepare 的单模式检查拒绝，不会启动 native。native job 还要求 plan、Linux package、crypto-web 和 web 全部成功，且整次运行未取消；失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。
 
 protected 宿主入口不继承旧 Strict/UI 的 20700 秒整轮截止，而由既有原生阶段和业务期限决定退出；单项证明仍限 7200 秒，11GiB/zero swap/64 PIDs、原订单期限和 W/I/F/S 均不变。`prepare`、`confirm_batch`、`accept_batch` 仅对结构化响应中的固定提交前 busy 错误沿既有 120 秒阶段上限重试原请求；网络异常、未知结果及其他拒绝不重发。Actions 的 `timeout-minutes: 360` 是独立外部限制，可能截断尚在合法阶段内的运行，不能据此宣称完整实验通过。分项保存保留已验真的公开材料，但当前驱动不支持停止容器后的原链/订单续跑。
 
@@ -146,7 +154,7 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 
 ## 定期、手动和发布检查
 
-定时检查每 4 小时运行一次，使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起。定时和 Actions 中普通手动运行 `ci` 强制执行扩展检查，不受路径影响；显式 native-only 实验按前文选择 Linux 包，不选 npm 和桌面。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+定时检查每 4 小时运行一次，使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起。定时和 Actions 中普通手动运行 `ci` 强制执行扩展检查，不受路径影响；显式 native-only 实验按前文选择 Linux 包，不选 npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 每四小时 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，以显式 `!cancelled()` 和 `ci-gate` success 作为条件，允许上游不适用的检查正常跳过。协调器使用固定 concurrency 且不取消进行中的协调。每四小时机械版本 PR 自动 squash 已授权并默认开启，需配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
 
@@ -282,7 +290,7 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 `ci-gate` 要求选中的任务成功，选中任务失败、取消、缺失或跳过均拒绝通过。未选中的任务允许跳过或缺失；若它们实际报告失败或取消，仍拒绝通过。gate 核对冻结提交范围并重新计算计划，拒绝缩小 `scopes`、必需任务或其他选取结果。它服务于 main、merge queue、定时和手动运行，不是开发分支 PR 的必需检查。
 
-native-only 的选择从真实 workflow_dispatch 输入重新计算，必须与 plan 及 gate 的 `--delivery-live` 一致。不能把普通四平台计划改成 Linux-only 或关闭 npm 后通过 gate。native 被选中时必须实际成功；未选的 npm、桌面和非 Linux 不计为已验证。
+native-only 的选择从真实 workflow_dispatch 输入重新计算，必须与 plan 及 gate 的 `--delivery-live` 一致。不能把普通四平台计划改成 Linux-only 或关闭 npm 后通过 gate。native 被选中时必须实际成功；未选的 npm、托管的 Mac/Windows 桌面窗口与 Windows native 验收，以及非 Linux 包不计为已验证。
 
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与应用 tag 的制品、发布和部署检查分别记录。
 

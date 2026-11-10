@@ -107,6 +107,10 @@ jobs:
           path: .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app
           key: ${{ steps.app.outputs.key }}
       - run: pnpm install --frozen-lockfile
+      - name: Check native mobile types before simulator acceptance
+        run: |
+          pnpm --filter @vibeface/secure-native run typecheck
+          pnpm --filter vibeface-mobile run typecheck
       - if: steps.app_cache.outputs.cache-hit != 'true'
         run: scripts/build-mobile-secure.sh ios
       - name: Build the simulator app
