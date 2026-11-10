@@ -2624,9 +2624,48 @@ fn internal_authorization_errors_roll_back_the_whole_ingested_batch() -> Result<
 #[test]
 fn narrowed_attesters_disable_stored_signatures_and_their_causes_without_erasing_history()
 -> Result<()> {
-    let net = net()?;
+    let mut net = net()?;
+    let setup = LocalIdentity::generate();
+    net.state.append(crate::identity::GovernanceEvent::grant(
+        &net.a.fixture_admin(),
+        &net.state.project()?,
+        Member::client(&setup, "setup", false)?,
+    )?)?;
     let mut store = store(&net)?;
-    bot_conversation(&mut store, &net)?;
+    let owner = setup.attest(
+        &net.network,
+        "c",
+        EventBody::ConversationOwner {
+            scheduler_node: net.a.device_id()?,
+            epoch: 1,
+            attestation: None,
+            cause: None,
+        },
+    )?;
+    store.create_conversation(
+        &net.a,
+        &net.network,
+        "c",
+        "t",
+        FirstOwner {
+            scheduler_node: net.a.device_id()?,
+            attestation: owner.attestation().cloned().context("signed owner")?,
+        },
+        1,
+    )?;
+    let created = setup.attest(
+        &net.network,
+        "c",
+        EventBody::BotCreated {
+            bot_id: "bot".into(),
+            name: "Helper".into(),
+            instructions: "be brief".into(),
+            project: None,
+            attestation: None,
+            cause: None,
+        },
+    )?;
+    store.append_event(&net.a, &net.network, "c", created, vec![], 2)?;
     let request = store.append_event(
         &net.a,
         &net.network,
@@ -2700,6 +2739,20 @@ fn narrowed_attesters_disable_stored_signatures_and_their_causes_without_erasing
         IngestStatus::Rejected(_)
     ));
     assert!(log::recompute(&store.connection, &narrowed)?);
+    assert_eq!(
+        store
+            .conversation(&net.network, "c")?
+            .context("conversation")?
+            .owner,
+        Some(net.a.device_id()?)
+    );
+    assert_eq!(
+        store
+            .bot_for_conversation(&net.network, "c")?
+            .context("retained bot")?
+            .bot_id,
+        "bot"
+    );
     assert!(store.messages(&net.network, "c")?.is_empty());
     let deleted_count: i64 =
         store
@@ -2723,7 +2776,18 @@ fn narrowed_attesters_disable_stored_signatures_and_their_causes_without_erasing
     assert!(store.work_records()?.is_empty());
     assert!(store.scheduler_jobs("c")?.is_empty());
     assert!(log::recompute(&store.connection, &original)?);
-    assert_eq!(store.messages(&net.network, "c")?.len(), 2);
+    assert_eq!(
+        store
+            .messages(&net.network, "c")?
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        ["request", "waiting"]
+    );
+    assert_eq!(
+        effective(&store, &net, &[&request, &deleted, &waiting])?,
+        [true; 3]
+    );
     assert!(store.work_records()?.is_empty());
     assert!(store.scheduler_jobs("c")?.is_empty());
     Ok(())
@@ -9014,20 +9078,18 @@ fn a_long_event_reads_whole_page_by_page_within_the_cap() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     bot_conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", user(&net, "m1", "go"), vec![], 3)?;
     let text = "好\"\\\n\u{1}a".repeat(20_000);
-    store.append_event(
-        &net.a,
-        &net.network,
-        "c",
-        user(&net, "m1", &text),
-        vec![],
-        10,
-    )?;
-    let seq = message_seq(&store, &net, "m1")?;
+    let mut reply = bot_reply("reply", "m1");
+    if let EventBody::MessagePosted { text: body, .. } = &mut reply {
+        *body = text.clone();
+    }
+    let reply = store.append_event(&net.a, &net.network, "c", reply, vec![], 10)?;
+    let seq = seq_of(&reply)?;
     let author = net.a.device_id()?;
     let event = store
         .scope_event(&net.network, "c", &author, seq)?
-        .context("m1")?;
+        .context("reply")?;
     let whole = crate::scheduler::agent_event_body(&event.event.body).to_string();
     let mut read = String::new();
     let mut pages = 0;
@@ -10256,7 +10318,7 @@ fn an_oversized_bot_gives_way_instead_of_failing_the_turn() -> Result<()> {
         &net.a,
         &net.network,
         "c",
-        user(&net, "m1", &"\n".repeat(4_000)),
+        user(&net, "m1", &format!("go{}", "\n".repeat(4_000))),
         vec![],
         10,
     )?;
