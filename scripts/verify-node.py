@@ -14,6 +14,8 @@ processes and controlled provider protocol fixtures.
 --memory-sync checks signed user Memory controls, concurrent Agent changes, receipts,
 provenance and replay across two isolated Nodes with the same controlled fixtures.
 --web-only checks packaged Web resources through one isolated Node process.
+--npm-service checks native npm service management and same-package replacement
+only on fresh GitHub-hosted POSIX runners, never a developer's user services.
 --auto-route checks the entry: joins, origins, revocation, unknown writes, recovery and forwarding
 through another member Gateway.
 """
@@ -30,6 +32,7 @@ import io
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import runpy
 from html.parser import HTMLParser
@@ -4546,6 +4549,281 @@ def memory_sync_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
         if cleanup_errors and "failure" not in report:
             raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
+
+
+def npm_service_acceptance(options):
+    require(os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
+            "npm service acceptance requires a disposable GitHub-hosted runner")
+    require(sys.platform in ("darwin", "linux"), "npm service acceptance requires launchd or systemd")
+    import fcntl
+
+    source = Path(__file__).resolve().parents[1]
+    artifacts = options.artifacts.resolve()
+    require(artifacts.is_relative_to(source / ".artifacts"), "npm service artifacts stay in the checkout")
+    binary, core = options.binary.resolve(strict=True), options.core_binary.resolve(strict=True)
+    root, vendor = binary.parent.parent, core.parent
+    require(binary.name == "vibeface.mjs" and root.name == "vibeface"
+            and root.parent.name == "@leaperone" and root.parents[1].name == "node_modules"
+            and root.parents[2].name == "lib" and root.is_relative_to(source / ".artifacts")
+            and vendor.parent == root / "vendor", "service acceptance uses an isolated scoped npm installation")
+    prefix = root.parents[3]
+    native = vendor / "vibeface"
+    module = options.crypto_module.resolve(strict=True)
+    require(module == vendor / "web/vibeface_secure.js", "the npm client uses its own packaged WASM")
+    require(options.npm_package is not None, "npm service acceptance requires the immutable CI npm artifact")
+    package = options.npm_package.resolve(strict=True)
+    require(package.is_relative_to(source / ".artifacts") and package.suffix == ".tgz",
+            "npm replacement uses the downloaded CI artifact")
+    metadata = json.loads((root / "package.json").read_text())
+    build = json.loads((vendor / "BUILD-INFO.json").read_text())
+    target = {("darwin", "arm64"): "aarch64-apple-darwin",
+              ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+              ("linux", "aarch64"): "aarch64-unknown-linux-gnu"}.get((sys.platform, os.uname().machine))
+    require(target is not None and build["target"] == target and metadata["name"] == "@leaperone/vibeface"
+            and metadata["version"] == build["version"] and build["data_epoch"] == DATA_EPOCH
+            and all(build[field] == os.environ.get("GITHUB_SHA")
+                    for field in ("source_commit", "core_source_commit", "app_source_commit")),
+            "the npm artifact pins this runner, source commit and current data format")
+    home = Path.home()
+    require(not list(home.glob(".vibeface*")), "the disposable runner has no existing Vibeface data")
+    manager_env = os.environ.copy()
+
+    def command(arguments, *, check=True):
+        result = subprocess.run([str(argument) for argument in arguments], capture_output=True, text=True,
+                                timeout=90, cwd=source, env=manager_env)
+        require(not check or result.returncode == 0,
+                f"{Path(arguments[0]).name} {arguments[1]} succeeds: {result.stderr[-400:]}")
+        return result
+
+    def manager_absent(unit):
+        if sys.platform == "darwin":
+            result = command(["/bin/launchctl", "print", f"{domain}/{unit}"], check=False)
+            return result.returncode != 0 and "Could not find service" in result.stderr
+        result = command(["/usr/bin/systemctl", "--user", "show", unit, "--property=LoadState", "--value"], check=False)
+        return result.stdout.strip() == "not-found"
+
+    if sys.platform == "darwin":
+        domain = f"gui/{os.getuid()}"
+        service_dir = home / "Library/LaunchAgents"
+        units = ("com.leaperone.vibeface.node", "com.leaperone.vibeface.update")
+        service_files = [service_dir / (unit + ".plist") for unit in units]
+        command(["/bin/launchctl", "print", domain])
+    else:
+        runtime = Path(f"/run/user/{os.getuid()}")
+        require(os.environ.get("XDG_CONFIG_HOME", str(home / ".config")) == str(home / ".config")
+                and os.environ.get("XDG_RUNTIME_DIR") == str(runtime)
+                and os.environ.get("DBUS_SESSION_BUS_ADDRESS") == f"unix:path={runtime}/bus"
+                and (runtime / "bus").is_socket(), "the real disposable user's D-Bus is available")
+        service_dir = home / ".config/systemd/user"
+        units = ("vibeface.service", "vibeface-update.service", "vibeface-update.timer")
+        service_files = [service_dir / unit for unit in units]
+        command(["/usr/bin/systemctl", "--user", "show-environment"])
+    require(all(manager_absent(unit) for unit in units), "the disposable manager has no existing default Vibeface service")
+    require(not any(path.exists() or path.is_symlink() for path in service_files),
+            "the disposable runner has no existing default service files")
+
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts / ("npm-service-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    cleanup_script = run / "cleanup-service.sh"
+    shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
+    report = {"status": "running", "target": target, "version": build["version"],
+              "source_commit": build["source_commit"], "package_sha256": file_sha256(package),
+              "binary_sha256": file_sha256(native), "core_sha256": file_sha256(core),
+              "manager": "launchd" if sys.platform == "darwin" else "systemd --user", "cases": [],
+              "native_path": str(native.relative_to(root)), "native_pids": [],
+              "real_provider_calls": 0, "replacement": "same immutable current-format package reinstalled",
+              "not_checked": ["historical-format migration", "cross-version upgrade", "real AI Providers"]}
+    node, owned = None, False
+
+    def service(action, *, check=True):
+        return command([binary, "service", action, "--data-dir", node.directory], check=check)
+
+    def passed(name):
+        report["cases"].append(name)
+        print("PASS npm service " + name, flush=True)
+
+    def persistent():
+        files = {name: file_sha256(node.directory / name) for name in
+                 ("identity.json", "config.json", "data-epoch.json", "node.lock", "update.lock", "update.json", "update-pending.json")
+                 if (node.directory / name).exists()}
+        with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            events = dict(database.execute("SELECT hash,envelope FROM events"))
+        return files, events
+
+    def rejected(action, expected):
+        before = persistent()
+        service_before = [path.read_bytes() if path.exists() else None for path in service_files]
+        result = service(action, check=False)
+        require(result.returncode != 0 and expected in result.stderr, "npm service refuses " + expected)
+        require(persistent() == before and service_before == [path.read_bytes() if path.exists() else None
+                                                             for path in service_files],
+                "refused npm service operations preserve existing data and service files")
+
+    def stopped():
+        wait_for("npm service stops its Node", lambda: node_status(node)["status"] == "stopped")
+        if sys.platform == "darwin":
+            require(manager_absent(units[0]), "launchd unloaded the stopped Node")
+        else:
+            state = dict(line.split("=", 1) for line in command([
+                "/usr/bin/systemctl", "--user", "show", units[0], "--property=MainPID,LoadState"], check=False).stdout.splitlines())
+            require(state.get("LoadState") == "not-found" or state.get("MainPID") == "0",
+                    "systemd has no running Node PID")
+
+    def running():
+        wait_for("native npm service starts", lambda: node_status(node)["status"] == "running")
+        require(node.client.request("/api/info")["device_id"] == node.device_id, "the service retains the fixture identity")
+        if sys.platform == "darwin":
+            with service_files[0].open("rb") as stream:
+                require(plistlib.load(stream)["ProgramArguments"] == [str(native), "serve", "--data-dir", str(node.directory)],
+                        "launchd runs the scoped npm vendor CLI with the fixture data")
+            state = command(["/bin/launchctl", "print", f"{domain}/{units[0]}"]).stdout
+            pid = int(re.search(r"(?m)^\s*pid = (\d+)$", state)[1])
+        else:
+            state = dict(line.split("=", 1) for line in command([
+                "/usr/bin/systemctl", "--user", "show", units[0], "--property=MainPID,ExecStart,FragmentPath"]).stdout.splitlines())
+            require(state["FragmentPath"] == str(service_files[0]) and f"path={native} ;" in state["ExecStart"],
+                    "systemd runs the scoped npm vendor CLI from the fixture unit")
+            pid = int(state["MainPID"])
+            require(Path(f"/proc/{pid}/exe").resolve(strict=True) == core, "the running Core is the npm vendor executable")
+        process = command(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="]).stdout.strip()
+        require(process == f"{core} --data-dir {node.directory}", "the manager PID executes the exact scoped npm Core")
+        require(not any(path.exists() for path in service_files[1:]) and all(manager_absent(unit) for unit in units[1:]),
+                "npm never installs or loads its built-in updater")
+        node.client.connect()
+        node.client.authenticate()
+        report["native_pids"].append(pid)
+        return pid
+
+    try:
+        node = Node(run, "NPM", binary, workspace, helper)
+        node.configure(bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
+                       manager=fixture_manager_settings(run, workspace), app_server=SPAWN_APP_SERVER)
+        node.start()
+        network = node.bootstrap()
+        conversation = "npm-service-history"
+        node.client.rpc("create_bot", bot_id="npm-service-bot", conversation_id=conversation, name="Npm fixture",
+                        instructions="", project={"target_node": node.device_id, "cwd": str(workspace)})
+        attachment = b"npm service attachment\x00\xff\n"
+        digest = hashlib.sha256(attachment).hexdigest()
+        uploaded = node.client.rpc("upload_attachment", conversation_id=conversation, hash=digest, size=len(attachment),
+                                   offset=0, data=base64.b64encode(attachment).decode())
+        require(uploaded == {"offset": len(attachment), "complete": True}, "the fixture persists the complete attachment")
+        receipt = node.client.rpc("message", conversation_id=conversation, message_id="npm-service-message",
+                                  text=json.dumps({"chat_agent": True, "label": "npm-service-message"}),
+                                  attachments=[{"hash": digest, "size": len(attachment), "name": "fixture.bin"}])
+        wait_for("the controlled fixture completes its actual message", lambda:
+                 (scheduler_record(node, network, receipt["trigger"]) or {}).get("state") == "completed")
+        messages = node.client.rpc("conversation", conversation_id=conversation)["messages"]
+        require(any(row["message_id"] == "npm-service-message" and row["attachments"] for row in messages)
+                and any(row["role"] == "assistant" for row in messages), "preservation starts with real nonempty message history")
+        invocation_count = len(fixture_records(run))
+        require(invocation_count == 1, "one controlled fixture call creates the message history")
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
+        rejected("install", "stop the node before installing its npm service")
+        passed("active Node refuses install without changing data or services")
+        node.client.close()
+        node.stop()
+        stopped()
+        rejected("install-updater", "npm installations are updated with npm")
+        with (node.directory / "update.lock").open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rejected("install", "wait for the updater before installing the npm service")
+        private_json(node.directory / "update-pending.json", {"fixture": "pending"})
+        rejected("install", "recover the pending update")
+        (node.directory / "update-pending.json").unlink()
+        before = persistent()
+        command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
+        require(persistent() == before, "npm automatic update exits without changing persistent data")
+        passed("second updater, OS-held updater lock and pending journal refuse without mutation")
+        saved_files, saved_events = persistent()
+
+        def preserved():
+            files, events = persistent()
+            require(files == saved_files and saved_events and all(events.get(key) == value for key, value in saved_events.items()),
+                    "npm lifecycle preserves identity, configuration and every original signed event")
+            require(node.client.rpc("conversation", conversation_id=conversation)["messages"] == messages,
+                    "npm lifecycle preserves the exact nonempty message history")
+            require(len(fixture_records(run)) == invocation_count, "service restarts never replay a completed fixture turn")
+            page = node.client.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, binary=True)
+            require(page["size"] == len(attachment) and page["next_offset"] is None
+                    and base64.b64decode(page["data"]) == attachment, "npm lifecycle returns the original attachment bytes")
+
+        owned = True
+        service("install")
+        running()
+        service("status")
+        preserved()
+        service("stop")
+        stopped()
+        service("start")
+        previous = running()
+        service("restart")
+        require(running() != previous, "native manager restart replaces the running PID")
+        preserved()
+        passed("real install, status, stop, start and restart use the scoped npm native path")
+        service("stop")
+        stopped()
+        definition = service_files[0].read_bytes()
+        candidate = run / "candidate-prefix"
+
+        def reinstall(destination):
+            command(["npm", "install", "--global", "--prefix", destination, "--cache", run / "npm-cache",
+                     "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--force", package])
+
+        reinstall(candidate)
+        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+        checksums = {name: file_sha256(vendor / name) for name in
+                     ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
+        require(checksums == {name: file_sha256(candidate_vendor / name) for name in checksums},
+                "the independent npm prefix contains the same immutable native candidate")
+        previous_inode = core.stat().st_ino
+        reinstall(prefix)
+        require(core.stat().st_ino != previous_inode and checksums == {name: file_sha256(vendor / name) for name in checksums},
+                "npm really replaces the stopped package with the same verified candidate")
+        require(file_sha256(package) == report["package_sha256"] and service_files[0].read_bytes() == definition,
+                "npm replacement preserves the immutable input and installed service definition")
+        stopped()
+        service("start")
+        running()
+        preserved()
+        passed("same-version npm replacement preserves identity, config, signed history and attachment bytes")
+        service("uninstall")
+        stopped()
+        require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
+                "uninstall removes the fixture services from disk and the native manager")
+        files, events = persistent()
+        require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
+                and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                "uninstall retains the fixture identity, configuration, history and attachment")
+        passed("uninstall removes the native service and retains data")
+        report["status"] = "passed"
+    except Exception as error:
+        report.update(status="failed", failure=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        cleanup = ([lambda: command([cleanup_script, "uninstall", "--data-dir", node.directory])] if owned else [])
+        cleanup += ([node.client.close, node.stop] if node else []) + [lambda: stop_fixture_processes(run)]
+        failures = []
+        for action in cleanup:
+            try:
+                action()
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        if failures:
+            report.update(status="failed", cleanup_failures=failures)
+        report["controlled_fixture_calls"] = len(fixture_records(run))
+        private_json(run / "report.json", report)
+        print("REPORT " + json.dumps(report, sort_keys=True), flush=True)
+        if failures and "failure" not in report:
+            raise RuntimeError("npm service cleanup failed")
 
 
 def web_acceptance(options):
@@ -9210,8 +9488,10 @@ if __name__ == "__main__":
                             help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
+        parser.add_argument("--npm-package", type=Path, help="the immutable CI npm artifact for --npm-service replacement")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
+        modes.add_argument("--npm-service", action="store_true", help="check real npm user services only on a fresh GitHub-hosted POSIX runner")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
@@ -9283,6 +9563,8 @@ if __name__ == "__main__":
                 phase4_acceptance(arguments)
             elif arguments.auto_route:
                 auto_route_acceptance(arguments)
+            elif arguments.npm_service:
+                npm_service_acceptance(arguments)
             elif arguments.web_only:
                 web_acceptance(arguments)
             elif arguments.chat_agent:

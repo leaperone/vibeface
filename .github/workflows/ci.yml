@@ -949,6 +949,29 @@ jobs:
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+      - name: Verify native npm service and package replacement
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        env:
+          VENDOR: ${{ steps.install.outputs.vendor }}
+          PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            if compgen -G "$HOME/.vibeface*" >/dev/null; then exit 1; fi
+            [[ "${XDG_CONFIG_HOME:-$HOME/.config}" == "$HOME/.config" ]]
+            for directory in "$HOME/.config/systemd/user" /etc/systemd/user /usr/lib/systemd/user /usr/local/lib/systemd/user; do
+              if compgen -G "$directory/vibeface*" >/dev/null || compgen -G "$directory/*/vibeface*" >/dev/null; then exit 1; fi
+            done
+            service_uid="$(id -u)"
+            sudo loginctl enable-linger "$(id -un)"
+            sudo systemctl start "user@$service_uid.service"
+            export XDG_RUNTIME_DIR="/run/user/$service_uid"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            [[ -S "$XDG_RUNTIME_DIR/bus" ]]
+            /usr/bin/systemctl --user show-environment >/dev/null
+          fi
+          prefix="$PWD/.artifacts/npm-installed"
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm-service --npm-service --npm-package ".artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
 
   windows-native:
     needs: [plan, package]
