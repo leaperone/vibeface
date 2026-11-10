@@ -220,3 +220,18 @@ fn overwritten_restore_uses_matching_original_after_and_keeps_full_change_bodies
     assert_eq!(body.fields.get("extra"), Some(&json!("retained")));
     Ok(())
 }
+
+#[test]
+fn reconnect_starts_a_new_history_window_and_rejects_old_page_tickets()->Result<()>{
+ let mut old=state();load(&mut old,snapshot("a",S::Works,json!([{"work_id":"old-running","state":"running"}]),Some("old-cursor")))?;let ticket=old.begin_page(S::Works)?;
+ let mut fresh=HistoryState::new(HistoryScope{generation:4,..old.scope().clone()});load(&mut fresh,snapshot("a",S::Works,json!([{"work_id":"latest","state":"completed"}]),None))?;
+ assert_eq!(rows(&fresh,S::Works),json!([{"work_id":"latest","state":"completed"}]));assert_eq!(fresh.apply_page(&ticket,page("a",S::Works,json!([{"work_id":"old-running","state":"running"}]),None))?,ApplyResult::Stale);Ok(())
+}
+
+#[test]
+fn restoration_never_uses_the_winning_value_or_another_provider()->Result<()>{
+ let original:history::BotChangeRecord=serde_json::from_value(json!({"change_id":"mine","conversation_id":"conversation","cause":null,"event_hash":"event","created_at_ms":1,"change":{"kind":"profile","model":{"provider":"codex","before":"old","after":"my-model"}}}))?;
+ let record:history::OverwrittenRecord=serde_json::from_value(json!({"change_id":"mine","by":"remote","field":"model","provider":"codex","value":"their-model"}))?;
+ match record.restoration(&original)?{history::ProfileRestoration::Instruction(text)=>assert_eq!(text,"请仅把 Codex 模型改回「my-model」，保留其他配置。"),_=>panic!("wrong restoration type")}
+ let foreign:history::OverwrittenRecord=serde_json::from_value(json!({"change_id":"mine","by":"remote","field":"model","provider":"claude","value":"their-model"}))?;assert!(foreign.restoration(&original).is_err());Ok(())
+}

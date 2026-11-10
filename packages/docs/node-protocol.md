@@ -220,7 +220,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `memory_state` | `conversation_id`、`memory_id`、可选 `operation_id` | 返回 `{current, receipt}`。current 为含墓碑的 `{memory_id, text, metadata}` 或 null。未指定操作时 receipt=null，否则为 recorded、superseded 或 not_seen_here。not_seen_here 只表示入口未见，不是全网未执行 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 `scheduler_node` 及其签名 `owner_attestation` | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（归给本 Bot 的外来会话，含 `muted`）、`local_node`、调度队列和 `observation_targets`（本次观察进度的设备）。负责人是其他设备时，入口限时向它读取 `scheduler_jobs`，带 `source_node` 合并进调度队列，只用于显示、不写本地；`scheduler.remote` 为 `{owner, reachable}`，联系不上时 `reachable: false` |
+| `conversation` | `conversation_id` | 会话元数据和各历史分区的有界首页，含 `history_authority`、`history`、负责人及 `owner_epoch`、Bot、`local_node` 和 `observation_targets`。列表内容与覆盖状态见下文；不能把这一响应当作完整会话历史。远端负责人状态只作显示，不写入本地调度；`scheduler.remote.reachable=false` 表示负责人暂不可达 |
+| `conversation_history` | `conversation_id`、`section`，可选 `cursor`、`limit` | 读取指定分区的一页完整记录，返回 `{conversation_id, section, history_authority, items, next_cursor, complete}`。默认 50 项，limit 为 1 至 100；游标不可跨网络、会话、分区或负责人复用。详见[会话历史分页](#会话历史分页) |
 | `open_works` | 无 | 全网仍要本人看的工作 `{works}`：没有结果或结果未知的工作；每个会话最新结束的工作失败或被拒、且还没跟进的那一项；以及本机发出、被拒且还没跟进的派发。跟进指之后又有工作结束、本人在它结束后发的消息有了完成的回复、它的汇报回合回复完成，或本人在待处理关掉它。只在 SQL 里选出这些工作，不读整段历史。派发项的 `state` 为 `dispatch_rejected`，没有 `outcome`。只有本人客户端能调用 |
 | `workspace_overview` | 可选 `conversation_id`、`limit`（1 至 256，默认 256）、`include_finished`（默认 `false`）、`include_sessions`（默认 `true`）；不支持 `cursor` | 本机所知事实的有界只读汇总，只给本人客户端：`{schema: 1, generated_at_ms, network_epoch, heads, consistency, truncated, conversations, bots, tasks, questions, checks, jobs, sessions, deliveries, relations, coverage}`。只含未删除 Bot 的会话。不带 `include_finished` 时 `tasks` 只取 `open_works` 那部分工作，已结束的只按 SQL 计数进 `coverage.omitted_finished`；本机还没被接收、被拒（仍未跟进）或结果未知的派发，以及已接收但工作还没同步来的派发（`accepted_waiting_sync`）也列进 `tasks` 和 `deliveries`。各列表超过 `limit` 时截断，`truncated` 为 `true`，`coverage.omitted_*` 给出截掉的条数。负责人是其他设备的会话不去问它，列进 `coverage.remote_owners`，此时 `consistency` 为 `partial` |
 | `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments`、`report_results` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
@@ -252,6 +253,30 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 1。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
 
 `memory_sync_conflicts` 为 `{items, has_more}`，最多 50 项。每项为 `{memory_id, losing_revision, winning_revision, losing_event_hash, winning_event_hash, reason}`，reason 为 user_protected、concurrent_automatic 或 concurrent_user。该页从入口 effective 历史的逻辑 base 链计算，同一本人操作先去重，赢家正常祖先排除，不包含候选正文。它与 owner 的本轮 `memory_conflicts` 独立，owner 不可达不影响入口共享冲突。
+
+## 会话历史分页
+
+`conversation` 和 `conversation_history` 共享 [Rust wire 类型](../../crates/protocol/src/history.rs)。首页在每个分区读取有界窗口，`history_authority` 是客户端只比较、不解释的投影依据标识。`history` 为以下 19 个分区分别给出 `{next_cursor, complete}`：
+
+| section | 首页中的列表 |
+| --- | --- |
+| `messages`、`works`、`changes`、`questions`、`sessions`、`checks`、`deliveries`、`overwritten` | 同名顶层列表 |
+| `jobs`、`scope_jobs`、`unanswered` | `scheduler` 下的同名列表 |
+| `owner_jobs`、`owner_scope_jobs`、`owner_memory_conflicts` | `scheduler.remote.jobs`、`scheduler.remote.scope_jobs`、`scheduler.remote.memory_conflicts` |
+| `skills`、`schedules`、`memory`、`memory_conflicts` | `bot_settings` 下的同名列表 |
+| `memory_sync_conflicts` | `bot_settings.memory_sync_conflicts.items` |
+
+`conversation_history` 的 `cursor` 省略或为 `null` 时从该分区的首页开始；后续请求原样传回 `next_cursor`。使用服务端提供的稳定边界向较早记录读取，不发送 offset，不解析或自行拼接游标。不同分区有各自的稳定顺序，客户端按记录的稳定业务身份去重，不能用列表下标识别记录。
+
+条数上限与字节预算同时生效。默认 limit 为 50，最大 100；单分区选取预算为 512 KiB，完整响应须小于 `3 MiB - 64 KiB`，为 RPC 元数据和加密帧留出空间。单条大记录可以独占一页，但仍须满足响应上限，超限返回错误，不截断正文。首页合计过大时，服务端延后整个分区，并给出该分区的起始游标；空列表不表示分区没有记录。经过范围筛选的空页也可能带有继续游标。
+
+`complete=false` 必须有非空 `next_cursor`；`complete=true` 时游标为 `null`。完成只表示在当前读取依据下，该入口对这个分区没有更多可读记录，不表示全网已同步、远端负责人已在线、工作已完成或客户端取得写权限。负责人暂不可达时，其分区保留未完成覆盖状态和可重试的起始游标。
+
+游标绑定个人网络、会话、分区和读取依据，负责人分页还绑定 owner 与 owner_epoch。成员治理、分叉或负责人投影变化可能使依据和游标失效。遇到 `history changed; refresh the conversation` 或 `conversation owner changed; refresh the conversation` 时，重新读取 `conversation`，丢弃旧依据的覆盖状态，不把两套结果合并。页响应中的 `conversation_id`、`section` 和 `history_authority` 必须与当前请求相符；切换网络、身份、会话或连接代数后，晚到响应不能进入新视图。
+
+普通刷新和 `records` 推送不是“删除所有未出现记录”的指令。同一依据下，已加载的旧页应按稳定身份保留；推送没有提供的列表不能被当作空列表。较早页不能覆盖读取期间已经更新的同 ID 记录。完整的权威分区替换、依据失效或明确清空须阻止晚到旧请求把移除的记录重新加回。更早页的合并保持当前阅读位置；搜索当前已读取记录不能表示搜索了尚未读取的历史。
+
+`sent` 不在上述 19 个分页分区内。当前会话响应的 `sent` 为空，并以 `sent_coverage={scope:"main", omitted_unknown:<数量>}` 标明省略；不能据此宣称已读完 Bot 发往其他会话的消息。`workspace_overview` 和 `workspace_history` 也有各自的范围与覆盖契约，不与会话游标混用。
 
 ## 可靠调度回执
 

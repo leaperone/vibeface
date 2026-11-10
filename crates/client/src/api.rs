@@ -197,7 +197,7 @@ impl Client {
     }
     pub fn is_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open()}
     pub fn target_node(&self)->&str {&self.target}
-    pub fn offline_block_reason(&self)->Option<OfflineBlockReason> {match self.authority {ClientAuthority::PrivateDataOnly {reason}=>Some(reason),_=>None}}
+    pub fn offline_block_reason(&self)->Option<OfflineBlockReason> {match self.authority() {ClientAuthority::PrivateDataOnly {reason}=>Some(reason),_=>None}}
     pub async fn open_local(key:Arc<ClientKey>,grant:crate::LocalGrant,outbox_dir:PathBuf)->Result<Self> {
         Self::open(key,Endpoint::Local(grant),outbox_dir).await
     }
@@ -240,7 +240,9 @@ impl Client {
                     Err(broadcast::error::RecvError::Lagged(_)) => json!({"type":"resync_required"}),
                     Err(broadcast::error::RecvError::Closed) => { let _=updates.send(ClientEvent {generation:token.clone(),network_id:event_network.clone(),payload:json!({"type":"disconnected"})}); break; }
                 };
+                let disconnected=payload["type"]=="disconnected";
                 let _ = updates.send(ClientEvent { generation:token.clone(), network_id:event_network.clone(), payload });
+                if disconnected {break;}
             }
         });
         connection.call("subscribe",json!({})).await?;
@@ -251,7 +253,7 @@ impl Client {
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
     pub async fn reconnect(&self,endpoint:Endpoint)->Result<Self> {
-        let (connection,network,authority,proof)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>() {self.revoked.store(true,Ordering::Release);let target=self.target.clone();self.stored(move|db|db.invalidate_profile(&target)).await?;}return Err(error);}};
+        let (connection,network,authority,proof)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>() {let target=endpoint.node_id().to_owned();if target==self.target {self.revoked.store(true,Ordering::Release);self.connection.close();}self.stored(move|db|db.invalidate_profile(&target)).await?;}return Err(error);}};
         ensure!(network==self.network,"reconnect cannot switch outbox networks");
         let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
         self.close();
@@ -259,18 +261,18 @@ impl Client {
     }
     /// Stops queued calls. A request already crossing the transport remains unknown until reconciled.
     pub fn close(&self) { self.active.store(false,Ordering::Release);self.connection.close(); }
-    fn require_active(&self)->Result<()> { ensure!(self.active.load(Ordering::Acquire),"client generation is closed");Ok(()) }
+    fn require_active(&self)->Result<()> { ensure!(self.active.load(Ordering::Acquire) && !self.revoked.load(Ordering::Acquire),"client generation is closed or revoked");Ok(()) }
     pub fn take_decision_token(&self, operation_id:&str)->Result<Option<DecisionToken>> {
         Ok(self.decision_tokens.lock().map_err(|_|anyhow::anyhow!("token lock poisoned"))?.remove(operation_id))
     }
     pub fn generation(&self) -> &str { &self.generation }
     pub fn network_id(&self) -> &str { &self.network }
-    pub fn authority(&self)->ClientAuthority {self.authority}
+    pub fn authority(&self)->ClientAuthority {if self.revoked.load(Ordering::Acquire) {ClientAuthority::PrivateDataOnly {reason:OfflineBlockReason::Revoked}} else {self.authority}}
     pub fn can_write(&self)->bool {matches!(self.authority,ClientAuthority::Membership {..}) && !self.revoked.load(Ordering::Acquire)}
     pub fn can_save_locally(&self)->bool {self.can_write() && self.write_gate.load(Ordering::Acquire)!=2}
     pub fn can_control(&self)->bool {self.is_online() && self.can_write()}
     pub fn can_send_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open() && self.write_gate.load(Ordering::Acquire)==1 && self.can_write()}
-    pub fn can_configure_node(&self)->bool {matches!(self.authority,ClientAuthority::LocalSession|ClientAuthority::Membership {can_manage:true})}
+    pub fn can_configure_node(&self)->bool {!self.revoked.load(Ordering::Acquire) && matches!(self.authority,ClientAuthority::LocalSession|ClientAuthority::Membership {can_manage:true})}
     pub fn management_session(&self)->Result<crate::Session<'_>> {
         self.require_active()?;ensure!(self.can_write(),"local session does not grant personal-network membership");
         Ok(self.key.session(self.connection.clone(),self.endpoint.clone()))

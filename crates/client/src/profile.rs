@@ -19,6 +19,7 @@ impl CachedProfile {
     pub fn verify_offline(&self,key:&ClientKey,target:&str)->Result<ClientAuthority> {
         ensure!(key.network_id().is_none_or(|network|network==self.network_id) && key.device_id()==self.client_id && target==self.target_node && self.state.genesis.network_id==self.network_id,"cached profile belongs to another network, client or target");
         ensure!(self.write_gate<=3,"invalid cached write state");
+        self.state.project_at(self.observed_at_ms)?.node(target)?;
         let view=self.state.project_at(vibeface_protocol::now_ms().max(self.observed_at_ms))?;
         let blocked=if self.revoked {Some(OfflineBlockReason::Revoked)} else if self.write_gate==2 {Some(OfflineBlockReason::Forked)} else if key.network_id().is_none() {Some(OfflineBlockReason::NotEnrolled)} else if view.node(target).is_err() {Some(OfflineBlockReason::NodeRemoved)} else if view.client(key.device_id()).is_err() {Some(OfflineBlockReason::NotMember)} else {None};
         if let Some(reason)=blocked {return Ok(ClientAuthority::PrivateDataOnly {reason});}

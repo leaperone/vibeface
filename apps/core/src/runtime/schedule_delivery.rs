@@ -7,14 +7,6 @@ use executor::{SteerAck, SteerTrace};
 use futures_util::FutureExt;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 
-/// The jobs a chat shows. An agent task runs in its bot's conversation, but it is that work: its
-/// card and details show it, and the chat never takes it for a reply or stops it as one.
-fn chat_jobs(jobs: Vec<SchedulerJob>) -> Vec<SchedulerJob> {
-    jobs.into_iter()
-        .filter(|job| job.scope == crate::scheduling::SessionScope::Main)
-        .collect()
-}
-
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
     value["lane"] = json!(job.kind.lane());
@@ -394,21 +386,17 @@ impl Runtime {
     }
     pub(super) async fn scheduler_context_observation(
         &self,
-        network: &str,
+        _network: &str,
         key: &SessionKey,
     ) -> Result<Option<crate::scheduling::ContextProjection>> {
-        let desired = crate::scheduler::session_configuration(self, network, key)
-            .await
-            .ok();
         let key = key.clone();
         self.store
             .read("scheduler_context_observation", move |store| {
                 let mut context = store.scheduler_scoped_context_projection(&key)?;
                 if let Some(context) = &mut context {
-                    context.session_status = desired
-                        .as_ref()
-                        .map(|config| store.scheduler_session_status(&key, Some(config)))
-                        .transpose()?;
+                    // Desired provider configuration is computed only when dispatching.
+                    // A display read cannot claim this stored attempt is still current.
+                    context.session_status = None;
                 }
                 Ok(context)
             })
@@ -1302,9 +1290,10 @@ impl Runtime {
         let owner = self.store.read("scheduler_owner_observation.owner", {
             let network = network.to_owned();
             let scope = scope.to_owned();
-            move |store| Ok(store.conversation(&network, &scope)?.and_then(|c| c.owner))
+            move |store| Ok(store.conversation(&network, &scope)?
+                .and_then(|c| c.owner.map(|owner| (owner, c.owner_epoch))))
         }).await?;
-        let Some(owner) = owner.filter(|owner| owner != &local) else { return Ok(None) };
+        let Some((owner, owner_epoch)) = owner.filter(|(owner, _)| owner != &local) else { return Ok(None) };
         let request = json!({"type":"scheduler_jobs","conversation_id":scope});
         let reply = match tokio::time::timeout(OWNER_READ_WAIT, self.peer_request(network, &owner, request)).await {
             Ok(Ok(reply)) => reply,
@@ -1312,7 +1301,8 @@ impl Runtime {
                 if let Ok(Err(error)) = outcome {
                     tracing::debug!(%error, "the conversation's owner did not report its jobs");
                 }
-                return Ok(Some((json!({"owner":owner,"reachable":false}), Value::Null)));
+                return Ok(Some((super::scheduler_history::unavailable_owner_observation(
+                    network, scope, &owner, owner_epoch)?, Value::Null)));
             }
         };
         ensure!(serde_json::to_vec(&reply)?.len() < vibeface_protocol::history::HISTORY_RESPONSE_BYTES,
@@ -1322,7 +1312,8 @@ impl Runtime {
         let query_scope = scope.to_owned();
         let query_owner = owner.clone();
         let remote = self.store.read("scheduler_owner_observation", move |store| {
-            ensure!(store.conversation(&query_network, &query_scope)?.and_then(|c| c.owner).as_deref() == Some(query_owner.as_str()),
+            ensure!(store.conversation(&query_network, &query_scope)?.is_some_and(|conversation|
+                conversation.owner.as_deref() == Some(query_owner.as_str()) && conversation.owner_epoch == owner_epoch),
                 "conversation owner changed; refresh the conversation");
             let mut remote = reply;
             remote.as_object_mut().context("invalid owner observation")?.remove("manager");
@@ -1331,7 +1322,7 @@ impl Runtime {
                 for job in jobs {
                     if job["replied"] == true
                         && let Some(message) = job["reply_message_id"].as_str()
-                        && store.message(&query_network, &query_scope, message)?.is_none() {
+                        && !store.scheduler_reply_is_present(&query_network, &query_scope, message)? {
                         job["state"] = json!("publishing");
                     }
                     job["source_node"] = json!(query_owner);

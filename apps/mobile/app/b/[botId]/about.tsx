@@ -1,3 +1,4 @@
+import { HistoryControls } from '@/features/chat/history-controls'
 import { Stack, useLocalSearchParams } from 'expo-router'
 import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
@@ -48,6 +49,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
+    <HistoryControls key={`${shared.generation}:${shared.conversationId}`} workspace={shared} sections={['skills', 'schedules', 'memory', 'memory_conflicts', 'memory_sync_conflicts']} />
     <View className="flex-row items-center gap-3">
       <BotFace bot={{ bot_id: bot.bot_id, avatar: look.avatar }} mood={botMood(bot, workspace, shared)} size={48} />
       <View className="min-w-0 flex-1 items-start gap-1">

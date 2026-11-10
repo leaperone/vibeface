@@ -271,7 +271,7 @@ impl Runtime {
                     let (network, scope) = (network.as_str(), scope.as_str());
 
                     use vibeface_protocol::history::HistorySection;
-                    let history_authority = store.conversation_history_authority(network)?;
+                    let history_authority = store.conversation_history_authority(network, scope)?;
                     let mut history_starts = BTreeMap::new();
                     for section in HistorySection::ALL.into_iter().filter(|section| !matches!(section,
                         HistorySection::OwnerJobs | HistorySection::OwnerScopeJobs | HistorySection::OwnerMemoryConflicts)) {
@@ -442,10 +442,10 @@ impl Runtime {
                     &network, &request.conversation_id, request.cursor.as_deref(), request.limit,
                 )?)?),
                 HistorySection::Works => {
-                    let mut page = store.conversation_works_page(&network, &request.conversation_id, request.cursor.as_deref(), request.limit)?;
+                    let page = store.conversation_works_page(&network, &request.conversation_id, request.cursor.as_deref(), request.limit)?;
                     let jobs = task_observations(store, &request.conversation_id, &page.items)?;
                     let items = page.items.iter().map(|work| work_view(work, &jobs)).collect::<Result<Vec<_>>>()?;
-                    let mut value = serde_json::to_value(&mut page)?;
+                    let mut value = serde_json::to_value(&page)?;
                     value["items"] = json!(items);
                     Ok(value)
                 },
@@ -541,7 +541,7 @@ impl Runtime {
             let jobs = task_observations(store, &scope, &works)?;
             let works = works.iter().map(|work| work_view(work, &jobs)).collect::<Result<Vec<_>>>()?;
             let patch = json!({"type":"records","conversation_id":scope,"messages":messages,"works":works,
-                "history_authority":store.conversation_history_authority(&network)?,"refresh_metadata":true});
+                "history_authority":store.conversation_history_authority(&network, &scope)?,"refresh_metadata":true});
             if serde_json::to_vec(&patch)?.len() >= vibeface_protocol::history::HISTORY_RESPONSE_BYTES {
                 return Ok(None);
             }
@@ -553,26 +553,34 @@ impl Runtime {
 /// Defer whole sections to their real first-page cursor when their combined payload is
 /// larger than one response. No record is shortened or made unreachable.
 fn fit_history_snapshot(snapshot: &mut Value, starts: &BTreeMap<String, String>) -> Result<()> {
-    use vibeface_protocol::history::HISTORY_RESPONSE_BYTES;
+    use vibeface_protocol::history::{HistorySection, HISTORY_RESPONSE_BYTES};
     let mut size = serde_json::to_vec(snapshot)?.len();
     if size < HISTORY_RESPONSE_BYTES { return Ok(()); }
-    let mut sections = starts.keys().map(|name| {
-        let section: vibeface_protocol::history::HistorySection = serde_json::from_value(json!(name))?;
+    let mut sections = Vec::new();
+    for name in starts.keys() {
+        let section: HistorySection = serde_json::from_value(json!(name))?;
         let value = section.snapshot_path().iter().fold(&*snapshot, |value, key| &value[*key]);
-        Ok((serde_json::to_vec(value)?.len(), name, section))
-    }).collect::<Result<Vec<_>>>()?;
+        if value.is_array() { sections.push((serde_json::to_vec(value)?.len(), name, section)); }
+    }
     sections.sort_by(|left, right| right.0.cmp(&left.0));
-    for (_, name, section) in sections {
+    for (previous_size, name, section) in sections {
+        let coverage_size = serde_json::to_vec(&snapshot["history"][name])?.len();
         let value = section.snapshot_path().iter().fold(&mut *snapshot, |value, key| &mut value[*key]);
         *value = json!([]);
         snapshot["history"][name] = json!({"next_cursor":starts[name],"complete":false});
-        if section == vibeface_protocol::history::HistorySection::MemorySyncConflicts {
-            snapshot["bot_settings"]["memory_sync_conflicts"]["has_more"] = json!(true);
+        size = size - previous_size + 2 - coverage_size + serde_json::to_vec(&snapshot["history"][name])?.len();
+        if section == HistorySection::MemorySyncConflicts {
+            let has_more = &mut snapshot["bot_settings"]["memory_sync_conflicts"]["has_more"];
+            let previous = serde_json::to_vec(has_more)?.len();
+            *has_more = json!(true);
+            size = size - previous + 4;
         }
-        size = serde_json::to_vec(snapshot)?.len();
-        if size < HISTORY_RESPONSE_BYTES { return Ok(()); }
+        if size < HISTORY_RESPONSE_BYTES { break; }
     }
-    ensure!(size < HISTORY_RESPONSE_BYTES, "conversation metadata exceeds the response byte limit");
+    // Verify the actual final payload once, after accounting for replacements. Repeated
+    // whole-snapshot serialization would otherwise grow with the number of deferred sections.
+    ensure!(serde_json::to_vec(snapshot)?.len() < HISTORY_RESPONSE_BYTES,
+        "conversation metadata exceeds the response byte limit");
     Ok(())
 }
 
@@ -728,9 +736,19 @@ mod conversation_history_tests {
             assert!(serde_json::to_vec(&oracle)?.len() > 4 * 1024 * 1024);
             let snapshot = node.rpc(access.clone(), json!({"method":"conversation","conversation_id":"history"})).await?;
             assert!(serde_json::to_vec(&snapshot)?.len() < HISTORY_RESPONSE_BYTES);
-            let mut all = snapshot["messages"].as_array().context("messages")?.clone();
-            assert!(all.len() < oracle.len());
-            let mut cursor = snapshot["history"]["messages"]["next_cursor"].as_str().map(str::to_owned);
+            assert!(snapshot["messages"].as_array().context("messages")?.len() < oracle.len());
+            let cursor_network = network.clone();
+            let start = node.store.read("history_budget_fixture", move |store| {
+                store.conversation_history_start_cursor(&cursor_network, "history", vibeface_protocol::history::HistorySection::Messages)
+            }).await?;
+            let mut aggregate = snapshot.clone();
+            aggregate["messages"] = serde_json::to_value(&oracle)?;
+            assert!(serde_json::to_vec(&aggregate)?.len() > HISTORY_RESPONSE_BYTES);
+            fit_history_snapshot(&mut aggregate, &BTreeMap::from([("messages".into(), start)]))?;
+            assert!(serde_json::to_vec(&aggregate)?.len() < HISTORY_RESPONSE_BYTES);
+            assert!(aggregate["messages"].as_array().context("deferred messages")?.is_empty());
+            let mut all = Vec::new();
+            let mut cursor = aggregate["history"]["messages"]["next_cursor"].as_str().map(str::to_owned);
             while let Some(before) = cursor {
                 let page = node.rpc(access.clone(), json!({"method":"conversation_history","conversation_id":"history",
                     "section":"messages","cursor":before,"limit":100})).await?;

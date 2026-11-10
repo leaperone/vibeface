@@ -6,7 +6,9 @@ mod host{pub use crate::profiles;}
 pub mod records;
 #[path="../src/views/offline.rs"]
 pub mod offline;
-mod views{pub use crate::{records,offline};}
+#[path="../src/views/history.rs"]
+pub mod history;
+mod views{pub use crate::{records,offline,history};}
 #[path="../src/ui.rs"]
 #[allow(dead_code)]
 mod ui;
@@ -91,4 +93,24 @@ fn explicit_manual_unlock_keeps_identity_sealed_without_a_vault_daemon(){
 #[test]
 fn explicit_node_selection_is_not_replaced_by_the_remembered_node(){
  let remembered=vibeface_client::Entry{origin:"https://gateway-old.invalid".into(),node_id:"a".repeat(64)};let target=ui::connection_entry("",&"b".repeat(64),Some(&remembered),true).unwrap();assert_eq!(target.origin,"https://gateway-old.invalid");assert_eq!(target.node_id,"b".repeat(64));let route=ui::connection_entry("https://gateway-new.invalid","",Some(&remembered),true).unwrap();assert_eq!(route.origin,"https://gateway-new.invalid");assert_eq!(route.node_id,"a".repeat(64));assert!(ui::connection_entry("https://user:password@gateway.invalid",&"a".repeat(64),None,true).is_err());
+}
+
+#[test]
+fn cached_history_never_reuses_live_page_cursors_or_claims_complete_coverage(){
+ use vibeface_protocol::history::HistoryCoverage;
+ let scope=offline::CacheScope{profile_id:"default".into(),network_id:"network".into(),client_id:"client".into(),target_node:"node".into()};
+ let bot=ui::Bot{bot_id:"bot".into(),conversation_id:"conversation".into(),..Default::default()};
+ let snapshot=ui::Snapshot{online:true,synced:true,network:Some(scope.network_id.clone()),client_id:Some(scope.client_id.clone()),write_state:"writable".into(),bots:vec![bot],conversation:std::sync::Arc::new(ui::Conversation{conversation:Some(ui::ConversationIdentity{conversation_id:"conversation".into(),..Default::default()}),history:std::collections::BTreeMap::from([("messages".into(),HistoryCoverage{next_cursor:Some("live-cursor".into()),complete:false}),("works".into(),HistoryCoverage{next_cursor:None,complete:true})]),..Default::default()}),..Default::default()};
+ let bytes=offline::encode(&snapshot,&scope,Some("conversation")).unwrap();let cold=offline::decode(&bytes,&scope).unwrap().into_snapshot(2,true);assert!(cold.conversation.history.is_empty());assert!(cold.cached);assert!(!cold.online);assert!(!cold.writable);
+}
+
+#[test]
+fn reachable_owner_jobs_take_precedence_without_duplicating_triggers(){
+ let scheduler:ui::Scheduler=serde_json::from_value(json!({"jobs":[{"trigger":"same","state":"running","scope":{"kind":"main"}}],"remote":{"owner":"owner","reachable":true,"jobs":[{"trigger":"same","state":"completed","scope":{"kind":"main"}}]}})).unwrap();
+ let jobs=scheduler.effective_jobs();assert_eq!(jobs.len(),1);assert_eq!(jobs[0].state,"completed");let mut streams=vec![ui::LiveProgress{trigger:Some("same".into()),..Default::default()}];ui::prune_terminal_progress(&mut streams,&ui::Conversation{scheduler,..Default::default()});assert!(streams.is_empty());
+}
+
+#[test]
+fn answered_and_closed_main_questions_remain_available_in_history(){
+ let conversation=ui::parse_conversation(json!({"conversation":{"conversation_id":"chat","owner_epoch":1},"questions":[{"question_id":"closed","conversation_id":"chat","target":{"kind":"bot_main","bot_id":"bot"},"closed":"resolved","text":"Original question"}]}),"chat",Some("bot")).unwrap();assert_eq!(conversation.questions.len(),1);assert_eq!(conversation.questions[0].text,"Original question");assert_eq!(conversation.questions[0].closed.as_deref(),Some("resolved"));
 }

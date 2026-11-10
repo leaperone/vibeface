@@ -21,6 +21,20 @@ pub enum Endpoint {
     Lan { node_id: String, addresses: Vec<String> },
 }
 impl Endpoint {
+    pub fn validate(&self)->Result<()> {
+        vibeface_secure::validate_device_id(self.node_id())?;
+        let addresses=match self {
+            Self::Gateway(entry)=>{client_url(&entry.origin)?;None},
+            Self::Local(grant)=>{grant.websocket_request(grant.client_id())?;None},
+            Self::Preferred {gateway,addresses}=>{client_url(&gateway.origin)?;Some(addresses)},
+            Self::Lan {addresses,..}=>{ensure!(!addresses.is_empty(),"direct Node entry has no addresses");Some(addresses)},
+        };
+        if let Some(addresses)=addresses {
+            ensure!(addresses.len()<=vibeface_secure::link::MAX_ADDRS,"too many Node address hints");
+            for address in addresses {let socket:std::net::SocketAddr=address.parse().context("direct hints must be numeric socket addresses")?;ensure!(socket.port()!=0 && !socket.ip().is_unspecified() && !socket.ip().is_multicast(),"invalid direct Node address hint");}
+        }
+        Ok(())
+    }
     pub fn node_id(&self) -> &str {
         match self { Self::Gateway(e) => &e.node_id, Self::Preferred {gateway,..}=>&gateway.node_id, Self::Local(grant)=>&grant.entry().node_id, Self::Lan { node_id, .. } => node_id }
     }
@@ -62,6 +76,7 @@ impl Connection {
         Self::open_endpoint(&Endpoint::Gateway(Entry { origin: origin.into(), node_id: target.into() }), identity).await
     }
     pub async fn open_endpoint(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
+        endpoint.validate()?;
         if let Endpoint::Preferred {gateway,addresses}=endpoint {
             if !addresses.is_empty() {
                 let direct=Endpoint::Lan {node_id:gateway.node_id.clone(),addresses:addresses.clone()};
@@ -77,11 +92,11 @@ impl Connection {
     async fn handshake(endpoint: &Endpoint, identity: &Identity) -> Result<Self> {
         let mut transport = match endpoint {
             Endpoint::Gateway(entry) => {
-                let (mut socket, _) = tokio_tungstenite::connect_async(client_url(&entry.origin)?).await?;
+                let (mut socket, _) = tokio_tungstenite::connect_async_with_config(client_url(&entry.origin)?,Some(websocket_config()),false).await?;
                 socket.send(Message::Text(json!({"type":"connect","target":entry.node_id}).to_string().into())).await?;
                 Transport::Web(socket)
             }
-            Endpoint::Local(grant) => {let (socket,_)=tokio_tungstenite::connect_async(grant.websocket_request(&identity.device_id())?).await?;Transport::Web(socket)},
+            Endpoint::Local(grant) => {let (socket,_)=tokio_tungstenite::connect_async_with_config(grant.websocket_request(&identity.device_id())?,Some(websocket_config()),false).await?;Transport::Web(socket)},
             Endpoint::Preferred {..}=>bail!("preferred route was not resolved before Noise handshake"),
             Endpoint::Lan { node_id, addresses } => Transport::Lan(lan_connect(node_id.clone(), addresses.clone(), 10_000).await?),
         };
@@ -187,6 +202,9 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
     writer.close().await;
 }
 
+fn websocket_config()->tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(65535)).max_frame_size(Some(65535)).max_write_buffer_size(256*1024)
+}
 enum Transport { Web(Socket), Lan(Arc<LanStream>) }
 impl Transport {
     async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => Ok(s.send(bytes)?) } }
@@ -352,5 +370,38 @@ mod admission_tests {
         assert!(denied.unwrap_err().to_string().contains("earlier outcome is unknown"));
         assert_eq!(connection.call("read-after-blocked-write",json!({})).await?,json!({"read":true}));
         task.await??;Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preferred_tests {
+    use super::*;
+    use super::tests::{receive,send,server};
+    #[tokio::test]
+    async fn preferred_route_attempts_numeric_direct_transport_then_pins_the_same_gateway_node()->Result<()> {
+        let node=Identity::generate()?;let client=Identity::generate()?;let node_id=node.device_id();
+        let silent=tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let address=silent.local_addr()?.to_string();
+        let direct=tokio::spawn(async move {
+            let mut packet=[0u8;2048];
+            let (count,_)=tokio::time::timeout(Duration::from_secs(5),silent.recv_from(&mut packet)).await??;
+            Ok::<_,anyhow::Error>((count,tokio::time::Instant::now(),silent))
+        });
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let gateway=Entry {origin:format!("http://{}",listener.local_addr()?),node_id:node_id.clone()};
+        let task=tokio::spawn(async move {
+            let (mut socket,mut channel)=server(listener,&node).await?;
+            let connected_at=tokio::time::Instant::now();
+            let request=receive(&mut socket,&mut channel).await?;
+            assert_eq!(request["method"],"read");
+            send(&mut socket,&mut channel,json!({"id":request["id"],"result":{"node_id":node.device_id()}})).await?;
+            Ok::<_,anyhow::Error>(connected_at)
+        });
+        let endpoint=Endpoint::Preferred {gateway,addresses:vec![address]};
+        let connection=Connection::open_endpoint(&endpoint,&client).await?;
+        assert_eq!(connection.call("read",json!({})).await?["node_id"],node_id);
+        let (count,direct_at,_silent)=direct.await??;let gateway_at=task.await??;
+        assert!(count>0);assert!(direct_at<gateway_at,"the direct route was attempted before Gateway success");
+        Ok(())
     }
 }

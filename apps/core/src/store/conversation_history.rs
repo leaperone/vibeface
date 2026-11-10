@@ -56,6 +56,67 @@ pub(super) fn history_page<T: Serialize>(
     Ok(page)
 }
 
+/// Runs before applying an effective event, in that event's projection transaction.
+/// This local cache revision also records late associations, so it need not converge
+/// between replicas. The empty scope tracks changes across conversations.
+pub(super) fn advance_revision(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    use crate::workspace::WorkspaceCommand;
+    let scope = event.scope_id.as_str();
+    let affected = match &event.body {
+        EventBody::BotDeleted { .. } | EventBody::SessionAttributed { .. }
+        | EventBody::SessionMuted { .. } | EventBody::WorkDispatched { .. } => Some(""),
+        EventBody::WorkspaceCommanded { command, .. } =>
+            (!matches!(command, WorkspaceCommand::PostChannelMessage { .. })).then_some(""),
+        EventBody::WorkProgress { work_id, thread_id: Some(thread), .. } => {
+            let previous: Option<String> = connection.query_row(
+                "SELECT thread_id FROM works WHERE network_id=? AND work_id=?",
+                params![network, work_id], |row| row.get(0),
+            ).optional()?.flatten();
+            (previous.as_deref() != Some(thread.as_str())).then_some("")
+        }
+        EventBody::BotChanged { change: BotChange::Skill { .. }, .. } => Some(""),
+        EventBody::ConversationOwner { .. } | EventBody::BotCreated { .. }
+        | EventBody::MessageSteered { .. } | EventBody::QuestionClosed { .. }
+        | EventBody::BotChanged { .. } | EventBody::BotAvatarSet { .. }
+        | EventBody::ScheduleControlled { .. } | EventBody::MemoryControlled { .. } => Some(scope),
+        EventBody::InputPosted { message_id, .. } | EventBody::MessagePosted { message_id, .. }
+        | EventBody::BotMessaged { message_id, .. } => {
+            let replacing: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3)
+                 OR EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?2 AND in_reply_to=?3)",
+                params![network, scope, message_id], |row| row.get(0),
+            )?;
+            replacing.then_some(scope)
+        }
+        EventBody::QuestionAsked { question_id, .. } => {
+            let replacing: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM questions WHERE network_id=?1 AND conversation_id=?2 AND question_id=?3)
+                 OR EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?2 AND answers=?3)",
+                params![network, scope, question_id], |row| row.get(0),
+            )?;
+            replacing.then_some(scope)
+        }
+        _ => None,
+    };
+    if let Some(scope) = affected { bump_revision(connection, network, scope)?; }
+    Ok(())
+}
+
+/// Cache metadata survives business projection rebuilds. Increment before clearing rows so
+/// a replay can never reuse an old cursor's authority, even if the projected counts match.
+pub(super) fn invalidate_all(connection: &Connection, network: &str) -> Result<()> {
+    bump_revision(connection, network, "")
+}
+
+fn bump_revision(connection: &Connection, network: &str, scope: &str) -> Result<()> {
+    connection.execute(
+        "INSERT INTO conversation_history_revisions(network_id,conversation_id,revision) VALUES(?,?,1)
+         ON CONFLICT(network_id,conversation_id) DO UPDATE SET revision=revision+1",
+        params![network, scope],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub(super) fn history_cursor(
         &self,
@@ -73,7 +134,12 @@ impl Store {
             "SELECT count(*),max(hash) FROM events WHERE network_id=? AND main=0",
             [network], |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let authority = digest(&serde_json::to_vec(&(bundle, forks))?);
+        let revisions: (u64, u64) = self.connection.query_row(
+            "SELECT COALESCE((SELECT revision FROM conversation_history_revisions WHERE network_id=?1 AND conversation_id=''),0),
+                    COALESCE((SELECT revision FROM conversation_history_revisions WHERE network_id=?1 AND conversation_id=?2),0)",
+            params![network, conversation], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let authority = digest(&serde_json::to_vec(&(bundle, forks, revisions))?);
         let before = cursor.map(|cursor| -> Result<Option<HistoryBoundary>> {
             ensure!(cursor.len() <= 8192, "history cursor is too large");
             let cursor: Cursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)
@@ -89,8 +155,8 @@ impl Store {
         Ok((authority, before))
     }
 
-    pub(crate) fn conversation_history_authority(&self, network: &str) -> Result<String> {
-        Ok(self.history_cursor(network, "", HistorySection::Messages, None)?.0)
+    pub(crate) fn conversation_history_authority(&self, network: &str, conversation: &str) -> Result<String> {
+        Ok(self.history_cursor(network, conversation, HistorySection::Messages, None)?.0)
     }
 
     pub(crate) fn conversation_history_start_cursor(

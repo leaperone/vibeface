@@ -185,6 +185,7 @@ impl HistoryState {
     pub fn new(scope: HistoryScope) -> Self {
         Self { scope, authority: None, revision: 0, sections: HistorySection::ALL.into_iter().map(|section| (section, SectionState::default())).collect(), base: Value::Object(Map::new()) }
     }
+    /// Retain valid loaded rows across a transport generation while fencing its old requests.
     pub fn scope(&self) -> &HistoryScope { &self.scope }
     pub fn authority(&self) -> Option<&str> { self.authority.as_deref() }
     pub fn section(&self, section: HistorySection) -> &SectionState {
@@ -424,6 +425,22 @@ impl OverwrittenRecord {
             }
             OverwrittenField::Skills { .. } => serde_json::to_value(&skills.as_ref().context("原始变更没有技能。")?.after)?,
             OverwrittenField::Avatar { .. } => serde_json::to_value(&avatar.as_ref().context("原始变更没有头像。")?.after)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ProfileRestoration { Avatar(Option<ChangeAvatar>), Instruction(String) }
+impl OverwrittenRecord {
+    pub fn restoration(&self,original:&BotChangeRecord)->Result<ProfileRestoration>{
+        let original=self.original_after(original)?;
+        Ok(match &self.field{
+            OverwrittenField::Avatar{..}=>ProfileRestoration::Avatar(serde_json::from_value(original)?),
+            OverwrittenField::Name{..}=>ProfileRestoration::Instruction(format!("请仅把名称改回「{}」，保留其他配置。",serde_json::from_value::<String>(original)?)),
+            OverwrittenField::Instructions{..}=>ProfileRestoration::Instruction(format!("请仅把说明改回下面这段，保留其他配置：\n\n{}",serde_json::from_value::<String>(original)?)),
+            OverwrittenField::Model{provider,..}=>{let value=serde_json::from_value::<String>(original)?;ProfileRestoration::Instruction(format!("请仅把 {provider:?} 模型改回{}，保留其他配置。",if value.is_empty(){"设备默认".into()}else{format!("「{value}」")}))},
+            OverwrittenField::ReasoningEffort{provider,..}=>{let value=serde_json::from_value::<Option<String>>(original)?;ProfileRestoration::Instruction(format!("请仅把 {provider:?} 推理强度改回{}，保留其他配置。",value.map(|value|format!("「{value}」")).unwrap_or_else(||"设备默认".into())))},
+            OverwrittenField::Skills{..}=>{let value=serde_json::from_value::<Option<Vec<String>>>(original)?;ProfileRestoration::Instruction(format!("请仅把技能范围改回{}，保留其他配置。",value.map(|items|if items.is_empty(){"不启用技能".into()}else{items.join("、")}).unwrap_or_else(||"全部可用".into())))},
         })
     }
 }

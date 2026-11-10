@@ -50,7 +50,7 @@ impl<'a> Enrollment<'a> {
             let join_id=invite_id(&ticket.invite_hash())?;
             let request=serde_json::to_vec(&json!({"id":format!("join-{join_id}"),"method":"join","params":{"secret":hex::encode(ticket.secret),"public_key":key.device_id(),"kind":"client","name":name,"commit":join_commit(key.device_id(),&nonce)?}}))?;
             let journal=Journal {device_id:key.device_id().into(),entry:Entry {origin:origin.into(),node_id:ticket.entry_id()},link:Zeroizing::new(link.into()),name:name.into(),join_id,nonce,admin:None,request,sent:false,joined:None,terminal:false};
-            privatefs::create_durable(&key.dir.join(FILE),&journal.bytes(key)?)?;
+            durable::publish_new(&key.dir.join(FILE),&journal.bytes(key)?)?;
         }
         Self::resume(key).await
     }

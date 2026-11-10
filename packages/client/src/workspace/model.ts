@@ -446,15 +446,18 @@ function work(value: unknown): WorkRecord {
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
-  const rows = [...works]
-  for (const item of list(value)) {
-    const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
-    if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") {
-      rows.push({ work_id, trigger: data.trigger == null ? "" : text(data.trigger), target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: data.prompt == null ? "" : text(data.prompt), state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason), ...failure(data.failure) })
-    } else if (state === "stop_waiting" || state === "stop_timed_out") {
-      const index = rows.findIndex((row) => row.work_id === work_id)
-      if (index >= 0) rows[index] = { ...rows[index], stop: state }
-    } else throw new Error("送达状态无法识别。")
+  const deliveries = list(value).map(deliveryRecord)
+  const stops = new Map(deliveries.flatMap((item) => item.state === 'stop_waiting' || item.state === 'stop_timed_out' ? [[item.work_id, item.state] satisfies [string, typeof item.state]] : []))
+  const rows: WorkRecord[] = works.map((item): WorkRecord => {
+    const stop = stops.get(item.work_id)
+    if (item.stop === stop) return item
+    if (stop) return { ...item, stop }
+    const { stop: _, ...withoutStop } = item
+    return withoutStop
+  })
+  for (const data of deliveries) {
+    if (!('cwd' in data) || rows.some((row) => row.work_id === data.work_id)) continue
+    rows.push({ work_id: data.work_id, trigger: data.trigger ?? '', target_node: data.target_node, cwd: data.cwd, title: data.title ?? '', prompt: data.prompt ?? '', state: data.state, summary: '', outcome: null, result_text: '', failure_reason: data.reason ?? null, ...(data.failure ? { failure: data.failure } : {}) })
   }
   return rows
 }
@@ -846,12 +849,12 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
   const owner = data.conversation === null ? null : conversation(data.conversation)
   if (expectedId && owner?.conversation_id !== expectedId) throw new Error("设备返回了别的对话，已暂停。")
   const scheduler = schedulerSnapshot(data.scheduler)
-  if (owner && scheduler?.scope_jobs.some((job) => job.conversation_id !== owner.conversation_id)) throw new Error('目标任务观察属于别的对话。')
+  if (owner && [...scheduler?.scope_jobs ?? [], ...scheduler?.remote?.scope_jobs ?? []].some((job) => job.conversation_id !== owner.conversation_id)) throw new Error('目标任务观察属于别的对话。')
   return {
     conversation: owner, history_authority: text(data.history_authority), history: parseConversationHistory(data.history), deliveries: list(data.deliveries).map(deliveryRecord), messages: list(data.messages).map(message).filter(mainMessage),
     works: withDeliveries(list(data.works).map(work), data.deliveries),
-    scheduler: scheduler && { ...scheduler, jobs: scheduler.jobs.filter((job) => job.scope.kind === 'main'), ...(scheduler.context && scheduler.context.scope.kind !== 'main' ? { context: null } : {}) },
-    scopeJobs: [...scheduler?.scope_jobs ?? [], ...scheduler?.remote?.scope_jobs ?? []],
+    scheduler: scheduler && { ...scheduler, jobs: scheduler.jobs.filter((job) => job.scope.kind === 'main'), local_jobs: scheduler.local_jobs.filter((job) => job.scope.kind === 'main'), remote: scheduler.remote && { ...scheduler.remote, jobs: scheduler.remote.jobs.filter((job) => job.scope.kind === 'main') }, ...(scheduler.context && scheduler.context.scope.kind !== 'main' ? { context: null } : {}) },
+    scopeJobs: mergeOwnerJobs(scheduler?.scope_jobs ?? [], scheduler?.remote?.scope_jobs ?? [], scheduler?.remote?.reachable === true),
     checks: list(data.checks).map(coordinationCheck),
     local_node: text(data.local_node),
     changes: list(data.changes).map(changeRecord),
@@ -1141,11 +1144,11 @@ export function parseHistoryPage(value: unknown, conversationId: string, section
   switch (section) {
     case 'messages': return { ...base, section, items: items.map(message).filter(mainMessage) }
     case 'works': return { ...base, section, items: items.map(work) }
-    case 'changes': return { ...base, section, items: items.map(changeRecord) }
-    case 'questions': return { ...base, section, items: items.map(question).filter(mainQuestion) }
+    case 'changes': return { ...base, section, items: historyScoped(items.map(changeRecord), conversationId) }
+    case 'questions': return { ...base, section, items: historyScoped(items.map(question).filter(mainQuestion), conversationId) }
     case 'sessions': return { ...base, section, items: items.map(sessionHandoff) }
     case 'owner_jobs': return { ...base, section, items: items.map(managerJob).filter((job) => job.scope.kind === 'main') }
-    case 'owner_scope_jobs': return { ...base, section, items: items.map(scopeJob) }
+    case 'owner_scope_jobs': return { ...base, section, items: historyScoped(items.map(scopeJob), conversationId) }
     case 'owner_memory_conflicts': return { ...base, section, items: conversationMemoryConflicts(items) ?? [] }
     case 'skills': return { ...base, section, items: items.map(skillSummary) }
     case 'schedules': return { ...base, section, items: items.map(scheduleView) }
@@ -1154,7 +1157,7 @@ export function parseHistoryPage(value: unknown, conversationId: string, section
     case 'memory_sync_conflicts': return { ...base, section, items: items.map(parseMemorySyncConflict) }
     case 'overwritten': return { ...base, section, items: items.map(overwritten) }
     case 'jobs': return { ...base, section, items: items.map(managerJob).filter((job) => job.scope.kind === 'main') }
-    case 'scope_jobs': return { ...base, section, items: items.map(scopeJob) }
+    case 'scope_jobs': return { ...base, section, items: historyScoped(items.map(scopeJob), conversationId) }
     case 'checks': return { ...base, section, items: items.map(coordinationCheck) }
     case 'deliveries': return { ...base, section, items: items.map(deliveryRecord) }
     case 'unanswered': return { ...base, section, items: items.map(text) }
@@ -1170,7 +1173,7 @@ function scheduleView(value: unknown) {
   const data = record(value)
   return { ...schedule(data), schedule_id: text(data.schedule_id), next_run_at_ms: data.next_run_at_ms == null ? null : number(data.next_run_at_ms) }
 }
-export function mergeOwnerJobs(local: ManagerJob[], remote: ManagerJob[], reachable: boolean): ManagerJob[] {
+export function mergeOwnerJobs<T extends { trigger: string }>(local: T[], remote: T[], reachable: boolean): T[] {
   const preferred = reachable ? remote : local, other = reachable ? local : remote
   return [...preferred, ...other.filter((job) => !preferred.some((known) => known.trigger === job.trigger))]
 }
@@ -1179,4 +1182,9 @@ function conversationMemoryConflicts(value: unknown): ConversationMemoryConflict
   if (value == null) return null
   const raw = list(value), conflicts = memoryConflicts(raw) ?? []
   return conflicts.map((item, index) => ({ ...item, history_id: text(record(raw[index]).history_id) }))
+}
+
+function historyScoped<T extends { conversation_id: string }>(items: T[], conversationId: string): T[] {
+  if (items.some((item) => item.conversation_id !== conversationId)) throw new Error('历史记录包含其他对话的内容。')
+  return items
 }

@@ -49,7 +49,7 @@ pub(crate) fn review(operation:&Operation,dependent_ids:Vec<String>)->Result<Set
         SettingsKind::Triage=>&["default_outlet","projects","webhook_url","scan_codex_sessions","codex_sessions"],
         SettingsKind::Relay=>&["volunteer","listen","url","rate","max_clients","max_clients_per_ip"],
     };
-    let mut fields=names.iter().filter_map(|name|wanted.get(*name).map(|value|SettingsField {name:(*name).into(),value:value.to_string(),secret:false})).collect::<Vec<_>>();
+    let mut fields=names.iter().filter_map(|name|wanted.get(*name).map(|value|SettingsField {name:(*name).into(),value:if matches!(*name,"webhook_url"|"url")&&!value.is_null(){"configured URL; value hidden".into()}else{value.to_string()},secret:matches!(*name,"webhook_url"|"url")})).collect::<Vec<_>>();
     let mut has_secret_changes=false;
     if let Some(env)=wanted["env"].as_object() {
         has_secret_changes=!env.is_empty();

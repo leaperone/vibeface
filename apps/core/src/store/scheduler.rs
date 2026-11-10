@@ -615,13 +615,26 @@ fn context_projection_from(
     });
     context.scope = session.scope.clone();
     context.inputs.clear();
-    let mut missing_sources = 0;
-    for job in query_jobs(
-        connection,
-        "conversation_id=? AND state IN ('steering','steered')",
-        [&session.conversation_id],
-    )? {
-        let (into, receipt, stage) = match &job.state {
+    let total: usize = connection.query_row(
+        "SELECT count(*) FROM scheduler_jobs WHERE conversation_id=?1
+            AND state IN ('steering','steered') AND json_extract(detail,'$.into.attempt_id')=?2",
+        params![session.conversation_id,context.attempt_id], |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT j.reply_to,j.state,j.detail,m.event_hash FROM scheduler_jobs j
+         JOIN messages m ON m.network_id=?1 AND m.conversation_id=j.conversation_id AND m.message_id=j.reply_to
+         WHERE j.conversation_id=?2 AND j.state IN ('steering','steered')
+            AND json_extract(j.detail,'$.into.attempt_id')=?3
+         ORDER BY j.sequence,j.rowid LIMIT 64",
+    )?;
+    let rows = statement.query_map(params![context.network_id,session.conversation_id,context.attempt_id], |row| {
+        Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))
+    })?;
+    for row in rows {
+        let (message_id, stored_state, detail, source) = row?;
+        let state: JobState = serde_json::from_str(&detail)?;
+        ensure!(state.name() == stored_state, "scheduler job steer state mismatch");
+        let (into, receipt, stage) = match &state {
             JobState::Steering {
                 into,
                 receipt,
@@ -658,28 +671,14 @@ fn context_projection_from(
             ),
             _ => continue,
         };
-        if into.attempt_id != context.attempt_id {
-            continue;
-        }
-        let Some(source) = message_from(
-            connection,
-            &context.network_id,
-            &job.conversation_id,
-            &job.reply_to,
-        )?
-        .map(|message| message.event_hash) else {
-            missing_sources += 1;
-            continue;
-        };
-        let mut value = json!({"message_id":job.reply_to,"source_event":source,"stage":stage,
+        let mut value = json!({"message_id":message_id,"source_event":source,"stage":stage,
             "expected_turn_id":into.turn_id,"actual_turn_id":receipt.as_ref().and_then(|receipt| receipt.actual_turn_id.clone())});
         if let Some(receipt) = receipt {
             value["accepted_at_ms"] = json!(receipt.accepted_at_ms);
         }
         context.inputs.push(value);
     }
-    context.inputs_omitted = context.inputs.len().saturating_sub(64) + missing_sources;
-    context.inputs.truncate(64);
+    context.inputs_omitted = total.saturating_sub(context.inputs.len());
     Ok(Some(context))
 }
 
@@ -5998,3 +5997,7 @@ mod hold_query_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler_context_tests.rs"]
+mod context_tests;

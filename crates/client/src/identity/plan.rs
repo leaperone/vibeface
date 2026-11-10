@@ -19,35 +19,41 @@ struct Plan {
 }
 /// An encrypted pending identity operation plus an already durable, verified recovery backup.
 /// No governance request is sent until `submit` is explicitly called after the user confirms the file.
-pub struct IdentityPlan {dir:PathBuf,plan:Plan,password:Zeroizing<String>}
+pub struct IdentityPlan {dir:PathBuf,plan:Plan,password:Zeroizing<String>,_lock:std::fs::File}
 impl IdentityPlan {
+    fn lock(key:&ClientKey)->Result<std::fs::File> {
+        let lock=privatefs::open_or_create(&key.dir.join("identity-operation.lock"))?;
+        lock.try_lock().context("identity operation is open in another process or window")?;Ok(lock)
+    }
     pub fn exists(key:&ClientKey)->bool {key.dir.join(PLAN_FILE).exists()}
     pub fn backup_path(&self)->&Path {&self.plan.backup_path}
     pub fn backup_sha256(&self)->String {hex::encode(Sha256::digest(&self.plan.backup_bytes))}
     pub fn network_id(&self)->&str {&self.plan.network_id}
     pub fn state(&self)->IdentityOperationState {self.plan.state}
     pub fn load(key:&ClientKey,password:&str)->Result<Self> {
+        let lock=Self::lock(key)?;
         let file=privatefs::read_private_bounded(&key.dir.join(PLAN_FILE),16*1024*1024,"pending identity operation")?;
         let bytes=Zeroizing::new(recovery_open(&file,password).context("wrong recovery password for pending operation")?);
         let plan:Plan=serde_json::from_slice(&bytes)?;
         ensure!(plan.client_id==key.device_id(),"pending operation belongs to another client");
         ensure!(key.network_id().is_none_or(|network|network==plan.network_id),"pending operation belongs to another network");
-        let pending=Self {dir:key.dir.clone(),plan,password:Zeroizing::new(password.into())};
+        let pending=Self {dir:key.dir.clone(),plan,password:Zeroizing::new(password.into()),_lock:lock};
         pending.verify_backup()?;Ok(pending)
     }
     pub(super) fn prepare(key:&ClientKey,entry:Entry,path:&Path,material:&RecoveryMaterial,password:&str,params:Value)->Result<Self> {
+        let lock=Self::lock(key)?;
         ensure!(path.is_absolute(),"recovery backup path must be absolute");
         ensure!(!Self::exists(key),"an identity operation is pending; reopen it instead of generating another recovery key");
         ensure!(!path.exists(),"recovery backup already exists; choose a new path");
         let backup_bytes=recovery_file_bytes(material,password)?;
         let request_bytes=serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"method":"recover","params":params}))?;
-        let pending=Self {dir:key.dir.clone(),password:Zeroizing::new(password.into()),plan:Plan {
+        let pending=Self {dir:key.dir.clone(),password:Zeroizing::new(password.into()),_lock:lock,plan:Plan {
             client_id:key.device_id().into(),network_id:material.network_id.clone(),entry,backup_path:path.to_owned(),backup_bytes,request_bytes,
             genesis:material.genesis.clone(),checkpoint:material.checkpoints.last().cloned(),state:IdentityOperationState::Prepared,
         }};
         // The encrypted journal lands first. A crash before publishing the backup resumes these same bytes.
         let sealed=pending.sealed()?;
-        privatefs::create_durable(&pending.dir.join(PLAN_FILE),&sealed)?;
+        durable::publish_new(&pending.dir.join(PLAN_FILE),&sealed)?;
         pending.verify_backup()?;Ok(pending)
     }
     fn sealed(&self)->Result<Vec<u8>> {
@@ -56,7 +62,7 @@ impl IdentityPlan {
     }
     fn save(&self)->Result<()> {privatefs::write_atomic(&self.dir.join(PLAN_FILE),&self.sealed()?)}
     fn verify_backup(&self)->Result<()> {
-        if !self.plan.backup_path.exists() {privatefs::create_durable(&self.plan.backup_path,&self.plan.backup_bytes)?;}
+        if !self.plan.backup_path.exists() {durable::publish_new(&self.plan.backup_path,&self.plan.backup_bytes)?;}
         let actual=privatefs::read_private_bounded(&self.plan.backup_path,MAX_FILE,"recovery backup")?;
         ensure!(actual==self.plan.backup_bytes,"recovery backup changed; restore the exact saved backup before submitting");Ok(())
     }
@@ -127,6 +133,7 @@ mod tests {
         let path=dir.join("recovery.json");
         let plan=IdentityPlan::prepare(&key,entry.clone(),&path,&backup,"recovery password",json!({"genesis":genesis,"capability":"controlled-one-time-capability"}))?;
         let bytes=std::fs::read(&path)?;let request=plan.plan.request_bytes.clone();
+        assert!(IdentityPlan::load(&key,"recovery password").is_err(),"another process cannot submit a stale Prepared plan");
         let journal=std::fs::read_to_string(key.dir.join(PLAN_FILE))?;
         assert!(!journal.contains("controlled-one-time-capability"));
         assert!(!journal.contains(&root.secret_hex()));

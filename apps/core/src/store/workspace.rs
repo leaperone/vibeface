@@ -20,6 +20,12 @@ struct Graph {
     inputs: BTreeMap<String, InputControlState>,
     queue_order: Vec<String>,
     last_rank: String,
+    #[serde(skip)]
+    dirty_tasks: BTreeSet<String>,
+    #[serde(skip)]
+    dirty_assignments: BTreeSet<String>,
+    #[serde(skip)]
+    replace_lookups: bool,
     #[serde(default)]
     stopped: BTreeMap<String, AssignmentStopProof>,
     #[serde(default)]
@@ -596,7 +602,52 @@ impl Graph {
             .map(Option::unwrap_or_default)
     }
     fn save(&self, connection: &Connection, network: &str) -> Result<()> {
-        connection.execute("INSERT INTO workspace_projection(network_id,state) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET state=excluded.state", params![network, serde_json::to_string(self)?])?;
+        let state = serde_json::to_string(self)?;
+        connection.execute_batch("SAVEPOINT workspace_lookup_save")?;
+        let saved = (|| {
+            connection.execute("INSERT INTO workspace_projection(network_id,state) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET state=excluded.state", params![network, state])?;
+            self.save_lookups(connection, network)
+        })();
+        match saved {
+            Ok(()) => {
+                connection.execute_batch("RELEASE workspace_lookup_save")?;
+                Ok(())
+            }
+            Err(error) => {
+                connection.execute_batch("ROLLBACK TO workspace_lookup_save; RELEASE workspace_lookup_save")?;
+                Err(error)
+            }
+        }
+    }
+    fn save_lookups(&self, connection: &Connection, network: &str) -> Result<()> {
+        if self.replace_lookups {
+            connection.execute("DELETE FROM workspace_tasks_lookup WHERE network_id=?", [network])?;
+            connection.execute("DELETE FROM workspace_assignments_lookup WHERE network_id=?", [network])?;
+        }
+        let task_ids: Box<dyn Iterator<Item = &String> + '_> = if self.replace_lookups {
+            Box::new(self.tasks.keys())
+        } else { Box::new(self.dirty_tasks.iter()) };
+        let mut task_insert = connection.prepare_cached("INSERT INTO workspace_tasks_lookup(network_id,task_id,record) VALUES(?,?,?)
+            ON CONFLICT(network_id,task_id) DO UPDATE SET record=excluded.record")?;
+        for id in task_ids {
+            if let Some(task) = self.tasks.get(id) {
+                task_insert.execute(params![network, id, serde_json::to_string(task)?])?;
+            } else {
+                connection.execute("DELETE FROM workspace_tasks_lookup WHERE network_id=? AND task_id=?", params![network,id])?;
+            }
+        }
+        let assignment_ids: Box<dyn Iterator<Item = &String> + '_> = if self.replace_lookups {
+            Box::new(self.assignments.keys())
+        } else { Box::new(self.dirty_assignments.iter()) };
+        let mut assignment_insert = connection.prepare_cached("INSERT INTO workspace_assignments_lookup(network_id,assignment_id,work_id,created_at_ms,record) VALUES(?,?,?,?,?)
+            ON CONFLICT(network_id,assignment_id) DO UPDATE SET work_id=excluded.work_id,created_at_ms=excluded.created_at_ms,record=excluded.record")?;
+        for id in assignment_ids {
+            if let Some(assignment) = self.assignments.get(id) {
+                assignment_insert.execute(params![network,id,assignment.work_id,assignment.created_at_ms,serde_json::to_string(assignment)?])?;
+            } else {
+                connection.execute("DELETE FROM workspace_assignments_lookup WHERE network_id=? AND assignment_id=?", params![network,id])?;
+            }
+        }
         Ok(())
     }
     fn task(&self, task_id: &str, expected: u64) -> Result<&WorkspaceTask> {
@@ -1422,6 +1473,14 @@ impl Graph {
             .err()
             .map(|error| error.to_string());
         if error.is_none() {
+            if !next.replace_lookups {
+            let changed_tasks: BTreeSet<_> = self.tasks.keys().chain(next.tasks.keys())
+                .filter(|id| self.tasks.get(*id) != next.tasks.get(*id)).cloned().collect();
+            let changed_assignments: BTreeSet<_> = self.assignments.keys().chain(next.assignments.keys())
+                .filter(|id| self.assignments.get(*id) != next.assignments.get(*id)).cloned().collect();
+            next.dirty_tasks.extend(changed_tasks);
+            next.dirty_assignments.extend(changed_assignments);
+            }
             *self = next;
         }
         self.commands.insert(
@@ -1461,6 +1520,7 @@ fn graph_at(
     known: Option<&BTreeMap<String, Event>>,
 ) -> Result<Graph> {
     let mut graph = Graph::default();
+    graph.replace_lookups = true;
     let mut statement=connection.prepare("SELECT hash,envelope,lamport,created_at_ms FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted') ORDER BY lamport,created_at_ms,hash")?;
     let rows = statement.query_map([network], |row| {
         Ok((
@@ -4641,17 +4701,11 @@ pub(crate) fn workspace_assignment_from(
     network: &str,
     assignment_id: &str,
 ) -> Result<Option<Assignment>> {
-    let encoded: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(state, '$.assignments.' || json_quote(?2)) FROM workspace_projection WHERE network_id=?1",
-            params![network, assignment_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    encoded
-        .map(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
-        .transpose()
+    let encoded: Option<String> = connection.query_row(
+        "SELECT record FROM workspace_assignments_lookup WHERE network_id=?1 AND assignment_id=?2",
+        params![network, assignment_id], |row| row.get(0),
+    ).optional()?;
+    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
 }
 
 pub(crate) fn assignment_admission_allowed_from(
@@ -4754,27 +4808,35 @@ fn command_in_task(graph: &Graph, task_id: &str, command: &WorkspaceCommand) -> 
     }
 }
 
+/// Reconstruct disposable lookup rows during schema initialization, in its transaction.
+pub(crate) fn rebuild_lookup_projection(connection: &Connection, network: &str) -> Result<()> {
+    let mut graph = Graph::read(connection, network)?;
+    graph.replace_lookups = true;
+    graph.save(connection, network)
+}
+
 pub(crate) fn workspace_task_from(
     connection: &Connection,
     network: &str,
     task_id: &str,
 ) -> Result<Option<WorkspaceTask>> {
-    Ok(Graph::read(connection, network)?.tasks.remove(task_id))
+    let encoded: Option<String> = connection.query_row(
+        "SELECT record FROM workspace_tasks_lookup WHERE network_id=?1 AND task_id=?2",
+        params![network,task_id], |row| row.get(0),
+    ).optional()?;
+    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
 }
 pub(crate) fn workspace_assignment_for_work_from(
     connection: &Connection,
     network: &str,
     work_id: &str,
 ) -> Result<Option<Assignment>> {
-    Ok(Graph::read(connection, network)?
-        .assignments
-        .into_values()
-        .filter(|assignment| assignment.work_id.as_deref() == Some(work_id))
-        .max_by(|left, right| {
-            left.created_at_ms
-                .cmp(&right.created_at_ms)
-                .then(left.assignment_id.cmp(&right.assignment_id))
-        }))
+    let encoded: Option<String> = connection.query_row(
+        "SELECT record FROM workspace_assignments_lookup WHERE network_id=?1 AND work_id=?2
+            ORDER BY created_at_ms DESC,assignment_id DESC LIMIT 1",
+        params![network,work_id], |row| row.get(0),
+    ).optional()?;
+    encoded.map(|encoded| serde_json::from_str(&encoded).map_err(Into::into)).transpose()
 }
 
 impl Store {
@@ -5633,3 +5695,7 @@ pub(crate) fn workspace_input_release_allowed_from(
         && matches!(&release.body, EventBody::WorkspaceCommanded { command_id, command: WorkspaceCommand::ControlInput { message_id: released, action: InputControl::Release, .. }, attestation: Some(_), .. }
             if released == message_id && graph.commands.get(command_id).is_some_and(|command| command.event_hash == input.control_event && command.error.is_none())))
 }
+
+#[cfg(test)]
+#[path = "workspace_lookup_tests.rs"]
+mod lookup_tests;

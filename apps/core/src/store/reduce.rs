@@ -34,7 +34,7 @@ fn text(value: impl serde::Serialize) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 20] = [
+pub(crate) const TABLES: [&str; 22] = [
     "conversations",
     "messages",
     "bots",
@@ -55,6 +55,8 @@ pub(crate) const TABLES: [&str; 20] = [
     "conversation_setting_writes",
     "memory_history_operations",
     "memory_winner_chain",
+    "workspace_tasks_lookup",
+    "workspace_assignments_lookup",
 ];
 
 /// Who owns a session, in any order the records arrive: the latest attribution or mute by
@@ -81,6 +83,7 @@ fn own_session(
 }
 
 pub(crate) fn clear(connection: &Connection, network: &str) -> Result<()> {
+    super::conversation_history::invalidate_all(connection, network)?;
     for table in TABLES {
         connection.execute(
             &format!("DELETE FROM {table} WHERE network_id=?"),
@@ -99,6 +102,7 @@ pub(crate) fn apply(
     rank: &str,
     notify_session: bool,
 ) -> Result<()> {
+    super::conversation_history::advance_revision(connection, network, event)?;
     let scope = event.scope_id.as_str();
     match &event.body {
         EventBody::ConversationCreated { title } => {

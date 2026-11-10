@@ -6,6 +6,12 @@ use serde_json::json;
 use vibeface_protocol::history::{HistoryPage, HistorySection, HISTORY_MAX_LIMIT, HISTORY_PAGE_BYTES};
 
 impl Store {
+    pub(crate) fn scheduler_reply_is_present(&self, network: &str, conversation: &str, message: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=? AND message_id=?)",
+            params![network, conversation, message], |row| row.get(0))?)
+    }
+
     pub(crate) fn scheduler_trigger_has_check(&self, conversation: &str, trigger: &str) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM pending_checks WHERE conversation_id=? AND trigger=?)",
@@ -281,6 +287,7 @@ mod tests {
         let first = store.conversation_scheduler_page(&network, "c", &local, HistorySection::ScopeJobs, None, 3,
             |_, job| Ok(json!(job)))?;
         let cursor = first.next_cursor.context("older jobs")?;
+        input(&identity, &mut store, &network, "appended", 1000)?;
         job(&store, "appended", 999, "new")?;
         let next = store.conversation_scheduler_page(&network, "c", &local, HistorySection::ScopeJobs, Some(&cursor), 3,
             |_, job| Ok(json!(job)))?;

@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use vibeface_protocol::workspace::{Attachment, InputIntent, InputTarget};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Route { Connect, Join, Home, Chat(String),Task(String),Work{conversation_id:String,work_id:String},Channel(String), Inbox, Tasks, Channels, Memory, Schedules, Bot, Devices, Settings, Node, Logs, Transfers }
+pub enum Route { Connect, Join, Home, Chat(String),History(vibeface_protocol::history::HistorySection),Task(String),Work{conversation_id:String,work_id:String},Channel(String), Inbox, Tasks, Channels, Memory, Schedules, Bot, Devices, Settings, Node, Logs, Transfers }
 impl Route {
-    pub fn title(&self) -> &'static str { match self { Self::Connect=>"连接个人网络",Self::Join=>"加入与恢复",Self::Home=>"Bot",Self::Chat(_)=>"对话",Self::Task(_)=>"任务详情",Self::Work{..}=>"工作详情",Self::Channel(_)=>"频道",Self::Inbox=>"待处理",Self::Tasks=>"任务",Self::Channels=>"频道",Self::Memory=>"记忆",Self::Schedules=>"计划",Self::Bot=>"Bot 设置",Self::Devices=>"设备与成员",Self::Settings=>"设置",Self::Node=>"本机 Node",Self::Logs=>"日志",Self::Transfers=>"文件传输" } }
+    pub fn title(&self) -> &'static str { match self { Self::Connect=>"连接个人网络",Self::Join=>"加入与恢复",Self::Home=>"Bot",Self::Chat(_)=>"对话",Self::History(_)=>"对话历史",Self::Task(_)=>"任务详情",Self::Work{..}=>"工作详情",Self::Channel(_)=>"频道",Self::Inbox=>"待处理",Self::Tasks=>"任务",Self::Channels=>"频道",Self::Memory=>"记忆",Self::Schedules=>"计划",Self::Bot=>"Bot 设置",Self::Devices=>"设备与成员",Self::Settings=>"设置",Self::Node=>"本机 Node",Self::Logs=>"日志",Self::Transfers=>"文件传输" } }
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Bot {#[serde(default)]pub last_message:Option<LastMessage>,#[serde(default)]pub successor:bool,#[serde(default)]pub avatar:Option<vibeface_client::Avatar>,#[serde(default)]pub avatar_version:Option<String>, pub bot_id:String,pub conversation_id:String,pub name:String,#[serde(default)]pub instructions:String,#[serde(default)]pub project:Option<Project>,#[serde(default)]pub models:BTreeMap<String,String>,#[serde(default)]pub reasoning_efforts:BTreeMap<String,String>,#[serde(default)]pub skills:Option<Vec<String>>,#[serde(default)]pub busy:Option<String> }
@@ -35,22 +35,26 @@ pub struct MemoryMetadata{pub epoch:u64,pub revision:String,pub control_revision
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct Schedule {pub schedule_id:String,pub name:String,pub prompt:String,pub enabled:bool,pub first_run_at_ms:i64,#[serde(default)]pub every_minutes:Option<u64>,#[serde(default)]pub next_run_at_ms:Option<i64>}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct Scheduler {#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>}
+pub struct Scheduler {#[serde(default)]pub unanswered:Vec<String>,#[serde(default)]pub remote:Option<RemoteScheduler>,#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>}
+impl Scheduler{
+ pub fn effective_jobs(&self)->Vec<&Job>{let remote=self.remote.as_ref().filter(|remote|remote.reachable);let mut seen=std::collections::HashSet::new();remote.into_iter().flat_map(|remote|remote.jobs.iter()).chain(self.jobs.iter()).filter(|job|seen.insert(job.trigger.as_str())).collect()}
+ pub fn effective_scope_jobs(&self)->Vec<&ScopeJob>{let remote=self.remote.as_ref().filter(|remote|remote.reachable);let mut seen=std::collections::HashSet::new();remote.into_iter().flat_map(|remote|remote.scope_jobs.iter()).chain(self.scope_jobs.iter()).filter(|job|seen.insert(job.trigger.as_str())).collect()}
+}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct Job{pub trigger:String,pub state:String,pub scope:Scope,#[serde(default)]pub message_id:Option<String>,#[serde(default)]pub failure:Option<vibeface_bridge::failure::ExecFailure>}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 #[serde(tag="kind",rename_all="snake_case")]
 pub enum Scope{#[default]Main,WorkspaceTask{task_id:String},Task{work_id:String},Routine{trigger:String}}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct ScopeJob{pub conversation_id:String,pub trigger:String,pub scope:Scope}
+pub struct ScopeJob{pub conversation_id:String,pub trigger:String,pub scope:Scope,#[serde(default)]pub state:String,#[serde(default)]pub failure:Option<vibeface_bridge::failure::ExecFailure>}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct ConversationIdentity{pub conversation_id:String,#[serde(default)]pub owner:Option<String>,pub owner_epoch:u64}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct Conversation {#[serde(default)]pub sessions:Vec<SessionHandoff>,#[serde(default)]pub checks:Vec<CoordinationCheck>,#[serde(default)]pub conversation:Option<ConversationIdentity>,#[serde(default,deserialize_with="deserialize_scheduler")]pub scheduler:Scheduler,#[serde(default)]pub messages:Vec<Message>,#[serde(default)]pub works:Vec<Work>,#[serde(default)]pub questions:Vec<Question>,#[serde(default)]pub bot_settings:BotSettings}
+pub struct Conversation {#[serde(default)]pub history_authority:String,#[serde(default)]pub history:BTreeMap<String,vibeface_protocol::history::HistoryCoverage>,#[serde(default)]pub changes:Vec<crate::views::history::BotChangeRecord>,#[serde(default)]pub overwritten:Vec<crate::views::history::OverwrittenRecord>,#[serde(default)]pub deliveries:Vec<DeliveryControl>,#[serde(default)]pub sessions:Vec<SessionHandoff>,#[serde(default)]pub checks:Vec<CoordinationCheck>,#[serde(default)]pub conversation:Option<ConversationIdentity>,#[serde(default,deserialize_with="deserialize_scheduler")]pub scheduler:Scheduler,#[serde(default)]pub messages:Vec<Message>,#[serde(default)]pub works:Vec<Work>,#[serde(default)]pub questions:Vec<Question>,#[serde(default)]pub bot_settings:BotSettings}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct BotSettings{#[serde(default)]pub skills:Vec<Skill>,#[serde(default)]pub memory_sync_conflicts:MemorySyncConflicts,#[serde(default)]pub memory_staged_count:Option<u64>,#[serde(default)]pub memory_conflicts:Option<Vec<MemoryConflict>>,#[serde(default)]pub memory:Vec<Memory>,#[serde(default)]pub schedules:Vec<Schedule>}
 #[derive(Clone,Debug,Default)]
-pub struct Snapshot {pub profiles:Vec<crate::host::profiles::PersonalProfile>,pub profile_id:Option<String>,pub credential_scope:Option<String>,pub generation:u64,pub online:bool,pub synced:bool,pub private_block:Option<String>,pub projection_valid:bool,pub cached:bool,pub cached_at_ms:Option<u64>,pub cache_omitted:usize,pub writable:bool,pub can_save_locally:bool,pub can_control:bool,pub local_session:bool,pub write_state:String,pub network:Option<String>,pub client_id:Option<String>,pub can_manage:bool,pub can_configure:bool,pub can_configure_owner:bool,pub operator_unknown:Option<String>,pub operator_unknown_kind:Option<String>,pub operator_can_close:bool,pub operator_fields:Vec<String>,pub operator_secret_changes:bool,pub decision_tokens:Vec<DecisionTokenSummary>,pub bots:Vec<Bot>,pub nodes:Vec<Node>,pub members:Vec<Member>,pub joins:Vec<JoinRequest>,pub inputs:Vec<vibeface_protocol::workspace::QueuedInput>,pub tasks:Vec<Task>,pub assignments:Vec<vibeface_protocol::workspace::Assignment>,pub channels:Vec<Channel>,pub conversation:std::sync::Arc<Conversation>,pub work_detail:Option<std::sync::Arc<crate::views::records::WorkDetail>>,pub channel_history:Option<std::sync::Arc<crate::views::records::WorkspaceHistory>>,pub artifact_preview:Option<std::sync::Arc<crate::views::records::ArtifactPage>>,pub settings_review:Option<SettingsReviewView>,pub pending:Vec<Pending>,pub identity_plan:Option<IdentityPlanView>,pub drafts:Vec<NativeDraftSummary>,pub questions:Vec<Question>,pub notifications:Vec<Notification>,pub live:Vec<LiveProgress>,pub delivery:Delivery,pub status:String,pub error:Option<String>}
+pub struct Snapshot {pub profiles:Vec<crate::host::profiles::PersonalProfile>,pub profile_id:Option<String>,pub credential_scope:Option<String>,pub generation:u64,pub online:bool,pub synced:bool,pub private_block:Option<String>,pub projection_valid:bool,pub cached:bool,pub cached_at_ms:Option<u64>,pub cache_omitted:usize,pub writable:bool,pub can_save_locally:bool,pub can_control:bool,pub local_session:bool,pub write_state:String,pub network:Option<String>,pub client_id:Option<String>,pub can_manage:bool,pub can_configure:bool,pub can_configure_owner:bool,pub operator_unknown:Option<String>,pub operator_unknown_kind:Option<String>,pub operator_can_close:bool,pub operator_fields:Vec<String>,pub operator_secret_changes:bool,pub decision_tokens:Vec<DecisionTokenSummary>,pub bots:Vec<Bot>,pub nodes:Vec<Node>,pub members:Vec<Member>,pub joins:Vec<JoinRequest>,pub inputs:Vec<vibeface_protocol::workspace::QueuedInput>,pub tasks:Vec<Task>,pub assignments:Vec<vibeface_protocol::workspace::Assignment>,pub channels:Vec<Channel>,pub conversation:std::sync::Arc<Conversation>,pub work_detail:Option<std::sync::Arc<crate::views::records::WorkDetail>>,pub channel_history:Option<std::sync::Arc<crate::views::records::WorkspaceHistory>>,pub artifact_preview:Option<std::sync::Arc<crate::views::records::ArtifactPage>>,pub settings_review:Option<SettingsReviewView>,pub pending:Vec<Pending>,pub identity_plan:Option<IdentityPlanView>,pub drafts:Vec<NativeDraftSummary>,pub questions:Vec<Question>,pub notifications:Vec<Notification>,pub history_loading:Option<vibeface_protocol::history::HistorySection>,pub history_error:Option<String>,pub live:Vec<LiveProgress>,pub delivery:Delivery,pub status:String,pub error:Option<String>}
 #[derive(Clone,Debug)]
 pub struct Pending{pub id:String,pub state:String}
 #[derive(Clone,Debug,Deserialize,Serialize)]
@@ -76,12 +80,13 @@ pub fn parse_conversation(value:serde_json::Value,expected_id:&str,bot_id:Option
  let mut conversation:Conversation=serde_json::from_value(value)?;
  anyhow::ensure!(conversation.conversation.as_ref().map(|c|c.conversation_id.as_str())==Some(expected_id),"设备返回了别的对话，已暂停");
  anyhow::ensure!(conversation.scheduler.scope_jobs.iter().all(|job|job.conversation_id==expected_id),"目标任务观察属于别的对话");
+ if let Some(remote)=&conversation.scheduler.remote{anyhow::ensure!(remote.scope_jobs.iter().all(|job|job.conversation_id==expected_id),"拥有者任务观察属于别的对话");}
  anyhow::ensure!(conversation.questions.iter().all(|q|q.conversation_id==expected_id),"问题属于别的对话");
  for message in &conversation.messages{crate::views::records::validate_attachments(&message.attachments)?;anyhow::ensure!(!message.message_id.is_empty(),"消息缺少稳定标识");if let(Some(InputTarget::BotMain{bot_id:target}),Some(expected))=(&message.target,bot_id){anyhow::ensure!(target==expected,"消息指向其他 Bot");}}
  conversation.scheduler.jobs.retain(|job|matches!(job.scope,Scope::Main));
  conversation.messages.retain(|message|message.target.as_ref().is_none_or(|target|matches!(target,InputTarget::BotMain{..})));
  conversation.messages.sort_by(|a,b|match(&a.rank,&b.rank){(Some(a),Some(b))=>a.cmp(b),(Some(_),None)=>std::cmp::Ordering::Less,(None,Some(_))=>std::cmp::Ordering::Greater,_=>std::cmp::Ordering::Equal});
- conversation.questions.retain(|q|matches!(q.target,Some(InputTarget::BotMain{..}))&&q.closed.is_none());
+ conversation.questions.retain(|q|matches!(q.target,Some(InputTarget::BotMain{..})));
  Ok(conversation)
 }
 #[derive(Clone,Debug,Default)]
@@ -120,7 +125,7 @@ pub fn merge_records(shown:&Conversation,records:ConversationRecords)->anyhow::R
  next.messages.sort_by(|a,b|match(&a.rank,&b.rank){(Some(a),Some(b))=>a.cmp(b),(Some(_),None)=>std::cmp::Ordering::Less,(None,Some(_))=>std::cmp::Ordering::Greater,_=>std::cmp::Ordering::Equal});
  for work in records.works{if let Some(old)=next.works.iter_mut().find(|old|old.work_id==work.work_id){*old=work}else{next.works.push(work)}}
  next.scheduler.jobs=records.jobs.into_iter().filter(|job|matches!(job.scope,Scope::Main)).collect();next.scheduler.scope_jobs=records.scope_jobs;
- next.questions=records.questions.into_iter().filter(|q|matches!(q.target,Some(InputTarget::BotMain{..}))&&q.closed.is_none()).collect();
+ next.questions=records.questions.into_iter().filter(|q|matches!(q.target,Some(InputTarget::BotMain{..}))).collect();
  if let Some(memory)=records.memory{next.bot_settings.memory=memory;}if let Some(conflicts)=records.memory_sync_conflicts{next.bot_settings.memory_sync_conflicts=conflicts;}if let Some(count)=records.memory_staged_count{next.bot_settings.memory_staged_count=Some(count);}next.bot_settings.memory_conflicts=records.memory_conflicts;
  Ok(next)
 }
@@ -132,9 +137,9 @@ pub fn merge_records(shown:&Conversation,records:ConversationRecords)->anyhow::R
 
 #[derive(Clone,Debug)]pub struct IdentityPlanView{pub backup_path:String,pub sha256:String,pub network_id:String,pub state:String}
 
-pub fn prune_terminal_progress(streams:&mut Vec<LiveProgress>,conversation:&Conversation){streams.retain(|progress|{if let Some(work_id)=&progress.work_id{if let Some(work)=conversation.works.iter().find(|work|&work.work_id==work_id){return !["finished","completed","failed","interrupted","rejected"].contains(&work.state.as_str())}}if let Some(trigger)=&progress.trigger{if conversation.messages.iter().any(|message|message.role=="assistant"&&message.in_reply_to.as_ref()==Some(trigger)&&message.status.is_some()){return false}if let Some(job)=conversation.scheduler.jobs.iter().find(|job|&job.trigger==trigger){return !["finished","completed","failed","cancelled","interrupted","stopped","answered","steered"].contains(&job.state.as_str())}}true});}
+pub fn prune_terminal_progress(streams:&mut Vec<LiveProgress>,conversation:&Conversation){streams.retain(|progress|{if let Some(work_id)=&progress.work_id{if let Some(work)=conversation.works.iter().find(|work|&work.work_id==work_id){return !["finished","completed","failed","interrupted","rejected"].contains(&work.state.as_str())}}if let Some(trigger)=&progress.trigger{if conversation.messages.iter().any(|message|message.role=="assistant"&&message.in_reply_to.as_ref()==Some(trigger)&&message.status.is_some()){return false}if let Some(job)=conversation.scheduler.effective_jobs().into_iter().find(|job|&job.trigger==trigger){return !["finished","completed","failed","cancelled","interrupted","stopped","answered","steered"].contains(&job.state.as_str())}}true});}
 
-#[derive(Clone,Debug,Deserialize,Serialize)]pub struct SessionHandoff{pub node:String,pub agent:crate::views::records::Provider,pub session_id:String,pub cwd:String,pub summary:String,pub muted:bool,pub created_at_ms:i64}
+#[derive(Clone,Debug,Deserialize,Serialize)]pub struct SessionHandoff{#[serde(default)]pub rank:Option<String>,pub node:String,pub agent:crate::views::records::Provider,pub session_id:String,pub cwd:String,pub summary:String,pub muted:bool,pub created_at_ms:i64}
 
 #[derive(Clone,Debug,Default,Deserialize,Serialize,PartialEq)]pub struct TransferDeadlines{pub quote_expires_at:u64,pub hold_deadline:u64,pub key_deadline:u64,pub open_deadline:u64,pub retain_until:u64,pub priority_deadline:u64}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct TransferWindow{pub index:u64,pub bytes:u64,pub committed_bytes:u64,pub state:String,pub decryption_proven:bool}
@@ -170,3 +175,6 @@ pub fn connection_entry(origin:&str,node_id:&str,remembered:Option<&vibeface_cli
  if gateway_required{let url=reqwest::Url::parse(&origin).map_err(|_|anyhow::anyhow!("请提供有效Gateway地址"))?;anyhow::ensure!(matches!(url.scheme(),"http"|"https")&&url.host_str().is_some()&&url.username().is_empty()&&url.password().is_none()&&url.query().is_none()&&url.fragment().is_none(),"Gateway地址仅接受无凭证、查询或片段的HTTP(S)入口");}
  Ok(vibeface_client::Entry{origin,node_id})
 }
+
+#[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct RemoteScheduler{#[serde(default)]pub owner:String,#[serde(default)]pub reachable:bool,#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>,#[serde(default)]pub memory_conflicts:Option<Vec<MemoryConflict>>}
+#[derive(Clone,Debug,Deserialize,Serialize)]#[serde(tag="state",rename_all="snake_case")]pub enum DeliveryControl{StopWaiting{work_id:String,target_node:String},StopTimedOut{work_id:String,target_node:String},DispatchWaiting{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>},DispatchRejected{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>},DispatchUnverified{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>}}

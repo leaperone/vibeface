@@ -18,10 +18,24 @@ pub struct OfflineProjection{
 pub fn encode(snapshot:&Snapshot,scope:&CacheScope,conversation_id:Option<&str>)->Result<Vec<u8>>{
  ensure!(snapshot.online&&(snapshot.synced||snapshot.projection_valid)&&snapshot.network.as_deref()==Some(scope.network_id.as_str())&&snapshot.client_id.as_deref()==Some(scope.client_id.as_str()),"只有当前已验证读取才能更新离线视图");
  let mut cache=OfflineProjection{version:1,profile_id:scope.profile_id.clone(),network_id:scope.network_id.clone(),client_id:scope.client_id.clone(),target_node:scope.target_node.clone(),observed_at_ms:vibeface_protocol::now_ms(),write_state:snapshot.write_state.clone(),omitted:0,bots:snapshot.bots.clone(),nodes:snapshot.nodes.clone(),tasks:snapshot.tasks.clone(),channels:snapshot.channels.clone(),assignments:snapshot.assignments.clone(),conversation_id:conversation_id.map(str::to_owned),conversation:(*snapshot.conversation).clone(),questions:snapshot.questions.clone(),notifications:snapshot.notifications.clone()};
+ cache.conversation.history.clear();
  loop{let bytes=serde_json::to_vec(&cache)?;if bytes.len()<=MAX_CACHE_BYTES{return Ok(bytes)}cache.omitted+=1;
   if !cache.conversation.messages.is_empty(){cache.conversation.messages.remove(0);}
   else if !cache.conversation.works.is_empty(){cache.conversation.works.pop();}
   else if !cache.conversation.bot_settings.memory.is_empty(){cache.conversation.bot_settings.memory.pop();}
+  else if !cache.conversation.changes.is_empty(){cache.conversation.changes.remove(0);}
+  else if !cache.conversation.sessions.is_empty(){cache.conversation.sessions.remove(0);}
+  else if !cache.conversation.overwritten.is_empty(){cache.conversation.overwritten.pop();}
+  else if !cache.conversation.questions.is_empty(){cache.conversation.questions.pop();}
+  else if !cache.conversation.checks.is_empty(){cache.conversation.checks.pop();}
+  else if !cache.conversation.deliveries.is_empty(){cache.conversation.deliveries.pop();}
+  else if !cache.conversation.scheduler.jobs.is_empty(){cache.conversation.scheduler.jobs.pop();}
+  else if !cache.conversation.scheduler.scope_jobs.is_empty(){cache.conversation.scheduler.scope_jobs.pop();}
+  else if !cache.conversation.scheduler.unanswered.is_empty(){cache.conversation.scheduler.unanswered.pop();}
+  else if cache.conversation.scheduler.remote.is_some(){cache.conversation.scheduler.remote=None;}
+  else if !cache.conversation.bot_settings.skills.is_empty(){cache.conversation.bot_settings.skills.pop();}
+  else if cache.conversation.bot_settings.memory_conflicts.as_ref().is_some_and(|rows|!rows.is_empty()){cache.conversation.bot_settings.memory_conflicts.as_mut().unwrap().pop();}
+  else if !cache.conversation.bot_settings.memory_sync_conflicts.items.is_empty(){cache.conversation.bot_settings.memory_sync_conflicts.items.pop();}
   else if !cache.tasks.is_empty(){let removed=cache.tasks.pop().expect("nonempty tasks");cache.assignments.retain(|assignment|assignment.task_id!=removed.task_id);}
   else if !cache.channels.is_empty(){cache.channels.pop();}
   else if !cache.assignments.is_empty(){cache.assignments.pop();}

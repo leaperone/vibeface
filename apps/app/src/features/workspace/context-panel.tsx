@@ -1,3 +1,4 @@
+import { HistoryControls } from '../chat/history-controls'
 "use client"
 
 import { useLayoutEffect, useRef, useState } from "react"
@@ -53,6 +54,10 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
       </div>
       <StatusPill tone="info" icon={MessagesSquare}>共享事实</StatusPill>
     </header>
+    <HistoryControls key={`${workspace.generation}:${workspace.conversationId}`} workspace={workspace} />
+    {data.scheduler?.remote?.memory_conflicts?.length ? <Details label={`负责设备的记忆冲突 · ${data.scheduler.remote.memory_conflicts.length}`}>
+      <ul className="grid gap-2">{data.scheduler.remote.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all text-meta">记忆 {conflict.memory_id} · 预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
+    </Details> : null}
     <section className="relative overflow-hidden rounded-2xl border border-brand/15 bg-linear-to-br from-brand-soft/55 via-card to-card p-4 shadow-sm" aria-label="上下文概览">
       <div aria-hidden="true" className="pointer-events-none absolute -end-10 -top-12 size-32 rounded-full bg-brand/10 blur-2xl" />
       <div className="relative grid gap-4">
@@ -278,7 +283,7 @@ export function MemorySummary({ settings, context, memory }: { settings: BotSett
       </li>)}</ul>
     </Details> : <p className="text-meta text-muted-foreground">暂无已保存记忆</p>}
     {settings.memory_conflicts?.length ? <Details label={`查看记忆冲突 · ${settings.memory_conflicts.length}`}>
-      <ul className="grid gap-2">{settings.memory_conflicts.map((conflict) => <li key={`${conflict.call_ref}:${conflict.memory_id}`} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</p><p className="break-all font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
+      <ul className="grid gap-2">{settings.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</p><p className="break-all font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
     </Details> : null}
     <Details label={`查看同步冲突 · ${settings.memory_sync_conflicts.items.length}${settings.memory_sync_conflicts.has_more ? '+' : ''}`}>
       <p className="text-meta text-muted-foreground">同步冲突记录共享历史中的其他分支，不代表未保存草稿或本轮待办。</p>

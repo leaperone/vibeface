@@ -17,8 +17,9 @@ impl SchedulerProjection {
                 let mut job = job.clone();
                 job.pending_check |= store.scheduler_trigger_has_check(conversation, &job.trigger)?;
                 let mut value = self.job(store, network, &job, &[])?;
+                if value["context"].is_object() { value["context"]["session_status"] = Value::Null; }
                 value["manager"] = manager.clone();
-                value["replied"] = json!(store.message(network, conversation, &job.message_id)?.is_some());
+                value["replied"] = json!(store.scheduler_reply_is_present(network, conversation, &job.message_id)?);
                 Ok(value)
             }
         })
@@ -58,6 +59,8 @@ mod tests {
                 Ok(store.connection.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))?)
             }).await?;
             let principal = access(network.clone(), true, None);
+            let snapshot = runtime.rpc(principal.clone(), json!({"method":"conversation", "conversation_id":"history"})).await?;
+            assert!(serde_json::to_vec(&snapshot)?.len() < HISTORY_RESPONSE_BYTES);
             for section in ["jobs", "scope_jobs", "checks", "deliveries", "unanswered", "owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"] {
                 let mut cursor: Option<String> = None;
                 let mut items = Vec::new();
@@ -93,9 +96,23 @@ mod tests {
             let first = runtime.rpc(principal.clone(), json!({"method":"conversation_history",
                 "conversation_id":"history","section":"owner_jobs","limit":1})).await?;
             let cursor = first["next_cursor"].as_str().context("owner cursor")?;
+            let unavailable = unavailable_owner_observation(&network, "history", &runtime.identity.device_id()?, 1)?;
+            assert_eq!(unavailable["jobs"], json!([]));
+            assert_eq!(unavailable["scope_jobs"], json!([]));
+            assert_eq!(unavailable["memory_conflicts"], json!([]));
+            assert_eq!(unavailable["history"]["owner_jobs"]["complete"], false);
+            let resume = unavailable["history"]["owner_jobs"]["next_cursor"].as_str().context("retryable owner start")?;
+            let resumed = runtime.rpc(principal.clone(), json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","cursor":resume,"limit":1})).await?;
+            assert_eq!(resumed["items"], first["items"], "an unavailable owner exposes a complete first-page retry path");
             assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
                 "conversation_id":"history","section":"owner_scope_jobs","cursor":cursor})).await.is_err());
             let mut wrapped: OwnerCursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)?)?;
+            wrapped.owner_epoch += 1;
+            let stale_epoch = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrapped)?);
+            assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","cursor":stale_epoch})).await.is_err());
+            wrapped.owner_epoch -= 1;
             wrapped.owner = "former-owner".into();
             let cursor = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrapped)?);
             assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
@@ -117,15 +134,33 @@ mod tests {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerCursor {
+    network: String,
+    conversation: String,
     owner: String,
+    owner_epoch: u64,
     section: HistorySection,
-    cursor: String,
+    cursor: Option<String>,
 }
 
-fn owner_cursor(owner: &str, section: HistorySection, cursor: &str) -> Result<String> {
+fn owner_cursor(network: &str, conversation: &str, owner: &str, owner_epoch: u64, section: HistorySection, cursor: Option<&str>) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&OwnerCursor {
-        owner: owner.into(), section, cursor: cursor.into(),
+        network: network.into(), conversation: conversation.into(),
+        owner: owner.into(), owner_epoch, section, cursor: cursor.map(str::to_owned),
     })?))
+}
+
+pub(super) fn unavailable_owner_observation(network: &str, conversation: &str, owner: &str, owner_epoch: u64) -> Result<Value> {
+    let mut value = json!({"owner":owner,"reachable":false,
+        "jobs":[],"scope_jobs":[],"memory_conflicts":[],
+        "memory_staged_count":null,"context":null,"manager":null,
+        "history":{},"history_starts":{}});
+    for (name, section) in [("owner_jobs", HistorySection::OwnerJobs),
+        ("owner_scope_jobs", HistorySection::OwnerScopeJobs), ("owner_memory_conflicts", HistorySection::OwnerMemoryConflicts)] {
+        let cursor = owner_cursor(network, conversation, owner, owner_epoch, section, None)?;
+        value["history"][name] = json!({"complete":false,"next_cursor":cursor});
+        value["history_starts"][name] = json!(cursor);
+    }
+    Ok(value)
 }
 
 impl Runtime {
@@ -142,7 +177,8 @@ impl Runtime {
         let query_network = network.to_owned();
         let query_scope = scope.to_owned();
         self.read_display(&access, &input, "scheduler_owner_report", move |store| {
-            ensure!(store.conversation(&query_network, &query_scope)?.and_then(|c| c.owner).as_deref() == Some(local.as_str()),
+            let conversation = store.conversation(&query_network, &query_scope)?.context("conversation not found")?;
+            ensure!(conversation.owner.as_deref() == Some(local.as_str()),
                 "conversation owner changed; refresh the conversation");
             let jobs = projection.history_page(store, &query_network, &query_scope, HistorySection::Jobs, None, 50, &manager)?;
             let scopes = projection.history_page(store, &query_network, &query_scope, HistorySection::ScopeJobs, None, 50, &manager)?;
@@ -158,10 +194,10 @@ impl Runtime {
             ];
             let mut starts = Vec::new();
             for (name, field, owner_section, local_section, next) in sections {
-                let next = next.map(|next| owner_cursor(&local, owner_section, &next)).transpose()?;
+                let next = next.map(|next| owner_cursor(&query_network, &query_scope, &local, conversation.owner_epoch, owner_section, Some(&next))).transpose()?;
                 value["history"][name] = json!({"complete":next.is_none(),"next_cursor":next});
                 let start = store.conversation_history_start_cursor(&query_network, &query_scope, local_section)?;
-                let start = owner_cursor(&local, owner_section, &start)?;
+                let start = owner_cursor(&query_network, &query_scope, &local, conversation.owner_epoch, owner_section, Some(&start))?;
                 value["history_starts"][name] = json!(start);
                 starts.push((name, field, start));
             }
@@ -195,13 +231,14 @@ impl Runtime {
             _ => bail!("not an owner history section"),
         };
         let local = self.identity.device_id()?;
-        let cursor = request.cursor.as_deref().map(|encoded| -> Result<String> {
+        let cursor = request.cursor.as_deref().map(|encoded| -> Result<OwnerCursor> {
             ensure!(encoded.len() <= 16384, "owner history cursor is too large");
             let cursor: OwnerCursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)
                 .context("invalid owner history cursor")?)?;
-            ensure!(cursor.owner == local && cursor.section == request.section,
+            ensure!(cursor.network == network && cursor.conversation == request.conversation_id
+                && cursor.owner == local && cursor.section == request.section,
                 "conversation owner changed; refresh the conversation");
-            Ok(cursor.cursor)
+            Ok(cursor)
         }).transpose()?;
         let projection = self.scheduler_projection()?;
         let manager = self.scheduler_manager_metadata();
@@ -213,19 +250,22 @@ impl Runtime {
             conversation_id: Some(request.conversation_id.clone()), manager: None };
         let requested_section = request.section;
         self.read_display(&access, input, "owner_history", move |store| {
-            ensure!(store.conversation(&query_network, &request.conversation_id)?
-                .and_then(|c| c.owner).as_deref() == Some(query_local.as_str()),
+            let conversation = store.conversation(&query_network, &request.conversation_id)?.context("conversation not found")?;
+            ensure!(conversation.owner.as_deref() == Some(query_local.as_str())
+                && cursor.as_ref().is_none_or(|cursor| cursor.owner_epoch == conversation.owner_epoch),
                 "conversation owner changed; refresh the conversation");
+            let cursor = cursor.as_ref().and_then(|cursor| cursor.cursor.as_deref());
             let mut page = if section == HistorySection::MemoryConflicts {
                 serde_json::to_value(store.conversation_memory_conflicts_page(&query_network,
-                    &request.conversation_id, cursor.as_deref(), request.limit)?)?
+                    &request.conversation_id, cursor, request.limit)?)?
             } else {
                 serde_json::to_value(projection.history_page(store, &query_network,
-                    &request.conversation_id, section, cursor.as_deref(), request.limit, &manager)?)?
+                    &request.conversation_id, section, cursor, request.limit, &manager)?)?
             };
             page["section"] = json!(requested_section);
             if let Some(next) = page["next_cursor"].as_str() {
-                page["next_cursor"] = json!(owner_cursor(&query_local, requested_section, next)?);
+                page["next_cursor"] = json!(owner_cursor(&query_network, &request.conversation_id,
+                    &query_local, conversation.owner_epoch, requested_section, Some(next))?);
             }
             ensure!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES,
                 "owner history record exceeds the response byte limit");
@@ -238,9 +278,10 @@ impl Runtime {
         let scope = field(input, "conversation_id")?.to_owned();
         let query_network = network.clone();
         let query_scope = scope.clone();
-        let owner = self.read_display(access, input, "conversation_owner_history.authorize", move |store| {
-            store.conversation(&query_network, &query_scope)?.and_then(|c| c.owner)
-                .context("conversation has no owner")
+        let (owner, owner_epoch, projection_authority) = self.read_display(access, input, "conversation_owner_history.authorize", move |store| {
+            let conversation = store.conversation(&query_network, &query_scope)?.context("conversation not found")?;
+            Ok((conversation.owner.context("conversation has no owner")?, conversation.owner_epoch,
+                store.conversation_history_authority(&query_network, &query_scope)?))
         }).await?;
         if owner == self.identity.device_id()? {
             return self.owner_history(&network, input).await;
@@ -249,15 +290,21 @@ impl Runtime {
         let fields = request.as_object_mut().context("owner history request must be an object")?;
         fields.remove("method");
         fields.insert("type".into(), json!("scheduler_history"));
-        let page = tokio::time::timeout(Duration::from_secs(3), self.peer_request(&network, &owner, request))
+        let mut page = tokio::time::timeout(Duration::from_secs(3), self.peer_request(&network, &owner, request))
             .await.context("conversation owner history timed out")??;
         ensure!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES,
             "owner history exceeds the response byte limit");
         // Ownership or membership may have changed while the peer was answering.
         let query_network = network;
         self.read_display(access, input, "conversation_owner_history.recheck", move |store| {
-            ensure!(store.conversation(&query_network, &scope)?.and_then(|c| c.owner).as_deref() == Some(owner.as_str()),
+            let conversation = store.conversation(&query_network, &scope)?.context("conversation not found")?;
+            let authority = store.conversation_history_authority(&query_network, &scope)?;
+            ensure!(conversation.owner.as_deref() == Some(owner.as_str()) && conversation.owner_epoch == owner_epoch
+                && authority == projection_authority,
                 "conversation owner changed; refresh the conversation");
+            // Clients compare pages with their local snapshot authority. The inner cursor
+            // remains bound to the owner's authority, which may have unsynced fork evidence.
+            page["history_authority"] = json!(authority);
             Ok(page)
         }).await
     }

@@ -23,7 +23,7 @@ import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
 import { unreachable } from "@vibeface/client/workspace/home.ts"
@@ -232,8 +232,9 @@ test("workspace preserves bot and message requests while routing native decision
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   let knownNodes: ReturnType<typeof parseNodes> = []
   let push: Parameters<ReadyConnection["subscribe"]>[0] = () => {}
+  let baseGeneration = 1
   const connection: ReadyConnection = {
-    generation: 1, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
+    get generation() { return baseGeneration }, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: (listener) => { push = listener; return () => {} }, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
@@ -318,12 +319,14 @@ test("workspace preserves bot and message requests while routing native decision
       const originalRpc = connection.rpc
       const row = (message_id: string, at: number, text = message_id) => ({ message_id, event_hash: message_id, rank: String(at).padStart(20, '0'), role: 'user', text, created_at_ms: at })
       let authority = 'authority', reads = 0
+      let newest = row('latest', 10)
       let held: ReturnType<typeof deferred> | null = null
       const calls: Record<string, unknown>[] = []
       connection.rpc = async (method, params = {}) => {
-        if (method === 'conversation') return { ...context, history_authority: authority, messages: [row('latest', 10)], history: { ...completeHistory(), messages: { next_cursor: 'first', complete: false } } }
+        if (method === 'conversation') return { ...context, history_authority: authority, messages: [newest], history: { ...completeHistory(), messages: { next_cursor: 'first', complete: false }, works: { next_cursor: 'works-first', complete: false } } }
         if (method !== 'conversation_history') return originalRpc(method, params)
         calls.push(params)
+        if (params.section === 'works') return { conversation_id: 'chat', section: 'works', history_authority: authority, items: [{ ...work, work_id: 'older-work', state: 'running' }], next_cursor: null, complete: true }
         if (held) return held.promise
         reads++
         return { conversation_id: 'chat', section: 'messages', history_authority: authority, items: reads === 1 ? [] : [row('old', 1), row('latest', 10, 'stale')], next_cursor: reads === 1 ? 'second' : 'third', complete: false }
@@ -336,6 +339,17 @@ test("workspace preserves bot and message requests while routing native decision
         await render().refresh()
         assert.deepEqual(Array.from(render().data?.messages ?? [], (item) => item.message_id), ['old', 'latest'])
         assert.equal(render().data?.history.messages.next_cursor, 'third')
+        held = deferred()
+        const previousWindow = render().loadHistory('messages')
+        newest = row('disjoint-newest', 20)
+        await render().refresh()
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-window', 0)], next_cursor: null, complete: true })
+        await previousWindow
+        assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-window'), false)
+        assert.equal(render().data?.history.messages.next_cursor, 'first', 'a late page cannot hide the newly exposed refresh gap')
+        newest = row('latest', 10)
+        await render().refresh()
+
         held = deferred()
         const pending = render().loadHistory('messages')
         assert.equal(render().historyLoading.has('messages'), true)
@@ -354,7 +368,7 @@ test("workspace preserves bot and message requests while routing native decision
         held = deferred()
         const invalidated = render().loadHistory('messages')
         authority = 'fork-authority'
-        held.reject(new Error('history changed; refresh the conversation'))
+        held.reject(new Error('conversation owner changed; refresh the conversation'))
         await invalidated
         assert.equal(render().data?.history_authority, 'fork-authority')
         assert.deepEqual(Array.from(render().data?.messages ?? [], (item) => item.message_id), ['latest'])
@@ -364,7 +378,39 @@ test("workspace preserves bot and message requests while routing native decision
         held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-visit', 0)], next_cursor: null, complete: true })
         await previousVisit
         assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-visit'), false)
+        held = null
+        await render().loadHistory('works')
+        assert.equal(render().data?.works.find((item) => item.work_id === 'older-work')?.state, 'running')
+        held = deferred()
+        const oldGeneration = render().loadHistory('messages')
+        baseGeneration += 1
+        render()
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-generation', 0)], next_cursor: null, complete: true })
+        await oldGeneration
+        await new Promise(setImmediate); render()
+        await new Promise(setImmediate)
+        await render().refresh()
+        assert.equal(render().data?.history_authority, 'fork-authority', 'same-authority reconnect still resets retained history')
+        assert.equal(render().data?.works.some((item) => item.work_id === 'older-work'), false, 'a missed terminal Work push outside the latest window cannot remain visibly running')
+        assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-generation'), false)
+
+        held = deferred()
+        const oldNetwork = render().loadHistory('messages')
+        const nextConnection: ReadyConnection = { ...connection, generation: 2, principal: { ...connection.principal, network_id: 'another-network' }, isCurrent: () => activeConnection === nextConnection }
+        activeConnection = nextConnection
+        render()
+        held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-network', 0)], next_cursor: null, complete: true })
+        await oldNetwork
+        assert.equal(render().data, null)
+        activeConnection = connection
+        render()
+        await new Promise(setImmediate)
+        render()
+
       } finally {
+        activeConnection = connection
+        baseGeneration = 1
+        render()
         connection.rpc = originalRpc
         await render().selectBot(bot)
         await render().refresh()
@@ -865,7 +911,7 @@ test("workspace preserves bot and message requests while routing native decision
         'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage, unreadCounts },
+        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
@@ -4659,4 +4705,65 @@ test('the native switch confirmation fixes the decoded entry and never erases fo
     assert.ok(typeof confirmed?.onPress === 'function'); confirmed.onPress(); await settleComponent()
     assert.equal(erased, 1); assert.deepEqual(kept, [link])
   } finally { app.close() }
+})
+
+
+test('Web and Mobile expose every omitted section, fetch only on demand and offer cancellation', async () => {
+  for (const platform of ['web', 'mobile']) {
+    const calls: string[] = [], cancellations: string[] = []
+    const shared = { ...parityShared(), data: parseConversation({ ...context, history: Object.fromEntries(workspaceModel.historySections.map((section) => [section, { next_cursor: `${section}-cursor`, complete: false }])) }),
+      loadHistory: async (section: HistorySection) => { calls.push(section) }, cancelHistory: (section: HistorySection) => { cancellations.push(section) },
+    }
+    const controls = componentHarness(platform === 'web' ? '../chat/history-controls.tsx' : '../../../../../apps/mobile/src/features/chat/history-controls.tsx', {})
+    const render = () => controls.render('HistoryControls', { workspace: shared })
+    const buttons = () => render().filter((element) => element.type === 'Button')
+    const press = (button: ReturnType<typeof buttons>[number]) => {
+      const action = platform === 'web' ? button.props.onClick : button.props.onPress
+      assert.equal(typeof action, 'function')
+      if (typeof action === 'function') action()
+    }
+    try {
+      assert.equal(buttons().length, 19)
+      assert.deepEqual(calls, [], 'opening a bounded snapshot never fetches all history')
+      const messages = buttons().find((button) => componentText(button.props.children) === '读取更多聊天消息')
+      assert.ok(messages); press(messages); await settleComponent()
+      assert.deepEqual(calls, ['messages'])
+      shared.historyLoading = new Set<HistorySection>(['messages'])
+      const cancel = buttons().find((button) => componentText(button.props.children) === '取消读取聊天消息')
+      assert.ok(cancel); press(cancel)
+      assert.deepEqual(cancellations, ['messages'])
+      shared.connectionOnline = false
+      assert(buttons().filter((button) => componentText(button.props.children).startsWith('读取更多')).every((button) => button.props.disabled === true))
+      shared.data.history.messages = { complete: true, next_cursor: null }
+      assert.equal(buttons().length, 18)
+    } finally { controls.close() }
+  }
+})
+
+test('the Web chat keeps the first visible identity and offset through older pages, pushes and streaming updates', () => {
+  const row = (key: string) => ({ key, message: { message_id: key, role: 'user', text: key, event_hash: key, created_at_ms: 1 } })
+  let positions = [{ key: 'one', top: 0 }, { key: 'two', top: 200 }, { key: 'three', top: 400 }]
+  const view = { scrollTop: 200, scrollHeight: 1000, clientHeight: 200, getBoundingClientRect: () => ({ top: 0 }),
+    querySelectorAll: () => positions.map((item) => ({ dataset: { historyKey: item.key }, getBoundingClientRect: () => ({ top: item.top - view.scrollTop, bottom: item.top + 100 - view.scrollTop }) })), querySelector: () => ({}),
+  }
+  const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }, { ResizeObserver: class { observe() {} disconnect() {} }, matchMedia: () => ({ matches: true }) })
+  const render = (keys: string[]) => chat.render('Chat', { entries: keys.map(row), empty: null })
+  try {
+    const viewport = render(['one', 'two', 'three']).find((element) => element.type === 'MessageScrollerViewport')
+    assert.ok(viewport)
+    workspaceModel.record(viewport.props.ref).current = view
+    assert.equal(typeof viewport.props.onScroll, 'function')
+    if (typeof viewport.props.onScroll === 'function') viewport.props.onScroll()
+    positions = [{ key: 'older', top: 0 }, { key: 'one', top: 150 }, { key: 'two', top: 350 }, { key: 'three', top: 550 }]
+    let elements = render(['older', 'one', 'two', 'three'])
+    assert.equal(view.scrollTop, 350)
+    assert.equal(elements.find((element) => element.type === 'MessageScrollerProvider')?.props.autoScroll, false)
+    positions.push({ key: 'pushed', top: 750 }); view.scrollHeight = 1200
+    render(['older', 'one', 'two', 'three', 'pushed'])
+    assert.equal(view.scrollTop, 350)
+    positions = positions.map((item) => item.key === 'two' || item.key === 'three' || item.key === 'pushed' ? { ...item, top: item.top + 40 } : item)
+    elements = render(['older', 'one', 'two', 'three', 'pushed'])
+    assert.equal(view.scrollTop, 390)
+    assert.equal(elements.find((element) => element.type === 'MessageScrollerProvider')?.props.autoScroll, false)
+  } finally { chat.close() }
 })

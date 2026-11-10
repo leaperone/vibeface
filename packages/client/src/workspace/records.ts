@@ -25,6 +25,6 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   if (shown.history_authority !== records.history_authority) throw new Error("history changed; refresh the conversation")
   if (shown.conversation?.conversation_id !== records.conversation_id) throw new Error('推送记录属于别的对话。')
   const messages = byRank(upsert(shown.messages.filter(mainMessage), records.messages.filter(mainMessage), (item) => item.message_id))
-  const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
+  const works = upsert(shown.works.filter((item) => !delivery(item)), records.works, (item) => item.work_id)
   return { ...shown, messages, works: withDeliveries(works, shown.deliveries) }
 }

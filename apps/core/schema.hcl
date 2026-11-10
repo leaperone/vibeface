@@ -287,9 +287,6 @@ table "messages" {
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
-  index "messages_order" {
-    columns = [column.network_id, column.conversation_id, column.rank]
-  }
   index "messages_answers" {
     columns = [column.network_id, column.answers]
   }
@@ -447,6 +444,10 @@ table "skills" {
   primary_key {
     columns = [column.network_id, column.skill_id]
   }
+  index "skills_history" {
+    columns = [column.network_id, column.skill_id]
+    where = "skill IS NOT NULL"
+  }
 }
 table "schedules" {
   schema = schema.main
@@ -492,6 +493,10 @@ table "schedules" {
   }
   primary_key {
     columns = [column.network_id, column.schedule_id]
+  }
+  index "schedules_history" {
+    columns = [column.network_id, column.conversation_id, column.schedule_id]
+    where = "removed = 0 AND schedule IS NOT NULL"
   }
 }
 table "memories" {
@@ -551,8 +556,9 @@ table "memories" {
   primary_key {
     columns = [column.network_id, column.conversation_id, column.memory_id]
   }
-  index "memories_conversation" {
-    columns = [column.network_id, column.conversation_id]
+  index "memories_history" {
+    columns = [column.network_id, column.conversation_id, column.changed_at_ms, column.memory_id]
+    where = "text IS NOT NULL"
   }
 }
 table "bot_changes" {
@@ -591,9 +597,6 @@ table "bot_changes" {
   }
   primary_key {
     columns = [column.network_id, column.change_id]
-  }
-  index "bot_changes_order" {
-    columns = [column.network_id, column.conversation_id, column.rank]
   }
   index "bot_changes_history" {
     columns = [column.network_id, column.conversation_id, column.rank, column.change_id]
@@ -759,9 +762,6 @@ table "questions" {
   }
   index "questions_session" {
     columns = [column.network_id, column.node, column.session_id]
-  }
-  index "questions_conversation" {
-    columns = [column.network_id, column.conversation_id, column.rank]
   }
   index "questions_history" {
     columns = [column.network_id, column.conversation_id, column.rank, column.question_id]
@@ -1239,6 +1239,18 @@ table "scheduler_jobs" {
   index "scheduler_jobs_hold" {
     columns = [column.conversation_id, column.scope, column.state, column.sequence]
   }
+  index "scheduler_jobs_context" {
+    on {
+      column = column.conversation_id
+    }
+    on {
+      expr = "json_extract(detail,'$.into.attempt_id')"
+    }
+    on {
+      column = column.sequence
+    }
+    where = "state IN ('steering','steered')"
+  }
 }
 table "scheduler_outbox" {
   schema = schema.main
@@ -1625,5 +1637,71 @@ table "memory_winner_chain" {
   }
   index "memory_winner_depth" {
     columns = [column.network_id, column.conversation_id, column.memory_id, column.depth]
+  }
+}
+table "conversation_history_revisions" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "revision" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
+table "workspace_tasks_lookup" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "task_id" {
+    null = false
+    type = text
+  }
+  column "record" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.task_id]
+  }
+}
+table "workspace_assignments_lookup" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "assignment_id" {
+    null = false
+    type = text
+  }
+  column "work_id" {
+    null = true
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = integer
+  }
+  column "record" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.assignment_id]
+  }
+  index "workspace_assignments_work" {
+    columns = [column.network_id, column.work_id, column.created_at_ms, column.assignment_id]
+    where = "work_id IS NOT NULL"
   }
 }

@@ -349,7 +349,7 @@ impl Outbox {
             "invalid settlement"
         );
         let mut op = self.get(id)?;
-        if op.snapshot.state==OperationState::ClosedByUser {return Ok(op.snapshot);}
+        if matches!(op.snapshot.state,OperationState::ClosedByUser|OperationState::Accepted|OperationState::Rejected) {return Ok(op.snapshot);}
         op.snapshot.state = state;
         op.snapshot.result = Some(result);
         self.save(

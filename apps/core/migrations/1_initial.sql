@@ -13,7 +13,6 @@ CREATE INDEX `pending_events_author` ON `pending_events` (`network_id`, `author`
 CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missing`);
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `attachments` text NOT NULL, `sender` text NULL, `steered_into` text NULL, `failure` text NULL, `target` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
-CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
 CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 CREATE INDEX `messages_replies` ON `messages` (`network_id`, `conversation_id`, `in_reply_to`) WHERE in_reply_to IS NOT NULL;
 CREATE INDEX `messages_steered` ON `messages` (`network_id`, `conversation_id`, `steered_into`, `rank`) WHERE steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL;
@@ -24,16 +23,13 @@ CREATE TABLE `bot_deletions` (`network_id` text NOT NULL, `conversation_id` text
 CREATE TABLE `skills` (`network_id` text NOT NULL, `skill_id` text NOT NULL, `skill` text NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `skill_id`));
 CREATE TABLE `schedules` (`network_id` text NOT NULL, `schedule_id` text NOT NULL, `conversation_id` text NOT NULL, `schedule` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, `enabled` integer NOT NULL, `enabled_rank` text NOT NULL, `enabled_at_ms` integer NOT NULL, `removed` integer NOT NULL, PRIMARY KEY (`network_id`, `schedule_id`));
 CREATE TABLE `memories` (`network_id` text NOT NULL, `memory_id` text NOT NULL, `conversation_id` text NOT NULL, `text` text NULL, `rank` text NOT NULL, `changed_at_ms` integer NOT NULL, `epoch` integer NOT NULL, `revision` text NOT NULL, `control_revision` integer NOT NULL, `origin` text NOT NULL, `user_controlled` integer NOT NULL, `essential` integer NOT NULL, `source_event_hash` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `memory_id`));
-CREATE INDEX `memories_conversation` ON `memories` (`network_id`, `conversation_id`);
 CREATE TABLE `bot_changes` (`network_id` text NOT NULL, `change_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, `change` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `change_id`));
-CREATE INDEX `bot_changes_order` ON `bot_changes` (`network_id`, `conversation_id`, `rank`);
 CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NULL, `dispatch` text NULL, `dispatch_rank` text NULL, `progress` text NULL, `progress_rank` text NULL, `thread_id` text NULL, `turn_id` text NULL, `finish` text NULL, `finish_rank` text NULL, PRIMARY KEY (`network_id`, `work_id`));
 CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
 CREATE TABLE `questions` (`network_id` text NOT NULL, `question_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `created_at_ms` integer NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `request_id` text NULL, `body` text NOT NULL, `closed` text NULL, PRIMARY KEY (`network_id`, `question_id`));
 CREATE INDEX `questions_session` ON `questions` (`network_id`, `node`, `session_id`);
-CREATE INDEX `questions_conversation` ON `questions` (`network_id`, `conversation_id`, `rank`);
 CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `attribution` text NULL, `muted` integer NOT NULL DEFAULT 0, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `node`, `session_id`));
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 CREATE TABLE `triage_seen` (`event_id` text NOT NULL, `ts_ms` integer NOT NULL, PRIMARY KEY (`event_id`));
@@ -86,3 +82,11 @@ CREATE INDEX `messages_bot_sender` ON `messages` (`network_id`, json_extract(sen
 CREATE INDEX `conversation_setting_observed` ON `conversation_setting_writes` (`network_id`, `conversation_id`, `setting`, `rank`) WHERE built_on_previous = 1;
 CREATE INDEX `memory_winner_depth` ON `memory_winner_chain` (`network_id`, `conversation_id`, `memory_id`, `depth`);
 CREATE INDEX `memory_history_conflicts` ON `memory_history_operations` (`network_id`, `conversation_id`, `memory_id`, `revision`) WHERE winning = 0;
+CREATE TABLE `conversation_history_revisions` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `revision` integer NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
+CREATE TABLE `workspace_tasks_lookup` (`network_id` text NOT NULL, `task_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`network_id`, `task_id`));
+CREATE TABLE `workspace_assignments_lookup` (`network_id` text NOT NULL, `assignment_id` text NOT NULL, `work_id` text NULL, `created_at_ms` integer NOT NULL, `record` text NOT NULL, PRIMARY KEY (`network_id`, `assignment_id`));
+CREATE INDEX `schedules_history` ON `schedules` (`network_id`, `conversation_id`, `schedule_id`) WHERE removed = 0 AND schedule IS NOT NULL;
+CREATE INDEX `memories_history` ON `memories` (`network_id`, `conversation_id`, `changed_at_ms`, `memory_id`) WHERE text IS NOT NULL;
+CREATE INDEX `skills_history` ON `skills` (`network_id`, `skill_id`) WHERE skill IS NOT NULL;
+CREATE INDEX `scheduler_jobs_context` ON `scheduler_jobs` (`conversation_id`, json_extract(detail,'$.into.attempt_id'), `sequence`) WHERE state IN ('steering','steered');
+CREATE INDEX `workspace_assignments_work` ON `workspace_assignments_lookup` (`network_id`, `work_id`, `created_at_ms`, `assignment_id`) WHERE work_id IS NOT NULL;

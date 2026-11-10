@@ -316,7 +316,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 只定位 Windows Rust 问题时，使用 `windows_only=true`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
 
-桌面测试使用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
+桌面测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
 
 离线文档使用 `scripts/offline-docs.json` 作为唯一清单；`offline-docs.py` 由 compose、POSIX 和 Windows 组包入口共同调用，复制所有已跟踪公开文档并改写相对链接。测试检查最终组装目录中的本地链接闭包，源码引用固定到本次完整提交。
 
@@ -325,9 +325,15 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 新增原生 workspace 成员时，可在明确源码分支手动派发一次 `native_prepare=true`。这个开发入口只运行原生准备任务，不运行发布、部署或普通 CI 门禁。
 
 ```sh
-gh workflow run ci.yml --ref <branch> -f native_prepare=true
+gh workflow run ci.yml --ref <branch> -f native_prepare=true -f native_tests=true
 ```
 
-受控 hosted runner 使用固定图形工具链执行 `cargo update --workspace`，尽量保留已有第三方锁，再运行 `cargo fmt --all` 和 Client、Desktop、CLI、Core 的 all-targets 编译。只有这个显式准备入口允许解析锁变更。无论编译成功或失败，都上传完整源码 SHA、各步骤 outcome、Cargo.lock、格式与锁补丁、工具链版本和编译日志。上传成功不表示编译成功。
+受控 hosted runner 使用固定图形工具链执行 `cargo update --workspace`，尽量保留已有第三方锁，再运行 `cargo fmt --all` 和 Client、Desktop、CLI、Core 的 all-targets 编译。`native_tests=true` 额外执行该入口注册的受控 Rust 回归；它仍不是四平台安装包或 OS 窗口验收。只有这个显式准备入口允许解析锁变更。无论编译成功或失败，都上传完整源码 SHA、各步骤 outcome、Cargo.lock、格式与锁补丁、工具链版本和编译日志。上传成功不表示编译成功。
 
 维护者核对原始 SHA，审核并应用 artifact 补丁，再提交最终锁和源码。随后必须使用普通 CI 的 `--locked` 检查和真实平台验收。准备任务不提交、推送、创建 Tag、发布或部署，也不读取真实 Provider 认证。
+
+## 会话分页的交付检查
+
+修改会话分页时，至少核对 `crates/protocol/src/history.rs` 的 19 分区与所有客户端解析器一致，并执行 Core 的 `conversation_history`、`conversation_sections`、`conversation_settings`、`scheduler_history` 专项，原生 `native_ui_history` 和共享 Client 的 history 测试。需要覆盖空页继续游标、字节预算、稳定身份去重、已加载旧页保留、完整替换后的删除、治理/分叉/owner 失效，以及网络或会话切换后的晚到响应。源码有测试不等于该 HEAD 已执行通过。
+
+最终已提交 HEAD 再运行 `desktop_only=true`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性、Windows 当前用户安装与卸载、OS 窗口输入及 PNG。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。

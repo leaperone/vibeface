@@ -134,7 +134,11 @@ impl Store {
             ensure!(digest(current.as_bytes()) == position.digest, "local memory conflicts changed; refresh the conversation");
             Ok(position)
         }).transpose()?;
-        let seek = if before.is_some() { " AND scope<=?2" } else { "" };
+        let seek = match before_conflict.as_ref() {
+            Some(boundary) if boundary.offset == -1 => " AND scope<?2",
+            Some(_) => " AND scope<=?2",
+            None => "",
+        };
         let mut statement = self.connection.prepare(&format!(
             "SELECT scope FROM scheduler_sessions WHERE conversation_id=?1{seek} ORDER BY scope DESC LIMIT ?3"
         ))?;

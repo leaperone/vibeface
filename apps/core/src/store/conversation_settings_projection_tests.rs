@@ -102,10 +102,108 @@ fn signed_setting_collision_late_insert_rebuild_and_fork_match_old_oracle() -> R
     if let EventBody::BotChanged { change: BotChange::Profile { name: Some(name), .. }, .. } = &mut fork.body {
         name.after = "Forked name".into();
     } else { bail!("expected profile event"); }
-    a.ingest_events(&f.network, &[f.b.sign_event(fork)?])?;
+    let ingested = a.ingest_events(&f.network, &[f.b.sign_event(fork)?])?;
+    assert_eq!(ingested.statuses, [IngestStatus::Conflict]);
+    assert!(ingested.rebuilt);
     assert_overwritten(&a, &f.network)?;
     rebuild_projection(&a.connection, &f.network)?;
     assert_overwritten(&a, &f.network)?;
+    Ok(())
+}
+
+#[test]
+fn settings_pages_keep_all_content_and_current_skill_selection() -> Result<()> {
+    let f = Fixture::new()?;
+    let mut store = f.seeded()?;
+    for (i, name) in ["Zulu", "Äpfel", "Alpha"].into_iter().enumerate() {
+        for (call, request) in [
+            (format!("skill{i}"), ChangeRequest::SaveSkill {
+                skill_id: None, name: name.into(), description: format!("{name} summary"), body: "instructions".into(),
+            }),
+            (format!("schedule{i}"), ChangeRequest::SaveSchedule {
+                schedule_id: None, name: name.into(), prompt: "later".into(),
+                first_run_at_ms: 100_000, every_minutes: None, enabled: Some(i != 1),
+            }),
+            (format!("memory{i}"), ChangeRequest::Remember {
+                memory_id: Some(format!("memory{i}")), text: format!("note {i}"),
+            }),
+        ] {
+            store.change_bot(&f.a, &f.network, "c", "message:m1", &call, request, Provider::Codex, 4 + i as i64)?;
+        }
+    }
+    let mut skills = pages(|cursor| store.conversation_skills_page(&f.network, "c", cursor, 1))?;
+    assert_eq!(skills.len(), 3);
+    assert!(skills.windows(2).all(|pair| pair[0].skill_id < pair[1].skill_id));
+    let selected_id = skills[1].skill_id.clone();
+    skills.sort_by_cached_key(|entry| (entry.skill.name.to_lowercase(), entry.skill_id.clone()));
+    assert_eq!(skills.iter().map(|s| s.skill.name.as_str()).collect::<Vec<_>>(), ["Alpha", "Zulu", "Äpfel"]);
+    assert_eq!(serde_json::to_value(&skills)?, serde_json::to_value(store.skills(&f.network)?)?);
+    let mut schedules = pages(|cursor| store.conversation_schedules_page(&f.network, "c", cursor, 1))?;
+    schedules.sort_by_cached_key(|entry| (entry.schedule.name.to_lowercase(), entry.schedule_id.clone()));
+    assert_eq!(serde_json::to_value(&schedules)?, serde_json::to_value(store.schedules(&f.network, "c")?)?);
+    let memory = pages(|cursor| store.conversation_memory_page(&f.network, "c", cursor, 1))?;
+    let old_memory = store.memory_records(&f.network, "c")?.into_iter().map(|record| serde_json::json!({
+        "memory_id":record.entry.memory_id,"text":record.entry.text,"metadata":record.metadata(),
+    })).collect::<Vec<_>>();
+    assert_eq!(serde_json::to_value(memory)?, serde_json::to_value(old_memory)?);
+    store.change_bot(&f.a, &f.network, "c", "message:m1", "select", ChangeRequest::ConfigureBot {
+        bot: "bot".into(), name: None, instructions: None, model: None, reasoning_effort: None,
+        skills: Some([selected_id.clone()].into_iter().collect()), all_skills: None, avatar: None, default_avatar: None,
+    }, Provider::Codex, 20)?;
+    let first = store.conversation_skills_page(&f.network, "c", None, 1)?;
+    assert!(first.items.is_empty());
+    assert!(!first.complete);
+    let selected = pages(|cursor| store.conversation_skills_page(&f.network, "c", cursor, 1))?;
+    assert_eq!(selected.iter().map(|s| s.skill_id.as_str()).collect::<Vec<_>>(), [selected_id.as_str()]);
+    Ok(())
+}
+
+#[test]
+fn local_conflict_pages_preserve_duplicate_scopes_and_reject_session_replacement() -> Result<()> {
+    use crate::scheduling::{MemoryConflict, Shown, StagedMemory};
+    let f = Fixture::new()?;
+    let store = f.seeded()?;
+    let conflict = MemoryConflict {
+        call_ref: "call".into(), memory_id: "memory".into(), expected_epoch: 1, actual_epoch: 2,
+        expected_revision: "old".into(), actual_revision: "new".into(), reason: "revision_changed".into(),
+    };
+    let mut shown = Shown { memory_conflicts: vec![conflict.clone(), conflict.clone()], ..Default::default() };
+    shown.staged_memories.insert("stage".into(), StagedMemory {
+        call_ref: "stage".into(), memory_id: "new-memory".into(), before: None, after: Some("note".into()),
+        base: MemoryBase::absent(), origin: AutomaticMemoryOrigin::Agent, essential: true,
+    });
+    for (scope, active) in [("main", Some("running")), ("task:work", None)] {
+        store.connection.execute(
+            "INSERT INTO scheduler_sessions(conversation_id,scope,next_sequence,covers,owner_epoch,permission_version,shown,active)
+             VALUES('c',?,1,'{}',1,1,?,?)",
+            params![scope, serde_json::to_string(&shown)?, active],
+        )?;
+    }
+    assert_eq!(store.conversation_memory_staged_count("c")?, 1);
+    assert_eq!(store.conversation_memory_staged_count("c")?, store.scheduler_memory_staged_count("c")?);
+    let all = pages(|cursor| store.conversation_memory_conflicts_page(&f.network, "c", cursor, 1))?;
+    assert_eq!(all.len(), 4);
+    assert_eq!(all.iter().map(|record| &record.history_id).collect::<std::collections::BTreeSet<_>>().len(), 4);
+    assert_eq!(all.iter().map(|record| &record.conflict).collect::<Vec<_>>(), [&conflict, &conflict, &conflict, &conflict]);
+    assert_eq!(serde_json::to_value(all.iter().map(|r| &r.conflict).collect::<Vec<_>>())?,
+        serde_json::to_value(store.scheduler_memory_conflicts("c")?)?);
+    let first = store.conversation_memory_conflicts_page(&f.network, "c", None, 1)?;
+    let cursor = first.next_cursor.context("more conflicts")?;
+    store.connection.execute(
+        "UPDATE scheduler_sessions SET shown=json_set(shown,'$.memory_conflicts[0].reason','changed') WHERE conversation_id='c' AND scope='task:work'", [],
+    )?;
+    assert!(store.conversation_memory_conflicts_page(&f.network, "c", Some(&cursor), 1)
+        .unwrap_err().to_string().contains("refresh"));
+    let old_ids = all.iter().map(|record| &record.history_id).collect::<std::collections::BTreeSet<_>>();
+    let mut moved = shown;
+    let mut other = conflict;
+    other.reason = "unrelated new conflict".into();
+    moved.memory_conflicts.insert(0, other);
+    store.connection.execute("UPDATE scheduler_sessions SET shown=? WHERE conversation_id='c' AND scope='task:work'",
+        [serde_json::to_string(&moved)?])?;
+    let new = pages(|cursor| store.conversation_memory_conflicts_page(&f.network, "c", cursor, 2))?;
+    let new_ids = new.iter().map(|record| &record.history_id).collect::<std::collections::BTreeSet<_>>();
+    assert!(old_ids.is_subset(&new_ids), "moving a conflict leaves its identity stable");
     Ok(())
 }
 

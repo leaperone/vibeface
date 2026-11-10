@@ -115,3 +115,35 @@ fn stale_critical_events_cannot_clear_a_newer_draft_or_copy_an_old_profile_secre
 fn a_verified_aligning_projection_can_stage_locally_without_granting_online_writes(cx:&mut TestAppContext){
  let mut snapshot=fixture();snapshot.synced=false;snapshot.writable=false;snapshot.cached=false;snapshot.projection_valid=true;snapshot.can_save_locally=true;snapshot.write_state="aligning".into();let mut h=open(cx,Route::Chat("chat-a".into()),snapshot);enter_message(&h,cx,"等待状态补齐的输入");click(&h,cx,"send");let(_,command)=scoped(h.commands.try_recv().expect("pure local staging"));assert!(matches!(command,Command::Input{..}));assert!(!h.view.read_with(cx,|view,_|view.snapshot.writable));
 }
+
+#[gpui_kit::test]
+fn native_history_reads_the_selected_section_with_current_scope(cx:&mut TestAppContext){
+ use vibeface_protocol::history::{HistoryCoverage,HistorySection};
+ let mut snapshot=fixture();snapshot.conversation=Arc::new(Conversation{history:std::collections::BTreeMap::from([("works".into(),HistoryCoverage{next_cursor:Some("opaque-older".into()),complete:false})]),..(*snapshot.conversation).clone()});
+ let mut h=open(cx,Route::History(HistorySection::Works),snapshot);click(&h,cx,"load-history-works");
+ let(generation,command)=scoped(h.commands.try_recv().expect("native history page command"));assert_eq!(generation,7);
+ match command{Command::LoadHistory{conversation_id,section}=>{assert_eq!(conversation_id,"chat-a");assert_eq!(section,HistorySection::Works);},_=>panic!("history control routed to another action")}
+}
+
+#[gpui_kit::test]
+fn offline_history_keeps_coverage_without_requesting_a_page(cx:&mut TestAppContext){
+ use vibeface_protocol::history::{HistoryCoverage,HistorySection};
+ let mut snapshot=fixture();snapshot.online=false;snapshot.cached=true;snapshot.conversation=Arc::new(Conversation{history:std::collections::BTreeMap::from([("memory".into(),HistoryCoverage{next_cursor:Some("old-cursor".into()),complete:false})]),..(*snapshot.conversation).clone()});
+ let mut h=open(cx,Route::History(HistorySection::Memory),snapshot);click(&h,cx,"load-history-memory");assert!(h.commands.try_recv().is_err(),"offline history button must not issue a page request");
+}
+
+#[gpui_kit::test]
+fn overwritten_profile_restore_uses_the_original_change(cx:&mut TestAppContext){
+ use vibeface_protocol::history::HistorySection;
+ let original=serde_json::json!({"change_id":"my-change","conversation_id":"chat-a","cause":null,"event_hash":"event-a","created_at_ms":10,"change":{"kind":"profile","name":{"before":"Before","after":"My Alpha"}}});
+ let record=serde_json::json!({"change_id":"my-change","by":"other-device","field":"name","value":"Their Alpha"});
+ let mut snapshot=fixture();snapshot.conversation=Arc::new(Conversation{changes:vec![serde_json::from_value(original).unwrap()],overwritten:vec![serde_json::from_value(record).unwrap()],..(*snapshot.conversation).clone()});
+ let mut h=open(cx,Route::History(HistorySection::Overwritten),snapshot);click(&h,cx,"restore-profile-0");assert!(h.commands.try_recv().is_err(),"restoration requires the visible confirmation");click(&h,cx,"confirm-danger");
+ let(_,command)=scoped(h.commands.try_recv().expect("confirmed restoration"));match command{Command::RestoreProfile{conversation_id,record}=>{assert_eq!(conversation_id,"chat-a");assert_eq!(record.change_id,"my-change");},_=>panic!("wrong restore command")}
+}
+
+#[gpui_kit::test]
+fn prepending_messages_and_updating_rows_preserve_the_reader_anchor(cx:&mut TestAppContext){
+ let rows=(0..20).map(|index|ui::Message{message_id:format!("message-{index}"),role:"user".into(),text:format!("正文 {index}"),..Default::default()}).collect::<Vec<_>>();
+ let h=open(cx,Route::Chat("chat-a".into()),fixture());h.view.update(cx,|view,cx|{view.timeline.replace(rows.clone(),cx);view.timeline.list.scroll_to(gpui_kit::ListOffset{item_ix:8,offset_in_item:gpui_kit::px(17.)});let mut older=vec![ui::Message{message_id:"older".into(),role:"user".into(),text:"更早记录".into(),..Default::default()}];older.extend(rows);view.timeline.replace(older.clone(),cx);assert_eq!(view.timeline.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:9,offset_in_item:gpui_kit::px(17.)});assert_eq!(view.timeline.message(9).unwrap().message_id,"message-8");older[9].text.push_str("，刷新后的内容");view.timeline.replace(older,cx);assert_eq!(view.timeline.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:9,offset_in_item:gpui_kit::px(17.)});});
+}

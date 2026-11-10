@@ -8,3 +8,5 @@ pub mod work_detail;
 pub mod channels;
 pub mod tasks;
 pub mod offline;
+pub mod history;
+pub mod history_view;

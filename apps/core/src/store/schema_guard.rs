@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -58,6 +58,9 @@ const DERIVED_TABLES: &[&str] = &[
     "conversation_setting_writes",
     "memory_history_operations",
     "memory_winner_chain",
+    "conversation_history_revisions",
+    "workspace_tasks_lookup",
+    "workspace_assignments_lookup",
 ];
 const DERIVED_INDEXES: &[(&str, &str)] = &[
     ("work_runs", "work_runs_reconcile"),
@@ -71,6 +74,7 @@ const DERIVED_INDEXES: &[(&str, &str)] = &[
     ("scheduler_jobs", "scheduler_jobs_history"),
     ("scheduler_jobs", "scheduler_jobs_main_history"),
     ("scheduler_jobs", "scheduler_jobs_hold"),
+    ("scheduler_jobs", "scheduler_jobs_context"),
     ("pending_checks", "pending_checks_history"),
     ("pending_checks", "pending_checks_scope"),
     ("scheduler_sessions", "scheduler_sessions_active"),
@@ -79,6 +83,19 @@ const DERIVED_INDEXES: &[(&str, &str)] = &[
     ("conversation_setting_writes", "conversation_setting_observed"),
     ("memory_winner_chain", "memory_winner_depth"),
     ("memory_history_operations", "memory_history_conflicts"),
+    ("schedules", "schedules_history"),
+    ("memories", "memories_history"),
+    ("skills", "skills_history"),
+    ("workspace_assignments_lookup", "workspace_assignments_work"),
+];
+
+// The new covering indexes or existing primary keys already serve these prefixes.
+// Only remove the exact former definitions; preserve any user-modified index.
+const SUPERSEDED_INDEXES: &[(&str, &str)] = &[
+    ("messages_order", "CREATE INDEX messages_order ON messages(network_id,conversation_id,rank)"),
+    ("memories_conversation", "CREATE INDEX memories_conversation ON memories(network_id,conversation_id)"),
+    ("bot_changes_order", "CREATE INDEX bot_changes_order ON bot_changes(network_id,conversation_id,rank)"),
+    ("questions_conversation", "CREATE INDEX questions_conversation ON questions(network_id,conversation_id,rank)"),
 ];
 
 fn normalize_type_name(raw: &str) -> String {
@@ -337,6 +354,15 @@ pub(crate) fn validate_readonly_schema(connection: &Connection) -> Result<()> {
 
 pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     validate_schema(connection, true)?;
+    let mut superseded = Vec::new();
+    for &(name, expected) in SUPERSEDED_INDEXES {
+        let sql: Option<String> = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?", [name], |row| row.get(0),
+        ).optional()?;
+        if sql.is_some_and(|sql| sql_tokens(&sql) == sql_tokens(expected)) {
+            superseded.push(name);
+        }
+    }
     let present = |kind: &str, name: &str| -> Result<bool> {
         Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=? AND name=?)",
@@ -347,11 +373,15 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
     for &table in DERIVED_TABLES {
         if !present("table", table)? { missing.push(("table", table)); }
     }
-    let rebuild = !missing.is_empty();
+    let rebuild_settings = missing.iter().any(|(_, name)| matches!(*name,
+        "conversation_setting_writes" | "memory_history_operations" | "memory_winner_chain"));
+    let rebuild_workspace = missing.iter().any(|(_, name)| matches!(*name,
+        "workspace_tasks_lookup" | "workspace_assignments_lookup"));
+    let initialize_history = missing.contains(&("table", "conversation_history_revisions"));
     for &(_, index) in DERIVED_INDEXES {
         if !present("index", index)? { missing.push(("index", index)); }
     }
-    if missing.is_empty() { return Ok(()); }
+    if missing.is_empty() && superseded.is_empty() { return Ok(()); }
 
     // Execute the authoritative definitions, rather than a second hand-maintained DDL.
     let reference = Connection::open_in_memory()?;
@@ -364,13 +394,29 @@ pub(crate) fn install_derived_objects(connection: &Connection) -> Result<()> {
         )?;
         tx.execute_batch(&sql)?;
     }
+    for name in superseded {
+        tx.execute_batch(&format!("DROP INDEX {name}"))?;
+    }
     validate_application_schema(&tx)?;
-    if rebuild {
+    if rebuild_settings || rebuild_workspace || initialize_history {
         let mut statement = tx.prepare("SELECT network_id FROM networks ORDER BY network_id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let network: String = row.get(0)?;
-            super::conversation_settings_projection::rebuild_projection(&tx, &network)?;
+            if rebuild_settings {
+                super::conversation_settings_projection::rebuild_projection(&tx, &network)?;
+            }
+            if rebuild_workspace {
+                super::workspace::rebuild_lookup_projection(&tx, &network)?;
+            }
+            if initialize_history {
+                // This is local cache metadata, not part of the signed shared state.
+                // A new random starting epoch cannot reuse a prior zero cursor after repair.
+                tx.execute(
+                    "INSERT INTO conversation_history_revisions(network_id,conversation_id,revision) VALUES(?,'',random() & 0x3fffffffffffffff)",
+                    [&network],
+                )?;
+            }
         }
     }
     tx.commit()?;
@@ -590,6 +636,9 @@ mod tests {
         {
             let db = Connection::open(&path)?;
             init_current_db(&db)?;
+            for &(_, sql) in SUPERSEDED_INDEXES {
+                db.execute_batch(sql)?;
+            }
             for &(_, index) in DERIVED_INDEXES {
                 db.execute_batch(&format!("DROP INDEX {index};"))?;
             }
@@ -612,6 +661,13 @@ mod tests {
         )?;
         assert_eq!(value, "original-device");
         validate_application_schema(&store.connection)?;
+        for &(name, _) in SUPERSEDED_INDEXES {
+            let exists: bool = store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?)",
+                [name], |row| row.get(0),
+            )?;
+            assert!(!exists, "redundant index {name} was retained");
+        }
         drop(store);
         drop(Store::open(&path)?);
         std::fs::remove_dir_all(dir)?;
@@ -638,6 +694,24 @@ mod tests {
             &INITIAL_SCHEMA.replace("`winning` integer NOT NULL DEFAULT 0", "`winning` text NOT NULL DEFAULT 0"),
             "memory_history_operations.winning",
         )
+    }
+
+    #[test]
+    fn customized_index_is_preserved_when_redundant_former_indexes_are_removed() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        init_current_db(&db)?;
+        for &(_, sql) in SUPERSEDED_INDEXES { db.execute_batch(sql)?; }
+        db.execute_batch("DROP INDEX messages_order; CREATE INDEX messages_order ON messages(role)")?;
+        install_derived_objects(&db)?;
+        let sql: String = db.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name='messages_order'", [], |row| row.get(0),
+        )?;
+        assert_eq!(sql_tokens(&sql), sql_tokens("CREATE INDEX messages_order ON messages(role)"));
+        assert_schema_refused(
+            &format!("{INITIAL_SCHEMA}\n{}; DROP INDEX events_main;", SUPERSEDED_INDEXES[0].1),
+            "events_main",
+        )?;
+        Ok(())
     }
 
     #[test]

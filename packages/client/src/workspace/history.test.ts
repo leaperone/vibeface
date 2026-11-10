@@ -104,3 +104,74 @@ test('history reads reject authority changes and nonadvancing cursors before app
     await assert.rejects(readConversationHistory({ conversationId: 'chat', section: 'messages', cursor: 'first', authority: 'authority', current: () => true, apply: () => assert.fail('invalid page applied'), rpc: async () => reply }))
   }
 })
+
+test('all nineteen sections retain their typed records through repeated pages', () => {
+  const hash = 'a'.repeat(64), other = 'b'.repeat(64)
+  const fixtures: Record<HistorySection, unknown> = {
+    messages: message('messages', 1),
+    works: { work_id: 'works', trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null } },
+    changes: { change_id: 'changes', conversation_id: 'chat', cause: null, event_hash: 'change', created_at_ms: 1, change: { kind: 'profile', name: { before: 'old', after: 'new' } } },
+    questions: { question_id: 'questions', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' }, bot: null, severity: 'info', text: '?', choices: [], about: { node: 'entry', agent: null, session_id: 'session', cwd: '/', summary: '' }, author: 'entry', created_at_ms: 1, answer: null, closed: null },
+    sessions: { node: 'entry', agent: 'codex', session_id: 'sessions', cwd: '/', summary: '', muted: false, created_at_ms: 1 },
+    jobs: { trigger: 'jobs', scope: { kind: 'main' }, state: 'queued', source_node: 'entry' },
+    scope_jobs: { trigger: 'scope_jobs', conversation_id: 'chat', scope: { kind: 'main' }, state: 'queued', kind: 'human', lane: 'main', source_node: 'entry', sequence: 1, owner: 'owner', message_id: null, reply_message_id: 'reply' },
+    owner_jobs: { trigger: 'owner_jobs', scope: { kind: 'main' }, state: 'queued', source_node: 'owner' },
+    owner_scope_jobs: { trigger: 'owner_scope_jobs', conversation_id: 'chat', scope: { kind: 'main' }, state: 'queued', kind: 'human', lane: 'main', source_node: 'owner', sequence: 1, owner: 'owner', message_id: null, reply_message_id: 'reply' },
+    owner_memory_conflicts: { history_id: 'owner_memory_conflicts', call_ref: 'call', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: '', actual_revision: '', reason: 'changed' },
+    checks: { check_id: 'checks', conversation_id: 'chat', trigger: 't', attempt_id: 'a', detail: '', process_groups: [], created_at_ms: 1 },
+    deliveries: { work_id: 'deliveries', target_node: 'entry', state: 'dispatch_waiting', cwd: '/' },
+    unanswered: 'unanswered',
+    skills: { skill_id: 'skills', name: 'Skill', description: '' },
+    schedules: { schedule_id: 'schedules', name: 'Schedule', prompt: '', first_run_at_ms: 1, enabled: true, next_run_at_ms: null },
+    memory: { memory_id: 'memory', text: '完整记忆', metadata: { epoch: 1, revision: hash, control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: other } },
+    memory_conflicts: { history_id: 'memory_conflicts', call_ref: 'call', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: '', actual_revision: '', reason: 'changed' },
+    memory_sync_conflicts: { memory_id: 'memory_sync_conflicts', losing_revision: hash, winning_revision: other, losing_event_hash: hash, winning_event_hash: other, reason: 'user_protected' },
+    overwritten: { change_id: 'overwritten', by: 'entry', field: 'name', value: 'new' },
+  }
+  let loaded = snapshot({ messages: [], scheduler: { jobs: [], scope_jobs: [], unanswered: [], remote: { owner: 'owner', reachable: true, jobs: [], scope_jobs: [], memory_conflicts: [] } } })
+  for (const section of historySections) {
+    const parsed = page(section, [fixtures[section]])
+    loaded = mergeHistoryPage(mergeHistoryPage(loaded, parsed), parsed)
+  }
+  assert.deepEqual(loaded.messages.map((item) => item.message_id), ['messages'])
+  assert.deepEqual(loaded.works.map((item) => item.work_id), ['works', 'deliveries'])
+  assert.deepEqual(loaded.changes.map((item) => item.change_id), ['changes'])
+  assert.deepEqual(loaded.questions.map((item) => item.question_id), ['questions'])
+  assert.deepEqual(loaded.sessions.map((item) => item.session_id), ['sessions'])
+  assert.deepEqual(loaded.scheduler?.local_jobs.map((item) => item.trigger), ['jobs'])
+  assert.deepEqual(loaded.scheduler?.scope_jobs.map((item) => item.trigger), ['scope_jobs'])
+  assert.deepEqual(loaded.scheduler?.remote?.jobs.map((item) => item.trigger), ['owner_jobs'])
+  assert.deepEqual(loaded.scheduler?.remote?.scope_jobs.map((item) => item.trigger), ['owner_scope_jobs'])
+  assert.deepEqual(loaded.scheduler?.remote?.memory_conflicts?.map((item) => item.history_id), ['owner_memory_conflicts'])
+  assert.deepEqual(loaded.checks.map((item) => item.check_id), ['checks'])
+  assert.deepEqual(loaded.deliveries.map((item) => item.work_id), ['deliveries'])
+  assert.deepEqual(loaded.scheduler?.unanswered, ['unanswered'])
+  assert.deepEqual(loaded.bot_settings.skills.map((item) => item.skill_id), ['skills'])
+  assert.deepEqual(loaded.bot_settings.schedules.map((item) => item.schedule_id), ['schedules'])
+  assert.deepEqual(loaded.bot_settings.memory.map((item) => item.memory_id), ['memory'])
+  assert.deepEqual(loaded.bot_settings.memory_conflicts?.map((item) => item.history_id), ['memory_conflicts'])
+  assert.deepEqual(loaded.bot_settings.memory_sync_conflicts.items.map((item) => item.memory_id), ['memory_sync_conflicts'])
+  assert.deepEqual(loaded.overwritten.map((item) => item.change_id), ['overwritten'])
+  assert(historySections.every((section) => loaded.history[section].complete))
+})
+
+test('historical Works preserve server order and accepted rows replace pending delivery summaries once', () => {
+  const initial = snapshot({ deliveries: [{ work_id: 'work', target_node: 'entry', state: 'dispatch_waiting', cwd: '/' }, { work_id: 'work', target_node: 'entry', state: 'stop_waiting' }] })
+  const work = (work_id: string) => ({ work_id, trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null } })
+  const loaded = mergeHistoryPage(initial, page('works', [work('old-z'), work('work')]))
+  assert.deepEqual(loaded.works.map((item) => [item.work_id, item.state, item.stop]), [['old-z', 'running', undefined], ['work', 'running', 'stop_waiting']])
+  assert.equal(loaded.deliveries.length, 2)
+  const baseline = loaded
+  const pushed = mergeConversation(loaded, parseRecords({ conversation_id: 'chat', history_authority: 'authority', refresh_metadata: true, messages: [message('pushed', 11)], works: [] }))
+  assert.equal(pushed.works[0], baseline.works[0], 'an unrelated push preserves row identity for refresh fencing')
+})
+
+test('a pending local job gaining its reporting node updates once while owner observations stay separate', () => {
+  const initial = snapshot({ history: { ...completeHistory(), jobs: { next_cursor: 'older', complete: false } }, scheduler: { jobs: [{ trigger: 'same', scope: { kind: 'main' }, state: 'pending_delivery' }], scope_jobs: [], unanswered: [] } })
+  const incoming = snapshot({ history: { ...completeHistory(), jobs: { next_cursor: 'new-cursor', complete: false } }, scheduler: { jobs: [{ trigger: 'same', scope: { kind: 'main' }, state: 'running', source_node: 'entry' }], scope_jobs: [], unanswered: [], remote: { owner: 'owner', reachable: true, jobs: [{ trigger: 'same', scope: { kind: 'main' }, state: 'completed', source_node: 'owner' }], scope_jobs: [], memory_conflicts: [] } } })
+  const refreshed = mergeConversationSnapshot(initial, incoming, initial)
+  assert.deepEqual(refreshed.scheduler?.local_jobs.map((job) => [job.trigger, job.state]), [['same', 'running']])
+  assert.deepEqual(refreshed.scheduler?.remote?.jobs.map((job) => [job.trigger, job.state]), [['same', 'completed']])
+  assert.deepEqual(refreshed.scheduler?.jobs.map((job) => [job.trigger, job.state]), [['same', 'completed']])
+  assert.equal(refreshed.history.jobs.next_cursor, 'older')
+})

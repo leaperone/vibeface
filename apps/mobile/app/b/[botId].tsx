@@ -1,5 +1,5 @@
 import { historySections } from '@vibeface/client/workspace/model.ts'
-import { historyLabels } from '@vibeface/client/workspace/history.ts'
+import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
@@ -162,7 +162,6 @@ export default function ChatScreen() {
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   const scrollInset = useRef({ id, top: 0, bottom: 0 })
   if (scrollInset.current.id !== id) scrollInset.current = { id, top: 0, bottom: 0 }
-  const [historyError, setHistoryError] = useState('')
   const [scrollButton, setScrollButton] = useState({ id, visible: false })
   const toLatest = () => {
     if (scrollInset.current.id !== id) return
@@ -212,13 +211,7 @@ export default function ChatScreen() {
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
   const history = live?.conversationId === id ? live.data?.history : undefined
-  if (history && live && historySections.some((section) => !history[section].complete)) rows.push({ key: 'history-controls', node: <View className="gap-2">
-    <Text className="text-meta text-muted-foreground">还有更早的记录。按需读取以下分区。</Text>
-    {historySections.filter((section) => !history[section].complete).map((section) => live.historyLoading.has(section)
-      ? <Button key={section} variant="outline" onPress={() => live.cancelHistory(section)}><Text>取消读取{historyLabels[section]}</Text></Button>
-      : <Button key={section} variant="outline" disabled={!live.connectionOnline} onPress={() => { setHistoryError(''); void live.loadHistory(section).catch((caught) => setHistoryError(messageOf(caught))) }}><Text>读取更早的{historyLabels[section]}</Text></Button>)}
-    {historyError ? <ErrorText error={historyError} /> : null}
-  </View> })
+  if (history && live && historySections.some((section) => !history[section].complete)) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} /> })
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
