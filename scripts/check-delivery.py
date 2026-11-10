@@ -1456,7 +1456,7 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     node_summary = {"schemaVersion": 1, "sourceCommit": commit, "workItem": "prepare", "status": "PREPARED", "stage": "complete", "guest": compiled, "file": context["file"], "contextSha256": context_hash,
         "executionControls": controls, "legacyImagePreTermsRejected": True, "wrongJournals": wrongs, "reused": False, "replayChecks": 2, "proofs": [], "branches": [], "transactions": [], "processes": [],
         "limits": {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64}, "resourceScope": "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS",
-        "coverage": "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality", "deployment": None, "corruptERejectedWithoutOutput": False, "failure": None}
+        "coverage": "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality", "deployment": None, "corruptERejectedWithoutOutput": False, "failure": None}
 
     def must_reject(call):
         try:
@@ -1467,6 +1467,8 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
 
     checked_context(context_data, compiled, vectors["profileId"], commit)
     checked_node_summary(node_summary, "prepare", context, commit)
+    producer_coverage = re.search(r"^  coverage: '([^'\n]*)',$", (ROOT / "contracts/delivery/experiment-delivery.mjs").read_text(), re.M)[1]
+    checked_node_summary({**node_summary, "coverage": producer_coverage}, "prepare", context, commit)
     checked_resources(resources, require_pass=True)
     checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec 0"})
     must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\n.core_sched.force_idle_usec 0"}))
@@ -1490,7 +1492,10 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     must_reject(lambda: checked_resources(oom, require_pass=True))
     oom["status"], oom["oomDelta"]["oom"] = "FAIL", 1
     checked_resources(oom)
-    for field, value in (("extra", "secret"), ("coverage", "raw witness"), ("processes", [{**process, "privateLog": "secret"}])):
+    for field, value in (("extra", "secret"),
+                         ("coverage", "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality"),
+                         ("coverage", "raw witness"), ("coverage", producer_coverage + " "), ("coverage", None),
+                         ("processes", [{**process, "privateLog": "secret"}])):
         must_reject(lambda: checked_node_summary({**node_summary, field: value}, "prepare", context, commit))
 
     def origin_for(item, artifact_id, attempt=2):
