@@ -5402,6 +5402,21 @@ mod tests {
         )
     }
 
+    fn pagination_reply(id: String) -> EventBody {
+        EventBody::MessagePosted {
+            message_id: id.clone(),
+            role: Role::Assistant,
+            text: id,
+            in_reply_to: None,
+            status: Some(ReplyStatus::Completed),
+            failure: None,
+            attachments: vec![],
+            report_results: None,
+            answers: None,
+            attestation: None,
+        }
+    }
+
     fn create_input_bot(
         store: &mut Store,
         author: &LocalIdentity,
@@ -5513,18 +5528,7 @@ mod tests {
                     let body = if i == 0 {
                         posted(&il, &network, "c", &id, 1)?
                     } else {
-                        EventBody::MessagePosted {
-                            message_id: id.clone(),
-                            role: Role::Assistant,
-                            text: id,
-                            in_reply_to: None,
-                            status: Some(ReplyStatus::Completed),
-                            failure: None,
-                            attachments: vec![],
-                            report_results: None,
-                            answers: None,
-                            attestation: None,
-                        }
+                        pagination_reply(id)
                     };
                     store.append_event(f1, &network, "c", body, vec![], i as i64)?;
                 }
@@ -5643,14 +5647,13 @@ mod tests {
                 create_input_bot(&mut store, &il, &il.fixture_admin(), &network, "c", 0)?;
                 for i in 0..40_000 {
                     let author = if i % 2 == 0 { &ih } else { &ij };
-                    store.append_event(
-                        author,
-                        &network,
-                        "c",
-                        posted(&il, &network, "c", &format!("m{i}"), i as u64 + 1)?,
-                        vec![],
-                        i,
-                    )?;
+                    let id = format!("m{i}");
+                    let body = if i < 2 {
+                        posted(&il, &network, "c", &id, 1)?
+                    } else {
+                        pagination_reply(id)
+                    };
+                    store.append_event(author, &network, "c", body, vec![], i)?;
                 }
             }
             let target = l.store.lock().await.heads(&network)?;
