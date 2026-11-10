@@ -60,8 +60,13 @@ pub(crate) mod test_support {
     use super::*;
     use crate::{
         identity::{Genesis, Member},
-        work::WorkSpec,
+        work::{WorkRecord, WorkSpec, WorkState},
     };
+
+    #[track_caller]
+    pub(super) fn assert_work_outcome(record: &WorkRecord, outcome: WorkOutcome) {
+        assert_eq!(record.state, WorkState::Finished { outcome });
+    }
 
     pub(super) fn provider_work(
         provider: Provider,

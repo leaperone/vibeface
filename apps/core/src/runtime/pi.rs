@@ -1753,7 +1753,9 @@ impl Executor for Pi {
 mod tests {
     use super::*;
     use crate::manager::{CodexTurn, Sdk, run_manager};
-    use crate::runtime::test_support::{join_network, open_node, provider_work};
+    use crate::runtime::test_support::{
+        assert_work_outcome, join_network, open_node, provider_work,
+    };
     use crate::work::WorkState;
 
     type Turns = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -2485,12 +2487,7 @@ mod tests {
         let (node, network) = node(&dir, "reply").await?;
         dispatch(&node, &network, &dir).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Completed);
         assert_eq!(record.text, "Hello");
         assert_eq!(prompts(&dir), ["do it"]);
         std::fs::remove_dir_all(&dir)?;
@@ -2753,12 +2750,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Completed);
         assert_eq!(prompts(&dir), ["do it", "again"]);
         assert_eq!(node.pi.pointer(&session)?.context("pointer")?.file, file);
         let users = entries(&file)?
@@ -2778,12 +2770,7 @@ mod tests {
         let running = work(&node, |state| state.handle().is_some()).await?;
         node.pi.interrupt(&running).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Interrupted);
         assert_eq!(record.text, "Working");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -2854,12 +2841,7 @@ mod tests {
         .await
         .context("the stop retry sent another native abort")?;
         let finished = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Interrupted);
         assert_eq!(
             node.pi.probe(&running).await?,
             Probe::Terminal {
@@ -2891,12 +2873,7 @@ mod tests {
         let (node, network) = node(&dir, "crash").await?;
         dispatch(&node, &network, &dir).await?;
         let record = work(&node, WorkState::finished).await?;
-        assert_eq!(
-            record.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&record, WorkOutcome::Interrupted);
         assert_eq!(prompts(&dir), ["do it"]);
         std::fs::remove_dir_all(&dir)?;
         Ok(())

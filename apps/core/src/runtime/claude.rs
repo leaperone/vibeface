@@ -2070,7 +2070,9 @@ impl Executor for Claude {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::runtime::test_support::{join_network, manager_settings, open_node, provider_work};
+    use crate::runtime::test_support::{
+        assert_work_outcome, join_network, manager_settings, open_node, provider_work,
+    };
     use crate::triage::{RequestKind, cli_hooks::hook_output};
     use crate::work::WorkState;
 
@@ -3454,12 +3456,7 @@ time.sleep(0.05)
             "the Node sends it, not the Agent"
         );
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "done: build it");
         let session = derived(SESSION_SEED, &spec.work_id);
         let unsure = WorkRecord {
@@ -3524,12 +3521,7 @@ time.sleep(0.05)
         );
         drop(store);
         let finished = until(&node, &work.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(
             finished.text,
             format!("initial finished\n\ndone: {}", input.message("work-input"))
@@ -3618,12 +3610,7 @@ time.sleep(0.05)
         assert!(!pidfile.exists(), "the restart ended the process it left");
         node.probe_work(&network, &spec.work_id, true).await?;
         let finished = record(&node, &spec.work_id).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "finished while unwatched");
         assert_eq!(place.user_frames(), 1, "the prompt was sent once");
         Ok(())
@@ -3662,12 +3649,7 @@ time.sleep(0.05)
         .await?;
         node.executor(Provider::Claude)?.interrupt(&running).await?;
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Interrupted);
         Ok(())
     }
 

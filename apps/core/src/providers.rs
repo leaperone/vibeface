@@ -559,91 +559,43 @@ pub struct ProviderDescriptor {
 
 impl ProviderDescriptor {
     pub fn for_provider(provider: Provider) -> Self {
-        let (
-            sessions,
-            prompt_mode,
-            stable_prompt,
-            skill_injection,
-            sandbox,
-            steer,
-            concurrency,
-            model_catalog,
-            text_stream_mode,
-            cancel_confirmation_evidence,
-        ) = match provider {
-            Provider::Codex => (
-                SessionPersistence::AppServer,
-                PromptMode::Thread,
-                StablePromptPlacement::ThreadInstructions,
-                SkillInjection::Folder,
-                SandboxMode::FullAccess,
-                true,
-                ConcurrencyMode::Parallel,
-                CapabilitySupport::Supported,
-                TextStreamMode::Snapshot,
-                CancelEvidence::AppServerTurnEnd,
-            ),
-            Provider::Cursor => (
-                SessionPersistence::Process,
-                PromptMode::Turn,
-                StablePromptPlacement::TurnInstructions,
-                SkillInjection::Folder,
-                SandboxMode::ProviderControlled,
-                false,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Supported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminal,
-            ),
-            Provider::Claude => (
-                SessionPersistence::Process,
-                PromptMode::Thread,
-                StablePromptPlacement::SessionInstructions,
-                SkillInjection::Plugin,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::Snapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-            Provider::Pi => (
-                SessionPersistence::Process,
-                PromptMode::Thread,
-                StablePromptPlacement::SessionInstructions,
-                SkillInjection::Folder,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-            Provider::Opencode => (
-                SessionPersistence::ProviderStore,
-                PromptMode::Thread,
-                StablePromptPlacement::UserTurnPrefix,
-                SkillInjection::PromptIndex,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-        };
         Self {
             provider,
-            sessions,
-            prompt_mode,
-            stable_prompt,
+            sessions: match provider.sessions() {
+                Sessions::AppServer => SessionPersistence::AppServer,
+                Sessions::Store(_) => SessionPersistence::ProviderStore,
+                Sessions::Process => SessionPersistence::Process,
+            },
+            prompt_mode: if provider == Provider::Cursor {
+                PromptMode::Turn
+            } else {
+                PromptMode::Thread
+            },
+            stable_prompt: match provider {
+                Provider::Codex => StablePromptPlacement::ThreadInstructions,
+                Provider::Cursor => StablePromptPlacement::TurnInstructions,
+                Provider::Claude | Provider::Pi => StablePromptPlacement::SessionInstructions,
+                Provider::Opencode => StablePromptPlacement::UserTurnPrefix,
+            },
             dynamic_context: DynamicContextPlacement::UserTurn,
             tool_mode: ToolMode::DynamicCatalog,
-            skill_injection,
+            skill_injection: match provider {
+                Provider::Codex | Provider::Cursor | Provider::Pi => SkillInjection::Folder,
+                Provider::Claude => SkillInjection::Plugin,
+                Provider::Opencode => SkillInjection::PromptIndex,
+            },
             workspace_required: true,
-            sandbox,
-            steer,
-            concurrency,
+            sandbox: if provider == Provider::Codex {
+                SandboxMode::FullAccess
+            } else {
+                SandboxMode::ProviderControlled
+            },
+            steer: provider != Provider::Cursor,
+            concurrency: if provider == Provider::Codex {
+                ConcurrencyMode::Parallel
+            } else {
+                ConcurrencyMode::Serial
+            },
             compaction: CompactionMode::Handoff,
             usage: if provider == Provider::Cursor {
                 CapabilitySupport::Supported
@@ -651,12 +603,26 @@ impl ProviderDescriptor {
                 CapabilitySupport::Unsupported
             },
             approvals: CapabilitySupport::Unsupported,
-            model_catalog,
+            model_catalog: if matches!(provider, Provider::Codex | Provider::Cursor) {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
             streaming: true,
             cancel: true,
             resume_local_session: true,
-            text_stream_mode,
-            cancel_confirmation_evidence,
+            text_stream_mode: if matches!(provider, Provider::Codex | Provider::Claude) {
+                TextStreamMode::Snapshot
+            } else {
+                TextStreamMode::DeltaAndSnapshot
+            },
+            cancel_confirmation_evidence: match provider {
+                Provider::Codex => CancelEvidence::AppServerTurnEnd,
+                Provider::Cursor => CancelEvidence::ProviderTerminal,
+                Provider::Claude | Provider::Pi | Provider::Opencode => {
+                    CancelEvidence::ProviderTerminalOrManagedProcessExit
+                }
+            },
         }
     }
 
@@ -713,11 +679,8 @@ impl Provider {
     /// The program the Node runs for this provider unless the owner or discovery chose one.
     pub fn default_bin(self) -> &'static str {
         match self {
-            Provider::Codex => "codex",
             Provider::Cursor => "agent",
-            Provider::Claude => "claude",
-            Provider::Pi => "pi",
-            Provider::Opencode => "opencode",
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => self.name(),
         }
     }
 
@@ -785,32 +748,10 @@ impl Provider {
 
     /// What a work on the provider can ask for.
     pub fn work(self) -> WorkCapabilities {
-        match self {
-            Provider::Codex => WorkCapabilities {
-                images: true,
-                effort: true,
-                any_thread: true,
-            },
-            Provider::Claude => WorkCapabilities {
-                images: false,
-                effort: true,
-                any_thread: false,
-            },
-            Provider::Pi => WorkCapabilities {
-                images: true,
-                effort: true,
-                any_thread: false,
-            },
-            Provider::Opencode => WorkCapabilities {
-                images: true,
-                effort: false,
-                any_thread: false,
-            },
-            Provider::Cursor => WorkCapabilities {
-                images: false,
-                effort: false,
-                any_thread: false,
-            },
+        WorkCapabilities {
+            images: matches!(self, Provider::Codex | Provider::Pi | Provider::Opencode),
+            effort: matches!(self, Provider::Codex | Provider::Claude | Provider::Pi),
+            any_thread: self == Provider::Codex,
         }
     }
 
