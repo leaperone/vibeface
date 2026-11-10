@@ -437,7 +437,16 @@ impl Delivery {
             "proof job differs from the authorized window"
         );
         let receipt = self.with_store(|store| store.reserve_proof(&digest))?;
-        let seal = self.proofs.prove(config, &input, &receipt, None).await?;
+        let diagnostics = proof::ProofDiagnostics::Order {
+            data_dir: &self.data_dir,
+            node_id: self.identity.device_id().ok(),
+            order_id: &stored.view.order_id,
+            window: index,
+        };
+        let seal = self
+            .proofs
+            .prove(config, &input, &receipt, diagnostics)
+            .await?;
         self.with_store(|store| store.put_value(&id, &seal))?;
         Ok(seal)
     }

@@ -229,6 +229,413 @@ def registration_diagnostics(data, source_commit, artifacts, cli):
         return project_registration_diagnostics(value, source_commit, artifacts)
 
 
+PROOF_PHASES = {"core": ("proof_job", "proof_info", "proof_prove", "proof_verify"),
+                "host": DIAGNOSTIC_PHASES["host"], "shim": DIAGNOSTIC_PHASES["shim"]}
+PROOF_IO_PHASES = ("process_spawn", "stdin_closed", "stdout_complete", "process_wait")
+PROOF_EVENT = {"v", "kind", "w", "c", "p", "e", "t", "x", "s", "n", "f", "r", "k", "g", "q", "i", "a"}
+PROOF_JOB_FIELDS = {"node", "order_index", "relation", "window", "job_digest", "availability", "binding", "mode",
+                    "event_count", "first_observed_failure", "last_open_phase", "command", "resources", "source_activity"}
+PROOF_COMMAND_FIELDS = {"command", "spawned", "stdin_write_complete", "stdin_closed", "stdout_eof", "stdout_bytes",
+                        "wait_observed", "exit_code", "signal", "spawn_errno", "timed_out", "failure_class", "start_ns", "end_ns"}
+SOURCE_ACTIVITY_FIELDS = ("usage_usec", "user_usec", "system_usec", "cpu_some_total", "memory_some_total", "memory_full_total", "io_some_total")
+
+
+def proof_hex(value, length=64):
+    need(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{" + str(length) + r"}", value), "invalid_proof_diagnostic_hex")
+
+
+def proof_group(value):
+    if value is not None:
+        need(type(value) is list and len(value) == 2, "invalid_proof_diagnostic_group")
+        for item in value:
+            need(type(item) is int and 0 <= item <= 2**64-1, "invalid_proof_diagnostic_group_integer")
+
+
+def proof_values(value, count, *, nullable=False):
+    need(type(value) is list and len(value) == count, "invalid_proof_diagnostic_values")
+    for item in value:
+        need(nullable and item is None or type(item) is int and 0 <= item <= 2**63-1, "invalid_proof_diagnostic_counter")
+
+
+def proof_io(value, command, exit_code, signal_number, failure):
+    need(type(value) is list and len(value) == 7, "invalid_proof_diagnostic_io")
+    spawned, written, closed, eof, count, waited, timed_out = value
+    need(all(type(item) is bool for item in (spawned, written, closed, eof, waited, timed_out)), "invalid_proof_diagnostic_io_boolean")
+    limit = 16384 if command == "prove" else 4096
+    diagnostic_integer(count, limit + 1)
+    need(not written or spawned, "proof_write_before_spawn")
+    need(not closed or written, "proof_close_before_write")
+    need(count is None or spawned, "proof_output_before_spawn")
+    need(not eof or count is not None and count <= limit, "proof_output_limit_is_not_eof")
+    need(not waited or spawned and closed and eof, "proof_wait_without_completed_io")
+    need(not timed_out or not waited, "proof_timeout_is_not_observed_wait")
+    need(waited or exit_code is None and signal_number is None, "proof_unobserved_wait_status")
+    need(not waited or (exit_code is None) != (signal_number is None), "proof_wait_requires_actual_status")
+    need(exit_code is None or signal_number is None, "proof_exit_and_signal_are_distinct")
+    if failure == "worker_exit": need(waited and exit_code is not None and exit_code > 0 and signal_number is None, "proof_worker_exit_needs_nonzero_wait")
+    if failure == "worker_signal": need(waited and exit_code is None and signal_number is not None, "proof_worker_signal_needs_signal_wait")
+    if failure == "spawn": need(not spawned and not waited, "proof_spawn_failure_has_no_process")
+    if failure == "timeout": need(timed_out and not waited, "proof_timeout_has_no_wait_status")
+    if failure == "output_limit": need(count == limit + 1 and not eof and not waited, "proof_output_limit_requires_actual_excess")
+    if failure in ("result_decode", "receipt_check"): need(waited and exit_code == 0 and signal_number is None, "proof_validation_failure_preserves_successful_wait")
+
+
+def unavailable_proof_job(node, index):
+    return {"node": node, "order_index": index, "relation": 2 if node == "S" else 3, "window": 0,
+            "job_digest": None, "availability": "unavailable", "binding": "unavailable", "mode": "unavailable", "event_count": 0,
+            "first_observed_failure": None, "last_open_phase": None, "command": None, "resources": None, "source_activity": None}
+
+
+def proof_availability(jobs):
+    return "complete" if len(jobs) == 4 and all(job["availability"] == "complete" for job in jobs) else (
+        "partial" if any(job["availability"] != "unavailable" for job in jobs) else "unavailable")
+
+
+def project_proof_diagnostics(value, source_commit, artifacts, profile_id, principals, orders, genuine_receipts):
+    if value is None:
+        return None
+    exact(value, {"schema_version", "source_commit", "artifact_sha256", "profile_id", "counter_fields", "attempt_policy", "availability", "jobs"}, "invalid_proof_diagnostic_fields")
+    need(type(value["schema_version"]) is int and value["schema_version"] == 1 and value["source_commit"] == source_commit, "invalid_proof_diagnostic_source")
+    proof_hex(source_commit, 40)
+    need(value["artifact_sha256"] == {name: artifacts[name] for name in ("prover", "r0vm", "profile")}, "invalid_proof_diagnostic_artifacts")
+    for item in value["artifact_sha256"].values(): proof_hex(item)
+    need(value["profile_id"] == profile_id, "invalid_proof_diagnostic_profile")
+    if profile_id is not None: proof_hex(profile_id)
+    need(value["counter_fields"] == list(DIAGNOSTIC_COUNTERS) and value["attempt_policy"] == "first_admitted", "invalid_proof_diagnostic_policy")
+    jobs = value["jobs"]
+    need(type(jobs) is list and len(jobs) <= 4 and type(orders) is list and len(orders) <= 2, "invalid_proof_diagnostic_job_count")
+    need(len({order["order_id"] for order in orders}) == len(orders), "duplicate_proof_diagnostic_order")
+    seen, job_digests = set(), set()
+    for job in jobs:
+        exact(job, PROOF_JOB_FIELDS, "invalid_proof_diagnostic_job_fields")
+        node, index = job["node"], job["order_index"]
+        need(node in ("S", "R") and type(index) is int and 0 <= index < len(orders)
+             and type(job["relation"]) is int and job["relation"] == (2 if node == "S" else 3)
+             and type(job["window"]) is int and job["window"] == 0 and (node, index) not in seen, "invalid_proof_diagnostic_slot")
+        seen.add((node, index)); proof_hex(principals[node]["peer"]); proof_hex(orders[index]["order_id"])
+        need(job["availability"] in ("complete", "partial", "unavailable"), "invalid_proof_diagnostic_availability")
+        if job["availability"] == "unavailable":
+            need(job == unavailable_proof_job(node, index), "unavailable_proof_diagnostic_claims_observations")
+            continue
+        proof_hex(job["job_digest"])
+        need(job["job_digest"] not in job_digests, "duplicate_proof_diagnostic_digest")
+        job_digests.add(job["job_digest"])
+        need(profile_id is not None and job["binding"] in ("reserved_job", "verified_receipt")
+             and job["mode"] in ("not_started", "prove", "receipt_reconcile")
+             and type(job["event_count"]) is int and 0 <= job["event_count"] <= 62, "invalid_proof_diagnostic_job_identity")
+        if job["binding"] == "verified_receipt":
+            need(any(fact.get("relation") == job["relation"] and fact.get("orderId") == "0x" + orders[index]["order_id"]
+                 and type(fact.get("windowIndex")) is int and fact["windowIndex"] == 0 and fact.get("journalHash") == job["job_digest"]
+                 and fact.get("official_host_verified") is True and fact.get("wrong_journal_receipt_comparison_rejected") is True
+                 for fact in genuine_receipts), "proof_diagnostic_receipt_binding")
+        for name in ("first_observed_failure", "last_open_phase"):
+            point = job[name]
+            if point is None: continue
+            fields = {"writer", "command", "phase", "t_ns", "event_index"}
+            if name == "first_observed_failure": fields |= {"failure_class", "worker", "exit_code", "signal", "errno", "cleanup_requested"}
+            exact(point, fields, "invalid_proof_diagnostic_phase_ref")
+            need(point["writer"] in PROOF_PHASES and point["phase"] in PROOF_PHASES[point["writer"]]
+                 and point["command"] in ("info", "prove", "verify") and type(point["event_index"]) is int
+                 and 2 <= point["event_index"] < job["event_count"] + 2, "invalid_proof_diagnostic_phase")
+            diagnostic_integer(point["t_ns"], 2**63-1)
+            writer, command, phase = (point[key] for key in ("writer", "command", "phase"))
+            expected = {"proof_info": "info", "proof_verify": "verify"}.get(phase, "prove")
+            need(writer == "core" and command == expected or writer == "shim" and command == "prove"
+                 or writer == "host" and (command == "prove" or command == "verify" and phase == "host_receipt_verify"), "invalid_proof_diagnostic_phase_command")
+            if name == "first_observed_failure":
+                need(point["failure_class"] in DIAGNOSTIC_CLASSES and point["worker"] in (None, "generator", "prover")
+                     and point["cleanup_requested"] is False, "invalid_proof_diagnostic_first_failure")
+                for key, maximum in (("exit_code", 255), ("signal", 64), ("errno", 4095)):
+                    diagnostic_integer(point[key], maximum, minimum=0 if key == "exit_code" else 1)
+                need(point["exit_code"] is None or point["signal"] is None, "invalid_proof_diagnostic_failure_wait")
+                if point["failure_class"] == "worker_exit": need(point["exit_code"] is not None and point["exit_code"] > 0, "proof_failure_exit_is_not_wait0")
+                if point["failure_class"] == "worker_signal": need(point["signal"] is not None, "proof_failure_signal_is_not_exit137")
+                if writer == "shim" and phase in ("generator_spawn", "prover_spawn", "worker_wait"):
+                    need(point["worker"] in ("generator", "prover") and (phase == "worker_wait" or point["worker"] == phase.removesuffix("_spawn")), "invalid_proof_failure_worker")
+                else: need(point["worker"] is None, "unexpected_proof_failure_worker")
+                if phase == "worker_wait":
+                    need(point["errno"] is None and (point["failure_class"] == "worker_exit" and point["exit_code"] is not None and point["exit_code"] > 0
+                         or point["failure_class"] == "worker_signal" and point["signal"] is not None), "invalid_proof_failure_worker_status")
+        command = job["command"]
+        if command is not None:
+            exact(command, PROOF_COMMAND_FIELDS, "invalid_proof_diagnostic_command_fields")
+            need(command["command"] in ("info", "prove", "verify"), "invalid_proof_diagnostic_command")
+            for key, maximum in (("exit_code", 255), ("signal", 64), ("spawn_errno", 4095), ("start_ns", 2**63-1), ("end_ns", 2**63-1)):
+                diagnostic_integer(command[key], maximum, minimum=1 if key in ("signal", "spawn_errno") else 0)
+            proof_io([command[key] for key in ("spawned", "stdin_write_complete", "stdin_closed", "stdout_eof", "stdout_bytes", "wait_observed", "timed_out")],
+                     command["command"], command["exit_code"], command["signal"], command["failure_class"])
+            need(command["failure_class"] is None or command["failure_class"] in DIAGNOSTIC_CLASSES, "invalid_proof_diagnostic_command_failure")
+            need(command["spawn_errno"] is None or command["failure_class"] == "spawn" and not command["spawned"], "invalid_proof_spawn_errno")
+            need(not command["timed_out"] or command["failure_class"] == "timeout", "invalid_proof_timeout_class")
+            need(command["start_ns"] is None or command["end_ns"] is None or command["start_ns"] <= command["end_ns"], "proof_command_clock_reversed")
+        resource = job["resources"]
+        if resource is not None:
+            exact(resource, {"cgroup", "same_cgroup_verified", "start", "last_open", "end"}, "invalid_proof_diagnostic_resources")
+            proof_group(resource["cgroup"])
+            need(type(resource["same_cgroup_verified"]) is bool and (not resource["same_cgroup_verified"] or resource["cgroup"] is not None), "invalid_proof_same_group")
+            points = []
+            for name in ("start", "last_open", "end"):
+                point = resource[name]
+                if point is None: continue
+                exact(point, {"t_ns", "event_index", "values"}, "invalid_proof_counter_point")
+                diagnostic_integer(point["t_ns"], 2**63-1); proof_values(point["values"], 5)
+                need(resource["cgroup"] is not None and type(point["event_index"]) is int and 2 <= point["event_index"] < job["event_count"] + 2, "invalid_proof_counter_ref")
+                points.append(point)
+            for before, after in zip(sorted(points, key=lambda item: item["event_index"]), sorted(points, key=lambda item: item["event_index"])[1:]):
+                need(all(a <= b for a, b in zip(before["values"], after["values"])), "proof_counters_reversed")
+        activity = job["source_activity"]
+        if activity is not None:
+            need(job["relation"] == 2 and job["mode"] == "prove", "hold_or_reconcile_has_source_activity")
+            exact(activity, {"start", "end"}, "invalid_source_activity_fields")
+            for point in activity.values():
+                if point is None: continue
+                exact(point, {"t_ns", "cgroup", "values"}, "invalid_source_activity_point")
+                diagnostic_integer(point["t_ns"], 2**63-1); proof_group(point["cgroup"]); proof_values(point["values"], len(SOURCE_ACTIVITY_FIELDS), nullable=True)
+                need(not any(item is not None for item in point["values"]) or resource is not None
+                     and resource["cgroup"] is not None and point["cgroup"] == resource["cgroup"], "source_activity_values_require_target_group")
+            before, after = activity["start"], activity["end"]
+            if before and after:
+                need(before["t_ns"] is None or after["t_ns"] is None or before["t_ns"] <= after["t_ns"], "source_activity_clock_reversed")
+                need(all(a is None or b is None or a <= b for a, b in zip(before["values"], after["values"])), "source_activity_counters_reversed")
+        if job["availability"] == "complete":
+            need(job["last_open_phase"] is None and resource is not None and resource["same_cgroup_verified"]
+                 and resource["start"] is not None and resource["end"] is not None
+                 and command is not None and not command["timed_out"], "incomplete_proof_diagnostic_claim")
+            if job["relation"] == 2 and job["mode"] == "prove":
+                need(activity is not None and all(activity.values()) and all(point["t_ns"] is not None
+                     and point["cgroup"] == resource["cgroup"] and all(item is not None for item in point["values"])
+                     for point in activity.values()), "incomplete_source_activity_claim")
+    groups = {tuple(job["resources"]["cgroup"]) for job in jobs if job["resources"] is not None and job["resources"]["same_cgroup_verified"]}
+    need(len(groups) <= 1, "proof_jobs_disagree_about_the_native_cgroup")
+    need(value["availability"] == proof_availability(jobs), "invalid_proof_diagnostic_aggregate")
+    need(len((json.dumps({"proof_diagnostics": value}, indent=2, sort_keys=True) + "\n").encode()) <= 16384, "proof_diagnostic_public_field_overflow")
+    return copy.deepcopy(value)
+
+
+def summarize_proof_job(data, node, index, peer, order, profile, artifacts, target, reserved_digest, genuine_receipts):
+    need(isinstance(data, bytes) and 0 < len(data) <= 32768 and data.endswith(b"\n"), "invalid_order_diagnostic_bytes")
+    lines = data.splitlines()
+    need(2 <= len(lines) <= 64 and all(0 < len(line) + 1 <= 512 for line in lines), "invalid_order_diagnostic_record_bound")
+    records = [diagnostic_json(line) for line in lines]
+    header, tools = records[:2]
+    exact(header, {"v", "kind", "node", "order", "relation", "window", "job", "profile"}, "invalid_order_diagnostic_header")
+    relation = 2 if node == "S" else 3
+    need(type(header["v"]) is int and header["v"] == 2 and header["kind"] == "job" and header["node"] == peer
+         and header["order"] == order and type(header["relation"]) is int and header["relation"] == relation
+         and type(header["window"]) is int and header["window"] == 0 and header["job"] == reserved_digest
+         and header["profile"] == profile, "order_diagnostic_input_binding")
+    for name in ("node", "order", "job", "profile"): proof_hex(header[name])
+    exact(tools, {"v", "kind", "prover", "r0vm", "target_cgroup", "core_same_target"}, "invalid_order_diagnostic_tools")
+    need(type(tools["v"]) is int and tools["v"] == 2 and tools["kind"] == "tools"
+         and all(tools[name] == artifacts[name] for name in ("prover", "r0vm"))
+         and type(tools["core_same_target"]) is bool, "order_diagnostic_tool_binding")
+    proof_group(tools["target_cgroup"]); proof_group(target)
+    need(not tools["core_same_target"] or tools["target_cgroup"] is not None, "order_diagnostic_unverified_group")
+    group = tools["target_cgroup"]
+    same = group is not None and group == target and tools["core_same_target"]
+    begins, ends, ranks, failed, clocks, counters, milestones, commands = {}, {}, {}, set(), {}, {}, set(), {}
+    events, activity = [], {}
+    complete = True
+    first = None
+    def phase_ref(event, position):
+        return {"writer": event["w"], "command": event["c"], "phase": event["p"], "t_ns": event["t"], "event_index": position}
+    for position, record in enumerate(records[2:], 2):
+        need(type(record) is dict, "invalid_order_diagnostic_record")
+        if record.get("kind") == "source_activity":
+            exact(record, {"v", "kind", "e", "t", "g", "q"}, "invalid_source_activity_record")
+            need(type(record["v"]) is int and record["v"] == 2 and relation == 2 and record["e"] in ("begin", "end")
+                 and record["e"] not in activity and (record["e"] != "end" or "begin" in activity)
+                 and ("core", "prove", "proof_prove", None) in begins
+                 and ("core", "prove", "proof_prove", None) not in ends, "invalid_source_activity_order")
+            diagnostic_integer(record["t"], 2**63-1); proof_group(record["g"]); proof_values(record["q"], len(SOURCE_ACTIVITY_FIELDS), nullable=True)
+            activity[record["e"]] = {"t_ns": record["t"], "cgroup": record["g"], "values": list(record["q"])}
+            writer, stamp = "core", record["t"]
+        else:
+            exact(record, PROOF_EVENT, "invalid_order_diagnostic_event_fields")
+            need(type(record["v"]) is int and record["v"] == 2 and record["kind"] == "event", "invalid_order_diagnostic_version")
+            writer, command, phase, edge = (record[key] for key in ("w", "c", "p", "e"))
+            need(writer in PROOF_PHASES and command in ("info", "prove", "verify") and edge in ("begin", "ok", "error", "observed"), "invalid_order_diagnostic_stage")
+            observed = writer == "core" and phase in PROOF_IO_PHASES
+            need((observed and edge == "observed") or (phase in PROOF_PHASES[writer] and edge != "observed"), "invalid_order_diagnostic_phase")
+            expected = {"proof_info": "info", "proof_verify": "verify"}.get(phase, "prove")
+            need((writer == "core" and (observed or command == expected)) or writer == "shim" and command == "prove"
+                 or writer == "host" and (command == "prove" or command == "verify" and phase == "host_receipt_verify"), "invalid_order_diagnostic_command")
+            diagnostic_integer(record["t"], 2**63-1); proof_group(record["g"])
+            if record["q"] is not None: proof_values(record["q"], 5)
+            for name, maximum in (("x", 255), ("s", 64), ("n", 4095)):
+                diagnostic_integer(record[name], maximum, minimum=0 if name == "x" else 1)
+            need(record["x"] is None or record["s"] is None, "order_diagnostic_exit_signal_conflict")
+            need(type(record["k"]) is bool and record["r"] in (None, "generator", "prover")
+                 and (not record["k"] or writer == "shim" and phase == "worker_wait")
+                 and (record["f"] is None or record["f"] in DIAGNOSTIC_CLASSES), "invalid_order_diagnostic_failure")
+            need(edge == "error" or record["f"] is None and record["n"] is None, "order_success_claims_failure")
+            need(edge != "error" or record["f"] is not None, "order_error_missing_failure")
+            role = record["r"]
+            if writer == "shim" and phase in ("generator_spawn", "prover_spawn", "worker_wait"):
+                need(role in ("generator", "prover") and (phase == "worker_wait" or role == phase.removesuffix("_spawn")), "invalid_order_worker")
+            else: need(role is None, "unexpected_order_worker")
+            key = (writer, command, phase, role)
+            if observed:
+                need(record["g"] is None and record["q"] is None and record["a"] is None
+                     and (command, phase) not in milestones, "invalid_order_io_milestone")
+                milestones.add((command, phase))
+            else:
+                if edge == "begin":
+                    need(key not in begins and key not in ends and (writer, command) not in failed, "duplicate_or_failed_order_begin")
+                    rank = PROOF_PHASES[writer].index(phase)
+                    need(rank >= ranks.get((writer, command), -1), "reordered_order_diagnostic_begin")
+                    ranks[writer, command] = rank; begins[key] = (record, position)
+                else:
+                    need(key not in ends and (key in begins or writer == "shim" and phase == "worker_wait"), "unbegun_or_duplicate_order_end")
+                    if phase == "worker_wait":
+                        spawned = ends.get(("shim", "prove", role + "_spawn", role))
+                        need(spawned is not None and spawned[0]["e"] == "ok" and record["n"] is None
+                             and ((edge == "ok" and record["x"] == 0 and record["s"] is None)
+                                  or (edge == "error" and record["x"] is not None and record["x"] != 0 and record["s"] is None and record["f"] == "worker_exit")
+                                  or (edge == "error" and record["x"] is None and record["s"] is not None and record["f"] == "worker_signal")), "invalid_order_worker_wait")
+                    ends[key] = (record, position)
+                    if edge == "error": failed.add((writer, command))
+                if record["g"] != group or record["g"] is None: same = False
+                if writer == "core" or writer == "host" and phase in ("host_succinct", "host_groth16") or writer == "shim" and phase == "shim_workers":
+                    complete = complete and record["q"] is not None
+                if record["q"] is not None:
+                    need(record["g"] is not None, "order_counters_missing_group")
+                    prior = counters.get((writer, tuple(record["g"])))
+                    need(prior is None or all(a <= b for a, b in zip(prior, record["q"])), "order_counters_reversed")
+                    counters[writer, tuple(record["g"])] = record["q"]
+            if writer == "core" and phase != "proof_job":
+                core_phase = {"info": "proof_info", "prove": "proof_prove", "verify": "proof_verify"}[command]
+                need(observed is False or ("core", command, core_phase, None) in begins, "order_io_without_command")
+                proof_io(record["i"], command, record["x"], record["s"], record["f"])
+                previous = commands.get(command)
+                if previous:
+                    old_io = previous[0]["i"]
+                    need(all(not old_io[i] or record["i"][i] for i in (0, 1, 2, 3, 5, 6))
+                         and (old_io[4] is None or old_io[4] == record["i"][4]), "order_io_flags_reversed")
+                commands[command] = (record, position)
+                if observed:
+                    flag = {"process_spawn": 0, "stdin_closed": 2, "stdout_complete": 4, "process_wait": 5}[phase]
+                    need(record["i"][flag] is not None if flag == 4 else record["i"][flag], "order_milestone_missing_observation")
+                if edge == "ok":
+                    need(all(record["i"][i] for i in (0, 1, 2, 3, 5)) and not record["i"][6]
+                         and record["x"] == 0 and record["s"] is None, "order_command_success_without_wait")
+                if record["f"] == "spawn": need(not record["i"][0], "order_spawn_error_claims_process")
+                if record["f"] == "timeout": need(record["i"][6], "order_timeout_missing_flag")
+            else: need(record["i"] is None, "non_command_has_io")
+            if writer == "core" and phase == "proof_job":
+                need(record["a"] in ("not_started", "prove", "receipt_reconcile") and (edge != "begin" or record["a"] == "not_started"), "invalid_order_job_mode")
+            else: need(record["a"] is None, "unexpected_order_job_mode")
+            if edge == "error" and not record["k"] and first is None:
+                first = {**phase_ref(record, position), "failure_class": record["f"], "worker": role,
+                         "exit_code": record["x"], "signal": record["s"], "errno": record["n"], "cleanup_requested": False}
+            events.append((record, position)); stamp = record["t"]
+        if stamp is None: complete = False
+        else:
+            need(stamp >= clocks.get(writer, -1), "order_writer_clock_reversed")
+            clocks[writer] = stamp
+    outer = ("core", "prove", "proof_job", None)
+    if events: need(events[0][0]["w"] == "core" and events[0][0]["p"] == "proof_job" and events[0][0]["e"] == "begin", "order_job_must_begin_first")
+    mode = "prove" if ("core", "prove", "proof_prove", None) in begins else (
+        "receipt_reconcile" if ("core", "verify", "proof_verify", None) in begins else "not_started")
+    if outer in ends: need(ends[outer][0]["a"] == mode, "order_terminal_mode_mismatch")
+    opened = [(event, position) for key, (event, position) in begins.items() if key not in ends]
+    last_open = max(opened, key=lambda item: item[1]) if opened else None
+    complete = complete and outer in ends and not opened
+    required_writers = {"core"}
+    if commands.get("prove", ({"i": [False]},))[0]["i"][0]: required_writers.add("host")
+    if ("host", "prove", "host_groth16", None) in begins: required_writers.add("shim")
+    if commands.get("verify", ({"i": [False]},))[0]["i"][0]: required_writers.add("host")
+    same = same and required_writers <= {event["w"] for event, _ in events if event["g"] == group and event["g"] is not None}
+    for command, (event, _) in commands.items():
+        flags = event["i"]
+        for flag, milestone in ((0, "process_spawn"), (2, "stdin_closed"), (4, "stdout_complete"), (5, "process_wait")):
+            if (flags[flag] is not None if flag == 4 else flags[flag]):
+                need((command, milestone) in milestones, "order_missing_io_milestone")
+        if flags[6]: complete = False
+    core = {command: ends.get(("core", command, phase, None)) for command, phase in (("info", "proof_info"), ("prove", "proof_prove"), ("verify", "proof_verify"))}
+    succeeded = lambda terminal: terminal is not None and terminal[0]["e"] == "ok"
+    outer_success = succeeded(ends.get(outer))
+    complete = complete and core["info"] is not None
+    if succeeded(core["info"]):
+        if mode == "prove":
+            complete = complete and core["prove"] is not None and (core["verify"] is not None if succeeded(core["prove"]) else "verify" not in commands)
+        elif mode == "receipt_reconcile": complete = complete and core["verify"] is not None and "prove" not in commands
+        else: complete = complete and not outer_success and "prove" not in commands and "verify" not in commands
+    else: complete = complete and not outer_success and "prove" not in commands and "verify" not in commands
+    if outer_success:
+        complete = complete and mode in ("prove", "receipt_reconcile") and succeeded(core["verify"]) and (mode != "prove" or succeeded(core["prove"]))
+    if any(event["w"] == "core" and event["s"] is not None for event, _ in events): complete = False
+    def observed_path(writer, command, phases, success):
+        for index, (phase, role) in enumerate(phases):
+            key = (writer, command, phase, role)
+            terminal = ends.get(key)
+            if key not in begins or terminal is None: return False
+            if terminal[0]["e"] == "error":
+                return not success and not any((writer, command, later, worker) in begins for later, worker in phases[index + 1:])
+        return True
+    shim_path = [(phase, None) for phase in ("shim_validate", "shim_lock", "shim_fifo")] + [(role + "_spawn", role) for role in ("generator", "prover")] + [(phase, None) for phase in ("shim_workers", "shim_commit")]
+    for command in ("prove", "verify"):
+        terminal = core[command]
+        if terminal is None: continue
+        if terminal[0]["i"][0]:
+            phases = PROOF_PHASES["host"] if command == "prove" else ("host_receipt_verify",)
+            complete = complete and observed_path("host", command, [(phase, None) for phase in phases], succeeded(terminal))
+            if command == "prove" and ("host", "prove", "host_groth16", None) in begins:
+                complete = complete and observed_path("shim", "prove", shim_path, succeeded(terminal))
+                for role in ("generator", "prover"):
+                    if succeeded(ends.get(("shim", "prove", role + "_spawn", role))):
+                        waited = ends.get(("shim", "prove", "worker_wait", role))
+                        complete = complete and waited is not None and (not succeeded(terminal) or succeeded(waited))
+        else:
+            complete = complete and not any(event["w"] in ("host", "shim") and event["c"] == command for event, _ in events)
+    def point(value):
+        if value is None or value[0]["g"] != group or value[0]["q"] is None: return None
+        return {"t_ns": value[0]["t"], "event_index": value[1], "values": value[0]["q"]}
+    start, end = point(begins.get(outer)), point(ends.get(outer))
+    source_activity = {"start": activity.get("begin"), "end": activity.get("end")} if activity else None
+    if source_activity is not None:
+        need(mode == "prove", "reconcile_has_source_activity")
+        target_verified = group is not None and group == target and tools["core_same_target"]
+        for activity_point in source_activity.values():
+            if activity_point is not None and (not target_verified or activity_point["cgroup"] != group): activity_point["values"] = [None] * len(SOURCE_ACTIVITY_FIELDS)
+        before, after = source_activity["start"], source_activity["end"]
+        if before and after:
+            for i, (a, b) in enumerate(zip(before["values"], after["values"])):
+                if a is not None and b is not None and b < a: after["values"][i] = None
+        if not before or not after or any(item["t_ns"] is None or item["cgroup"] != group or any(value is None for value in item["values"]) for item in source_activity.values() if item):
+            complete = False
+    if relation == 2 and mode == "prove" and source_activity is None: complete = False
+    selected = max(commands.items(), key=lambda item: item[1][1]) if commands else None
+    command_summary = None
+    if selected:
+        command, (event, _) = selected
+        begin = begins["core", command, {"info": "proof_info", "prove": "proof_prove", "verify": "proof_verify"}[command], None][0]
+        terminal = ends.get(("core", command, begin["p"], None))
+        command_summary = dict(zip(("spawned", "stdin_write_complete", "stdin_closed", "stdout_eof", "stdout_bytes", "wait_observed", "timed_out"), event["i"]))
+        command_summary.update(command=command, exit_code=event["x"], signal=event["s"], spawn_errno=event["n"] if event["f"] == "spawn" else None,
+                               failure_class=event["f"], start_ns=begin["t"], end_ns=terminal[0]["t"] if terminal else None)
+    binding = "verified_receipt" if any(fact.get("journalHash") == header["job"] and fact.get("relation") == relation
+        and fact.get("orderId") == "0x" + order and type(fact.get("windowIndex")) is int and fact["windowIndex"] == 0 and fact.get("official_host_verified") is True
+        and fact.get("wrong_journal_receipt_comparison_rejected") is True for fact in genuine_receipts) else "reserved_job"
+    return {**unavailable_proof_job(node, index), "job_digest": header["job"], "binding": binding, "mode": mode,
+            "availability": "complete" if complete and same and start is not None and end is not None and command_summary is not None else "partial",
+            "event_count": len(records) - 2, "first_observed_failure": first,
+            "last_open_phase": phase_ref(*last_open) if last_open else None, "command": command_summary,
+            "resources": {"cgroup": group, "same_cgroup_verified": same, "start": start, "last_open": point(last_open), "end": end},
+            "source_activity": source_activity}
+
+
+def final_proof_diagnostics(summary, diagnostics):
+    if diagnostics is None: return dict(summary)
+    minimal = {**diagnostics, "availability": "unavailable", "jobs": [unavailable_proof_job(job["node"], job["order_index"]) for job in diagnostics["jobs"]]}
+    for value in (diagnostics, minimal):
+        result = {**summary, "proof_diagnostics": value}
+        if len((json.dumps({"proof_diagnostics": value}, indent=2, sort_keys=True) + "\n").encode()) <= 16384 \
+                and len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode()) <= 131072:
+            return result
+    return dict(summary)
+
+
 def wait_observer_ready():
     descriptor = os.environ.pop(OBSERVER_READY_FD, None)
     if descriptor is None:
@@ -424,6 +831,8 @@ class Experiment:
         self.initial_resources = None
         self.started = time.monotonic()
         self.registration_channel = None
+        self.proof_channels = {}
+        self.proof_diagnostic_result = None
         self.registration_cli = dict.fromkeys(("exit_code", "signal", "spawn_errno"))
         self.stage = "initializing"
         self.summary = {"schema_version": 1, "status": "RUNNING", "source_commit": config["source_commit"],
@@ -707,6 +1116,8 @@ class Experiment:
             self.nodes.append(node)
             self.helpers["isolate_delivery_node"](node)
             need(not (node.directory / "delivery-settings.json").exists(), "fresh_delivery_settings_must_be_absent")
+            if name in ("S", "R"):
+                self.prepare_proof_diagnostics(node)
         source, receiver, provider = self.nodes
         provider.configure_mesh(mesh)
         for node in (source, receiver):
@@ -758,6 +1169,105 @@ class Experiment:
                              "network_id": node.client.network_id if node.name != "P" else None} for node in self.nodes},
                              "deployment": {field: self.deployment[field] for field in ("rpc_url", "chain_id", "escrow", "asset", "adapter", "verifier", "runtime_code_hashes", "baseline_block")}})
         save_json(self.run / "private-runtime.json", {"passwords": self.passwords, "nodes": {node.name: str(node.directory) for node in self.nodes}})
+
+    def prepare_proof_diagnostics(self, node):
+        descriptor = None
+        self.proof_channels = getattr(self, "proof_channels", {})
+        if node.name in self.proof_channels: return
+        try:
+            need(node.name in ("S", "R") and node.name not in self.proof_channels, "fresh_proof_diagnostic_node_required")
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            descriptor = os.open(node.directory, flags)
+            chain = []
+            path = node.directory
+            for component in (None, "delivery", "private", "proof-diagnostics"):
+                if component is not None:
+                    try: os.mkdir(component, 0o700, dir_fd=descriptor)
+                    except FileExistsError:
+                        need(component != "proof-diagnostics", "fresh_proof_diagnostic_directory_required")
+                    child = os.open(component, flags, dir_fd=descriptor)
+                    os.close(descriptor); descriptor = child; path = path / component
+                info = os.fstat(descriptor)
+                need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                     "private_proof_diagnostic_directory_required")
+                chain.append((path, (info.st_dev, info.st_ino)))
+            self.proof_channels[node.name] = {"fd": descriptor, "path": path, "chain": chain}
+        except (OSError, CheckFailure, ValueError):
+            if descriptor is not None: os.close(descriptor)
+            self.proof_channels[node.name] = None
+
+    def collect_proof_diagnostics(self):
+        if self.proof_diagnostic_result is not None:
+            return copy.deepcopy(self.proof_diagnostic_result)
+        orders = list(self.orders.values())[:2]
+        jobs = {(name, index): unavailable_proof_job(name, index) for name in ("S", "R") for index in range(len(orders))}
+        target = None
+        try:
+            actual, _ = resources()
+            configured = Path(self.prover_settings["cgroup"])
+            current, expected = actual.stat(), configured.stat()
+            if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino): target = [current.st_dev, current.st_ino]
+        except (OSError, ValueError, KeyError, AttributeError, StopIteration): pass
+        for node in self.nodes:
+            if node.name not in ("S", "R"): continue
+            channel = self.proof_channels.get(node.name)
+            if channel is None: continue
+            touched = set()
+            try:
+                def directory_current():
+                    for path, identity in channel["chain"]:
+                        info = path.lstat()
+                        need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+                             and (info.st_dev, info.st_ino) == identity, "changed_proof_diagnostic_directory")
+                    pinned = os.fstat(channel["fd"])
+                    need((pinned.st_dev, pinned.st_ino) == channel["chain"][-1][1], "changed_proof_diagnostic_directory_fd")
+                directory_current()
+                with os.scandir(channel["fd"]) as entries:
+                    names = [entry.name for _, entry in zip(range(3), entries)]
+                need(len(names) <= 2 and all(re.fullmatch(r"[0-9a-f]{64}\.jsonl", name) for name in names), "unexpected_proof_diagnostic_files")
+                reserved = dict(self.rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest"))
+                for name in names:
+                    descriptor = None
+                    index = None
+                    try:
+                        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=channel["fd"])
+                        before = os.fstat(descriptor)
+                        need(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and stat.S_IMODE(before.st_mode) == 0o600
+                             and before.st_nlink == 1 and 0 < before.st_size <= 32768, "invalid_proof_diagnostic_file")
+                        data = os.read(descriptor, 32769)
+                        after = os.fstat(descriptor)
+                        named = os.stat(name, dir_fd=channel["fd"], follow_symlinks=False)
+                        metadata = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid, info.st_nlink)
+                        need(metadata(before) == metadata(after) == metadata(named) and len(data) == before.st_size, "changed_proof_diagnostic_file")
+                        header = diagnostic_json(data.splitlines()[0])
+                        index = next((index for index, order in enumerate(orders) if order["order_id"] == header.get("order")), None)
+                        need(index is not None and index not in touched, "unknown_or_duplicate_proof_diagnostic_order")
+                        touched.add(index)
+                        job_digest = name[:-6]
+                        need(reserved.get(job_digest) == str(node.directory / "delivery/private" / ("proof-" + job_digest + ".receipt")), "proof_diagnostic_reservation_binding")
+                        jobs[node.name, index] = summarize_proof_job(data, node.name, index, node.device_id, orders[index]["order_id"],
+                            getattr(self, "profile_id", None), self.config["sha256"], target, job_digest, self.summary["genuine_receipts"])
+                    except Exception:
+                        if index is None: raise CheckFailure("unbound_proof_diagnostic_file")
+                        jobs[node.name, index] = unavailable_proof_job(node.name, index)
+                    finally:
+                        if descriptor is not None: os.close(descriptor)
+                directory_current()
+            except Exception:
+                for index in range(len(orders)): jobs[node.name, index] = unavailable_proof_job(node.name, index)
+            finally:
+                os.close(channel["fd"]); self.proof_channels[node.name] = None
+        result = {"schema_version": 1, "source_commit": self.config["source_commit"],
+                  "artifact_sha256": {name: self.config["sha256"][name] for name in ("prover", "r0vm", "profile")},
+                  "profile_id": getattr(self, "profile_id", None), "counter_fields": list(DIAGNOSTIC_COUNTERS),
+                  "attempt_policy": "first_admitted", "availability": proof_availability(list(jobs.values())), "jobs": list(jobs.values())}
+        principals = {node.name: {"peer": node.device_id} for node in self.nodes if node.name in ("S", "R")}
+        try:
+            self.proof_diagnostic_result = project_proof_diagnostics(result, self.config["source_commit"], self.config["sha256"],
+                getattr(self, "profile_id", None), principals, orders, self.summary["genuine_receipts"])
+        except (CheckFailure, ValueError, TypeError, KeyError):
+            self.proof_diagnostic_result = {**result, "availability": "unavailable", "jobs": [unavailable_proof_job(job["node"], job["order_index"]) for job in result["jobs"]]}
+        return copy.deepcopy(self.proof_diagnostic_result)
 
     def prepare_registration_diagnostics(self, receiver, intent):
         descriptor = None
@@ -1088,7 +1598,9 @@ class Experiment:
                     self.summary["failure_code"] = "final_resource_read_failed"
             self.publish_registration_diagnostics()
             self.progress()
-            self.public_json("native-result.json", self.summary)
+            try: diagnostics = self.collect_proof_diagnostics()
+            except Exception: diagnostics = None
+            self.public_json("native-result.json", final_proof_diagnostics(self.summary, diagnostics))
             self.progress()
         return 0 if self.summary["status"] == "PASS" else 1
 
@@ -1115,6 +1627,336 @@ def run_from_options(options, helpers):
         need(Path(config["paths"][name]).resolve(strict=True) == getattr(options, name).resolve(strict=True), "cli_option_and_final_config_artifact_mismatch")
     run_directory = options.delivery_run_dir or options.artifacts.resolve() / ("delivery-protected-" + uuid.uuid4().hex)
     return run_experiment(config, helpers, run_directory)
+
+
+def self_test_proof_fixture(node, index, artifacts, profile, mode="prove"):
+    peer, order = ("11" if node == "S" else "22") * 32, ("ab" if index == 0 else "cd") * 32
+    relation = 2 if node == "S" else 3
+    records = [{"v": 2, "kind": "job", "node": peer, "order": order, "relation": relation, "window": 0,
+                "job": digest((node + str(index)).encode()), "profile": profile},
+               {"v": 2, "kind": "tools", "prover": artifacts["prover"], "r0vm": artifacts["r0vm"],
+                "target_cgroup": [1, 2], "core_same_target": True}]
+    def event(writer, command, phase, edge, *, io=None, role=None, code=None, mode=None):
+        stamp = len(records) * 1000
+        sampled = writer == "core" and edge != "observed" or writer == "host" and phase in ("host_succinct", "host_groth16") or writer == "shim" and phase == "shim_workers"
+        records.append({"v": 2, "kind": "event", "w": writer, "c": command, "p": phase, "e": edge, "t": stamp,
+                        "x": code, "s": None, "n": None, "f": None, "r": role, "k": False,
+                        "g": None if edge == "observed" else [1, 2], "q": [stamp] * 5 if sampled else None, "i": io, "a": mode})
+    def stage(writer, phase, *, command="prove", role=None):
+        event(writer, command, phase, "begin", role=role); event(writer, command, phase, "ok", role=role)
+    def activity(edge):
+        records.append({"v": 2, "kind": "source_activity", "e": edge, "t": len(records) * 1000, "g": [1, 2], "q": [len(records) * 1000] * 7})
+    def command(name, phase):
+        event("core", name, phase, "begin", io=[False, False, False, False, None, False, False])
+        if name == "prove" and node == "S": activity("begin")
+        event("core", name, "process_spawn", "observed", io=[True, False, False, False, None, False, False])
+        event("core", name, "stdin_closed", "observed", io=[True, True, True, False, None, False, False])
+        if name == "prove":
+            for phase_name in ("host_input", "host_succinct", "host_succinct_verify"): stage("host", phase_name)
+            event("host", "prove", "host_groth16", "begin")
+            for phase_name in ("shim_validate", "shim_lock", "shim_fifo"): stage("shim", phase_name)
+            for role in ("generator", "prover"): stage("shim", role + "_spawn", role=role)
+            event("shim", "prove", "shim_workers", "begin")
+            for role in ("generator", "prover"): event("shim", "prove", "worker_wait", "ok", role=role, code=0)
+            event("shim", "prove", "shim_workers", "ok"); stage("shim", "shim_commit")
+            event("host", "prove", "host_groth16", "ok")
+            for phase_name in ("host_receipt_verify", "host_receipt_publish"): stage("host", phase_name)
+        elif name == "verify": stage("host", "host_receipt_verify", command="verify")
+        event("core", name, "stdout_complete", "observed", io=[True, True, True, True, 9, False, False])
+        event("core", name, "process_wait", "observed", io=[True, True, True, True, 9, True, False], code=0)
+        if name == "prove" and node == "S": activity("end")
+        event("core", name, phase, "ok", io=[True, True, True, True, 9, True, False], code=0)
+    event("core", "prove", "proof_job", "begin", mode="not_started")
+    command("info", "proof_info")
+    if mode == "prove": command("prove", "proof_prove")
+    command("verify", "proof_verify")
+    event("core", "prove", "proof_job", "ok", mode=mode)
+    return records
+
+
+def self_test_proof_diagnostics():
+    from unittest.mock import Mock, patch
+    from types import SimpleNamespace
+    import tempfile
+    artifacts = {"prover": "b" * 64, "r0vm": "c" * 64, "profile": "d" * 64}
+    source, profile = "1" * 40, "f" * 64
+    orders = [{"order_id": value * 32, "sha256": "e" * 64} for value in ("ab", "cd")]
+    principals = {node: {"peer": value * 32} for node, value in (("S", "11"), ("R", "22"))}
+    encode = lambda records: b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in records)
+    def summarize(records, node="S", index=0, facts=()):
+        return summarize_proof_job(encode(records), node, index, principals[node]["peer"], orders[index]["order_id"], profile,
+                                   artifacts, [1, 2], digest((node + str(index)).encode()), facts)
+    fixtures = {(node, index): self_test_proof_fixture(node, index, artifacts, profile) for node in ("S", "R") for index in range(2)}
+    jobs = [summarize(records, node, index) for (node, index), records in fixtures.items()]
+    value = {"schema_version": 1, "source_commit": source, "artifact_sha256": artifacts, "profile_id": profile,
+             "counter_fields": list(DIAGNOSTIC_COUNTERS), "attempt_policy": "first_admitted", "availability": "complete", "jobs": jobs}
+    need(project_proof_diagnostics(value, source, artifacts, profile, principals, orders, []) == value
+         and len(jobs) == 4 and len({job["job_digest"] for job in jobs}) == 4
+         and all(job["availability"] == "complete" and job["binding"] == "reserved_job" for job in jobs), "four_concrete_bound_proof_jobs")
+    need(all((job["source_activity"] is not None) == (job["node"] == "S") for job in jobs), "source_only_activity")
+    need(registration_diagnostics(encode(fixtures["S", 0]), source, artifacts,
+         {"exit_code": 0, "signal": None, "spawn_errno": None})["availability"] == "unavailable", "order_v2_never_becomes_key_v1")
+    facts = [{"relation": job["relation"], "orderId": "0x" + orders[job["order_index"]]["order_id"], "windowIndex": 0,
+              "journalHash": job["job_digest"], "official_host_verified": True, "wrong_journal_receipt_comparison_rejected": True} for job in jobs]
+    verified = [summarize(records, node, index, facts) for (node, index), records in fixtures.items()]
+    need(all(job["binding"] == "verified_receipt" for job in verified), "only_existing_verified_receipts_upgrade_binding")
+    for node in ("S", "R"):
+        reconciled = summarize(self_test_proof_fixture(node, 0, artifacts, profile, "receipt_reconcile"), node)
+        need(reconciled["availability"] == "complete" and reconciled["mode"] == "receipt_reconcile"
+             and reconciled["source_activity"] is None, "receipt_reconciliation_does_not_claim_new_prove")
+    records = fixtures["S", 0]
+    cut = next(i for i, event in enumerate(records) if event.get("p") == "host_succinct" and event["e"] == "begin")
+    timeout = copy.deepcopy(records[:cut + 1]); stamp = timeout[-1]["t"]
+    activity = next(copy.deepcopy(event) for event in records if event["kind"] == "source_activity" and event["e"] == "end")
+    activity.update(t=stamp + 1000, q=[stamp + 1000] * 7); timeout.append(activity)
+    terminal = next(copy.deepcopy(event) for event in records if event.get("p") == "proof_prove" and event["e"] == "ok")
+    terminal.update(e="error", t=stamp + 2000, x=None, f="timeout", q=[stamp + 2000] * 5, i=[True, True, True, False, None, False, True]); timeout.append(terminal)
+    outer = copy.deepcopy(records[-1]); outer.update(e="error", t=stamp + 3000, f="stage_error", q=[stamp + 3000] * 5); timeout.append(outer)
+    partial = summarize(timeout, facts=facts)
+    need(partial["availability"] == "partial" and partial["binding"] == "verified_receipt"
+         and partial["last_open_phase"]["phase"] == "host_succinct" and partial["command"]["timed_out"]
+         and partial["command"]["stdout_bytes"] is None and partial["command"]["exit_code"] is None, "timeout_prefix_stays_partial_after_later_receipt")
+    cut = next(i for i, event in enumerate(records) if event.get("p") == "worker_wait")
+    cleanup = copy.deepcopy(records[:cut + 2]); cleanup[-2].update(e="error", x=137, f="worker_exit")
+    cleanup[-1].update(e="error", x=None, s=9, f="worker_signal", k=True)
+    failed = summarize(cleanup)
+    need(failed["first_observed_failure"]["exit_code"] == 137 and failed["first_observed_failure"]["signal"] is None
+         and failed["availability"] == "partial", "cleanup_never_overwrites_first_noncleanup_failure")
+    for errno in (11, 12):
+        spawn = copy.deepcopy(records[:4]); terminal = copy.deepcopy(spawn[-1])
+        terminal.update(e="error", n=errno, f="spawn", t=4000, q=[4000] * 5); spawn.append(terminal)
+        outer = copy.deepcopy(records[-1]); outer.update(e="error", a="not_started", t=5000, q=[5000] * 5, f="stage_error"); spawn.append(outer)
+        observed = summarize(spawn)
+        need(observed["command"]["spawn_errno"] == errno and not observed["command"]["spawned"]
+             and observed["command"]["exit_code"] is None, "actual_spawn_errno_has_no_wait0")
+    negative_count = 0
+    changes = [lambda data: data[0].update(node="ff" * 32), lambda data: data[0].update(order=orders[1]["order_id"]),
+               lambda data: data[0].update(relation=3), lambda data: data[0].update(window=1), lambda data: data[0].update(job="e" * 64),
+               lambda data: data[0].update(profile="e" * 64), lambda data: data[1].update(prover="e" * 64),
+               lambda data: data[1].update(r0vm="e" * 64), lambda data: data[0].update(private="PRIVATE_PROOF_SENTINEL"),
+               lambda data: data.insert(2, copy.deepcopy(data[0])), lambda data: data[2].update(v=1),
+               lambda data: data[3].update(p="proof_preflight"), lambda data: data[3].update(t=0),
+               lambda data: data[4].update(i=[True, False, False, True, 16385, False, False]),
+               lambda data: data[5].update(i=[True, True, True, False, None, False, False], x=0),
+               lambda data: data[-1].update(q=[0] * 5), lambda data: data[-2].update(x=True)]
+    for change in changes:
+        invalid = copy.deepcopy(records); change(invalid)
+        try: summarize(invalid)
+        except (CheckFailure, ValueError, TypeError, KeyError): negative_count += 1
+        else: raise AssertionError("invalid order diagnostic accepted")
+    for bad in (b"", encode(records)[:-1], b"x" * 32769, b"x" * 512 + b"\n", encode(records + [records[-1]] * (65 - len(records))),
+                encode(records).replace(b'"v":2', b'"v":2,"v":2', 1)):
+        try: summarize_proof_job(bad, "S", 0, principals["S"]["peer"], orders[0]["order_id"], profile, artifacts, [1, 2], records[0]["job"], [])
+        except (CheckFailure, ValueError, TypeError, KeyError): negative_count += 1
+        else: raise AssertionError("invalid order diagnostic byte stream accepted")
+    for change in (lambda data: data[1].update(core_same_target=False), lambda data: data[1].update(target_cgroup=[3, 4]),
+                   lambda data: next(event for event in data if event.get("w") == "host").update(g=None),
+                   lambda data: next(event for event in data if event.get("w") == "shim").update(g=[3, 4]),
+                   lambda data: next(event for event in data if event["kind"] == "source_activity" and event["e"] == "end").update(q=[0] * 7)):
+        unknown = copy.deepcopy(records); change(unknown); need(summarize(unknown)["availability"] == "partial", "unknown_group_or_activity_stays_partial")
+    for change in (lambda data: data.update(source_commit="0" * 40), lambda data: data["artifact_sha256"].update(prover="0" * 64),
+                   lambda data: data.update(profile_id="0" * 64), lambda data: data.update(private="PRIVATE_PROOF_SENTINEL"),
+                   lambda data: data["jobs"][0].update(window=True), lambda data: data["jobs"][0]["command"].update(exit_code=137, signal=9),
+                   lambda data: data["jobs"][0]["command"].update(failure_class="worker_exit", exit_code=0),
+                   lambda data: data["jobs"][0]["command"].update(failure_class="worker_signal", exit_code=137, signal=None),
+                   lambda data: data["jobs"][1].update(job_digest=data["jobs"][0]["job_digest"]),
+                   lambda data: data["jobs"][0].update(source_activity={"start": {"private": "PRIVATE_PROOF_SENTINEL"}, "end": None})):
+        invalid = copy.deepcopy(value); change(invalid)
+        try: project_proof_diagnostics(invalid, source, artifacts, profile, principals, orders, facts)
+        except (CheckFailure, ValueError, TypeError, KeyError): negative_count += 1
+        else: raise AssertionError("invalid public proof diagnostic accepted")
+    source_text = (REPOSITORY / "apps/core/src/delivery/proof.rs").read_text()
+    admitted = source_text.split("impl ProofRunner {", 1)[1].split("async fn verified_seal", 1)[0]
+    admission = [admitted.index(part) for part in (".try_acquire()", "process_lock(receipt)", "Diagnostics::claim_order", "config.validate()?", "config.validate_executables()?", "config.check_memory_limit()?", "config.oom_events()?", "/var/run/docker.sock", "verify_relation(", "input.profile == config.profile", "sink.activate_order")]
+    need(admission == sorted(admission) and "proof_preflight" not in PROOF_PHASES["core"], "original_admission_precedes_order_activation")
+    with tempfile.TemporaryDirectory(prefix="proof-collector-selftest-", dir=ARTIFACTS) as temporary:
+        run = Path(temporary)
+        experiment = object.__new__(Experiment)
+        experiment.nodes = [SimpleNamespace(name=node, device_id=principals[node]["peer"], directory=run / node) for node in ("S", "R")]
+        for node in experiment.nodes: node.directory.mkdir(mode=0o700)
+        experiment.config = {"source_commit": source, "sha256": artifacts}; experiment.profile_id = profile
+        experiment.proof_channels = {}; experiment.proof_diagnostic_result = None
+        experiment.orders = {order["order_id"]: order for order in orders}; experiment.summary = {"genuine_receipts": facts}
+        experiment.prover_settings = {"cgroup": str(run)}
+        target_info = run.stat(); synthetic_target = [target_info.st_dev, target_info.st_ino]
+        for node in experiment.nodes:
+            experiment.prepare_proof_diagnostics(node)
+            channel = experiment.proof_channels[node.name]
+            need(channel is not None and not os.get_inheritable(channel["fd"]), "collector_directory_is_pinned_private")
+            for index in range(2):
+                fixture = copy.deepcopy(fixtures[node.name, index])
+                fixture[1]["target_cgroup"] = synthetic_target
+                for event in fixture[2:]:
+                    if event["g"] is not None: event["g"] = synthetic_target
+                path = channel["path"] / (fixture[0]["job"] + ".jsonl")
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(descriptor, encode(fixture)); os.close(descriptor)
+        experiment.rows = Mock(side_effect=lambda node, _sql: [(fixtures[node.name, index][0]["job"], str(node.directory / "delivery/private" / ("proof-" + fixtures[node.name, index][0]["job"] + ".receipt"))) for index in range(2)])
+        with patch.dict(globals(), resources=lambda: (run, {})):
+            collected = experiment.collect_proof_diagnostics()
+        need(collected["availability"] == "complete" and len(collected["jobs"]) == 4
+             and all(job["resources"]["cgroup"] == synthetic_target for job in collected["jobs"]), "four_synthetic_streams_bound_to_the_pinned_directory_fixture")
+        for node in experiment.nodes: need(experiment.proof_channels[node.name] is None, "collector_closes_pinned_descriptors")
+        need(experiment.collect_proof_diagnostics() == collected, "collector_never_upgrades_first_attempt")
+    for kind in ("missing", "fifo", "directory", "symlink", "hardlink", "mode", "owner", "changed", "replaced-directory", "overflow", "half-line", "extra"):
+        with tempfile.TemporaryDirectory(prefix="proof-collector-negative-", dir=ARTIFACTS) as temporary:
+            run = Path(temporary); node = SimpleNamespace(name="S", device_id=principals["S"]["peer"], directory=run / "S"); node.directory.mkdir(mode=0o700)
+            experiment = object.__new__(Experiment); experiment.nodes = [node]; experiment.proof_channels = {}; experiment.proof_diagnostic_result = None
+            experiment.config = {"source_commit": source, "sha256": artifacts}; experiment.profile_id = profile
+            experiment.orders = {orders[0]["order_id"]: orders[0]}; experiment.summary = {"genuine_receipts": []}; experiment.rows = Mock(return_value=[])
+            experiment.prepare_proof_diagnostics(node); channel = experiment.proof_channels["S"]; path = channel["path"] / (records[0]["job"] + ".jsonl")
+            if kind == "fifo": os.mkfifo(path, 0o600)
+            elif kind == "directory": path.mkdir(mode=0o700)
+            elif kind == "symlink": path.symlink_to(run / "missing")
+            elif kind != "missing":
+                path.write_bytes(encode(records)); path.chmod(0o600)
+                if kind == "hardlink": os.link(path, run / "linked")
+                if kind == "mode": path.chmod(0o644)
+                if kind == "overflow": path.write_bytes(b"x" * 32769)
+                if kind == "half-line": path.write_bytes(encode(records)[:-1])
+                if kind == "extra": (channel["path"] / "unexpected").touch(mode=0o600)
+                if kind == "replaced-directory":
+                    channel["path"].rename(channel["path"].with_name("old-proof-diagnostics")); channel["path"].mkdir(mode=0o700)
+            actual_fstat = os.fstat
+            regular_stats = 0
+            def checked_fstat(descriptor):
+                nonlocal regular_stats
+                info = actual_fstat(descriptor)
+                if stat.S_ISREG(info.st_mode):
+                    regular_stats += 1
+                    if kind == "owner" or kind == "changed" and regular_stats == 2:
+                        fields = {name: getattr(info, name) for name in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode", "st_uid", "st_nlink")}
+                        fields["st_uid" if kind == "owner" else "st_mtime_ns"] += 1
+                        return SimpleNamespace(**fields)
+                return info
+            with patch.dict(globals(), resources=lambda: (_ for _ in ()).throw(OSError())), patch.object(os, "fstat", side_effect=checked_fstat):
+                unavailable = experiment.collect_proof_diagnostics()
+            need(unavailable["availability"] == "unavailable" and all(job == unavailable_proof_job(job["node"], job["order_index"]) for job in unavailable["jobs"]), "unsafe_stream_is_nonblocking_unavailable")
+    maximum, maximum_group = 2**63-1, [2**64-1] * 2
+    conservative_records = copy.deepcopy(records)
+    for record in conservative_records:
+        if record["kind"] == "job": record["window"] = 65535
+        elif record["kind"] == "tools": record.update(target_cgroup=maximum_group, core_same_target=False)
+        else:
+            record["t"] = maximum; record["g"] = maximum_group
+            record["q"] = [maximum] * (7 if record["kind"] == "source_activity" else 5)
+            if record["kind"] == "event":
+                record.update(x=None, s=None, n=4095, f="result_decode", k=False)
+                if record["r"] is not None: record["r"] = "generator"
+                if record["i"] is not None: record["i"] = [False, False, False, False, 16385, False, False]
+                if record["a"] is not None: record["a"] = "receipt_reconcile"
+    worst = copy.deepcopy(value)
+    phase = {"writer": "host", "command": "prove", "phase": max(PROOF_PHASES["host"], key=len), "t_ns": maximum, "event_index": 63}
+    for job in worst["jobs"]:
+        job.update(availability="partial", binding="verified_receipt", mode="receipt_reconcile", event_count=62,
+                   first_observed_failure={**phase, "failure_class": "result_decode", "worker": "generator", "exit_code": None,
+                                           "signal": None, "errno": 4095, "cleanup_requested": False}, last_open_phase=dict(phase))
+        job["command"].update(command="verify", spawned=False, stdin_write_complete=False, stdin_closed=False, stdout_eof=False,
+            stdout_bytes=16385, wait_observed=False, timed_out=False, exit_code=None, signal=None, spawn_errno=4095,
+            failure_class="result_decode", start_ns=maximum, end_ns=maximum)
+        job["resources"] = {"cgroup": maximum_group, "same_cgroup_verified": False, **{name: {"t_ns": maximum, "event_index": 63, "values": [maximum] * 5} for name in ("start", "last_open", "end")}}
+        if job["source_activity"] is not None:
+            job["source_activity"] = {name: {"t_ns": maximum, "cgroup": maximum_group, "values": [maximum] * 7} for name in ("start", "end")}
+    worst["availability"] = "unavailable"
+    # Optional summaries and mutually exclusive maxima are all included in this size-only bound.
+    private_max = max(len((json.dumps(record, separators=(",", ":")) + "\n").encode()) for record in conservative_records)
+    stream_bound = sum(len((json.dumps(record, separators=(",", ":")) + "\n").encode()) for record in conservative_records[:2]) + 54 * private_max
+    public_bound = len((json.dumps({"proof_diagnostics": worst}, indent=2, sort_keys=True) + "\n").encode())
+    need(private_max <= 512 and len(records) <= 56 and stream_bound <= 32768 and public_bound <= 16384, "actual_amended_serialization_bounds")
+    for status in ("PASS", "FAIL"):
+        base = {"status": status, "genuine_receipts": [], "payload": ""}
+        minimal = {**value, "availability": "unavailable", "jobs": [unavailable_proof_job(job["node"], job["order_index"]) for job in jobs]}
+        overhead = len((json.dumps({**base, "proof_diagnostics": minimal}, indent=2, sort_keys=True) + "\n").encode())
+        base["payload"] = "x" * (131072 - overhead)
+        result = final_proof_diagnostics(base, value)
+        need(result["status"] == status and result["genuine_receipts"] == [] and result["payload"] == base["payload"]
+             and result["proof_diagnostics"]["availability"] == "unavailable" and len((json.dumps(result, indent=2, sort_keys=True) + "\n").encode()) <= 131072, "combined_cap_uses_minimal_unavailable_without_business_changes")
+        base["payload"] = "x" * (131072 - len((json.dumps({**base, "payload": ""}, indent=2, sort_keys=True) + "\n").encode()))
+        need(final_proof_diagnostics(base, value) == base, "combined_cap_omits_only_diagnostics")
+    oversized = copy.deepcopy(value); oversized["jobs"][0]["command"]["failure_class"] = "x" * 16385
+    need(final_proof_diagnostics({"status": "PASS"}, oversized)["proof_diagnostics"]["availability"] == "unavailable", "public_field_cap_does_not_expand")
+    print(json.dumps({"proof_diagnostic_selftest": "PASS", "concrete_jobs": 4, "negative_controls": negative_count,
+                      "group_unknown_controls": 5, "collector_negative_controls": 12,
+                      "source_records": len(records), "max_record_bound_bytes": private_max, "stream_bound_bytes": stream_bound,
+                      "public_field_bound_bytes": public_bound, "combined_cap_bytes": 131072, "external_processes": 0, "network_sockets": 0}))
+
+
+def self_test_proof_review_regressions():
+    artifacts = {"prover": "b" * 64, "r0vm": "c" * 64, "profile": "d" * 64}
+    source, profile = "1" * 40, "f" * 64
+    principals = {node: {"peer": value * 32} for node, value in (("S", "11"), ("R", "22"))}
+    orders = [{"order_id": value * 32} for value in ("ab", "cd")]
+    fixtures = {(node, index): self_test_proof_fixture(node, index, artifacts, profile) for node in ("S", "R") for index in range(2)}
+    def summarize(records, node="S", index=0, target=(1, 2)):
+        data = b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in records)
+        return summarize_proof_job(data, node, index, principals[node]["peer"], orders[index]["order_id"], profile,
+            artifacts, list(target) if target is not None else None, fixtures[node, index][0]["job"], [])
+    baseline = fixtures["S", 0]
+    jobs = [summarize(records, node, index) for (node, index), records in fixtures.items()]
+    failures, observed = [], {}
+    def check(label, records, expected_complete):
+        try: row = summarize(records); status = row["availability"]
+        except CheckFailure: row, status = None, "rejected"
+        observed[label] = status
+        if (status == "complete") != expected_complete: failures.append(label)
+        return row
+    def project(row):
+        rows = [row, *jobs[1:]]
+        value = {"schema_version": 1, "source_commit": source, "artifact_sha256": artifacts, "profile_id": profile,
+            "counter_fields": list(DIAGNOSTIC_COUNTERS), "attempt_policy": "first_admitted", "availability": proof_availability(rows), "jobs": rows}
+        return project_proof_diagnostics(value, source, artifacts, profile, principals, orders, [])
+    check("complete_source", baseline, True)
+    check("missing_info", [record for record in baseline if not (record.get("w") == "core" and record.get("c") == "info")], False)
+    check("missing_verify", [record for record in baseline if not (record.get("w") in ("core", "host") and record.get("c") == "verify")], False)
+    reconcile = self_test_proof_fixture("S", 0, artifacts, profile, "receipt_reconcile")
+    check("complete_reconcile", reconcile, True)
+    check("reconcile_missing_info", [record for record in reconcile if not (record.get("w") == "core" and record.get("c") == "info")], False)
+    info = copy.deepcopy(baseline[:4]); terminal = copy.deepcopy(info[-1])
+    terminal.update(e="error", n=11, f="spawn", t=4000, q=[4000] * 5); info.append(terminal)
+    outer = copy.deepcopy(baseline[-1]); outer.update(e="error", a="not_started", t=5000, q=[5000] * 5, f="stage_error"); info.append(outer)
+    check("fully_observed_info_spawn_failure", info, True)
+    failed = [copy.deepcopy(record) for record in baseline if not (record.get("c") == "verify"
+        or record.get("w") == "host" and record.get("p") == "host_receipt_publish")]
+    for record in failed:
+        if record.get("w") == "host" and record.get("p") == "host_receipt_verify" and record["e"] == "ok": record.update(e="error", f="stage_error")
+        if record.get("w") == "core" and record.get("c") == "prove" and record.get("p") == "process_wait": record.update(x=1)
+        if record.get("w") == "core" and record.get("p") == "proof_prove" and record["e"] == "ok": record.update(e="error", x=1, f="worker_exit")
+        if record.get("p") == "proof_job" and record["e"] == "ok": record.update(e="error", f="stage_error")
+    check("fully_observed_host_failure", failed, True)
+    check("failure_missing_host_stage", [record for record in failed if not (record.get("w") == "host" and record.get("p") == "host_succinct_verify")], False)
+    signaled = [copy.deepcopy(record) for record in failed if record.get("w") != "shim"
+        and not (record.get("w") == "host" and record.get("p") != "host_input")]
+    for record in signaled:
+        if record.get("w") == "core" and record.get("c") == "prove" and record.get("p") in ("process_wait", "proof_prove") and record["e"] != "begin":
+            record.update(x=None, s=9)
+            if record["e"] == "error": record["f"] = "worker_signal"
+    check("unexplained_hardkill", signaled, False)
+    for edge in ("begin", "end"):
+        for group in (None, [3, 4]):
+            wrong = copy.deepcopy(baseline)
+            raw = next(record for record in wrong if record["kind"] == "source_activity" and record["e"] == edge)
+            raw["g"] = group
+            row = summarize(wrong); point = row["source_activity"]["start" if edge == "begin" else "end"]
+            label = "activity_" + edge + ("_missing_group" if group is None else "_wrong_group")
+            normalized = point["values"] == [None] * 7 and point["t_ns"] == raw["t"] and point["cgroup"] == group
+            observed[label] = normalized
+            if not normalized: failures.append(label)
+            untrusted = copy.deepcopy(jobs[0]); untrusted["availability"] = "partial"
+            point = untrusted["source_activity"]["start" if edge == "begin" else "end"]; point["cgroup"] = group
+            try: project(untrusted)
+            except CheckFailure: rejected = True
+            else: rejected = False
+            observed["public_" + label] = rejected
+            if not rejected: failures.append("public_" + label)
+    unknown = summarize(baseline, target=None)
+    if any(value is not None for point in unknown["source_activity"].values() for value in point["values"]): failures.append("activity_unknown_target")
+    partial = copy.deepcopy(baseline)
+    next(record for record in partial if record.get("w") == "host")["g"] = [3, 4]
+    row = summarize(partial)
+    need(row["availability"] == "partial" and row["source_activity"] == jobs[0]["source_activity"]
+         and project(row)["jobs"][0]["source_activity"] == jobs[0]["source_activity"], "valid_same_target_partial_keeps_activity")
+    print(json.dumps({"proof_review_regressions": observed, "failures": failures}, sort_keys=True))
+    need(not failures, "proof_review_regression_failures")
 
 
 def self_test_diagnostic_fixture():
@@ -1234,6 +2076,8 @@ def self_test():
         raise AssertionError("no-process self-test attempted an external process or network")
     with patch.object(subprocess, "Popen", forbidden), patch.object(subprocess, "run", forbidden), patch.object(socket, "socket", forbidden):
         self_test_diagnostics()
+        self_test_proof_diagnostics()
+        self_test_proof_review_regressions()
         node_helpers = runpy.run_path(str(REPOSITORY / "scripts/verify-node.py"))
         Client = node_helpers["Client"]
         for identity in (None, Path("/artifact/client-identity.json")):
@@ -1336,6 +2180,7 @@ def self_test():
                 startup = object.__new__(Experiment)
                 startup.run = run; startup.paths = {name: Path(value) for name, value in sample["paths"].items()}
                 startup.nodes = []; startup.progress = Mock(); startup.deployment = {"funder":"0x" + "11" * 20}
+                startup.prepare_proof_diagnostics = Mock()
                 startup.rpc = Mock(side_effect=[["0x" + value * 20 for value in ("11","22","33","44")],"0x7a69"])
                 startup.helpers = {"CLIENT_SOURCE":"MODULE_URL", "mesh_network":Mock(return_value="t-123456789abc"),
                     "public_node_args":Mock(return_value=["--relay-open"]), "Node":Mock(side_effect=nodes), "isolate_delivery_node":Mock()}

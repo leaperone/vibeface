@@ -312,7 +312,12 @@ impl Delivery {
             drop(preproof);
             let seal = self
                 .proofs
-                .prove(&config, &input, &path, diagnostics)
+                .prove(
+                    &config,
+                    &input,
+                    &path,
+                    proof::ProofDiagnostics::Registration(diagnostics),
+                )
                 .await?;
             let mut stored = proof::DiagnosticStage::new(diagnostics, "key_proof_store", "key");
             self.with_store(|store| store.put_value(&proof_id, &seal))?;

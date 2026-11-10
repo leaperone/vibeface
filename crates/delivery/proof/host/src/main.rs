@@ -22,6 +22,7 @@ struct DiagnosticStage {
     command: &'static str,
     success: bool,
     errno: Option<i32>,
+    order: bool,
 }
 fn diagnostic_file(fd: i32) -> Option<std::fs::File> {
     use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
@@ -46,6 +47,7 @@ fn diagnostic_file(fd: i32) -> Option<std::fs::File> {
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != 0o600
         || metadata.len() > 32768
+        || metadata.nlink() != 1
     {
         return None;
     }
@@ -54,10 +56,17 @@ fn diagnostic_file(fd: i32) -> Option<std::fs::File> {
 
 impl DiagnosticStage {
     fn new(phase: &'static str, command: &str) -> Self {
-        let file = std::env::var("VIBEFACE_DELIVERY_DIAGNOSTIC_FD")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .and_then(diagnostic_file);
+        let format = diagnostic_format(
+            std::env::var("VIBEFACE_DELIVERY_DIAGNOSTIC_FORMAT")
+                .ok()
+                .as_deref(),
+        );
+        let file = format.and_then(|_| {
+            std::env::var("VIBEFACE_DELIVERY_DIAGNOSTIC_FD")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .and_then(diagnostic_file)
+        });
         let stage = Self {
             file,
             phase,
@@ -68,6 +77,7 @@ impl DiagnosticStage {
             },
             success: false,
             errno: None,
+            order: format == Some(true),
         };
         stage.emit("begin");
         stage
@@ -81,6 +91,9 @@ impl DiagnosticStage {
             .lines()
             .find_map(|line| line.strip_prefix("0::"))?;
         let root = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        Self::counters_at(&root)
+    }
+    fn counters_at(root: &Path) -> Option<serde_json::Value> {
         let read = |name: &str| -> Option<std::collections::HashMap<String, u64>> {
             let mut values = std::collections::HashMap::new();
             for line in std::fs::read_to_string(root.join(name)).ok()?.lines() {
@@ -103,9 +116,55 @@ impl DiagnosticStage {
         let Some(file) = &self.file else {
             return;
         };
-        let value = json!({"v":1,"writer":"host","command":self.command,"phase":self.phase,"edge":edge,
+        let value = if self.order {
+            use std::os::unix::fs::MetadataExt;
+            let group = std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|text| {
+                    text.lines().find_map(|line| {
+                        line.strip_prefix("0::").map(|relative| {
+                            Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))
+                        })
+                    })
+                });
+            let identity = group
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|info| [info.dev(), info.ino()]);
+            let mut clock = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let time = (unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } == 0)
+                .then(|| {
+                    u64::try_from(clock.tv_sec)
+                        .ok()?
+                        .checked_mul(1_000_000_000)?
+                        .checked_add(u64::try_from(clock.tv_nsec).ok()?)
+                })
+                .flatten()
+                .filter(|value| *value <= i64::MAX as u64);
+            let counters = group
+                .as_deref()
+                .filter(|_| matches!(self.phase, "host_succinct" | "host_groth16"))
+                .and_then(Self::counters_at)
+                .and_then(|value| {
+                    Some([
+                        value["pids_max"].as_u64()?,
+                        value["memory_max"].as_u64()?,
+                        value["oom"].as_u64()?,
+                        value["oom_kill"].as_u64()?,
+                        value["oom_group_kill"].as_u64()?,
+                    ])
+                });
+            json!({"v":2,"kind":"event","w":"host","c":self.command,"p":self.phase,"e":edge,
+                "t":time,"x":null,"s":null,"n":self.errno,"f":if edge == "error" {Some("stage_error")} else {None},
+                "r":null,"k":false,"g":identity,"q":counters,"i":null,"a":null})
+        } else {
+            json!({"v":1,"writer":"host","command":self.command,"phase":self.phase,"edge":edge,
             "exit_code":null,"signal":null,"errno":self.errno,"failure_class":if edge == "error" {Some("stage_error")} else {None},
-            "worker":null,"cleanup_requested":false,"counters":self.counters()});
+            "worker":null,"cleanup_requested":false,"counters":self.counters()})
+        };
         let Ok(mut bytes) = serde_json::to_vec(&value) else {
             return;
         };
@@ -118,7 +177,9 @@ impl DiagnosticStage {
             return;
         }
         let mut destination = file;
-        let _ = destination.write(&bytes);
+        if destination.write(&bytes).ok() != Some(bytes.len()) {
+            let _ = file.set_len(32769);
+        }
     }
     fn ok(&mut self) {
         self.success = true;
@@ -127,6 +188,13 @@ impl DiagnosticStage {
         self.errno = error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error);
+    }
+}
+fn diagnostic_format(value: Option<&str>) -> Option<bool> {
+    match value {
+        None => Some(false),
+        Some("order-job-v2") => Some(true),
+        _ => None,
     }
 }
 impl Drop for DiagnosticStage {
@@ -589,6 +657,7 @@ mod tests {
             command: "prove",
             success: false,
             errno: None,
+            order: false,
         };
         assert!(stage.file.is_some());
         stage.emit("begin");
@@ -602,6 +671,15 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["edge"], "begin");
         assert_eq!(events[1]["edge"], "ok");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["v"] == 1 && event.get("kind").is_none())
+        );
+        let linked = directory.join("linked");
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert!(diagnostic_file(fd).is_none());
+        std::fs::remove_file(linked).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(diagnostic_file(fd).is_none());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -610,5 +688,13 @@ mod tests {
         drop(file);
         assert!(diagnostic_file(fd).is_none());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_format_never_guesses_an_unknown_encoding() {
+        assert_eq!(diagnostic_format(None), Some(false));
+        assert_eq!(diagnostic_format(Some("order-job-v2")), Some(true));
+        assert_eq!(diagnostic_format(Some("")), None);
+        assert_eq!(diagnostic_format(Some("unknown")), None);
     }
 }

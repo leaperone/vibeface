@@ -2811,6 +2811,7 @@ def protected_public(run, expected, returncode):
             for target in pair: target.unlink(missing_ok=True)
     allowed_files = {"before-source-offline.json","confirmed-chain.json","settlement.json","settlement-observation.json","native-result.json","registration-diagnostics.json"}
     diagnostic_binding = None
+    proof_diagnostic_binding = None
     certified_files = progress.get("public_files",{}) if progress else {}
     if not isinstance(certified_files,dict):
         certified_files = {}; failures.add("invalid_public_file_manifest")
@@ -2832,6 +2833,20 @@ def protected_public(run, expected, returncode):
                     raise ValueError("Registration diagnostic source differs")
                 projected = driver["project_registration_diagnostics"](driver["diagnostic_json"](data),expected,native["artifact_sha256"])
                 diagnostic_binding = projected["artifact_sha256"]
+            elif name == "native-result.json":
+                driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+                native = driver["diagnostic_json"](data)
+                if native.get("proof_diagnostics") is not None:
+                    if native.get("source_commit") != expected:
+                        raise ValueError("Proof diagnostic source differs")
+                    projected = driver["project_proof_diagnostics"](native["proof_diagnostics"], expected, native["artifact_sha256"],
+                        native.get("profile_id"), native.get("principals", {}), native.get("orders", []), qualified)
+                    if projected["profile_id"] is not None:
+                        profile_bytes = regular(ROOT / "crates/delivery/proof/profile.json", 16384)
+                        if hashlib.sha256(profile_bytes).hexdigest() != projected["artifact_sha256"]["profile"] \
+                                or driver["profile_id"](driver["diagnostic_json"](profile_bytes)) != projected["profile_id"]:
+                            raise ValueError("Proof diagnostic profile differs from the final source")
+                    proof_diagnostic_binding = (native, projected)
             else:
                 json.loads(data)
             (output / name).write_bytes(data); (output / name).chmod(0o644)
@@ -2868,6 +2883,25 @@ def protected_public(run, expected, returncode):
             failures.add("invalid_registration_diagnostic_binding")
             (output / "registration-diagnostics.json").unlink(missing_ok=True)
             public_files.pop("registration-diagnostics.json",None)
+    if proof_diagnostic_binding is not None:
+        try:
+            native, diagnostic = proof_diagnostic_binding
+            provenance = wrappers["artifact-provenance.json"]
+            tested = provenance["testedArtifactSha256"]
+            names = {"binary", "core_binary", "crypto_module", "crypto_wasm", "prover", "r0vm", "profile"}
+            if set(native["artifact_sha256"]) != names or native["artifact_sha256"] != {name: tested[name] for name in names}:
+                raise ValueError("Proof diagnostics differ from the tested artifacts")
+            if diagnostic["availability"] != "unavailable":
+                if native.get("prover_info") != provenance["guestInfo"]:
+                    raise ValueError("Proof diagnostics differ from the tested guest")
+                for fact in qualified:
+                    metadata = json.loads(regular(output / fact["public"], 16384))
+                    if metadata.get("profileId") != diagnostic["profile_id"] or metadata.get("imageId") != provenance["guestInfo"]["imageId"]:
+                        raise ValueError("Proof diagnostic receipt profile differs")
+        except (KeyError, TypeError, ValueError):
+            failures.add("invalid_certified_public_file")
+            (output / "native-result.json").unlink(missing_ok=True)
+            public_files.pop("native-result.json", None)
     observer_summary = None
     try:
         manifest = wrappers["artifact-provenance.json"]["restartObserver"]
@@ -3287,6 +3321,7 @@ def self_test_protected(original):
 
 
     self_test_registration_export(expected)
+    self_test_proof_export(expected)
 
 
 def self_test_registration_export(expected):
@@ -3360,6 +3395,109 @@ def self_test_registration_export(expected):
         output,passed=export(unavailable,1)
         assert not passed and json.loads((output/"registration-diagnostics.json").read_bytes())["availability"]=="unavailable"
     print(f"Registration diagnostic export self-tests passed; full synthetic {len(records)}-event path, 8 resource groups, strict privacy negatives; no processes or proofs")
+
+
+def self_test_proof_export(expected):
+    from copy import deepcopy
+    from unittest.mock import patch
+    driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
+    profile_bytes = regular(ROOT / "crates/delivery/proof/profile.json", 16384)
+    profile = driver["profile_id"](driver["diagnostic_json"](profile_bytes))
+    profile_value = json.loads(profile_bytes)
+    artifacts = {name: "a" * 64 for name in ("binary", "core_binary", "crypto_module", "crypto_wasm", "prover", "r0vm", "profile")}
+    artifacts.update(prover="b" * 64, r0vm="c" * 64, profile=hashlib.sha256(profile_bytes).hexdigest())
+    guest = {"imageId": bytes(profile_value["guest_image_id"]).hex(), "schemaHash": bytes(profile_value["statement_schema_hash"]).hex(),
+             "elfSha256": "e" * 64, "statementBytes": 1504}
+    principals = {node: {"peer": value * 32} for node, value in (("S", "11"), ("R", "22"))}
+    orders = [{"order_id": value * 32, "sha256": "f" * 64} for value in ("ab", "cd")]
+    fixtures = {(node, index): driver["self_test_proof_fixture"](node, index, artifacts, profile) for node in ("S", "R") for index in range(2)}
+    facts = [{"relation": 1, "public": "key-binding.json", "receipt": "key-binding.receipt", "journalHash": "a" * 64,
+              "official_host_verified": True, "wrong_journal_receipt_comparison_rejected": True}]
+    metadata = {"key-binding.json": {"journalHash": "a" * 64, "profileId": profile, "imageId": guest["imageId"]}}
+    receipts = {"key-binding.receipt": b"synthetic key receipt for proof diagnostic exporter selfcheck"}
+    for (node, index), records in fixtures.items():
+        relation, order = records[0]["relation"], orders[index]["order_id"]
+        name = f"order-{order}-relation-{relation}-window-0"
+        metadata[name + ".json"] = {"journalHash": records[0]["job"], "profileId": profile, "imageId": guest["imageId"]}
+        receipts[name + ".receipt"] = b"synthetic order receipt for exporter selfcheck: " + name.encode()
+        facts.append({"relation": relation, "orderId": "0x" + order, "windowIndex": 0, "public": name + ".json", "receipt": name + ".receipt",
+                      "journalHash": records[0]["job"], "official_host_verified": True, "wrong_journal_receipt_comparison_rejected": True})
+    for fact in facts:
+        fact["receiptSha256"] = hashlib.sha256(receipts[fact["receipt"]]).hexdigest()
+        fact["publicSha256"] = hashlib.sha256(json.dumps(metadata[fact["public"]]).encode()).hexdigest()
+    jobs = [driver["summarize_proof_job"](b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in records),
+        node, index, principals[node]["peer"], orders[index]["order_id"], profile, artifacts, [1, 2], records[0]["job"], facts)
+        for (node, index), records in fixtures.items()]
+    diagnostic = {"schema_version": 1, "source_commit": expected, "artifact_sha256": {name: artifacts[name] for name in ("prover", "r0vm", "profile")},
+                  "profile_id": profile, "counter_fields": list(driver["DIAGNOSTIC_COUNTERS"]), "attempt_policy": "first_admitted", "availability": "complete", "jobs": jobs}
+    native = {"source_commit": expected, "artifact_sha256": artifacts, "profile_id": profile, "prover_info": guest,
+              "principals": principals, "orders": orders, "genuine_receipts": facts, "proof_diagnostics": diagnostic}
+    def forbidden(*_args, **_kwargs): raise AssertionError("proof diagnostic export selfcheck started business work")
+    negative_count = 0
+    with tempfile.TemporaryDirectory(prefix="proof-diagnostic-export-selftest-", dir=ARTIFACTS) as temporary, \
+         patch("subprocess.Popen", forbidden), patch("subprocess.run", forbidden), patch("socket.socket", forbidden):
+        parent = Path(temporary)
+        def export(value, *, code=0, wrapper_artifacts=None, duplicate=False):
+            run = parent / uuid.uuid4().hex; run.mkdir(mode=0o700)
+            self_test_observer_fixture(run, expected, value)
+            public = run / "native/public"
+            for name, data in receipts.items(): (public / name).write_bytes(data)
+            for name, data in metadata.items(): (public / name).write_text(json.dumps(data))
+            if duplicate:
+                path = public / "native-result.json"
+                path.write_bytes(path.read_bytes().replace(b'"proof_diagnostics":', b'"proof_diagnostics":null,"proof_diagnostics":', 1))
+                # Authenticate the altered original bytes too; the parser, not a stale hash, must reject them.
+                bindings = observer_bindings(run, expected)
+                raw = json.loads((run / "restart-observer/result.json").read_bytes())
+                raw["native_result_sha256"] = bindings["nativeResultSha256"]
+                (run / "restart-observer/result.json").write_text(json.dumps(raw))
+            observer, passed = write_observer_summary(run, expected, 0, 0)
+            assert passed
+            write_private(run / "artifact-provenance.json", {"sourceCommit": expected, "status": "PASS", "testedArtifactSha256": wrapper_artifacts or artifacts,
+                "guestInfo": guest, "restartObserver": observer})
+            write_private(run / "resources.json", {"status": "PASS"})
+            raw_bytes = (public / "native-result.json").read_bytes()
+            write_private(public / "progress.json", {"source_commit": expected, "scope": "fresh-two-order-protected-native-only", "status": "PASS",
+                "genuine_receipts": facts, "public_files": {"native-result.json": hashlib.sha256(raw_bytes).hexdigest()}})
+            output, passed = protected_public(run, expected, code)
+            return output, passed, raw_bytes
+        output, passed, raw_bytes = export(native)
+        assert passed and (output / "native-result.json").read_bytes() == raw_bytes
+        assert json.loads(raw_bytes)["proof_diagnostics"]["availability"] == "complete" and len(jobs) == 4
+        missing = deepcopy(native); missing.pop("proof_diagnostics")
+        output, passed, raw_bytes = export(missing)
+        assert passed and (output / "native-result.json").read_bytes() == raw_bytes
+        unavailable = deepcopy(native)
+        unavailable["proof_diagnostics"].update(availability="unavailable", jobs=[driver["unavailable_proof_job"](job["node"], job["order_index"]) for job in jobs])
+        for code in (0, 1):
+            output, passed, raw_bytes = export(unavailable, code=code)
+            assert passed == (code == 0) and (output / "native-result.json").read_bytes() == raw_bytes
+        changes = [lambda value: value["proof_diagnostics"].update(source_commit="0" * 40),
+                   lambda value: value["proof_diagnostics"]["artifact_sha256"].update(prover="0" * 64),
+                   lambda value: value["proof_diagnostics"].update(profile_id="0" * 64),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(node="R"),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(order_index=1),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(relation=3),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(window=1),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(job_digest="0" * 64),
+                   lambda value: value["proof_diagnostics"].update(private="PRIVATE_ORDER_DIAGNOSTIC_SENTINEL"),
+                   lambda value: value["proof_diagnostics"]["jobs"][0]["source_activity"]["start"].update(private="PRIVATE_ORDER_DIAGNOSTIC_SENTINEL"),
+                   lambda value: value["proof_diagnostics"]["jobs"][0].update(mode="receipt_reconcile"),
+                   lambda value: value["artifact_sha256"].update(core_binary="0" * 64),
+                   lambda value: value["prover_info"].update(elfSha256="0" * 64)]
+        for change in changes:
+            invalid = deepcopy(native); change(invalid)
+            output, passed, _ = export(invalid)
+            assert not passed and not (output / "native-result.json").exists()
+            assert json.loads((output / "summary.json").read_bytes())["genuineReceipts"] == 5
+            assert all(b"PRIVATE_ORDER_DIAGNOSTIC_SENTINEL" not in path.read_bytes() for path in output.iterdir())
+            negative_count += 1
+        output, passed, _ = export(native, wrapper_artifacts={**artifacts, "r0vm": "0" * 64})
+        assert not passed and not (output / "native-result.json").exists(); negative_count += 1
+        output, passed, _ = export(native, duplicate=True)
+        assert not passed and not (output / "native-result.json").exists(); negative_count += 1
+    print(json.dumps({"proof_diagnostic_export_selftest": "PASS", "concrete_jobs": 4, "qualified_pairs": 5,
+                      "negative_controls": negative_count, "native_bytes_preserved": True, "external_processes": 0, "network_sockets": 0}))
 
 
 if __name__ == "__main__":

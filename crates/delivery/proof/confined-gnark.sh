@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 os.umask(0o077)
 
@@ -33,6 +34,7 @@ def inherited(name, lock=False):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not os.get_inheritable(fd): raise ValueError()
         if not lock and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600
+                         or info.st_nlink != 1 or info.st_size > 32768
                          or not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND
                          or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY): raise ValueError()
         return fd
@@ -42,6 +44,7 @@ def inherited(name, lock=False):
 
 proof_lock = None
 diag_fd = None
+order_format = False
 workers = {}
 temporary = None
 gnark_lock = None
@@ -49,11 +52,12 @@ active_phase = None
 launching = False
 pending_signal = None
 
-def counters(phase):
+def counters(phase, root=None):
     if phase != "shim_workers": return None
     try:
-        relative = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
-        root = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        if root is None:
+            relative = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
+            root = Path("/sys/fs/cgroup") / relative.lstrip("/")
         def values(name):
             result = {}
             for line in (root / name).read_text().splitlines():
@@ -73,9 +77,22 @@ def event(phase, edge, *, worker=None, exit_code=None, signal_number=None, errno
     if edge == "begin": active_phase = phase
     elif active_phase == phase: active_phase = None
     if diag_fd is None: return
-    value = {"v":1, "writer":"shim", "command":"prove", "phase":phase, "edge":edge,
+    value = None if order_format else {"v":1, "writer":"shim", "command":"prove", "phase":phase, "edge":edge,
              "exit_code":exit_code, "signal":signal_number, "errno":errno, "failure_class":failure,
              "worker":worker, "cleanup_requested":cleanup, "counters":counters(phase)}
+    if order_format:
+        root, identity = None, None
+        try:
+            relative = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
+            root = Path("/sys/fs/cgroup") / relative.lstrip("/")
+            info = root.stat(); identity = [info.st_dev, info.st_ino]
+        except (OSError, ValueError, StopIteration): pass
+        sampled = counters(phase, root) if root is not None else None
+        values = [sampled[key] for key in ("pids_max", "memory_max", "oom", "oom_kill", "oom_group_kill")] if sampled is not None else None
+        stamp = time.monotonic_ns()
+        value = {"v":2, "kind":"event", "w":"shim", "c":"prove", "p":phase, "e":edge,
+                 "t":stamp if stamp <= 2**63-1 else None, "x":exit_code, "s":signal_number, "n":errno,
+                 "f":failure, "r":worker, "k":cleanup, "g":identity, "q":values, "i":None, "a":None}
     try:
         data = (json.dumps(value, separators=(",", ":")) + "\n").encode()
         if len(data) > 512 or os.fstat(diag_fd).st_size + len(data) > 32768:
@@ -110,9 +127,12 @@ def cleanup():
     if temporary is not None: shutil.rmtree(temporary, ignore_errors=True)
 
 def run():
-    global proof_lock, diag_fd, temporary, gnark_lock, launching
+    global proof_lock, diag_fd, temporary, gnark_lock, launching, order_format
     proof_lock = inherited("VIBEFACE_DELIVERY_PROOF_LOCK_FD", lock=True)
     diag_fd = inherited("VIBEFACE_DELIVERY_DIAGNOSTIC_FD")
+    format_name = os.environ.get("VIBEFACE_DELIVERY_DIAGNOSTIC_FORMAT")
+    order_format = format_name == "order-job-v2"
+    if format_name is not None and not order_format: diag_fd = None
     if diag_fd == proof_lock: diag_fd = None
     arguments = sys.argv[1:]
     if arguments == ["--version"]:
