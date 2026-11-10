@@ -752,6 +752,13 @@ def self_test():
     assert "inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop'" in gate_command
     small = re.search(r"(?ms)^  delivery-small-prepare:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert 'run: test "$DELIVERY_LIVE" = false' in small
+    assert re.search(r"^    if: (.+)$", small, re.M)[1] == "github.event_name == 'workflow_dispatch' && inputs.delivery_small"
+    prepare_only = workflow.split("      delivery_small_prepare_only:\n", 1)[1].split("      delivery_small_resume_run:", 1)[0]
+    assert "type: boolean" in prepare_only and "default: false" in prepare_only
+    for job in ("delivery-small-proofs", "delivery-small-accept"):
+        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+        condition = re.search(r"^    if: (.+)$", block, re.M)[1]
+        assert "&& !inputs.delivery_small_prepare_only" in condition and "||" not in condition
     assert "runs-on: ubuntu-24.04" in live and "timeout-minutes: 360" in live
     assert 'test "$(uname -s)" = Linux' in live and 'test "$(uname -m)" = x86_64' in live
     assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live

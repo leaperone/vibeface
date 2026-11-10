@@ -98,10 +98,12 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 手动生成真实付费交付证据
 
-`delivery_small` 是默认关闭的独立小实验。显式选中后只运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，跳过常规计划与 aggregate gate，不构建 Android 或运行 full live。两个实验选项不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
+`delivery_small` 是默认关闭的独立小实验。显式选中后默认运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，跳过常规计划与 aggregate gate，不构建 Android 或运行 full live。`delivery_small_prepare_only` 默认 false，仅在 `delivery_small=true` 时生效；设为 true 后只运行 prepare 并上传既有公开准备证据，proofs 和 accept 均跳过。未选中 small 时，该输入不改变其他入口。`delivery_small` 和 `delivery_live` 不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
 
 ```sh
 gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false
+# 只运行四关系准备和执行控制，不启动证明或 accept 的资金与恢复分支。
+gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false -f delivery_small_prepare_only=true
 # 从明确的同源运行续用已合格的公开分项。
 gh workflow run ci.yml --ref <同一提交的分支> -f delivery_small=true -f delivery_live=false -f delivery_small_resume_run=<run-id>
 # 本机只运行准备控制，不生成证明或可复用分项证书。
@@ -113,6 +115,8 @@ python3 scripts/check-delivery.py --sandbox --prove-small prepare
 小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=20 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
 
 `prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
+
+prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute 和 decoder 控制。公开摘要的 `executionControls` 记录各关系的 `cycles` 和 `segments`，其中 cycles 是 `user_cycles`，不包含全部 STARK padding 与 paging 工作。这些控制不生成证明，`PREPARED/NO_PROOF` 不能定位原 Source7200 的全部内部阶段，也不证明原两订单 fresh5 验收通过。guest、profile、11 GiB、64 PIDs、外层 Tokio2 和单 prove7200 均保持原设置。
 
 公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
 

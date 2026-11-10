@@ -600,7 +600,7 @@ def checked_node_summary(value, item, context, commit):
             raise ValueError("Node summary uses a different continuation context")
     elif value["file"] is not None or value["contextSha256"] is not None:
         raise ValueError("Node summary claims a missing context")
-    if value["limits"] != {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64} or value["resourceScope"] != "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS" or value["coverage"] != "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality":
+    if value["limits"] != {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64} or value["resourceScope"] != "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS" or value["coverage"] != "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality":
         raise ValueError("Unexpected experiment limits or coverage claim")
     if any(type(limit) is not int for limit in value["limits"].values()):
         raise ValueError("Invalid experiment limit type")

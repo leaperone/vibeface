@@ -17,6 +17,10 @@ on:
         description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
         type: boolean
         default: false
+      delivery_small_prepare_only:
+        description: 'With delivery_small, run only preparation and execute controls without proofs or settlement'
+        type: boolean
+        default: false
       delivery_small_resume_run:
         description: 'Optional explicit same-source small-experiment run ID to reuse verified public parts'
         type: string
@@ -671,7 +675,7 @@ jobs:
 
   delivery-small-proofs:
     needs: delivery-small-prepare
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small && !inputs.delivery_small_prepare_only
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -706,7 +710,7 @@ jobs:
 
   delivery-small-accept:
     needs: [delivery-small-prepare, delivery-small-proofs]
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && !inputs.delivery_small_prepare_only && needs.delivery-small-prepare.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
