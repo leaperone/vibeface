@@ -1186,7 +1186,7 @@ jobs:
 
   daily-nightly:
     needs: ci-gate
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (!cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success') }}
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     concurrency:

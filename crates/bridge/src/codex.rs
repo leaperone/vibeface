@@ -1236,8 +1236,9 @@ async fn run_session(
                     // to answer; the rest stay with the client that opened the thread.
                     if let Some(id) = request_id(&message)
                         && thread.is_none_or(|thread| observed.borrow().contains(thread))
+                        && let Err(reason) = events.send(ExecEvent::Request(ServerRequest { id, method: method.into(), thread_id: thread.map(str::to_owned), params: message["params"].clone() }))
                     {
-                        if let Err(reason) = events.send(ExecEvent::Request(ServerRequest { id, method: method.into(), thread_id: thread.map(str::to_owned), params: message["params"].clone() })) { break reason; }
+                        break reason;
                     }
                     drop(observed_cache);
                     if (message["method"] == "thread/closed" || message["method"] == "thread/unsubscribed"

@@ -118,14 +118,14 @@ function zip(source, destination, mac) {
     [path.join(repo, 'scripts/zip-directory.py'), source, destination]);
 }
 
-function windowsInstallerManifest(application, includeFile) {
+function windowsInstallerManifest(application, includeFile, planFile = `${includeFile}.plan`) {
   const files = relativeFiles(application);
   const manifest = '.vibeface-installed-files.json';
   assert(!files.includes(manifest), 'the installer ownership manifest must be generated once');
   const known = new Set();
   const directories = new Set();
   for (const name of files) {
-    assert(/^[a-zA-Z0-9._/-]+$/.test(name), `unsafe Windows installer payload path: ${name}`);
+    assert(name.length <= 768 && /^[a-zA-Z0-9._/-]+$/.test(name), `unsafe Windows installer payload path: ${name}`);
     assert(!fs.lstatSync(path.join(application, name)).isSymbolicLink(), 'Windows installer payload must not contain links');
     for (const part of name.split('/')) {
       assert(part && part !== '.' && part !== '..' && !part.endsWith('.') && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part), `unsafe Windows path component: ${part}`);
@@ -141,7 +141,14 @@ function windowsInstallerManifest(application, includeFile) {
   writeJson(path.join(application, manifest), { schema: 1, app: 'vibeface-native-desktop', files, directories: folders });
   const windowsPath = name => name.replaceAll('/', '\\');
   const check = (prefix, name, kind) => `  !insertmacro CheckPath "${prefix}" "$INSTDIR${name ? `\\${windowsPath(name)}` : ''}" "${kind}"`;
+  assert(files.length + folders.length <= 16384, 'installer path plan is too large');
+  const plan = ['vibeface-install-path-plan-v2', ...folders.map(name => `D|${windowsPath(name)}`), ...files.map(name => `F|${windowsPath(name)}`)].join('\r\n') + '\r\n';
+  fs.writeFileSync(planFile, plan);
   const output = [
+    'Function un.IsOwnedPath', '  StrCpy $0 0',
+    ...folders.map(name => `  StrCmp "$PlanKind|$PlanRelative" "D|${windowsPath(name)}" known_owned_path`),
+    ...files.map(name => `  StrCmp "$PlanKind|$PlanRelative" "F|${windowsPath(name)}" known_owned_path`),
+    '  Goto ownership_lookup_done', 'known_owned_path:', '  StrCpy $0 1', 'ownership_lookup_done:', '  Push $0', 'FunctionEnd',
     '!macro ValidateOwnedPaths PREFIX', check('${PREFIX}', '', 'dir'),
     ...folders.map(name => check('${PREFIX}', name, 'dir')),
     ...files.map(name => check('${PREFIX}', name, 'file')), '!macroend',
@@ -153,7 +160,28 @@ function windowsInstallerManifest(application, includeFile) {
     ...folders.flatMap(name => [check('un.', name, 'dir'), `  RMDir "$INSTDIR\\${windowsPath(name)}"`]), '!macroend', '',
   ].join('\n');
   fs.writeFileSync(includeFile, output);
-  return { files, directories: folders, include: output };
+  return { files, directories: folders, include: output, plan };
+}
+
+function buildWindowsUpgradeFixture(portableDirectory, outputDirectory) {
+  assert.equal(process.platform, 'win32', 'installer fixtures are built on the existing hosted Windows runner');
+  assert(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted', 'installer fixture builds are limited to disposable hosted accounts');
+  const temporaryRoot = path.resolve(process.env.RUNNER_TEMP);
+  const location = path.relative(temporaryRoot, path.resolve(outputDirectory));
+  assert(location && !location.startsWith('..') && !path.isAbsolute(location), 'installer fixture output stays below the hosted task temp directory');
+  assert(!fs.existsSync(outputDirectory), 'installer fixture output must be fresh');
+  fs.mkdirSync(outputDirectory, { recursive: true });
+  const payload = path.join(outputDirectory, 'payload');
+  fs.cpSync(portableDirectory, payload, { recursive: true });
+  fs.rmSync(path.join(payload, '.vibeface-installed-files.json'));
+  const collision = path.join(payload, 'resources', 'upgrade-new-file.txt');
+  assert(!fs.existsSync(collision), 'upgrade fixture path must be new to the old payload');
+  fs.writeFileSync(collision, 'new-package-payload');
+  const include = path.join(outputDirectory, 'installer-files.nsh');
+  const plan = path.join(outputDirectory, 'installer-paths.txt');
+  windowsInstallerManifest(payload, include, plan);
+  run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
+    [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${path.join(outputDirectory, 'upgrade-fixture.exe')}`, `/DVERSION=${productVersion()}`, path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
 }
 
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
@@ -224,9 +252,10 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   } else if (windows) {
     if (signed) await signNative([executable]);
     const installerFiles = path.join(stage, 'installer-files.nsh');
-    windowsInstallerManifest(appRoot, installerFiles);
+    const installerPlan = path.join(stage, 'installer-paths.txt');
+    windowsInstallerManifest(appRoot, installerFiles, installerPlan);
     run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
-      [`/DAPP_DIR=${appRoot}`, `/DFILE_MANIFEST=${installerFiles}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+      [`/DAPP_DIR=${appRoot}`, `/DFILE_MANIFEST=${installerFiles}`, `/DPATH_PLAN=${installerPlan}`, `/DOUTPUT=${path.join(produced, `${base}.exe`)}`, `/DVERSION=${version}`, ...(signed ? [`/DSIGNING_SCRIPT=${path.join(repo, 'scripts/windows-signing.mjs')}`] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
     if (signed) await signNative([path.join(produced, `${base}.exe`)]);
   } else {
     run(process.env.PY || 'python3', [path.join(repo, 'scripts/native-desktop/dependencies.py'), '--executable', executable, '--target', target, '--output', path.join(appRoot, 'native-dependencies.json')]);
@@ -362,12 +391,26 @@ function selfTest() {
     assert(!ownership.include.includes('RMDir /r') && !ownership.include.includes('Delete "$INSTDIR\\*'));
     assert.equal((ownership.include.match(/  Delete /g) ?? []).length, ownership.files.length);
     assert.equal((ownership.include.match(/  RMDir /g) ?? []).length, ownership.directories.length);
+    assert.equal(ownership.plan, 'vibeface-install-path-plan-v2\r\nD|resources\\runtime\\web\\assets\r\nD|resources\\runtime\\web\r\nD|resources\\runtime\r\nD|resources\r\nF|.vibeface-installed-files.json\r\nF|Vibeface.exe\r\nF|resources\\runtime\\web\\assets\\hash-old.js\r\n');
+    assert(ownership.include.includes('StrCmp "$PlanKind|$PlanRelative" "F|resources\\runtime\\web\\assets\\hash-old.js" known_owned_path'));
+    assert(!ownership.include.includes('upgrade-new-file.txt'), 'new paths cannot be claimed by the old compiled ownership list');
+    const newerPayload = path.join(scratch, 'newer-windows-payload');
+    fs.cpSync(windowsPayload, newerPayload, { recursive: true });
+    fs.rmSync(path.join(newerPayload, '.vibeface-installed-files.json'));
+    fs.writeFileSync(path.join(newerPayload, 'resources/upgrade-new-file.txt'), 'new package file');
+    const newer = windowsInstallerManifest(newerPayload, path.join(scratch, 'newer-installer-files.nsh'));
+    assert(newer.plan.includes('F|resources\\upgrade-new-file.txt\r\n'));
+    assert(newer.include.includes('F|resources\\upgrade-new-file.txt'));
+    assert(!ownership.include.includes('F|resources\\upgrade-new-file.txt'));
     const installerSource = fs.readFileSync(path.join(desktop, 'build/installer.nsi'), 'utf8');
     assert(!/RMDir\s+\/r\b/i.test(installerSource), 'uninstall must never recursively remove the selected root');
     assert(installerSource.includes('!define MUI_PAGE_CUSTOMFUNCTION_LEAVE ValidateInstallRoot'));
     assert(installerSource.includes('Call ValidateInstallRoot\n  IfFileExists'), 'silent install validates ownership before copying');
     assert(installerSource.includes('/UPGRADE=1 _?=$INSTDIR'), 'owned upgrade uses the previous compiled exact deletion list');
     assert(installerSource.includes('IntOp $4 $2 & 0x400'), 'installation checks reparse attributes');
+    assert(installerSource.includes('vibeface-native-install-v2'), 'old non-preflight uninstallers must fail the ownership protocol');
+    assert(installerSource.includes('FileReadUTF16LE $0 $2') && installerSource.includes('FileWriteUTF16LE $0'), 'ownership markers retain Unicode installation paths');
+    assert(installerSource.indexOf('/S /VERIFYPLAN=') > 0 && installerSource.indexOf('/S /VERIFYPLAN=') < installerSource.indexOf('/S /UPGRADE=1'), 'all upgrade collisions are checked before cleanup');
     const invalidPayload = path.join(scratch, 'invalid-windows-payload');
     fs.mkdirSync(invalidPayload);
     fs.writeFileSync(path.join(invalidPayload, 'CON.txt'), 'reserved device');
@@ -387,6 +430,8 @@ function selfTest() {
     const args = process.argv.slice(2);
     if (args.length === 1 && args[0] === '--self-test') {
       selfTest();
+    } else if (args.length === 3 && args[0] === '--windows-upgrade-fixture') {
+      buildWindowsUpgradeFixture(path.resolve(args[1]), path.resolve(args[2]));
     } else {
       const options = new Map();
       let sign = false;

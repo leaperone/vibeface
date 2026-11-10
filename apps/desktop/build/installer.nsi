@@ -19,6 +19,14 @@ UninstallIcon "${__FILEDIR__}\icon.ico"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 Var Upgrade
+Var VerifyPlan
+Var PlanHandle
+Var PlanLine
+Var PlanKind
+Var PlanRelative
+Var PlanPath
+Var PlanSegment
+Var PlanCount
 
 !macro CheckPath PREFIX PATH KIND
   Push "${PATH}"
@@ -84,11 +92,11 @@ Function ${PREFIX}RequireOwnedRoot
   ClearErrors
   FileOpen $0 "$INSTDIR\.vibeface-install-owned" r
   IfErrors ownership_invalid
-  FileRead $0 $1
-  FileRead $0 $2
-  FileRead $0 $3
+  FileReadUTF16LE $0 $1
+  FileReadUTF16LE $0 $2
+  FileReadUTF16LE $0 $3
   FileClose $0
-  StrCmp $1 "vibeface-native-install-v1$\r$\n" 0 ownership_invalid
+  StrCmp $1 "vibeface-native-install-v2$\r$\n" 0 ownership_invalid
   StrCmp $2 "$INSTDIR$\r$\n" 0 ownership_invalid
   StrCmp $3 "" 0 ownership_invalid
   IfFileExists "$INSTDIR\Uninstall.exe" ownership_done
@@ -139,6 +147,101 @@ invalid_root:
   Call Refuse
 FunctionEnd
 
+Function un.ValidatePlanRelative
+  StrLen $0 $PlanRelative
+  IntCmp $0 0 plan_path_invalid
+  IntCmp $0 768 0 0 plan_path_invalid
+  StrCpy $1 0
+  StrCpy $PlanSegment ""
+plan_character:
+  StrCpy $2 $PlanRelative 1 $1
+  StrCmp $2 "" plan_segment_end
+  StrCpy $3 "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-\"
+  StrCpy $4 0
+plan_allowed:
+  StrCpy $5 $3 1 $4
+  StrCmp $5 "" plan_path_invalid
+  StrCmp $2 $5 plan_character_valid
+  IntOp $4 $4 + 1
+  Goto plan_allowed
+plan_character_valid:
+  StrCmp $2 "\" plan_segment_end
+  StrCpy $PlanSegment "$PlanSegment$2"
+  IntOp $1 $1 + 1
+  Goto plan_character
+plan_segment_end:
+  StrCmp $PlanSegment "" plan_path_invalid
+  StrCmp $PlanSegment "." plan_path_invalid
+  StrCmp $PlanSegment ".." plan_path_invalid
+  StrCpy $3 $PlanSegment 1 -1
+  StrCmp $3 "." plan_path_invalid
+  StrCmp $2 "" plan_path_done
+  StrCpy $PlanSegment ""
+  IntOp $1 $1 + 1
+  Goto plan_character
+plan_path_invalid:
+  Push "The proposed upgrade has an invalid relative package path. The installation was not changed."
+  Call un.Refuse
+plan_path_done:
+  GetFullPathName $PlanPath "$INSTDIR\$PlanRelative"
+  StrCpy $0 "$INSTDIR\"
+  StrLen $1 $0
+  StrCpy $2 $PlanPath $1
+  StrCmp $2 $0 0 plan_path_invalid
+  StrCpy $2 $PlanPath "" $1
+  StrCmp $2 $PlanRelative 0 plan_path_invalid
+FunctionEnd
+
+; This mode reads a proposed plan and compares existing paths with this OLD
+; uninstaller's compiled ownership. The input is never used by deletion code.
+Function un.VerifyNewPlan
+  !insertmacro CheckPath "un." "$VerifyPlan" "file"
+  ClearErrors
+  FileOpen $PlanHandle "$VerifyPlan" r
+  IfErrors invalid_plan
+  FileRead $PlanHandle $PlanLine
+  StrCmp $PlanLine "vibeface-install-path-plan-v2$\r$\n" 0 invalid_plan
+  StrCpy $PlanCount 0
+next_plan_line:
+  ClearErrors
+  FileRead $PlanHandle $PlanLine
+  IfErrors plan_finished
+  IntOp $PlanCount $PlanCount + 1
+  IntCmp $PlanCount 16384 0 0 invalid_plan
+  StrLen $0 $PlanLine
+  IntCmp $0 4 0 invalid_plan
+  StrCpy $0 $PlanLine 2 -2
+  StrCmp $0 "$\r$\n" 0 invalid_plan
+  StrCpy $PlanLine $PlanLine -2
+  StrCpy $PlanKind $PlanLine 1
+  StrCmp $PlanKind "F" kind_valid
+  StrCmp $PlanKind "D" 0 invalid_plan
+kind_valid:
+  StrCpy $0 $PlanLine 1 1
+  StrCmp $0 "|" 0 invalid_plan
+  StrCpy $PlanRelative $PlanLine "" 2
+  Call un.ValidatePlanRelative
+  StrCmp $PlanKind "F" plan_file
+  !insertmacro CheckPath "un." "$PlanPath" "dir"
+  Goto plan_path_checked
+plan_file:
+  !insertmacro CheckPath "un." "$PlanPath" "file"
+plan_path_checked:
+  IfFileExists "$PlanPath" 0 next_plan_line
+  Call un.IsOwnedPath
+  Pop $0
+  StrCmp $0 1 next_plan_line
+  Push "A proposed upgrade path contains an unowned file or directory. The existing installation was not changed."
+  Call un.Refuse
+invalid_plan:
+  Push "The proposed upgrade path plan is invalid. The existing installation was not changed."
+  Call un.Refuse
+plan_finished:
+  FileClose $PlanHandle
+  IntCmp $PlanCount 0 invalid_plan
+  SetErrorLevel 0
+FunctionEnd
+
 Function .onInit
   SetShellVarContext current
   SetRegView 64
@@ -153,6 +256,18 @@ Function un.onInit
   StrCpy $Upgrade 0
   ${GetParameters} $0
   ClearErrors
+  ${GetOptions} $0 "/VERIFYPLAN=" $VerifyPlan
+  IfErrors no_verify_plan
+  StrCmp $VerifyPlan "" invalid_verify_plan
+  Call un.VerifyNewPlan
+  SetErrorLevel 0
+  Quit
+invalid_verify_plan:
+  Push "The proposed upgrade path plan is missing. The existing installation was not changed."
+  Call un.Refuse
+no_verify_plan:
+  ${GetParameters} $0
+  ClearErrors
   ${GetOptions} $0 "/UPGRADE=" $1
   IfErrors no_upgrade
   StrCmp $1 "1" 0 no_upgrade
@@ -164,6 +279,17 @@ Section "Vibeface"
   SetShellVarContext current
   Call ValidateInstallRoot
   IfFileExists "$INSTDIR\.vibeface-install-owned" 0 install_payload
+  ; Only the v2 ownership marker reaches this path. Earlier uninstallers do not
+  ; understand validation-only mode and must never receive an unknown switch.
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  ClearErrors
+  File /oname=vibeface-next-paths.txt "${PATH_PLAN}"
+  IfErrors upgrade_failed
+  ExecWait '$\"$INSTDIR\Uninstall.exe$\" /S /VERIFYPLAN=$\"$PLUGINSDIR\vibeface-next-paths.txt$\" _?=$INSTDIR' $0
+  IfErrors upgrade_failed
+  IntCmp $0 0 upgrade_preflight_done upgrade_failed upgrade_failed
+upgrade_preflight_done:
   ; The previous uninstaller carries its own exact build-generated deletion list,
   ; so obsolete hashed assets are removed without trusting an editable manifest.
   ClearErrors
@@ -186,7 +312,7 @@ install_payload:
   IfErrors copy_failed
   FileOpen $0 "$INSTDIR\.vibeface-install-owned" w
   IfErrors copy_failed
-  FileWrite $0 "vibeface-native-install-v1$\r$\n$INSTDIR$\r$\n"
+  FileWriteUTF16LE $0 "vibeface-native-install-v2$\r$\n$INSTDIR$\r$\n"
   FileClose $0
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "DisplayName" "Vibeface"

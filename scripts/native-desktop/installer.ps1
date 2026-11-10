@@ -23,6 +23,7 @@ if (@(Get-ChildItem -Force $unowned).Count -ne 2 -or (Test-Path $registration)) 
 $userAfter = Join-Path $destination 'user-after.txt'
 $userNested = Join-Path $destination 'user-files\keep.txt'
 $ownedPaths = @()
+$collisionSentinel = $null
 $installed = $false
 try {
   $process = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
@@ -66,9 +67,30 @@ try {
     if ($junctionCreated) { [System.IO.Directory]::Delete($runtimeDirectory) }
     Move-Item $heldRuntime $runtimeDirectory
   }
+  $upgradeFixture = Join-Path $env:RUNNER_TEMP ('Vibeface different payload ' + [guid]::NewGuid().ToString('N'))
+  node scripts/build-desktop.mjs --windows-upgrade-fixture (Split-Path $PortableApp) $upgradeFixture
+  if ($LASTEXITCODE -ne 0) { throw 'Could not build the different-payload upgrade fixture' }
+  $newPayloadPath = 'resources/upgrade-new-file.txt'
+  if ($ownedPaths -contains $newPayloadPath) { throw 'Upgrade collision fixture must use a path absent from the old package' }
+  $collisionSentinel = Join-Path $destination $newPayloadPath
+  if (Test-Path $collisionSentinel) { throw 'Upgrade collision fixture path was not empty' }
+  [System.IO.File]::WriteAllText($collisionSentinel, 'keep-future-package-collision')
+  $oldAsset = @($ownedPaths | Where-Object { $_ -like 'resources/runtime/web/assets/*.js' } | Select-Object -First 1)
+  if ($oldAsset.Count -ne 1) { throw 'The old package has no hashed asset for the upgrade preservation check' }
+  $preservedPaths = @('Vibeface.exe', $oldAsset[0], '.vibeface-install-owned', '.vibeface-installed-files.json', 'Uninstall.exe', $newPayloadPath)
+  $beforeHashes = @{}
+  foreach ($relative in $preservedPaths) { $beforeHashes[$relative] = (Get-FileHash -Algorithm SHA256 (Join-Path $destination $relative)).Hash }
+  $beforeRegistration = Get-ItemProperty $registration | Select-Object InstallLocation,DisplayName,DisplayVersion,UninstallString | ConvertTo-Json -Compress
+  $refused = Start-Process -FilePath (Join-Path $upgradeFixture 'upgrade-fixture.exe') -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
+  if ($refused.ExitCode -eq 0) { throw 'The different-payload installer accepted an unowned new-path collision' }
+  foreach ($relative in $preservedPaths) {
+    if (-not (Test-Path (Join-Path $destination $relative)) -or (Get-FileHash -Algorithm SHA256 (Join-Path $destination $relative)).Hash -ne $beforeHashes[$relative]) { throw 'Refused different-payload upgrade changed the old installation or user file' }
+  }
+  $afterRegistration = Get-ItemProperty $registration | Select-Object InstallLocation,DisplayName,DisplayVersion,UninstallString | ConvertTo-Json -Compress
+  if ($beforeRegistration -ne $afterRegistration) { throw 'Refused different-payload upgrade changed the old registration' }
   $upgraded = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
   if ($upgraded.ExitCode -ne 0) { throw 'An owned upgrade failed' }
-  if ([System.IO.File]::ReadAllText($userAfter) -ne 'keep-after-install' -or [System.IO.File]::ReadAllText($userNested) -ne 'keep-nested-user-file') { throw 'Owned upgrade changed extra user files' }
+  if ([System.IO.File]::ReadAllText($userAfter) -ne 'keep-after-install' -or [System.IO.File]::ReadAllText($userNested) -ne 'keep-nested-user-file' -or [System.IO.File]::ReadAllText($collisionSentinel) -ne 'keep-future-package-collision') { throw 'Owned upgrade changed extra user files' }
   if (Test-Path $machineRegistration) { throw 'Installer unexpectedly wrote machine-wide registration' }
   $receipt = Get-ItemProperty $registration
   if (-not $receipt.UninstallString.Contains($destination)) { throw 'Uninstall registration is not bound to the task-owned installation' }
@@ -124,6 +146,7 @@ try {
     }
     if ([System.IO.File]::ReadAllText($userAfter) -ne 'keep-after-install' -or [System.IO.File]::ReadAllText($userNested) -ne 'keep-nested-user-file') { throw 'Uninstall changed extra user files' }
     if (Test-Path (Join-Path $destination '.vibeface-install-owned')) { throw 'Ownership marker survived uninstall' }
+    if ($collisionSentinel -and [System.IO.File]::ReadAllText($collisionSentinel) -ne 'keep-future-package-collision') { throw 'Uninstall changed the refused-upgrade user file' }
   }
 }
-Write-Output 'Current-user install, unowned-root refusal, copied-uninstaller refusal, junction refusal, owned upgrade, sealed runtime, native window and user-file-preserving uninstall checks passed'
+Write-Output 'Current-user install, unowned-root refusal, copied-uninstaller refusal, junction refusal, nondestructive different-payload collision refusal, owned upgrade, sealed runtime, native window and user-file-preserving uninstall checks passed'
