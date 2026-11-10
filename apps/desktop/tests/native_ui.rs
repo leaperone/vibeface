@@ -1,3 +1,7 @@
+#[path="../src/host/profiles.rs"]
+#[allow(dead_code)]
+pub mod profiles;
+mod host{pub use crate::profiles;}
 #[path="../src/views/records.rs"]
 pub mod records;
 mod views{pub use crate::records;}

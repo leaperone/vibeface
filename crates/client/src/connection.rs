@@ -33,6 +33,17 @@ impl std::fmt::Display for Refused {
 }
 impl std::error::Error for Refused {}
 
+#[derive(Debug)]
+pub(crate) struct Disconnected;
+impl std::fmt::Display for Disconnected {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("connection closed")}}
+impl std::error::Error for Disconnected {}
+pub(crate) fn transport_failure(error:&anyhow::Error)->bool {
+    if error.is::<Disconnected>() || error.is::<tokio::time::error::Elapsed>() {return true;}
+    let io=if let Some(error)=error.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+        match error {tokio_tungstenite::tungstenite::Error::Io(io)=>Some(io),tokio_tungstenite::tungstenite::Error::ConnectionClosed|tokio_tungstenite::tungstenite::Error::AlreadyClosed=>return true,_=>None}
+    } else {error.downcast_ref::<std::io::Error>()};
+    io.is_some_and(|error|matches!(error.kind(),std::io::ErrorKind::ConnectionRefused|std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionAborted|std::io::ErrorKind::TimedOut|std::io::ErrorKind::NotConnected|std::io::ErrorKind::AddrNotAvailable|std::io::ErrorKind::NetworkUnreachable|std::io::ErrorKind::HostUnreachable|std::io::ErrorKind::BrokenPipe|std::io::ErrorKind::UnexpectedEof))
+}
 pub(crate) type BeforeWrite=Box<dyn FnOnce()->futures_util::future::BoxFuture<'static,Result<()>>+Send>;
 struct Request { id: String, bytes: Vec<u8>, reply: oneshot::Sender<Result<Value>>, before_write:Option<BeforeWrite> }
 struct Pending { reply: oneshot::Sender<Result<Value>>, deadline: tokio::time::Instant }
@@ -41,6 +52,11 @@ struct Pending { reply: oneshot::Sender<Result<Value>>, deadline: tokio::time::I
 #[derive(Clone)]
 pub struct Connection { requests: mpsc::Sender<Request>, pushes: broadcast::Sender<Value>, shutdown: watch::Sender<bool> }
 impl Connection {
+    pub(crate) fn disconnected()->Self {
+        let (requests,receiver)=mpsc::channel(LIMIT);drop(receiver);
+        let (pushes,_)=broadcast::channel(128);let (shutdown,_)=watch::channel(true);
+        Self {requests,pushes,shutdown}
+    }
     pub async fn open(origin: &str, identity: &Identity, target: &str) -> Result<Self> {
         Self::open_endpoint(&Endpoint::Gateway(Entry { origin: origin.into(), node_id: target.into() }), identity).await
     }
@@ -63,7 +79,7 @@ impl Connection {
             match transport.recv().await? {
                 Message::Binary(bytes) => { ensure!(handshake.read(&bytes)?.is_empty(), "unexpected handshake payload"); break; }
                 Message::Text(text) => ensure!(serde_json::from_str::<Value>(&text)?["type"] == "queued", "entry refused connection"),
-                Message::Close(_) => bail!("entry closed connection"),
+                Message::Close(_) => return Err(Disconnected.into()),
                 _ => {}
             }
         }
@@ -128,7 +144,7 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
                     for record in records { tokio::time::timeout(Duration::from_secs(10), writer.send(record)).await.context("write timed out; outcome unknown")??; }
                 }
                 frame = frames.recv() => {
-                    let frame = frame.context("connection ended; outcome unknown")??;
+                    let frame = frame.ok_or(Disconnected)??;
                     match frame {
                         Message::Binary(bytes) => {
                             let Some(plain) = channel.open_record(&bytes)? else { continue; };
@@ -141,7 +157,7 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
                                 }
                             } else { let _ = pushes.send(value); }
                         }
-                        Message::Close(_) => bail!("connection closed; outcome unknown"),
+                        Message::Close(_) => return Err(Disconnected.into()),
                         _ => {}
                     }
                 }
@@ -152,8 +168,9 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
             }
         }
     }.await;
-    let error = result.err().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
-    for (_, p) in pending { let _ = p.reply.send(Err(anyhow::anyhow!(error.clone()))); }
+    let failure=result.err();let lost=failure.as_ref().is_none_or(transport_failure);
+    let error=failure.map(|e|e.to_string()).unwrap_or_else(||"connection closed".into());
+    for (_,p) in pending {let _=p.reply.send(Err(if lost {Disconnected.into()} else {anyhow::anyhow!(error.clone())}));}
     let _ = pushes.send(json!({"type":"disconnected"}));
     writer.close().await;
 }
@@ -161,7 +178,7 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
 enum Transport { Web(Socket), Lan(Arc<LanStream>) }
 impl Transport {
     async fn send(&mut self, bytes: Vec<u8>) -> Result<()> { match self { Self::Web(s) => Ok(s.send(Message::Binary(bytes.into())).await?), Self::Lan(s) => Ok(s.send(bytes)?) } }
-    async fn recv(&mut self) -> Result<Message> { match self { Self::Web(s) => s.next().await.context("connection ended")?.map_err(Into::into), Self::Lan(s) => lan_frame(s).await } }
+    async fn recv(&mut self) -> Result<Message> { match self { Self::Web(s) => s.next().await.ok_or(Disconnected)?.map_err(Into::into), Self::Lan(s) => lan_frame(s).await } }
     fn split(self) -> (Writer, Reader) { match self { Self::Web(s) => { let (w,r)=s.split(); (Writer::Web(w),Reader::Web(r)) }, Self::Lan(s) => (Writer::Lan(s.clone()), Reader::Lan(s)) } }
 }
 enum Writer { Web(futures_util::stream::SplitSink<Socket, Message>), Lan(Arc<LanStream>) }

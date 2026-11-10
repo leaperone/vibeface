@@ -23,10 +23,12 @@ impl NativeTray {
         let separator = PredefinedMenuItem::separator();
         menu.append_items(&[&settings, &focus, &separator, &quit])?;
         let icon = tray_icon()?;
-        let icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_icon(icon)
-            .with_icon_as_template(cfg!(target_os = "macos"))
+        let builder = TrayIconBuilder::new().with_menu(Box::new(menu));
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icon);
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(icon);
+        let icon = builder
             .with_menu_on_left_click(false)
             .with_tooltip(format!("Vibeface {}", env!("CARGO_PKG_VERSION")))
             .build()

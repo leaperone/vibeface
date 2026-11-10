@@ -13,3 +13,5 @@ pub use vibeface_protocol::workspace as wire;
 
 pub mod local;
 pub use local::{LocalGrant, LocalTarget};
+
+mod profile;

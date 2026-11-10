@@ -108,6 +108,7 @@ impl Lane {
                     });
                     }
                     if !healthy {
+                        tracing::error!(worker = name, operation = request.operation, "database worker stopped after an operation panic");
                         break;
                     }
                 }
@@ -692,6 +693,7 @@ mod tests {
 #[cfg(test)]
 mod performance {
     use super::*;
+    use anyhow::Context;
     use crate::{crypto::LocalIdentity, identity::NetworkState, model::*};
     use std::sync::atomic::{AtomicBool, Ordering};
 

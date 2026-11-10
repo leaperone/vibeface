@@ -1954,7 +1954,6 @@ impl Executor for Pi {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
-    use tokio::io::AsyncReadExt as _;
 
     fn rpc() -> Arc<Rpc> {
         Arc::new(Rpc {

@@ -71,7 +71,10 @@ impl Runtime {
         let state = self.membership_state().await?;
         ensure!(state.genesis.network_id == access.network_id, "wrong personal network");
         let network = access.network_id.clone(); let local = self.identity.device_id()?;
-        self.store.call("chat_controls.attachment_scope", move |store| store.authorize_node(&network, &local)).await
+        self.store.call("chat_controls.attachment_scope", move |store| {
+            store.authorize_node(&network, &local)?;
+            Ok(())
+        }).await
     }
 
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {

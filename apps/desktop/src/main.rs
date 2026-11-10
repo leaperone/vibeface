@@ -115,8 +115,9 @@ fn run() -> Result<()> {
     };
     let desktop_host =
         host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
+    let credential_base=format!("vibeface-native://{}",hex::encode(sha2::Sha256::digest(options.profile.to_string_lossy().as_bytes())));
     let (tx, events, snapshots, stop, backend_task) =
-        views::backend::Backend::spawn(desktop_host, runtime.handle());
+        views::backend::Backend::spawn(desktop_host, runtime.handle(),credential_base);
     let shutdown = stop.clone();
     let finish_runtime = runtime.clone();
     let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(32);
@@ -142,8 +143,7 @@ fn run() -> Result<()> {
             Ok(tray) => (Some(tray), None),
             Err(error) => (None, Some(format!("系统托盘不可用：{error}"))),
         };
-        let fixture = options.fixture;
-        let credential_scope = format!("vibeface-native://{}", hex::encode(sha2::Sha256::digest(options.profile.to_string_lossy().as_bytes())));
+        let fixture = options.fixture && options.report.is_some();
         let app_tx = tx.clone();let app_stop=stop.clone();let notifications=std::rc::Rc::new(std::cell::RefCell::new(host::platform::Notifications::default()));let app_notifications=notifications.clone();
         let (visible, view) = gpui_kit::open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(820.)), cx))),
@@ -153,7 +153,7 @@ fn run() -> Result<()> {
             window.on_window_should_close(cx, |_, cx| { cx.hide(); false });
             cx.new(|cx| {
                 let mut app = app::Desktop::new(app_tx, app_stop, events, snapshots, window, cx);
-                app.credential_scope = credential_scope;app.notifications=app_notifications;
+                app.notifications=app_notifications;
                 app.notice_is_error=tray_error.is_some();app.notice = tray_error;
                 if fixture { app.configure_fixture(window, cx); }
                 app

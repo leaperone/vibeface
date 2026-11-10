@@ -43,7 +43,7 @@ pub(super) struct SchedulerProjection {
     pending: BTreeSet<Provider>,
 }
 impl SchedulerProjection {
-    fn hold_reason(
+    pub(super) fn hold_reason(
         &self,
         store: &Store,
         network: &str,
@@ -420,7 +420,7 @@ impl Runtime {
         Ok(SchedulerProjection {
             local: self.identity.device_id()?,
             manager: self.manager().map(|manager| manager.provider),
-            limits: self.config.scheduling.clone(),
+            limits: self.config.scheduling,
             pending: Provider::ALL
                 .into_iter()
                 .filter(|provider| self.provider_configuration_pending(*provider, &providers))

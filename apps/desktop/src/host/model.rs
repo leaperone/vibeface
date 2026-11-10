@@ -59,6 +59,8 @@ pub struct Inspect {
     pub web_enabled: bool,
     pub core_version: String,
     #[serde(default)]
+    pub maintenance_socket: Option<PathBuf>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 impl Inspect {
@@ -155,6 +157,7 @@ impl LocalNode {
                     .web_enabled
                     .ok_or_else(|| anyhow::anyhow!("节点接入状态缺失。"))?,
                 core_version: self.core_version.clone().unwrap_or_default(),
+                maintenance_socket: None,
                 error: None,
             };
             inspected.validate()?;

@@ -3077,7 +3077,7 @@ mod tests {
             node.manager().is_none(),
             "fixture has no configured Provider"
         );
-        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (events, receiver) = vibeface_bridge::codex::event_channel();
         node.start_writers(receiver);
         let weak = Arc::downgrade(&node);
 
@@ -5192,24 +5192,86 @@ mod tests {
                 vec![],
                 issued,
             )?)?;
+            let expected_epoch = waiting.project_at(issued + RECOVERY_DELAY_MS)?.epoch;
+            let mut changes = a.membership.subscribe();
             a.install_membership(waiting).await?;
             a.start_recovery_timer();
-            let installs = *a.membership.borrow();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while a.recovery_since_ms(&next).await?.is_none() {
-                ensure!(
-                    Instant::now() < deadline,
-                    "the recovery was not installed when due"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            let installed_at = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    changes.changed().await?;
+                    if let Some(at) = a.recovery_since_ms(&next).await? {
+                        break anyhow::Ok(at);
+                    }
+                }
+            }).await??;
+            let (_, cached) = a.client_membership();
+            let effective = cached.context("committed membership")?.project()?;
+            assert_eq!(effective.epoch, expected_epoch);
+            assert_eq!(effective.recovery_key, next);
+            assert!(effective.node(&ia.device_id()?).is_ok());
+            assert!(a.settle_recovery().await?.is_none());
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(*a.membership.borrow(), installs + 1, "installed once");
+            assert_eq!(a.recovery_since_ms(&next).await?, Some(installed_at), "the durable recovery marker must not be rewritten");
             anyhow::Ok(())
         }
         .await;
+        a.shutdown().await;
         drop(a);
         std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_waiting_recovery_wakes_authority_observers_while_the_writer_is_held() -> Result<()> {
+        use crate::identity::{RECOVERY_DELAY_MS, RootCheckpoint};
+        let identity = LocalIdentity::generate();
+        let state = identity.sign_network_fixture(1, vec![identity.device_id()?])?;
+        let (node, directory) = node(&identity).await?;
+        node.install_membership(state.clone()).await?;
+        let before_epoch = state.project()?.epoch;
+        let next = LocalIdentity::generate().device_id()?;
+        let issued = now_ms() as u64 + 1_000 - RECOVERY_DELAY_MS;
+        let mut waiting = state.clone();
+        waiting.recover(RootCheckpoint::recovery(
+            &state, &identity.fixture_root_at(2), &next, state.project()?.members, vec![], issued,
+        )?)?;
+        node.install_membership(waiting).await?;
+        let mut changed = node.membership.subscribe();
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let writer_node = node.clone();
+        let writer = tokio::spawn(async move {
+            writer_node.store.call("fixture_hold_authority_writer", move |store| {
+                let transaction = store.connection.transaction()?;
+                let count: i64 = transaction.query_row("SELECT count(*) FROM networks", [], |row| row.get(0))?;
+                assert_eq!(count, 1);
+                let _ = entered.send(());
+                held.recv()?;
+                transaction.commit()?;
+                Ok(())
+            }).await
+        });
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(2), running).await??;
+            let projected = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    changed.changed().await?;
+                    let (_, state) = node.client_membership();
+                    let view = state.context("cached authority")?.project()?;
+                    if view.epoch != before_epoch { break anyhow::Ok(view); }
+                }
+            }).await??;
+            assert!(!writer.is_finished(), "permission notification must not wait for the writer");
+            assert_eq!(projected.recovery_key, next);
+            assert!(projected.epoch > before_epoch);
+            anyhow::Ok(())
+        }.await;
+        let _ = release.send(());
+        let written = writer.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        written??;
         result
     }
 

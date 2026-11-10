@@ -922,6 +922,7 @@ impl Runtime {
             rejoin: tokio::sync::Notify::new(),
             log_intake: Default::default(),
         };
+        node.start_authority_projection_timer()?;
         for token in node.relay_tokens() {
             crate::logging::add_credential(token);
         }
@@ -1051,6 +1052,48 @@ impl Runtime {
         }
         self.start_network().await
     }
+    /// Time can change the projected directory before the writer is free to rebuild its rows.
+    /// Wake observers from committed history without delaying that permission check on SQLite.
+    fn start_authority_projection_timer(&self) -> Result<()> {
+        let mut authority = self.client_authority.subscribe();
+        let membership = self.membership.clone();
+        self.background_tasks.spawn(async move {
+            let mut effective = None;
+            loop {
+                let state = authority.borrow_and_update().1.clone();
+                let due = match state.map(|state| state.project()).transpose() {
+                    Ok(Some(view)) => {
+                        let projected = (view.epoch, view.recovery_key);
+                        if effective.as_ref() != Some(&projected) {
+                            effective = Some(projected);
+                            membership.send_modify(|_| {});
+                        }
+                        view.pending.map(|pending| pending.effective_at_ms)
+                    }
+                    Ok(None) => { effective = None; None }
+                    Err(error) => {
+                        tracing::warn!(%error, "committed client authority could not be projected");
+                        membership.send_modify(|_| {});
+                        None
+                    }
+                };
+                let wait = async {
+                    match due {
+                        Some(due) => {
+                            let left = due.saturating_sub(now_ms() as u64).min(15 * 60_000);
+                            tokio::time::sleep(Duration::from_millis(left)).await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = wait => {}
+                    change = authority.changed() => if change.is_err() { return; },
+                }
+            }
+        })
+    }
+
     /// A recovery takes effect with time alone and no new record, so this installs the history
     /// again whenever another directory is in effect: at start, after each membership change, and
     /// when a waiting recovery is due. It wakes at least every 15 minutes and checks the wall
@@ -1270,8 +1313,9 @@ impl Runtime {
                     .collect::<Vec<_>>();
                 let projected_jobs = store.scheduler_jobs_for_scopes(&query_scopes, include_finished)?
                     .into_iter().map(|job| {
-                        let observation = projection.job(store, network, &job, &checks)?;
-                        Ok((job, observation))
+                        let hold = projection.hold_reason(store, network, &job)?;
+                        let context = store.scheduler_job_context_projection(&job)?;
+                        Ok((job, hold, context))
                     }).collect::<Result<Vec<_>>>()?;
                 let sessions = if include_sessions {
                     store.attributed_sessions_all(network)?.into_iter()
@@ -1373,13 +1417,13 @@ impl Runtime {
             .map(|check| format!("{}\n{}", check.conversation_id, check.trigger))
             .collect();
         let jobs = projected_jobs.into_iter()
-            .map(|(job, observation)| {
+            .map(|(job, hold, context)| {
                 let epoch = conversation_by_id
                     .get(job.conversation_id.as_str())
                     .map_or(0, |conversation| conversation.owner_epoch);
                 let mut value = workspace_job_summary(&job, &local, epoch, &pending_jobs);
-                value["hold_reason"] = observation["hold_reason"].clone();
-                value["context"] = observation["context"].clone();
+                value["hold_reason"] = json!(hold);
+                value["context"] = json!(context);
                 value
             })
             .collect::<Vec<_>>();

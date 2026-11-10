@@ -1,7 +1,7 @@
 use super::*;
 
 impl Backend{
- pub(super) fn draft_dir(&self)->Result<PathBuf>{let client=self.client()?;Ok(self.host.client_storage_dir().join("input-drafts").join(client.network_id()).join(client.client_id()))}
+ pub(super) fn draft_dir(&self)->Result<PathBuf>{let client=self.client()?;Ok(self.client_directory()?.join("input-drafts").join(client.network_id()).join(client.client_id()))}
  pub(super) async fn send_draft(&mut self,conversation_id:String,draft:ComposerDraft,saved:Option<DurableInputDraft>)->Result<()>{ensure!(self.state.can_save_locally,"此身份尚未完成可写工作区验证，输入保留在编辑器");
  let client=self.client()?.clone();let target_node=self.active_entry.as_ref().context("目标设备未确认")?.node_id.clone();let directory=self.draft_dir()?;let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"target_node":target_node,"conversation":conversation_id,"draft":draft}))?));let path=directory.join(format!("{}.json",saved.as_ref().map(|d|d.fingerprint.as_str()).unwrap_or(&fingerprint)));
  let mut saved=if let Some(saved)=saved{saved}else if tokio::fs::try_exists(&path).await?{read_draft(path.clone()).await?}else{

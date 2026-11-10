@@ -149,16 +149,39 @@ pub struct Client {
 
 impl Client {
     pub async fn open(key: Arc<ClientKey>, endpoint: Endpoint, outbox_dir: PathBuf) -> Result<Self> {
-        let (connection,network,authority)=Self::authenticate(&key,&endpoint).await?;
+        let (connection,network,authority,proof)=Self::authenticate(&key,&endpoint).await?;
         let client_id=key.device_id().to_owned();
         let outbox_network=network.clone();
         let outbox=tokio::task::spawn_blocking(move||Outbox::open(&outbox_dir,&outbox_network,&client_id)).await??;
-        Self::attach(key,endpoint,connection,network,authority,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new()))).await
+        Self::attach(key,endpoint,connection,network,authority,proof,Arc::new(Mutex::new(outbox)),Arc::new(Semaphore::new(8)),Arc::new(Mutex::new(BTreeMap::new()))).await
     }
+    pub async fn open_or_offline(key:Arc<ClientKey>,endpoint:Endpoint,outbox_dir:PathBuf)->Result<Self> {
+        match Self::open(key.clone(),endpoint.clone(),outbox_dir.clone()).await {
+            Ok(client)=>Ok(client),
+            Err(error) if crate::connection::transport_failure(&error)=>Self::open_offline(key,endpoint,outbox_dir).await.context("Node is unreachable and no usable verified offline profile is available"),
+            Err(error)=>{
+                if error.is::<Revoked>() && let Some(network)=key.network_id() {
+                    let network=network.to_owned();let id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();
+                    tokio::task::spawn_blocking(move||Outbox::open(&outbox_dir,&network,&id)?.invalidate_profile(&target)).await??;
+                }
+                Err(error)
+            }
+        }
+    }
+    pub async fn open_offline(key:Arc<ClientKey>,endpoint:Endpoint,outbox_dir:PathBuf)->Result<Self> {
+        let network=key.network_id().context("offline use needs previously verified membership")?.to_owned();
+        let client_id=key.device_id().to_owned();let target=endpoint.node_id().to_owned();let cache_target=target.clone();let cache_network=network.clone();
+        let (outbox,proof)=tokio::task::spawn_blocking(move||->Result<_>{let db=Outbox::open(&outbox_dir,&cache_network,&client_id)?;let proof=db.cached_profile(&cache_target)?;Ok((db,proof))}).await??;
+        let authority=proof.verify_offline(&key,&target)?;
+        let (events,_)=broadcast::channel(128);
+        Ok(Self {key,connection:Connection::disconnected(),target,network,authority,endpoint,outbox:Arc::new(Mutex::new(outbox)),events,generation:uuid::Uuid::new_v4().to_string(),writes:Arc::new(Semaphore::new(8)),decision_tokens:Arc::new(Mutex::new(BTreeMap::new())),active:Arc::new(AtomicBool::new(false)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(proof.write_gate))})
+    }
+    pub fn is_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open()}
+    pub fn target_node(&self)->&str {&self.target}
     pub async fn open_local(key:Arc<ClientKey>,grant:crate::LocalGrant,outbox_dir:PathBuf)->Result<Self> {
         Self::open(key,Endpoint::Local(grant),outbox_dir).await
     }
-    async fn authenticate(key:&ClientKey, endpoint:&Endpoint)->Result<(Connection,String,ClientAuthority)> {
+    async fn authenticate(key:&ClientKey, endpoint:&Endpoint)->Result<(Connection,String,ClientAuthority,crate::profile::CachedProfile)> {
         let network = match endpoint {Endpoint::Local(grant)=>{ensure!(grant.client_id()==key.device_id(),"local grant belongs to another client");grant.network_id()},_=>key.network_id().context("client is not enrolled")?}.to_owned();
         ensure!(key.network_id().is_none_or(|known|known==network),"entry belongs to another personal network");
         let connection = Connection::open_endpoint(&endpoint, &key.identity).await?;
@@ -180,9 +203,10 @@ impl Client {
         };
         let node = view.member(endpoint.node_id())?;
         ensure!(node.kind == vibeface_secure::membership::IdentityKind::Node, "endpoint is not a network Node");
-        Ok((connection,network,authority))
+        let proof=crate::profile::CachedProfile {network_id:network.clone(),client_id:key.device_id().into(),target_node:endpoint.node_id().into(),state,observed_at_ms:now,write_gate:0,revoked:false};
+        Ok((connection,network,authority,proof))
     }
-    async fn attach(key:Arc<ClientKey>,endpoint:Endpoint,connection:Connection,network:String,authority:ClientAuthority,outbox:Arc<Mutex<Outbox>>,writes:Arc<Semaphore>,decision_tokens:Arc<Mutex<BTreeMap<String,DecisionToken>>>)->Result<Self> {
+    async fn attach(key:Arc<ClientKey>,endpoint:Endpoint,connection:Connection,network:String,authority:ClientAuthority,mut proof:crate::profile::CachedProfile,outbox:Arc<Mutex<Outbox>>,writes:Arc<Semaphore>,decision_tokens:Arc<Mutex<BTreeMap<String,DecisionToken>>>)->Result<Self> {
         let event_network=network.clone();
         let (events, _) = broadcast::channel(128);
         let generation = uuid::Uuid::new_v4().to_string();
@@ -201,15 +225,16 @@ impl Client {
         });
         connection.call("subscribe",json!({})).await?;
         let write_state=connection.call("write_state",json!({})).await?;
-        let gate=write_gate_value(&write_state)?;
+        let gate=write_gate_value(&write_state)?;proof.write_gate=gate;
+        let cache=outbox.clone();tokio::task::spawn_blocking(move||cache.lock().map_err(|_|anyhow::anyhow!("outbox lock poisoned"))?.cache_profile(&proof)).await??;
         Ok(Self {key,connection,target:endpoint.node_id().into(),network,authority,endpoint,outbox,events,generation,writes,decision_tokens,active:Arc::new(AtomicBool::new(true)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(gate))})
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
     pub async fn reconnect(&self,endpoint:Endpoint)->Result<Self> {
         ensure!(!self.revoked.load(Ordering::Acquire),"known revoked profile cannot reconnect");
-        let (connection,network,authority)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>(){self.revoked.store(true,Ordering::Release);}return Err(error);}};
+        let (connection,network,authority,proof)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>() {self.revoked.store(true,Ordering::Release);let target=self.target.clone();self.stored(move|db|db.invalidate_profile(&target)).await?;}return Err(error);}};
         ensure!(network==self.network,"reconnect cannot switch outbox networks");
-        let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
+        let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
         self.close();
         Ok(next)
     }
@@ -265,14 +290,19 @@ impl Client {
     }
     pub async fn read(&self, request: ReadRequest) -> Result<Value> {
         self.require_active()?;let update_gate=matches!(&request,ReadRequest::WriteState);
+        if update_gate && self.write_gate.load(Ordering::Acquire)!=2 {self.write_gate.store(0,Ordering::Release);}
         let (rpc, method, mut params) = request.wire();
         let value=if rpc {params["method"]=json!(method);self.connection.call("rpc",params).await?} else {self.connection.call(method,params).await?};
-        if update_gate {self.write_gate.store(write_gate_value(&value)?,Ordering::Release);}
+        if update_gate {
+            let mut gate=write_gate_value(&value)?;if self.write_gate.load(Ordering::Acquire)==2 {gate=2;}
+            self.write_gate.store(gate,Ordering::Release);let target=self.target.clone();self.stored(move|db|db.cache_write_gate(&target,gate)).await?;
+        }
         Ok(value)
     }
     pub async fn stage(&self,action:Action)->Result<OperationSnapshot> {self.stage_after(action,vec![]).await}
     pub async fn stage_after(&self,action:Action,mut prerequisites:Vec<String>)->Result<OperationSnapshot> {
         ensure!(self.can_save_locally(),"this profile cannot stage network writes");
+        if matches!(&action,Action::Delivery(_)|Action::NodeSettings(_)|Action::ProviderSettings(_)|Action::Triage(_)|Action::Relay {..}|Action::CreateDecisionToken {..}|Action::RevokeDecisionToken {..}|Action::ConfirmWritable|Action::TestWebhook) {ensure!(matches!(self.authority,ClientAuthority::Membership {can_manage:true}),"operation requires a managing member");}
         prerequisites.sort();prerequisites.dedup();
         let client=self.clone();
         self.stored(move|db|client.stage_in(db,action,prerequisites)).await
@@ -320,12 +350,18 @@ impl Client {
         let request:Value=serde_json::from_slice(&operation.bytes)?;
         let network_write=request["method"]=="rpc" || request["method"]=="delivery";
         if network_write && !self.can_send_online() {return Ok(operation.snapshot);}
-        let check=id.clone();if !self.stored(move|db|db.can_begin(&check)).await? {return Ok(operation.snapshot);}
+        if request["method"]=="delivery" {ensure!(matches!(self.authority,ClientAuthority::Membership {can_manage:true}),"delivery requires current management permission");}
+        if !network_write {ensure!(self.can_configure_node(),"Node operation requires current owner permission");}
+        let check=id.clone();if !self.stored(move|db|db.can_begin(&check)).await? {return self.stored(move|db|Ok(db.get(&id)?.snapshot)).await;}
         let sent = async {
             if let Some(conversation_id)=&operation.upload_scope {for attachment in &operation.attachments {self.upload(conversation_id,attachment).await?;}}
             self.require_active()?;
             let before=self.clone();let begin_id=id.clone();
-            let callback:crate::connection::BeforeWrite=Box::new(move||Box::pin(async move {before.require_active()?;before.stored(move|db|db.begin(&begin_id).map(|_|())).await}));
+            let callback:crate::connection::BeforeWrite=Box::new(move||Box::pin(async move {
+                before.require_active()?;
+                let active=before.active.clone();let gate=before.write_gate.clone();let revoked=before.revoked.clone();
+                before.stored(move|db|{ensure!(active.load(Ordering::Acquire) && !revoked.load(Ordering::Acquire) && (!network_write || gate.load(Ordering::Acquire)==1),"operation was not admitted under current authority");db.begin(&begin_id).map(|_|())}).await
+            }));
             self.connection.call_staged(operation.bytes.clone(),callback).await
         }.await;
         match sent {
@@ -376,7 +412,16 @@ impl Client {
             Reconciliation::Input {message_id,target,..} => {
                 ensure!(result["message_id"]==*message_id && result["target"]==serde_json::to_value(target)?,"receipt identifies another input");
                 match result["stage"].as_str() {
-                    Some("entry_accepted"|"owner_accepted"|"submitting"|"provider_accepted"|"associated"|"refused") => Some(OperationState::Accepted),
+                    Some("entry_accepted"|"owner_accepted"|"submitting"|"provider_accepted"|"associated"|"refused") => {
+                        let mut original:Value=serde_json::from_slice(&op.bytes)?;
+                        let mut body=original["params"].take();let object=body.as_object_mut().context("stored input body missing")?;
+                        let scope=object.remove("conversation_id").context("input conversation missing")?;
+                        let attestation=object.remove("attestation").context("input signature missing")?;
+                        object.remove("method");object.insert("type".into(),json!("input_posted"));
+                        let proof=self.connection.call("rpc",json!({"method":"signed_receipt","scope_id":scope,"body":body,"attestation":attestation})).await?;
+                        ensure!(proof["network_id"]==op.snapshot.network_id && proof["client_id"]==op.snapshot.client_id && proof["scope_id"]==scope,"input signed receipt identity mismatch");
+                        match proof["receipt"].as_str() {Some("recorded")=>{ensure!(valid_hash(&proof["event_hash"]),"input has no signed event evidence");Some(OperationState::Accepted)},Some("not_seen_here")=>None,_=>anyhow::bail!("invalid signed input receipt")}
+                    },
                     Some("unknown") => None,
                     _ => anyhow::bail!("invalid input receipt stage"),
                 }
@@ -456,6 +501,9 @@ impl Client {
         let mut reconciliation=Reconciliation::Manual;
         let (rpc,method,mut params,lane,signature)=match action {
             Action::Input {conversation_id,input} => {
+                vibeface_protocol::validate_id(&input.message_id).map_err(anyhow::Error::msg)?;
+                vibeface_protocol::validate_id(&conversation_id).map_err(anyhow::Error::msg)?;
+                ensure!(input.text.len()<=65536 && (!input.text.trim().is_empty() || !input.attachments.is_empty()),"input needs text or an attachment within 65536 bytes");
                 ensure!(input.route.sequence>0,"input sequence must be positive");
                 id=input.message_id.clone(); sequence=Some(input.route.sequence); revision=input.route.expected_revision;
                 attachments=input.attachments.clone();
@@ -675,12 +723,13 @@ mod tests {
                         Some("rpc")=>match request["params"]["method"].as_str() {
                             Some("message")=> {counter.fetch_add(1,Ordering::SeqCst); socket.close(None).await?;break;},
                             Some("input_receipt")=>json!({"message_id":fixture_input.message_id,"target":fixture_input.route.target,"stage":"entry_accepted","retry_safe":false,"control_event":null,"actual_turn_id":null,"reason":null}),
+                            Some("signed_receipt")=>json!({"network_id":fixture_state.genesis.network_id,"client_id":fixture_client_id,"scope_id":"chat","receipt":"recorded","event_hash":"a".repeat(64)}),
                             _=>anyhow::bail!("unexpected fixture RPC"),
                         },
                         _=>anyhow::bail!("unexpected fixture method"),
                     };
                     send(&mut socket,&mut channel,json!({"id":request["id"],"result":result})).await?;
-                    if request["params"]["method"]=="input_receipt" {break;}
+                    if request["params"]["method"]=="signed_receipt" {break;}
                 }
                 Ok::<_,anyhow::Error>(())
             });
@@ -741,4 +790,120 @@ fn validate_memory_state(state:&Value,memory_id:&str)->Result<()> {
 
 fn write_gate_value(value:&Value)->Result<u8> {
     Ok(match value["state"].as_str() {Some("writable")=>1,Some("forked")=>2,Some("read_only"|"aligning")=>3,_=>anyhow::bail!("invalid Node write state")})
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+    use crate::connection::tests::{receive,send,server};
+    use vibeface_secure::{Identity,membership::{Genesis,Member,NetworkState}};
+
+    struct Evidence {counts:BTreeMap<String,u32>,inputs:BTreeMap<String,Value>}
+    async fn fixture(node_secret:&str,state:NetworkState,client_id:String,evidence:Arc<Mutex<Evidence>>,drop_message:Option<String>)->Result<(Endpoint,tokio::task::JoinHandle<Result<()>>)> {
+        let node=Identity::from_secret_hex(node_secret)?;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let entry=crate::Entry {origin:format!("http://{}",listener.local_addr()?),node_id:node.device_id()};
+        let task=tokio::spawn(async move {
+            let (mut socket,mut channel)=server(listener,&node).await?;
+            loop {
+                let request=match receive(&mut socket,&mut channel).await {Ok(value)=>value,Err(_)=>break};
+                let result=match request["method"].as_str() {
+                    Some("authenticate")=>json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}}),
+                    Some("directory")=>json!({"state":state,"now_ms":vibeface_protocol::now_ms()}),
+                    Some("subscribe")=>json!({}),
+                    Some("write_state")=>json!({"state":"writable"}),
+                    Some("rpc")=>match request["params"]["method"].as_str() {
+                        Some("message")=>{
+                            let params=&request["params"];
+                            let id=params["message_id"].as_str().context("message ID")?.to_owned();
+                            let mut body=params.clone();
+                            let object=body.as_object_mut().context("input body")?;
+                            let attestation=object.remove("attestation").context("signature")?;
+                            object.remove("method");object.remove("conversation_id");object.insert("type".into(),json!("input_posted"));
+                            vibeface_secure::verify(&client_id,vibeface_secure::join::ATTESTATION_DOMAIN,&vibeface_secure::join::attestation_payload(&state.genesis.network_id,"chat",&body.to_string())?,attestation["signature"].as_str().context("signature bytes")?)?;
+                            {
+                                let mut saved=evidence.lock().expect("fixture evidence");
+                                *saved.counts.entry(id.clone()).or_default()+=1;
+                                saved.inputs.insert(id.clone(),params.clone());
+                            }
+                            if drop_message.as_deref()==Some(id.as_str()) {socket.close(None).await?;break;}
+                            json!({"accepted":true,"message_id":id})
+                        }
+                        Some("signed_receipt")=>{
+                            let query=&request["params"];let id=query["body"]["message_id"].as_str().context("signed receipt ID")?;
+                            let saved=evidence.lock().expect("fixture evidence");let original=saved.inputs.get(id).context("unrecorded signed input")?;
+                            let mut body=original.clone();let object=body.as_object_mut().context("recorded input")?;
+                            object.remove("method");object.remove("conversation_id");object.remove("attestation");object.insert("type".into(),json!("input_posted"));
+                            let recorded=body==query["body"] && original["attestation"]==query["attestation"];
+                            json!({"network_id":state.genesis.network_id,"client_id":client_id,"scope_id":"chat","receipt":if recorded {"recorded"} else {"not_seen_here"},"event_hash":"a".repeat(64)})
+                        }
+                        Some("input_receipt")=>{
+                            let id=request["params"]["message_id"].as_str().context("receipt ID")?;
+                            let saved=evidence.lock().expect("fixture evidence");
+                            let input=saved.inputs.get(id).context("fixture has not accepted input")?;
+                            json!({"message_id":id,"target":input["target"],"stage":"entry_accepted","retry_safe":false,"control_event":null,"actual_turn_id":null,"reason":null})
+                        }
+                        _=>anyhow::bail!("unexpected fixture RPC"),
+                    },
+                    _=>anyhow::bail!("unexpected fixture method"),
+                };
+                send(&mut socket,&mut channel,json!({"id":request["id"],"result":result})).await?;
+            }
+            Ok(())
+        });
+        Ok((Endpoint::Gateway(entry),task))
+    }
+    fn input(id:&str,target:InputTarget)->Action {
+        Action::Input {conversation_id:"chat".into(),input:InputRequest {message_id:id.into(),route:InputRoute {target,intent:InputIntent::Continue,sequence:0,expected_revision:Some(1)},text:format!("input {id}"),attachments:vec![],report_results:Some(true)}}
+    }
+    #[tokio::test]
+    async fn offline_queue_restart_and_concurrent_flush_preserve_exact_inputs_without_duplicate_effects()->Result<()> {
+        let dir=std::env::temp_dir().join(format!("native-offline-{}",uuid::Uuid::new_v4()));
+        let mut key=ClientKey::create(&dir.join("key"),"client fixture password")?;
+        let node=Identity::generate()?;
+        let state=NetworkState::new(Genesis::create(&Identity::generate()?,Member::client(&key.identity,"client",true)?,Member::node(&node,"node")?)?)?;
+        let evidence=Arc::new(Mutex::new(Evidence {counts:BTreeMap::new(),inputs:BTreeMap::new()}));
+        let (entry,first)=fixture(&node.secret_hex(),state.clone(),key.device_id().into(),evidence.clone(),None).await?;
+        let Endpoint::Gateway(gateway)=&entry else {unreachable!()};key.remember(&state.genesis.network_id,gateway.clone())?;
+        let client=Client::open(Arc::new(key),entry,dir.join("outbox")).await?;
+        let task=InputTarget::Task {task_id:"task".into()};
+        let channel_task=InputTarget::ChannelTask {channel_id:"channel".into(),task_id:"task".into(),bot_id:"bot".into()};
+        let a=client.stage(input("offline-a",task.clone())).await?;
+        assert_eq!((a.state,a.sequence),(OperationState::Prepared,Some(1)));
+        let original=client.stored(|db|Ok(db.get("offline-a")?.bytes)).await?;
+        client.close();first.await??;
+        assert!(client.can_save_locally());
+        let b=client.stage(input("offline-b",channel_task)).await?;
+        let c=client.stage(input("offline-c",task.clone())).await?;
+        assert_eq!((b.sequence,c.sequence),(Some(2),Some(3)),"task and channel-task share one durable sequence");
+        assert_eq!(client.send_staged("offline-a").await?.state,OperationState::Prepared,"a closed transport never admits the write");
+        assert!(evidence.lock().expect("fixture").counts.is_empty());
+        let (entry,second)=fixture(&node.secret_hex(),state.clone(),client.client_id().into(),evidence.clone(),Some("offline-a".into())).await?;
+        let next=client.reconnect(entry).await?;drop(client);
+        let (one,two)=tokio::join!(next.send_staged("offline-a"),next.send_staged("offline-a"));one?;two?;second.await??;
+        assert_eq!(evidence.lock().expect("fixture").counts.get("offline-a"),Some(&1));
+        let d=next.stage_after(input("offline-d",InputTarget::BotMain {bot_id:"other".into()}),vec!["offline-a".into()]).await?;
+        assert_eq!(d.state,OperationState::Prepared);
+        let e=next.stage(input("offline-e",task)).await?;
+        assert_eq!((e.state,e.sequence),(OperationState::Prepared,Some(4)),"new input can be durably saved behind an unknown outcome");
+        drop(next);
+        let key=Arc::new(ClientKey::open(&dir.join("key"),"client fixture password")?);
+        let (entry,third)=fixture(&node.secret_hex(),state,key.device_id().into(),evidence.clone(),None).await?;
+        let client=Client::open(key,entry,dir.join("outbox")).await?;
+        assert_eq!(client.stored(|db|Ok(db.get("offline-a")?.bytes)).await?,original);
+        assert_eq!(client.send_staged("offline-b").await?.state,OperationState::Prepared,"unknown input blocks its lane");
+        assert_eq!(client.send_staged("offline-d").await?.state,OperationState::Prepared,"unknown prerequisite blocks another lane");
+        assert_eq!(evidence.lock().expect("fixture").counts.len(),1);
+        assert_eq!(client.reconcile("offline-a").await?.state,OperationState::Accepted);
+        assert_eq!(client.send_staged("offline-c").await?.state,OperationState::Prepared,"earlier saved inputs preserve order");
+        let (one,two)=tokio::join!(client.send_staged("offline-b"),client.send_staged("offline-b"));one?;two?;
+        assert_eq!(client.send_staged("offline-e").await?.state,OperationState::Prepared,"saved inputs cannot overtake an earlier sequence");
+        assert_eq!(client.send_staged("offline-c").await?.state,OperationState::Accepted);
+        assert_eq!(client.send_staged("offline-e").await?.state,OperationState::Accepted);
+        assert_eq!(client.send_staged("offline-d").await?.state,OperationState::Accepted);
+        assert!(client.pending().await?.is_empty());
+        assert_eq!(evidence.lock().expect("fixture").counts,BTreeMap::from([("offline-a".into(),1),("offline-b".into(),1),("offline-c".into(),1),("offline-d".into(),1),("offline-e".into(),1)]));
+        client.close();drop(client);third.await??;
+        std::fs::remove_dir_all(dir)?;Ok(())
+    }
 }

@@ -13,6 +13,10 @@ on:
         description: 'Prepare the native workspace lockfile and rustfmt patch, then compile without publishing'
         type: boolean
         default: false
+      native_tests:
+        description: 'Run controlled native and runtime tests after a successful preparation compile'
+        type: boolean
+        default: false
       delivery_live:
         description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
         type: boolean
@@ -1241,12 +1245,26 @@ jobs:
             fi
           done
           exit "$result"
+      - name: Run controlled native and runtime tests
+        id: native-tests
+        if: ${{ always() && steps.compile.outcome == 'success' && inputs.native_tests }}
+        run: |
+          result=0
+          for package in vibeface-protocol vibeface-bridge vibeface-client; do
+            if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          done
+          for filter in store::actor store::schema_guard store::client_receipts attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input cli_round_trip runtime::pi::transport_tests runtime::codex_server; do
+            if ! cargo test --locked -p vibeface-core --lib "$filter" -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          done
+          if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
+          exit "$result"
       - name: Record exact preparation outcomes even when the compiler rejects the source
         if: always()
         env:
           LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
           FORMATTING_OUTCOME: ${{ steps.formatting.outcome }}
           COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          TEST_OUTCOME: ${{ steps.native-tests.outcome }}
         run: |
           mkdir -p .artifacts/native-prepare
           cp Cargo.lock .artifacts/native-prepare/Cargo.lock
@@ -1258,7 +1276,7 @@ jobs:
           data = {'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                   'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
                   'lockfile': os.environ['LOCKFILE_OUTCOME'], 'formatting': os.environ['FORMATTING_OUTCOME'],
-                  'compile': os.environ['COMPILE_OUTCOME'], 'publishing': False}
+                  'compile': os.environ['COMPILE_OUTCOME'], 'tests': os.environ['TEST_OUTCOME'], 'publishing': False}
           (root / 'outcomes.json').write_text(json.dumps(data, indent=2) + '\n')
           PYMETA
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

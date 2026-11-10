@@ -93,7 +93,8 @@ impl Outbox {
           CREATE INDEX IF NOT EXISTS operations_lane ON operations(lane, state);
           CREATE TABLE IF NOT EXISTS lane_sequences(lane TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS reserved_sequences(lane TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
-          CREATE TABLE IF NOT EXISTS attachment_leases(owner TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(owner,hash));")?;
+          CREATE TABLE IF NOT EXISTS attachment_leases(owner TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(owner,hash));
+          CREATE TABLE IF NOT EXISTS verified_profiles(target TEXT PRIMARY KEY,payload BLOB NOT NULL);")?;
         let identity: Option<(String, String)> = db
             .query_row("SELECT network,client FROM identity", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -120,6 +121,31 @@ impl Outbox {
             client: client.into(),
         };
         Ok(outbox)
+    }
+    pub(crate) fn cache_profile(&self,profile:&crate::profile::CachedProfile)->Result<()> {
+        ensure!(profile.network_id==self.network && profile.client_id==self.client,"profile cache identity mismatch");
+        let existing:Option<Vec<u8>>=self.db.query_row("SELECT payload FROM verified_profiles WHERE target=?1",[&profile.target_node],|row|row.get(0)).optional()?;
+        if let Some(existing)=existing {
+            let known:crate::profile::CachedProfile=serde_json::from_slice(&existing)?;
+            ensure!(!known.revoked || profile.revoked,"known revocation cannot be overwritten by cached membership");
+            ensure!(known.write_gate!=2 || profile.write_gate==2,"known Node fork cannot be overwritten by older write status");
+        }
+        let bytes=serde_json::to_vec(profile)?;ensure!(bytes.len()<=4*1024*1024,"profile proof exceeds cache limit");
+        let count:u64=self.db.query_row("SELECT count(*) FROM verified_profiles",[],|row|row.get(0))?;
+        let exists:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM verified_profiles WHERE target=?1)",[&profile.target_node],|row|row.get(0))?;
+        ensure!(count<64||exists,"too many cached Node profiles");
+        self.db.execute("INSERT INTO verified_profiles VALUES(?1,?2) ON CONFLICT(target) DO UPDATE SET payload=excluded.payload",params![profile.target_node,bytes])?;Ok(())
+    }
+    pub(crate) fn cached_profile(&self,target:&str)->Result<crate::profile::CachedProfile> {
+        let bytes:Vec<u8>=self.db.query_row("SELECT payload FROM verified_profiles WHERE target=?1",[target],|row|row.get(0))?;
+        ensure!(bytes.len()<=4*1024*1024,"profile cache exceeds limit");Ok(serde_json::from_slice(&bytes)?)
+    }
+    pub(crate) fn cache_write_gate(&self,target:&str,gate:u8)->Result<()> {
+        let mut profile=self.cached_profile(target)?;if profile.write_gate!=2 {profile.write_gate=gate;}
+        self.cache_profile(&profile)
+    }
+    pub(crate) fn invalidate_profile(&self,target:&str)->Result<()> {
+        let mut profile=self.cached_profile(target)?;profile.revoked=true;self.cache_profile(&profile)
     }
     pub(crate) fn reserve_sequence(&mut self, lane: &str) -> Result<u64> {
         let tx = self

@@ -11,6 +11,7 @@ anyhow.workspace = true
 base64 = "0.22"
 futures-util.workspace = true
 gpui-kit = "=0.9.1"
+markdown = "=1.0.0"
 png = "=0.18.1"
 hex.workspace = true
 reqwest.workspace = true

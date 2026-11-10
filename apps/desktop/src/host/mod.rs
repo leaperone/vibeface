@@ -3,7 +3,9 @@ pub mod activation;
 mod bootstrap;
 mod lifecycle;
 mod model;
+mod operator;
 pub mod platform;
+pub mod profiles;
 mod service;
 mod settings;
 pub mod tray;
@@ -11,11 +13,9 @@ pub mod tray;
 pub use bootstrap::BootstrapInvitation;
 pub use model::{
     Discovery, Inspect, LocalNode, NodeIdentity, NodeSource, NodeStatus, OwnedNode, RuntimeState,
-    UnavailableReason,
 };
-pub use service::{
-    BackgroundAction, ManagedNodeStatus, RuntimeUpdate, ServiceState, UpdateAvailability,
-};
+pub use operator::{NodeOperatorChange, NodeOperatorRead, OperatorOutcomeUnknown};
+pub use service::{BackgroundAction, ManagedNodeStatus, ServiceState, UpdateAvailability};
 pub use settings::{NodeMode, Preferences, Settings, Theme};
 
 use anyhow::{Context, Result, bail, ensure};

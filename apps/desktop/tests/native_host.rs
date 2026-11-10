@@ -1,3 +1,4 @@
+#[allow(dead_code, unused_imports)]
 #[path = "../src/host/mod.rs"]
 mod host;
 
