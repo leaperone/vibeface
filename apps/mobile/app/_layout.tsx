@@ -23,7 +23,6 @@ import { LiveWorkspace, useLive, useWaiting } from '@/data/live'
 import { HomeList } from '@/features/home/list'
 import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
-import { cn } from '@/lib/utils'
 
 // The join address last answered here, so a remount or a return to the app does not ask again.
 let answered: string | null = null
@@ -129,10 +128,10 @@ function Screens() {
             return <Link key={href} href={{ pathname: href, params: { tab: '1' } }} replace asChild>
               <Pressable role="button" accessibilityState={{ selected }} accessibilityLabel={href === '/inbox' && waiting ? `${label}，${waiting} 件事等你决定` : label} className="min-h-14 flex-1 items-center justify-center gap-1">
                 <View>
-                  <Icon as={icon} className={cn('size-5', tint)} />
+                  <Icon as={icon} className={`size-5 ${tint}`} />
                   {href === '/inbox' ? <View className="absolute start-3 -top-1.5"><Badge count={waiting} /></View> : null}
                 </View>
-                <Text className={cn('text-meta font-medium', tint)}>{label}</Text>
+                <Text className={`text-meta font-medium ${tint}`}>{label}</Text>
               </Pressable>
             </Link>
           })}

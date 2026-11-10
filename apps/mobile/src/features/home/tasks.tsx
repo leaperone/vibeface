@@ -14,7 +14,7 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { Button } from '@/components/ui/button'
 import { useWorkspace } from '@/data/context'
-import { useInbox, useLive, useWaiting } from '@/data/live'
+import { useInbox, useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 import { WorkspaceTasks } from '@/features/workspace/workspace'
 
@@ -24,7 +24,7 @@ export function TasksScreen() {
   const [filter, setFilter] = useState<TaskGroup | 'all'>('all')
   const [botFilter, setBotFilter] = useState('all')
   const inbox = useInbox()
-  const pending = useWaiting()
+  const pending = inbox.filter((item) => !(item.kind === 'question' && item.done)).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -63,12 +63,10 @@ export function TasksScreen() {
     return [activity.attention]
   })
 
+  const count = (group: TaskGroup) => read ? known.filter((item) => item.group === group).length + taskCounts[group] : null
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
-    {/* The counts are the status filter: a tap shows that group, a second tap shows all again. */}
-    <View className="flex-row gap-2" accessibilityLabel="任务筛选">
-      {taskGroups.map(({ group, title }) => <MobileMetric key={group} label={title} value={read ? known.filter((item) => item.group === group).length + taskCounts[group] : null} tone={group === 'attention' ? 'warning' : group === 'working' ? 'info' : 'neutral'} selected={filter === group} onPress={() => setFilter(filter === group ? 'all' : group)} />)}
-    </View>
-    {!read || !shared?.connectionOnline ? <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : ['连接已断开，显示最近记录'])].join(' · ')}</Text> : null}
+    <MobileMasthead attention={count('attention')} working={count('working')} waiting={count('waiting')} filter={filter} onFilter={setFilter} />
+    <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2"><Button size="sm" hitSlop={4} variant={botFilter === 'all' ? 'secondary' : 'ghost'} accessibilityState={{ selected: botFilter === 'all' }} onPress={() => setBotFilter('all')}><Text>所有 Bot</Text></Button>{(read ? shared?.bots ?? [] : []).map((bot) => <Button key={bot.bot_id} size="sm" hitSlop={4} variant={botFilter === bot.bot_id ? 'secondary' : 'ghost'} accessibilityState={{ selected: botFilter === bot.bot_id }} onPress={() => setBotFilter(bot.bot_id)}><Text>{bot.name}</Text></Button>)}</ScrollView>
     <WorkspaceTasks botFilter={botFilter} filter={filter} />
     <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning-border bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
@@ -103,6 +101,13 @@ function MobileTurn({ activity }: { activity: Extract<WorkspaceActivity, { kind:
   return <View className="gap-1 rounded-xl border border-border bg-card p-4">
     <Text className="font-medium">后台工作 · {status.label}</Text>
     <Text className="text-meta text-muted-foreground">{activity.job.trigger || '未提供触发信息'}{'source_node' in activity.job && activity.job.source_node ? ` · 来源设备 ${activity.job.source_node}` : ''}</Text>
+  </View>
+}
+
+/** The counts are the status filter: a tap shows that group, a second tap shows all again. */
+function MobileMasthead({ filter, onFilter, ...counts }: Record<TaskGroup, number | null> & { filter: TaskGroup | 'all'; onFilter(filter: TaskGroup | 'all'): void }) {
+  return <View className="flex-row gap-2" accessibilityLabel="任务筛选">
+    {taskGroups.map(({ group, title }) => <MobileMetric key={group} label={title} value={counts[group]} tone={group === 'attention' ? 'warning' : group === 'working' ? 'info' : 'neutral'} selected={filter === group} onPress={() => onFilter(filter === group ? 'all' : group)} />)}
   </View>
 }
 
