@@ -107,7 +107,7 @@ Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一�
 
 激活日志和 Compose 文件留在私有 `deploy_dir`。旧 Nginx 文件和离线备份只供激活中回滚；确认新容器后删除，同时删除其他旧 release 目录和上一版镜像，主机只保留当前版本。需要留档时在激活前把数据拷到本地。镜像健康需同时满足容器 running/healthy 与 Core inspect 的 running、版本和 device ID。失败时先停新容器，再恢复旧容器，并恢复 Nginx；全新安装没有旧服务，只停新容器；不会自动覆盖现有数据。中断后的非终态日志会先回滚并退出，检查旧服务后可重跑原命令。新容器无法确认停止时拒绝启动旧进程。确认后的同一请求会再次核对实际容器健康。
 
-`deploy-services` 部署 node 时，无论是否 `apply`，先在 runner 上按上文初始化一个 fixture 数据目录，用只改了 `public-bootstrap.json` 的同一镜像依次演练全新安装、交接和重复激活；演练失败则不触碰主机。
+`deploy-services` 部署 node 时，无论是否 `apply`，先选择候选发布时间之前最近的完整产品 Release，复用制品与摘要校验后构建旧 Core 镜像。旧 Core 初始化并启动 fixture，再在它运行时原子写入候选 Core 生成的完整配置，随后激活候选镜像并重复激活，核对原身份、bootstrap 文件、epoch 和数据库中的初始化记录保留。两个镜像只替换 fixture 的 `public-bootstrap.json`；数据格式和配置均按各自发布版实际生成，不做兼容迁移。fixture 只用回环地址、独立 mesh 和生成的数据。缺少历史完整产品 Release 时输出 `first_release`，验证首次安装和重复激活；其他查询、校验或升级错误一律停止。演练失败则不触碰主机。
 
 本地验证入口均不访问生产服务。
 
@@ -117,4 +117,4 @@ python3 deploy/static-config.py --self-test
 python3 scripts/deploy-activate.py --self-test
 ```
 
-镜像跨 Docker 存储后端传输时，接收端的不可变 ID 可能与构建端不同。导入流程应先校验传输归档的 SHA-256，再使用 Docker 返回的实际导入 ID 执行激活检查。
+导入流程先校验传输归档的 SHA-256，再核对 Docker 返回的唯一不可变 ID 与调用方指定的 `--image` 严格一致。ID 不一致时在停止服务或修改部署数据前拒绝激活，不改用导入结果。

@@ -70,7 +70,9 @@ jobs:
         run: python3 -B scripts/deploy-run.py build --service "$SERVICE" --tag "$RELEASE_TAG" --output .artifacts/deploy
       - name: Rehearse the Core activation on this runner
         if: matrix.service == 'node'
-        run: sudo python3 -B scripts/deploy-run.py rehearse --output .artifacts/deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sudo --preserve-env=GH_TOKEN python3 -B scripts/deploy-run.py rehearse --output .artifacts/deploy
       - name: Activate the pinned container on the configured host
         if: inputs.apply
         env:

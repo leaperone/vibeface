@@ -104,6 +104,8 @@ jobs:
         if: needs.plan.outputs.rust == 'true'
         run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
+        env:
+          GOTOOLCHAIN: go1.26.3
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
@@ -117,7 +119,7 @@ jobs:
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py", "scripts/nightly_source.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
@@ -918,9 +920,12 @@ jobs:
     needs: [plan, package]
     if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
     runs-on: ubuntu-24.04
+    outputs:
+      baseline_artifact: ${{ steps.baseline.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -938,6 +943,21 @@ jobs:
         with:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm/leaperone-vibeface-*.tgz*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Pin one complete public npm baseline for every service runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIBEFACE_RELEASE_SCRATCH: ${{ github.workspace }}/.artifacts/npm-baseline-source
+        run: python3 scripts/verify-node.py --npm-baseline-pin --artifacts .artifacts/npm-service-baseline
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: baseline
+        with:
+          name: npm-service-baseline-${{ github.sha }}
+          path: |
+            .artifacts/npm-service-baseline/baseline.tgz
+            .artifacts/npm-service-baseline/pin.json
+            .artifacts/npm-service-baseline/release.json
           if-no-files-found: error
           retention-days: 14
 
@@ -965,6 +985,12 @@ jobs:
         with:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        with:
+          artifact-ids: ${{ needs.npm-package.outputs.baseline_artifact }}
+          path: .artifacts/npm-service-baseline
+          merge-multiple: true
       - name: Install npm artifact without lifecycle scripts
         id: install
         env:
@@ -994,6 +1020,30 @@ jobs:
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+      - name: Verify native npm service and package replacement
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        env:
+          VENDOR: ${{ steps.install.outputs.vendor }}
+          PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+          NPM_BASELINE_ARTIFACT_ID: ${{ needs.npm-package.outputs.baseline_artifact }}
+        run: |
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            if compgen -G "$HOME/.vibeface*" >/dev/null; then exit 1; fi
+            [[ "${XDG_CONFIG_HOME:-$HOME/.config}" == "$HOME/.config" ]]
+            for directory in "$HOME/.config/systemd/user" /etc/systemd/user /usr/lib/systemd/user /usr/local/lib/systemd/user; do
+              if compgen -G "$directory/vibeface*" >/dev/null || compgen -G "$directory/*/vibeface*" >/dev/null; then exit 1; fi
+            done
+            service_uid="$(id -u)"
+            sudo loginctl enable-linger "$(id -un)"
+            sudo systemctl start "user@$service_uid.service"
+            export XDG_RUNTIME_DIR="/run/user/$service_uid"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            [[ -S "$XDG_RUNTIME_DIR/bus" ]]
+            /usr/bin/systemctl --user show-environment >/dev/null
+          fi
+          prefix="$PWD/.artifacts/npm-installed"
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm-service --npm-service --npm-package ".artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz" --npm-baseline .artifacts/npm-service-baseline
 
   windows-native:
     needs: [plan, package]
@@ -1186,22 +1236,16 @@ jobs:
     permissions:
       contents: write
       actions: write
-      pull-requests: read
     steps:
-      - name: Require the Nightly release token
-        env:
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
-        run: test -n "$NIGHTLY_RELEASE_TOKEN" || { echo '::error::NIGHTLY_RELEASE_TOKEN is missing'; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-      - name: Reconcile four-hour version PR and immutable Nightly archives
+      - name: Reconcile tag-only Nightly sources and immutable archives
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
         run: |
           gh auth setup-git
           python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"

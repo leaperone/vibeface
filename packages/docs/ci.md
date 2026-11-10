@@ -160,11 +160,13 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-定时检查每 4 小时运行一次，使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起。定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+定时检查保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。定时和 Actions 手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。手动 `ci` 只验证和生成制品，不自动补发 Nightly。
 
-每四小时 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，以显式 `!cancelled()` 和 `ci-gate` success 作为条件，允许上游不适用的检查正常跳过。协调器使用固定 concurrency 且不取消进行中的协调。每四小时机械版本 PR 自动 squash 已授权并默认开启，需配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
+`daily-nightly` 接在同一 main schedule run 的 `ci-gate` 后，要求 `!cancelled()` 和 gate success，不增加第二套定时全量 CI。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
 
-协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，Android versionCode 与 iOS buildNumber 各递增一次；延迟启动或跨日重跑复用原批次 PR、版本、构建号、SHA 和留存制品。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则拒绝初始化，避免版本倒退。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、旧批次拒绝倒退、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
+版本提交只使用原 schedule 的精确 main SHA 作 parent。共享来源门核对普通单 parent、完整机械 tree、版本 cohort、两个移动构建号及 `cargo metadata --locked --no-deps`。发布 workflow 验证原 run 的仓库、workflow path、main、SHA 与 `ci-gate` success，不等待包含协调 job 的整体 run success。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。main 上的普通 Tag 继续要求同一 SHA 的 main push CI success，Stable/RC 不允许 detached 来源。
+
+原 run 的 UTC `created_at` 决定四小时批次；延迟和跨日恢复沿用原版本、构建号、SHA、运行与留存 artifact。构建号从 main 和上一可信产品 Nightly 取数值上界加一，iOS 分段溢出时停止。上一来源完整发布且 npm 成功、main 无新提交时跳过；部分 Tag、Release、npm 先恢复原来源，不新建版本覆盖。quick-check 与 preflight 执行现有 Nightly 自测，覆盖真实临时 Git、机械 tree 篡改、原 schedule CI 门、固定 parent、构建号数值比较、同批次及部分发布恢复、Tag 冲突和未知写入对账。详情见 [Nightly 发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -178,13 +180,19 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | 公共节点、排队与私有 relay 令牌验收 | Linux x64 一次，使用 `--public-node` |
 | 全网入网、志愿 relay、relay 选择与无网页 Node 验收 | Linux x64 一次，使用 `--mesh` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
-| Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本，POSIX 平台另执行 `--web-only` 冒烟 |
+| Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本；macOS ARM64、Linux x64/ARM64 另执行 `--web-only` 和 `--npm-service` 原生服务验收 |
+
+`--npm-service` 仅允许无既有 Vibeface 数据或默认服务的 GitHub hosted runner，使用真实 launchd 或 systemd user manager，不能在开发者机器运行。Linux job 显式准备 user manager 和 D-Bus；不可用即失败。验收通过公开 npm CLI 执行安装、启动、停止、重启和卸载，核对服务使用 scoped npm vendor 中的原生程序。
+
+`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。来源相同、基线业务来源超前或 data epoch 不兼容均失败。
+
+受控 Node 和 App Server 夹具从不可变的公开基线包创建真实非空消息及附件，安装真实服务并核对运行状态与数据，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。两包都验证活动 Node、updater 锁、pending journal 和第二 updater 的无修改拒绝。完整的安装、状态、停止、启动、重启换 PID 和卸载生命周期由最终候选包验收；重启后核对原身份、配置、签名历史和附件字节，并确认已完成的受控调用未重放，卸载保留数据。公开基线不承担完整生命周期验收。收据分别记录两包的真实 version、source、摘要和来源关系；候选声明版本相同或较低时如实标注，不称为 SemVer 升级。只验证当前格式，不做跨历史格式迁移，也不据机械版本变化宣称业务升级或真实 Provider 验收。
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Nightly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Nightly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Nightly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
 

@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::sync::watch;
 pub use vibeface_bridge::agent::{AgentFailure as ManagerFailure, StartEvidence};
+pub(crate) use vibeface_bridge::agent::{redact_progress as redact, redact_text as redact_string};
 use vibeface_bridge::{
     agent::{self, AgentResult, CursorAgent, CursorTurn, CustomToolConfig},
     codex::DirectSession,
@@ -1218,31 +1219,6 @@ fn codex_metadata_text(value: &toml::Value) -> Result<&str> {
     );
     Ok(text)
 }
-pub(crate) fn redact_string(mut text: String, secrets: &[String]) -> String {
-    for secret in secrets.iter().filter(|value| !value.is_empty()) {
-        text = text.replace(secret, "[redacted]");
-    }
-    text
-}
-pub(crate) fn redact(value: Value, secrets: &[String]) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact_string(text, secrets)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact(item, secrets))
-                .collect(),
-        ),
-        Value::Object(items) => Value::Object(
-            items
-                .into_iter()
-                .map(|(key, value)| (key, redact(value, secrets)))
-                .collect(),
-        ),
-        value => value,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2188,14 +2164,15 @@ mod tests {
         let config = ManagerConfig {
             tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
             tool_token: Some("turn-token-secret".into()),
+            provider_env: BTreeMap::from([("API_KEY".into(), "other-secret-provider".into())]),
             ..codex(".".into(), "app-server.sock".into())
         };
         assert_eq!(
             redact(
-                json!({"nested":["other-secret","turn-token-secret"]}),
+                json!({"other-secret":["other-secret","turn-token-secret",{"provider":"other-secret-provider"}],"number":1}),
                 &secret_values(&config)
             ),
-            json!({"nested":["[redacted]","[redacted]"]})
+            json!({"other-secret":["[redacted]","[redacted]",{"provider":"[redacted]"}],"number":1})
         );
     }
 }

@@ -80,6 +80,14 @@ def check(source, helpers):
                     for name, block in workflow.items()), 'artifact publication must not deploy services')
     require('release-${{ inputs.tag || github.ref_name }}-' in source,
             'tag pushes and manual publication must share the same concurrency group')
+    identity = workflow['identity']
+    require("command += ['--require-main', '--publish']" in identity
+            and 'release.require_ci(result)' in identity
+            and "result['source_commit'] != os.environ['GITHUB_SHA']" in identity
+            and "os.environ['GITHUB_REPOSITORY'] != release.GITHUB_REPO" in identity,
+            'publication identity must prove exact source, repository and shared CI rules')
+    require('scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish' in helpers['npm-publish.yml'],
+            'npm publication must enforce the same release source rule')
     producers = ['static', 'android', 'ios', *('native-' + target for target in TARGETS)]
     for producer in producers:
         require(needs(workflow[producer]) == {'identity'}, producer + ' waits on an unrelated build')
@@ -236,6 +244,8 @@ def self_test(source, helpers):
     check(source, helpers)
     helper = helpers['release-publish-part.yml']
     broken = [
+        source.replace('release.require_ci(result)', 'pass'),
+        source.replace("command += ['--require-main', '--publish']", "command += ['--publish']"),
         source + '\n  deploy-app:\n    uses: ./.github/workflows/deploy-services.yml\n',
         source.replace('needs: [identity, static, native-macos]', 'needs: [identity, static, native-macos, native-linux-x64]'),
         source.replace('needs: [identity, compose-macos]', 'needs: [identity, compose-macos, compose-windows]'),
