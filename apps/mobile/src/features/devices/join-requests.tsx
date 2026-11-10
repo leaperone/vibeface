@@ -1,3 +1,4 @@
+import * as Haptics from 'expo-haptics'
 import { useEffect, useState } from 'react'
 import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -55,7 +56,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const asking = request.status === 'pending' && !auto
   // As on the web: one 一致，允许 after the codes match, with 设为管理设备 as a switch beside the request.
   const [manage, setManage] = useState(false)
-  const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || '新设备', manage: asManager }) })
+  const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || '新设备', manage: asManager }) })
   return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
     meta={formName[deviceForm(request.kind, request.name)]} actions={<>
     <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>

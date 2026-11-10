@@ -1,5 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import * as DocumentPicker from 'expo-document-picker'
+import * as Haptics from 'expo-haptics'
 import { File } from 'expo-file-system'
 import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, QrCode, Shield, ShieldAlert, ShieldCheck, ShieldX, X, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
@@ -218,13 +219,16 @@ export function RecoveryPendingCard() {
   ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
-    { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', () => device.vetoRecovery(pending.checkpoint)) },
+    { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', async () => { await device.vetoRecovery(pending.checkpoint); void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success) }) },
   ])
-  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<>
-    <Button disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
-    <Button variant="ghost" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); Alert.alert(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
-    <Button variant="destructive" disabled={busy !== null} onPress={stop}><Icon as={Hand} /><Text>{busy ? '处理中' : recoveryCopy.stop}</Text></Button>
-  </>}>
+  // Stopping is the safe answer, so it leads at full weight; letting it take effect early comes last and quietest.
+  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<View className="w-full gap-2">
+    <Button variant="destructive" className="bg-destructive shadow-xs active:bg-destructive/90 dark:bg-destructive dark:active:bg-destructive/90" disabled={busy !== null} onPress={stop}>
+      <Icon as={Hand} className="text-primary-foreground" /><Text className="text-primary-foreground">{busy ? '处理中' : recoveryCopy.stop}</Text>
+    </Button>
+    <Button variant="outline" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); Alert.alert(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
+    <Button variant="ghost" disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
+  </View>}>
     {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}
     {changes.some(({ added }) => !added) ? <Text className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</Text> : null}
     {changes.map(({ member, added }) => {
@@ -248,7 +252,7 @@ export function RecoveryAlert({ top }: { top: number }) {
   if (!pending) return null
   return <View pointerEvents="box-none" className="absolute inset-x-0 w-full max-w-3xl self-center px-4" style={{ top: top + 8 }}>
     <Link href="/inbox" asChild>
-      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs active:opacity-70">
+      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs active:bg-muted">
         <View className="size-8 items-center justify-center rounded-lg bg-danger-soft"><Icon as={ShieldAlert} className="size-4 text-danger" /></View>
         <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{recoveryCopy.pending}</Text>
         <Text className="text-meta text-danger" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</Text>
