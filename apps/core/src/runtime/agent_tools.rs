@@ -1175,7 +1175,7 @@ impl Runtime {
         }
         let (bot_id, _) = created_bot_id(&scope, &manager.trigger, &call_ref);
         let bot = store
-            .bots(network)?
+            .bots(&network)?
             .into_iter()
             .find(|bot| bot.bot_id == bot_id);
         Ok(match bot {

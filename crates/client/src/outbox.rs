@@ -35,6 +35,7 @@ pub(crate) struct Operation {
     pub reconciliation: Reconciliation,
     pub attachments: Vec<Attachment>,
     pub upload_scope: Option<String>,
+    pub prerequisites:Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum Reconciliation {
@@ -91,7 +92,8 @@ impl Outbox {
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, lane TEXT NOT NULL, state TEXT NOT NULL, payload BLOB NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_lane ON operations(lane, state);
           CREATE TABLE IF NOT EXISTS lane_sequences(lane TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
-          CREATE TABLE IF NOT EXISTS reserved_sequences(lane TEXT PRIMARY KEY, sequence INTEGER NOT NULL);")?;
+          CREATE TABLE IF NOT EXISTS reserved_sequences(lane TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS attachment_leases(owner TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(owner,hash));")?;
         let identity: Option<(String, String)> = db
             .query_row("SELECT network,client FROM identity", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -110,23 +112,19 @@ impl Outbox {
             }
         }
         privatefs::sync_dir(dir)?;
-        Ok(Self {
+        let outbox=Self {
             _lock: lock,
             db,
             dir: dir.to_owned(),
             network: network.into(),
             client: client.into(),
-        })
+        };
+        Ok(outbox)
     }
     pub(crate) fn reserve_sequence(&mut self, lane: &str) -> Result<u64> {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE lane=?1 AND state IN ('prepared','unknown'))",[lane],|r|r.get(0))?;
-        ensure!(
-            !blocked,
-            "input lane must be reconciled before another input"
-        );
         let previous:u64=tx.query_row("SELECT MAX(sequence) FROM (SELECT sequence FROM lane_sequences WHERE lane=?1 UNION ALL SELECT sequence FROM reserved_sequences WHERE lane=?1 UNION ALL SELECT 0)",[lane],|r|r.get(0))?;
         let next = previous
             .checked_add(1)
@@ -145,6 +143,18 @@ impl Outbox {
             .prepare("SELECT payload FROM operations ORDER BY rowid")?;
         let rows = query.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         rows.map(|r| Ok(serde_json::from_slice(&r?)?)).collect()
+    }
+    pub(crate) fn find(&self,id:&str)->Result<Option<Operation>> {
+        let bytes:Option<Vec<u8>>=self.db.query_row("SELECT payload FROM operations WHERE id=?1",[id],|row|row.get(0)).optional()?;
+        bytes.map(|bytes|Ok(serde_json::from_slice(&bytes)?)).transpose()
+    }
+    pub(crate) fn can_begin(&self,id:&str)->Result<bool> {
+        let operation=self.get(id)?;
+        if operation.snapshot.state!=OperationState::Prepared {return Ok(false);}
+        let blocked:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE lane=?1 AND state IN ('prepared','unknown') AND rowid<(SELECT rowid FROM operations WHERE id=?2))",params![operation.lane,id],|row|row.get(0))?;
+        if blocked {return Ok(false);}
+        for id in &operation.prerequisites {if self.get(id)?.snapshot.state!=OperationState::Accepted {return Ok(false);}}
+        Ok(true)
     }
     pub(crate) fn get(&self, id: &str) -> Result<Operation> {
         let bytes: Vec<u8> =
@@ -186,17 +196,18 @@ impl Outbox {
             );
             return Ok(());
         }
-        tx.execute("DELETE FROM operations WHERE state IN ('accepted','rejected') AND rowid NOT IN (SELECT rowid FROM operations WHERE state IN ('accepted','rejected') ORDER BY rowid DESC LIMIT 64)", [])?;
+        tx.execute("DELETE FROM operations WHERE state='accepted' AND rowid NOT IN (SELECT rowid FROM operations WHERE state='accepted' ORDER BY rowid DESC LIMIT 64) AND NOT EXISTS(SELECT 1 FROM operations pending,json_each(CAST(pending.payload AS TEXT),'$.prerequisites') dependency WHERE pending.state!='accepted' AND dependency.value=operations.id)", [])?;
         let count: u64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
         ensure!(
             count < 256,
             "outbox is full; reconcile outstanding operations"
         );
-        let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE lane=?1 AND state IN ('prepared','unknown'))", [&operation.lane], |r|r.get(0))?;
-        ensure!(
-            !blocked,
-            "write lane has an unresolved operation; query its receipt first"
-        );
+        ensure!(operation.prerequisites.len()<=16,"too many operation prerequisites");
+        for prerequisite in &operation.prerequisites {
+            let bytes:Vec<u8>=tx.query_row("SELECT payload FROM operations WHERE id=?1",[prerequisite],|row|row.get(0))?;
+            let prior:Operation=serde_json::from_slice(&bytes)?;
+            ensure!(prior.snapshot.target_node==operation.snapshot.target_node,"prerequisite belongs to another target");
+        }
         if let Some(sequence) = operation.snapshot.sequence {
             ensure!(
                 sequence <= 9_007_199_254_740_991,
@@ -226,8 +237,14 @@ impl Outbox {
         tx.commit()?;
         Ok(())
     }
+    pub(crate) fn dismiss_rejected(&mut self,id:&str)->Result<()> {
+        let operation=self.get(id)?;
+        ensure!(operation.snapshot.state==OperationState::Rejected,"only an explicitly rejected operation may be discarded");
+        self.db.execute("DELETE FROM operations WHERE id=?1 AND state='rejected'",[id])?;Ok(())
+    }
     /// Persists uncertainty BEFORE crossing the network boundary. Process death cannot create a retryable write.
     pub(crate) fn begin(&mut self, id: &str) -> Result<Operation> {
+        ensure!(self.can_begin(id)?,"an earlier operation or prerequisite still needs confirmation");
         let mut op = self.get(id)?;
         ensure!(
             op.snapshot.state == OperationState::Prepared,
@@ -266,6 +283,23 @@ impl Outbox {
             params![op.snapshot.id, state, serde_json::to_vec(op)?],
         )?;
         Ok(())
+    }
+    pub(crate) fn retain_attachments(&mut self,owner:&str,references:&[Attachment])->Result<()> {
+        ensure!(!owner.is_empty() && owner.len()<=256,"invalid attachment owner");
+        ensure!(references.len()<=128,"too many attachments in a draft");
+        for attachment in references {self.read_attachment(attachment)?;}
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owners:u64=tx.query_row("SELECT count(DISTINCT owner) FROM attachment_leases",[],|row|row.get(0))?;
+        let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachment_leases WHERE owner=?1)",[owner],|row|row.get(0))?;
+        ensure!(owners<256 || exists,"too many retained attachment drafts");
+        for attachment in references {tx.execute("INSERT OR IGNORE INTO attachment_leases VALUES(?1,?2)",params![owner,attachment.hash])?;}
+        tx.commit()?;Ok(())
+    }
+    pub(crate) fn release_attachments(&self,owner:&str)->Result<()> {
+        self.db.execute("DELETE FROM attachment_leases WHERE owner=?1",[owner])?;Ok(())
+    }
+    pub(crate) fn attachment_owners(&self)->Result<Vec<String>> {
+        Ok(self.db.prepare("SELECT DISTINCT owner FROM attachment_leases ORDER BY owner")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
     /// Content is synced before a SQLite row may reference it. Names never become paths.
     pub fn store_attachment(&self, name: &str, data: &[u8]) -> Result<Attachment> {
@@ -320,12 +354,17 @@ impl Outbox {
         Ok(data)
     }
     /// Explicit cleanup runs with the application's outbox lock held. Referenced bytes survive restart.
-    pub fn collect_unreferenced(&self) -> Result<()> {
-        let hashes: std::collections::HashSet<_> = self
+    pub fn collect_unreferenced(&self) -> Result<()> { self.collect_attachments(&[]) }
+    pub fn collect_attachments(&self,keep:&[Attachment]) -> Result<()> {
+        let mut hashes: std::collections::HashSet<_> = self
             .operations()?
             .into_iter()
+            .filter(|op|op.snapshot.state!=OperationState::Accepted)
             .flat_map(|op| op.attachments.into_iter().map(|a| a.hash))
             .collect();
+        for attachment in keep {self.read_attachment(attachment)?;hashes.insert(attachment.hash.clone());}
+        let mut leases=self.db.prepare("SELECT DISTINCT hash FROM attachment_leases")?;
+        for hash in leases.query_map([],|row|row.get::<_,String>(0))? {hashes.insert(hash?);}
         for entry in std::fs::read_dir(self.dir.join("attachments"))? {
             let entry = entry?;
             if !hashes.contains(&entry.file_name().to_string_lossy().to_string())
@@ -346,7 +385,7 @@ mod tests {
         Operation {
             snapshot:OperationSnapshot {id:id.into(),network_id:"network-a".into(),client_id:"client-a".into(),target_node:"node-a".into(),state:OperationState::Prepared,sequence:Some(1),result:None},
             lane:"chat-a".into(),expected_revision:Some(7),bytes:br#"{"id":"business-1","method":"rpc","params":{"attestation":{"signature":"exact-original"}}}"#.to_vec(),
-            reconciliation:Reconciliation::Manual,attachments:vec![],upload_scope:None,
+            reconciliation:Reconciliation::Manual,attachments:vec![],upload_scope:None,prerequisites:vec![],
         }
     }
     #[test]
@@ -401,5 +440,28 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn draft_lease_survives_a_crash_before_the_ui_sidecar_or_outbox_reference() -> Result<()> {
+        let dir=std::env::temp_dir().join(format!("native-draft-lease-{}",uuid::Uuid::new_v4()));
+        let mut db=Outbox::open(&dir,"network","client")?;
+        let file=db.store_attachment("draft.txt",b"must survive")?;
+        let orphan=db.store_attachment("orphan.txt",b"not referenced")?;
+        db.retain_attachments("message-draft",&[file.clone()])?;
+        drop(db);
+        let db=Outbox::open(&dir,"network","client")?;
+        db.collect_attachments(&[])?;
+        assert_eq!(db.read_attachment(&file)?,b"must survive");
+        assert!(db.read_attachment(&orphan).is_err());
+        assert_eq!(db.attachment_owners()?,vec!["message-draft"]);
+        db.release_attachments("message-draft")?;
+        db.collect_attachments(&[])?;
+        assert!(db.read_attachment(&file).is_err());
+        drop(db);std::fs::remove_dir_all(dir)?;Ok(())
     }
 }

@@ -5424,8 +5424,8 @@ pub(super) mod tests {
                     .await?;
                     let epoch = {
                         let store = (network).to_owned();
-                        node.store.call("triage.test.conversation", move |store| {
-                            store.conversation(&store, "c")
+                        node.store.call("triage.test.conversation", move |database| {
+                            database.conversation(&store, "c")
                         }).await
                     }?
                         .context("Bot")?
@@ -6053,11 +6053,11 @@ pub(super) mod tests {
         let local = node.identity.device_id()?;
         {
             let network = (network).to_owned();
-            let node = (local).to_owned();
+            let local_node = (local).to_owned();
             let session = (session).to_owned();
             node.store
                 .call("triage.test.session_owner", move |store| {
-                    store.session_owner(&network, &node, &session)
+                    store.session_owner(&network, &local_node, &session)
                 })
                 .await
         }

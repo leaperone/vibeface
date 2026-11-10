@@ -62,10 +62,22 @@ impl Runtime {
         Ok(json!({"work":value,"coverage":{"source":"shared_history","complete":false}}))
     }
 
+    async fn require_attachment_scope(&self, access: &Access, scope: &str) -> Result<()> {
+        if scope != crate::workspace::WORKSPACE_SCOPE {
+            return self.require_scope(access, scope).await;
+        }
+        ensure!(access.human && access.conversation_id.is_none(),
+            "workspace attachments need the user's personal network access");
+        let state = self.membership_state().await?;
+        ensure!(state.genesis.network_id == access.network_id, "wrong personal network");
+        let network = access.network_id.clone(); let local = self.identity.device_id()?;
+        self.store.call("chat_controls.attachment_scope", move |store| store.authorize_node(&network, &local)).await
+    }
+
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "artifact access requires the user");
         let scope = field(input, "conversation_id")?;
-        self.require_scope(access, scope).await?;
+        self.require_attachment_scope(access, scope).await?;
         let hash = field(input, "blob_hash")?;
         if input["binary"] == true {
             use base64::Engine as _;
@@ -111,7 +123,7 @@ impl Runtime {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(access.human, "only the user sends attachments");
         let scope = field(input, "conversation_id")?;
-        self.require_scope(access, scope).await?;
+        self.require_attachment_scope(access, scope).await?;
         let blob = BlobRef {
             hash: field(input, "hash")?.into(),
             size: input["size"].as_u64().context("size is required")?,
@@ -121,7 +133,7 @@ impl Runtime {
             "attachment must be 1 byte to 64 MiB"
         );
         let _upload = self.blob_fetch.lock().await;
-        self.require_scope(access, scope).await?;
+        self.require_attachment_scope(access, scope).await?;
         let (part, target, committed) = {
             let hash = blob.hash.clone();
             self.store
@@ -786,4 +798,59 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
         works.push(value);
     }
     Ok(works)
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use crate::runtime::{test_support::access as test_access, triage::tests::{bot, node}};
+    use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
+    use base64::Engine as _;
+
+    #[tokio::test]
+    async fn workspace_channel_upload_and_download_require_unscoped_human_network_access() -> Result<()> {
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "Channel bot", &[]).await?;
+            let network = node.network_id().await?;
+            let access = test_access(network.clone(), true, None);
+            let bytes = b"workspace channel attachment";
+            let attachment = Attachment { hash: crate::crypto::digest(bytes), size: bytes.len() as u64, name: "channel.txt".into() };
+            let upload = json!({"conversation_id":WORKSPACE_SCOPE,"hash":attachment.hash,"size":bytes.len(),"offset":0,
+                "data":base64::engine::general_purpose::STANDARD.encode(bytes)});
+            for restricted in [test_access(network.clone(), false, None), test_access(network.clone(), false, Some("c".into())),
+                test_access(network.clone(), true, Some("c".into())), test_access("another-network".into(), true, None)] {
+                assert!(node.upload_attachment(&restricted, &upload).await.is_err());
+            }
+            assert_eq!(node.upload_attachment(&access, &upload).await?, json!({"offset":bytes.len(),"complete":true}));
+            let read = json!({"conversation_id":WORKSPACE_SCOPE,"blob_hash":attachment.hash,"binary":true});
+            assert!(node.read_artifact(&access, &read).await.is_err(), "upload alone grants no reference");
+            for (id, command) in [
+                ("create-channel", WorkspaceCommand::CreateChannel { channel_id: "channel".into(), title: "Synthetic".into(),
+                    purpose: "File round trip".into(), members: vec!["c".into()], coordinator_bot: "c".into(), coordinator_node: node.identity.device_id()? }),
+                ("post-channel", WorkspaceCommand::PostChannelMessage { channel_id: "channel".into(), message_id: "channel-message".into(),
+                    text: "Read attached file".into(), attachments: vec![attachment.clone()], recipient_bot: None, task_id: None, reply_to: None }),
+            ] {
+                let signed = admin.attest(&network, WORKSPACE_SCOPE, EventBody::WorkspaceCommanded { command_id: id.into(), command: command.clone(),
+                    attestation: None, cause: None, acting_assignment: None })?;
+                let reply = node.workspace_command(&access, &json!({"command_id":id,"command":command,"attestation":signed.attestation()})).await?;
+                assert!(reply["event_hash"].as_str().is_some());
+            }
+            let reply = node.read_artifact(&access, &read).await?;
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(reply["data"].as_str().context("binary page")?)?, bytes);
+            let text = node.read_artifact(&access, &json!({"conversation_id":WORKSPACE_SCOPE,"blob_hash":attachment.hash})).await?;
+            assert_eq!(text["text"], "workspace channel attachment");
+            for restricted in [test_access(network.clone(), false, None), test_access(network.clone(), false, Some("c".into())),
+                test_access(network.clone(), true, Some("c".into())), test_access("another-network".into(), true, None)] {
+                assert!(node.read_artifact(&restricted, &read).await.is_err());
+            }
+            assert!(node.read_artifact(&access, &json!({"conversation_id":"c","blob_hash":attachment.hash})).await.is_err());
+            assert!(node.read_artifact(&access, &json!({"conversation_id":WORKSPACE_SCOPE,"blob_hash":crate::crypto::digest(b"absent")})).await.is_err());
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
 }

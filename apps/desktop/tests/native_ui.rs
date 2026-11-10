@@ -1,3 +1,6 @@
+#[path="../src/views/records.rs"]
+pub mod records;
+mod views{pub use crate::records;}
 #[path="../src/ui.rs"]
 #[allow(dead_code)]
 mod ui;

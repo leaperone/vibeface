@@ -5,8 +5,10 @@
 //! manager's signed grant. It then signs exactly what those clients sign. The Node never signs
 //! governance for it.
 
-use crate::connection::Connection;
+use crate::connection::{Connection, Endpoint};
 mod plan;
+mod enrollment;
+pub use enrollment::{Enrollment, Progress};
 pub use plan::{IdentityPlan, IdentityOperationState};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -149,7 +151,8 @@ impl ClientKey {
         privatefs::write_atomic(
             &self.dir.join(KEY_FILE),
             &serde_json::to_vec_pretty(&self.file)?,
-        )
+        )?;
+        enrollment::clear_joined(self, network_id)
     }
 
     /// Opens a channel to the remembered Node, or to `entry` when given.
@@ -158,13 +161,14 @@ impl ClientKey {
             .or(self.file.entry.as_ref())
             .context("this client is not enrolled yet; run vibeface client enroll")?
             .clone();
-        let connection = Connection::open(&entry.origin, &self.identity, &entry.node_id).await?;
-        Ok(Session {
-            key: self,
-            connection,
-            entry,
-        })
+        self.connect_endpoint(&Endpoint::Gateway(entry)).await
     }
+
+    pub async fn connect_endpoint(&self, endpoint:&Endpoint)->Result<Session<'_>> {
+        let connection=Connection::open_endpoint(endpoint,&self.identity).await?;
+        Ok(self.session(connection,endpoint.clone()))
+    }
+    pub(crate) fn session(&self,connection:Connection,entry:Endpoint)->Session<'_> {Session {key:self,connection,entry}}
 
     pub(crate) fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
         Ok(self.identity.sign(domain, payload)?)
@@ -175,7 +179,7 @@ impl ClientKey {
 pub struct Session<'a> {
     key: &'a ClientKey,
     pub connection: Connection,
-    pub entry: Entry,
+    pub entry: Endpoint,
 }
 
 /// The directory as this client checked it, at the Node's time.
@@ -311,7 +315,7 @@ impl Session<'_> {
         let registered = self.call("invite", json!({"record":record})).await?;
         let entry = NodeLink::parse(registered["entry"].as_str().context("entry is missing")?)?;
         ensure!(
-            self.entry.node_id == entry.device_id(),
+            self.entry.node_id() == entry.device_id(),
             "the invite names another Node than the one this client reached"
         );
         Ok(Ticket::new(entry, secret)?.link()?)
@@ -491,130 +495,6 @@ impl Pins {
     }
 }
 
-/// The joiner's side of an invite, from `join` to the grant.
-pub struct Enrollment<'a> {
-    session: Session<'a>,
-    pub join_id: String,
-    nonce: Zeroizing<String>,
-    /// What the first confirming answer named; a later one must agree.
-    admin: Option<(String, String, String)>,
-}
-
-/// How far an enrollment got.
-pub enum Progress {
-    Waiting,
-    /// Compare this code with the one the approving device shows.
-    Code(String),
-    Joined,
-}
-
-impl<'a> Enrollment<'a> {
-    /// Sends `join` for `link` through `origin`, whose Gateway reaches the invite's Node.
-    pub async fn start(key: &'a ClientKey, origin: &str, link: &str, name: &str) -> Result<Self> {
-        let ticket = Ticket::from_link(link)?;
-        let entry = Entry {
-            origin: origin.to_owned(),
-            node_id: ticket.entry_id(),
-        };
-        let mut session = key.connect(Some(&entry)).await?;
-        let authenticated = session.call("authenticate", json!({})).await?;
-        ensure!(
-            authenticated["revoked"] != true,
-            "this client key was removed from the network; delete its key file and enroll again"
-        );
-        ensure!(
-            authenticated["principal"].is_null(),
-            "this client is already a member"
-        );
-        let nonce = Zeroizing::new(hex::encode(rand::random::<[u8; 32]>()));
-        let request = session
-            .call(
-                "join",
-                json!({"secret":hex::encode(ticket.secret),"public_key":key.device_id(),
-                    "kind":"client","name":name,"commit":join_commit(key.device_id(), &nonce)?}),
-            )
-            .await?;
-        ensure!(
-            request["invite_id"] == invite_id(&ticket.invite_hash())?,
-            "the Node answered for another invite"
-        );
-        Ok(Self {
-            join_id: text(&request, "join_id")?.to_owned(),
-            session,
-            nonce,
-            admin: None,
-        })
-    }
-
-    /// One look at the join; reveals this side's nonce once a manager confirmed it.
-    pub async fn poll(&mut self) -> Result<Progress> {
-        let mut status = self
-            .session
-            .call("join_status", json!({"join_id":self.join_id}))
-            .await?;
-        match status["status"].as_str() {
-            Some("pending") => Ok(Progress::Waiting),
-            Some("confirming") => {
-                let admin = (
-                    text(&status, "network_id")?.to_owned(),
-                    text(&status, "admin_id")?.to_owned(),
-                    text(&status, "admin_nonce")?.to_owned(),
-                );
-                let pinned = self.admin.get_or_insert_with(|| admin.clone());
-                ensure!(
-                    *pinned == admin,
-                    "the approving device changed mid-join; start again"
-                );
-                if status["joiner_nonce"].is_null() {
-                    status = self
-                        .session
-                        .call(
-                            "join_status",
-                            json!({"join_id":self.join_id,"reveal":self.nonce.as_str()}),
-                        )
-                        .await?;
-                }
-                Ok(Progress::Code(short_code(
-                    &admin.0,
-                    text(&status, "invite_id")?,
-                    self.session.key.device_id(),
-                    &admin.1,
-                    &admin.2,
-                    &self.nonce,
-                )?))
-            }
-            Some("joined") => {
-                let state: NetworkState = serde_json::from_value(status["state"].take())?;
-                let network = text(&status, "network_id")?;
-                ensure!(
-                    state.genesis.network_id == network
-                        && self
-                            .admin
-                            .as_ref()
-                            .is_none_or(|(pinned, ..)| pinned == network),
-                    "the Node answered for another personal network"
-                );
-                state.project()?.client(self.session.key.device_id())?;
-                Ok(Progress::Joined)
-            }
-            other => bail!(
-                "the join ended: {} {}",
-                other.unwrap_or("unknown"),
-                status["reason"].as_str().unwrap_or_default()
-            ),
-        }
-    }
-
-    /// The network joined and the Node it was joined through.
-    pub fn finish(self) -> Result<(String, Entry)> {
-        let network = self
-            .admin
-            .map(|(network, ..)| network)
-            .context("the join finished without a confirmation")?;
-        Ok((network, self.session.entry))
-    }
-}
-
 /// The recovery file a browser saves: the root key, sealed with the recovery password.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -671,6 +551,7 @@ pub async fn prepare_create(
     recovery_file: &Path,
     password: &str,
 ) -> Result<IdentityPlan> {
+    ensure!(!IdentityPlan::exists(key),"an identity operation is pending; reopen it instead of generating another root");
     let mut session = key.connect(Some(&entry)).await?;
     let info = session.call("info", json!({})).await?;
     ensure!(
@@ -708,6 +589,7 @@ pub async fn prepare_recovery(
     name: &str,
     capability: Option<&str>,
 ) -> Result<IdentityPlan> {
+    ensure!(!IdentityPlan::exists(key),"an identity operation is pending; reopen it instead of generating another root");
     let material = read_recovery_file(recovery_file, password)?;
     let root = Identity::from_secret_hex(&material.root_secret_key)?;
     let me = key.device_id().to_owned();

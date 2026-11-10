@@ -5,31 +5,118 @@ mod theme;
 mod ui;
 mod views;
 mod widgets;
-use sha2::Digest;
-use anyhow::{Context,Result,ensure};
+use anyhow::{Context, Result, ensure};
 use gpui_kit::*;
-use std::{path::PathBuf,sync::Arc,time::Duration};
-use host::{activation::{SingleInstance,InstanceClaim,Activation},platform::NativeAction};
+use host::{
+    activation::{Activation, InstanceClaim, SingleInstance},
+    platform::NativeAction,
+};
+use sha2::Digest;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-struct Options{profile:PathBuf,runtime:PathBuf,report:Option<PathBuf>,fixture:bool,args:Vec<String>}
-impl Options{
- fn parse()->Result<Self>{let args=std::env::args().skip(1).collect::<Vec<_>>();let mut profile=None;let mut runtime=None;let mut report=None;let mut fixture=false;let mut index=0;while index<args.len(){match args[index].as_str(){"--profile-dir"|"--runtime-dir"|"--acceptance-report"=>{let option=args[index].clone();index+=1;let path=PathBuf::from(args.get(index).context("参数缺少路径")?);ensure!(path.is_absolute(),"路径必须是绝对路径");match option.as_str(){"--profile-dir"=>profile=Some(path),"--runtime-dir"=>runtime=Some(path),_=>report=Some(path)}},"--controlled-fixture"=>fixture=true,value if value.starts_with("vibeface:")=>{},_=>anyhow::bail!("未知桌面参数")};index+=1;}
- let profile=match profile{Some(path)=>path,None=>default_profile()?};if runtime.is_some(){ensure!(fixture,"--runtime-dir 仅允许受控验收夹具使用");}let executable=std::env::current_exe()?;let parent=executable.parent().context("程序路径缺少父目录")?;let runtime=runtime.unwrap_or_else(||if cfg!(target_os="macos"){parent.parent().unwrap_or(parent).join("Resources/runtime")}else{parent.join("resources/runtime")});if let Some(path)=&report{ensure!(fixture,"验收报告仅在 --controlled-fixture 模式提供");ensure!(path.starts_with(&profile),"验收报告必须位于受控 profile 目录内");}Ok(Self{profile,runtime,report,fixture,args})}
+struct Options {
+    profile: PathBuf,
+    runtime: PathBuf,
+    report: Option<PathBuf>,
+    fixture: bool,
+    args: Vec<String>,
 }
-fn default_profile()->Result<PathBuf>{
- #[cfg(target_os="macos")]let base=PathBuf::from(std::env::var_os("HOME").context("无法定位当前用户目录")?).join("Library/Application Support");
- #[cfg(target_os="windows")]let base=PathBuf::from(std::env::var_os("LOCALAPPDATA").context("无法定位当前用户应用目录")?);
- #[cfg(not(any(target_os="macos",target_os="windows")))]let base=std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or(PathBuf::from(std::env::var_os("HOME").context("无法定位当前用户目录")?).join(".local/share"));
- Ok(base.join("Vibeface/native-desktop"))
+impl Options {
+    fn parse() -> Result<Self> {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        let mut profile = None;
+        let mut runtime = None;
+        let mut report = None;
+        let mut fixture = false;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--profile-dir" | "--runtime-dir" | "--acceptance-report" => {
+                    let option = args[index].clone();
+                    index += 1;
+                    let path = PathBuf::from(args.get(index).context("参数缺少路径")?);
+                    ensure!(path.is_absolute(), "路径必须是绝对路径");
+                    match option.as_str() {
+                        "--profile-dir" => profile = Some(path),
+                        "--runtime-dir" => runtime = Some(path),
+                        _ => report = Some(path),
+                    }
+                }
+                "--controlled-fixture" => fixture = true,
+                value if value.starts_with("vibeface:") => {}
+                _ => anyhow::bail!("未知桌面参数"),
+            };
+            index += 1;
+        }
+        let profile = match profile {
+            Some(path) => path,
+            None => default_profile()?,
+        };
+        if runtime.is_some() {
+            ensure!(fixture, "--runtime-dir 仅允许受控验收夹具使用");
+        }
+        let executable = std::env::current_exe()?;
+        let parent = executable.parent().context("程序路径缺少父目录")?;
+        let runtime = runtime.unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                parent.parent().unwrap_or(parent).join("Resources/runtime")
+            } else {
+                parent.join("resources/runtime")
+            }
+        });
+        if let Some(path) = &report {
+            ensure!(fixture, "验收报告仅在 --controlled-fixture 模式提供");
+            ensure!(
+                path.starts_with(&profile),
+                "验收报告必须位于受控 profile 目录内"
+            );
+        }
+        Ok(Self {
+            profile,
+            runtime,
+            report,
+            fixture,
+            args,
+        })
+    }
 }
-fn main(){if let Err(error)=run(){eprintln!("Vibeface 原生桌面无法启动：{error}");std::process::exit(1);}}
+fn default_profile() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME").context("无法定位当前用户目录")?)
+        .join("Library/Application Support");
+    #[cfg(target_os = "windows")]
+    let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("无法定位当前用户应用目录")?);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(
+            PathBuf::from(std::env::var_os("HOME").context("无法定位当前用户目录")?)
+                .join(".local/share"),
+        );
+    Ok(base.join("Vibeface/native-desktop"))
+}
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Vibeface 原生桌面无法启动：{error}");
+        std::process::exit(1);
+    }
+}
 fn run() -> Result<()> {
     let options = Options::parse()?;
-    let runtime = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("vibeface-client").build()?);
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("vibeface-client")
+            .build()?,
+    );
     let instance = runtime.block_on(SingleInstance::claim(&options.profile, &options.args))?;
-    let InstanceClaim::Primary(mut instance) = instance else { return Ok(()); };
-    let desktop_host = host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
-    let (tx, events, snapshots, stop, backend_task) = views::backend::Backend::spawn(desktop_host, runtime.handle());
+    let InstanceClaim::Primary(mut instance) = instance else {
+        return Ok(());
+    };
+    let desktop_host =
+        host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
+    let (tx, events, snapshots, stop, backend_task) =
+        views::backend::Backend::spawn(desktop_host, runtime.handle());
     let shutdown = stop.clone();
     let finish_runtime = runtime.clone();
     let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(32);
@@ -37,10 +124,15 @@ fn run() -> Result<()> {
     let urls_tx = activation_tx.clone();
     application.on_open_urls(move |urls| {
         for url in urls {
-            if let Some(activation) = Activation::parse(&url) { let _ = urls_tx.try_send(activation); }
+            if let Some(activation) = Activation::parse(&url) {
+                let _ = urls_tx.try_send(activation);
+            }
         }
     });
-    application.on_reopen(move |cx| { cx.activate(true); let _ = activation_tx.try_send(Activation::Focus); });
+    application.on_reopen(move |cx| {
+        cx.activate(true);
+        let _ = activation_tx.try_send(Activation::Focus);
+    });
     application.run(move |cx| {
         gpui_kit::init(cx);
         cx.set_quit_mode(QuitMode::Explicit);
@@ -52,7 +144,7 @@ fn run() -> Result<()> {
         };
         let fixture = options.fixture;
         let credential_scope = format!("vibeface-native://{}", hex::encode(sha2::Sha256::digest(options.profile.to_string_lossy().as_bytes())));
-        let app_tx = tx.clone();let app_stop=stop.clone();
+        let app_tx = tx.clone();let app_stop=stop.clone();let notifications=std::rc::Rc::new(std::cell::RefCell::new(host::platform::Notifications::default()));let app_notifications=notifications.clone();
         let (visible, view) = gpui_kit::open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(820.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some("Vibeface".into()), ..Default::default() }),
@@ -61,19 +153,18 @@ fn run() -> Result<()> {
             window.on_window_should_close(cx, |_, cx| { cx.hide(); false });
             cx.new(|cx| {
                 let mut app = app::Desktop::new(app_tx, app_stop, events, snapshots, window, cx);
-                app.credential_scope = credential_scope;
-                app.notice = tray_error;
+                app.credential_scope = credential_scope;app.notifications=app_notifications;
+                app.notice_is_error=tray_error.is_some();app.notice = tray_error;
                 if fixture { app.configure_fixture(window, cx); }
                 app
             })
         }).expect("无法创建原生窗口");
         cx.activate(true);
-        let notifications = std::rc::Rc::new(std::cell::RefCell::new(host::platform::Notifications::default()));
         let notification_state = notifications.clone();
         let notification_view = view.downgrade();
         cx.on_system_notification_response(move |response, cx| {
-            if notification_state.borrow_mut().respond(response.tag.as_ref()).is_some() {
-                let _ = notification_view.update(cx, |app, cx| app.navigate(ui::Route::Inbox, cx));
+            if let Some(NativeAction::Notification{route})=notification_state.borrow_mut().respond(response.tag.as_ref()) {
+                let _ = notification_view.update(cx, |app, cx| app.open_notification_route(&route,cx));
                 cx.activate(true);
             }
         });
@@ -117,7 +208,7 @@ fn run() -> Result<()> {
                             NativeAction::ZoomIn => window.set_rem_size((window.rem_size() + px(1.)).min(px(24.))),
                             NativeAction::ZoomOut => window.set_rem_size((window.rem_size() - px(1.)).max(px(12.))),
                             NativeAction::ResetZoom => window.set_rem_size(px(16.)),
-                            NativeAction::Notification { .. } => app.navigate(ui::Route::Inbox, cx),
+                            NativeAction::Notification { route } => app.open_notification_route(&route,cx),
                             NativeAction::Quit => {}
                         });
                     });
@@ -149,6 +240,8 @@ fn run() -> Result<()> {
     // GPUI only gives OS quit callbacks 200ms. Retain the runtime after its event loop
     // returns so EOF/graceful Child cleanup finishes before the process exits.
     shutdown.send_replace(true);
-    finish_runtime.block_on(backend_task).context("原生客户端后台退出失败")?;
+    finish_runtime
+        .block_on(backend_task)
+        .context("原生客户端后台退出失败")?;
     Ok(())
 }

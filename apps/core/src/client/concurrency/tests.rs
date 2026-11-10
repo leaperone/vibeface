@@ -18,11 +18,19 @@ struct HeldWriter {
 
 impl HeldWriter {
     async fn new(node: &Arc<Runtime>) -> Result<Self> {
+        Self::after(node, |_| Ok(())).await
+    }
+
+    async fn after(
+        node: &Arc<Runtime>,
+        before_barrier: impl FnOnce(&mut crate::store::Store) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let node = node.clone();
         let task = tokio::spawn(async move {
-            node.store.call("fixture_held_writer", move |_| {
+            node.store.call("fixture_held_writer", move |store| {
+                before_barrier(store)?;
                 let _ = entered.send(());
                 wait.recv().context("writer barrier was abandoned")?;
                 Ok(())
@@ -229,6 +237,48 @@ async fn ping_and_heartbeat(client: &mut FrameClient) -> Result<()> {
 }
 
 #[tokio::test]
+async fn encrypted_workspace_overview_and_history_read_committed_rows_while_writer_is_held() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture.accepted_work().await?;
+    let (mut client, serving) = fixture.connect(&fixture.admin, None).await?;
+    let writer = HeldWriter::new(&fixture.node).await?;
+    let result = async {
+        for method in ["conversations", "open_works", "workspace_overview", "workspace_state", "workspace_history", "notifications"] {
+            send(&mut client, method, "rpc", json!({"method":method})).await?;
+        }
+        send(&mut client, "missing-display-scope", "rpc", json!({
+            "method":"workspace_history", "conversation_id":"missing",
+        })).await?;
+        let mut replies = BTreeMap::new();
+        while replies.len() < 7 {
+            let reply = receive(&mut client).await?;
+            let id = reply["id"].as_str().context("display response ID")?.to_owned();
+            assert!(replies.insert(id, reply).is_none(), "duplicate display reply");
+        }
+        for method in ["conversations", "open_works", "workspace_overview", "workspace_state", "workspace_history", "notifications"] {
+            assert!(replies[method]["error"].is_null(), "{}", replies[method]);
+        }
+        assert_eq!(replies["conversations"]["result"]["conversations"][0]["title"], "Fixture work");
+        let overview = &replies["workspace_overview"]["result"];
+        assert_eq!(overview["network_epoch"], fixture.state.project()?.epoch);
+        assert_eq!(overview["coverage"]["source"], "workspace_overview");
+        assert_eq!(overview["consistency"], "local_snapshot");
+        assert_eq!(replies["workspace_state"]["result"]["tasks"], json!([]));
+        assert_eq!(replies["workspace_history"]["result"]["events"], json!([]));
+        assert_eq!(replies["workspace_history"]["result"]["coverage"]["scope"], "workspace");
+        assert_eq!(replies["notifications"]["result"]["notifications"], json!([]));
+        assert!(replies["missing-display-scope"]["error"].as_str()
+            .is_some_and(|error| error.contains("conversation not found")));
+        ping_and_heartbeat(&mut client).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    writer.finish().await?;
+    close(&mut client, serving).await?;
+    fixture.cleanup().await?;
+    result
+}
+
+#[tokio::test]
 async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or_completed_result() -> Result<()> {
     let fixture = Fixture::new().await?;
     fixture.accepted_work().await?;
@@ -250,8 +300,11 @@ async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or
         assert_eq!(overload["code"], "client_overloaded",
             "the encrypted stop frames must be admitted before the writer is released");
         send(&mut client, "read-under-writer", "rpc", json!({"method":"conversations"})).await?;
+        let read = response(&mut client, "read-under-writer").await?;
+        assert!(read["error"].is_null(), "{read}");
+        assert_eq!(read["result"]["conversations"][0]["title"], "Fixture work");
         fixture.node.publish_reread(&fixture.state.genesis.network_id);
-        // Both request authentication and subscribed push preparation now wait on the writer.
+        // Control authentication and subscribed push preparation still wait on the writer.
         ping_and_heartbeat(&mut client).await?;
         probe.write_all(b"G").await?;
         let completed = response(&mut client, "complete-under-writer").await?;
@@ -262,13 +315,12 @@ async fn a_held_writer_does_not_block_encrypted_control_intake_pong_heartbeat_or
     writer.finish().await?;
     if result.is_ok() {
         let mut returned = BTreeSet::new();
-        while returned.len() < CONTROL_CALLS + 1 {
+        while returned.len() < CONTROL_CALLS {
             let value = receive(&mut client).await?;
             if value["type"] == "changed" { continue; }
             assert!(value["error"].is_null(), "{value}");
             returned.insert(value["id"].as_str().context("response ID")?.to_owned());
         }
-        assert!(returned.contains("read-under-writer"));
         for index in 0..CONTROL_CALLS { assert!(returned.contains(&format!("stop-under-writer-{index}"))); }
         assert_eq!(fixture.node.store.call("fixture_stopped_under_writer", |store| store.stop_requests()).await?[0].work_id, "held-work");
     }
@@ -302,6 +354,29 @@ async fn a_cancelled_membership_installer_fences_socket_results_while_the_next_w
     probe_exited(&mut probe).await?;
     assert!(receive(&mut client).await.is_err(), "a revoked probe result reached the socket");
     next_writer.finish().await?;
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn a_committed_revocation_fences_results_before_the_writer_closure_returns() -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let (mut client, serving) = fixture.connect(&fixture.admin, None).await?;
+    send(&mut client, "probe-during-revoke", "provider_probe", json!({"provider":"pi"})).await?;
+    let mut probe = fixture.probe_started().await?;
+    fixture.state.append(GovernanceEvent::revoke(&fixture.backup, &fixture.state.project()?,
+        Revocation::new(&fixture.admin.device_id()?, None)?)?)?;
+    let state = fixture.state.clone();
+    // install_state commits before this barrier. The accepted closure remains parked, so an
+    // end-of-closure cache publication alone cannot pass this encrypted-socket check.
+    let writer = HeldWriter::after(&fixture.node, move |store| {
+        store.install_state(state)?;
+        Ok(())
+    }).await?;
+    let closed = tokio::time::timeout(DEADLINE, serving).await??;
+    assert!(closed.is_err(), "a physically committed revocation must fence the old connection immediately");
+    probe_exited(&mut probe).await?;
+    assert!(receive(&mut client).await.is_err(), "the physically revoked device received its old result");
+    writer.finish().await?;
     fixture.cleanup().await
 }
 
@@ -398,7 +473,9 @@ async fn disconnect_aborts_the_probe_process_and_all_capacity_waiters() -> Resul
     assert_eq!(client.call("info", json!({})).await?["initialized"], true);
     close(&mut client, serving).await?;
     probe_exited(&mut control).await?;
-    assert!(futures_util::poll!(fixture.probes.accept()).is_pending());
+    let mut next_probe = Box::pin(fixture.probes.accept());
+    assert!(futures_util::poll!(next_probe.as_mut()).is_pending());
+    drop(next_probe);
     fixture.cleanup().await
 }
 
@@ -412,7 +489,9 @@ async fn duplicate_request_ids_close_the_channel_without_executing_a_second_prob
     let error = tokio::time::timeout(DEADLINE, serving).await??.unwrap_err();
     assert!(error.to_string().contains("duplicate request ID"), "{error}");
     probe_exited(&mut control).await?;
-    assert!(futures_util::poll!(fixture.probes.accept()).is_pending());
+    let mut next_probe = Box::pin(fixture.probes.accept());
+    assert!(futures_util::poll!(next_probe.as_mut()).is_pending());
+    drop(next_probe);
     fixture.cleanup().await
 }
 
@@ -506,13 +585,13 @@ async fn local_cookie_revocation_aborts_the_held_process() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_completed_result_is_rechecked_even_before_membership_watch_is_polled() -> Result<()> {
+async fn a_completed_display_result_is_rechecked_even_before_membership_watch_is_polled() -> Result<()> {
     let mut fixture = Fixture::new().await?;
     let mut session = Snapshot { device_id: fixture.admin.device_id()?, cookie: None, operator: false }.session();
     let authority = Authority::new(&fixture.node, &session, fixture.node.local_access.subscribe())?;
     let mut calls = Calls::default();
     calls.accept(&fixture.node, &session, &authority, Request {
-        id: "completed".into(), method: "provider_models".into(), params: json!({"provider":"pi"}),
+        id: "completed".into(), method: "rpc".into(), params: json!({"method":"conversations"}),
     })?;
     let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
     let prepared = PreparedPush {

@@ -2,9 +2,10 @@
 use super::Store;
 use crate::identity::NetworkState;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::collections::VecDeque;
 use anyhow::{Context, Result, anyhow};
 use std::{
-    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
     thread::{self, JoinHandle},
@@ -13,6 +14,7 @@ use std::{
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 const CAPACITY: usize = 64;
+#[cfg(test)]
 const TIMING_SAMPLES: usize = 4096;
 
 type Job = Box<dyn FnOnce(&mut Store) -> bool + Send>;
@@ -23,6 +25,7 @@ struct Request {
     job: Job,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct StoreTiming {
     pub operation: &'static str,
@@ -54,6 +57,7 @@ struct Lane {
     admission: Mutex<Option<mpsc::Sender<Request>>>,
     done: watch::Receiver<bool>,
     worker: StdMutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
     timings: Arc<StdMutex<VecDeque<StoreTiming>>>,
 }
 impl Lane {
@@ -64,7 +68,9 @@ impl Lane {
         let (sender, mut receiver) = mpsc::channel::<Request>(CAPACITY);
         let (ready_tx, ready) = oneshot::channel();
         let (done_tx, done) = watch::channel(false);
+        #[cfg(test)]
         let timings = Arc::new(StdMutex::new(VecDeque::new()));
+        #[cfg(test)]
         let samples = timings.clone();
         let worker = thread::Builder::new().name(name.into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -89,6 +95,7 @@ impl Lane {
                         execute_us = execute.as_micros() as u64,
                         "database operation"
                     );
+                    #[cfg(test)] {
                     let mut samples = samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if samples.len() == TIMING_SAMPLES {
                         samples.pop_front();
@@ -99,6 +106,7 @@ impl Lane {
                         queue_wait,
                         execute,
                     });
+                    }
                     if !healthy {
                         break;
                     }
@@ -115,6 +123,7 @@ impl Lane {
             admission: Mutex::new(Some(sender)),
             done,
             worker: StdMutex::new(Some(worker)),
+            #[cfg(test)]
             timings,
         }, ready))
     }
@@ -182,6 +191,8 @@ type ClientMembership = (u64, Option<Arc<NetworkState>>);
 
 struct MembershipPublication {
     dirty: Arc<AtomicBool>,
+    network_dirty: Arc<AtomicBool>,
+    fenced: AtomicBool,
     authority: watch::Sender<ClientMembership>,
     changed: watch::Sender<u64>,
 }
@@ -190,10 +201,14 @@ impl MembershipPublication {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
+        self.network_dirty.store(false, Ordering::Release);
         let state = if store.has_network()? { Some(store.public_state()?) } else { None };
         let previous = self.authority.borrow().clone();
+        let fenced = self.fenced.swap(false, Ordering::AcqRel);
         if previous.1.as_deref() != state.as_ref() {
-            let generation = previous.0.checked_add(1).context("membership generation overflow")?;
+            let generation = if fenced { previous.0 } else {
+                previous.0.checked_add(1).context("membership generation overflow")?
+            };
             self.authority.send_replace((generation, state.map(Arc::new)));
             self.changed.send_replace(generation);
         } else {
@@ -204,6 +219,8 @@ impl MembershipPublication {
     }
 
     fn invalidate(&self) {
+        self.fenced.store(true, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
         let generation = self.authority.borrow().0.saturating_add(1);
         self.authority.send_replace((generation, None));
         self.changed.send_replace(generation);
@@ -256,16 +273,35 @@ impl StoreActor {
         log_wakeup: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
         let publication = Arc::new(MembershipPublication {
-            dirty: Arc::new(AtomicBool::new(true)), authority, changed,
+            dirty: Arc::new(AtomicBool::new(true)),
+            network_dirty: Arc::new(AtomicBool::new(false)),
+            fenced: AtomicBool::new(false), authority, changed,
         });
         let worker_publication = publication.clone();
         self.writer.call("initialize_membership_snapshot", move |store| {
             let dirty = worker_publication.dirty.clone();
+            let network_dirty = worker_publication.network_dirty.clone();
             store.connection.update_hook(Some(move |_, _: &str, table: &str, _| {
                 if table == "log_heads" { log_wakeup.notify_one(); }
                 if table == "networks" || table == "identity_meta" {
                     dirty.store(true, Ordering::Release);
                 }
+                if table == "networks" {
+                    network_dirty.store(true, Ordering::Release);
+                }
+            }));
+            let committed = worker_publication.clone();
+            store.connection.commit_hook(Some(move || {
+                if committed.network_dirty.swap(false, Ordering::AcqRel) {
+                    // Fence before the new directory becomes visible to WAL readers. The
+                    // enclosing operation may keep running after this physical commit.
+                    committed.invalidate();
+                }
+                false
+            }));
+            let rolled_back = worker_publication.network_dirty.clone();
+            store.connection.rollback_hook(Some(move || {
+                rolled_back.store(false, Ordering::Release);
             }));
             worker_publication.refresh(store)
         }).await?;
@@ -319,6 +355,7 @@ impl StoreActor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn take_timings(&self) -> Vec<StoreTiming> {
         let mut samples: Vec<_> = self.writer.timings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect();
         if let Some(reader) = &self.reader {
@@ -331,6 +368,20 @@ impl StoreActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn released_lock(directory: &std::path::Path) -> Result<std::fs::File> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::config::lock_data_dir(directory) {
+                Err(error) if matches!(error.downcast_ref(), Some(std::fs::TryLockError::WouldBlock))
+                    && Instant::now() < deadline => {
+                    // Another concurrently spawning test can inherit the descriptor until exec.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => return result,
+            }
+        }
+    }
 
     async fn fixture() -> Result<(PathBuf, Arc<StoreActor>)> {
         let directory = std::env::temp_dir().join(format!("vibeface-store-actor-{}", uuid::Uuid::new_v4()));
@@ -421,7 +472,7 @@ mod tests {
         actor.shutdown().await?;
         let error = actor.call("closed_write", |_| Ok(())).await.unwrap_err();
         assert!(matches!(error.downcast_ref::<StoreCallError>(), Some(StoreCallError::NotAdmitted)));
-        let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+        let lock = Arc::new(released_lock(&directory).await?);
         let reopened = StoreActor::open(directory.join("node.sqlite3"), lock, |_| Ok(())).await?;
         reopened.shutdown().await?;
         actor.shutdown().await?;
@@ -475,7 +526,7 @@ mod tests {
         release.send(())?;
         blocking.await??;
         shutdown.await??;
-        let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+        let lock = Arc::new(released_lock(&directory).await?);
         let reopened = StoreActor::open(directory.join("node.sqlite3"), lock, |_| Ok(())).await?;
         let count: String = reopened.call("queued_count", |store| {
             Ok(store.connection.query_row("SELECT value FROM identity_meta WHERE key='queued_once'", [], |row| row.get(0))?)
@@ -498,7 +549,7 @@ mod tests {
         assert!(matches!(error.downcast_ref::<StoreCallError>(), Some(StoreCallError::OutcomeUnknown)));
         actor.shutdown().await?;
         assert!(actor.call("after_panic", |_| Ok(())).await.is_err());
-        let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+        let lock = Arc::new(released_lock(&directory).await?);
         let reopened = StoreActor::open(directory.join("node.sqlite3"), lock, |_| Ok(())).await?;
         let value: String = reopened.read("read_effect", |store| {
             Ok(store.connection.query_row("SELECT value FROM identity_meta WHERE key='before_panic'", [], |row| row.get(0))?)
@@ -522,20 +573,115 @@ mod tests {
         let state = identity.sign_network_fixture(1, vec![identity.device_id()?])?;
         let installed = state.clone();
         actor.call("install_history", move |store| store.install_state(installed)).await?;
-        assert_eq!(authority.borrow().0, 1);
-        assert_eq!(*changed.borrow(), 1);
+        let installed_generation = authority.borrow().0;
+        assert!(installed_generation > 0);
+        assert_eq!(*changed.borrow(), installed_generation);
         assert!(authority.borrow().1.as_deref() == Some(&state));
         let repeated = state.clone();
         actor.call("same_history", move |store| store.install_state(repeated)).await?;
-        assert_eq!(authority.borrow().0, 1, "identical sync must not invalidate in-flight calls");
+        assert_eq!(authority.borrow().0, installed_generation, "identical sync must not invalidate in-flight calls");
         let error = actor.call::<()>("rolled_back_history", |store| {
             store.connection.execute_batch("BEGIN; DELETE FROM networks; ROLLBACK;")?;
             Err(anyhow!("synthetic rolled-back operation"))
         }).await.unwrap_err();
         assert!(error.to_string().contains("rolled-back"));
-        assert_eq!(authority.borrow().0, 1);
+        assert_eq!(authority.borrow().0, installed_generation);
         assert!(authority.borrow().1.as_deref() == Some(&state));
         actor.shutdown().await?;
+        drop(actor);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_open_joins_its_initializing_writer_before_releasing_the_lock() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("vibeface-actor-cancelled-open-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&directory)?;
+        let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+        let path = directory.join("node.sqlite3");
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let opening = tokio::spawn(async move {
+            StoreActor::open(path, lock, move |store| {
+                let transaction = store.connection.transaction()?;
+                transaction.execute("INSERT INTO identity_meta(key,value) VALUES('initializing','once')", [])?;
+                let _ = entered.send(());
+                held.recv()?;
+                transaction.commit()?;
+                Ok(())
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running).await??;
+        opening.abort();
+        // Exceptional Drop joins synchronously. Release the synthetic initialization from an
+        // independent OS thread, as SQLite completion cannot depend on the dropping Tokio task.
+        let release_thread = std::thread::spawn(move || release.send(()));
+        assert!(opening.await.err().context("cancelled open task")?.is_cancelled());
+        release_thread.join().map_err(|_| anyhow!("fixture release thread panicked"))??;
+        let lock = Arc::new(released_lock(&directory).await?);
+        let reopened = StoreActor::open(directory.join("node.sqlite3"), lock, |_| Ok(())).await?;
+        let value: String = reopened.read("initialization_result", |store| {
+            Ok(store.connection.query_row("SELECT value FROM identity_meta WHERE key='initializing'", [], |row| row.get(0))?)
+        }).await?;
+        assert_eq!(value, "once");
+        reopened.shutdown().await?;
+        drop(reopened);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_initialization_releases_the_process_lock_without_retrying() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("vibeface-actor-failed-open-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&directory)?;
+        let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+        let error = StoreActor::open(directory.join("node.sqlite3"), lock, |store| {
+            store.connection.execute("INSERT INTO identity_meta(key,value) VALUES('partial_initialization','1')", [])?;
+            Err(anyhow!("synthetic initialization failure"))
+        }).await.err().context("failed initialization")?;
+        assert!(error.to_string().contains("synthetic initialization failure"));
+        let lock = Arc::new(released_lock(&directory).await?);
+        let reopened = StoreActor::open(directory.join("node.sqlite3"), lock, |_| Ok(())).await?;
+        let value: String = reopened.read("failed_initialization_result", |store| {
+            Ok(store.connection.query_row("SELECT value FROM identity_meta WHERE key='partial_initialization'", [], |row| row.get(0))?)
+        }).await?;
+        assert_eq!(value, "1");
+        reopened.shutdown().await?;
+        drop(reopened);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_an_accepted_snapshot_without_blocking_tokio() -> Result<()> {
+        let (directory, actor) = fixture().await?;
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let reading_actor = actor.clone();
+        let reading = tokio::spawn(async move {
+            reading_actor.read("held_snapshot", move |store| {
+                let _: i64 = store.connection.query_row("SELECT count(*) FROM identity_meta", [], |row| row.get(0))?;
+                let _ = entered.send(());
+                held.recv()?;
+                Ok(())
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running).await??;
+        let shutting_actor = actor.clone();
+        let shutdown = tokio::spawn(async move { shutting_actor.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while actor.writer.admission.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }).await?;
+        assert!(!shutdown.is_finished());
+        assert!(crate::config::lock_data_dir(&directory).is_err());
+        release.send(())?;
+        reading.await??;
+        shutdown.await??;
+        let lock = released_lock(&directory).await?;
+        drop(lock);
         drop(actor);
         std::fs::remove_dir_all(directory)?;
         Ok(())
@@ -581,6 +727,15 @@ mod performance {
             intent: crate::workspace::InputIntent::Continue, sequence: 1, expected_revision: None,
             text: "fixture".into(), attachments: vec![], report_results: Some(false), attestation: None,
         })?, vec![])?;
+        let (_, dispatched) = crate::work::accept(crate::work::WorkSpec {
+            work_id: "synthetic-stop".into(), conversation: "c".into(), trigger: "message:seed".into(),
+            target: author.clone(), dispatcher: author.clone(), call_ref: "synthetic-stop".into(),
+            kind: WorkKind::Agent(crate::providers::Provider::Pi), model: None,
+            resolved: ResolvedModel { provider: crate::providers::Provider::Pi, model: None },
+            cwd: "/synthetic".into(), title: "Synthetic stop target".into(), prompt: "Never execute".into(),
+            continues: None, parent: None, thread: None,
+        }, 5);
+        sign(dispatched, vec![])?;
         for index in 0..size {
             let deps = if cascade_group.is_some_and(|group| index % group == 0) {
                 let dependency = dependency_author.sign_event(Event {
@@ -600,8 +755,54 @@ mod performance {
                 status: Some(ReplyStatus::Completed), answers: None, attestation: None, failure: None,
             }, deps)?;
         }
-        let workload = events.split_off(4);
+        let workload = events.split_off(5);
         Ok((network, state, events, workload, dependencies))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signed_workload_fixture_ingests_and_releases_its_pending_cascade() -> Result<()> {
+        for cascade in [false, true] {
+            let (network, state, prelude, events, dependencies) = signed_fixture(8, cascade.then_some(4))?;
+            let directory = std::env::temp_dir().join(format!("vibeface-actor-signed-fixture-{}", uuid::Uuid::new_v4()));
+            crate::config::private_dir(&directory)?;
+            let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+            let seed_network = network.clone();
+            let actor = StoreActor::open(directory.join("node.sqlite3"), lock, move |store| {
+                store.install_trust_bundle(&seed_network, &state)?;
+                let result = store.ingest_events(&seed_network, &prelude)?;
+                assert_eq!(result.statuses, vec![IngestStatus::Accepted; 5]);
+                Ok(())
+            }).await?;
+            for (group_index, group) in events.chunks(if cascade { 4 } else { 2 }).enumerate() {
+                for batch in group.chunks(2) {
+                    let network = network.clone(); let batch = batch.to_vec();
+                    let expected = vec![if cascade { IngestStatus::Pending } else { IngestStatus::Accepted }; batch.len()];
+                    let statuses = actor.call("fixture_signed_page", move |store| {
+                        Ok(store.ingest_events(&network, &batch)?.statuses)
+                    }).await?;
+                    assert_eq!(statuses, expected);
+                }
+                if cascade {
+                    let dependency = dependencies[group_index].clone(); let network = network.clone();
+                    let stored = actor.call("fixture_dependency", move |store| {
+                        Ok(store.ingest_events(&network, &[dependency])?.stored.len())
+                    }).await?;
+                    assert_eq!(stored, 5, "one dependency page must release all four waiting events");
+                }
+            }
+            actor.call("fixture_complete", move |store| {
+                let pending: i64 = store.connection.query_row("SELECT count(*) FROM pending_events", [], |row| row.get(0))?;
+                assert_eq!(pending, 0);
+                let accepted: i64 = store.connection.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?;
+                assert_eq!(accepted, if cascade { 15 } else { 13 });
+                assert_eq!(store.work(&network, "synthetic-stop")?.context("signed stop target")?.conversation_id, "c");
+                Ok(())
+            }).await?;
+            actor.shutdown().await?;
+            drop(actor);
+            std::fs::remove_dir_all(directory)?;
+        }
+        Ok(())
     }
 
     fn report(label: &str, mut values: Vec<u128>) {
@@ -659,14 +860,16 @@ mod performance {
                             }
                             Ok::<_, anyhow::Error>(samples)
                         });
-                        let stopper = actor.clone(); let admission_stop = stop.clone();
+                        let stopper = actor.clone(); let admission_stop = stop.clone(); let stop_network = network.clone();
                         let admissions = tokio::spawn(async move {
                             let mut samples = Vec::new();
                             while !admission_stop.load(Ordering::Relaxed) {
-                                let started = Instant::now();
-                                stopper.call("benchmark_stop_admission", |store| {
+                                let started = Instant::now(); let network = stop_network.clone();
+                                stopper.call("benchmark_stop_admission", move |store| {
+                                    let work = store.work(&network, "synthetic-stop")?.context("signed stop target")?;
+                                    anyhow::ensure!(work.conversation_id == "c", "stop target scope changed");
                                     store.hold_stop_request(&crate::work::StopRequest {
-                                        work_id: "synthetic-stop".into(), conversation: "c".into(), target: "synthetic-target".into(),
+                                        work_id: work.work_id, conversation: work.conversation_id, target: work.target_node,
                                         requested_at_ms: 1, deadline_ms: i64::MAX, timed_out: false,
                                     })
                                 }).await?;

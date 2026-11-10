@@ -33,7 +33,8 @@ impl std::fmt::Display for Refused {
 }
 impl std::error::Error for Refused {}
 
-struct Request { id: String, bytes: Vec<u8>, reply: oneshot::Sender<Result<Value>> }
+pub(crate) type BeforeWrite=Box<dyn FnOnce()->futures_util::future::BoxFuture<'static,Result<()>>+Send>;
+struct Request { id: String, bytes: Vec<u8>, reply: oneshot::Sender<Result<Value>>, before_write:Option<BeforeWrite> }
 struct Pending { reply: oneshot::Sender<Result<Value>>, deadline: tokio::time::Instant }
 
 /// A bounded multiplexed Noise connection. Dropping a caller never cancels the stream reader.
@@ -84,19 +85,22 @@ impl Connection {
         });
         Self { requests, pushes, shutdown }
     }
+    pub fn is_open(&self)->bool {!*self.shutdown.borrow() && !self.requests.is_closed()}
     pub fn close(&self) { self.shutdown.send_replace(true); }
     pub fn subscribe(&self) -> broadcast::Receiver<Value> { self.pushes.subscribe() }
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.call_bytes(serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"method":method,"params":params}))?).await
     }
     /// Sends the original persisted envelope, without regenerating its ID or signature.
-    pub async fn call_bytes(&self, bytes: Vec<u8>) -> Result<Value> {
+    pub async fn call_bytes(&self, bytes: Vec<u8>) -> Result<Value> { self.enqueue(bytes,None).await }
+    pub(crate) async fn call_staged(&self,bytes:Vec<u8>,before_write:BeforeWrite)->Result<Value> {self.enqueue(bytes,Some(before_write)).await}
+    async fn enqueue(&self,bytes:Vec<u8>,before_write:Option<BeforeWrite>)->Result<Value> {
         ensure!(!*self.shutdown.borrow(), "connection is closed");
         ensure!(bytes.len() <= MAX_REQUEST, "request exceeds limit");
         let value: Value = serde_json::from_slice(&bytes)?;
         let id = value["id"].as_str().context("request ID missing")?.to_owned();
         let (reply, response) = oneshot::channel();
-        self.requests.send(Request { id, bytes, reply }).await.context("connection closed; outcome unknown")?;
+        tokio::time::timeout(TIMEOUT,self.requests.send(Request { id, bytes, reply, before_write })).await.context("request queue did not admit the operation")?.context("connection closed before request admission")?;
         response.await.context("connection closed; outcome unknown")?
     }
 }
@@ -110,10 +114,13 @@ async fn run(mut requests: mpsc::Receiver<Request>, mut frames: mpsc::Receiver<R
             tokio::select! {
                 _ = shutdown.changed() => { return Ok(()); }
                 request = requests.recv(), if pending.len() < LIMIT => {
-                    let Some(request) = request else { return Ok(()); };
+                    let Some(mut request) = request else { return Ok(()); };
                     if request.reply.is_closed() { continue; }
                     if pending.contains_key(&request.id) {
                         let _ = request.reply.send(Err(anyhow::anyhow!("request already in flight"))); continue;
+                    }
+                    if let Some(before_write)=request.before_write.take() {
+                        if let Err(error)=before_write().await {let _=request.reply.send(Err(error));continue;}
                     }
                     let records = channel.seal_message(&request.bytes)?;
                     pending.insert(request.id, Pending { reply: request.reply, deadline: tokio::time::Instant::now() + TIMEOUT });

@@ -3164,12 +3164,11 @@ mod tests {
                     })
                     .await?
             }
-            let owners_before = Arc::strong_count(&node);
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let actor = node.store.clone();
+            let barrier_node = node.clone();
             let blocked = tokio::spawn(async move {
-                actor
+                barrier_node.store
                     .call("peers.shutdown_barrier", move |_store| {
                         let _ = entered_tx.send(());
                         release_rx.recv().context("release peer shutdown barrier")?;
@@ -3178,6 +3177,7 @@ mod tests {
                     .await
             });
             entered_rx.await?;
+            let owners_before = Arc::strong_count(&node);
             let queued = node.clone();
             let queued_network = network.clone();
             node.background_tasks.spawn(async move {
@@ -4552,57 +4552,82 @@ mod tests {
                 3,
             )?;
         }
-        let (p, q) = (Mutex::new(p), Mutex::new(q));
+        let p = crate::store::actor::StoreActor::from_store(p)?;
+        let q = crate::store::actor::StoreActor::from_store(q)?;
         let pulls = Mutex::new(0);
-        let network = network.as_str();
-        let fetch = async |to: &Mutex<Store>, from: &Mutex<Store>| -> Result<bool> {
-            let their = from.lock().unwrap().heads(network)?[&author].clone();
-            let our_max = to.lock().unwrap().heads(network)?[&author].0;
+        let fetch = async |to: &crate::store::actor::StoreActor,
+                           from: &crate::store::actor::StoreActor| -> Result<bool> {
+            let their = {
+                let network = network.clone();
+                let author = author.clone();
+                from.call("fork_fixture.source_head", move |store| {
+                    Ok(store.heads(&network)?[&author].clone())
+                }).await?
+            };
+            let our_max = {
+                let network = network.clone();
+                let author = author.clone();
+                to.call("fork_fixture.target_head", move |store| {
+                    Ok(store.heads(&network)?[&author].0)
+                }).await?
+            };
             reconcile_log(
                 our_max,
                 (their.0, &their.1),
-                |hash| async move { Ok(to.lock().unwrap().event(network, &hash)?.is_some()) },
+                |hash| {
+                    let network = network.clone();
+                    async move {
+                        to.call("fork_fixture.event", move |store| {
+                            Ok(store.event(&network, &hash)?.is_some())
+                        }).await
+                    }
+                },
                 |seq, limit| {
                     *pulls.lock().unwrap() += 1;
-                    let events = from
-                        .lock()
-                        .unwrap()
-                        .events_from(network, &author, seq, limit);
-                    async move { events }
+                    let network = network.clone();
+                    let author = author.clone();
+                    async move {
+                        from.call("fork_fixture.events", move |store| {
+                            store.events_from(&network, &author, seq, limit)
+                        }).await
+                    }
                 },
-                |events| async move {
-                    to.lock().unwrap().ingest_events(network, &events)?;
-                    Ok(())
+                |events| {
+                    let network = network.clone();
+                    async move {
+                        to.call("fork_fixture.ingest", move |store| {
+                            store.ingest_events(&network, &events)?;
+                            Ok(())
+                        }).await
+                    }
                 },
-            )
-            .await
+            ).await
         };
         assert!(fetch(&q, &p).await?);
-        assert!(
-            *pulls.lock().unwrap() <= 4,
-            "walk-back probes in doubling steps"
-        );
+        assert!(*pulls.lock().unwrap() <= 4, "walk-back probes in doubling steps");
         assert!(fetch(&p, &q).await?);
         assert!(!fetch(&q, &p).await? && !fetch(&p, &q).await?);
-        let evidence = |store: &Mutex<Store>| -> Result<(Vec<String>, Vec<String>, String)> {
-            let store = store.lock().unwrap();
-            let hashes = |sql: &str| -> Result<Vec<String>> {
-                Ok(store
-                    .connection
-                    .prepare(sql)?
-                    .query_map([network], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?)
-            };
-            Ok((
-                hashes("SELECT hash FROM events WHERE network_id=? ORDER BY hash")?,
-                hashes("SELECT hash FROM events WHERE network_id=? AND effective=1 ORDER BY hash")?,
-                store.fork_digest(network)?,
-            ))
+        let evidence = async |store: &crate::store::actor::StoreActor| -> Result<(Vec<String>, Vec<String>, String)> {
+            let network = network.clone();
+            store.call("fork_fixture.evidence", move |store| {
+                let hashes = |sql: &str| -> Result<Vec<String>> {
+                    Ok(store.connection.prepare(sql)?
+                        .query_map([&network], |row| row.get(0))?
+                        .collect::<rusqlite::Result<_>>()?)
+                };
+                Ok((
+                    hashes("SELECT hash FROM events WHERE network_id=? ORDER BY hash")?,
+                    hashes("SELECT hash FROM events WHERE network_id=? AND effective=1 ORDER BY hash")?,
+                    store.fork_digest(&network)?,
+                ))
+            }).await
         };
-        let (stored, effective, forks) = evidence(&p)?;
+        let (stored, effective, forks) = evidence(&p).await?;
         assert_eq!((stored.len(), effective.len()), (11, 4));
         assert!(!forks.is_empty());
-        assert_eq!(evidence(&q)?, (stored, effective, forks));
+        assert_eq!(evidence(&q).await?, (stored, effective, forks));
+        p.shutdown().await?;
+        q.shutdown().await?;
         Ok(())
     }
 

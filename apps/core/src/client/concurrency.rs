@@ -15,8 +15,8 @@ struct LocalAuthority {
     session: crate::local_access::LocalSession,
 }
 
-/// This cache only fences transport delivery. Dispatch tasks still authenticate against the
-/// writer before mutation admission; a WAL reader or this cache never grants a write.
+/// Display queries and transport delivery use committed authority. Mutations and controls
+/// still authenticate against the writer; a WAL reader or this cache never grants a write.
 pub(super) struct Authority {
     local: Option<LocalAuthority>,
     local_changes: tokio::sync::watch::Receiver<u64>,
@@ -80,7 +80,7 @@ impl Authority {
         Ok(principal)
     }
 
-    fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
+    pub(super) fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
         ensure!(self.principal(node, session)? == *was, "this device's permission changed during a client request");
         Ok(())
     }
@@ -306,6 +306,8 @@ impl Calls {
         let guest_method = GUEST_METHODS.contains(&request.method.as_str());
         let fenced = lane != Lane::Ordered
             || (!guest_method && !SIGNED_METHODS.contains(&request.method.as_str()));
+        let display = snapshot_request(&request.method, &request.params);
+        let display_authority = display.then(|| authority.principal(node, session));
         self.active
             .insert(request.id.clone(), Active { lane, authority: fenced.then(|| authority.principal(node, session).ok()).flatten() });
         let snapshot = Snapshot::from(session);
@@ -313,7 +315,11 @@ impl Calls {
         self.tasks.spawn(async move {
             let mut request_session = snapshot.session();
             let (authority, denied) = if fenced {
-                match principal(&node, &request_session).await {
+                let authenticated = match display_authority {
+                    Some(authority) => authority,
+                    None => principal(&node, &request_session).await,
+                };
+                match authenticated {
                     Ok(authority) => (Some(authority), None),
                     Err(_) if guest_method => (None, None),
                     Err(error) => (None, Some(error)),
@@ -324,11 +330,12 @@ impl Calls {
             let observing = request.method == "rpc" && request.params["method"] == "conversation";
             let result = match denied {
                 Some(error) => Err(error),
-                None => dispatch(
+                None => dispatch_inner(
                     &node,
                     &mut request_session,
                     &request.method,
                     request.params,
+                    if display { authority.clone() } else { None },
                 )
                 .await,
             };
@@ -418,14 +425,23 @@ impl Calls {
                 error: None,
                 code: None,
             },
-            Err(error) => Response {
+            Err(error) => {
+                if matches!(error.downcast_ref::<crate::store::actor::StoreCallError>(),
+                    Some(crate::store::actor::StoreCallError::OutcomeUnknown))
+                {
+                    // An accepted writer operation may have committed before its reply was
+                    // lost. Closing keeps the client outcome unknown instead of refusing it.
+                    return Err(error.context("client request outcome may be unknown; reconcile before retrying"));
+                }
+                Response {
                 id: completed.id,
                 result: Value::Null,
                 error: Some(crate::logging::scrub(&error.to_string())),
                 code: error
                     .downcast_ref::<crate::discovery::CodexMissing>()
                     .map(|_| crate::discovery::CodexMissing::CODE),
-            },
+                }
+            }
         })
     }
 }

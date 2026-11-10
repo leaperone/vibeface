@@ -237,6 +237,13 @@ pub fn channel<T>(
     )
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self { sender: self.sender.clone(), measure: self.measure, bytes: self.bytes.clone(),
+            budget: self.budget, failure: self.failure.clone() }
+    }
+}
+
 impl<T> Sender<T> {
     pub fn fail(&self, error: impl ToString) {
         *self
@@ -290,6 +297,10 @@ impl<T> Sender<T> {
 }
 
 impl<T> Receiver<T> {
+    pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.receiver.try_recv().map(|queued| queued.value)
+    }
+
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.recv().await.map(|queued| queued.value)
     }
@@ -308,6 +319,7 @@ pub struct JsonBudget {
     bytes: Arc<Semaphore>,
     limit: usize,
 }
+#[derive(Debug)]
 pub struct HeldJson {
     pub value: Value,
     _bytes: OwnedSemaphorePermit,

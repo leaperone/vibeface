@@ -1,7 +1,6 @@
 //! Positive evidence for a native client's exact signed command. Absence never permits replay.
 use super::*;
 use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
-use anyhow::Context as _;
 use serde_json::json;
 
 impl Store {
@@ -112,49 +111,99 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn fixture(body: EventBody, scope: &str) -> Result<(Store,String,String,EventBody)> {
-        let node=LocalIdentity::generate();
-        let state=node.sign_network_fixture(1,vec![node.device_id()?])?;
-        let network=state.genesis.network_id.clone();
-        let client=node.fixture_admin();
-        let signed=client.attest(&network,scope,body)?;
-        let mut store=Store::open(":memory:")?;
-        store.install_trust_bundle(&network,&state)?;
-        store.append_event(&node,&network,scope,signed.clone(),vec![],1)?;
-        Ok((store,network,client.device_id()?,signed))
+    fn fixture(body: EventBody, scope: &str) -> Result<(Store, String, String, EventBody)> {
+        let node = LocalIdentity::generate();
+        let state = node.sign_network_fixture(1, vec![node.device_id()?])?;
+        let network = state.genesis.network_id.clone();
+        let client = node.fixture_admin();
+        let signed = client.attest(&network, scope, body)?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(&network, &state)?;
+        store.append_event(&node, &network, scope, signed.clone(), vec![], 1)?;
+        Ok((store, network, client.device_id()?, signed))
     }
     #[test]
     fn signed_receipts_verify_exact_client_network_and_payload_without_writing() -> Result<()> {
-        let (store,network,client,signed)=fixture(EventBody::NotificationAcked {
-            notification_id:"notice".into(),client_id:"inbox".into(),attestation:None,
-        },"chat")?;
-        let attestation=signed.attestation().context("fixture attestation")?.clone();
-        let mut body=serde_json::to_value(signed)?;
+        let (store, network, client, signed) = fixture(
+            EventBody::NotificationAcked {
+                notification_id: "notice".into(),
+                client_id: "inbox".into(),
+                attestation: None,
+            },
+            "chat",
+        )?;
+        let attestation = signed.attestation().context("fixture attestation")?.clone();
+        let mut body = serde_json::to_value(signed)?;
         body.as_object_mut().context("body")?.remove("attestation");
-        let before=store.connection.total_changes();
-        let receipt=store.client_signed_receipt(&network,&client,"chat",body.clone(),&attestation)?;
-        assert_eq!(receipt["receipt"],"recorded");
-        assert_eq!(receipt["client_id"],client);
-        assert!(store.client_signed_receipt(&network,&"0".repeat(64),"chat",body.clone(),&attestation).is_err());
-        assert!(store.client_signed_receipt(&"0".repeat(64),&client,"chat",body.clone(),&attestation).is_err());
-        body["notification_id"]=json!("different");
-        assert!(store.client_signed_receipt(&network,&client,"chat",body,&attestation).is_err());
-        assert_eq!(store.connection.total_changes(),before);
+        let before = store.connection.total_changes();
+        let receipt =
+            store.client_signed_receipt(&network, &client, "chat", body.clone(), &attestation)?;
+        assert_eq!(receipt["receipt"], "recorded");
+        assert_eq!(receipt["client_id"], client);
+        assert!(
+            store
+                .client_signed_receipt(
+                    &network,
+                    &"0".repeat(64),
+                    "chat",
+                    body.clone(),
+                    &attestation
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .client_signed_receipt(&"0".repeat(64), &client, "chat", body.clone(), &attestation)
+                .is_err()
+        );
+        body["notification_id"] = json!("different");
+        assert!(
+            store
+                .client_signed_receipt(&network, &client, "chat", body, &attestation)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
         Ok(())
     }
     #[test]
     fn workspace_receipt_matches_the_original_signed_command_and_effective_record() -> Result<()> {
-        let command=WorkspaceCommand::CreateTask {task_id:"task".into(),channel_id:None,parent_task_id:None,owner_bot:"bot".into(),title:"fixture".into(),request:"controlled".into(),expected_result:"receipt".into(),source_events:vec![],dependencies:vec![],reply_only:true};
-        let (store,network,client,signed)=fixture(EventBody::WorkspaceCommanded {
-            command_id:"command".into(),command:command.clone(),acting_assignment:None,attestation:None,cause:None,
-        },WORKSPACE_SCOPE)?;
-        let attestation=signed.attestation().context("fixture attestation")?;
-        let receipt=store.client_workspace_receipt(&network,&client,"command",&command,attestation)?;
-        assert_eq!(receipt["receipt"],"recorded");
-        assert!(store.client_workspace_receipt(&network,&client,"another",&command,attestation).is_err());
-        store.connection.execute("UPDATE events SET effective=0",[])?;
-        let receipt=store.client_workspace_receipt(&network,&client,"command",&command,attestation)?;
-        assert_eq!(receipt["receipt"],"not_seen_here");
+        let command = WorkspaceCommand::CreateTask {
+            task_id: "task".into(),
+            channel_id: None,
+            parent_task_id: None,
+            owner_bot: "bot".into(),
+            title: "fixture".into(),
+            request: "controlled".into(),
+            expected_result: "receipt".into(),
+            source_events: vec![],
+            dependencies: vec![],
+            reply_only: true,
+        };
+        let (store, network, client, signed) = fixture(
+            EventBody::WorkspaceCommanded {
+                command_id: "command".into(),
+                command: command.clone(),
+                acting_assignment: None,
+                attestation: None,
+                cause: None,
+            },
+            WORKSPACE_SCOPE,
+        )?;
+        let attestation = signed.attestation().context("fixture attestation")?;
+        let receipt =
+            store.client_workspace_receipt(&network, &client, "command", &command, attestation)?;
+        assert_eq!(receipt["receipt"], "recorded");
+        assert!(
+            store
+                .client_workspace_receipt(&network, &client, "another", &command, attestation)
+                .is_err()
+        );
+        store
+            .connection
+            .execute("UPDATE events SET effective=0", [])?;
+        let receipt =
+            store.client_workspace_receipt(&network, &client, "command", &command, attestation)?;
+        assert_eq!(receipt["receipt"], "not_seen_here");
         assert!(receipt.get("retry_safe").is_none());
         Ok(())
     }

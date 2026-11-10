@@ -1842,8 +1842,8 @@ mod tests {
                 Member::node(&node.identity, "node")?,
             )?)?;
             let bootstrap_capability = capability.capability.clone();
-            let admin = admin.device_id()?;
-            node.store.call("fixture_bootstrap", move |store| store.bootstrap_network(state, &bootstrap_capability, &admin)).await?;
+            let admin_id = admin.device_id()?;
+            node.store.call("fixture_bootstrap", move |store| store.bootstrap_network(state, &bootstrap_capability, &admin_id)).await?;
             node.local_access.set_enabled(false)?;
             let initialized: Value = request().send().await?.json().await?;
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));

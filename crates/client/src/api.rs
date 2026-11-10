@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, Semaphore};
-use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Mutex, atomic::{AtomicBool, AtomicU8, Ordering}};
 use crate::{ClientKey, Connection, Endpoint, wire::*, outbox::{Operation, Outbox, Reconciliation}};
 pub use crate::outbox::{OperationSnapshot, OperationState};
 
@@ -105,12 +105,11 @@ pub enum DeliveryAction {
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(rename_all="snake_case")]
-pub enum ResolveOutcome {Completed,Failed,Interrupted}
+pub enum ResolveOutcome {Completed,Interrupted}
 #[derive(Clone)]
 pub enum Action {
     Input { conversation_id: String, input: InputRequest },
     Workspace { command: WorkspaceCommand },
-    WorkspaceWithAttachments { command: WorkspaceCommand, conversation_id: String },
     Memory { conversation_id: String, memory_id: String, base: MemoryBase, after: Option<String> },
     Schedule { conversation_id: String, schedule_id: String, action: ScheduleAction },
     StopReply { conversation_id: String, trigger: String },
@@ -132,15 +131,20 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub struct ClientEvent { pub generation: String, pub network_id: String, pub payload: Value }
 
+#[derive(Debug)]
+struct Revoked;
+impl std::fmt::Display for Revoked {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("client or target Node was revoked")}}
+impl std::error::Error for Revoked {}
 #[derive(Clone)]
 pub struct Client {
     key: Arc<ClientKey>, connection: Connection, target: String,
-    network:String,authority:ClientAuthority,
+    network:String,authority:ClientAuthority,endpoint:Endpoint,
     outbox: Arc<Mutex<Outbox>>, events: broadcast::Sender<ClientEvent>,
     generation: String,
     writes: Arc<Semaphore>,
     decision_tokens: Arc<Mutex<BTreeMap<String,DecisionToken>>>,
     active: Arc<AtomicBool>,
+    revoked:Arc<AtomicBool>,write_gate:Arc<AtomicU8>,
 }
 
 impl Client {
@@ -159,6 +163,7 @@ impl Client {
         ensure!(key.network_id().is_none_or(|known|known==network),"entry belongs to another personal network");
         let connection = Connection::open_endpoint(&endpoint, &key.identity).await?;
         let authentication=connection.call("authenticate", json!({})).await?;
+        if authentication["revoked"]==true || authentication["node_revoked"]==true {return Err(Revoked.into());}
         ensure!(authentication["network_id"]==network && authentication["principal"]["device_id"]==key.device_id(),"principal identity mismatch");
         let mut directory = connection.call("directory", json!({})).await?;
         let state: vibeface_secure::membership::NetworkState = serde_json::from_value(directory["state"].take())?;
@@ -195,11 +200,14 @@ impl Client {
             }
         });
         connection.call("subscribe",json!({})).await?;
-        Ok(Self {key,connection,target:endpoint.node_id().into(),network,authority,outbox,events,generation,writes,decision_tokens,active:Arc::new(AtomicBool::new(true))})
+        let write_state=connection.call("write_state",json!({})).await?;
+        let gate=write_gate_value(&write_state)?;
+        Ok(Self {key,connection,target:endpoint.node_id().into(),network,authority,endpoint,outbox,events,generation,writes,decision_tokens,active:Arc::new(AtomicBool::new(true)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(gate))})
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
     pub async fn reconnect(&self,endpoint:Endpoint)->Result<Self> {
-        let (connection,network,authority)=Self::authenticate(&self.key,&endpoint).await?;
+        ensure!(!self.revoked.load(Ordering::Acquire),"known revoked profile cannot reconnect");
+        let (connection,network,authority)=match Self::authenticate(&self.key,&endpoint).await {Ok(value)=>value,Err(error)=>{if error.is::<Revoked>(){self.revoked.store(true,Ordering::Release);}return Err(error);}};
         ensure!(network==self.network,"reconnect cannot switch outbox networks");
         let next=Self::attach(self.key.clone(),endpoint,connection,network,authority,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone()).await?;
         self.close();
@@ -214,7 +222,14 @@ impl Client {
     pub fn generation(&self) -> &str { &self.generation }
     pub fn network_id(&self) -> &str { &self.network }
     pub fn authority(&self)->ClientAuthority {self.authority}
-    pub fn can_write(&self)->bool {matches!(self.authority,ClientAuthority::Membership {..})}
+    pub fn can_write(&self)->bool {matches!(self.authority,ClientAuthority::Membership {..}) && !self.revoked.load(Ordering::Acquire)}
+    pub fn can_save_locally(&self)->bool {self.can_write() && self.write_gate.load(Ordering::Acquire)!=2}
+    pub fn can_send_online(&self)->bool {self.active.load(Ordering::Acquire) && self.connection.is_open() && self.write_gate.load(Ordering::Acquire)==1 && self.can_write()}
+    pub fn can_configure_node(&self)->bool {matches!(self.authority,ClientAuthority::LocalSession|ClientAuthority::Membership {can_manage:true})}
+    pub fn management_session(&self)->Result<crate::Session<'_>> {
+        self.require_active()?;ensure!(self.can_write(),"local session does not grant personal-network membership");
+        Ok(self.key.session(self.connection.clone(),self.endpoint.clone()))
+    }
     pub fn client_id(&self) -> &str { self.key.device_id() }
     pub fn subscribe(&self) -> broadcast::Receiver<ClientEvent> { self.events.subscribe() }
     async fn stored<T: Send + 'static>(&self, task: impl FnOnce(&mut Outbox)->Result<T> + Send + 'static) -> Result<T> {
@@ -222,47 +237,96 @@ impl Client {
         tokio::task::spawn_blocking(move || { let mut store=outbox.lock().map_err(|_|anyhow::anyhow!("outbox lock poisoned"))?; task(&mut store) }).await?
     }
     pub async fn next_input_sequence(&self, conversation_id: &str, target: &InputTarget) -> Result<u64> {
-        ensure!(self.can_write(),"local session cannot submit network inputs");
+        ensure!(self.can_save_locally(),"this profile cannot stage network inputs");
         let lane=input_lane(conversation_id,target)?;
         self.stored(move|db|db.reserve_sequence(&lane)).await
     }
-    pub async fn pending(&self) -> Result<Vec<OperationSnapshot>> { self.stored(|db|db.snapshots()).await }
-    pub async fn store_attachment(&self, name: String, data: Vec<u8>) -> Result<Attachment> { self.stored(move|db|db.store_attachment(&name,&data)).await }
+    pub async fn pending(&self) -> Result<Vec<OperationSnapshot>> { self.stored(|db|Ok(db.snapshots()?.into_iter().filter(|snapshot|snapshot.state!=OperationState::Accepted).collect())).await }
+    pub async fn dismiss_rejected(&self,id:&str)->Result<()> {
+        self.require_active()?;let id=id.to_owned();self.stored(move|db|db.dismiss_rejected(&id)).await
+    }
+    pub async fn store_attachment(&self, name: String, data: Vec<u8>) -> Result<Attachment> {
+        ensure!(self.can_save_locally(),"this profile cannot retain new input attachments");
+        let revoked=self.revoked.clone();self.stored(move|db|{ensure!(!revoked.load(Ordering::Acquire),"profile was revoked");db.store_attachment(&name,&data)}).await
+    }
+    pub async fn retain_attachments(&self,owner:&str,references:Vec<Attachment>)->Result<()> {
+        ensure!(self.can_save_locally(),"this profile cannot retain input drafts");let owner=owner.to_owned();
+        let revoked=self.revoked.clone();self.stored(move|db|{ensure!(!revoked.load(Ordering::Acquire),"profile was revoked");db.retain_attachments(&owner,&references)}).await
+    }
+    pub async fn release_attachments(&self,owner:&str)->Result<()> {
+        self.require_active()?;let active=self.active.clone();let owner=owner.to_owned();
+        self.stored(move|db|{ensure!(active.load(Ordering::Acquire),"draft belongs to a closed client");db.release_attachments(&owner)}).await
+    }
+    pub async fn attachment_owners(&self)->Result<Vec<String>> {self.stored(|db|db.attachment_owners()).await}
+    /// The owning UI supplies all current selections. Pending writes protect their own content independently.
+    pub async fn collect_attachments(&self,keep:Vec<Attachment>)->Result<()> {
+        self.require_active()?;let active=self.active.clone();
+        self.stored(move|db|{ensure!(active.load(Ordering::Acquire),"selection belongs to a closed client");db.collect_attachments(&keep)}).await
+    }
     pub async fn read(&self, request: ReadRequest) -> Result<Value> {
-        self.require_active()?;
+        self.require_active()?;let update_gate=matches!(&request,ReadRequest::WriteState);
         let (rpc, method, mut params) = request.wire();
-        if rpc { params["method"]=json!(method); self.connection.call("rpc",params).await }
-        else { self.connection.call(method,params).await }
+        let value=if rpc {params["method"]=json!(method);self.connection.call("rpc",params).await?} else {self.connection.call(method,params).await?};
+        if update_gate {self.write_gate.store(write_gate_value(&value)?,Ordering::Release);}
+        Ok(value)
     }
-    /// The worker owns the operation after queueing; cancelling the UI future cannot interrupt persistence/send/settlement.
-    pub async fn submit(&self, action: Action) -> Result<OperationSnapshot> {
-        self.require_active()?;
-        ensure!(self.can_write(),"local session is read-only; enroll this client before writing");
-        let permit=self.writes.clone().acquire_owned().await?;
+    pub async fn stage(&self,action:Action)->Result<OperationSnapshot> {self.stage_after(action,vec![]).await}
+    pub async fn stage_after(&self,action:Action,mut prerequisites:Vec<String>)->Result<OperationSnapshot> {
+        ensure!(self.can_save_locally(),"this profile cannot stage network writes");
+        prerequisites.sort();prerequisites.dedup();
         let client=self.clone();
-        tokio::spawn(async move { let _permit=permit; client.submit_owned(action).await }).await?
+        self.stored(move|db|client.stage_in(db,action,prerequisites)).await
     }
-    async fn submit_owned(&self, action: Action) -> Result<OperationSnapshot> {
-        self.require_active()?;
-        let operation=self.prepare(action)?;
-        let id=operation.snapshot.id.clone();
-        self.stored(move|db|db.prepare(&operation)).await?;
-        let lookup=id.clone();
-        let existing=self.stored(move|db|db.get(&lookup)).await?;
-        if existing.snapshot.state!=OperationState::Prepared { return Ok(existing.snapshot); }
-        self.send_prepared(id).await
+    fn stage_in(&self,db:&mut Outbox,mut action:Action,prerequisites:Vec<String>)->Result<OperationSnapshot> {
+        ensure!(!self.revoked.load(Ordering::Acquire) && self.write_gate.load(Ordering::Acquire)!=2,"known revoked or forked profile cannot stage writes");
+        let known=match &action {
+            Action::Input {input,..}=>Some(input.message_id.clone()),
+            Action::Workspace {command}=>Some(self.operation_id("workspace",&json!({"type":"workspace_commanded","command":command}))?),
+            Action::Memory {conversation_id,memory_id,base,after}=>Some(self.operation_id(conversation_id,&json!({"type":"memory_controlled","memory_id":memory_id,"base":base,"after":after}))?),
+            _=>None,
+        };
+        if let Some(id)=known && let Some(original)=db.find(&id)? {
+            ensure!(original.snapshot.target_node==self.target && original.prerequisites==prerequisites,"original operation target or prerequisite cannot change");
+            if let Action::Input {conversation_id,input}=&action {
+                let request:Value=serde_json::from_slice(&original.bytes)?;
+                let mut stored=request["params"].clone();stored.as_object_mut().context("stored input params missing")?.remove("method");stored.as_object_mut().context("stored input params missing")?.remove("attestation");
+                let mut wanted=serde_json::to_value(input)?;wanted["conversation_id"]=json!(conversation_id);
+                if input.route.sequence==0 {wanted["sequence"]=stored["sequence"].clone();}
+                ensure!(wanted==stored,"original input contents or CAS cannot change");
+            }
+            return Ok(original.snapshot);
+        }
+        if let Action::Input {conversation_id,input}=&mut action && input.route.sequence==0 {input.route.sequence=db.reserve_sequence(&input_lane(conversation_id,&input.route.target)?)?;}
+        let mut operation=self.prepare(action)?;operation.prerequisites=prerequisites;
+        db.prepare(&operation)?;Ok(operation.snapshot)
+    }
+    /// Local staging survives transport loss; only an admitted writer changes Prepared to Unknown.
+    pub async fn submit(&self,action:Action)->Result<OperationSnapshot> {
+        let node_operator=matches!(&action,Action::NodeSettings(_)|Action::ProviderSettings(_)|Action::Triage(_)|Action::Relay {..}|Action::TestWebhook|Action::CreateDecisionToken {..}|Action::RevokeDecisionToken {..}|Action::ConfirmWritable);
+        let allowed=if node_operator {self.can_configure_node() && self.active.load(Ordering::Acquire)} else if matches!(&action,Action::Delivery(_)) {self.can_save_locally() && matches!(self.authority,ClientAuthority::Membership {can_manage:true})} else {self.can_save_locally()};
+        ensure!(allowed,"this client is not authorized for this operation");
+        let client=self.clone();let staged=self.stored(move|db|client.stage_in(db,action,vec![])).await?;
+        if staged.state!=OperationState::Prepared {return Ok(staged);}
+        self.send_staged(&staged.id).await
+    }
+    pub async fn send_staged(&self,id:&str)->Result<OperationSnapshot> {
+        let permit=self.writes.clone().acquire_owned().await?;let client=self.clone();let id=id.to_owned();
+        tokio::spawn(async move{let _permit=permit;client.send_prepared(id).await}).await?
     }
     async fn send_prepared(&self,id:String)->Result<OperationSnapshot> {
-        self.require_active()?;
-        let operation=self.stored(move|db|db.begin(&id)).await?;
-        let id=operation.snapshot.id.clone();
+        let lookup=id.clone();let operation=self.stored(move|db|db.get(&lookup)).await?;
+        ensure!(operation.snapshot.target_node==self.target,"original operation cannot switch target");
+        if operation.snapshot.state!=OperationState::Prepared || !self.active.load(Ordering::Acquire) || !self.connection.is_open() {return Ok(operation.snapshot);}
+        let request:Value=serde_json::from_slice(&operation.bytes)?;
+        let network_write=request["method"]=="rpc" || request["method"]=="delivery";
+        if network_write && !self.can_send_online() {return Ok(operation.snapshot);}
+        let check=id.clone();if !self.stored(move|db|db.can_begin(&check)).await? {return Ok(operation.snapshot);}
         let sent = async {
+            if let Some(conversation_id)=&operation.upload_scope {for attachment in &operation.attachments {self.upload(conversation_id,attachment).await?;}}
             self.require_active()?;
-            if let Some(conversation_id)=&operation.upload_scope {
-                for attachment in &operation.attachments { self.upload(conversation_id,attachment).await?; }
-            }
-            self.require_active()?;
-            self.connection.call_bytes(operation.bytes.clone()).await
+            let before=self.clone();let begin_id=id.clone();
+            let callback:crate::connection::BeforeWrite=Box::new(move||Box::pin(async move {before.require_active()?;before.stored(move|db|db.begin(&begin_id).map(|_|())).await}));
+            self.connection.call_staged(operation.bytes.clone(),callback).await
         }.await;
         match sent {
             Ok(mut result) => {
@@ -280,7 +344,7 @@ impl Client {
                 } else { Ok(operation.snapshot) }
             }
             // Generic RPC errors do not prove no side effect; only method-specific receipts settle a write.
-            Err(_) => Ok(operation.snapshot),
+            Err(_) => self.stored(move|db|Ok(db.get(&id)?.snapshot)).await,
         }
     }
     pub async fn reconcile(&self, id: &str) -> Result<OperationSnapshot> {
@@ -288,10 +352,7 @@ impl Client {
         let id=id.to_owned();
         let op=self.stored(move|db|db.get(&id)).await?;
         ensure!(op.snapshot.target_node==self.target && op.snapshot.network_id==self.network_id() && op.snapshot.client_id==self.client_id(),"operation belongs to another endpoint or identity");
-        if op.snapshot.state==OperationState::Prepared {
-            let client=self.clone();let id=op.snapshot.id;
-            return tokio::spawn(async move{client.send_prepared(id).await}).await?;
-        }
+        if op.snapshot.state==OperationState::Prepared {return self.send_staged(&op.snapshot.id).await;}
         if op.snapshot.state!=OperationState::Unknown { return Ok(op.snapshot); }
         let result=match &op.reconciliation {
             Reconciliation::Input {conversation_id,message_id,target} => self.connection.call("rpc",json!({"method":"input_receipt","conversation_id":conversation_id,"message_id":message_id,"target":target})).await?,
@@ -321,9 +382,10 @@ impl Client {
                 }
             }
             Reconciliation::Memory {memory_id,..} => {
+                if !result["current"].is_null() {validate_memory_state(&result["current"],memory_id)?;}
                 match result["receipt"].as_str() {
                     Some("recorded") => { ensure!(result["current"]["memory_id"]==*memory_id && result["current"]["metadata"]["revision"]==op.snapshot.id,"memory receipt identity mismatch"); Some(OperationState::Accepted) },
-                    Some("superseded") => Some(OperationState::Rejected),
+                    Some("superseded") => {ensure!(result["current"]["metadata"]["revision"]!=op.snapshot.id,"superseded memory receipt mismatch");Some(OperationState::Rejected)},
                     Some("not_seen_here") => None,
                     _ => anyhow::bail!("invalid memory receipt"),
                 }
@@ -385,7 +447,7 @@ impl Client {
     }
     fn prepare(&self, action: Action) -> Result<Operation> {
         let upload_scope=match &action {
-            Action::Input {conversation_id,..}|Action::WorkspaceWithAttachments {conversation_id,..}=>Some(conversation_id.clone()),_=>None,
+            Action::Input {conversation_id,..}=>Some(conversation_id.clone()),Action::Workspace {..}=>Some("workspace".into()),_=>None,
         };
         let mut id=uuid::Uuid::new_v4().to_string();
         let mut sequence=None;
@@ -403,9 +465,8 @@ impl Client {
                 let lane=input_lane(&conversation_id,&input.route.target)?;
                 (true,"message",params,lane,Some((conversation_id,body)))
             }
-            Action::Workspace {command} | Action::WorkspaceWithAttachments {command,..} => {
+            Action::Workspace {command} => {
                 attachments=match &command {WorkspaceCommand::PostChannelMessage {attachments,..}|WorkspaceCommand::ControlInput {action:InputControl::Edit {attachments,..},..}=>attachments.clone(),_=>vec![]};
-                ensure!(attachments.is_empty() || upload_scope.is_some(),"workspace attachments require an upload conversation");
                 reconciliation=Reconciliation::Workspace;
                 id=self.operation_id("workspace",&json!({"type":"workspace_commanded","command":command}))?;
                 revision=serde_json::to_value(&command)?["expected_revision"].as_u64();
@@ -414,6 +475,8 @@ impl Client {
             }
             Action::Memory {conversation_id,memory_id,base,after} => {
                 ensure!(base.epoch==1,"unsupported memory epoch");
+                if let Some(version)=&base.version {ensure!(valid_hash(&json!(version.revision))&&valid_hash(&json!(version.source_event_hash)),"memory version must identify exact source hashes");}
+                if let Some(text)=&after {ensure!(!text.trim().is_empty() && text.chars().count()<=500,"a memory must contain 1-500 characters");}
                 let body=json!({"type":"memory_controlled","memory_id":memory_id,"base":base,"after":after});
                 id=self.operation_id(&conversation_id,&body)?;
                 reconciliation=Reconciliation::Memory {conversation_id:conversation_id.clone(),memory_id:memory_id.clone()};
@@ -464,6 +527,7 @@ impl Client {
                 (true,"ack",json!({"notification_id":notification_id}),format!("notification:{notification_id}"),Some((conversation_id,body)))
             }
             Action::ResolveCheck {conversation_id,check_id,work_id,outcome,note} => {
+                let note=note.trim().to_owned();
                 let signature=if check_id.starts_with("work:") {
                     let work_id=work_id.context("work ID required for work resolution")?;
                     ensure!(check_id==format!("work:{work_id}"),"check does not identify this work");
@@ -493,7 +557,7 @@ impl Client {
         }
         let method=if rpc { params["method"]=json!(method); "rpc" } else {method};
         let bytes=serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
-        Ok(Operation {snapshot:OperationSnapshot {id,network_id:self.network_id().into(),client_id:self.client_id().into(),target_node:self.target.clone(),state:OperationState::Prepared,sequence,result:None},lane,expected_revision:revision,bytes,reconciliation,attachments,upload_scope})
+        Ok(Operation {snapshot:OperationSnapshot {id,network_id:self.network_id().into(),client_id:self.client_id().into(),target_node:self.target.clone(),state:OperationState::Prepared,sequence,result:None},lane,expected_revision:revision,bytes,reconciliation,attachments,upload_scope,prerequisites:vec![]})
     }
 }
 
@@ -518,14 +582,16 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
         "workspace_command" => {
             ensure!(result["command_id"]==op.snapshot.id,"workspace response has another command ID");
             if result["stored"]==false && result["code"]=="workspace_command_not_saved" { Ok(Some(OperationState::Rejected)) }
-            else if result["event_hash"].as_str().is_some_and(|v|v.len()==64) { Ok(Some(OperationState::Accepted)) }
+            else if valid_hash(&result["event_hash"]) { Ok(Some(OperationState::Accepted)) }
             else { Ok(None) }
         }
         "control_memory" => {
             ensure!(result["operation_id"]==op.snapshot.id,"memory response has another operation ID");
+            if !result["current"].is_null() {validate_memory_state(&result["current"],request["params"]["memory_id"].as_str().context("memory ID missing")?)?;}
             match result["state"].as_str() {
-                Some("applied"|"already_recorded")=>Ok(Some(OperationState::Accepted)),
-                Some("superseded"|"conflict")=>Ok(Some(OperationState::Rejected)),
+                Some("applied"|"already_recorded")=>{ensure!(result["current"]["metadata"]["revision"]==op.snapshot.id,"memory receipt does not prove original revision");Ok(Some(OperationState::Accepted))},
+                Some("superseded")=>{ensure!(result["current"]["metadata"]["revision"]!=op.snapshot.id,"superseded receipt still names original revision");Ok(Some(OperationState::Rejected))},
+                Some("conflict")=>Ok(Some(OperationState::Rejected)),
                 _=>Ok(None),
             }
         }
@@ -579,7 +645,6 @@ mod tests {
     use crate::connection::tests::{receive,send,server};
     use vibeface_secure::{Identity,membership::{Genesis,Member,NetworkState}};
     use std::sync::atomic::{AtomicUsize,Ordering};
-    use futures_util::SinkExt;
 
     #[tokio::test]
     async fn lost_receipt_and_restart_query_the_original_operation_without_duplicate_effect() -> Result<()> {
@@ -605,6 +670,7 @@ mod tests {
                     let result=match request["method"].as_str() {
                         Some("authenticate")=>json!({"network_id":fixture_state.genesis.network_id,"principal":{"source":"membership","device_id":fixture_client_id,"can_manage":true}}),
                         Some("subscribe")=>json!({}),
+                        Some("write_state")=>json!({"state":"writable"}),
                         Some("directory")=>json!({"state":fixture_state,"now_ms":vibeface_protocol::now_ms()}),
                         Some("rpc")=>match request["params"]["method"].as_str() {
                             Some("message")=> {counter.fetch_add(1,Ordering::SeqCst); socket.close(None).await?;break;},
@@ -633,7 +699,7 @@ mod tests {
     }
     #[test]
     fn malformed_or_mismatched_receipts_never_settle_writes() -> Result<()> {
-        let operation=Operation {snapshot:OperationSnapshot {id:"message-1".into(),network_id:"n".into(),client_id:"c".into(),target_node:"t".into(),state:OperationState::Unknown,sequence:Some(1),result:None},lane:"chat".into(),expected_revision:None,bytes:serde_json::to_vec(&json!({"params":{"method":"message"}}))?,reconciliation:Reconciliation::Manual,attachments:vec![],upload_scope:None};
+        let operation=Operation {snapshot:OperationSnapshot {id:"message-1".into(),network_id:"n".into(),client_id:"c".into(),target_node:"t".into(),state:OperationState::Unknown,sequence:Some(1),result:None},lane:"chat".into(),expected_revision:None,bytes:serde_json::to_vec(&json!({"params":{"method":"message"}}))?,reconciliation:Reconciliation::Manual,attachments:vec![],upload_scope:None,prerequisites:vec![]};
         assert!(validate_result(&operation,&json!({"accepted":true,"message_id":"different"})).is_err());
         assert_eq!(validate_result(&operation,&json!({"accepted":false,"message_id":"message-1"}))?,None);
         assert_eq!(validate_result(&operation,&json!({"accepted":true,"message_id":"message-1"}))?,Some(OperationState::Accepted));
@@ -664,4 +730,15 @@ fn decimal_at_most(actual:&str,maximum:&str)->bool {
 fn input_lane(conversation_id:&str,target:&InputTarget)->Result<String> {
     let target=match target {InputTarget::Task {task_id}|InputTarget::ChannelTask {task_id,..}=>json!(["workspace_task",task_id]),other=>serde_json::to_value(other)?};
     Ok(format!("input:{conversation_id}:{target}"))
+}
+
+fn validate_memory_state(state:&Value,memory_id:&str)->Result<()> {
+    ensure!(state["memory_id"]==memory_id && (state["text"].is_string()||state["text"].is_null()),"memory state identity or text is invalid");
+    let metadata=&state["metadata"];
+    ensure!(metadata["epoch"]==1 && valid_hash(&metadata["revision"]) && valid_hash(&metadata["source_event_hash"]) && metadata["control_revision"].as_u64().is_some_and(|v|v<=u32::MAX as u64),"invalid memory metadata");
+    ensure!(matches!(metadata["origin"].as_str(),Some("agent"|"user")) && metadata["user_controlled"].is_boolean() && metadata["essential"].is_boolean(),"invalid memory protection metadata");Ok(())
+}
+
+fn write_gate_value(value:&Value)->Result<u8> {
+    Ok(match value["state"].as_str() {Some("writable")=>1,Some("forked")=>2,Some("read_only"|"aligning")=>3,_=>anyhow::bail!("invalid Node write state")})
 }

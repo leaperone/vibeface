@@ -82,6 +82,23 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         plan.discard()?;
         assert_eq!(created["principal"]["can_manage"], true);
         assert!(view().await?.member(&admin_id)?.manage);
+        // The native local viewer uses its own unenrolled key and the private launcher exchange.
+        let viewer=Arc::new(key(&dir,"local-viewer")?);
+        let local_entry=Entry {origin:format!("http://{}",node.config.local_listen),node_id:entry.node_id.clone()};
+        let grant=client::LocalTarget::read(&node_dir,&local_entry)?.grant(viewer.device_id()).await?;
+        let local_client=client::Client::open_local(viewer.clone(),grant,dir.join("local-outbox")).await?;
+        assert_eq!(local_client.authority(),client::ClientAuthority::LocalSession);
+        assert_eq!(viewer.network_id(),None,"local authorization never enrolls the key");
+        assert!(local_client.read(client::ReadRequest::Home).await?["bots"].is_array());
+        assert!(local_client.next_input_sequence("chat",&client::wire::InputTarget::BotMain {bot_id:"bot".into()}).await.is_err());
+        assert!(local_client.submit(client::Action::DeleteBot {conversation_id:"chat".into()}).await.is_err());
+        assert!(local_client.management_session().is_err());
+        assert!(local_client.can_configure_node(),"private local owner retains Node settings authority");
+        let local_root=std::fs::canonicalize(&dir)?;
+        let configured=local_client.submit(client::Action::NodeSettings(client::NodeSettings {roots:vec![local_root.clone()],manager:None})).await?;
+        assert_eq!(configured.state,client::OperationState::Accepted);
+        assert_eq!(local_client.read(client::ReadRequest::NodeSettings).await?["settings"]["roots"],json!([local_root]));
+        local_client.close();drop(local_client);
         let settings = crate::client::operator_call(&node, "node_settings", json!({})).await?;
         let root = std::fs::canonicalize(&dir)?;
         crate::client::operator_call(
@@ -114,12 +131,19 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let mut enrollment = Enrollment::start(&phone, &entry.origin, &link, "phone").await?;
         assert!(matches!(enrollment.poll().await?, Progress::Waiting));
         let join_id = enrollment.join_id.clone();
+        drop(enrollment);
+        let mut enrollment=Enrollment::resume(&phone).await?;
+        assert_eq!(enrollment.join_id,join_id,"restart retains the original invite and nonce");
         session.confirm_join(&join_id).await?;
         let Progress::Code(joiner_code) = enrollment.poll().await? else {
             anyhow::bail!("the joiner sees a code once confirmed")
         };
         let admin_code = session.join_code(&join_id).await?.context("revealed")?;
         assert_eq!(admin_code, joiner_code);
+        drop(enrollment);
+        let mut enrollment=Enrollment::resume(&phone).await?;
+        let Progress::Code(reopened_code)=enrollment.poll().await? else {anyhow::bail!("restart lost confirmed short code")};
+        assert_eq!(reopened_code,joiner_code);
         session.grant_join(&join_id, false).await?;
         assert!(matches!(enrollment.poll().await?, Progress::Joined));
         let (network, _) = enrollment.finish()?;

@@ -1,5 +1,6 @@
 //! Native desktop ownership and OS integration. This module never links Core's Runtime.
 pub mod activation;
+mod bootstrap;
 mod lifecycle;
 mod model;
 pub mod platform;
@@ -7,6 +8,7 @@ mod service;
 mod settings;
 pub mod tray;
 
+pub use bootstrap::BootstrapInvitation;
 pub use model::{
     Discovery, Inspect, LocalNode, NodeIdentity, NodeSource, NodeStatus, OwnedNode, RuntimeState,
     UnavailableReason,

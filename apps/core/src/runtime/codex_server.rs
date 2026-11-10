@@ -13,7 +13,7 @@ use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
 use vibeface_bridge::{
-    codex::{CodexClient, CodexError, ExecEvent},
+    codex::{CodexClient, CodexError, EventSender},
     platform::{
         ipc::{Alias, Endpoint},
         privatefs, tree,
@@ -932,7 +932,7 @@ impl CodexServer {
         target: CodexTarget,
         identity: &LocalIdentity,
         data_dir: &Path,
-        events: mpsc::UnboundedSender<ExecEvent>,
+        events: EventSender,
     ) -> Result<Self> {
         let directory = socket_dir(identity, data_dir)?;
         let (endpoint, receiver) = tokio::sync::watch::channel(None);
@@ -1642,7 +1642,7 @@ mod tests {
             env: BTreeMap::from([("HOME".into(), dir.display().to_string())]),
             external_auth: None,
         };
-        let (events, _) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = Arc::new(CodexServer::open(
             CodexTarget::Spawn(launch.clone()),
             &LocalIdentity::generate(),
@@ -1720,7 +1720,7 @@ raise SystemExit(7)
                 plan_type: None,
             }),
         };
-        let (events, _) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(
             CodexTarget::Spawn(launch.clone()),
             &LocalIdentity::generate(),
@@ -1805,7 +1805,7 @@ raise SystemExit(7)
                 plan_type: None,
             }),
         });
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(first.clone(), &LocalIdentity::generate(), &dir, events)?;
         let listener = tokio::net::UnixListener::bind(server.inner.spawn_endpoint.path())?;
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -1924,7 +1924,7 @@ raise SystemExit(7)
             CodexTarget::System(dir.join("system.sock")),
             CodexTarget::Off,
         ] {
-            let (events, _) = mpsc::unbounded_channel();
+            let (events, _events) = vibeface_bridge::codex::event_channel();
             let server =
                 CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
             let mut lease = server.lease("manager:config-fixture".into(), &target)?;
@@ -1977,7 +1977,7 @@ raise SystemExit(7)
         )?;
         local.switches.execution.insert(Provider::Codex);
         let target = local.codex_target(false);
-        let (events, _) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
         server.start();
         let first = lines(&out, 1).await;
@@ -2052,7 +2052,7 @@ raise SystemExit(7)
         local.switches.execution.insert(Provider::Codex);
         local.switches.codex_app_server.mode = AppServerMode::Spawn;
         let identity = LocalIdentity::generate();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(local.codex_target(false), &identity, &dir, events)?;
         server.start();
         let first = lines(&out, 1).await;
@@ -2218,7 +2218,7 @@ raise SystemExit(7)
             "an explicit system App Server remains usable"
         );
         let identity = LocalIdentity::generate();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(local.codex_target(false), &identity, &dir, events)?;
         server.start();
         let connected = link_becomes(&server, |link| matches!(link, Link::Connected { .. })).await;
@@ -2285,7 +2285,7 @@ raise SystemExit(7)
             env: ProviderEnv::default(),
         };
         let identity = LocalIdentity::generate();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
         let server = CodexServer::open(local.codex_target(false), &identity, &dir, events)?;
         server.start();
         let link = link_becomes(&server, |link| matches!(link, Link::NotFound { .. })).await;

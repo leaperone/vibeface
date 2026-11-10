@@ -1,2 +1,9 @@
 pub mod backend;
 pub mod forms;
+pub mod chat;
+pub mod workspace;
+pub mod settings;
+pub mod records;
+pub mod work_detail;
+pub mod channels;
+pub mod tasks;

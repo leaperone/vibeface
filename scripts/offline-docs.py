@@ -61,6 +61,12 @@ def assemble(destination):
 
 
 def verify(destination):
+    if not destination.is_dir():
+        raise ValueError('Assembled documentation directory does not exist')
+    required = sources().values()
+    absent = [name for name in required if not (destination / name).is_file()]
+    if absent:
+        raise ValueError('Missing assembled documentation files: ' + ', '.join(absent))
     missing = []
     for source in destination.rglob('*.md'):
         for match in LINK.finditer(source.read_text(encoding='utf-8')):
@@ -77,6 +83,12 @@ def verify(destination):
 def self_test():
     with tempfile.TemporaryDirectory(prefix='vibeface-docs-') as temporary:
         destination = Path(temporary)
+        try:
+            verify(destination)
+        except ValueError as error:
+            assert 'Missing assembled documentation files' in str(error)
+        else:
+            raise AssertionError('empty documentation bundle accepted')
         mapping = assemble(destination)
         assert len(mapping) > 25 and (destination / 'docs/node.md').is_file()
         assert 'packages/docs/' not in (destination / 'README.md').read_text()
@@ -87,6 +99,14 @@ def self_test():
             assert 'missing.md' in str(error)
         else:
             raise AssertionError('missing assembled link accepted')
+        (destination / 'docs/broken.md').unlink()
+        (destination / 'docs/quick-start.md').unlink()
+        try:
+            verify(destination)
+        except ValueError as error:
+            assert 'quick-start.md' in str(error)
+        else:
+            raise AssertionError('incomplete documentation bundle accepted')
     print('Offline docs self-test passed: all packagers share one manifest and assembled link closure')
 
 

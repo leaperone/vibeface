@@ -19,6 +19,7 @@ use vibeface_bridge::platform::privatefs;
 pub(crate) mod actor;
 pub use actor::StoreActor;
 pub(crate) mod admission;
+mod attachment_scope;
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod client_receipts;
@@ -754,23 +755,9 @@ impl Store {
         message_id: &str,
         attachment: &Attachment,
     ) -> Result<(PathBuf, Vec<u8>)> {
-        if let Some(input) = self.queued_workspace_input(network, message_id)? {
-            ensure!(
-                input.conversation_id == conversation
-                    && input.input.attachments.contains(attachment),
-                "attachment is outside the signed input"
-            );
-            if self
-                .referenced_size(network, conversation, &attachment.hash)
-                .is_err()
-            {
-                return self.verified_blob_path(
-                    network,
-                    crate::workspace::WORKSPACE_SCOPE,
-                    attachment,
-                );
-            }
-        }
+        let source = self.input_attachment_source(network, message_id)?.context("signed input missing")?;
+        ensure!(source.input.conversation_id == conversation && source.input.input.attachments.contains(attachment),
+            "attachment is outside the signed input");
         self.verified_blob_path(network, conversation, attachment)
     }
 
@@ -795,14 +782,7 @@ impl Store {
 
     /// Reads an attachment referenced by a stored event of this conversation.
     pub(crate) fn referenced_size(&self, network: &str, scope: &str, hash: &str) -> Result<u64> {
-        self.connection
-            .query_row(
-                "SELECT b.size FROM event_blobs b JOIN events e ON e.network_id=b.network_id AND e.hash=b.hash WHERE b.network_id=? AND b.blob=? AND e.scope_id=? LIMIT 1",
-                params![network, hash, scope],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("attachment is not referenced by this conversation")
+        self.attachment_reference_size(network, scope, hash)
     }
 
     /// Up to `len` bytes of an attachment from `offset`, and its size. The file was verified

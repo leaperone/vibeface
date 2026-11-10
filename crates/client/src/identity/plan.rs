@@ -71,13 +71,7 @@ impl IdentityPlan {
             session.connection.call_bytes(self.plan.request_bytes.clone()).await
         }.await;
         match result {
-            Ok(result)=>{
-                ensure!(result["network_id"]==self.plan.network_id,"identity reply names another network; original operation remains unknown");
-                // A successful RPC is positive admission evidence, but membership may still be waiting.
-                self.plan.state=IdentityOperationState::Recorded;self.save()?;
-                key.remember(&self.plan.network_id,self.plan.entry.clone())?;
-                Ok(result)
-            }
+            Ok(result)=>{self.record_receipt(key,&result)?;Ok(result)}
             Err(error)=>match self.reconcile(key).await {Ok(result)=>Ok(result),Err(_)=>Err(error).context("identity operation outcome is unknown; reopen the pending operation and query its receipt")},
         }
     }
@@ -86,24 +80,31 @@ impl IdentityPlan {
         let mut session=key.connect(Some(&self.plan.entry)).await?;
         let result=session.call("authenticate",json!({})).await?;
         drop(session);
+        self.record_receipt(key,&result)?;
+        Ok(result)
+    }
+    fn record_receipt(&mut self,key:&mut ClientKey,result:&Value)->Result<()> {
         ensure!(result["network_id"]==self.plan.network_id,"original Node has not confirmed this network; pending operation retained");
-        if !result["state"].is_null() {
+        self.plan.state=if !result["state"].is_null() {
             let state:NetworkState=serde_json::from_value(result["state"].clone())?;
             ensure!(state.genesis==self.plan.genesis,"Node returned another genesis");
-            if let Some(checkpoint)=&self.plan.checkpoint {ensure!(state.checkpoints.contains(checkpoint),"original checkpoint is not recorded here");}
             let now=result["now_ms"].as_u64().context("receipt time missing")?;
             let view=state.project_at(now)?;
-            let member=view.client(key.device_id())?;
-            ensure!(member.manage,"identity has not become a managing member");
-            self.plan.state=IdentityOperationState::Applied;
+            if let Some(checkpoint)=&self.plan.checkpoint {
+                ensure!(state.checkpoints.contains(checkpoint),"original checkpoint is not recorded here");
+                let hash=checkpoint.hash()?;
+                if view.stopped.contains(&hash) {IdentityOperationState::Stopped}
+                else if view.pending.as_ref().is_some_and(|pending|pending.checkpoint==hash) {IdentityOperationState::Recorded}
+                else {ensure!(view.epoch>=checkpoint.epoch && view.client(key.device_id())?.manage,"recovery has not taken effect");IdentityOperationState::Applied}
+            } else {ensure!(view.client(key.device_id())?.manage,"creation did not grant this client management");IdentityOperationState::Applied}
         } else {
             let checkpoint=self.plan.checkpoint.as_ref().context("original creation is not confirmed")?;
             ensure!(result["recovery"]["checkpoint_hash"]==checkpoint.hash()?,"Node has not confirmed this exact recovery checkpoint");
-            self.plan.state=match result["recovery"]["status"].as_str() {Some("waiting")=>IdentityOperationState::Recorded,Some("stopped")=>IdentityOperationState::Stopped,_=>anyhow::bail!("recovery has no authoritative receipt")};
-        }
+            match result["recovery"]["status"].as_str() {Some("waiting")=>IdentityOperationState::Recorded,Some("stopped")=>IdentityOperationState::Stopped,_=>anyhow::bail!("recovery has no authoritative receipt")}
+        };
         self.save()?;
         if self.plan.state!=IdentityOperationState::Stopped {key.remember(&self.plan.network_id,self.plan.entry.clone())?;}
-        Ok(result)
+        Ok(())
     }
     /// Explicitly discard only a never-sent or conclusively settled plan. The recovery backup stays intact.
     pub fn discard(self)->Result<()> {

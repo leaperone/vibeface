@@ -1476,7 +1476,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<ExecEvent>) {
+    pub(super) fn start_codex(self: &Arc<Self>, mut events: vibeface_bridge::codex::EventReceiver) {
         let node = self.clone();
         if let Err(error) = self.background_tasks.spawn(async move {
             // Known before the first connect, so requests on these threads come back to the Node

@@ -2297,34 +2297,9 @@ impl Store {
         network: &str,
         message_id: &str,
     ) -> Result<Vec<HashedEvent>> {
-        let Some(input) = self.queued_workspace_input(network, message_id)? else {
-            return Ok(vec![]);
-        };
-        let mut events = Vec::new();
-        for attachment in &input.input.attachments {
-            let mut sources = attachment_sources_from(
-                &self.connection,
-                network,
-                &input.conversation_id,
-                &attachment.hash,
-            )?;
-            if sources.is_empty() {
-                sources = attachment_sources_from(
-                    &self.connection,
-                    network,
-                    crate::workspace::WORKSPACE_SCOPE,
-                    &attachment.hash,
-                )?;
-            }
-            if let Some(event) = sources.into_iter().next()
-                && !events
-                    .iter()
-                    .any(|source: &HashedEvent| source.hash == event.hash)
-            {
-                events.push(event);
-            }
-        }
-        Ok(events)
+        Ok(self.input_attachment_source(network, message_id)?
+            .filter(|source| !source.input.input.attachments.is_empty())
+            .map(|source| vec![source.source]).unwrap_or_default())
     }
 
     pub(crate) fn scheduler_work_in_scope(
@@ -2584,6 +2559,11 @@ impl Store {
                 return Ok(Some(conversation.into()));
             }
         }
+        for source in self.edited_attachment_sources(network, conversation, hash)? {
+            if self.main_event_allowed(network, conversation, &source.original)? {
+                return Ok(Some(conversation.into()));
+            }
+        }
         Ok(None)
     }
 
@@ -2599,18 +2579,20 @@ impl Store {
                 return Ok(Some(job.conversation_id.clone()));
             }
         }
-        for input in accepted_steering_jobs(&self.connection, job)? {
-            if let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
-                && effective
-                    .input
-                    .attachments
-                    .iter()
-                    .any(|attachment| attachment.hash == hash)
-                && self
-                    .referenced_size(network, crate::workspace::WORKSPACE_SCOPE, hash)
-                    .is_ok()
+        for source in self.edited_attachment_sources(network, &job.conversation_id, hash)? {
+            if self.scheduler_event_allowed(network, job, &source.original)?
+                && source.source.event.seq <= job.basis.get(&source.source.event.author).copied().unwrap_or(0)
             {
-                return Ok(Some(crate::workspace::WORKSPACE_SCOPE.into()));
+                return Ok(Some(job.conversation_id.clone()));
+            }
+        }
+        for input in accepted_steering_jobs(&self.connection, job)? {
+            if let Some(source) = self.input_attachment_source(network, &input.reply_to)?
+                && source.input.conversation_id == job.conversation_id
+                && source.input.input.attachments.iter().any(|attachment| attachment.hash == hash)
+                && self.scheduler_event_allowed(network, job, &source.original)?
+            {
+                return Ok(Some(job.conversation_id.clone()));
             }
         }
         Ok(None)

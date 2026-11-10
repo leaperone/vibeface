@@ -738,6 +738,31 @@ async fn dispatch(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    if snapshot_request(method, &params) {
+        let authority = Authority::new(node, session, node.local_access.subscribe())?;
+        let principal = authority.principal(node, session)?;
+        let result = dispatch_inner(node, session, method, params, Some(principal.clone())).await;
+        authority.check(node, session, &principal)?;
+        result
+    } else {
+        dispatch_inner(node, session, method, params, None).await
+    }
+}
+
+fn snapshot_request(method: &str, params: &Value) -> bool {
+    method == "rpc" && params["method"].as_str().is_some_and(crate::runtime::snapshot_rpc)
+}
+
+async fn dispatch_inner(
+    node: &Arc<Runtime>,
+    session: &mut Session,
+    method: &str,
+    params: Value,
+    display_principal: Option<Principal>,
+) -> Result<Value> {
+    // A supplied cached principal can only authorize the explicit display allowlist. Every
+    // mutation, control and receipt still enters the authoritative writer checks below.
+    let display_principal = display_principal.filter(|_| snapshot_request(method, &params));
     let _work = if matches!(
         method,
         "info"
@@ -756,7 +781,10 @@ async fn dispatch(
     } else {
         Some(node.maintenance.enter()?)
     };
-    if !GUEST_METHODS.contains(&method) && !local_owner_outside_a_network(node, session).await? {
+    if display_principal.is_none()
+        && !GUEST_METHODS.contains(&method)
+        && !local_owner_outside_a_network(node, session).await?
+    {
         principal(node, session).await?;
     }
     match method {
@@ -955,7 +983,10 @@ async fn dispatch(
             Ok(json!({"subscribed":true,"vector":vector,"behind":behind}))
         }
         "rpc" => {
-            let principal = principal(node, session).await?;
+            let principal = match display_principal {
+                Some(principal) => principal,
+                None => principal(node, session).await?,
+            };
             let mut params = params;
             bind_client_identity(&mut params, &principal.device_id)?;
             let watched_scope = (params["method"] == "conversation")
@@ -1730,7 +1761,9 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}));
+        return Ok(
+            json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
+        );
     }
     for checkpoint in &state.checkpoints {
         if checkpoint
