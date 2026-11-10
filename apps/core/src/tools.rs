@@ -1,5 +1,4 @@
-//! The coordination tools of a bot turn: one table for the schemas the SDK offers, the
-//! Node's handler and the `vibeface tool` CLI.
+//! Bot coordination tool schemas, permission rules and Node handlers.
 use crate::{
     model::{
         HUES, MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS,

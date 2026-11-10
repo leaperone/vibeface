@@ -2082,28 +2082,6 @@ impl Executor for Claude {
     }
 }
 
-/// What a `PermissionRequest` of the owner's own session asks, for the bot: the tool and what
-/// the model said it is for, never the command or the file contents, and how to answer.
-pub(crate) fn describe_request(input: &Value) -> String {
-    let tool = input["tool_name"].as_str().unwrap_or("a tool");
-    let tool_input = &input["tool_input"];
-    if request_kind(input) == RequestKind::Question {
-        let questions = crate::triage::question_lines(&tool_input["questions"]);
-        return format!(
-            "Claude Code asks: {}. Answer with {{\"answers\":{{\"QUESTION\":\"ANSWER\"}}}}.",
-            questions.join("; ")
-        );
-    }
-    let what = tool_input["description"]
-        .as_str()
-        .or_else(|| tool_input["file_path"].as_str())
-        .map(|what| format!(": {what}"))
-        .unwrap_or_default();
-    format!(
-        "{tool}{what}. Answer with {{\"behavior\":\"allow\"}} or {{\"behavior\":\"deny\",\"message\":\"WHY\"}}."
-    )
-}
-
 /// `AskUserQuestion` asks a question; every other tool asks permission.
 pub(crate) fn request_kind(input: &Value) -> RequestKind {
     match input["tool_name"] == "AskUserQuestion" {

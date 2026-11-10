@@ -491,48 +491,6 @@ pub async fn config_set(data_dir: &Path, key: &str, value: serde_json::Value) ->
     Ok(())
 }
 
-pub async fn delivery_wallet(
-    data_dir: &Path,
-    command: crate::delivery::wallet::WalletCommand,
-) -> Result<crate::delivery::wallet::WalletStatus> {
-    let (_, response) = request(data_dir, Command::DeliveryWallet(command)).await?;
-    response
-        .wallet
-        .context("node did not return its delivery wallet status")
-}
-
-pub async fn configure_delivery(
-    data_dir: &Path,
-    config: crate::delivery::DeliveryConfig,
-) -> Result<()> {
-    let (_, response) = request(data_dir, Command::DeliveryConfig(Box::new(config))).await?;
-    ensure!(
-        response.status == Status::Healthy,
-        "node did not apply delivery settings"
-    );
-    Ok(())
-}
-
-pub async fn delivery_key_operation(
-    data_dir: &Path,
-    action: crate::delivery::KeyAction,
-    intent_id: String,
-    gas_cap: String,
-) -> Result<serde_json::Value> {
-    let (_, response) = request(
-        data_dir,
-        Command::DeliveryKeyOperation {
-            action,
-            intent_id,
-            gas_cap,
-        },
-    )
-    .await?;
-    response
-        .delivery
-        .context("node did not return its receiving key operation")
-}
-
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
     let mut listener = Listener::claim(&listener_endpoint(&data_dir)?).await?;
     loop {
