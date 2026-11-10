@@ -219,6 +219,7 @@ enum Command {
     },
     DeliveryWallet(vibeface_control::maintenance::WalletCommand),
     DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
+    DeliveryBudget(Box<crate::delivery::budget::BudgetCommand>),
     DeliveryKeyOperation {
         action: crate::delivery::KeyAction,
         intent_id: String,
@@ -499,6 +500,20 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             }
             write_packet(&mut stream, &response).await?;
         }
+        Command::DeliveryBudget(command) => {
+            let result = match runtime.maintenance.enter() {
+                Ok(_guard) => runtime.delivery.local_budget(*command).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(value) => response.delivery = Some(value),
+                Err(error) => {
+                    response.status = Status::Error;
+                    response.error = Some(error.to_string());
+                }
+            }
+            write_packet(&mut stream, &response).await?;
+        }
         Command::DeliveryConfig(config) => {
             let result = match runtime.maintenance.enter() {
                 Ok(_guard) => runtime.delivery.configure_local(*config),
@@ -515,15 +530,39 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             intent_id,
             gas_cap,
         } => {
-            let result = match runtime.maintenance.enter() {
+            let diagnostics = if matches!(action, crate::delivery::KeyAction::Register) {
+                crate::delivery::proof::Diagnostics::open(&runtime.data_dir, &intent_id)
+            } else {
+                None
+            };
+            let mut owner = crate::delivery::proof::DiagnosticStage::new(
+                diagnostics.as_ref(),
+                "owner_guard",
+                "key",
+            );
+            let admission = runtime.maintenance.enter();
+            if admission.is_ok() {
+                owner.ok();
+            }
+            drop(owner);
+            let result = match admission {
                 Ok(_guard) => {
                     runtime
                         .delivery
-                        .local_key_operation(action, &intent_id, &gas_cap)
+                        .local_key_operation(action, &intent_id, &gas_cap, diagnostics.as_ref())
                         .await
                 }
                 Err(error) => Err(error),
             };
+            let mut completion = crate::delivery::proof::DiagnosticStage::new(
+                diagnostics.as_ref(),
+                "owner_response",
+                "key",
+            );
+            if result.is_ok() {
+                completion.ok();
+            }
+            drop(completion);
             match result {
                 Ok(value) => response.delivery = Some(value),
                 Err(error) => {

@@ -353,8 +353,8 @@ impl Leftover {
 
     /// Whether the record this was found from still describes the same program.
     ///
-    /// Windows reuses process ids, so the record carries the moment the root started and the
-    /// path it was started from; both must still match before anything is ended.
+    /// Windows reuses process ids, so the recorded root's start time and membership in the
+    /// recorded job must still match before anything is ended.
     pub fn matches_record(&self) -> bool {
         #[cfg(unix)]
         {

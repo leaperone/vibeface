@@ -96,7 +96,7 @@ acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w
 
 `tls-cert.pem` 是完整证书链，属 root、权限 0644；`tls-key.pem` 属 root:1001、权限 0640，容器用户只能读。`tls_dir` 属 root:1001、权限 0750。激活脚本在宿主上核对这些属主和权限，容器里的 guard 再核对两个文件来自只读挂载、属主是 root、组和其他用户不可写。两个文件按单文件 bind mount 挂进容器，挂载跟随 inode：续期必须原地改写文件内容。acme.sh 的 `--install-cert` 用 `cat >` 原地写，inode 不变，符合要求；不要用先写临时文件再 `mv` 替换的方式，否则容器继续看到旧文件，直到重新激活。Core 每次接受连接时检查这两个文件，内容变化后重新加载，不需要重启容器，也不需要 reloadcmd；证书与私钥暂时不配对（例如只写完一个）时继续用旧证书，5 秒后再试。
 
-**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
+**必做：提供商安全组和宿主防火墙。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改提供商安全组或宿主防火墙，首次激活前按实际配置放行并核对。
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分两种情况：
 

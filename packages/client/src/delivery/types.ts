@@ -31,6 +31,24 @@ export type DeliveryPayment = {
   withdrawn: string
   refunded: string
   tx_hash: string | null
+  budget_id: string | null
+  settlement: { earned: string; withdrawn: string; refunded: string; publication: { state: 'private_ready' | 'disclosed_outstanding' | 'final_earned' | 'final_settled' | 'expired_unrevealed'; total_amount: string; economic_cutoff: number; availability_risk: string | null } | null } | null
+}
+export type DeliveryBudget = {
+  budget_id: string
+  payer: string
+  payee: string
+  provider_peer: string
+  asset: string
+  deposit: string
+  free: string
+  locked: string
+  earned: string
+  withdrawn: string
+  refunded: string
+  state: 'open' | 'closing' | 'closed'
+  gas_cap: string
+  ready_windows: Array<{ order_id: string; index: number }>
 }
 export type DeliveryWindow = {
   index: number
@@ -75,6 +93,7 @@ export type DeliveryDraft = {
   acceptance: Acceptance
   max_service_amount: string
   max_gas_amount: string
+  budget_id: string | null
 }
 export type TransferFile = { name: string; size: number; arrayBuffer(): Promise<ArrayBuffer> }
 export type ReceivedFile = { name: string; content_base64: string; sha256: string; bytes: number }
