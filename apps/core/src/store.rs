@@ -269,7 +269,7 @@ impl Store {
                 ))?;
             }
             SCHEMA_VERSION => {
-                schema_guard::validate_application_schema(&connection)?;
+                schema_guard::install_derived_indexes(&connection)?;
             }
             _ => bail!(
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
@@ -317,7 +317,7 @@ impl Store {
             version == SCHEMA_VERSION,
             "unsupported database schema version {version}"
         );
-        schema_guard::validate_application_schema(&connection)?;
+        schema_guard::validate_readonly_schema(&connection)?;
         network_from(&connection)?;
         Ok(Self {
             connection,

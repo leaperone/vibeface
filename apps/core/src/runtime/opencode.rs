@@ -1758,10 +1758,10 @@ async fn follow(node: std::sync::Weak<Runtime>, network: String, work_id: String
         let Some(node) = node.upgrade() else {
             return;
         };
-        let Ok(Some(record)) = {
+        let Ok(Some(record)) = ({
             let work_id = work_id.to_owned();
             node.store.call("opencode.work_record", move |store| store.work_record(&work_id)).await
-        } else {
+        }) else {
             return;
         };
         let starting = matches!(record.state, WorkState::Starting { .. });

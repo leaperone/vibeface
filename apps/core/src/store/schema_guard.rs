@@ -277,6 +277,32 @@ fn expected_application_shape() -> Result<&'static ApplicationShape> {
 /// Checks required columns, indexes and constraints before the runtime can write.
 /// Extra user tables and indexes are ignored. Column order is ignored.
 pub(crate) fn validate_application_schema(connection: &Connection) -> Result<()> {
+    validate_schema(connection, false)
+}
+
+pub(crate) fn validate_readonly_schema(connection: &Connection) -> Result<()> {
+    validate_schema(connection, true)
+}
+
+pub(crate) fn install_derived_indexes(connection: &Connection) -> Result<()> {
+    validate_schema(connection, true)?;
+    let present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='work_runs_reconcile')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        let tx = connection.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE INDEX work_runs_reconcile ON work_runs(state,send_by_ms,work_id);",
+        )?;
+        validate_application_schema(&tx)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn validate_schema(connection: &Connection, allow_missing_derived: bool) -> Result<()> {
     let expected = expected_application_shape()?;
     let actual = application_shape(connection)?;
     let mut mismatches = Vec::new();
@@ -287,6 +313,11 @@ pub(crate) fn validate_application_schema(connection: &Connection) -> Result<()>
             continue;
         };
         for (index, expected_index) in &expected_table.indexes {
+            if allow_missing_derived && table == "work_runs" && index == "work_runs_reconcile"
+                && !actual_table.indexes.contains_key(index)
+            {
+                continue;
+            }
             if actual_table.indexes.get(index) != Some(expected_index) {
                 mismatches.push(format!("{table}.{index}: required index metadata does not match this Core"));
             }
@@ -429,6 +460,44 @@ mod tests {
         init_current_db(&db)?;
         db.execute_batch("DROP INDEX events_main; CREATE UNIQUE INDEX events_main ON events (network_id, author, seq) /* local formatting */ WHERE MAIN = 1;")?;
         validate_application_schema(&db)
+    }
+
+    #[test]
+    fn only_missing_derived_index_is_installed_without_changing_existing_rows() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-derived-index-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let path = dir.join("node.sqlite3");
+        {
+            let db = Connection::open(&path)?;
+            init_current_db(&db)?;
+            db.execute_batch("DROP INDEX work_runs_reconcile;")?;
+            db.execute("INSERT INTO identity_meta(key,value) VALUES('device','original-device')", [])?;
+        }
+        let before = std::fs::read(&path)?;
+        drop(Store::open_readonly(&path)?);
+        assert_eq!(std::fs::read(&path)?, before);
+        let store = Store::open(&path)?;
+        let value: String = store.connection.query_row(
+            "SELECT value FROM identity_meta WHERE key='device'", [], |row| row.get(0),
+        )?;
+        assert_eq!(value, "original-device");
+        validate_application_schema(&store.connection)?;
+        drop(store);
+        drop(Store::open(&path)?);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_schema_is_not_modified_while_a_derived_index_is_missing() -> Result<()> {
+        assert_schema_refused(
+            &format!("{INITIAL_SCHEMA}\nDROP INDEX work_runs_reconcile; DROP INDEX events_main;"),
+            "events_main",
+        )?;
+        assert_schema_refused(
+            &format!("{INITIAL_SCHEMA}\nDROP INDEX work_runs_reconcile; CREATE INDEX work_runs_reconcile ON work_runs(work_id);"),
+            "work_runs_reconcile",
+        )
     }
 
     #[test]
