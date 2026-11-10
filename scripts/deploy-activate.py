@@ -194,6 +194,14 @@ def healthy(manifest):
     return container
 
 
+def running(manifest):
+    # Health reloads config.json, which a release may rewrite in its own format before activation;
+    # the maintenance lease proves the running Core's identity instead.
+    container, info = container_info(manifest)
+    require(info['State']['Status'] == 'running', 'previous container is not running at the pinned image')
+    return container
+
+
 def wait_healthy(manifest):
     for _ in range(45):
         try:
@@ -368,7 +376,7 @@ def transform_nginx(text, config):
 @contextmanager
 def lease(config, previous):
     if previous:
-        container = healthy(previous)
+        container = running(previous)
         process = subprocess.Popen([*DOCKER, 'exec', '-i', container, 'python3', '/opt/vibeface/runtime.py', 'lease'],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
@@ -574,7 +582,10 @@ def activate(config, image, tag, source, version):
             return {'status': 'already_active', 'image': image, 'source_sha': source, 'version': version}
         if current:
             require(current['project'] == config['project'] and current['role'] == config['role'], 'current service ownership differs')
-            healthy(current)
+            if config['role'] in CORE_ROLES:
+                running(current)
+            else:
+                healthy(current)
         release = directory / ('release-' + uuid.uuid4().hex)
         release.mkdir(mode=0o700)
         templates = (Path(__file__).resolve().parent / 'deploy/compose.yaml',
