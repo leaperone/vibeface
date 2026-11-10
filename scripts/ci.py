@@ -957,6 +957,7 @@ def coverage_self_test(directory, base, nonancestor):
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text("test-only change\n")
         unit_head = commit("test-only change after unverified Rust")
+        event_file.write_text(json.dumps({"before": head, "after": unit_head}))
         with patch.dict(os.environ, {"GITHUB_SHA": unit_head}):
             with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [successful]}).encode())):
                 accumulated = event_plan(args)
