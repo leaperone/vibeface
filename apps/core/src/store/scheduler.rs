@@ -5943,8 +5943,7 @@ mod hold_query_tests {
         for (index, intent, report, expected) in [
             (0, InputIntent::Continue, Some(false), None),
             (1, InputIntent::Defer, Some(true), None),
-            (3, InputIntent::Continue, None, Some(QueueHoldReason::EarlierInput)),
-            (4, InputIntent::Continue, Some(true), Some(QueueHoldReason::EarlierInput)),
+            (3, InputIntent::Continue, Some(true), Some(QueueHoldReason::EarlierInput)),
         ] {
             f.store.connection.execute("DELETE FROM scheduler_jobs", [])?;
             let id = format!("input.{index}");

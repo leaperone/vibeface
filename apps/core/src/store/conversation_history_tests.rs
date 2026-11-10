@@ -66,12 +66,35 @@ fn signed_scoped_pages_match_full_oracle_and_allow_empty_continuations() -> Resu
     assert!(first.items.is_empty());
     assert!(first.next_cursor.is_some());
     assert_eq!(paged(&origin, &net.network, 2)?, origin.main_messages(&net.network, "c")?);
+    let dependent = origin.append_event(&net.b, &net.network, "c",
+        user(&net, "cross-node", "input waiting for the other author's history"), vec![], 30)?;
     let mut replica = store(&net)?;
+    assert_eq!(replica.ingest_events(&net.network, &[dependent])?.statuses, [IngestStatus::Pending]);
     let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
-    for event in events.iter().rev() {
-        replica.ingest_events(&net.network, std::slice::from_ref(event))?;
+    // A missing predecessor at an arbitrary sequence is refused, not queued. The sync
+    // sender must retry from the receiver's contiguous author head.
+    for envelope in events.iter().rev() {
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        let received = replica.ingest_events(&net.network, std::slice::from_ref(envelope))?;
+        if event.seq == 1 {
+            assert_eq!(received.statuses, [IngestStatus::Accepted]);
+        } else {
+            assert!(matches!(received.statuses.as_slice(), [IngestStatus::Rejected(reason)]
+                if reason.starts_with("sequence gap:")), "sequence {}: {:?}", event.seq, received.statuses);
+        }
     }
-    assert_eq!(paged(&replica, &net.network, 3)?, origin.main_messages(&net.network, "c")?);
+    assert!(replica.messages(&net.network, "c")?.is_empty());
+    let retried = replica.ingest_events(&net.network, &events)?;
+    assert!(retried.statuses.iter().all(|status|
+        matches!(status, IngestStatus::Accepted | IngestStatus::Duplicate)), "{:?}", retried.statuses);
+    assert_eq!(replica.heads(&net.network)?, origin.heads(&net.network)?, "every author converged, including the pending dependent");
+    let pending: usize = replica.connection.query_row(
+        "SELECT count(*) FROM pending_events WHERE network_id=?", [&net.network], |row| row.get(0))?;
+    assert_eq!(pending, 0);
+    assert_eq!(replica.messages(&net.network, "c")?, origin.messages(&net.network, "c")?);
+    let oracle = origin.main_messages(&net.network, "c")?;
+    assert_eq!(replica.main_messages(&net.network, "c")?, oracle);
+    assert_eq!(paged(&replica, &net.network, 3)?, oracle);
     Ok(())
 }
 

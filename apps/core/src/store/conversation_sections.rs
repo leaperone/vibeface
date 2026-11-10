@@ -262,7 +262,7 @@ mod tests {
                 }, Provider::Codex, 12 + i * 10)?;
             add_session(&mut f, &format!("s{i}"), "session", 13 + i * 10)?;
             f.store.ask(&f.identity, &f.network, "c", EventBody::QuestionAsked {
-                question_id: format!("q{i}"), target: Some(InputTarget::BotMain { bot_id: "bot".into() }),
+                question_id: format!("q-{i}"), target: Some(InputTarget::BotMain { bot_id: "bot".into() }),
                 attention: AttentionRequest { kind: AttentionKind::Question, device_id: Some(node.clone()) },
                 severity: Severity::Info, text: format!("question {i}"), choices: vec![],
                 about: Subject { node: node.clone(), agent: Some(Provider::Codex), session_id: format!("s{i}"),
@@ -279,7 +279,7 @@ mod tests {
         let questions = all_pages(|cursor| f.store.conversation_questions_page(&f.network, "c", cursor, 2))?;
         assert_eq!(questions, f.store.conversation_questions(&f.network, "c")?);
         assert_eq!(questions.iter().map(|q| q["question_id"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["q0", "q1", "q2", "q3", "q4", "q5"]);
+            ["q-0", "q-1", "q-2", "q-3", "q-4", "q-5"]);
         let sessions = all_pages(|cursor| f.store.conversation_sessions_page(&f.network, "c", cursor, 2))?;
         assert_eq!(sessions, f.store.attributed_sessions(&f.network, "c")?);
         assert_eq!(sessions.iter().map(|s| s["session_id"].as_str().unwrap()).collect::<Vec<_>>(),
@@ -337,8 +337,8 @@ mod tests {
         let mut f = fixture()?;
         let node = f.identity.device_id()?;
         for (id, target, at) in [
-            ("main", Some(InputTarget::BotMain { bot_id: "bot".into() }), 10),
-            ("unknown", None, 11),
+            ("q-main", Some(InputTarget::BotMain { bot_id: "bot".into() }), 10),
+            ("q-unknown", None, 11),
         ] {
             f.store.ask(&f.identity, &f.network, "c", EventBody::QuestionAsked {
                 question_id: id.into(), target,
@@ -352,7 +352,7 @@ mod tests {
         assert!(first.items.is_empty());
         assert!(!first.complete);
         let next = f.store.conversation_questions_page(&f.network, "c", first.next_cursor.as_deref(), 1)?;
-        assert_eq!(next.items[0]["question_id"], "main");
+        assert_eq!(next.items[0]["question_id"], "q-main");
         assert!(next.complete);
         Ok(())
     }

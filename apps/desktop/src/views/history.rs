@@ -323,13 +323,15 @@ impl HistoryState {
         let mut result = self.base.clone();
         for (section, state) in &self.sections {
             let values = Value::Array(state.rows.iter().map(|row| row.value.clone()).collect());
+            let absent_owner = matches!(section,HistorySection::OwnerJobs|HistorySection::OwnerScopeJobs|HistorySection::OwnerMemoryConflicts)
+                && state.rows.is_empty() && at_path(&result,&["scheduler","remote"]).is_none_or(Value::is_null);
             if *section == HistorySection::MemorySyncConflicts {
                 set_path(&mut result, section.snapshot_path(), values);
                 let path = section.snapshot_path();
                 let mut more_path = path[..path.len() - 1].to_vec();
                 more_path.push("has_more");
                 set_path(&mut result, &more_path, Value::Bool(state.coverage.as_ref().is_some_and(|coverage| !coverage.complete)));
-            } else if !state.rows.is_empty() || state.coverage.is_some() || at_path(&result, section.snapshot_path()).is_some_and(Value::is_array) {
+            } else if !absent_owner && (!state.rows.is_empty() || state.coverage.is_some() || at_path(&result, section.snapshot_path()).is_some_and(Value::is_array)) {
                 set_path(&mut result, section.snapshot_path(), values);
             }
             if let Some(coverage) = &state.coverage {

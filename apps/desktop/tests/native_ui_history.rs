@@ -235,3 +235,10 @@ fn restoration_never_uses_the_winning_value_or_another_provider()->Result<()>{
  match record.restoration(&original)?{history::ProfileRestoration::Instruction(text)=>assert_eq!(text,"请仅把 Codex 模型改回「my-model」，保留其他配置。"),_=>panic!("wrong restoration type")}
  let foreign:history::OverwrittenRecord=serde_json::from_value(json!({"change_id":"mine","by":"remote","field":"model","provider":"claude","value":"their-model"}))?;assert!(foreign.restoration(&original).is_err());Ok(())
 }
+
+#[test]
+fn empty_owner_coverage_never_fabricates_an_owner_observation()->Result<()>{
+ let mut history=state();let mut value=snapshot("a",S::Jobs,json!([]),None);value["scheduler"]["remote"]=Value::Null;
+ for section in [S::OwnerJobs,S::OwnerScopeJobs,S::OwnerMemoryConflicts]{let name=serde_json::to_value(section)?.as_str().unwrap().to_owned();value["history"][name]=json!({"next_cursor":null,"complete":true});}
+ load(&mut history,value)?;assert_eq!(history.materialize()["scheduler"]["remote"],Value::Null);assert_eq!(history.materialize()["history"]["owner_jobs"],json!({"next_cursor":null,"complete":true}));Ok(())
+}

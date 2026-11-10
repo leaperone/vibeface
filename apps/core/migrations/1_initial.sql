@@ -90,3 +90,4 @@ CREATE INDEX `memories_history` ON `memories` (`network_id`, `conversation_id`, 
 CREATE INDEX `skills_history` ON `skills` (`network_id`, `skill_id`) WHERE skill IS NOT NULL;
 CREATE INDEX `scheduler_jobs_context` ON `scheduler_jobs` (`conversation_id`, json_extract(detail,'$.into.attempt_id'), `sequence`) WHERE state IN ('steering','steered');
 CREATE INDEX `workspace_assignments_work` ON `workspace_assignments_lookup` (`network_id`, `work_id`, `created_at_ms`, `assignment_id`) WHERE work_id IS NOT NULL;
+CREATE INDEX `events_input_identity` ON `events` (`network_id`, `subject`) WHERE kind = 'input_posted';

@@ -9164,6 +9164,7 @@ if __name__ == "__main__":
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
+        modes.add_argument("--conversation-history", action="store_true", help="check bounded conversation history through a real isolated Core process")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
@@ -9235,6 +9236,9 @@ if __name__ == "__main__":
                 phase4_acceptance(arguments)
             elif arguments.auto_route:
                 auto_route_acceptance(arguments)
+            elif arguments.conversation_history:
+                from conversation_history_probe import conversation_history_acceptance
+                conversation_history_acceptance(arguments, sys.modules[__name__])
             elif arguments.web_only:
                 web_acceptance(arguments)
             elif arguments.chat_agent:

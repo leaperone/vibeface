@@ -93,6 +93,10 @@ table "events" {
   index "events_kind" {
     columns = [column.network_id, column.scope_id, column.kind, column.subject]
   }
+  index "events_input_identity" {
+    columns = [column.network_id, column.subject]
+    where = "kind = 'input_posted'"
+  }
 }
 table "event_blobs" {
   schema = schema.main

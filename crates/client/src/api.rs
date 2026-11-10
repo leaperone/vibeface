@@ -184,13 +184,16 @@ impl Client {
         let (events,_)=broadcast::channel(128);
         Ok(Self {key,connection:Connection::disconnected(),target,network,authority,endpoint,outbox,events,generation:uuid::Uuid::new_v4().to_string(),writes,decision_tokens,active:Arc::new(AtomicBool::new(false)),revoked:Arc::new(AtomicBool::new(false)),write_gate:Arc::new(AtomicU8::new(proof.write_gate))})
     }
+    pub async fn reopen_offline(&self,endpoint:Endpoint)->Result<Self> {
+        let target=endpoint.node_id().to_owned();let proof=self.stored(move|db|db.cached_profile(&target)).await?;
+        let next=Self::offline_generation(self.key.clone(),endpoint,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone())?;
+        self.close();Ok(next)
+    }
     pub async fn reconnect_or_offline(&self,endpoint:Endpoint)->Result<Self> {
         match self.reconnect(endpoint.clone()).await {
             Ok(client)=>Ok(client),
             Err(error) if crate::connection::transport_failure(&error)=>{
-                let target=endpoint.node_id().to_owned();let proof=self.stored(move|db|db.cached_profile(&target)).await?;
-                let next=Self::offline_generation(self.key.clone(),endpoint,proof,self.outbox.clone(),self.writes.clone(),self.decision_tokens.clone())?;
-                self.close();Ok(next)
+                self.reopen_offline(endpoint).await
             }
             Err(error)=>Err(error),
         }

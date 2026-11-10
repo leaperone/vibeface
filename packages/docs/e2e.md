@@ -49,6 +49,20 @@ pnpm exec e2e run --config tests/e2e/e2e.config.ts --headed
 
 排查失败时，读取终端指向的 `trace.md`。不要上传 Node 数据目录或恢复文件。
 
+## 验证会话历史分页
+
+使用同一源码构建的 CLI、Core 和 Web 加密模块运行隔离进程验收：
+
+```sh
+python3 scripts/verify-node.py --conversation-history \
+  --binary /absolute/path/to/vibeface \
+  --core-binary /absolute/path/to/vibeface-core \
+  --crypto-module /absolute/path/to/apps/app/dist/client/vibeface_secure.js \
+  --artifacts .artifacts/conversation-history
+```
+
+该模式通过真实加密连接写入 1024 条延后处理的签名消息，核对默认窗口、完整旧历史、3 MiB 响应预算、错误作用域拒绝、进程重启和新消息合并。Provider 执行与会话扫描关闭；若任何 Provider 程序被调用，验收失败。每次运行仅停止自己的 Node 和客户端进程，私有目录中的 `summary.json` 保存内容摘要、字节计量和清理结果，不输出凭证。此验收不证明网页或原生窗口的滚动表现。
+
 ## 验证公益传输进程和网络边界
 
 先构建仅用于受控 loopback 验收的 QUIC/Noise probe。构建产物必须留在任务 worktree 的 `.artifacts/`。

@@ -37,11 +37,16 @@ pub struct Schedule {pub schedule_id:String,pub name:String,pub prompt:String,pu
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct Scheduler {#[serde(default)]pub unanswered:Vec<String>,#[serde(default)]pub remote:Option<RemoteScheduler>,#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>}
 impl Scheduler{
+ pub fn retry_job_for_message(&self,message_id:&str)->Option<&Job>{let jobs=match self.remote.as_ref().filter(|remote|!remote.owner.is_empty()){Some(remote)if remote.reachable=>&remote.jobs,Some(_)=>return None,None=>&self.jobs};jobs.iter().find(|job|job.message_id.as_deref()==Some(message_id))}
  pub fn effective_jobs(&self)->Vec<&Job>{let remote=self.remote.as_ref().filter(|remote|remote.reachable);let mut seen=std::collections::HashSet::new();remote.into_iter().flat_map(|remote|remote.jobs.iter()).chain(self.jobs.iter()).filter(|job|seen.insert(job.trigger.as_str())).collect()}
  pub fn effective_scope_jobs(&self)->Vec<&ScopeJob>{let remote=self.remote.as_ref().filter(|remote|remote.reachable);let mut seen=std::collections::HashSet::new();remote.into_iter().flat_map(|remote|remote.scope_jobs.iter()).chain(self.scope_jobs.iter()).filter(|job|seen.insert(job.trigger.as_str())).collect()}
 }
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct Job{pub trigger:String,pub state:String,pub scope:Scope,#[serde(default)]pub message_id:Option<String>,#[serde(default)]pub failure:Option<vibeface_bridge::failure::ExecFailure>}
+pub struct Job{#[serde(default)]pub retryable:bool,pub trigger:String,pub state:String,pub scope:Scope,#[serde(default)]pub message_id:Option<String>,#[serde(default)]pub failure:Option<vibeface_bridge::failure::ExecFailure>}
+impl Job{
+ pub fn is_active(&self)->bool{["queued","claimed","running","steering","cancelling","reconciling"].contains(&self.state.as_str())}
+ pub fn can_retry(&self)->bool{if !self.retryable||!["failed","rejected","cancelled","interrupted"].contains(&self.state.as_str()){return false}self.failure.as_ref().is_none_or(|failure|{use vibeface_bridge::failure::FailureKind;!matches!(failure.kind,FailureKind::Transport|FailureKind::TimedOut|FailureKind::Restarted|FailureKind::Lost|FailureKind::Unknown)&&!failure.detail.to_ascii_lowercase().contains("outcome may be unknown")&&!failure.detail.to_ascii_lowercase().contains("timed out")})}
+}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 #[serde(tag="kind",rename_all="snake_case")]
 pub enum Scope{#[default]Main,WorkspaceTask{task_id:String},Task{work_id:String},Routine{trigger:String}}
@@ -56,7 +61,7 @@ pub struct BotSettings{#[serde(default)]pub skills:Vec<Skill>,#[serde(default)]p
 #[derive(Clone,Debug,Default)]
 pub struct Snapshot {pub profiles:Vec<crate::host::profiles::PersonalProfile>,pub profile_id:Option<String>,pub credential_scope:Option<String>,pub generation:u64,pub online:bool,pub synced:bool,pub private_block:Option<String>,pub projection_valid:bool,pub cached:bool,pub cached_at_ms:Option<u64>,pub cache_omitted:usize,pub writable:bool,pub can_save_locally:bool,pub can_control:bool,pub local_session:bool,pub write_state:String,pub network:Option<String>,pub client_id:Option<String>,pub can_manage:bool,pub can_configure:bool,pub can_configure_owner:bool,pub operator_unknown:Option<String>,pub operator_unknown_kind:Option<String>,pub operator_can_close:bool,pub operator_fields:Vec<String>,pub operator_secret_changes:bool,pub decision_tokens:Vec<DecisionTokenSummary>,pub bots:Vec<Bot>,pub nodes:Vec<Node>,pub members:Vec<Member>,pub joins:Vec<JoinRequest>,pub inputs:Vec<vibeface_protocol::workspace::QueuedInput>,pub tasks:Vec<Task>,pub assignments:Vec<vibeface_protocol::workspace::Assignment>,pub channels:Vec<Channel>,pub conversation:std::sync::Arc<Conversation>,pub work_detail:Option<std::sync::Arc<crate::views::records::WorkDetail>>,pub channel_history:Option<std::sync::Arc<crate::views::records::WorkspaceHistory>>,pub artifact_preview:Option<std::sync::Arc<crate::views::records::ArtifactPage>>,pub settings_review:Option<SettingsReviewView>,pub pending:Vec<Pending>,pub identity_plan:Option<IdentityPlanView>,pub drafts:Vec<NativeDraftSummary>,pub questions:Vec<Question>,pub notifications:Vec<Notification>,pub history_loading:Option<vibeface_protocol::history::HistorySection>,pub history_error:Option<String>,pub live:Vec<LiveProgress>,pub delivery:Delivery,pub status:String,pub error:Option<String>}
 #[derive(Clone,Debug)]
-pub struct Pending{pub id:String,pub state:String}
+pub struct Pending{pub id:String,pub state:String,pub target_node:String}
 #[derive(Clone,Debug,Deserialize,Serialize)]
 pub struct ComposerDraft{pub target:InputTarget,pub intent:InputIntent,pub text:String,pub attachments:Vec<Attachment>,pub expected_revision:Option<u64>}
 impl ComposerDraft {
@@ -107,7 +112,7 @@ pub struct MemorySyncConflicts{#[serde(default)]pub items:Vec<MemorySyncConflict
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
 pub struct MemorySyncConflict{pub memory_id:String,pub losing_revision:String,pub winning_revision:String,pub reason:String}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]
-pub struct MemoryConflict{pub memory_id:String,pub expected_revision:String,pub actual_revision:String,pub reason:String}
+pub struct MemoryConflict{#[serde(default)]pub history_id:String,#[serde(default)]pub call_ref:String,pub memory_id:String,pub expected_revision:String,pub actual_revision:String,pub reason:String}
 
 pub fn target_conversation(target:&InputTarget,shown:&Snapshot,current:Option<&str>)->anyhow::Result<String>{
  let owner=match target{InputTarget::BotMain{bot_id}|InputTarget::Routine{bot_id,..}|InputTarget::ChannelMember{bot_id,..}|InputTarget::ChannelTask{bot_id,..}=>Some(bot_id.as_str()),InputTarget::Task{task_id}=>Some(shown.tasks.iter().find(|t|&t.task_id==task_id).ok_or_else(||anyhow::anyhow!("目标任务未加载"))?.owner_bot.as_str()),InputTarget::Work{work_id}=>{anyhow::ensure!(shown.conversation.works.iter().any(|work|&work.work_id==work_id),"目标工作不属于当前对话");return current.map(str::to_owned).ok_or_else(||anyhow::anyhow!("工作对话未选择"));}};
@@ -133,7 +138,7 @@ pub fn merge_records(shown:&Conversation,records:ConversationRecords)->anyhow::R
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct CoordinationCheck{pub check_id:String,pub conversation_id:String,pub trigger:String,pub attempt_id:String,pub detail:String}
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct Notification{pub notification_id:String,pub kind:String,pub text:String,pub conversation_id:String,#[serde(default)]pub target:Option<InputTarget>}
 
-#[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct Skill{pub skill_id:String,pub name:String,pub description:String}
+#[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct Skill{pub skill_id:String,pub name:String,pub description:String,#[serde(default)]pub body:String}
 
 #[derive(Clone,Debug)]pub struct IdentityPlanView{pub backup_path:String,pub sha256:String,pub network_id:String,pub state:String}
 
@@ -178,3 +183,14 @@ pub fn connection_entry(origin:&str,node_id:&str,remembered:Option<&vibeface_cli
 
 #[derive(Clone,Debug,Default,Deserialize,Serialize)]pub struct RemoteScheduler{#[serde(default)]pub owner:String,#[serde(default)]pub reachable:bool,#[serde(default)]pub jobs:Vec<Job>,#[serde(default)]pub scope_jobs:Vec<ScopeJob>,#[serde(default)]pub memory_conflicts:Option<Vec<MemoryConflict>>}
 #[derive(Clone,Debug,Deserialize,Serialize)]#[serde(tag="state",rename_all="snake_case")]pub enum DeliveryControl{StopWaiting{work_id:String,target_node:String},StopTimedOut{work_id:String,target_node:String},DispatchWaiting{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>},DispatchRejected{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>},DispatchUnverified{work_id:String,target_node:String,cwd:String,#[serde(default)]trigger:Option<String>,#[serde(default)]title:Option<String>,#[serde(default)]prompt:Option<String>,#[serde(default)]reason:Option<String>}}
+
+/// User supplied targets never inherit direct hints for another Node.
+pub fn connection_endpoint(transport:&str,origin:&str,node_id:&str,addresses:&str,remembered:Option<&vibeface_client::Endpoint>,hint:Option<&vibeface_client::Entry>)->anyhow::Result<vibeface_client::Endpoint>{
+ use vibeface_client::{Endpoint,Entry};
+ anyhow::ensure!(["","auto","gateway","lan"].contains(&transport),"接入方式须为 auto、gateway 或 lan");
+ if transport.is_empty()&&origin.trim().is_empty()&&node_id.trim().is_empty()&&addresses.trim().is_empty(){if let Some(endpoint)=remembered{endpoint.validate()?;return Ok(endpoint.clone())}}
+ let remembered_entry=remembered.map(|endpoint|match endpoint{Endpoint::Gateway(entry)|Endpoint::Preferred{gateway:entry,..}=>entry.clone(),Endpoint::Lan{node_id,..}=>Entry{origin:String::new(),node_id:node_id.clone()},Endpoint::Local(grant)=>grant.entry().clone()});
+ let entry=connection_entry(origin,node_id,remembered_entry.as_ref().or(hint),false)?;
+ let direct=if !addresses.trim().is_empty(){addresses.lines().map(str::trim).filter(|line|!line.is_empty()).map(str::to_owned).collect::<Vec<_>>()}else{match remembered.filter(|endpoint|endpoint.node_id()==entry.node_id){Some(Endpoint::Lan{addresses,..}|Endpoint::Preferred{addresses,..})=>addresses.clone(),_=>vec![]}};
+ let endpoint=if transport=="gateway"{Endpoint::Gateway(entry)}else if transport=="lan"||entry.origin.is_empty(){Endpoint::Lan{node_id:entry.node_id,addresses:direct}}else if direct.is_empty(){Endpoint::Gateway(entry)}else{Endpoint::Preferred{gateway:entry,addresses:direct}};endpoint.validate()?;Ok(endpoint)
+}

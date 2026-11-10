@@ -18,7 +18,7 @@ on:
         type: boolean
         default: false
       native_frames:
-        description: 'Measure native async frames after compilation without running the full runtime suite'
+        description: 'Measure native async frames and inspect controlled cold start without the full runtime suite'
         type: boolean
         default: false
       native_benchmarks:
@@ -1270,6 +1270,34 @@ jobs:
           path: .artifacts/native-prepare/native-frames.log
           if-no-files-found: error
           retention-days: 7
+      - name: Inspect the controlled native cold-start stack
+        id: native-offline-diagnostic
+        if: ${{ always() && inputs.native_frames && steps.compile.outputs.vibeface-desktop == 'success' }}
+        run: |
+          cargo test --locked -p vibeface-desktop --features native-ui-tests --test native_ui_offline --no-run --message-format=json > .artifacts/native-prepare/offline-build.jsonl
+          python3 - <<'PYBINARY'
+          import json, pathlib
+          root = pathlib.Path('.artifacts/native-prepare')
+          matches = [record['executable'] for line in (root / 'offline-build.jsonl').read_text().splitlines()
+                     if (record := json.loads(line)).get('reason') == 'compiler-artifact'
+                     and record['target']['name'] == 'native_ui_offline' and record.get('executable')]
+          if len(matches) != 1: raise SystemExit('Expected exactly one same-source native offline test executable')
+          (root / 'offline-binary.txt').write_text(matches[0])
+          PYBINARY
+          binary="$(cat .artifacts/native-prepare/offline-binary.txt)"
+          if command -v gdb >/dev/null 2>&1; then
+            xvfb-run -a gdb --batch --return-child-result -ex 'set pagination off' -ex 'set print frame-arguments none' -ex run -ex 'thread apply all bt 32' --args "$binary" native_backend_cold_offline_stages_original_input_in_actual_outbox --exact --nocapture 2>&1 | tee .artifacts/native-prepare/native-offline-stack.log
+          else
+            printf 'No installed debugger; recording the exact controlled test result.\n' | tee .artifacts/native-prepare/native-offline-stack.log
+            xvfb-run -a "$binary" native_backend_cold_offline_stages_original_input_in_actual_outbox --exact --nocapture 2>&1 | tee -a .artifacts/native-prepare/native-offline-stack.log
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && inputs.native_frames && steps.compile.outputs.vibeface-desktop == 'success' }}
+        with:
+          name: native-offline-stack-${{ github.sha }}-${{ github.run_id }}
+          path: .artifacts/native-prepare/native-offline-stack.log
+          if-no-files-found: error
+          retention-days: 7
       - name: Run controlled native and runtime tests
         id: native-tests
         if: ${{ always() && steps.lockfile.outcome == 'success' && inputs.native_tests }}
@@ -1283,7 +1311,7 @@ jobs:
             if [[ "$package" == vibeface-client && "$CLIENT_COMPILE" != success ]]; then continue; fi
             if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
-          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests workspace::lookup_tests scheduler::context_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
+          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests fresh_main_input_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests workspace::lookup_tests scheduler::context_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
             if [[ "$CORE_COMPILE" != success ]]; then break; fi
             if ! cargo test --locked -p vibeface-core --lib "$filter" -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
@@ -1298,9 +1326,12 @@ jobs:
           BENCHMARK_MODE: ${{ inputs.native_benchmarks }}
         run: |
           export VIBEFACE_PERF_SIZES=1000
-          filters=(signed_history_scale signed_ingest_concurrency)
+          export VIBEFACE_PERF_KINDS=assistant
+          filters=(signed_local_main_input_append_scale signed_ingest_concurrency signed_history_scale)
           if [[ "$BENCHMARK_MODE" == full ]]; then
             export VIBEFACE_PERF_SIZES=1000,10000,100000
+            export VIBEFACE_PERF_KINDS=assistant,input,fork,multi
+            filters=(signed_history_scale signed_ingest_concurrency)
             filters+=(signed_pending_cascade_scale local_journal_scale lookup_read_scale_preserves_graph_oracle_without_full_graph_reads)
           fi
           result=0
@@ -1317,6 +1348,7 @@ jobs:
           TEST_OUTCOME: ${{ steps.native-tests.outcome }}
           BENCHMARK_OUTCOME: ${{ steps.native-benchmarks.outcome }}
           FRAME_OUTCOME: ${{ steps.native-frames.outcome }}
+          OFFLINE_DIAGNOSTIC_OUTCOME: ${{ steps.native-offline-diagnostic.outcome }}
         run: |
           mkdir -p .artifacts/native-prepare
           cp Cargo.lock .artifacts/native-prepare/Cargo.lock
@@ -1329,7 +1361,8 @@ jobs:
                   'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
                   'lockfile': os.environ['LOCKFILE_OUTCOME'], 'formatting': os.environ['FORMATTING_OUTCOME'],
                   'compile': os.environ['COMPILE_OUTCOME'], 'tests': os.environ['TEST_OUTCOME'],
-                  'benchmarks': os.environ['BENCHMARK_OUTCOME'], 'native_frames': os.environ['FRAME_OUTCOME'], 'publishing': False}
+                  'benchmarks': os.environ['BENCHMARK_OUTCOME'], 'native_frames': os.environ['FRAME_OUTCOME'],
+                  'offline_diagnostic': os.environ['OFFLINE_DIAGNOSTIC_OUTCOME'], 'publishing': False}
           (root / 'outcomes.json').write_text(json.dumps(data, indent=2) + '\n')
           PYMETA
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

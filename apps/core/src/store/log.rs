@@ -32,6 +32,7 @@ pub(crate) mod test_metrics {
     thread_local! {
         pub(super) static METRICS: RefCell<Metrics> = RefCell::new(Metrics::default());
         static LEGACY: Cell<bool> = const { Cell::new(false) };
+        static FULL_WORKSPACE_AUTHORIZATION: Cell<bool> = const { Cell::new(false) };
     }
     pub(crate) fn reset() {
         METRICS.with(|metrics| *metrics.borrow_mut() = Metrics::default());
@@ -50,6 +51,17 @@ pub(crate) mod test_metrics {
             }
         }
         let _restore = Restore(LEGACY.with(|value| value.replace(enabled)));
+        f()
+    }
+    pub(crate) fn full_workspace_authorization() -> bool {
+        FULL_WORKSPACE_AUTHORIZATION.with(Cell::get)
+    }
+    pub(crate) fn with_full_workspace_authorization<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) { FULL_WORKSPACE_AUTHORIZATION.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(FULL_WORKSPACE_AUTHORIZATION.with(|value| value.replace(true)));
         f()
     }
     pub(super) struct IngestTimer(std::time::Instant);
@@ -972,7 +984,18 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
-    super::workspace::authorize_event(connection, network, &event)?;
+    // This branch is only for this transaction's freshly signed local head extension.
+    // Forked/cutoff authors and every sync/recompute admission retain causal authorization.
+    let fresh_main_input = matches!(&event.body, EventBody::InputPosted { target: crate::workspace::InputTarget::BotMain { .. }, .. })
+        && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+        && first_fork(connection, network, &event.author)?.is_none();
+    #[cfg(test)]
+    let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+    let fresh_main_input = fresh_main_input
+        && super::workspace::authorize_fresh_local_bot_main(connection, network, &event)?;
+    if !fresh_main_input {
+        super::workspace::authorize_event(connection, network, &event)?;
+    }
     authorize_memory(connection, network, &event)?;
     authorize_cause(connection, &view, &event)?;
     authorize_owner(connection, &view, &event)?;

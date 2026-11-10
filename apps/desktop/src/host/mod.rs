@@ -10,7 +10,6 @@ mod service;
 mod settings;
 pub mod tray;
 
-pub use bootstrap::BootstrapInvitation;
 pub use model::{
     Discovery, Inspect, LocalNode, NodeIdentity, NodeSource, NodeStatus, OwnedNode, RuntimeState,
 };

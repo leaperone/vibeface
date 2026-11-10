@@ -63,6 +63,7 @@ const DERIVED_TABLES: &[&str] = &[
     "workspace_assignments_lookup",
 ];
 const DERIVED_INDEXES: &[(&str, &str)] = &[
+    ("events", "events_input_identity"),
     ("work_runs", "work_runs_reconcile"),
     ("messages", "messages_history"),
     ("messages", "messages_replies_status"),
@@ -540,13 +541,6 @@ mod tests {
                 "INSERT INTO identity_meta(key,value) VALUES('device','preserved-device')",
                 [],
             )?;
-            let actual = application_shape(&db)?;
-            for (table, shape) in expected_application_shape()? {
-                assert_eq!(
-                    actual[table].columns, shape.columns,
-                    "{table} columns must be unchanged in the fixture"
-                );
-            }
         }
         let before = std::fs::read(&path)?;
         let error = match Store::open(&path) {

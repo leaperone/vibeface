@@ -13,7 +13,7 @@ impl Backend{
  // The outbox dependency prevents any generic resend path from bypassing task creation.
  if let Some(command)=saved.prerequisite.clone(){let prerequisite=client.stage(Action::Workspace{command}).await?;saved.prerequisite_id=Some(prerequisite.id);write_draft(path.clone(),saved.clone()).await?;}
  let prerequisites=saved.prerequisite_id.iter().cloned().collect();let staged=client.stage_after(Action::Input{conversation_id:saved.conversation_id.clone(),input:saved.input.clone()},prerequisites).await?;saved.input.route.sequence=staged.sequence.context("本机输入序号未持久化")?;
- write_draft(path.clone(),saved.clone()).await?;self.state.drafts=load_draft_summaries(directory).await?;self.state.pending=client.pending().await?.into_iter().map(|item|Pending{id:item.id,state:operation_label(item.state).into()}).collect();self.publish();
+ write_draft(path.clone(),saved.clone()).await?;self.state.drafts=load_draft_summaries(directory).await?;self.state.pending=client.pending().await?.into_iter().map(|item|Pending{id:item.id,state:operation_label(item.state).into(),target_node:item.target_node}).collect();self.publish();
  let _=self.emit(Event::InputStored(saved.input.text.clone())).await;if let Some(id)=&self.form_id{let _=self.emit(Event::FormSaved(id.clone())).await;}
  let _=self.emit(Event::Notice(if self.state.online{"输入已存本机，等待可写连接或核对前序回执。"}else{"输入已存本机，等待连接；结果未知的原操作只核对，不重发。"}.into())).await;
  if !self.state.writable{return Ok(())}

@@ -43,7 +43,7 @@ fn open(cx:&mut TestAppContext,route:Route,snapshot:Snapshot)->Harness{
  cx.update(gpui_kit::init);
  let(tx,commands)=mpsc::channel(32);let(events,event_rx)=mpsc::channel(32);let(snapshots,snapshot_rx)=watch::channel(Arc::new(snapshot.clone()));let(stop,stop_rx)=watch::channel(false);
  let(window,view)=cx.update(|cx|gpui_kit::open_window(WindowOptions::default(),cx,move|window,cx|cx.new(|cx|app::Desktop::new(tx,stop,event_rx,snapshot_rx,window,cx))).unwrap());
- view.update(cx,|view,cx|{view.snapshot=Arc::new(snapshot);view.route=route;view.selected=Some("chat-a".into());view.attachment_scope=Some("chat-a".into());cx.notify();});
+ view.update(cx,|view,cx|{view.snapshot=Arc::new(snapshot);view.route=route;view.selected=Some("chat-a".into());view.prepare_history_list();view.attachment_scope=Some("chat-a".into());cx.notify();});
  Harness{window,view,commands,events,_snapshots:snapshots,_stop:stop_rx}
 }
 fn enter_message(h:&Harness,cx:&mut TestAppContext,text:&str){h.window.update(cx,|_,window,cx|h.view.update(cx,|view,cx|view.composer.update(cx,|input,cx|input.set_value(text.to_owned(),window,cx)))).unwrap();}
@@ -146,4 +146,15 @@ fn overwritten_profile_restore_uses_the_original_change(cx:&mut TestAppContext){
 fn prepending_messages_and_updating_rows_preserve_the_reader_anchor(cx:&mut TestAppContext){
  let rows=(0..20).map(|index|ui::Message{message_id:format!("message-{index}"),role:"user".into(),text:format!("正文 {index}"),..Default::default()}).collect::<Vec<_>>();
  let h=open(cx,Route::Chat("chat-a".into()),fixture());h.view.update(cx,|view,cx|{view.timeline.replace(rows.clone(),cx);view.timeline.list.scroll_to(gpui_kit::ListOffset{item_ix:8,offset_in_item:gpui_kit::px(17.)});let mut older=vec![ui::Message{message_id:"older".into(),role:"user".into(),text:"更早记录".into(),..Default::default()}];older.extend(rows);view.timeline.replace(older.clone(),cx);assert_eq!(view.timeline.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:9,offset_in_item:gpui_kit::px(17.)});assert_eq!(view.timeline.message(9).unwrap().message_id,"message-8");older[9].text.push_str("，刷新后的内容");view.timeline.replace(older,cx);assert_eq!(view.timeline.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:9,offset_in_item:gpui_kit::px(17.)});});
+}
+
+#[gpui_kit::test]
+fn native_non_message_history_preserves_record_identity_and_offset(cx:&mut TestAppContext){
+ let h=open(cx,Route::History(vibeface_protocol::history::HistorySection::Works),fixture());h.view.update(cx,|view,_|{let rows=(0..1000).map(|index|format!("work-{index}")).collect::<Vec<_>>();view.history_list.replace("same-network-generation".into(),rows.clone());view.history_list.list.scroll_to(gpui_kit::ListOffset{item_ix:400,offset_in_item:gpui_kit::px(23.)});let mut older=vec!["older-work".into()];older.extend(rows);view.history_list.replace("same-network-generation".into(),older.clone());assert_eq!(view.history_list.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:401,offset_in_item:gpui_kit::px(23.)});view.history_list.replace("new-generation".into(),older);assert_eq!(view.history_list.list.logical_scroll_top(),gpui_kit::ListOffset{item_ix:0,offset_in_item:gpui_kit::px(0.)});});
+}
+
+#[gpui_kit::test]
+fn native_skill_history_reads_and_copies_the_complete_body(cx:&mut TestAppContext){
+ let mut snapshot=fixture();snapshot.conversation=Arc::new(Conversation{bot_settings:ui::BotSettings{skills:vec![serde_json::from_value(serde_json::json!({"skill_id":"full-skill","name":"完整技能","description":"摘要","body":"# 完整指令\n\n保留正文，不以摘要代替。"})).unwrap()],..Default::default()},..(*snapshot.conversation).clone()});
+ let h=open(cx,Route::History(vibeface_protocol::history::HistorySection::Skills),snapshot);click(&h,cx,"copy-skill-body-full-skill");let copied=cx.update(|cx|cx.read_from_clipboard().and_then(|item|item.text()));assert_eq!(copied.as_deref(),Some("# 完整指令\n\n保留正文，不以摘要代替。"));
 }

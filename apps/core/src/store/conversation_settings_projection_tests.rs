@@ -40,10 +40,18 @@ impl Fixture {
     }
 
     fn sync(&self, from: &Store, to: &mut Store) -> Result<()> {
-        for identity in [&self.a, &self.b] {
-            let events = from.events_from(&self.network, &identity.device_id()?, 1, 500)?;
-            let ingested = to.ingest_events(&self.network, &events)?;
-            ensure!(ingested.statuses.iter().all(|status| matches!(status, IngestStatus::Accepted | IngestStatus::Duplicate)), "fixture sync rejected");
+        // An author's later events may depend on the other author's branch. Lamport order
+        // puts every stored parent first, including the memory base and conversation heads.
+        let mut statement = from.connection.prepare(
+            "SELECT envelope FROM events WHERE network_id=? ORDER BY lamport,created_at_ms,hash",
+        )?;
+        let events = statement.query_map([&self.network], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<SignedEvent>(&row?)?))
+            .collect::<Result<Vec<_>>>()?;
+        for events in events.chunks(1024) {
+            let ingested = to.ingest_events(&self.network, events)?;
+            ensure!(ingested.statuses.iter().all(|status| matches!(status, IngestStatus::Accepted | IngestStatus::Duplicate)),
+                "fixture causal sync did not accept every event: {:?}", ingested.statuses);
         }
         Ok(())
     }
@@ -243,6 +251,14 @@ fn signed_memory_branches_user_control_and_all_conflict_pages_match_old_oracle()
     assert!(!serde_json::to_string(&expected)?.contains("private candidate"));
     rebuild_projection(&a.connection, &f.network)?;
     assert_eq!(assert_memory_conflicts(&a, &f.network)?, expected);
+    // Reproduce why author-at-a-time replay was an invalid acceptance assertion: A's
+    // signed takeover and later events wait for the concurrent B head, without rejection.
+    let mut missing_parent = f.store()?;
+    let author_a = a.events_from(&f.network, &f.a.device_id()?, 1, 500)?;
+    let waiting = missing_parent.ingest_events(&f.network, &author_a)?;
+    assert!(waiting.statuses.contains(&IngestStatus::Pending), "the other author's parent is absent");
+    assert!(!waiting.statuses.iter().any(|status| matches!(status, IngestStatus::Rejected(_))),
+        "legitimate signed branches are pending, not rejected: {:?}", waiting.statuses);
     let mut late = f.store()?;
     f.sync(&a, &mut late)?;
     assert_eq!(assert_memory_conflicts(&late, &f.network)?, expected);

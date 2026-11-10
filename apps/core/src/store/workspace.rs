@@ -1546,6 +1546,7 @@ fn graph_at(
 thread_local! {
     static PROJECTION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AUTHORIZATION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FRESH_LOCAL_MAIN_INPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 pub(crate) fn projection_ancestor_walks() -> usize {
@@ -1560,6 +1561,11 @@ pub(crate) fn reset_projection_ancestor_walks() {
 pub(crate) fn authorization_ancestor_walks() -> usize {
     AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get)
 }
+#[cfg(test)]
+pub(crate) fn fresh_local_main_inputs() -> usize { FRESH_LOCAL_MAIN_INPUTS.with(std::cell::Cell::get) }
+#[cfg(test)]
+pub(crate) fn reset_fresh_local_main_inputs() { FRESH_LOCAL_MAIN_INPUTS.with(|count| count.set(0)); }
+
 
 fn projection_basis(
     connection: &Connection,
@@ -1767,6 +1773,41 @@ fn assignment_reply_source_matches_from(
             || submitted))
 }
 
+/// Local appends have already checked the event shape, client attestation and membership.
+/// A new BotMain input has no task/channel/assignment dependency. Without any stored input
+/// for this ID, neither the causal nor current Graph can contain its input-control state.
+/// Incoming sync events and non-fresh IDs always retain the full causal authorization path.
+pub(crate) fn authorize_fresh_local_bot_main(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<bool> {
+    let EventBody::InputPosted { message_id, target: InputTarget::BotMain { .. }, expected_revision: None,
+        intent: InputIntent::Continue | InputIntent::Defer, .. } = &event.body else { return Ok(false); };
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=?1 AND kind='input_posted' AND subject=?2)
+            OR EXISTS(SELECT 1 FROM messages WHERE network_id=?1 AND conversation_id=?3 AND message_id=?2)",
+        params![network,message_id,event.scope_id], |row| row.get(0),
+    )?;
+    if exists { return Ok(false); }
+    authorize_input_target_at_graph(connection, network, event, &Graph::default())?;
+    #[cfg(test)]
+    FRESH_LOCAL_MAIN_INPUTS.with(|count| count.set(count.get() + 1));
+    Ok(true)
+}
+
+fn authorize_input_target_at_graph(connection: &Connection, network: &str, event: &Event, graph: &Graph) -> Result<()> {
+    let EventBody::InputPosted { target,expected_revision,intent,.. } = &event.body else { bail!("input authorization needs an input"); };
+    validate_target(target)?;
+    ensure!(!matches!(target,InputTarget::ChannelMember { .. }), "channel input must first name its stable task");
+    ensure!(*intent != InputIntent::NewTask || matches!(target,InputTarget::Task { .. } | InputTarget::ChannelTask { .. }),
+        "new task input requires a stable task");
+    let resolved = resolve_with_graph(connection,network,target,graph)?;
+    ensure!(resolved.conversation_id == event.scope_id,"input target belongs to another conversation");
+    ensure!(resolved.task_revision == *expected_revision,"input task revision changed");
+    Ok(())
+}
+
 pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Event) -> Result<()> {
     if !matches!(
         event.body,
@@ -1815,35 +1856,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
         _ => {}
     }
     match &event.body {
-        EventBody::InputPosted {
-            target,
-            expected_revision,
-            intent,
-            ..
-        } => {
-            validate_target(target)?;
-            ensure!(
-                !matches!(target, InputTarget::ChannelMember { .. }),
-                "channel input must first name its stable task"
-            );
-            ensure!(
-                *intent != InputIntent::NewTask
-                    || matches!(
-                        target,
-                        InputTarget::Task { .. } | InputTarget::ChannelTask { .. }
-                    ),
-                "new task input requires a stable task"
-            );
-            let resolved = resolve_with_graph(connection, network, target, &graph)?;
-            ensure!(
-                resolved.conversation_id == event.scope_id,
-                "input target belongs to another conversation"
-            );
-            ensure!(
-                resolved.task_revision == *expected_revision,
-                "input task revision changed"
-            );
-        }
+        EventBody::InputPosted { .. } => authorize_input_target_at_graph(connection,network,event,&graph)?,
         EventBody::WorkspaceCommanded {
             command,
             acting_assignment,
@@ -5699,3 +5712,7 @@ pub(crate) fn workspace_input_release_allowed_from(
 #[cfg(test)]
 #[path = "workspace_lookup_tests.rs"]
 mod lookup_tests;
+
+#[cfg(test)]
+#[path = "fresh_main_input_tests.rs"]
+mod fresh_main_input_tests;

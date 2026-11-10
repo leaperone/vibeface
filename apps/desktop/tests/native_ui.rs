@@ -114,3 +114,33 @@ fn reachable_owner_jobs_take_precedence_without_duplicating_triggers(){
 fn answered_and_closed_main_questions_remain_available_in_history(){
  let conversation=ui::parse_conversation(json!({"conversation":{"conversation_id":"chat","owner_epoch":1},"questions":[{"question_id":"closed","conversation_id":"chat","target":{"kind":"bot_main","bot_id":"bot"},"closed":"resolved","text":"Original question"}]}),"chat",Some("bot")).unwrap();assert_eq!(conversation.questions.len(),1);assert_eq!(conversation.questions[0].text,"Original question");assert_eq!(conversation.questions[0].closed.as_deref(),Some("resolved"));
 }
+
+#[test]
+fn persisted_preferred_routes_keep_the_exact_node_and_do_not_follow_an_explicit_new_target(){
+ use vibeface_client::{Endpoint,Entry};
+ let original=Entry{origin:"https://gateway.example".into(),node_id:"a".repeat(64)};let remembered=Endpoint::Preferred{gateway:original.clone(),addresses:vec!["127.0.0.1:41501".into()]};
+ let route=ui::connection_endpoint("","","","",Some(&remembered),None).unwrap();assert!(matches!(route,Endpoint::Preferred{gateway,addresses}if gateway==original&&addresses==vec!["127.0.0.1:41501"]));
+ let route=ui::connection_endpoint("","",&"b".repeat(64),"",Some(&remembered),None).unwrap();assert!(matches!(route,Endpoint::Gateway(entry)if entry.node_id=="b".repeat(64)&&entry.origin==original.origin));
+ assert!(ui::connection_endpoint("lan","",&"b".repeat(64),"",Some(&remembered),None).is_err(),"old Node direct hints must not be reused for a newly selected Node");
+ let route=ui::connection_endpoint("auto","https://gateway.example",&"a".repeat(64),"[::1]:41501",None,None).unwrap();assert!(matches!(route,Endpoint::Preferred{addresses,..}if addresses==vec!["[::1]:41501"]));assert!(ui::connection_endpoint("lan","",&"a".repeat(64),"hostname.local:41501",None,None).is_err());
+}
+
+#[test]
+fn retries_require_explicit_server_proof_and_unknown_execution_never_looks_stopped(){
+ let job=|value|serde_json::from_value::<ui::Job>(value).unwrap();
+ assert!(!job(json!({"trigger":"message:a","state":"failed","scope":{"kind":"main"}})).can_retry());
+ assert!(job(json!({"trigger":"message:a","state":"failed","retryable":true,"scope":{"kind":"main"}})).can_retry());
+ assert!(!job(json!({"trigger":"message:a","state":"running","retryable":true,"scope":{"kind":"main"}})).can_retry());
+ assert!(!job(json!({"trigger":"message:a","state":"interrupted","retryable":true,"scope":{"kind":"main"},"failure":{"kind":"unknown","detail":"server result unknown"}})).can_retry());
+ for state in ["completed","cancelled","failed","interrupted","answered","steered","unknown"]{assert!(!job(json!({"trigger":"message:a","state":state,"scope":{"kind":"main"}})).is_active());}
+ assert!(job(json!({"trigger":"message:a","state":"running","scope":{"kind":"main"}})).is_active());
+}
+
+#[test]
+fn unreachable_or_unloaded_owner_jobs_cannot_authorize_retry_from_local_cache(){
+ let mut scheduler:ui::Scheduler=serde_json::from_value(json!({"jobs":[{"trigger":"message:original","message_id":"original","state":"failed","retryable":true,"scope":{"kind":"main"}}],"remote":{"owner":"real-owner","reachable":false,"jobs":[{"trigger":"message:original","message_id":"original","state":"failed","retryable":true,"scope":{"kind":"main"}}]}})).unwrap();
+ assert!(scheduler.retry_job_for_message("original").is_none(),"unreachable owner cannot be replaced by a retryable local observation");
+ scheduler.remote.as_mut().unwrap().reachable=true;scheduler.remote.as_mut().unwrap().jobs.clear();assert!(scheduler.retry_job_for_message("original").is_none(),"an unloaded owner row cannot borrow the local proof");
+ scheduler.remote.as_mut().unwrap().jobs=serde_json::from_value(json!([{"trigger":"message:original","message_id":"original","state":"running","scope":{"kind":"main"}}])).unwrap();assert!(!scheduler.retry_job_for_message("original").unwrap().can_retry());
+ scheduler.remote=None;assert!(scheduler.retry_job_for_message("original").unwrap().can_retry(),"local ownership keeps the explicit server proof");
+}
