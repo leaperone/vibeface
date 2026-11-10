@@ -12,7 +12,7 @@ import { entryAddress, messageOf, type ConnectionEntry } from '@vibeface/client/
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { passphrase, passwordStrength, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
 import { ErrorText } from '@/components/action'
-import { ActionCard, Panel } from '@/components/kit'
+import { ActionCard, Panel, toast } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -215,7 +215,7 @@ export function RecoveryPendingCard() {
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
   const confirm = () => Alert.alert(recoveryCopy.confirmAsk, recoveryCopy.confirmNote, [
     { text: '取消', style: 'cancel' },
-    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); Alert.alert(recoveryCopy.confirmDone) }) },
+    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); toast(recoveryCopy.confirmDone, 'success') }) },
   ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
@@ -226,7 +226,7 @@ export function RecoveryPendingCard() {
     <Button variant="destructive" className="bg-destructive shadow-xs active:bg-destructive/90 dark:bg-destructive dark:active:bg-destructive/90" disabled={busy !== null} onPress={stop}>
       <Icon as={Hand} className="text-primary-foreground" /><Text className="text-primary-foreground">{busy ? '处理中' : recoveryCopy.stop}</Text>
     </Button>
-    <Button variant="outline" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); Alert.alert(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
+    <Button variant="outline" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
     <Button variant="ghost" disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
   </View>}>
     {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}

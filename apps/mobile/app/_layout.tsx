@@ -14,7 +14,7 @@ import { useCSSVariable } from 'uniwind'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { factoryReset } from '@/lib/factory-reset'
-import { Badge } from '@/components/kit'
+import { Badge, Toaster } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -62,6 +62,7 @@ function Screens() {
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
   const waiting = useWaiting()
+  const tabbed = ready && !wide && tabs.some(([href]) => href === pathname)
   // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
   const root = wide ? { headerBackVisible: false, gestureEnabled: false } : {}
   if (device.phase === 'erasing' || device.phase === 'erase_failed') return <View className="flex-1 justify-center gap-4 p-6">
@@ -119,7 +120,7 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
-        {ready && !wide && tabs.some(([href]) => href === pathname) ? <View accessibilityRole="tabbar" className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
+        {tabbed ? <View accessibilityRole="tabbar" className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
           {tabs.map(([href, label, icon]) => {
             const selected = pathname === href
             const tint = selected ? 'text-foreground' : 'text-muted-foreground'
@@ -136,6 +137,8 @@ function Screens() {
             </Link>
           })}
         </View> : null}
+        {/* ponytail: a fixed lift clears the tab bar or a one-line composer; measure the composer if a taller one gets covered. */}
+        <Toaster bottom={(tabbed ? 68 : 88) + insets.bottom} />
       </View>
     </View>
   </>
