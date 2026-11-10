@@ -269,7 +269,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(/^[0-9]{6}$/.test(code));
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
-  await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   const openLink = async (url: string) => {
     await device.openLink(url);
     const consent = screen.getByRole('alert', /Open in.*Vibeface/);
@@ -277,8 +277,8 @@ test('provider settings and queued cancellation work in the installed native app
   };
   await openLink('vibeface://add-device');
   await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
-  const clientKind = screen.getByRole('button', '客户端', { exact: true });
-  const nodeKind = screen.getByRole('button', '节点', { exact: true });
+  const clientKind = screen.getByRole('radio', '客户端', { exact: true });
+  const nodeKind = screen.getByRole('radio', '节点', { exact: true });
   await expect(clientKind).toBeVisible({ timeout: 30000 });
   await expect(screen.getByText('手机 App／浏览器', { exact: true })).toBeVisible();
   await nodeKind.click();
@@ -304,7 +304,7 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const openSettings = async (from: 'home' | 'ai') => {
     if (from === 'home') {
-      await screen.getByRole('link', '设置', { exact: true }).click();
+      await screen.getByLabel('设置', { exact: true }).click();
       await expect(screen.getByText('我的设备', { exact: true })).toBeVisible();
       await navigation('settings');
       const computer = screen.getByRole('link', /当前连接/);
@@ -622,8 +622,8 @@ test('receives a charity file through a real native pairing and verifies the sav
   assert(/^[0-9]{6}$/.test(code), 'Real pairing has a six digit safety code');
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
-  await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-  await screen.getByRole('link', '设置', { exact: true }).click();
+  await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  await screen.getByLabel('设置', { exact: true }).click();
   await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'down' });
   await screen.getByRole('link', '发送和接收文件', { exact: true }).click();
   await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible();
