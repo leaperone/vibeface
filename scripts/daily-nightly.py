@@ -424,8 +424,102 @@ def run_daily(run_id):
                           schedule_ci=ci['html_url'], releases=releases), indent=2))
 
 
+def self_test_source_layouts():
+    """Historical and native source trees use their own exact version manifests."""
+    from unittest.mock import patch
+
+    old = '0.0.1-nightly.20261105.2'
+    new = '0.0.1-nightly.20261106.1'
+    for native in (False, True):
+        with tempfile.TemporaryDirectory(dir=scratch(), prefix='source-layout-') as temporary:
+            root = Path(temporary)
+            rust = {'core': 'vibeface-core', 'cli': 'vibeface'}
+            if native:
+                rust['desktop'] = 'vibeface-desktop'
+            initial = {}
+            for app in release.APPS:
+                directory = root / 'apps' / app
+                directory.mkdir(parents=True)
+                if app in rust:
+                    path = f'apps/{app}/Cargo.toml'
+                    text = f'[package]\nname = "{rust[app]}"\nversion = "{old}"\nedition = "2021"\n'
+                    (directory / 'src').mkdir()
+                    (directory / 'src/main.rs').write_text('fn main() {}\n')
+                else:
+                    path = f'apps/{app}/package.json'
+                    value = {'version': old, 'private': True}
+                    if app == 'mobile':
+                        path = 'apps/mobile/app.json'
+                        value = {'expo': {'version': '0.0.1', 'extra': {'releaseVersion': old},
+                                          'android': {'versionCode': 1}, 'ios': {'buildNumber': '1'}}}
+                    text = json.dumps(value, indent=2) + '\n'
+                initial[path] = text.encode()
+            initial['Cargo.lock'] = ('version = 3\n' + ''.join(
+                f'\n[[package]]\nname = "{name}"\nversion = "{old}"\n' for name in sorted(rust.values()))).encode()
+            for path, content in initial.items():
+                (root / path).write_bytes(content)
+            members = ', '.join(json.dumps(f'apps/{app}') for app in rust)
+            (root / 'Cargo.toml').write_text(f'[workspace]\nmembers = [{members}]\nresolver = "2"\n')
+            (root / 'business.txt').write_text('unchanged business source\n')
+            git('init', '--initial-branch=main', root=root)
+            git('add', '.', root=root)
+            git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                'commit', '-qm', 'immutable source layout', root=root)
+            with patch('release.ROOT', root):
+                base = git('rev-parse', 'HEAD')
+                git('update-ref', 'refs/remotes/origin/main', base)
+                plan = DailyPlan('2026110600', base, dict.fromkeys(release.APPS, new), 2, '2', '42')
+                # Independent expected bytes, including unchanged manifest bodies and lock entries.
+                expected = {path: content.replace(old.encode(), new.encode()) for path, content in initial.items()}
+                expected['apps/mobile/app.json'] = expected['apps/mobile/app.json'].replace(
+                    b'"versionCode": 1', b'"versionCode": 2').replace(b'"buildNumber": "1"', b'"buildNumber": "2"')
+                assert generated(plan) == expected
+                desktop_path = 'apps/desktop/' + ('Cargo.toml' if native else 'package.json')
+                assert len(expected['Cargo.lock'].split(b'[[package]]')) - 1 == len(rust)
+                if native:
+                    assert set(expected) == set(PATHS) and len(rust) == 3
+                else:
+                    assert 'apps/desktop/Cargo.toml' not in expected and len(rust) == 2
+
+                def commit_candidate(changes):
+                    git('checkout', '--detach', '-q', base)
+                    for path, content in (expected | changes).items():
+                        (root / path).write_bytes(content)
+                    git('add', '--all')
+                    git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                        'commit', '-qm', plan.message)
+                    return git('rev-parse', 'HEAD')
+
+                head = commit_candidate({})
+                assert versions_at(head) == plan.versions
+                assert recovered_plan(head) == plan
+                verify_tree(plan, head)
+                metadata(root, plan)
+                assert release.validate_source(head, 'product') == dict(
+                    ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
+                tampered_manifest = (expected[desktop_path] + b'\n[dependencies]\nserde = "1"\n'
+                                     if native else expected[desktop_path].replace(b'"private": true', b'"private": false'))
+                for path, content in (
+                    (desktop_path, tampered_manifest),
+                    (desktop_path, expected[desktop_path].replace(new.encode(), b'0.0.1-nightly.20261106.2')),
+                    ('Cargo.lock', expected['Cargo.lock'].replace(new.encode(), b'0.0.1-nightly.20261106.2', 1)),
+                    ('Cargo.lock', expected['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
+                    ('business.txt', b'modified non-version source\n'),
+                ):
+                    bad = commit_candidate({path: content})
+                    for check in (lambda: verify_tree(plan, bad), lambda: release.validate_source(bad, 'product')):
+                        try:
+                            check()
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError(f'tampered source accepted: {path}')
+
+
 def self_test():
     from unittest.mock import patch
+
+    self_test_source_layouts()
 
     with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token'}):
         with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as transport:
