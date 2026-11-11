@@ -48,6 +48,8 @@ def source_plan(text, architecture):
             if key in fields:
                 raise ValueError("duplicate Ubuntu source field")
             fields[key] = value.strip()
+        if not fields:
+            continue
         if fields.get("Enabled", "yes") == "no":
             continue
         types = fields.get("Types", "").split()

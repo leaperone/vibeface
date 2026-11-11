@@ -5416,15 +5416,29 @@ mod tests {
             assert!(flipped.revocation(&ib.device_id()?).is_some());
             b.install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
                 .await?;
-            for node in [&a, &b] {
+            for (node, peer) in [(&a, &ib), (&b, &ia)] {
+                node.sync_peers
+                    .lock()
+                    .unwrap()
+                    .entry(peer.device_id()?)
+                    .or_default()
+                    .running = true;
                 node.start_network().await?;
             }
             b.net()?.learn(&a.net()?.addr()).await;
-            // Refused this round (unless a background round already handed it over).
-            let _ = b.sync_peer(&network, &ia.device_id()?).await;
+            let peer = ia.device_id()?;
+            let error = b
+                .sync_peer(&network, &peer)
+                .await
+                .expect_err("the retained veto disproves the removed-peer Hello");
+            assert_eq!(
+                error.to_string(),
+                "the peer refused this Node without a removal",
+                "the first sync must deliver the veto before returning its semantic refusal"
+            );
             assert_eq!(a.membership_state().await?, b.membership_state().await?);
             assert_eq!(a.membership_state().await?.project()?.epoch, 2);
-            b.sync_peer(&network, &ia.device_id()?).await?;
+            b.sync_peer(&network, &peer).await?;
             anyhow::Ok(())
         }
         .await;
