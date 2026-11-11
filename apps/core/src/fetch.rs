@@ -372,7 +372,10 @@ mod tests {
             assert_eq!(fetch_url(url).await.unwrap_err().to_string(), expected);
         }
         let public = checked(Url::parse("https://8.8.8.8/page")?)?;
-        assert_eq!(resolve(&public).await?, "8.8.8.8:443".parse::<SocketAddr>()?);
+        assert_eq!(
+            resolve(&public).await?,
+            "8.8.8.8:443".parse::<SocketAddr>()?
+        );
         Ok(())
     }
 
