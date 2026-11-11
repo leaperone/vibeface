@@ -625,7 +625,7 @@ async fn acknowledge(
     journal.phase = Phase::Confirmed;
     persist(&data.join("update-pending.json"), journal)?;
     service.commit(data).await?;
-    retain_committed_backups(policy, data, journal);
+    retain_committed_artifacts(policy, data, journal);
     Ok(())
 }
 
@@ -714,6 +714,9 @@ async fn recover_with_service(
         );
         fs::remove_file(&pending)?;
         privatefs::sync_dir(data)?;
+        if confirmed {
+            retain_committed_artifacts(policy, data, &journal);
+        }
         eprintln!(
             "Recovered {} program; business data was kept.",
             if confirmed { "confirmed" } else { "previous" }
@@ -728,7 +731,7 @@ async fn recover_with_service(
             .is_ok()
     {
         service.commit(data).await?;
-        retain_committed_backups(policy, data, &journal);
+        retain_committed_artifacts(policy, data, &journal);
         return Ok(());
     }
     service.stop().await?;
@@ -742,7 +745,7 @@ async fn recover_with_service(
     persist(&pending, &journal)?;
     service.commit(data).await?;
     if confirmed {
-        retain_committed_backups(policy, data, &journal);
+        retain_committed_artifacts(policy, data, &journal);
     }
     eprintln!(
         "Recovered {} program; business data was kept.",
@@ -890,6 +893,14 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
     );
     fs::remove_file(pending)?;
     privatefs::sync_dir(data)?;
+    if let Some(root) = journal.candidate.parent().and_then(Path::parent) {
+        let policy = Policy {
+            channel: Channel::Nightly,
+            automatic: false,
+            install_root: root.to_owned(),
+        };
+        retain_committed_artifacts(&policy, data, &journal);
+    }
     Ok(())
 }
 
@@ -1178,10 +1189,19 @@ fn backup_receipt(backups: &Path, backup: &Path) -> Result<PathBuf> {
     Ok(backups.join(format!(".updater-{name}.json")))
 }
 
-fn retain_committed_backups(policy: &Policy, data: &Path, journal: &Journal) {
+fn retain_committed_artifacts(policy: &Policy, data: &Path, journal: &Journal) {
     // Recovery pins candidate to previous before committing a rollback; that backup is evidence.
     if journal.candidate == journal.previous {
         return;
+    }
+    if let Err(error) = release::retain_committed(
+        &policy.install_root,
+        data,
+        &journal.device_id,
+        &journal.previous,
+        &journal.candidate,
+    ) {
+        eprintln!("Update committed; release retention could not finish: {error:#}");
     }
     if let Err(error) = prune_committed_backups(policy, data, journal) {
         eprintln!("Update committed; backup retention could not finish: {error:#}");
@@ -2619,6 +2639,68 @@ mod tests {
         privatefs::remove_dir_link(&backups).unwrap();
         fs::rename(&moved_backups, &backups).unwrap();
         fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[test]
+    fn committed_release_retention_keeps_referenced_changed_and_unknown_packages() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data)?;
+        let first = package(&root, "1.0.0");
+        let second = package(&root, "1.1.0");
+        privatefs::link_dir(&second, &root.join("current"))?;
+        release::retain_committed(&root, &data, "device", &first, &second)?;
+        let unknown = package(&root, "0.9.0");
+        let staging = root.join("releases/.staging-unclaimed");
+        fs::create_dir(&staging)?;
+        fs::write(staging.join("keep"), b"unclaimed partial download")?;
+        let third = package(&root, "1.2.0");
+        switch(&root, &third)?;
+        fs::write(
+            data.join("update-pending.json"),
+            b"a journal still pins the first package",
+        )?;
+        assert!(release::retain_committed(&root, &data, "device", &second, &third).is_err());
+        assert!(first.is_dir() && second.is_dir());
+        fs::remove_file(data.join("update-pending.json"))?;
+        release::retain_committed(&root, &data, "device", &second, &third)?;
+        assert!(!first.exists());
+        assert!(!root.join("releases/.updater-1.0.0.json").exists());
+        assert!(second.is_dir() && third.is_dir() && unknown.is_dir() && staging.is_dir());
+        fs::write(
+            second.join("user-file"),
+            b"not part of the committed package",
+        )?;
+        let outside = root.join("outside");
+        private_dir(&outside)?;
+        fs::write(outside.join("keep"), b"link target")?;
+        privatefs::link_dir(&outside, &first)?;
+        fs::copy(
+            root.join("releases/.updater-1.2.0.json"),
+            root.join("releases/.updater-1.0.0.json"),
+        )?;
+        let fourth = package(&root, "1.3.0");
+        switch(&root, &fourth)?;
+        release::retain_committed(&root, &data, "device", &third, &fourth)?;
+        assert_eq!(installed(&root)?, fourth);
+        assert!(second.join("user-file").is_file() && third.is_dir());
+        assert!(unknown.is_dir() && staging.join("keep").is_file());
+        assert!(privatefs::is_dir_link(&first)?);
+        assert_eq!(fs::read(outside.join("keep"))?, b"link target");
+        let alias = root.join("root-alias");
+        privatefs::link_dir(&root, &alias)?;
+        assert!(release::retain_committed(&alias, &data, "device", &third, &fourth).is_err());
+        privatefs::remove_dir_link(&alias)?;
+        privatefs::remove_dir_link(&first)?;
+        let releases = root.join("releases");
+        let moved = root.join("kept-releases");
+        fs::rename(&releases, &moved)?;
+        privatefs::link_dir(&moved, &releases)?;
+        assert!(release::retain_committed(&root, &data, "device", &third, &fourth).is_err());
+        privatefs::remove_dir_link(&releases)?;
+        fs::rename(&moved, &releases)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

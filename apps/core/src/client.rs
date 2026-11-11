@@ -1640,7 +1640,9 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+        return Ok(
+            json!({"status":"waiting","checkpoint":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
+        );
     }
     for checkpoint in &state.checkpoints {
         if checkpoint
@@ -1649,7 +1651,7 @@ fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str)
             .is_some_and(|d| manages(&d.members))
             && view.stopped.contains(&checkpoint.hash()?)
         {
-            return Ok(json!({"status":"stopped"}));
+            return Ok(json!({"status":"stopped","checkpoint":checkpoint.hash()?}));
         }
     }
     Ok(Value::Null)
@@ -4558,6 +4560,7 @@ mod tests {
             assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
+            assert_eq!(waiting["recovery"]["checkpoint"], checkpoint.hash()?);
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
             assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
             let seen = manager.call("authenticate", json!({})).await?;
@@ -4568,7 +4571,9 @@ mod tests {
             let stopped = manager.call("veto", json!({"event":veto})).await?;
             assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
             assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
-            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            let stopped_recovery = recovering.call("authenticate", json!({})).await?;
+            assert_eq!(stopped_recovery["recovery"]["status"], "stopped");
+            assert_eq!(stopped_recovery["recovery"]["checkpoint"], checkpoint.hash()?);
             refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
             recovering.call("recovery_state", read(&root)?).await?;
             // A guest sends events only to carry its file's vetoes; anything else is dropped.

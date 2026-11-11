@@ -952,7 +952,7 @@ pub async fn recover(
         RootCheckpoint::recovery(&state, &root, &next.device_id(), members, retired, now)?;
     state.clone().recover_at(checkpoint.clone(), now)?;
     let mut checkpoints = state.checkpoints.clone();
-    checkpoints.push(checkpoint);
+    checkpoints.push(checkpoint.clone());
     write_recovery_file(
         new_file,
         &RecoveryMaterial {
@@ -970,10 +970,52 @@ pub async fn recover(
     if fresh {
         params["capability"] = json!(capability.context("an empty Node needs its capability")?);
     }
-    let result = session.call("recover", params).await?;
+    let reply = session.call("recover", params).await;
     drop(session);
+    let result = match reply {
+        Ok(result) => result,
+        Err(error) if error.is::<Refused>() => return Err(error),
+        Err(error) => {
+            let mut installed = None;
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let observed = async {
+                    let mut session = key.connect(Some(&entry)).await?;
+                    let reply = session.call("authenticate", json!({})).await?;
+                    ensure!(
+                        recovery_installed(&reply, &material.network_id, &checkpoint)?,
+                        "the Node has not accepted this recovery checkpoint"
+                    );
+                    Ok::<_, anyhow::Error>(reply)
+                }
+                .await;
+                if let Ok(reply) = observed {
+                    installed = Some(reply);
+                    break;
+                }
+            }
+            installed.ok_or(error)?
+        }
+    };
     key.remember(&material.network_id, entry)?;
     Ok(result)
+}
+
+fn recovery_installed(reply: &Value, network: &str, checkpoint: &RootCheckpoint) -> Result<bool> {
+    if let Some(state) = reply.get("state") {
+        let state: NetworkState = serde_json::from_value(state.clone())?;
+        ensure!(
+            state.genesis.network_id == network,
+            "the Node answered for another personal network"
+        );
+        state.project_at(reply["now_ms"].as_u64().context("now_ms is missing")?)?;
+        return Ok(state.checkpoints.contains(checkpoint));
+    }
+    // Waiting clients cannot read the directory; the pinned Node only discloses their hash.
+    Ok(matches!(
+        reply["recovery"]["status"].as_str(),
+        Some("waiting" | "stopped")
+    ) && reply["recovery"]["checkpoint"].as_str() == Some(checkpoint.hash()?.as_str()))
 }
 
 fn text<'v>(value: &'v Value, key: &str) -> Result<&'v str> {
@@ -1074,6 +1116,168 @@ mod tests {
             root.device_id()
         );
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_readback_requires_the_exact_checkpoint_and_valid_signed_state() -> Result<()> {
+        let root = Identity::generate()?;
+        let client = Identity::generate()?;
+        let node = Identity::generate()?;
+        let mut state = NetworkState::new(vibeface_secure::membership::Genesis::create(
+            &root,
+            Member::client(&client, "cli", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        let now = now_ms() as u64;
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &Identity::generate()?.device_id(),
+            state.project_at(now)?.members,
+            vec![],
+            now,
+        )?;
+        assert!(!recovery_installed(
+            &json!({"state":state,"now_ms":now,"principal":{"can_manage":true}}),
+            &network,
+            &checkpoint,
+        )?);
+        for status in ["waiting", "stopped"] {
+            assert!(recovery_installed(
+                &json!({"recovery":{"status":status,"checkpoint":checkpoint.hash()?}}),
+                &network,
+                &checkpoint,
+            )?);
+            assert!(!recovery_installed(
+                &json!({"recovery":{"status":status,"checkpoint":"another-checkpoint"}}),
+                &network,
+                &checkpoint,
+            )?);
+        }
+        state.recover_at(checkpoint.clone(), now)?;
+        let mut reply = json!({"state":state,"now_ms":now});
+        assert!(recovery_installed(&reply, &network, &checkpoint)?);
+        assert!(recovery_installed(&reply, "another-network", &checkpoint).is_err());
+        reply["state"]["checkpoints"][0]["signature"] = json!("invalid");
+        assert!(recovery_installed(&reply, &network, &checkpoint).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_lost_reply_is_read_back_once_and_refusal_does_not_enroll() -> Result<()> {
+        for accepted in [true, false] {
+            let dir = temp_dir("recover-reconcile");
+            let mut key = ClientKey::create(&dir, "client passphrase")?;
+            let root = Identity::generate()?;
+            let node = Identity::generate()?;
+            let genesis = vibeface_secure::membership::Genesis::create(
+                &root,
+                Member::client(&Identity::generate()?, "previous client", true)?,
+                Member::node(&node, "node")?,
+            )?;
+            let network = genesis.network_id.clone();
+            let recovery_file = dir.join("recovery.json");
+            write_recovery_file(
+                &recovery_file,
+                &RecoveryMaterial {
+                    version: 1,
+                    network_id: network.clone(),
+                    root_secret_key: Zeroizing::new(root.secret_hex()),
+                    genesis,
+                    checkpoints: vec![],
+                    events: vec![],
+                },
+                "recovery passphrase",
+            )?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let entry = Entry {
+                origin: format!("http://{}", listener.local_addr()?),
+                node_id: node.device_id(),
+            };
+            let serving = tokio::spawn(async move {
+                let mut checkpoint = None;
+                let mut writes = 0;
+                for _ in 0..if accepted { 2 } else { 1 } {
+                    let (stream, _) = listener.accept().await?;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    assert!(matches!(socket.next().await.unwrap()?, Message::Text(_)));
+                    let mut handshake = Handshake::signed(false, &node, None, PROLOGUE)?;
+                    let frame = socket.next().await.unwrap()?;
+                    handshake.read(&frame.into_data())?;
+                    socket
+                        .send(Message::Binary(handshake.write(&[])?.into()))
+                        .await?;
+                    let frame = socket.next().await.unwrap()?;
+                    handshake.read(&frame.into_data())?;
+                    let mut channel = handshake.finish()?;
+                    while let Some(frame) = socket.next().await {
+                        let Some(plain) = channel.open_record(&frame?.into_data())? else {
+                            continue;
+                        };
+                        let request: Value = serde_json::from_slice(&plain)?;
+                        let result = match request["method"].as_str().unwrap() {
+                            "info" => json!({"initialized":false}),
+                            "recover" => {
+                                writes += 1;
+                                let state: NetworkState = serde_json::from_value(json!({
+                                    "genesis":request["params"]["genesis"],
+                                    "checkpoints":request["params"]["checkpoints"],
+                                    "events":request["params"]["events"],
+                                }))?;
+                                state.project()?;
+                                checkpoint = Some(state.checkpoints[0].hash()?);
+                                if accepted {
+                                    break;
+                                }
+                                let response =
+                                    json!({"id":request["id"],"error":"recovery refused"});
+                                for record in
+                                    channel.seal_message(&serde_json::to_vec(&response)?)?
+                                {
+                                    socket.send(Message::Binary(record.into())).await?;
+                                }
+                                break;
+                            }
+                            "authenticate" => {
+                                json!({"recovery":{"status":"waiting","checkpoint":checkpoint}})
+                            }
+                            method => panic!("unexpected method {method}"),
+                        };
+                        let response = json!({"id":request["id"],"result":result});
+                        for record in channel.seal_message(&serde_json::to_vec(&response)?)? {
+                            socket.send(Message::Binary(record.into())).await?;
+                        }
+                        if request["method"] == "authenticate" {
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(writes)
+            });
+            let result = recover(
+                &mut key,
+                entry.clone(),
+                &recovery_file,
+                "recovery passphrase",
+                &dir.join("next-recovery.json"),
+                "recovered client",
+                Some("fixture-capability"),
+            )
+            .await;
+            assert_eq!(serving.await??, 1, "recover must never be resubmitted");
+            let reopened = ClientKey::open(&dir, "client passphrase")?;
+            if accepted {
+                assert_eq!(result?["recovery"]["status"], "waiting");
+                assert_eq!(reopened.network_id(), Some(network.as_str()));
+                assert_eq!(reopened.entry(), Some(&entry));
+            } else {
+                assert!(result.unwrap_err().is::<Refused>());
+                assert!(reopened.network_id().is_none() && reopened.entry().is_none());
+            }
+            std::fs::remove_dir_all(dir)?;
+        }
         Ok(())
     }
 
