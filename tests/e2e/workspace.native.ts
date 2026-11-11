@@ -88,22 +88,23 @@ test('native workspace routes preserve Task input, queue controls and directed C
   const externalChat = screen.getByRole('link', '转发到外部聊天', { exact: true });
   const settingsScroll = device.locator('role=scroll-area').filter({ has: externalChat });
   await settingsScroll.scrollUntilVisible(externalChat, { direction: 'down' });
+  let previousRowTop: number | undefined;
   await expect.poll(async () => {
     const row = await externalChat.boundingBox(), area = await settingsScroll.boundingBox();
-    assert(row && area, 'The settings link and its content area expose bounds');
-    const reachable = row.y >= area.y && row.y + row.height <= area.y + area.height;
+    const header = await screen.getByTestId('设置', { visible: true }).boundingBox();
+    const tab = await screen.getByRole('button', '设置', { exact: true }).boundingBox();
+    assert(row && area && header && tab, 'The settings link and native chrome expose bounds');
+    const top = Math.max(area.y, header.y + header.height), bottom = Math.min(area.y + area.height, tab.y);
+    const reachable = row.y >= top && row.y + row.height <= bottom;
+    const settled = previousRowTop === row.y;
+    previousRowTop = row.y;
     if (!reachable) {
       const x = area.x + area.width / 2;
-      const high = { x, y: area.y + area.height * 0.25 }, low = { x, y: area.y + area.height * 0.75 };
-      await screen.swipe(row.y < area.y ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
+      const high = { x, y: top + (bottom - top) * 0.25 }, low = { x, y: top + (bottom - top) * 0.75 };
+      await screen.swipe(row.y < top ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
     }
-    return reachable;
+    return reachable && settled;
   }, { timeout: 5000 }).toBe(true);
-  await writeFile(resolve(artifacts, 'settings-link-bounds.json'), `${JSON.stringify({
-    row: await externalChat.boundingBox(), area: await settingsScroll.boundingBox(),
-    header: await screen.getByTestId('设置', { visible: true }).boundingBox(),
-    tab: await screen.getByRole('button', '设置', { exact: true }).boundingBox(),
-  })}\n`, { mode: 0o600 });
   await externalChat.click();
   await expect(screen.getByTestId('外部聊天', { visible: true })).toBeVisible();
   const webhookUrl = screen.getByLabel('外部聊天地址', { exact: true });
