@@ -5,7 +5,7 @@ use crate::{
     maintenance::Gate,
     model::*,
     providers::{Provider, ProviderRoots},
-    store::{Store, WriteState},
+    store::{Store, WriteState, admission::AdmissionRejected},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -1800,15 +1800,31 @@ impl Runtime {
     }
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;
+        let roots = self
+            .settings_snapshot()
+            .roots
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<Vec<_>>();
+        let allowed = roots
+            .iter()
+            .filter_map(|root| root.as_ref().ok())
+            .any(|root| path.starts_with(root));
+        if !allowed {
+            for root in roots {
+                root.context("configured execution root cannot be resolved")?;
+            }
+        }
         ensure!(
-            self.settings_snapshot()
-                .roots
-                .iter()
-                .filter_map(|r| std::fs::canonicalize(r).ok())
-                .any(|r| path.starts_with(r)),
-            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+            allowed,
+            AdmissionRejected::new(
+                "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+            )
         );
-        ensure!(path.is_dir(), "execution path must be a directory");
+        ensure!(
+            std::fs::metadata(&path)?.is_dir(),
+            AdmissionRejected::new("execution path must be a directory")
+        );
         Ok(path)
     }
 }
