@@ -1,5 +1,5 @@
-//! Drives the work state machine from what the providers report and read back. Every change goes
-//! through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
+//! Drives the work state machine from what the providers report and read back. Provider signals
+//! go through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::store::admission::{AdmissionRejected, authorize_peer_node_from};

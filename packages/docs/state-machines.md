@@ -21,7 +21,11 @@ description: 定位执行、输入、连接和恢复的状态模型与安全边�
 | 资金与文件交付 | `apps/core/src/delivery` | 订单、链上支付、证明和逐窗状态须一致。链状态未知或重组后撤回旧完成声明。 |
 | 客户端连接 | `packages/client/src/lib/link.ts`、`identity/context.tsx` | 保留旧画面不等于新连接已授权。旧响应不能修改新会话。 |
 | 客户端发件箱 | `packages/client/src/lib/outbox.ts`、`workspace/context.tsx` | 保存原始请求。提交结果未知时先对账。传输接收不等于 Agent 执行成功。 |
-| 草稿与附件 | Web 和 Mobile 的 chat composer | 旧保存或选择结果不得清除用户的新草稿，或进入另一个目标。 |
+| 草稿与附件 | Web 和 Mobile 的 chat composer、外部聊天设置 | 失败不清空未保存草稿。成功只清除对应的已提交内容。旧选择结果不得进入另一个目标。 |
+| LAN 与 mesh 发现 | `apps/core/src/net/lan.rs`、`net/mesh.rs` | 广播只是地址提示，连接仍需认证。停止后不因 refresh 复活。重连退避随邻居状态更新。 |
+| 原生密码学适配 | `packages/secure-native`、`crates/secure-ffi` | 握手失败关闭，完成时消费原握手。接收、关闭与运行时重建需核对句柄归属。 |
+| 系统服务 | `scripts/install-node-service.sh`、`scripts/install-node-service.ps1` | 服务管理器已加载或受理启动不等于 Core 健康。停止须确认进程与数据锁均已释放。 |
+| 官网主题 | `apps/www/src/components/theme-toggle.tsx` | hydration、偏好与解析后的颜色分别处理。持久化由主题 provider 管理。 |
 | 桌面进程 | `apps/desktop/src/main/lifecycle.ts`、`session.ts` | 已连接的外部服务不归当前窗口所有。退出未确认时保留所有权屏障。 |
 | 本机更新 | `apps/cli/src/update`、`apps/core/src/maintenance.rs` | 未确认更新保留日志和执行屏障。恢复运行程序不回滚业务数据。 |
 
@@ -37,3 +41,21 @@ description: 定位执行、输入、连接和恢复的状态模型与安全边�
 优先复用现有领域状态和转换函数。只有存在可证明的非法组合或重复规则时才收敛数据结构。
 独立事实保留独立维度，尤其是保存、接收、执行、完成与清理。
 类型校验、恢复测试、真实进程及界面验收分别提供不同证据，不能互相替代。
+
+## 验证具体转换
+
+加入任务的并发归属、同邀请重试和取消有对应的 Rust 回归入口：
+
+```sh
+cargo test -p vibeface-core --lib concurrent_node_joins_preserve_the_first_owner_and_request
+cargo test -p vibeface-core --lib a_terminal_join_runs_in_the_running_node_and_asking_again_only_reads_it
+cargo test -p vibeface-core --lib the_local_page_cancels_a_waiting_join_but_not_an_approved_one
+```
+
+外部聊天密钥的失败、成功与保存期间再次编辑，使用实际 Web 和 Mobile 组件的回调验证：
+
+```sh
+node --experimental-strip-types --test --test-name-pattern='webhook secret saves' apps/app/src/features/workspace/entry-url.test.ts
+```
+
+组件检查不验证浏览器或原生设备渲染。修改连接或执行路径时，还须选择对应的真实进程与界面验收。
