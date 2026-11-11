@@ -159,7 +159,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | method | params | 用途 |
 | --- | --- | --- |
 | `info` | `{}` | 访客仅得到通用名称 `Node`、`device_id`、`version`、`initialized` 和 `network_id: null`；有效成员或本机会话还可读取真实名称、`network_id` 和 `connection_entry` |
-| `authenticate` | 可选 `network_id` | 验证成员授权或本机会话；不是成员但在找回目录里做管理设备的，回 `recovery: {status: "waiting", effective_at_ms}` 或 `{status: "stopped"}` |
+| `authenticate` | 可选 `network_id` | 验证成员授权或本机会话；不是成员但在找回目录里做管理设备的，回 `recovery: {status: "waiting", checkpoint, effective_at_ms}` 或 `{status: "stopped", checkpoint}`，`checkpoint` 是该次找回的精确哈希，用于未知结果对账，不透露成员目录 |
 | `directory` | `{}` | 当前签名目录及投影 |
 | `entrances` | `{}` | 地址簿中的签名地址记录，浏览器自行验签 |
 | `subscribe` | 可选 `vector` | 订阅 `changed` 推送；浏览器带已见的版本向量，入口落后时回 `behind: true` 并立即同步 |
