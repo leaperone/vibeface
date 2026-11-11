@@ -37,8 +37,9 @@ Var PlanCount
 
 !macro SafetyFunctions PREFIX
 Function ${PREFIX}Refuse
-  Pop $0
+  Exch $0
   MessageBox MB_OK|MB_ICONSTOP "$0" /SD IDOK
+  Pop $0
   SetErrorLevel 1603
   Abort
 FunctionEnd
@@ -46,16 +47,23 @@ FunctionEnd
 ; Check the path and every ancestor before copy/delete. Missing paths are allowed;
 ; junctions, symlinks and inaccessible paths fail without following them.
 Function ${PREFIX}CheckPath
-  Pop $1
-  Pop $0
+  Exch $1
+  Exch 1
+  Exch $0
+  Push $2
+  Push $3
+  Push $4
+  Push $5
   StrCpy $3 1
 path_loop:
-  System::Call 'kernel32::GetFileAttributesW(w r0) i.r2'
+  ; System's e option captures the API error before plugin marshalling can change it.
+  System::Call 'kernel32::GetFileAttributesW(w r0) i.r2 ?e'
+  Pop $5
   IntCmp $2 -1 path_missing
   IntOp $4 $2 & 0x400
   IntCmp $4 0 path_kind
   Push "Reparse points are not allowed in the installation path. The operation was stopped."
-  Call ${PREFIX}Refuse
+  Goto path_failed
 path_kind:
   IntOp $4 $2 & 0x10
   StrCmp $1 "dir" 0 path_file
@@ -64,12 +72,11 @@ path_file:
   IntCmp $3 1 0 path_parent path_parent
   IntCmp $4 0 path_parent path_invalid path_invalid
 path_missing:
-  System::Call 'kernel32::GetLastError() i.r2'
-  IntCmp $2 2 path_parent
-  IntCmp $2 3 path_parent
+  IntCmp $5 2 path_parent
+  IntCmp $5 3 path_parent
 path_invalid:
   Push "The installation path is inaccessible or conflicts with a package path. The operation was stopped."
-  Call ${PREFIX}Refuse
+  Goto path_failed
 path_parent:
   ${GetParent} "$0" $4
   StrCmp $4 "" path_done
@@ -79,6 +86,23 @@ path_parent:
   StrCpy $3 0
   Goto path_loop
 path_done:
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $0
+  Pop $1
+  Return
+path_failed:
+  ; Keep the error message while restoring the six saved caller registers.
+  Exch 6
+  Pop $1
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $0
+  Call ${PREFIX}Refuse
 FunctionEnd
 
 Function ${PREFIX}RequireOwnedRoot

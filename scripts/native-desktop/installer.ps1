@@ -10,6 +10,52 @@ $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibef
 $machineRegistration = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface'
 if ((Test-Path $registration) -or (Test-Path $machineRegistration)) { throw 'A pre-existing product registration cannot be changed by this fixture' }
 $destination = Join-Path $env:RUNNER_TEMP ('Vibeface native 安装 ' + [guid]::NewGuid().ToString('N'))
+$evidenceRoot = [System.IO.Path]::GetFullPath($Output)
+$artifactPrefix = [System.IO.Path]::GetFullPath((Join-Path $PWD '.artifacts')) + [System.IO.Path]::DirectorySeparatorChar
+if (-not $evidenceRoot.StartsWith($artifactPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Installer diagnostics must remain below this task workspace artifacts' }
+New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
+function Save-InitialInstallerEvidence([string]$Phase, $ExitCode, $HasExited) {
+  $rootExists = Test-Path -LiteralPath $destination
+  $attributes = $null
+  if ($rootExists) { $attributes = (Get-Item -Force -LiteralPath $destination).Attributes.ToString() }
+  $marker = Join-Path $destination '.vibeface-install-owned'
+  $markerExists = Test-Path -LiteralPath $marker
+  $markerFormat = 'absent'
+  $markerRootMatches = $false
+  if ($markerExists) {
+    if ((Get-Item -Force -LiteralPath $marker).Length -le 4096) {
+      $lines = [System.IO.File]::ReadAllLines($marker, [System.Text.Encoding]::Unicode)
+      $markerFormat = if ($lines.Length -ge 1 -and $lines[0] -eq 'vibeface-native-install-v2') { 'v2' } else { 'unrecognized' }
+      $markerRootMatches = $lines.Length -eq 2 -and $lines[1] -eq $destination
+    } else { $markerFormat = 'oversized' }
+  }
+  $registered = Test-Path $registration
+  $matchesRoot = $false
+  $matchesUninstaller = $false
+  if ($registered) {
+    $state = Get-ItemProperty $registration
+    $matchesRoot = $state.InstallLocation -eq $destination
+    $matchesUninstaller = $state.UninstallString -eq ('"' + (Join-Path $destination 'Uninstall.exe') + '"')
+  }
+  $evidence = [ordered]@{
+    phase = $Phase
+    exit_code = $ExitCode
+    has_exited = $HasExited
+    task_install_root = $destination
+    root_exists = $rootExists
+    root_attributes = $attributes
+    marker_exists = $markerExists
+    marker_format = $markerFormat
+    marker_root_matches = $markerRootMatches
+    executable_exists = Test-Path -LiteralPath (Join-Path $destination 'Vibeface.exe')
+    manifest_exists = Test-Path -LiteralPath (Join-Path $destination '.vibeface-installed-files.json')
+    uninstaller_exists = Test-Path -LiteralPath (Join-Path $destination 'Uninstall.exe')
+    registration_exists = $registered
+    registration_root_matches = $matchesRoot
+    registration_uninstaller_matches = $matchesUninstaller
+  }
+  $evidence | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidenceRoot ($Phase + '.json')) -Encoding utf8
+}
 $unowned = Join-Path $env:RUNNER_TEMP ('Vibeface unowned ' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $unowned | Out-Null
 $beforeSentinel = Join-Path $unowned 'user-before.txt'
@@ -26,8 +72,15 @@ $ownedPaths = @()
 $collisionSentinel = $null
 $installed = $false
 try {
-  $process = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
-  if ($process.ExitCode -ne 0) { throw 'The per-user installer failed' }
+  Save-InitialInstallerEvidence 'initial-before-start' $null $null
+  try {
+    $process = Start-Process -FilePath $Installer -ArgumentList ('/S /D=' + $destination) -Wait -PassThru
+  } catch {
+    Save-InitialInstallerEvidence 'initial-start-failed' $null $null
+    throw
+  }
+  Save-InitialInstallerEvidence 'initial-after-exit' $process.ExitCode $process.HasExited
+  if ($process.ExitCode -ne 0) { throw "The per-user installer failed with exit code $($process.ExitCode); task evidence: initial-after-exit.json" }
   $installed = $true
   $manifest = Get-Content -Raw (Join-Path $destination '.vibeface-installed-files.json') | ConvertFrom-Json
   if ($manifest.schema -ne 1 -or $manifest.app -ne 'vibeface-native-desktop' -or $manifest.files.Count -lt 2) { throw 'Installed ownership manifest is invalid' }
