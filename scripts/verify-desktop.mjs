@@ -117,6 +117,10 @@ function verifySignature(application, target, receipt) {
   assert.equal(described.status, 0, 'cannot read the application signature');
   assert(/flags=0x[0-9a-f]+\([^)]*runtime/.test(described.stdout + described.stderr),
     'the signed application must use the hardened runtime');
+  const entitlements = run('codesign', ['--display', '--entitlements', ':-', application]);
+  const permissions = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', '-'], { input: entitlements }));
+  assert.equal(permissions['com.apple.security.device.camera'], true,
+    'the signed application must allow the camera used to scan join links');
   const assessment = spawnSync('spctl', ['-a', '-vvv', '-t', 'exec', application], { encoding: 'utf8' });
   assert.equal(assessment.status, 0, `Gatekeeper rejected the application: ${assessment.stderr}`);
   assert(assessment.stderr.includes('source=Notarized Developer ID'), 'the published application must be notarized');

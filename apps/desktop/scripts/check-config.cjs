@@ -27,6 +27,13 @@ fs.mkdirSync(electronCache, { recursive: true });
         });
         delete require.cache[require.resolve(configPath)];
         const config = require(configPath);
+        if (target === 'aarch64-apple-darwin') {
+          assert.match(fs.readFileSync(config.mac.entitlements, 'utf8'),
+            /<key>com\.apple\.security\.device\.camera<\/key>\s*<true\s*\/>/,
+            'the hardened runtime must allow camera access for join-link scanning');
+          assert.equal(config.mac.entitlementsInherit, config.mac.entitlements);
+          assert(config.mac.extendInfo.NSCameraUsageDescription.trim(), 'camera access needs a usage description');
+        }
         assert.equal(config.electronDownload.cache, electronCache,
           'electron-builder must consume the prefetch cache root');
         await validateConfiguration(config, { isEnabled: false });
