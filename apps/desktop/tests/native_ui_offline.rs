@@ -21,7 +21,7 @@ use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -78,8 +78,8 @@ fn connect(entry: &Entry) -> Command {
         conversation_id: None,
     }
 }
-fn host_at(profile: &PathBuf) -> Result<host::DesktopHost> {
-    host::DesktopHost::open(profile.clone(), profile.join("runtime"), true)
+fn host_at(profile: &Path) -> Result<host::DesktopHost> {
+    host::DesktopHost::open(profile.to_path_buf(), profile.join("runtime"), true)
 }
 async fn serve(
     listener: tokio::net::TcpListener,
@@ -423,15 +423,14 @@ async fn native_backend_cold_offline_stages_original_input_in_actual_outbox() ->
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.context("private native events ended")?;
-            match event {
-                Event::Scoped { event, .. } => match *event {
+            if let Event::Scoped { event, .. } = event {
+                match *event {
                     Event::Error(_) => return Ok::<_, anyhow::Error>(()),
                     Event::InputStored(_) => {
                         anyhow::bail!("private viewer staged a business input")
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
     })
