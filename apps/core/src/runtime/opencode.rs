@@ -3701,6 +3701,10 @@ mod tests {
         drop(node);
         let node = Arc::new(Runtime::reopen(&place.dir.join("node")).await?);
         node.reconcile_works(&network).await?;
+        assert_eq!(place.recorded("argv").lines().count(), 1, "not due yet");
+        node.live_probe_at
+            .store(now_ms() - 60_000, std::sync::atomic::Ordering::Relaxed);
+        node.reconcile_works(&network).await?;
         let record = until(&node, WorkState::finished).await?;
         assert_eq!(
             record.state,
