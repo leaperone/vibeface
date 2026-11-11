@@ -18,31 +18,26 @@ impl SchedulerProjection {
     ) -> Result<HistoryPage<Value>> {
         let conversation = query.conversation;
         let section = query.section;
-        store.conversation_scheduler_page(
-            network,
-            &self.local,
-            query,
-            |store, job| {
-                if section == HistorySection::ScopeJobs {
-                    self.scope_job(store, network, job)
-                } else {
-                    let mut job = job.clone();
-                    job.pending_check |=
-                        store.scheduler_trigger_has_check(conversation, &job.trigger)?;
-                    let mut value = self.job(store, network, &job, &[])?;
-                    if value["context"].is_object() {
-                        value["context"]["session_status"] = Value::Null;
-                    }
-                    value["manager"] = manager.clone();
-                    value["replied"] = json!(store.scheduler_reply_is_present(
-                        network,
-                        conversation,
-                        &job.message_id
-                    )?);
-                    Ok(value)
+        store.conversation_scheduler_page(network, &self.local, query, |store, job| {
+            if section == HistorySection::ScopeJobs {
+                self.scope_job(store, network, job)
+            } else {
+                let mut job = job.clone();
+                job.pending_check |=
+                    store.scheduler_trigger_has_check(conversation, &job.trigger)?;
+                let mut value = self.job(store, network, &job, &[])?;
+                if value["context"].is_object() {
+                    value["context"]["session_status"] = Value::Null;
                 }
-            },
-        )
+                value["manager"] = manager.clone();
+                value["replied"] = json!(store.scheduler_reply_is_present(
+                    network,
+                    conversation,
+                    &job.message_id
+                )?);
+                Ok(value)
+            }
+        })
     }
 }
 

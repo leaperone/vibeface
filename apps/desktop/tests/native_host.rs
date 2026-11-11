@@ -5,7 +5,7 @@ mod fixture_rustc;
 #[path = "../src/host/mod.rs"]
 mod host;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use host::{
     BackgroundAction, DesktopHost, NodeIdentity, NodeMode, NodeStatus, ServiceState,
     UpdateAvailability,
@@ -18,6 +18,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
+use tokio::io::AsyncReadExt;
 use vibeface_bridge::platform::privatefs;
 
 struct CompiledFixture {
@@ -96,9 +97,22 @@ impl Fixture {
         self.profile.join("node")
     }
     fn initialize(&self) -> Result<()> {
+        // The dependency-free synthetic child does not implement Windows DACL creation.
+        // These lifecycle scenarios use a Node provisioned by the real private filesystem API.
         privatefs::create_dir(&self.node())?;
         privatefs::write_atomic(&self.node().join("config.json"), b"{}")?;
-        privatefs::write_atomic(&self.node().join("identity.json"), b"{}")
+        privatefs::write_atomic(&self.node().join("identity.json"), b"{}")?;
+        privatefs::ensure_private(&self.node(), "controlled Node directory")?;
+        for name in ["config.json", "identity.json"] {
+            let path = self.node().join(name);
+            assert!(privatefs::is_plain_file(&std::fs::symlink_metadata(&path)?));
+            privatefs::ensure_private(&path, "controlled Node file")?;
+            assert_eq!(
+                privatefs::read_private_bounded(&path, 1024, "controlled Node file")?,
+                b"{}"
+            );
+        }
+        Ok(())
     }
     fn identity(&self) -> NodeIdentity {
         NodeIdentity {
@@ -120,6 +134,29 @@ async fn wait_file(path: &Path, exists: bool) -> Result<()> {
     })
     .await
     .context("synthetic child did not reach the expected state")
+}
+
+async fn wait_parent_ready(parent: &mut tokio::process::Child, path: &Path) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if path.try_exists()? {
+                return Ok(());
+            }
+            if let Some(status) = parent.try_wait()? {
+                let mut stderr = Vec::new();
+                if let Some(stream) = parent.stderr.take() {
+                    stream.take(64 * 1024).read_to_end(&mut stderr).await?;
+                }
+                bail!(
+                    "synthetic GUI parent exited before readiness ({status}): {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("synthetic GUI parent did not reach the expected state")?
 }
 
 #[tokio::test]
@@ -146,6 +183,7 @@ async fn client_only_discovery_settings_and_forget_never_initialize_node() -> Re
 #[tokio::test]
 async fn owned_start_stop_and_drop_close_only_the_held_child_stdin() -> Result<()> {
     let fixture = Fixture::new()?;
+    fixture.initialize()?;
     let mut host = fixture.open(false)?;
     let running = host.start_owned().await?;
     assert_eq!(running.status, NodeStatus::Running);
@@ -238,6 +276,7 @@ async fn changed_identity_and_untrusted_paths_are_rejected_before_start() -> Res
 #[tokio::test]
 async fn service_and_runtime_updates_remain_distinct_and_require_fresh_state() -> Result<()> {
     let fixture = Fixture::new()?;
+    fixture.initialize()?;
     let mut host = fixture.open(false)?;
     let status = host.background(BackgroundAction::Install).await?;
     assert_eq!(status.state, ServiceState::Installed);
@@ -379,15 +418,16 @@ async fn native_host_parent_fixture() -> Result<()> {
 #[tokio::test]
 async fn killing_the_synthetic_gui_parent_delivers_eof_to_only_its_owned_child() -> Result<()> {
     let fixture = Fixture::new()?;
+    fixture.initialize()?;
     let mut parent = tokio::process::Command::new(std::env::current_exe()?)
         .args(["--exact", "native_host_parent_fixture", "--nocapture"])
         .env("VF_NATIVE_HOST_SYNTHETIC_PARENT", &fixture.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    wait_file(&fixture.root.join("parent.ready"), true).await?;
+    wait_parent_ready(&mut parent, &fixture.root.join("parent.ready")).await?;
     parent.start_kill()?;
     tokio::time::timeout(Duration::from_secs(3), parent.wait()).await??;
     wait_file(&fixture.node().join("running"), false).await?;
