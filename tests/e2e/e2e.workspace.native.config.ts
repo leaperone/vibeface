@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import type { E2EConfig } from 'e2e';
@@ -17,5 +18,5 @@ export default {
   output: results,
   cache: { dir: resolve(results, 'cache') },
   timeout: 600000,
-  secrets: { nativeInvitation: async () => (await readFile(invitation, 'utf8')).trim() },
+  secrets: { nativeInvitation: async () => (await readFile(invitation, 'utf8')).trim(), nativeWebhookSecret: randomBytes(24).toString('base64url') },
 } satisfies E2EConfig;

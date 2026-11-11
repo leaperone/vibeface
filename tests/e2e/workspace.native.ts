@@ -4,7 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
-import { expect } from 'e2e';
+import { expect, secrets } from 'e2e';
 import { bundleManifest as nativeBundleManifest, nativeFixture, record, text } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');
@@ -84,6 +84,33 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  await screen.getByLabel('设置', { exact: true }).click();
+  const externalChat = screen.getByRole('link', '转发到外部聊天', { exact: true });
+  await screen.scrollUntilVisible(externalChat, { direction: 'down' });
+  await externalChat.click();
+  const webhookUrl = screen.getByLabel('外部聊天地址', { exact: true });
+  const webhookSecret = screen.getByLabel('外部聊天密钥', { exact: true });
+  const saveWebhook = screen.getByRole('button', '保存', { exact: true });
+  await expect(saveWebhook).toBeDisabled();
+  await webhookUrl.fill('not-a-url');
+  await webhookSecret.fill(secrets.get('nativeWebhookSecret'));
+  await webhookSecret.press('Enter');
+  await expect(saveWebhook).toBeEnabled();
+  await saveWebhook.click();
+  const invalidWebhook = screen.getByText(/invalid webhook URL/);
+  await screen.scrollUntilVisible(invalidWebhook, { direction: 'down' });
+  await expect(invalidWebhook).toBeVisible();
+  await webhookUrl.clear();
+  await webhookUrl.press('Enter');
+  await expect(saveWebhook).toBeEnabled();
+  await app.screenshot('workspace-native-webhook-draft-retained');
+  await saveWebhook.click();
+  const clearWebhook = screen.getByRole('button', '清除密钥', { exact: true });
+  await expect(clearWebhook).toBeVisible();
+  await expect(clearWebhook).toBeEnabled();
+  await expect(saveWebhook).toBeDisabled();
+  await screen.getByTestId('BackButton', { visible: true }).click();
+
   // The join page must not stay under the tabs as a back button.
   await screen.getByLabel('任务', { exact: true }).click();
   await expect(screen.getByTestId('任务', { visible: true })).toBeVisible();
@@ -461,5 +488,5 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await channelHistory.scrollUntilVisible(result, { direction: 'down' });
   await expect(result).toBeVisible();
   await app.screenshot('workspace-native-channel-directed');
-  await writeFile(resolve(artifacts, 'acceptance.json'), `${JSON.stringify({ ui_passed: true, source, simulator, installed_matches_build: true, task_inputs: 3, cancelled_input_invoked: false, directed_channel_result: true, scroll_short_chat_hidden: true, scroll_latest_hidden: true, scroll_history_to_latest: true, scroll_keyboard_clearance: true, scroll_new_reply_preserves_history: true, scroll_conversation_isolation: true })}\n`, { mode: 0o600 });
+  await writeFile(resolve(artifacts, 'acceptance.json'), `${JSON.stringify({ ui_passed: true, source, simulator, installed_matches_build: true, task_inputs: 3, cancelled_input_invoked: false, directed_channel_result: true, scroll_short_chat_hidden: true, scroll_latest_hidden: true, scroll_history_to_latest: true, scroll_keyboard_clearance: true, scroll_new_reply_preserves_history: true, scroll_conversation_isolation: true, webhook_failed_save_keeps_draft: true, webhook_saved_draft_cleared: true })}\n`, { mode: 0o600 });
 });
