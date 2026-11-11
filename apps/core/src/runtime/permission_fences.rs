@@ -151,6 +151,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::runtime::test_support::{access as test_access, manager_settings, provider_work};
+    use crate::store::admission::AdmissionRejected;
     use crate::{
         crypto::LocalIdentity,
         runtime::{
@@ -304,6 +305,66 @@ mod tests {
             assert!(error.to_string().contains("actual canonical directories"));
             assert_eq!(signed_roots[0], alias.to_string_lossy());
         }
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn work_path_policy_refusals_are_definite_but_filesystem_failures_retryable() -> Result<()>
+    {
+        let (node, _, directory) = node().await?;
+        let allowed = directory.join("allowed");
+        std::fs::create_dir(&allowed)?;
+        let allowed = allowed.canonicalize()?;
+        node.settings.lock().unwrap().roots = vec![allowed.clone()];
+        assert_eq!(
+            node.allowed_path(allowed.to_str().context("allowed")?)?,
+            allowed
+        );
+
+        let outside = node
+            .allowed_path(directory.to_str().context("outside")?)
+            .expect_err("an outside-root task has a definite refusal");
+        assert!(outside.is::<AdmissionRejected>(), "{outside:#}");
+        assert!(outside.to_string().contains("outside configured roots"));
+
+        let file = allowed.join("file");
+        std::fs::write(&file, b"")?;
+        let not_directory = node
+            .allowed_path(file.to_str().context("file")?)
+            .expect_err("a file cannot be a work directory");
+        assert!(not_directory.is::<AdmissionRejected>(), "{not_directory:#}");
+
+        let unavailable = directory.join("unavailable");
+        let missing_path = node
+            .allowed_path(unavailable.to_str().context("unavailable")?)
+            .expect_err("an unavailable path can recover");
+        assert!(!missing_path.is::<AdmissionRejected>());
+        assert!(missing_path.is::<std::io::Error>());
+
+        node.settings.lock().unwrap().roots = vec![unavailable.clone(), allowed.clone()];
+        assert_eq!(
+            node.allowed_path(allowed.to_str().context("allowed")?)?,
+            allowed
+        );
+        node.settings.lock().unwrap().roots = vec![unavailable.clone()];
+        let missing_root = node
+            .allowed_path(allowed.to_str().context("allowed")?)
+            .expect_err("an unavailable root cannot prove a policy refusal");
+        assert!(!missing_root.is::<AdmissionRejected>());
+        assert!(missing_root.is::<std::io::Error>());
+        std::fs::create_dir(&unavailable)?;
+        assert_eq!(
+            node.allowed_path(unavailable.to_str().context("unavailable")?)?,
+            unavailable.canonicalize()?
+        );
+
+        node.settings.lock().unwrap().roots.clear();
+        let no_roots = node
+            .allowed_path(allowed.to_str().context("allowed")?)
+            .expect_err("an empty root grant refuses work");
+        assert!(no_roots.is::<AdmissionRejected>());
+        drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
