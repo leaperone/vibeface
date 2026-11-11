@@ -92,6 +92,8 @@ jobs:
           node scripts/private-control.mjs --self-test
           "$PY" -B scripts/verify-windows-node.py --package "$PACKAGE" --artifacts .artifacts/ci-windows-node
       - name: Test the native desktop features
+        id: native_features
+        continue-on-error: true
         run: cargo test -p vibeface-desktop --features native-ui-tests --locked
       - name: Build the desktop application around the verified runtime
         env:
@@ -154,6 +156,8 @@ jobs:
           systemctl --user show-environment >/dev/null
           printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
       - name: Drive the packaged native GPUI window
+        id: native_window
+        continue-on-error: true
         env:
           VIBEFACE_E2E_DESKTOP_APP: ${{ steps.application.outputs.path }}
           VIBEFACE_E2E_DESKTOP_RUNTIME: ${{ steps.runtime.outputs.dir }}
@@ -165,6 +169,7 @@ jobs:
             pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
           fi
       - name: Verify the real per-user Windows installer and installed application
+        id: native_installer
         if: runner.os == 'Windows'
         shell: pwsh
         env:
@@ -173,6 +178,16 @@ jobs:
           $installer = @(Get-ChildItem .artifacts/desktop/*.exe)
           if ($installer.Count -ne 1) { throw 'Expected exactly one native installer' }
           ./scripts/native-desktop/installer.ps1 -Installer $installer[0].FullName -Runtime $env:RUNTIME -PortableApp "$PWD/.artifacts/desktop-app/Vibeface.exe" -Output "$PWD/.artifacts/native-desktop-installer"
+      - name: Require every native acceptance result
+        if: ${{ always() && !cancelled() }}
+        env:
+          NATIVE_FEATURES: ${{ steps.native_features.outcome }}
+          NATIVE_WINDOW: ${{ steps.native_window.outcome }}
+          NATIVE_INSTALLER: ${{ steps.native_installer.outcome }}
+        run: |
+          # Independent package checks continue after a test failure; none can waive this gate.
+          [[ "$NATIVE_FEATURES" == success && "$NATIVE_WINDOW" == success ]]
+          if [[ "$RUNNER_OS" == Windows ]]; then [[ "$NATIVE_INSTALLER" == success ]]; fi
       - name: Keep compact desktop failure evidence independently
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() }}
