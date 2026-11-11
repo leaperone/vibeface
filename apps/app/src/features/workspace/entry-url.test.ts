@@ -19,7 +19,7 @@ import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
-import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
+import { deviceCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
@@ -1839,6 +1839,61 @@ test("provider cards keep summary readiness, setup and execution details in thei
         assert.ok(execution)
         assert.equal(text(execution), `执行模型：${example.executionLabel}${example.executionReason}`, 'execution details show the saved execution readiness independently')
       }
+    } finally { app.close() }
+  })
+})
+
+test('webhook secret saves preserve failures and newer drafts on web and mobile', async (t) => {
+  const settings = workspaceModel.parseTriageSettings({
+    default_outlet: 'record', projects: [], webhook_url: '', webhook_secret_set: false,
+    scan_codex_sessions: false, codex_sessions: null, decision_url: '', device_id: 'node', decision_tokens: [],
+    outbox: { pending: 0, delivered: 0, dead: 0 },
+    status: { budget: { day: '2026-11-11', used: 0, limit: 10, retry_at_ms: 0, paused_reason: null }, pending_events: 0, inflight_events: 0, unknown_events: 0 },
+  })
+  for (const platform of ['web', 'mobile']) for (const outcome of ['failed', 'saved', 'edited']) await t.test(`${platform} ${outcome}`, async () => {
+    const held = pendingResult(), writes: unknown[] = []
+    const save = (params: unknown) => { writes.push(params); return held.promise }
+    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => method === 'triage_settings' ? settings : save(params) }
+    const name = platform === 'mobile' ? 'Triage' : 'TriageSettings'
+    const app = componentHarness(platform === 'mobile' ? '../../../../../apps/mobile/app/external-chat.tsx' : '../devices/triage-settings.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/identity/copy.ts': { waitingCopy },
+      '@vibeface/client/workspace/model.ts': workspaceModel,
+      '@/lib/glossary': { terms: { externalChat: { label: '外部聊天', icon: 'Send' } } },
+      '@/features/devices/remote-settings': { useCall: () => ({ value: settings, busy: '', error: null, call: (_key: string, _method: string, params: unknown) => save(params) }) },
+    }, {}, platform === 'mobile' ? 'Triage' : '')
+    const render = () => app.render(name)
+    const field = () => {
+      const input = render().find(({ props }) => platform === 'mobile' ? props.accessibilityLabel === '外部聊天密钥' : props.id === 'webhook-secret')
+      assert.ok(input)
+      return input.props
+    }
+    const edit = (value: string) => {
+      const input = field()
+      if (platform === 'mobile') { assert.ok(typeof input.onChangeText === 'function'); input.onChangeText(value) }
+      else { assert.ok(typeof input.onChange === 'function'); input.onChange({ target: { value } }) }
+    }
+    try {
+      render(); await settleComponent()
+      if (platform === 'web') {
+        const expand = render().find(({ type }) => type === 'SettingsRow')?.props.onClick
+        assert.ok(typeof expand === 'function'); expand()
+      }
+      edit('first-secret-draft')
+      if (platform === 'mobile') {
+        const press = render().find(({ type, props }) => type === 'Button' && elementText(props.children) === '保存')?.props.onPress
+        assert.ok(typeof press === 'function'); press()
+      } else {
+        const submit = render().find(({ type }) => type === 'form')?.props.onSubmit
+        assert.ok(typeof submit === 'function'); submit({ preventDefault() {} })
+      }
+      assert.equal(writes.length, 1)
+      assert.equal(JSON.parse(JSON.stringify(writes[0])).webhook_secret, 'first-secret-draft')
+      if (outcome === 'edited') edit('newer-secret-draft')
+      if (outcome === 'failed' && platform === 'web') held.reject(new Error('device offline'))
+      else held.resolve(outcome === 'failed' ? null : settings)
+      await settleComponent()
+      assert.equal(field().value, outcome === 'saved' ? '' : outcome === 'edited' ? 'newer-secret-draft' : 'first-secret-draft')
     } finally { app.close() }
   })
 })
