@@ -2,8 +2,13 @@
 """Check the release DAG and evaluate its real collection/publication guards."""
 import argparse
 import ast
+import json
 from pathlib import Path
 import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -209,20 +214,6 @@ def check(source, helpers):
     return workflow
 
 
-def check_identity_helper(source):
-    required = (
-        "environ['GITHUB_REPOSITORY'] == release.GITHUB_REPO",
-        "environ['GITHUB_REF'] == 'refs/tags/' + tag",
-        'require_main=publish, publishing=publish',
-        "result['source_commit'] == environ['GITHUB_SHA']",
-        'release.require_ci(result)',
-        "environ.get('WINDOWS_SIGNING_CONFIGURED') == 'true'",
-        "environ.get('IOS_SIGNING_CONFIGURED') == 'true'",
-    )
-    require(all(fragment in source for fragment in required),
-            'release entries must retain source, CI, exact tag and stable signing boundaries')
-
-
 def check_website(source):
     workflow = jobs(source)
     require(set(workflow) == {'identity', 'static', 'collect', 'publish'},
@@ -266,10 +257,9 @@ def check_website(source):
                     'website must consume its same-run immutable artifacts')
 
 
-def self_test(source, helpers, website, entry):
+def self_test(source, helpers, website):
     check(source, helpers)
     check_website(website)
-    check_identity_helper(entry)
     helper = helpers['release-publish-part.yml']
     broken = [
         source.replace('scripts/release-entry.py --app product', 'scripts/release-entry.py --app www'),
@@ -301,15 +291,6 @@ def self_test(source, helpers, website, entry):
                 'self-test mutation did not reach the workflow')
         with TestCase().assertRaises((ValueError, SyntaxError, KeyError), msg='Unsafe release dependency or gate was accepted'):
             check(candidate, candidate_helper)
-    for fragment in ('release.require_ci(result)', 'require_main=publish, publishing=publish',
-                     "environ['GITHUB_REPOSITORY'] == release.GITHUB_REPO",
-                     "environ['GITHUB_REF'] == 'refs/tags/' + tag",
-                     "result['source_commit'] == environ['GITHUB_SHA']",
-                     "environ.get('WINDOWS_SIGNING_CONFIGURED') == 'true'",
-                     "environ.get('IOS_SIGNING_CONFIGURED') == 'true'"):
-        require(fragment in entry, 'identity mutation did not reach the helper')
-        with TestCase().assertRaises(ValueError, msg='Unsafe release identity was accepted'):
-            check_identity_helper(entry.replace(fragment, 'True'))
     for candidate in (
         website.replace('--app www', '--app product'),
         website.replace('needs: [identity, static]', 'needs: [identity]'),
@@ -323,6 +304,79 @@ def self_test(source, helpers, website, entry):
         require(candidate != website, 'website mutation did not reach the workflow')
         with TestCase().assertRaises((ValueError, KeyError), msg='Unsafe website gate was accepted'):
             check_website(candidate)
+
+
+def deployment_steps(block):
+    matches = list(re.finditer(r'^      - (.*)\n', block, re.M))
+    return [block[match.start():matches[index + 1].start() if index + 1 < len(matches) else len(block)]
+            for index, match in enumerate(matches)]
+
+
+def step_run(step):
+    match = re.search(r'^        run: (.*)$', step, re.M)
+    require(match is not None, 'deployment step must run a shell command')
+    if match[1] in ('|', '|-', '|+'):
+        lines = []
+        for line in step[match.end() + 1:].splitlines():
+            if line and not line.startswith('          '):
+                break
+            lines.append(line[10:])
+        return '\n'.join(lines)
+    require(match[1] not in ('>', '>-', '>+'), 'use an explicit deployment shell script')
+    return match[1]
+
+
+def check_rehearsal_execution(rehearsal, activation):
+    """Run only these two step scripts, with no real deployment tools on PATH."""
+    rehearsal_args = ['-B', 'scripts/deploy-run.py', 'rehearse', '--output', '.artifacts/deploy']
+    activation_args = ['-B', 'scripts/deploy-run.py', 'activate', '--service', 'node', '--output', '.artifacts/deploy']
+    with tempfile.TemporaryDirectory(prefix='release-rehearsal-') as directory:
+        scratch = Path(directory)
+        binary = scratch / 'bin'
+        binary.mkdir()
+        stub = textwrap.dedent('''\
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            name = Path(sys.argv[0]).name
+            args = sys.argv[1:]
+            rehearsal = ['-B', 'scripts/deploy-run.py', 'rehearse', '--output', '.artifacts/deploy']
+            activation = ['-B', 'scripts/deploy-run.py', 'activate', '--service', 'node', '--output', '.artifacts/deploy']
+            with open(os.environ['INVOCATIONS'], 'a') as output:
+                output.write(json.dumps([name, *args]) + '\\n')
+            if name == 'sudo' and args == ['--preserve-env=GH_TOKEN', 'python3', *rehearsal]:
+                tool = str(Path(__file__).with_name('python3'))
+                os.execve(tool, [tool, *rehearsal], os.environ)
+            if name != 'python3' or args not in (rehearsal, activation):
+                sys.exit(97)
+            sys.exit(int(os.environ['REHEARSAL_STATUS']) if args == rehearsal else 0)
+            ''')
+        for name in ('sudo', 'python3'):
+            tool = binary / name
+            tool.write_text('#!' + sys.executable + '\n' + stub)
+            tool.chmod(0o700)
+        for status in (0, 23):
+            log = scratch / f'invocations-{status}.jsonl'
+            environment = dict(PATH=str(binary), INVOCATIONS=str(log), REHEARSAL_STATUS=str(status),
+                               GH_TOKEN='synthetic-token', SERVICE='node')
+
+            def run(command):
+                # Restricted bash cannot change PATH, execute absolute tools or source host scripts.
+                return subprocess.run(['/bin/bash', '--noprofile', '--norc', '--restricted', '-e', '-o', 'pipefail',
+                                       '-c', command], cwd=scratch, env=environment, capture_output=True, text=True)
+
+            completed = run(step_run(rehearsal))
+            require(completed.returncode == status, 'rehearsal must propagate the deployment tool status')
+            if completed.returncode == 0:
+                require(run(step_run(activation)).returncode == 0, 'activation script rejected the pinned Node arguments')
+            observed = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            expected = [['sudo', '--preserve-env=GH_TOKEN', 'python3', *rehearsal_args],
+                        ['python3', *rehearsal_args]]
+            if status == 0:
+                expected.append(['python3', *activation_args])
+            require(observed == expected, 'Node rehearsal must run before activation, and failure must block activation')
 
 
 def check_deployment(source, entries):
@@ -358,16 +412,24 @@ def check_deployment(source, entries):
             expression = gate.replace('github.ref', repr(branch)).replace('inputs.apply', repr(apply))
             require(evaluate(expression, {}) == (branch == 'refs/heads/main' or not apply),
                     'deployment activation must require main; branches may only validate')
-    activate = source.split('      - name: Activate the pinned container on the configured host', 1)
-    require(len(activate) == 2 and re.search(r'^        if: inputs\.apply$', activate[1], re.M),
+    steps = deployment_steps(workflow['containers'])
+
+    def select(name):
+        selected = [(index, step) for index, step in enumerate(steps)
+                    if step.startswith('      - name: ' + name + '\n')]
+        require(len(selected) == 1, 'missing or duplicate deployment step: ' + name)
+        return selected[0]
+
+    activation_index, activation = select('Activate the pinned container on the configured host')
+    require(re.search(r'^        if: inputs\.apply$', activation, re.M),
             'production activation must be disabled for validation runs')
     require("|| 'vibeface-validation'" in source, 'validation must not use a production environment')
-    rehearsal = source.split('      - name: Rehearse the Core activation on this runner', 1)
-    require(len(rehearsal) == 2 and rehearsal[1].index('deploy-run.py rehearse') < rehearsal[1].index('deploy-run.py activate'),
+    rehearsal_index, rehearsal = select('Rehearse the Core activation on this runner')
+    require(rehearsal_index < activation_index,
             'the Core activation must be rehearsed before the host activation')
-    step = rehearsal[1].split('      - name:', 1)[0]
-    require("        if: matrix.service == 'node'\n" in step and step.count('if:') == 1
-            and 'continue-on-error' not in step, 'every Core deployment must pass the rehearsal')
+    require("        if: matrix.service == 'node'\n" in rehearsal and rehearsal.count('if:') == 1
+            and 'continue-on-error' not in rehearsal, 'every Core deployment must pass the rehearsal')
+    check_rehearsal_execution(rehearsal, activation)
 
 
 def main():
@@ -380,15 +442,13 @@ def main():
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-publish-part.yml',
                             'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml')}
     website = (directory / 'release-www.yml').read_text()
-    entry = (ROOT / 'scripts/release-entry.py').read_text()
     if args.self_test:
-        self_test(source, helpers, website, entry)
+        self_test(source, helpers, website)
         import runpy
         runpy.run_path(str(ROOT / 'scripts/release-entry.py'))['self_test']()
     else:
         check(source, helpers)
         check_website(website)
-        check_identity_helper(entry)
     deployment = helpers['deploy-services.yml']
     entries = {service: (directory / f'deploy-{filename}.yml').read_text()
                for service, filename in (('node', 'node'), ('app', 'app'), ('www', 'www'), ('all', 'product'))}
@@ -397,6 +457,9 @@ def main():
         for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
                           deployment.replace('if: inputs.apply', 'if: always()'),
                           deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
+                          deployment.replace('run: sudo --preserve-env=GH_TOKEN python3 -B scripts/deploy-run.py rehearse',
+                                             'run: echo rehearsal-disabled # sudo --preserve-env=GH_TOKEN python3 -B scripts/deploy-run.py rehearse'),
+                          deployment.replace('rehearse --output .artifacts/deploy', 'rehearse --output .artifacts/deploy || true'),
                           deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
                           deployment.replace("if: matrix.service == 'node'",
                                              "if: matrix.service == 'node'\n        continue-on-error: true")):

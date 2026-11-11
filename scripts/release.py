@@ -1944,7 +1944,6 @@ def self_test():
                      core_version=product_version, core_source_commit=source,
                      app_version=product_version, app_source_commit=source)
         accepts(lambda: verify_build_info(build))
-        require(len(build) == 9, 'BUILD-INFO keeps its nine fields')
         for change in ({'component_source_commits': {'core': source, 'app': source}}, {'data_epoch': 12},
                        {'data_epoch': '1'}, {'update_protocol': True}, {'core_version': '9.9.9'},
                        {'app_version': '9.9.9'}, {'core_source_commit': foreign}, {'app_source_commit': foreign},

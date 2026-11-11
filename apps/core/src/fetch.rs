@@ -343,21 +343,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_targets_and_other_schemes_are_refused_before_any_request() {
-        for url in [
-            "http://127.0.0.1:4790/rpc",
-            "http://localhost/",
-            "http://[::1]/",
-            "http://169.254.169.254/latest/meta-data",
-            "http://10.0.0.1/",
-            "http://2130706433/",
-            "http://0x7f.1/",
-            "file:///etc/passwd",
-            "ftp://example.com/",
-            "https://user:secret@example.com/",
+    async fn local_targets_and_other_schemes_are_refused_before_any_request() -> Result<()> {
+        for (url, host) in [
+            ("http://127.0.0.1:4790/rpc", "127.0.0.1"),
+            ("http://localhost/", "localhost"),
+            ("http://[::1]/", "[::1]"),
+            ("http://169.254.169.254/latest/meta-data", "169.254.169.254"),
+            ("http://10.0.0.1/", "10.0.0.1"),
+            ("http://2130706433/", "127.0.0.1"),
+            ("http://0x7f.1/", "127.0.0.1"),
         ] {
-            assert!(fetch_url(url).await.is_err(), "{url} must be refused");
+            assert_eq!(
+                fetch_url(url).await.unwrap_err().to_string(),
+                format!(
+                    "{host} is on a local or private network; fetch_url reads only the public web"
+                ),
+                "{url} must be refused by the address policy"
+            );
         }
+        for (url, expected) in [
+            ("file:///etc/passwd", "fetch_url reads only http and https"),
+            ("ftp://example.com/", "fetch_url reads only http and https"),
+            (
+                "https://user:secret@example.com/",
+                "fetch_url sends no credentials",
+            ),
+        ] {
+            assert_eq!(fetch_url(url).await.unwrap_err().to_string(), expected);
+        }
+        let public = checked(Url::parse("https://8.8.8.8/page")?)?;
+        assert_eq!(
+            resolve(&public).await?,
+            "8.8.8.8:443".parse::<SocketAddr>()?
+        );
+        Ok(())
     }
 
     #[test]

@@ -38,6 +38,16 @@ test('every outline and mood stays finite and inside the radius band', () => {
   }
 })
 
+test('both eyes remain filled paths while awake and asleep', () => {
+  const face = { ...faceOf('bot-a'), eyes: 'dot' as const, gap: 10 }
+  for (const mood of ['idle', 'asleep'] as const) {
+    const paths = eyePaths(face, { ...pose(face, mood, 0), gazeX: 0, gazeY: 0 })
+    assert.equal(paths.length, 2)
+    assert.match(paths[0], /^M34\.1 46[A-Za-z][\d., +\-A-Za-z]+Z$/)
+    assert.match(paths[1], /^M54\.1 46[A-Za-z][\d., +\-A-Za-z]+Z$/)
+  }
+})
+
 test('mix lands exactly on either end', () => {
   const face = faceOf('bot-a')
   const a = pose(face, 'idle', 1234)
@@ -50,6 +60,14 @@ test('every hue gives in-gamut hex colours in both themes, asleep included', () 
   const hues = new Set(Array.from({ length: 400 }, (_, i) => faceOf(`bot-${i}`).hue))
   for (const hue of hues) for (const dark of [false, true]) for (const saturation of [1, 0.35]) {
     for (const value of Object.values(colors({ ...faceOf('bot-a'), hue }, dark, saturation))) assert.match(value, /^#[0-9a-f]{6}$/)
+  }
+})
+
+test('the picked hue colours the body and sleep mutes it', () => {
+  for (const [hue, awake, asleep] of [[20, '#e88e8e', '#c2a2a1'], [255, '#7aaeef', '#9badc3']] as const) {
+    const face = faceOf('bot-a', { outline: 'round', eyes: 'dot', hue })
+    assert.equal(colors(face, false, pose(face, 'idle', 0).saturation).base, awake)
+    assert.equal(colors(face, false, pose(face, 'asleep', 0).saturation).base, asleep)
   }
 })
 

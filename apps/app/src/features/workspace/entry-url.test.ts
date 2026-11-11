@@ -31,12 +31,83 @@ import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
 import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
-test("bulk inbox actions re-arm focus after an intervening list update", () => {
-  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../routes/_app/inbox.tsx"), "utf8")
-  const start = source.indexOf("const action = async (kind")
-  const action = source.slice(start, source.indexOf("\n  return <div", start))
-  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") >= 0)
-  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") < action.indexOf("setBusy(kind)"), "the action re-arms the sentinel before the list can change")
+test("bulk inbox actions restore focus after an intervening list update", async (t) => {
+  for (const destination of ['card', 'title']) await t.test(destination, async () => {
+    let activeElement: Target | null = null
+    class Target {
+      readonly name: string
+      constructor(name: string) { this.name = name }
+      get ownerDocument() { return document }
+      focus() { activeElement = this }
+    }
+    const body = new Target('body'), title = new Target('title'), bulkButton = new Target('ignore')
+    const document = { body, get activeElement() { return activeElement }, querySelector: () => null, getElementById: () => ({ querySelector: () => title }) }
+    const bot = parseBot({ bot_id: 'bot', conversation_id: 'chat', name: 'Bot', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'event', last_message: null, busy: null })
+    const reminder = (id: string): ReturnType<typeof inboxItems>[number] => ({ key: `attention:${id}`, kind: 'attention', title: id, bot, notification: { notification_id: id, kind: 'manager_attention', text: id, conversation_id: 'chat' } })
+    const remaining: ReturnType<typeof inboxItems> = destination === 'card' ? [{ key: 'rotate', kind: 'rotate', title: '换个恢复密码' }] : []
+    let items = [reminder('first'), ...remaining]
+    const ignored: string[][] = []
+    const workspace = {
+      nodes: [{}],
+      run: async (work: () => Promise<void>) => work(),
+      ignoreNotifications(ids: string[]) { ignored.push(ids); items = remaining },
+      announce() {},
+    }
+    // Run the real focus helper against the DOM boundary, rather than spying on its calls.
+    const kit = componentHarness('../../components/app/kit.tsx', {}, { document })
+    const cards = new Map<string, Target>()
+    let listRef: { current: unknown } | undefined
+    const mount = () => componentHarness('../../routes/_app/inbox.tsx', {
+      '@tanstack/react-router': { createFileRoute: () => () => ({}) },
+      '@/features/workspace/inbox': { useInbox: () => items },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+      '@/components/app/kit': { ...kit.module, EmptyState: 'EmptyState' },
+      '@/components/ui/button': { Button: 'Button' },
+    }, { document, HTMLElement: Target }, 'InboxPage')
+    let app = mount()
+    const render = () => app.render('InboxPage', {}, elements => {
+      const list = elements.find(element => element.type === 'ul')
+      if (list) {
+        const children = elements.filter(element => element.type === 'li').map(element => {
+          assert.ok(element.key)
+          let card = cards.get(element.key)
+          if (!card) { card = new Target(element.key); cards.set(element.key, card) }
+          return card
+        })
+        const ref = list.props.ref
+        assert.ok(ref && typeof ref === 'object' && 'current' in ref)
+        ref.current = { children }
+        listRef = ref
+      } else if (listRef) listRef.current = null
+      if (!items.some(item => item.kind === 'attention') && activeElement === bulkButton) activeElement = body
+    })
+    try {
+      activeElement = body
+      let elements = render()
+      assert.equal(activeElement.name, 'body', 'a fresh mount does not steal focus')
+      const button = elements.find(element => element.type === 'Button' && componentText(element) === '忽略提醒')
+      assert.ok(button)
+      assert.ok(typeof button.props.onFocus === 'function')
+      activeElement = bulkButton
+      button.props.onFocus()
+      items = [reminder('new'), ...items]
+      elements = render()
+      assert.equal(activeElement.name, 'ignore', 'a list update leaves the focused bulk control in place')
+      const updatedButton = elements.find(element => element.type === 'Button' && componentText(element) === '忽略提醒')
+      assert.ok(updatedButton?.props.onClick)
+      updatedButton.props.onClick()
+      await settleComponent()
+      render()
+      assert.deepEqual(structuredClone(ignored), [['new', 'first']], 'the action handles the updated reminders')
+      assert.equal(activeElement?.name, destination === 'card' ? 'rotate' : 'title', 'the replacement card or page heading receives focus')
+      app.close()
+      activeElement = body
+      items = [reminder('after-remount'), ...remaining]
+      app = mount()
+      render()
+      assert.equal(activeElement.name, 'body', 'remounting does not retain the previous focus request')
+    } finally { app.close(); kit.close() }
+  })
 })
 
 const context = {
@@ -1423,11 +1494,12 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
   new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
   return {
-    render(name: string, props: unknown = {}) {
+    render(name: string, props: unknown = {}, commit?: (rendered: typeof elements) => void) {
       hooks.reset(); elements.length = 0
       const component = module.exports[name]
       assert.ok(typeof component === 'function')
       output = component(props)
+      commit?.(elements)
       afterRender.splice(0).forEach(run => run())
       return elements
     },

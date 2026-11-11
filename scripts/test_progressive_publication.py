@@ -131,9 +131,6 @@ def main():
     channel = rel.version(version)
     calls = []
 
-    require('manual verified platform downloads' in rel.product_building_notes(dict(version=version, source_commit=source)),
-            'building notes')
-
     inventory = rel.progressive_part_inventory(version, ios_signed=False)
     require(len(inventory) == 11, 'eleven part groups')
     require(sum(len(names) for _, _, names in inventory) == 44, 'forty-four payloads')

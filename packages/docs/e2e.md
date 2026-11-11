@@ -71,7 +71,7 @@ python3 scripts/verify-node.py --delivery-charity \
 
 ## 验证受保护付费交付
 
-当前 Node 只提供 Recoverable 预算付款。旧 `verify-node.py --delivery`、Strict/十三证明 `run-delivery-live.py` 和旧 JSONL mutation 控制器已明确拒绝原启动方式；不能用其旧命令或旧截图当作当前产品验收。默认公益进程验收沿用上节，不产生链或钱包副作用。
+当前 Node 只提供 Recoverable 预算付款。旧 `verify-node.py --delivery`、Strict/十三证明 `run-delivery-live.py` 和旧 JSONL mutation 控制器已明确拒绝原启动方式。旧付费 Web/Android E2E、专用配置、控制器、录像辅助及其启动器已移除；历史报告的解析和隐私校验仍保留，不能用旧命令或旧截图当作当前产品验收。默认公益进程验收沿用上节，不产生链或钱包副作用。
 
 受保护真实场景使用正常当前时钟、固定产品 profile、Linux cgroup v2 和真正的 S/P/R 进程。R 先注册新的 genuine KeyBinding；S 开一个精确预付预算，分别 prepare 两笔新的 paid/recoverable 单窗口订单，再经管理成员 `confirm_batch` 明确授权同批。后台按原证明锁产生两个 genuine Source，一笔 reserveBatch 分配到不同订单 slot。R 经 `accept_batch` 明确同批接收并串行产生两个 genuine Hold；P 的正式预算状态 `ready_windows` 同时出现两窗后，操作者在既有实验室页或 `wallet budget flush` 明确同批核验/揭钥。正常恢复不再自动要求 Open。
 

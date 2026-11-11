@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { parseLocalNodes } from '../src/main/local-nodes.js'
-import { isAbsolute, resolve } from 'node:path'
+import { resolve } from 'node:path'
 
 const first = resolve('/fixture/Node A'), second = resolve('/fixture/Node B')
 const row = (dataDir = first, status = 'running') => ({ status, data_dir: dataDir, device_id: 'a'.repeat(64),
@@ -9,7 +9,7 @@ const row = (dataDir = first, status = 'running') => ({ status, data_dir: dataDi
 describe('local Node discovery parsing', () => {
   it('retains the verified absolute directory and discovery source', () => {
     const catalog = parseLocalNodes({ nodes: [row()], warnings: [] })
-    expect(isAbsolute(first)).toBe(true)
+    expect(catalog.nodes[0]?.dataDir).toBe(first)
     expect(catalog.nodes[0]?.sources).toEqual(['user_service'])
   })
   it('retains stopped and unverified states', () => {

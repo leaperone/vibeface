@@ -1064,7 +1064,7 @@ def focused_self_test():
         assert plan["required_jobs"] == unit_jobs and not plan["docs_only"]
     for path in WEB_E2E_TESTS:
         assert make_plan([path])["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
-    for path in ("tests/e2e/workspace.native.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.config.ts", "tests/e2e/paid-native-transfers.paid.ts", "apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
+    for path in ("tests/e2e/workspace.native.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.config.ts", "tests/e2e/unclassified.paid.ts", "apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
         assert make_plan([path])["full"], path
     assert make_plan(["apps/app/src/lib/markdown.test.ts", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     assert "web-tests" not in make_plan(["apps/app/src/lib/markdown.test.ts", "apps/app/src/lib/markdown.ts"])["required_jobs"]
