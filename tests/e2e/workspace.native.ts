@@ -211,10 +211,15 @@ test('native workspace routes preserve Task input, queue controls and directed C
     return stable;
   }).toBe(true);
   for (const phase of ['closed', 'keyboard', 'reply']) {
+    await expect(toLatest).toHaveCount(0);
     if (await keyboard.count() !== 0) await screen.getByText(/^原生滚动记录 8\s/, { visible: true }).click();
     await expect(keyboard).toHaveCount(0);
     await expect(latestReply).toBeVisible();
     await expect(toLatest).toHaveCount(0);
+    await expect.poll(async () => {
+      const reply = await latestReply.boundingBox(), target = await mainTarget.boundingBox();
+      return Boolean(reply && target && reply.y + reply.height <= target.y);
+    }).toBe(true);
     let previousHistoryBounds = '', positioningAttempt = 0;
     await expect.poll(async () => {
       const pane = await mainHistory.boundingBox(), target = await mainTarget.boundingBox(), back = await backButton.boundingBox();

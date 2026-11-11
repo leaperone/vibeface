@@ -165,6 +165,7 @@ export default function ChatScreen() {
   const [scrollButton, setScrollButton] = useState({ id, visible: false })
   const toLatest = () => {
     if (scrollInset.current.id !== id) return
+    setScrollButton({ id, visible: false })
     list.current?.scrollToOffset({ offset: ios ? -scrollInset.current.top : 0, animated: true })
   }
   // Opening a chat with 新消息 brings it to the top of the screen, the unread under it.
@@ -251,7 +252,7 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
-      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+      maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return
