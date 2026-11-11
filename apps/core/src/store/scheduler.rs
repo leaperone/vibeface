@@ -1631,7 +1631,45 @@ pub(crate) fn admit_from(
     )
 }
 
+pub(super) fn queue_workspace_input_admission_from(
+    connection: &Connection,
+    network: &str,
+    message_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "INSERT OR IGNORE INTO identity_meta(key,value) VALUES(?,?)",
+        params![
+            format!("workspace-input-admission:{network}:{message_id}"),
+            message_id
+        ],
+    )?;
+    Ok(())
+}
+
+fn finish_workspace_input_admission_from(
+    connection: &Connection,
+    network: &str,
+    message_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "DELETE FROM identity_meta WHERE key=?",
+        [format!("workspace-input-admission:{network}:{message_id}")],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn admit_workspace_input_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    message_id: &str,
+) -> Result<AdmissionReceipt> {
+    let receipt = workspace_input_admission_from(connection, network, local, message_id)?;
+    finish_workspace_input_admission_from(connection, network, message_id)?;
+    Ok(receipt)
+}
+
+fn workspace_input_admission_from(
     connection: &Connection,
     network: &str,
     local: &str,
@@ -1654,10 +1692,17 @@ pub(crate) fn admit_workspace_input_from(
         if let Some(job) = load_job(connection, &input.conversation_id, &trigger)? {
             return Ok(job.receipt(network));
         }
-        ensure!(
-            resolved.task_revision == input.input.route.expected_revision,
-            "input task revision changed"
-        );
+        if resolved.task_revision != input.input.route.expected_revision {
+            return admit_ended_from(
+                connection,
+                network,
+                &input.conversation_id,
+                &trigger,
+                TriggerKind::Human,
+                message_id,
+                Some("input task revision changed"),
+            );
+        }
     }
     if input.deferred || input.cancelled {
         return Ok(AdmissionReceipt {
@@ -2608,6 +2653,16 @@ impl Store {
         Ok(None)
     }
 
+    pub(crate) fn pending_workspace_input_admissions(&self, network: &str) -> Result<Vec<String>> {
+        Ok(self
+            .connection
+            .prepare("SELECT value FROM identity_meta WHERE key LIKE ? ORDER BY key")?
+            .query_map([format!("workspace-input-admission:{network}:%")], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn admit_workspace_input(
         &mut self,
         network: &str,
@@ -2643,6 +2698,7 @@ impl Store {
             message_id,
             Some(reason),
         )?;
+        finish_workspace_input_admission_from(&tx, network, message_id)?;
         tx.commit()?;
         Ok(receipt)
     }

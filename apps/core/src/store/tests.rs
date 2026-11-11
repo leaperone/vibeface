@@ -18223,14 +18223,15 @@ fn an_owner_rechecks_new_input_revisions_without_rewriting_existing_receipts() -
             .unwrap(),
         accepted
     );
-    let error = origin
-        .admit_workspace_input(&net.network, &local, "stale")
-        .expect_err("a newly admitted input cannot use an obsolete task revision");
-    assert!(error.to_string().contains("input task revision changed"));
-    assert!(
-        origin
-            .scheduler_job("c", &message_trigger("stale"))?
-            .is_none()
+    let refused = origin.admit_workspace_input(&net.network, &local, "stale")?;
+    assert_eq!(refused.state, "cancelled");
+    assert!(matches!(
+        origin.scheduler_job("c", &message_trigger("stale"))?.context("revision refusal")?.state,
+        JobState::Cancelled { attempt: None, evidence } if evidence == "input task revision changed"
+    ));
+    assert_eq!(
+        origin.admit_workspace_input(&net.network, &local, "stale")?,
+        refused
     );
     assert!(
         origin

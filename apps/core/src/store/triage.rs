@@ -608,9 +608,14 @@ impl Store {
         }
         let key = format!("triage:{network}");
         let status = budget(&tx, &key, limit, now)?;
-        if status.paused_reason.is_some() {
+        if status.paused_reason.is_some() && rows[0].answer.is_none() {
             return Ok(TriageAdmission::Paused(status));
         }
+        let used = status
+            .used
+            .checked_add(1)
+            .context("triage budget overflow")?;
+        ensure!(used <= i64::MAX as u64, "triage budget overflow");
         let id = uuid::Uuid::new_v4().simple().to_string();
         for row in &mut rows {
             row.claim = Some(TriageClaim {
@@ -622,7 +627,7 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",
-            params![key, status.day, status.used + 1],
+            params![key, status.day, used],
         )?;
         tx.commit()?;
         let answer = rows
