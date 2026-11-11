@@ -3206,6 +3206,22 @@ mod tests {
             assert!(command.envelope.target.starts_with("held_request:"));
             assert_eq!(command.envelope.owner_epoch, 0);
             assert_eq!(command.envelope.causal_refs.len(), 2);
+            let expired = r.accept_held_answer_delivery(&network, "c", "a-q-held").await
+                .expect_err("an expired request is a definite refusal");
+            assert!(expired.is::<AdmissionRejected>());
+            let saved = r.store.lock().await.save_peer_command(
+                &network, &sender_id, &command.envelope, now_ms(),
+            )?;
+            r.store.lock().await.connection.execute_batch("PRAGMA query_only=ON")?;
+            let unwritten = r.process_peer_command(&network, &saved).await;
+            r.store.lock().await.connection.execute_batch("PRAGMA query_only=OFF")?;
+            assert!(unwritten.unwrap_err().is::<rusqlite::Error>(),
+                "a failed refusal receipt write stays retryable");
+            let pending = r.store.lock().await.pending_peer_commands(&network)?;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].state, PeerAdmissionState::Saved);
+            assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             for node in [&a, &r] { node.start_network().await?; }
             a.net()?.learn(&r.net()?.addr()).await;
             r.net()?.learn(&a.net()?.addr()).await;
@@ -3219,6 +3235,11 @@ mod tests {
                 }
                 anyhow::Ok(())
             }).await.context("an answer for a request without a live transport fails explicitly")??;
+            let rejected = r.store.lock().await.save_peer_command(
+                &network, &sender_id, &command.envelope, now_ms(),
+            )?;
+            assert_eq!(rejected.state, PeerAdmissionState::Rejected);
+            assert!(r.store.lock().await.pending_peer_commands(&network)?.is_empty());
             assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             anyhow::Ok(())
@@ -4297,6 +4318,12 @@ mod tests {
                 recovery_on(&ia, &base, base.project()?.members, vec![], issued)?;
             let mut removed = waiting.clone();
             let view = removed.project()?;
+            let mut private = waiting.clone();
+            private.append(GovernanceEvent::grant(
+                &manager_d,
+                &view,
+                Member::client(&manager_c, "private-manager", true)?,
+            )?)?;
             removed.append(GovernanceEvent::revoke(
                 &admin,
                 &view,
@@ -4307,16 +4334,14 @@ mod tests {
                 &view,
                 Revocation::new(&admin.device_id()?, None)?,
             )?)?;
-            removed.append(GovernanceEvent::grant(
-                &manager_d,
-                &removed.project()?,
-                Member::client(&manager_c, "private-manager", true)?,
-            )?)?;
+            removed = removed.merge(&private)?;
+            assert!(removed.project()?.node(&ib.device_id()?).is_ok());
             removed.append(GovernanceEvent::revoke(
                 &manager_c,
-                &removed.project()?,
+                &private.project()?,
                 Revocation::new(&manager_b.device_id()?, None)?,
             )?)?;
+            assert!(removed.project()?.removed_node(&ib.device_id()?));
             assert!(removed.removal_state(&ib.device_id()?, None).is_err());
             a.install_membership(removed).await?;
             b.install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
@@ -4403,8 +4428,16 @@ mod tests {
             members.push(crate::identity::Member::client(
                 &attacker, "attacker", true,
             )?);
-            let (forged, _, _) = recovery_on(&ia, &removed, members, vec![], overdue())?;
+            let (forged, checkpoint, _) = recovery_on(&ia, &removed, members, vec![], overdue())?;
             assert!(forged.project()?.client(&attacker.device_id()?).is_ok());
+            assert!(forged.project()?.node(&ib.device_id()?).is_ok());
+            assert!(before.removal_state(&ib.device_id()?, None).is_ok());
+            assert!(
+                before
+                    .removal_state(&ib.device_id()?, Some(&forged))
+                    .is_err(),
+                "the local denial cannot override the unaccepted recovery directory"
+            );
             for node in [&a, &b] {
                 node.start_network().await?;
             }
@@ -4417,9 +4450,15 @@ mod tests {
                     &json!({"type":"membership","network_id":network,"state":forged}),
                     PEER_TIMEOUT,
                 )
-                .await?;
-            assert_eq!(reply["type"], "revoked");
+                .await;
+            assert!(reply.is_err(), "an unprovable denial fails closed");
             assert_eq!(a.membership_state().await?, before);
+            assert!(
+                !a.membership_state()
+                    .await?
+                    .checkpoints
+                    .contains(&checkpoint)
+            );
             let view = a.membership_state().await?.project()?;
             assert!(view.client(&attacker.device_id()?).is_err());
             anyhow::Ok(())

@@ -9,7 +9,10 @@ use crate::{
     model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
     net,
     providers::Provider,
-    store::triage::{BudgetStatus, TriageAdmission},
+    store::{
+        admission::AdmissionRejected,
+        triage::{BudgetStatus, TriageAdmission},
+    },
     triage::{
         self, AgentEvent, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl,
         HeldAnswerRequest, HookRequest, OutboxEntry, RequestKind, Severity, TriageConfig,
@@ -1272,7 +1275,7 @@ impl Runtime {
         };
         ensure!(
             question["about"]["node"] == node,
-            "this Node does not hold the answer's request"
+            AdmissionRejected::new("this Node does not hold the answer's request")
         );
         if let Some(receipt) = store.held_answer_receipt(network, conversation, message_id)? {
             return Ok(Some(receipt));
@@ -1280,10 +1283,12 @@ impl Runtime {
         let request = lock(&self.triage.requests)
             .get(request_id)
             .cloned()
-            .context("the original request is no longer waiting on this Node")?;
+            .context(AdmissionRejected::new(
+                "the original request is no longer waiting on this Node",
+            ))?;
         ensure!(
             request.question_id.as_deref() == Some(question_id),
-            "the held request belongs to another question"
+            AdmissionRejected::new("the held request belongs to another question")
         );
         store.queue_answer_control(
             network,
