@@ -1,0 +1,87 @@
+name: CI / Mobile device builds
+run-name: >-
+  Mobile device builds · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ inputs.platforms }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Device archive and APK platforms to build without publishing
+        type: choice
+        options: [ios, android, both]
+        default: both
+
+concurrency:
+  group: ci-mobile-device-${{ github.ref }}-${{ inputs.platforms }}${{ github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
+
+permissions:
+  contents: read
+
+jobs:
+  mobile-plan:
+    name: Read mobile device build version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - id: version
+        name: Read the committed mobile release version
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          version = json.load(open('apps/mobile/app.json'))['expo']['extra']['releaseVersion']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('value=' + version + '\n')
+          PYTHON
+
+  ios-device:
+    name: iOS device archive
+    needs: [mobile-plan]
+    if: github.event_name == 'workflow_dispatch' && (inputs.platforms == 'ios' || inputs.platforms == 'both')
+    uses: ./.github/workflows/release-ios.yml
+    with:
+      source_sha: ${{ github.sha }}
+      version: ${{ needs.mobile-plan.outputs.version }}
+    secrets:
+      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+
+  android-app:
+    name: Android native APK
+    needs: [mobile-plan]
+    if: github.event_name == 'workflow_dispatch' && (inputs.platforms == 'android' || inputs.platforms == 'both')
+    uses: ./.github/workflows/release-apps.yml
+    with:
+      source_sha: ${{ github.sha }}
+      version: ${{ needs.mobile-plan.outputs.version }}
+      tag: ''
+
+  mobile-gate:
+    name: Mobile device build gate
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: [mobile-plan, ios-device, android-app]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require exactly the selected native mobile applications
+        env:
+          MOBILE_NEEDS: ${{ toJSON(needs) }}
+          SCOPE: ${{ inputs.platforms }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          checks = json.loads(os.environ['MOBILE_NEEDS'])
+          if os.environ['SCOPE'] not in ('ios', 'android', 'both'): raise SystemExit('Invalid mobile platforms')
+          required = ['mobile-plan']
+          if os.environ['SCOPE'] in ('ios', 'both'): required.append('ios-device')
+          if os.environ['SCOPE'] in ('android', 'both'): required.append('android-app')
+          failed = {name: checks.get(name, {}).get('result', 'missing') for name in required if checks.get(name, {}).get('result', 'missing') != 'success'}
+          failed.update({name: job['result'] for name, job in checks.items() if name not in required and job['result'] in ('failure', 'cancelled')})
+          if failed: raise SystemExit('Native mobile builds are incomplete: ' + json.dumps(failed))
+          print('Selected native mobile application builds passed')
+          PYTHON
+

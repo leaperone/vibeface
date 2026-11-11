@@ -5,9 +5,30 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 # 按改动选择 CI
 
-`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。`delivery_small` 的独立实验流程见下文。没有顶层 `paths` 筛选。
+`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。付费交付的独立实验流程见下文。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。普通 `ci` 由 `main` push、定时、手动运行和 merge queue 触发。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 独立构建官网。合并、CI 通过、发布和部署各有自己的验收结果。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`CI / Core` 由 `main` push、手动运行、merge queue 或其他 workflow 调用，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`。合并、CI 通过、发布和部署各有自己的验收结果。
+
+## 按用途选择 Actions 入口
+
+下表描述本分支的工作流定义。新增手动入口需合入默认分支后，才可在 Actions 页面或 CLI 中派发。
+
+| 文件 | Actions 名称 | 触发方式 | 用途 |
+| --- | --- | --- | --- |
+| `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
+| `ci-desktop-acceptance.yml` | CI / Desktop | 手动 | `desktop-only` 默认运行四平台真实窗口与 Windows Rust；`full-validation` 运行完整 Core，再验收同 SHA 包的 Mac、Windows 窗口与 Windows 进程 |
+| `ci-windows.yml` | CI / Windows native | 手动 | 只检查当前源码的 Windows Rust |
+| `ci-mobile-device.yml` | CI / Mobile device builds | 手动 | `platforms=ios\|android\|both` 构建设备归档或 APK，不发布 |
+| `mobile.yml` | CI / Mobile acceptance | 手动、复用调用 | Android 原生构建与 iOS 模拟器 UI；不含 Android 模拟器 UI 验收 |
+| `delivery-small.yml` | Delivery / Small proof | 手动 | 四关系真实证明、公开分项续用与结算实验 |
+| `delivery-live.yml` | Delivery / Live native proof | 手动 | Linux native Core 检查后，生成五份 fresh proof 并验收真实交付 |
+| `nightly.yml` | Release / Nightly | 每四小时、手动 | 完整标准 Core 检查后进入 Nightly 门；仅 main schedule 可启动发布协调器 |
+| `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；手动默认只构建 |
+| `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；手动默认只构建 |
+| `npm-publish.yml` | Release / npm Nightly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
+| `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 手动 | 固定目标部署，`tag` 必填，`apply=false` 默认构建验证与排练 |
+
+`_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
 
 | 反馈层 | 入口 | 结果含义 |
 | --- | --- | --- |
@@ -15,7 +36,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
 | PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
 | 合并后检查 | 经明确授权合并，再核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
-| 制品发布 | 显式产品或官网 Tag 与 `release.yml` | 校验产品制品和发布记录，不更新线上服务 |
+| 制品发布 | 显式产品或官网 Tag 与各自发布入口 | 校验产品制品和发布记录，不更新线上服务 |
 | 服务部署 | 独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
 
 ## main 与 merge queue 的核心检查
@@ -24,7 +45,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 自动 `main` push 从同仓库 `ci.yml` 最近的成功 main push 运行中选择已验证的祖先提交，以该提交到当前 HEAD 的累计差异选取检查。较早的 Rust 提交被取消或跳过后，后续文档提交仍包含未通过的 Rust 差异。查询只读最近 100 条成功运行，排除当前运行、相同 HEAD、其他分支和事件；无可信祖先、API 失败、无 token 或历史不匹配时选择全部核心检查，绝不退回事件的 `before`。CI 规则文件本身的变化也会选取全部核心检查。
 
-计划冻结 `coverage_base`、`coverage_head` 和原因。`ci-gate` 在完整 Git 历史中核对当前提交及事件，用冻结范围重新生成路径和检查选择，不再次查询成功运行。定时、手动和 merge queue 保持各自的全范围规则。本地显式 `--base`、`--head` 使用指定范围，不查询 GitHub。
+计划冻结 `coverage_base`、`coverage_head` 和原因。`ci-gate` 在完整 Git 历史中核对当前提交及事件，用冻结范围重新生成路径和检查选择，不再次查询成功运行。手动、复用调用和 merge queue 保持各自的全范围规则。本地显式 `--base`、`--head` 使用指定范围，不查询 GitHub。
 
 | 改动 | 核心检查 |
 | --- | --- |
@@ -102,7 +123,7 @@ python3 scripts/check-delivery.py --sandbox
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
-普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 Strict/十三证明启动协议明确拒绝，不能用历史成功状态为新预算背书；当前受保护真实 Node/证明验收由显式选择的 `delivery_live` 手动 job 或同一宿主命令执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 Strict/十三证明启动协议明确拒绝，不能用历史成功状态为新预算背书；当前受保护真实 Node/证明验收由显式运行的 `delivery-live.yml` 或同一宿主命令执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
 
 当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复、私人协议拒绝、每条服务连接只处理一个请求后关闭，以及停滞握手在限期内释放，都使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
 
@@ -110,21 +131,21 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 手动生成真实付费交付证据
 
-`delivery_small` 是默认关闭的独立小实验。显式选中后默认运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，跳过常规计划与 aggregate gate，不构建 Android 或运行 full live。`delivery_small_prepare_only` 默认 false，仅在 `delivery_small=true` 时生效；设为 true 后只运行 prepare 并上传既有公开准备证据，proofs 和 accept 均跳过。未选中 small 时，该输入不改变其他入口。`delivery_small` 和 `delivery_live` 不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
+`delivery-small.yml` 是独立手动小实验。默认运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，不调用常规 Core、Android 或 full live。`prepare_only` 默认 false；设为 true 后只运行 prepare 并上传公开准备证据，proofs 和 accept 均跳过。`resume_run` 指定同源旧运行。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
 
 ```sh
-gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false
+gh workflow run delivery-small.yml --ref <实验分支>
 # 只运行四关系准备和执行控制，不启动证明或 accept 的资金与恢复分支。
-gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false -f delivery_small_prepare_only=true
+gh workflow run delivery-small.yml --ref <实验分支> -F prepare_only=true
 # 从明确的同源运行续用已合格的公开分项。
-gh workflow run ci.yml --ref <同一提交的分支> -f delivery_small=true -f delivery_live=false -f delivery_small_resume_run=<run-id>
+gh workflow run delivery-small.yml --ref <同一提交的分支> -f resume_run=<run-id>
 # 本机只运行准备控制，不生成证明或可复用分项证书。
 python3 scripts/check-delivery.py --sandbox --prove-small prepare
 ```
 
 `--prove-small` 必须指定 `prepare`、`relation-1` 至 `relation-4` 或 `accept`，不保留旧的无参数四证明入口。证明与续跑项要求真实 Actions 来源。`--resume-run` 仅供宿主选择一个明确的旧 run，不猜测分支最新运行。内部 `--resume-dir` 指向宿主已按 API、精确文件树和摘要检查的私有候选集合；容器中的 Python 用当前重编 host 验真全部合格候选后，才生成 Node 可读取的规范化目录。GH token 留在宿主，不进入容器环境、envfile 或新增挂载。
 
-小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=19 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
+小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=19 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group `ci-delivery-small`，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
 
 `prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
 
@@ -140,11 +161,15 @@ prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute �
 
 旧 Strict/十三证明、逐单 fund/publish 和 UI 控制器协议已退休。`verify-node.py --delivery`、`--delivery-ui-selfcheck` 和旧 run-live 的 package/Android 参数组合都在写入或启动工作前明确拒绝；历史 artifact 工具纯自检只用于识别旧证据，不代表当前产品验收。
 
-`delivery_live` 仍只在手动 workflow_dispatch 且输入为 true 时执行，默认 false。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。现有 gate 在显式选中该模式时仍要求 job success；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
+`delivery-live.yml` 仅在显式手动 workflow_dispatch 时执行，没有额外开关。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。独立 Live gate 要求 Core 和真实证明 job 均成功；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
 
-该选项选择专门的 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 CI、普通手动运行、定时及产品 Tag 的选择保持原样。计划摘要列出实际 target 和未选范围。
+Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core、Nightly 的完整标准 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
 
-同时设置附加 `desktop=true` 时，`delivery_live` 现在优先选择 native-only，托管的 Mac/Windows 桌面窗口及 Windows native 验收不执行；这改变了原先同时执行两者的组合行为。`desktop_only`、`windows_only` 或非 `none` 的 `mobile_apps` 保持各专门入口优先，native 未选。`delivery_small=true` 与 `delivery_live=true` 仍被 small-prepare 的单模式检查拒绝，不会启动 native。native job 还要求 plan、Linux package、crypto-web 和 web 全部成功，且整次运行未取消；失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。
+Live 等待同一次运行的 Core 成功，再从其输出的精确 SHA 下载 Linux package、crypto 和 Web 制品。失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。各用途使用独立入口。
+
+```sh
+gh workflow run delivery-live.yml --ref <实验分支>
+```
 
 protected 宿主入口不继承旧 Strict/UI 的 20700 秒整轮截止，而由既有原生阶段和业务期限决定退出；单项证明仍限 7200 秒，11GiB/zero swap/64 PIDs、原订单期限和 W/I/F/S 均不变。`prepare`、`confirm_batch`、`accept_batch` 仅对结构化响应中的固定提交前 busy 错误沿既有 120 秒阶段上限重试原请求；网络异常、未知结果及其他拒绝不重发。Actions 的 `timeout-minutes: 360` 是独立外部限制，可能截断尚在合法阶段内的运行，不能据此宣称完整实验通过。分项保存保留已验真的公开材料，但当前驱动不支持停止容器后的原链/订单续跑。
 
@@ -158,11 +183,11 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 
 ## 定期、手动和发布检查
 
-定时检查保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。定时和 Actions 中普通手动运行 `ci` 强制执行扩展检查，不受路径影响；显式 native-only 实验按前文选择 Linux 包，不选 npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。手动 `ci` 只验证和生成制品，不发布，也不自动补发 Nightly。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+`nightly.yml` 保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过。Nightly 调用一次完整标准 Core，根级 `ci-gate` 确认成功后，才允许 main schedule 运行 `daily-nightly`。手动 Nightly 只验证，不发布。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
 
-`daily-nightly` 接在同一 main schedule run 的 `ci-gate` 后，要求 `!cancelled()` 和 gate success，不增加第二套定时全量 CI。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
+手动 `CI / Core` 同样执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。产品 `v` Tag 由 `release.yml` 构建全部产品目标，`www-v` Tag 由 `release-www.yml` 构建官网。
 
-版本提交只使用原 schedule 的精确 main SHA 作 parent。共享来源门核对普通单 parent、完整机械 tree、版本 cohort、两个移动构建号及 `cargo metadata --locked --no-deps`。发布 workflow 验证原 run 的仓库、workflow path、main、SHA 与 `ci-gate` success，不等待包含协调 job 的整体 run success。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。main 上的普通 Tag 继续要求同一 SHA 的 main push CI success，Stable/RC 不允许 detached 来源。
+版本提交只使用原 schedule 的精确 main SHA 作 parent。共享来源门核对普通单 parent、完整机械 tree、版本 cohort、两个移动构建号及 `cargo metadata --locked --no-deps`。发布 workflow 根据原 CI SHA 的精确文件树选择来源工作流，验证原 run 的仓库、workflow path、main、SHA 与根级 `ci-gate` success。新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整体 run success。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。main 上的普通 Tag 继续要求同一 SHA 的 main push CI success，Stable/RC 不允许 detached 来源。
 
 原 run 的 UTC `created_at` 决定四小时批次；延迟和跨日恢复沿用原版本、构建号、SHA、运行与留存 artifact。构建号从 main 和上一可信产品 Nightly 取数值上界加一，iOS 分段溢出时停止。上一来源完整发布且 npm 成功、main 无新提交时跳过；部分 Tag、Release、npm 先恢复原来源，不新建版本覆盖。quick-check 与 preflight 执行现有 Nightly 自测，覆盖真实临时 Git、机械 tree 篡改、原 schedule CI 门、固定 parent、构建号数值比较、同批次及部分发布恢复、Tag 冲突和未知写入对账。详情见 [Nightly 发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
 
@@ -199,20 +224,20 @@ CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK �
 Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
 
 ```sh
-gh workflow run ci.yml --ref <branch> -F windows_only=true
+gh workflow run ci-windows.yml --ref <branch>
 ```
 
 需要运行当前 Windows 包的真实进程、IPC、服务、更新和 Provider 夹具时，使用扩展平台入口：
 
 ```sh
-gh workflow run ci.yml --ref <branch> -F desktop=true
+gh workflow run ci-desktop-acceptance.yml --ref <branch> -f intent=full-validation
 ```
 
 该入口先构建当前源码的 Windows package，再从同一次运行下载按源码 SHA 命名的不可变制品，校验摘要后执行真实进程检查。
 
 ## 本地按改动补充验收
 
-开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发 `ci`，确认目标平台制品。
+开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发完整 Core 或对应平台入口，确认目标平台制品。
 
 Web 开发使用 `pnpm --filter vibeface-web dev` 或 `pnpm --filter vibeface-www dev`，Vite HMR 只更新开发页面。Rust 可按需复用 Cargo 增量缓存，依赖与编译结果仍以 Cargo 为准，不引入另一套构建调度或 Core 热重载。最终验收使用当前提交的真实制品并重启进程，核对 Node、scheduler、Provider、DAG 和持久化状态的恢复、去重与未知结果对账。
 
@@ -296,7 +321,9 @@ Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检�
 
 ## 缓存与并发
 
-`ci` 按事件类型和 Git ref 分组，仅 `main` push 的首次运行自动取消旧的同组运行，累计覆盖范围保留旧运行尚未通过的改动。每次手动运行和 `run_attempt > 1` 的重跑再按 `run_id` 分组，因此重跑旧提交不会挤掉新提交的检查，显式 `delivery_live` 不会被后续 push 取消，也不会被另一条手动运行替换其 pending 位置。定时和 merge queue 不取消正在执行的同组运行，同组仍最多保留一个等待运行。主分支核心检查可以与定时完整检查同时进行。产品或官网 Tag 不触发普通 `ci`，发布与部署工作流使用各自的并发规则。 `delivery_small` 仍使用前文的跨 ref 串行分组，不按 `run_id` 拆组，也不取消正在执行的实验。
+Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动。Desktop、Windows 与 Mobile 等纯验证入口的首次手动运行也按同分支、同模式去重。这些验证仅在 `run_attempt > 1` 时追加 `run_id`，并且不取消新提交的运行；普通手动验证不按 `run_id` 隔离。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
+
+Small 使用跨 ref 的 `ci-delivery-small` 串行组，不取消正在执行的实验。Live 及其调用的 `linux-native` Core 均按 `run_id` 隔离且不自动取消，保留昂贵实验的显式独立运行。Nightly 协调器、产品发布与部署分别遵守自己的并发规则；Nightly 协调器使用全局 `daily-nightly` 串行组。
 
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 
@@ -310,26 +337,35 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 ## 合并门禁
 
-`ci-gate` 要求选中的任务成功，选中任务失败、取消、缺失或跳过均拒绝通过。未选中的任务允许跳过或缺失；若它们实际报告失败或取消，仍拒绝通过。gate 核对冻结提交范围并重新计算计划，拒绝缩小 `scopes`、必需任务或其他选取结果。它服务于 main、merge queue、定时和手动运行，不是开发分支 PR 的必需检查。
+`ci-gate` 要求选中的任务成功，选中任务失败、取消、缺失或跳过均拒绝通过。未选中的任务允许跳过或缺失；若它们实际报告失败或取消，仍拒绝通过。gate 核对冻结提交范围并重新计算计划，拒绝缩小 `scopes`、必需任务或其他选取结果。它服务于 main、merge queue、手动运行与复用调用，不是开发分支 PR 的必需检查。
 
-native-only 的选择从真实 workflow_dispatch 输入重新计算，必须与 plan 及 gate 的 `--delivery-live` 一致。不能把普通四平台计划改成 Linux-only 或关闭 npm 后通过 gate。native 被选中时必须实际成功；未选的 npm、托管的 Mac/Windows 桌面窗口与 Windows native 验收，以及非 Linux 包不计为已验证。
+Core 的 plan 与 gate 都从同一个内部 `package_policy` 重新计算覆盖范围，拒绝将标准四平台计划缩成 Linux-only 或关闭 npm。Live 的 `linux-native` 策略只允许手动来源的复用调用。独立 Live gate 另要求真实证明 job 成功。未选的 npm、托管 Mac/Windows 窗口与 Windows native 验收，以及非 Linux 包不计为已验证。
 
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与产品或官网 Tag 的制品、发布和部署检查分别记录。
 
-产品与官网 Tag 由 `release.yml` 独立校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
+产品与官网 Tag 分别由 `release.yml` 和 `release-www.yml` 校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
 
 
 ## 桌面专项验收
 
-在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
+在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
 
 ```sh
-	gh workflow run ci.yml --repo leaperone/vibeface --ref <branch> -f desktop_only=true
+	gh workflow run ci-desktop-acceptance.yml --repo leaperone/vibeface --ref <branch> -f intent=desktop-only
 ```
 
-只定位 Windows Rust 问题时，使用 `windows_only=true`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
+需要完整 Core 与 Mac、Windows 包验收时，选择 `intent=full-validation`。它只运行一次完整标准 Core，再消费同一次运行、同 SHA 的 Mac 与 Windows 包，运行真实窗口与 Windows 进程验收。该模式不额外运行 Linux 桌面窗口。
+
+只定位 Windows Rust 问题时，运行 `ci-windows.yml`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
 
 桌面测试使用打包应用自身的 DevTools 页面，核对真实 Electron 版本、窗口隔离、内置包来源、自有 Core、退出和重启。测试预先用包内 CLI 建立不入全网（`--no-mesh`）的独立 Node，随后由真实启动器启动并持有 Core；首次初始化逻辑另由桌面会话测试覆盖。Windows 另外核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程回收和当前用户服务。Unix shell、Unix 权限位及 Linux 证明宿主夹具保留在 Unix 测试中；协调器的协议测试在两端使用各自的私有 IPC。所有 Provider 均为受控夹具，不调用真实模型。
 
 
-原生移动端构建可使用 `ci.yml` 的 `mobile_apps=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；现有 `mobile.yml` 保留模拟器界面测试。手动移动端验收按运行编号隔离并行，避免新提交取消尚在验证的专用模拟器任务。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh`、`release-rustflags.py` 和 `.github/workflows/mobile.yml` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
+## 移动端专项验收
+
+```sh
+gh workflow run ci-mobile-device.yml --ref <branch> -f platforms=both
+gh workflow run mobile.yml --ref <branch> -f platforms=ios
+```
+
+原生移动端构建使用 `ci-mobile-device.yml` 的 `platforms=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；`mobile.yml` 的 `platforms=all|android|ios` 选择 Android 原生构建或 iOS 模拟器界面测试，不包含 Android 模拟器 UI 验收。同 ref、同平台的首次手动运行会取消旧运行，重跑按前文规则隔离。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh`、`release-rustflags.py` 和 `.github/workflows/mobile.yml` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。

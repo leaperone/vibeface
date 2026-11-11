@@ -18,7 +18,6 @@ PRODUCT_APPS = release.PRODUCT_APPS
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 ABANDONED = 'scripts/nightly-abandoned.json'
 MAX_HISTORY = 16
-RELEASE_WORKFLOW = '.github/workflows/release.yml'
 require = release.require
 
 
@@ -253,12 +252,14 @@ def remote_tag(tag):
 
 
 def release_runs(source, tag):
-    response = github('actions/workflows/release.yml/runs?head_sha=' + source
+    app, _, _ = release.parse_tag(tag)
+    workflow, _ = release.release_workflow(source, app)
+    response = github('actions/workflows/' + workflow.split('/')[-1] + '/runs?head_sha=' + source
                       + '&branch=' + quote(tag, safe='') + '&per_page=100')
     require(response['total_count'] <= 100, 'too many runs to reconcile one immutable Nightly tag')
     return [run for run in response['workflow_runs']
             if run['head_sha'] == source and run['head_branch'] == tag
-            and run['event'] in ('push', 'workflow_dispatch') and run['path'] == RELEASE_WORKFLOW
+            and run['event'] in ('push', 'workflow_dispatch') and run['path'] == workflow
             and run['repository']['full_name'] == release.GITHUB_REPO
             and run['head_repository']['full_name'] == release.GITHUB_REPO]
 

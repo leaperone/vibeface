@@ -74,8 +74,6 @@ PLATFORMS = (
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
-# Only an explicit dispatch runs the hosted Windows and desktop application checks.
-DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
@@ -101,7 +99,7 @@ def local_process_modes(paths, full):
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
 
-def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, delivery_live=False):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
         if WEB_UNIT_TEST.fullmatch(path):
@@ -118,18 +116,18 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly",
             scopes.add("desktop")
         if path.startswith("apps/desktop/src/shared/"):
             scopes.add("web")
-    plan = scope_plan(scopes, event, ref_type, channel, delivery_live=delivery_live)
+    plan = scope_plan(scopes, event, ref_type, channel, package_policy=package_policy)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
-def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
+def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
         scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
-        or type(delivery_live) is not bool
-        or delivery_live and event != "workflow_dispatch"
+        or not isinstance(package_policy, str) or package_policy not in {"standard", "linux-native"}
+        or package_policy == "linux-native" and event != "workflow_dispatch"
     ):
         raise ValueError("Invalid CI scopes or scenario")
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
@@ -152,14 +150,14 @@ def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
     desktop = full or "desktop" in scopes
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
-    platforms = PLATFORMS if "node" in affected and extended and not delivery_live else PLATFORMS[:1]
+    platforms = PLATFORMS if "node" in affected and extended and package_policy == "standard" else PLATFORMS[:1]
     plan = {
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
         "docs_only": not crypto and not packages and not mobile and not desktop,
         "event": event,
-        "delivery_live": delivery_live,
+        "package_policy": package_policy,
         "ref_type": ref_type,
         "channel": channel,
         "scopes": sorted(scopes),
@@ -175,7 +173,7 @@ def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
-        "npm": channel == "nightly" and "node" in affected and extended and not delivery_live,
+        "npm": channel == "nightly" and "node" in affected and extended and package_policy == "standard",
     }
     required = {"quick-check"}
     if crypto:
@@ -252,25 +250,12 @@ def successful_push_base(head):
     return None
 
 
-def delivery_live_selected(event, payload):
-    if event != "workflow_dispatch":
-        return False
-    if not isinstance(payload, dict) or not isinstance(payload.get("inputs", {}), dict):
-        raise ValueError("Invalid workflow_dispatch inputs")
-    inputs = payload.get("inputs", {})
-    flags = {}
-    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
-        value = inputs.get(name, False)
-        if type(value) is bool:
-            flags[name] = value
-        elif isinstance(value, str) and value in ("true", "false"):
-            flags[name] = value == "true"
-        else:
-            raise ValueError(f"Invalid workflow_dispatch boolean: {name}")
-    mobile = inputs.get("mobile_apps", "none")
-    if not isinstance(mobile, str) or mobile not in ("none", "ios", "android", "both"):
-        raise ValueError("Invalid mobile application selection")
-    return flags["delivery_live"] and not any(flags[name] for name in ("delivery_small", "windows_only", "desktop_only")) and mobile == "none"
+def package_policy(value, event):
+    if not isinstance(value, str) or value not in {"standard", "linux-native"}:
+        raise ValueError("Package policy must be standard or linux-native")
+    if value == "linux-native" and event != "workflow_dispatch":
+        raise ValueError("Linux native package coverage requires explicit workflow_dispatch")
+    return value
 
 
 def event_plan(args):
@@ -305,7 +290,7 @@ def event_plan(args):
         base = git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    plan = make_plan(paths, event, ref_type, metadata["channel"], delivery_live=delivery_live_selected(event, payload))
+    plan = make_plan(paths, event, ref_type, metadata["channel"], package_policy=package_policy(getattr(args, "package_policy", "standard"), event))
     plan.update(metadata)
     plan.update(coverage_base=base, coverage_head=head, coverage_reason=reason, baseline_run_id=baseline_run)
     return plan
@@ -345,7 +330,7 @@ def write_plan(plan, output=None):
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
-            "delivery_live": str(plan["delivery_live"]).lower(),
+            "source_sha": plan["coverage_head"],
             "package": str("package" in plan["required_jobs"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
@@ -371,7 +356,7 @@ def write_plan(plan, output=None):
                 f"- Test tiers: {', '.join(plan['test_tiers']) or 'none'}\n"
                 f"- Package acceptance: {plan['package_mode'] if plan['web'] else 'none'}\n"
                 f"- Package targets: {', '.join(row['target'] for row in plan['package_matrix']['include']) or 'none'}\n"
-                f"- Native delivery experiment: {'native-only; non-Linux, npm and hosted desktop acceptance checks are not selected; delivery_live takes precedence over additive desktop' if plan['delivery_live'] else 'not selected'}\n"
+                f"- Package policy: {plan['package_policy']}\n"
                 f"- Required jobs: {', '.join(plan['required_jobs'])}\n"
                 "\nLocal process checks to run separately, using current CLI/Core and JS/WASM paths:\n\n"
             )
@@ -384,7 +369,7 @@ def write_plan(plan, output=None):
                 destination.write("- None for these paths.\n")
 
 
-def frozen_plan(plan):
+def frozen_plan(plan, policy="standard"):
     if os.environ.get("GITHUB_ACTIONS") == "true":
         if plan["event"] != os.environ.get("GITHUB_EVENT_NAME") or plan["ref_type"] != os.environ.get("GITHUB_REF_TYPE") or plan["coverage_head"] != os.environ.get("GITHUB_SHA"):
             raise ValueError("CI plan differs from the current event or commit")
@@ -412,36 +397,26 @@ def frozen_plan(plan):
         paths = changed_paths(base, head, plan["event"])
     if automatic_main_push(plan["event"]) and reason not in {"successful-main-push", "no-trusted-main-push"}:
         raise ValueError("Main push coverage requires a successful ancestor or full fallback")
-    payload_path = os.environ.get("GITHUB_EVENT_PATH")
-    payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
-    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live_selected(plan["event"], payload))
+    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"], package_policy=package_policy(policy, plan["event"]))
 
 
-def gate(needs, plan=None, delivery_live=False, desktop=False):
+def gate(needs, plan=None, policy="standard"):
     if needs.get("plan", {}).get("result") != "success":
         raise ValueError("CI plan did not succeed")
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
     if "coverage_head" in plan or os.environ.get("GITHUB_ACTIONS") == "true":
         try:
-            expected = frozen_plan(plan)
+            expected = frozen_plan(plan, policy)
         except (KeyError, TypeError, subprocess.CalledProcessError) as error:
             raise ValueError("Invalid frozen CI coverage") from error
     else:
-        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live)
+        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"], package_policy=package_policy(policy, plan["event"]))
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
-    if plan["delivery_live"] is not delivery_live:
-        raise ValueError("Live delivery selection differs from the frozen plan")
-    if delivery_live and desktop:
-        raise ValueError("Native-only delivery does not select desktop acceptance")
-    if delivery_live and plan["event"] != "workflow_dispatch":
-        raise ValueError("Live delivery proofs require explicit workflow_dispatch")
-    if desktop and plan["event"] != "workflow_dispatch":
-        raise ValueError("Windows native and desktop application checks require explicit workflow_dispatch")
-    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else []) + (DESKTOP_JOBS if desktop else [])
+    required = expected["required_jobs"]
     failed = [job for job in required if needs.get(job, {}).get("result") != "success"]
-    failed.extend(job for job in (*JOBS, "delivery-live", *DESKTOP_JOBS)
+    failed.extend(job for job in JOBS
                   if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
     if failed:
         raise ValueError(f"Required CI checks did not succeed: {', '.join(failed)}")
@@ -704,51 +679,28 @@ def self_test():
         incomplete = json.loads(json.dumps(complete))
         incomplete[job]["result"] = "skipped"
         expect_failure(lambda: gate(incomplete))
-    expect_failure(lambda: gate(complete, delivery_live=True))
-    complete["delivery-live"] = {"result": "success"}
-    expect_failure(lambda: gate(complete, delivery_live=True))
-    native = make_plan([], "workflow_dispatch", delivery_live=True)
+    native = make_plan([], "workflow_dispatch", package_policy="linux-native")
     assert native["package_matrix"]["include"] == list(PLATFORMS[:1]) and native["package_mode"] == "node"
     assert not native["npm"] and native["test_tiers"] == ready["test_tiers"] and native["check_msrv"]
     assert native["required_jobs"] == [job for job in ready["required_jobs"] if job not in ("npm-package", "npm-smoke")]
     native_needs = {job: {"result": "success" if job in native["required_jobs"] else "skipped"} for job in JOBS}
     native_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(native)}}
-    native_needs["delivery-live"] = {"result": "success"}
-    gate(native_needs, delivery_live=True)
+    gate(native_needs, policy="linux-native")
     expect_failure(lambda: gate(native_needs))
-    expect_failure(lambda: gate(native_needs, delivery_live=True, desktop=True))
+    expect_failure(lambda: gate(complete, policy="linux-native"))
     for result in ("failure", "cancelled", "skipped", "missing"):
-        for job in ("plan", "package", "crypto-web", "web", "delivery-live"):
+        for job in ("plan", *native["required_jobs"]):
             broken = json.loads(json.dumps(native_needs))
             if result == "missing":
                 del broken[job]
             else:
                 broken[job] = {"result": result}
-            expect_failure(lambda: gate(broken, delivery_live=True))
-    for job in ("npm-package", "npm-smoke", *DESKTOP_JOBS):
+            expect_failure(lambda: gate(broken, policy="linux-native"))
+    for job in ("npm-package", "npm-smoke"):
         for result in ("failure", "cancelled"):
             broken = json.loads(json.dumps(native_needs))
             broken[job] = {"result": result}
-            expect_failure(lambda: gate(broken, delivery_live=True))
-    expect_failure(lambda: gate(needs, delivery_live=True))
-    expect_failure(lambda: gate(complete, desktop=True))
-    for job in DESKTOP_JOBS:
-        complete[job] = {"result": "success"}
-    gate(complete, desktop=True)
-    gate(complete)
-    for result in ("failure", "cancelled", "skipped", "missing"):
-        for job in DESKTOP_JOBS:
-            broken = json.loads(json.dumps(complete))
-            broken[job] = {"result": result}
-            expect_failure(lambda: gate(broken, desktop=True))
-            # Without the dispatch input a skipped desktop job is expected, but a failed one still fails the gate.
-            if result in {"failure", "cancelled"}:
-                expect_failure(lambda: gate(broken))
-            else:
-                gate(broken)
-    expect_failure(lambda: gate(needs, desktop=True))
-    for job in DESKTOP_JOBS:
-        del complete[job]
+            expect_failure(lambda: gate(broken, policy="linux-native"))
     delivery_plan = make_plan(["crates/delivery/proof/fixtures/manifest.json"])
     delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
     delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
@@ -847,8 +799,8 @@ def self_test():
         assert "pnpm --filter @vibeface/secure-native run typecheck" in standalone
         assert "pnpm --filter vibeface-mobile run typecheck" in standalone
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
-    assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
-    assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
+    assert "ci-core-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}" in concurrency
+    assert "cancel-in-progress: ${{ inputs.package_policy != 'linux-native' && github.run_attempt == 1 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}" in concurrency
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
     for job in ("rust-check", "rust-fast", "rust-slow"):
         block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
@@ -858,34 +810,7 @@ def self_test():
     package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert "    needs: [plan, crypto-web, web]\n" in package
     assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
-    live_input = workflow.split("      delivery_live:\n", 1)[1].split("      delivery_small:", 1)[0]
-    assert "type: boolean" in live_input and "default: false" in live_input
-    live = re.search(r"(?ms)^  delivery-live:\n(.*?)(?=^  \w|\Z)", workflow)[1]
-    assert "github.event_name == 'workflow_dispatch' && inputs.delivery_live" in live
-    assert "needs: [plan, package, crypto-web, web]" in live
-    live_condition = re.search(r"^    if: (.+)$", live, re.M)[1]
-    assert "!cancelled()" in live_condition and "always()" not in live_condition
-    assert all(f"needs.{job}.result == 'success'" in live_condition for job in ("plan", "package", "crypto-web", "web"))
-    assert "needs.plan.outputs.delivery_live == 'true'" in live_condition
-    assert "!inputs.delivery_small" in live_condition and all(f"inputs.{name}" in live_condition for name in ("desktop_only", "windows_only", "mobile_apps"))
-    assert "delivery_live: ${{ steps.select.outputs.delivery_live }}" in workflow
-    gate_command = workflow.split("run: python3 scripts/ci.py gate --needs-env CI_NEEDS", 1)[1].split("\n", 1)[0]
-    assert "needs.plan.outputs.delivery_live == 'true' && '--delivery-live'" in gate_command
-    assert "inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop'" in gate_command
-    small = re.search(r"(?ms)^  delivery-small-prepare:\n(.*?)(?=^  \w|\Z)", workflow)[1]
-    assert 'run: test "$DELIVERY_LIVE" = false' in small
-    assert re.search(r"^    if: (.+)$", small, re.M)[1] == "github.event_name == 'workflow_dispatch' && inputs.delivery_small"
-    prepare_only = workflow.split("      delivery_small_prepare_only:\n", 1)[1].split("      delivery_small_resume_run:", 1)[0]
-    assert "type: boolean" in prepare_only and "default: false" in prepare_only
-    for job in ("delivery-small-proofs", "delivery-small-accept"):
-        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
-        condition = re.search(r"^    if: (.+)$", block, re.M)[1]
-        assert "&& !inputs.delivery_small_prepare_only" in condition and "||" not in condition
-    assert "runs-on: ubuntu-24.04" in live and "timeout-minutes: 360" in live
-    assert 'test "$(uname -s)" = Linux' in live and 'test "$(uname -m)" = x86_64' in live
-    assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live
-    assert all(retired not in live for retired in ("--package ", "--android ", "delivery-android", "ffmpeg", "/dev/kvm", "continue-on-error"))
-    assert "path: ${{ steps.protected.outputs.public-directory }}" in live and "if-no-files-found: error" in live
+    workflow_contract_self_test()
     quick = re.search(r"(?ms)^  quick-check:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert "python3 scripts/run-delivery-live.py --self-test" in quick
     assert all(name in quick for name in ("scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"))
@@ -896,6 +821,238 @@ def self_test():
     release_privacy_test(root, scratch)
     gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def concurrency_self_test(workflows):
+    from types import SimpleNamespace
+
+    def evaluate(text, filename, inputs, event="workflow_dispatch", run_id=101, attempt=1, ref="refs/heads/main"):
+        context = {
+            "github": SimpleNamespace(workflow=filename, event_name=event, ref=ref, ref_name=ref.removeprefix("refs/heads/"), run_id=run_id, run_attempt=attempt),
+            "inputs": SimpleNamespace(**{"package_policy": "", "intent": "", "platforms": "", "android_only": False, **inputs}),
+            "format": lambda template, *values: template.format(*values),
+        }
+
+        def expression(source):
+            return eval(source.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, context)
+
+        if text in {"true", "false"}:
+            return text == "true"
+        match = re.fullmatch(r"\$\{\{ (.*?) \}\}", text)
+        if match:
+            return expression(match[1])
+        return re.sub(r"\$\{\{ (.*?) \}\}", lambda match: str(expression(match[1])), text)
+
+    selections = {
+        "ci.yml": [{"package_policy": "standard"}],
+        "ci-desktop-acceptance.yml": [{"intent": "desktop-only"}, {"intent": "full-validation"}],
+        "ci-windows.yml": [{}],
+        "ci-mobile-device.yml": [{"platforms": platform} for platform in ("ios", "android", "both")],
+        "mobile.yml": [{"platforms": platform} for platform in ("all", "ios", "android")],
+    }
+    for filename, modes in selections.items():
+        concurrency = workflows[filename].split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
+        group = re.search(r"^  group: (.+)$", concurrency, re.M)[1]
+        cancellation = re.search(r"^  cancel-in-progress: (.+)$", concurrency, re.M)[1]
+        assert "github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || ''" in group
+        first_groups = []
+        for inputs in modes:
+            first = evaluate(group, filename, inputs, run_id=100)
+            newer = evaluate(group, filename, inputs, run_id=101)
+            assert first == newer, (filename, inputs, "first attempts deduplicate")
+            assert evaluate(cancellation, filename, inputs) is True
+            first_groups.append(first)
+            for attempt in (2, 3):
+                old_rerun = evaluate(group, filename, inputs, run_id=100, attempt=attempt)
+                assert old_rerun == first + "-rerun-100" and old_rerun != newer
+                assert evaluate(cancellation, filename, inputs, run_id=100, attempt=attempt) is False
+            assert evaluate(group, filename, inputs, ref="refs/heads/other") != first
+        assert len(set(first_groups)) == len(modes), (filename, "different modes remain independent")
+        if filename == "ci.yml":
+            for event in ("push", "schedule", "merge_group"):
+                for attempt in (1, 2):
+                    assert evaluate(cancellation, filename, modes[0], event=event, attempt=attempt) is (event == "push" and attempt == 1)
+                assert evaluate(group, filename, modes[0], event=event, run_id=100, attempt=2) != evaluate(group, filename, modes[0], event=event, run_id=101)
+    # Both the explicit proof entry and its nested Core must isolate separate paid experiments.
+    live_concurrency = workflows["delivery-live.yml"].split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
+    live_group = re.search(r"^  group: (.+)$", live_concurrency, re.M)[1]
+    live_cancel = re.search(r"^  cancel-in-progress: (.+)$", live_concurrency, re.M)[1]
+    core_concurrency = workflows["ci.yml"].split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
+    core_group = re.search(r"^  group: (.+)$", core_concurrency, re.M)[1]
+    core_cancel = re.search(r"^  cancel-in-progress: (.+)$", core_concurrency, re.M)[1]
+    proof_policy = {"package_policy": "linux-native"}
+    for run_id in (100, 101):
+        live_first = evaluate(live_group, "delivery-live.yml", {}, run_id=run_id)
+        assert live_first == f"delivery-live-refs/heads/main-{run_id}"
+        proof_first = evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id)
+        assert proof_first == f"ci-core-delivery-live.yml-workflow_dispatch-refs/heads/main-linux-native-proof-{run_id}"
+        for attempt in (1, 2, 3):
+            assert evaluate(live_group, "delivery-live.yml", {}, run_id=run_id, attempt=attempt) == live_first
+            assert evaluate(live_cancel, "delivery-live.yml", {}, run_id=run_id, attempt=attempt) is False
+            assert evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id, attempt=attempt) == proof_first
+            assert evaluate(core_cancel, "delivery-live.yml", proof_policy, run_id=run_id, attempt=attempt) is False
+            assert evaluate(core_group, "delivery-live.yml", {"package_policy": "standard"}, run_id=run_id, attempt=attempt) != proof_first
+        assert evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id) != evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id + 1)
+    mobile = workflows["mobile.yml"]
+    assert mobile.startswith("name: CI / Mobile acceptance\n")
+    run_name = " ".join(line.strip() for line in mobile.split("run-name: >-\n", 1)[1].split("\n\n", 1)[0].splitlines())
+    for inputs, label in (({"platforms": "android"}, "Android native build"), ({"platforms": "ios"}, "iOS simulator UI"), ({"platforms": "all"}, "Android native build + iOS simulator UI"), ({"android_only": True}, "Android native build")):
+        assert evaluate(run_name, "mobile.yml", inputs) == "Mobile acceptance · workflow_dispatch · main · " + label
+    assert evaluate(run_name, "mobile.yml", {}, event="schedule") == "Mobile acceptance · schedule · main · no platform selected"
+    assert evaluate(run_name, "mobile.yml", {"android_only": True}, event="schedule") == "Mobile acceptance · schedule · main · Android native build"
+    print("Concurrency controls passed: first-attempt deduplication, isolated old reruns, independent modes, protected Live/Core proof runs and non-cancelling Core schedules/merge groups")
+
+
+def workflow_contract_self_test():
+    import textwrap
+    from unittest.mock import patch
+    root = Path(__file__).resolve().parent.parent
+    directory = root / ".github/workflows"
+    workflows = {path.name: path.read_text() for path in directory.glob("*.yml")}
+    core = workflows["ci.yml"]
+
+    def block(workflow, job):
+        return re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflows[workflow].split("\njobs:\n", 1)[1])[1]
+
+    # This inventory maps the previous required checks to their new owning entry points.
+    inventory = {
+        "ci.yml": ["plan", *JOBS, "ci-gate"],
+        "ci-desktop-acceptance.yml": ["checks", "crypto-web", "web", "windows-native", "desktop-macos", "desktop-windows", "desktop-only-macos", "desktop-only-windows", "desktop-only-linux-x64", "desktop-only-linux-arm64", "windows-platform", "desktop-gate"],
+        "ci-windows.yml": ["windows-platform", "windows-gate"],
+        "ci-mobile-device.yml": ["mobile-plan", "ios-device", "android-app", "mobile-gate"],
+        "delivery-live.yml": ["checks", "delivery-live", "delivery-gate"],
+        "delivery-small.yml": ["delivery-small-prepare", "delivery-small-proofs", "delivery-small-accept"],
+        "mobile.yml": ["android", "ios"],
+    }
+    for filename, jobs in inventory.items():
+        selected = workflows[filename]
+        actual = re.findall(r"(?m)^  ([\w-]+):$", selected.split("\njobs:\n", 1)[1])
+        assert set(actual) == set(jobs), (filename, actual, jobs)
+        assert "run-name:" in selected
+    concurrency_self_test(workflows)
+    assert "  schedule:" not in core and "daily-nightly:" not in core
+    manual = core.split("  workflow_dispatch:\n", 1)[1].split("  workflow_call:", 1)[0]
+    assert not manual.strip(), "Core manual dispatch has no cross-purpose switches"
+    for retired in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "mobile_apps", "inputs.desktop"):
+        assert retired not in core
+    assert "name: ci-gate\n    if: always()" in block("ci.yml", "ci-gate")
+    assert core.count("CI_PACKAGE_POLICY: ${{ inputs.package_policy || 'standard' }}") == 2
+    assert core.count("--package-policy-env CI_PACKAGE_POLICY") == 2
+    assert "source_sha: ${{ steps.select.outputs.source_sha }}" in core
+    assert "value: ${{ jobs.plan.outputs.source_sha }}" in core
+    for filename in ("delivery-live.yml", "delivery-small.yml", "ci-desktop-acceptance.yml", "ci-windows.yml", "ci-mobile-device.yml"):
+        trigger = workflows[filename].split("\non:\n", 1)[1].split("\nconcurrency:", 1)[0]
+        assert "  workflow_dispatch:" in trigger
+        assert not any(f"  {event}:" in trigger for event in ("push", "schedule", "workflow_call", "workflow_run", "pull_request"))
+    desktop = workflows["ci-desktop-acceptance.yml"]
+    assert desktop.count("uses: ./.github/workflows/ci.yml") == 1
+    assert "if: inputs.intent == 'full-validation'" in block("ci-desktop-acceptance.yml", "checks")
+    for job, target in (("desktop-macos", "aarch64-apple-darwin"), ("desktop-windows", "x86_64-pc-windows-msvc"), ("windows-native", "x86_64-pc-windows-msvc")):
+        acceptance = block("ci-desktop-acceptance.yml", job)
+        assert "needs: checks" in acceptance and "inputs.intent == 'full-validation'" in acceptance
+        assert f"package_artifact: node-package-{target}-${{{{ needs.checks.outputs.source_sha }}}}" in acceptance
+        assert "source_sha: ${{ needs.checks.outputs.source_sha }}" in acceptance
+    assert "inputs.intent" in desktop.split("concurrency:\n", 1)[1].split("permissions:", 1)[0]
+    assert "inputs.platforms" in workflows["ci-mobile-device.yml"].split("concurrency:\n", 1)[1].split("permissions:", 1)[0]
+    for filename in ("ci-desktop.yml", "ci-windows-native.yml", "_ci-crypto.yml", "_ci-web.yml"):
+        selected = workflows[filename]
+        assert selected.startswith("name: Reusable / ") and "workflow_call:" in selected
+        assert "workflow_dispatch:" not in selected
+        assert "ref: ${{ inputs.source_sha }}" in selected or "ref: '${{ inputs.source_sha }}'" in selected
+    for job, filename in (("crypto-web", "_ci-crypto.yml"), ("web", "_ci-web.yml")):
+        for entry in ("ci.yml", "ci-desktop-acceptance.yml"):
+            assert f"uses: ./.github/workflows/{filename}" in block(entry, job)
+        assert "${{ inputs.source_sha }}" in workflows[filename]
+    assert "node scripts/crypto-client.mjs --self-test --native-probe" in workflows["_ci-crypto.yml"]
+    assert "run: bash scripts/build-web.sh" in workflows["_ci-web.yml"]
+    for command in ("atlas migrate validate", "scripts/check-delivery.py --self-test", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
+        assert command in core, command
+    package = block("ci.yml", "package")
+    for command in ("--web-only", "--delivery-charity", "pnpm test:e2e", "--phase1", "--artifacts .artifacts/ci-multi-node", "--chat-agent", "--phase4", "--public-node", "--mesh", "--phase5", "Verify Developer ID signature", "Verify checksum and unpacked source identity"):
+        assert command in package, command
+    for job in ("npm-package", "npm-smoke"):
+        assert "needs.plan.outputs.npm == 'true'" in block("ci.yml", job)
+    windows = workflows["ci-windows-native.yml"]
+    assert all(f"scope: {scope}" in windows for scope in ("core", "bridge", "cli"))
+    assert "scripts/ci.py check --packages" in windows and "scripts/ci.py test --tier fast --packages" in windows
+    assert "scripts/verify-windows-node.py --package" in windows and "if: inputs.package_artifact != ''" in windows
+    assert "scripts/verify-windows-node.py --package" in workflows["ci-desktop.yml"]
+    assert "pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts" in workflows["ci-desktop.yml"]
+    mobile = workflows["ci-mobile-device.yml"]
+    assert "uses: ./.github/workflows/release-ios.yml" in mobile and "uses: ./.github/workflows/release-apps.yml" in mobile
+    assert "tag: ''" in mobile and "contents: write" not in mobile
+    live_entry = workflows["delivery-live.yml"]
+    assert live_entry.count("uses: ./.github/workflows/ci.yml") == 1 and "package_policy: linux-native" in live_entry
+    live = block("delivery-live.yml", "delivery-live")
+    condition = re.search(r"^    if: (.+)$", live, re.M)[1]
+    assert "!cancelled()" in condition and "always()" not in condition
+    assert "github.event_name == 'workflow_dispatch'" in condition and "needs.checks.result == 'success'" in condition
+    assert "needs: checks" in live and "runs-on: ubuntu-24.04" in live and "timeout-minutes: 360" in live
+    for artifact in ("node-package-x86_64-unknown-linux-gnu", "crypto-web", "web"):
+        assert f"name: {artifact}-${{{{ needs.checks.outputs.source_sha }}}}" in live
+    assert "run-id:" not in live, "Live proofs consume only this run's fresh package"
+    assert 'test "$(uname -s)" = Linux' in live and 'test "$(uname -m)" = x86_64' in live
+    assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live
+    assert "SOURCE_COMMIT: ${{ needs.checks.outputs.source_sha }}" in live
+    assert all(retired not in live for retired in ("--package ", "--android ", "delivery-android", "ffmpeg", "/dev/kvm", "continue-on-error"))
+    assert "path: ${{ steps.protected.outputs.public-directory }}" in live and "if-no-files-found: error" in live
+    small = workflows["delivery-small.yml"]
+    assert "group: ci-delivery-small\n  cancel-in-progress: false" in small
+    assert "max-parallel: 1" in small and "fail-fast: false" in small
+    assert "fromJSON(needs.delivery-small-prepare.outputs.matrix)" in small
+    assert "needs: [delivery-small-prepare, delivery-small-proofs]" in small
+    for job in ("delivery-small-proofs", "delivery-small-accept"):
+        condition = re.search(r"^    if: (.+)$", block("delivery-small.yml", job), re.M)[1]
+        assert "&& !inputs.prepare_only" in condition and "||" not in condition
+    assert small.count("RESUME_RUN: ${{ inputs.resume_run }}") == 3
+    assert small.count("path: ${{ steps.run.outputs.public-directory }}") == 3
+
+    # Execute the checked-in gate scripts against missing, failed, cancelled and skipped results.
+    def gate_script(filename, job):
+        script = block(filename, job).split("python3 - <<'PYTHON'\n", 1)[1].split("          PYTHON", 1)[0]
+        return textwrap.dedent(script)
+
+    def accepts(script, environment, checks):
+        with patch.dict(os.environ, {**environment, **{key: json.dumps(checks) for key in ("DESKTOP_NEEDS", "MOBILE_NEEDS", "RESULTS")}}):
+            try:
+                exec(compile(script, "workflow-gate", "exec"), {})
+            except SystemExit:
+                return False
+        return True
+
+    suites = (
+        ("ci-desktop-acceptance.yml", "desktop-gate", {"INTENT": "desktop-only"}, ["crypto-web", "web", "desktop-only-macos", "desktop-only-windows", "desktop-only-linux-x64", "desktop-only-linux-arm64", "windows-platform"], ["checks", "windows-native", "desktop-macos", "desktop-windows"]),
+        ("ci-desktop-acceptance.yml", "desktop-gate", {"INTENT": "full-validation"}, ["checks", "windows-native", "desktop-macos", "desktop-windows"], ["crypto-web", "web", "desktop-only-macos", "desktop-only-windows", "desktop-only-linux-x64", "desktop-only-linux-arm64", "windows-platform"]),
+        ("ci-mobile-device.yml", "mobile-gate", {"SCOPE": "ios"}, ["mobile-plan", "ios-device"], ["android-app"]),
+        ("ci-mobile-device.yml", "mobile-gate", {"SCOPE": "android"}, ["mobile-plan", "android-app"], ["ios-device"]),
+        ("ci-mobile-device.yml", "mobile-gate", {"SCOPE": "both"}, ["mobile-plan", "ios-device", "android-app"], []),
+        ("delivery-live.yml", "delivery-gate", {}, ["checks", "delivery-live"], []),
+    )
+    for filename, job, environment, required, skipped in suites:
+        script = gate_script(filename, job)
+        checks = {name: {"result": "success"} for name in required}
+        checks.update({name: {"result": "skipped"} for name in skipped})
+        assert accepts(script, environment, checks), (filename, environment)
+        for name in required:
+            for result in ("failure", "cancelled", "skipped", "missing"):
+                broken = dict(checks)
+                if result == "missing":
+                    del broken[name]
+                else:
+                    broken[name] = {"result": result}
+                assert not accepts(script, environment, broken), (filename, environment, name, result)
+        for name in skipped:
+            for result in ("failure", "cancelled"):
+                assert not accepts(script, environment, dict(checks, **{name: {"result": result}}))
+        for key in environment:
+            assert not accepts(script, {**environment, key: "invalid"}, checks)
+    windows_gate = block("ci-windows.yml", "windows-gate")
+    assert "needs: windows-platform" in windows_gate and "if: always()" in windows_gate
+    script = textwrap.dedent(windows_gate.split("        run: |\n", 1)[1])
+    for result in ("success", "failure", "cancelled", "skipped", ""):
+        outcome = subprocess.run(["bash", "--noprofile", "--norc", "-e"], input=script, env={**os.environ, "RESULT": result}, text=True, capture_output=True)
+        assert (outcome.returncode == 0) == (result == "success")
+    print("Workflow coverage inventory and actual Desktop, Windows, mobile and live gate negative scenarios passed")
 
 
 def focused_self_test():
@@ -983,67 +1140,58 @@ def focused_self_test():
 def native_delivery_self_test(scratch):
     from unittest.mock import patch
     for event in ("pull_request", "push", "schedule", "merge_group"):
-        assert not delivery_live_selected(event, {"inputs": {"delivery_live": True}})
-        expect_failure(lambda: make_plan([], event, delivery_live=True))
-    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
-        for invalid in (0, 1, None, "", "True", "yes", [], {}):
-            expect_failure(lambda: delivery_live_selected("workflow_dispatch", {"inputs": {name: invalid}}))
-    for invalid in (None, [], {"inputs": []}, {"inputs": {"mobile_apps": "unknown"}}):
-        expect_failure(lambda: delivery_live_selected("workflow_dispatch", invalid))
-    for invalid in (0, 1, "true"):
-        expect_failure(lambda: make_plan([], "workflow_dispatch", delivery_live=invalid))
+        assert package_policy("standard", event) == "standard"
+        expect_failure(lambda: make_plan([], event, package_policy="linux-native"))
+    for invalid in (0, 1, None, True, False, "", "true", "native", [], {}):
+        expect_failure(lambda: package_policy(invalid, "workflow_dispatch"))
+        expect_failure(lambda: make_plan([], "workflow_dispatch", package_policy=invalid))
     with tempfile.TemporaryDirectory(prefix="native-event-", dir=scratch) as directory:
         directory = Path(directory)
         event_file = directory / "event.json"
         head = "1" * 40
         environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF_TYPE": "branch",
                        "GITHUB_EVENT_PATH": str(event_file), "GITHUB_SHA": head}
-        arguments = argparse.Namespace(event=None, base=None, head=None)
+        arguments = argparse.Namespace(event=None, base=None, head=None, package_policy="standard")
         metadata = {"channel": "nightly", "version": "1.2.3-nightly.20261109.1", "msrv": "1.91", "prerelease": True}
         def needs_for(selected):
             needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
             needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(selected)}}
-            if selected["delivery_live"]:
-                needs["delivery-live"] = {"result": "success"}
             return needs
         with patch.dict(os.environ, environment), patch(f"{__name__}.git", return_value=(head + "\n").encode()), \
              patch(f"{__name__}.release_metadata", return_value=metadata):
-            for value in (False, "false", True, "true"):
-                event_file.write_text(json.dumps({"inputs": {"delivery_live": value}}))
+            event_file.write_text(json.dumps({"inputs": {}}))
+            for policy in ("standard", "linux-native"):
+                arguments.package_policy = policy
                 selected = event_plan(arguments)
-                live = value is True or value == "true"
-                assert selected["delivery_live"] is live
-                gate(needs_for(selected), delivery_live=live)
-                expect_failure(lambda: gate(needs_for(selected), delivery_live=not live))
-                opposite = dict(make_plan([], "workflow_dispatch", delivery_live=not live), **metadata)
-                opposite.update({key: selected[key] for key in ("coverage_base", "coverage_head", "coverage_reason", "baseline_run_id")})
-                expect_failure(lambda: gate(needs_for(opposite), delivery_live=not live))
-                for key in ("delivery_live", "package_matrix", "npm", "required_jobs"):
-                    changed = dict(selected, **{key: opposite[key]})
-                    expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
-                changed = dict(selected, delivery_live=int(live))
-                expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
-                if value is True:
-                    output, summary = directory / "output", directory / "summary"
-                    with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
-                        write_plan(selected, output)
-                    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                    assert outputs["delivery_live"] == "true" and json.loads(outputs["plan"]) == selected
-                    assert "native-only; non-Linux, npm and hosted desktop acceptance checks are not selected" in summary.read_text()
-                    assert "delivery_live takes precedence over additive desktop" in summary.read_text()
-            for extra, expected in (({"desktop": True}, True), ({"delivery_small": True}, False),
-                                    ({"windows_only": True}, False), ({"desktop_only": True}, False),
-                                    *[({"mobile_apps": mobile}, False) for mobile in ("ios", "android", "both")]):
-                event_file.write_text(json.dumps({"inputs": {"delivery_live": "true", **extra}}))
+                assert selected["package_policy"] == policy
+                gate(needs_for(selected), policy=policy)
+                opposite = "standard" if policy == "linux-native" else "linux-native"
+                expect_failure(lambda: gate(needs_for(selected), policy=opposite))
+                other = dict(make_plan([], "workflow_dispatch", package_policy=opposite), **metadata)
+                other.update({key: selected[key] for key in ("coverage_base", "coverage_head", "coverage_reason", "baseline_run_id")})
+                expect_failure(lambda: gate(needs_for(other), policy=policy))
+                for key in ("package_policy", "package_matrix", "npm", "required_jobs", "check_msrv", "test_tiers", "delivery"):
+                    wrong = other[key] if other[key] != selected[key] else ([] if isinstance(selected[key], list) else not selected[key])
+                    changed = dict(selected, **{key: wrong})
+                    expect_failure(lambda: gate(needs_for(changed), policy=policy))
+                for invalid in (0, 1, None, True, "native"):
+                    expect_failure(lambda: gate(needs_for(dict(selected, package_policy=invalid)), policy=policy))
+                output, summary = directory / f"output-{policy}", directory / f"summary-{policy}"
+                with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                    write_plan(selected, output)
+                outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                assert outputs["source_sha"] == head and json.loads(outputs["plan"]) == selected
+                assert f"Package policy: {policy}" in summary.read_text()
+            # Caller inputs cannot select or weaken the internal reusable policy.
+            for inputs in ({"package_policy": "linux-native"}, {"delivery_live": True}, {"desktop": True}, {"delivery_small": True}, {"windows_only": True}, {"desktop_only": True}, {"mobile_apps": "both"}):
+                event_file.write_text(json.dumps({"inputs": inputs}))
+                arguments.package_policy = "standard"
                 selected = event_plan(arguments)
-                assert selected["delivery_live"] is expected
-                if expected:
-                    gate(needs_for(selected), delivery_live=True)
-                else:
-                    expect_failure(lambda: gate(needs_for(selected), delivery_live=True))
-            event_file.write_text(json.dumps({"inputs": {"delivery_live": "yes"}}))
+                assert selected["package_policy"] == "standard" and selected["npm"]
+                gate(needs_for(selected))
+            arguments.package_policy = "invalid"
             expect_failure(lambda: event_plan(arguments))
-    print("Native-only CI controls passed; actual event, plan and gate agree; ordinary platforms, selector precedence and rejection cases covered")
+    print("Core package policies passed; frozen scope, explicit policy and tampering rejection agree")
 
 
 def coverage_self_test(directory, base, nonancestor):
@@ -1298,10 +1446,10 @@ def main():
     plan.add_argument("--head")
     plan.add_argument("--event", choices=("pull_request", "push", "schedule", "workflow_dispatch", "merge_group"))
     plan.add_argument("--github-output")
+    plan.add_argument("--package-policy-env", help="internal standard or linux-native policy environment variable")
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)
-    final_gate.add_argument("--delivery-live", action="store_true", help="also require the explicitly dispatched live proof job")
-    final_gate.add_argument("--desktop", action="store_true", help="also require the explicitly dispatched Windows native and desktop jobs")
+    final_gate.add_argument("--package-policy-env", help="independently validate the internal package policy")
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
@@ -1321,11 +1469,12 @@ def main():
         with patch.dict(os.environ, {key: value for key, value in os.environ.items() if not key.startswith("GITHUB_") and key != "GH_TOKEN"}, clear=True):
             self_test()
     elif args.command == "plan":
+        args.package_policy = os.environ[args.package_policy_env] if args.package_policy_env else "standard"
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
-        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live,
-             desktop=args.desktop)
+        gate(needs, json.loads(args.plan.read_text()) if args.plan else None,
+             policy=os.environ[args.package_policy_env] if args.package_policy_env else "standard")
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":

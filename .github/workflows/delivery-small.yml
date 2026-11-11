@@ -1,0 +1,123 @@
+name: Delivery / Small proof
+run-name: >-
+  Small proof · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ inputs.prepare_only && 'prepare only' || 'prove and settle' }} · resume ${{ inputs.resume_run || 'none' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_only:
+        description: Prepare and execute controls without proofs or settlement
+        type: boolean
+        default: false
+      resume_run:
+        description: Explicit same-source Small proof run ID with verified public parts
+        type: string
+        default: ''
+
+concurrency:
+  group: ci-delivery-small
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  delivery-small-prepare:
+    name: Prepare bounded experiment
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.run.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Rebuild the canonical profile and verify two actual fixture replays
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.resume_run }}
+        run: |
+          args=(--sandbox --prove-small prepare)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve validated public preparation evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-prepare-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-proofs:
+    name: Prove or verify saved relation (${{ matrix.item }})
+    needs: delivery-small-prepare
+    if: github.event_name == 'workflow_dispatch' && !inputs.prepare_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.delivery-small-prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prove the selected relation or independently verify its saved part
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK_ITEM: ${{ matrix.item }}
+          RESUME_RUN: ${{ inputs.resume_run }}
+        run: |
+          args=(--sandbox --prove-small "$WORK_ITEM")
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified public part or unqualified diagnostic
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-${{ matrix.item }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-accept:
+    name: Accept four qualified parts and settlement
+    needs: [delivery-small-prepare, delivery-small-proofs]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && !inputs.prepare_only && needs.delivery-small-prepare.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require all four qualified parts before the original money and recovery checks
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.resume_run }}
+        run: |
+          args=(--sandbox --prove-small accept)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified final public evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-accept-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
