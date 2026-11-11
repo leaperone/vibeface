@@ -63,7 +63,7 @@ function Triage() {
     </View></Field>
     <View className="flex-row flex-wrap items-center gap-2">
       <Button variant="outline" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
-        onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
+        onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then((result) => { if (result !== null) setSecret((current) => current === secret ? '' : current) })}>
         {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
       </Button>
       <Button variant="ghost" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {

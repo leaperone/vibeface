@@ -70,6 +70,8 @@ export type Platform = {
   erase?(): Promise<void>
   page?: LocalPage
   joinTabs?: JoinTabs
+  /** Serializes local input persistence across tabs independently of network delivery. */
+  inputLock?<T>(name: string, save: () => Promise<T>): Promise<T>
   /** The app's: a browser cannot reach Nodes on its LAN directly. */
   lan?: Lan
 }

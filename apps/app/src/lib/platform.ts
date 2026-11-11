@@ -91,6 +91,7 @@ const browserPlatform: Platform = {
   transport: createTransport(secure, browserKeys),
   storage: { getItem: key => typeof localStorage === 'undefined' ? null : localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
   outbox: indexedOutbox(),
+  inputLock: (name, save) => globalThis.navigator?.locks ? navigator.locks.request(`vibeface-input:${name}`, save) : save(),
   notifier,
   onForeground(listener) {
     const visible = () => { if (!document.hidden) listener() }

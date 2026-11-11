@@ -173,6 +173,43 @@ test('creates a persistent Bot without a model and shows triage budget state', a
   await expect(triage).toContainText('待审阅 0 · 审阅中 0 · 待确认 0');
   await expect(triage).not.toContainText('分诊暂停');
 
+  const webhookSecret = screen.getByLabel(/^密钥/);
+  const saveWebhook = screen.getByRole('button', '保存', { exact: true });
+  await webhookSecret.fill(secrets.get('webhookSecret'));
+  await browser.evaluate(() => {
+    const send = WebSocket.prototype.send;
+    const pending: { socket: WebSocket; data: Parameters<WebSocket['send']>[0] }[] = [];
+    window.addEventListener('release-webhook-save', () => {
+      WebSocket.prototype.send = send;
+      for (const { socket, data } of pending) send.call(socket, data);
+      document.documentElement.removeAttribute('data-webhook-save-held');
+    }, { once: true });
+    WebSocket.prototype.send = function (this: WebSocket, data) {
+      const copy = typeof data === 'string' || data instanceof Blob ? data
+        : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice() : new Uint8Array(data).slice();
+      pending.push({ socket: this, data: copy });
+      document.documentElement.setAttribute('data-webhook-save-held', 'true');
+    };
+    return true;
+  });
+  try {
+    await saveWebhook.click();
+    await expect(saveWebhook).toBeDisabled();
+    await expect(browser.locator('html')).toHaveAttribute('data-webhook-save-held', 'true');
+    await webhookSecret.fill(secrets.get('nextWebhookSecret'));
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+    const clearWebhook = screen.getByRole('button', '清除密钥', { exact: true });
+    await expect(clearWebhook).toBeVisible();
+    await expect(clearWebhook).toBeEnabled();
+    await expect(saveWebhook).toBeEnabled();
+    await app.screenshot('webhook-newer-draft-preserved');
+    await saveWebhook.click();
+    await expect(clearWebhook).toBeEnabled();
+    await expect(saveWebhook).toBeDisabled();
+  } finally {
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+  }
+
   const database = new DatabaseSync(join(node.directory, 'node.sqlite3'));
   try {
     const network = database.prepare('SELECT network_id FROM networks').get();

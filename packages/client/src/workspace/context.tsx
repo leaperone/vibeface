@@ -53,6 +53,7 @@ class WorkspaceCommandNotSavedError extends Error {
 
 function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
   const { notifier } = platform
+  const inputLock: NonNullable<Platform["inputLock"]> = platform.inputLock ?? ((_name, save) => save())
   const { readStorage, writeStorage } = storageOf(platform.storage)
   const networkId = connection.principal.network_id
   const clientId = connection.principal.device_id
@@ -866,7 +867,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const saves = messageSaves.current
     const previous = saves.get(lane) ?? Promise.resolve()
     localMessageSaves.current += 1; setMessageBusy(true)
-    const save = previous.catch(() => {}).then(async () => {
+    const save = inputLock(outboxKey('input-save', lane), () => previous.catch(() => {}).then(async () => {
       const uploads = await Promise.all(files.map(prepareAttachment))
       if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
       let prerequisite: OutboxItem | undefined
@@ -885,15 +886,18 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
           ?? [...messagesRef.current].reverse().find((item) => inputTargetKey(item.target) === key)?.expected_revision
       }
       if ('task_id' in target && revision === undefined) throw new Error('任务版本尚未读取，先查询任务。')
-      const sequenceKey = scoped('input-sequences'), sequences = record(readStorage<unknown>(sequenceKey, {}, true)), key = messageLane({ target, conversation_id: id })
-      const prior = sequences[key]
-      if (prior !== undefined && (typeof prior !== 'number' || !Number.isSafeInteger(prior) || prior < 0)) throw new Error('本地输入顺序损坏，已暂停发送。')
-      const sequence = (typeof prior === 'number' ? prior : 0) + 1
-      const prepared = prepareSend({ conversationId: id, text, target, sequence, intent: options?.intent ?? 'continue', expected_revision: revision, reportResults: true, files: files.length + sent.length > 0 })
-      if (!prepared.ok) throw new Error(prepared.error)
       const attachments = signedOrder([...sent, ...uploads.map(({ data: _, ...file }) => file)])
+      const sequenceKey = scoped('input-sequences')
+      const prepared = await inputLock(sequenceKey, async () => {
+        const sequences = record(readStorage<unknown>(sequenceKey, {}, true)), prior = sequences[lane]
+        if (prior !== undefined && (typeof prior !== 'number' || !Number.isSafeInteger(prior) || prior < 0)) throw new Error('本地输入顺序损坏，已暂停发送。')
+        const sequence = (typeof prior === 'number' ? prior : 0) + 1
+        const prepared = prepareSend({ conversationId: id, text, target, sequence, intent: options?.intent ?? 'continue', expected_revision: revision, reportResults: true, files: files.length + sent.length > 0 })
+        if (!prepared.ok) throw new Error(prepared.error)
+        writeStorage(sequenceKey, { ...sequences, [lane]: sequence }, true)
+        return prepared
+      })
       const body = { ...prepared.body, ...(attachments.length ? { attachments } : {}) }
-      writeStorage(sequenceKey, { ...sequences, [key]: sequence }, true)
       const attestation = await attest(id, inputEventBody(body))
       if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
       const queued = await enqueue(outbox, { key: outboxKey('message', body.message_id), method: 'message', params: { ...body, attestation }, created_at_ms: prepared.pending.created_at_ms, uploads, delivery: 'saved', ...(prerequisite ? { prerequisite } : {}) })
@@ -902,7 +906,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       try { options?.onSaved?.(parsePendingMessage(queued)) }
       catch (caught) { showError(caught, '更新已保存输入的目标') }
       flushMessages()
-    })
+    }))
     saves.set(lane, save)
     try { await save; return true }
     finally {
