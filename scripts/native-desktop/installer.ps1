@@ -14,11 +14,11 @@ $evidenceRoot = [System.IO.Path]::GetFullPath($Output)
 $artifactPrefix = [System.IO.Path]::GetFullPath((Join-Path $PWD '.artifacts')) + [System.IO.Path]::DirectorySeparatorChar
 if (-not $evidenceRoot.StartsWith($artifactPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Installer diagnostics must remain below this task workspace artifacts' }
 New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
-function Save-InitialInstallerEvidence([string]$Phase, $ExitCode, $HasExited) {
-  $rootExists = Test-Path -LiteralPath $destination
+function Save-InitialInstallerEvidence([string]$Phase, $ExitCode, $HasExited, [string]$InstallRoot = $destination) {
+  $rootExists = Test-Path -LiteralPath $InstallRoot
   $attributes = $null
-  if ($rootExists) { $attributes = (Get-Item -Force -LiteralPath $destination).Attributes.ToString() }
-  $marker = Join-Path $destination '.vibeface-install-owned'
+  if ($rootExists) { $attributes = (Get-Item -Force -LiteralPath $InstallRoot).Attributes.ToString() }
+  $marker = Join-Path $InstallRoot '.vibeface-install-owned'
   $markerExists = Test-Path -LiteralPath $marker
   $markerFormat = 'absent'
   $markerRootMatches = $false
@@ -26,7 +26,7 @@ function Save-InitialInstallerEvidence([string]$Phase, $ExitCode, $HasExited) {
     if ((Get-Item -Force -LiteralPath $marker).Length -le 4096) {
       $lines = [System.IO.File]::ReadAllLines($marker, [System.Text.Encoding]::Unicode)
       $markerFormat = if ($lines.Length -ge 1 -and $lines[0] -eq 'vibeface-native-install-v2') { 'v2' } else { 'unrecognized' }
-      $markerRootMatches = $lines.Length -eq 2 -and $lines[1] -eq $destination
+      $markerRootMatches = $lines.Length -eq 2 -and $lines[1] -eq $InstallRoot
     } else { $markerFormat = 'oversized' }
   }
   $registered = Test-Path $registration
@@ -34,28 +34,111 @@ function Save-InitialInstallerEvidence([string]$Phase, $ExitCode, $HasExited) {
   $matchesUninstaller = $false
   if ($registered) {
     $state = Get-ItemProperty $registration
-    $matchesRoot = $state.InstallLocation -eq $destination
-    $matchesUninstaller = $state.UninstallString -eq ('"' + (Join-Path $destination 'Uninstall.exe') + '"')
+    $matchesRoot = $state.InstallLocation -eq $InstallRoot
+    $matchesUninstaller = $state.UninstallString -eq ('"' + (Join-Path $InstallRoot 'Uninstall.exe') + '"')
   }
   $evidence = [ordered]@{
     phase = $Phase
     exit_code = $ExitCode
     has_exited = $HasExited
-    task_install_root = $destination
+    task_install_root = $InstallRoot
     root_exists = $rootExists
     root_attributes = $attributes
     marker_exists = $markerExists
     marker_format = $markerFormat
     marker_root_matches = $markerRootMatches
-    executable_exists = Test-Path -LiteralPath (Join-Path $destination 'Vibeface.exe')
-    manifest_exists = Test-Path -LiteralPath (Join-Path $destination '.vibeface-installed-files.json')
-    uninstaller_exists = Test-Path -LiteralPath (Join-Path $destination 'Uninstall.exe')
+    executable_exists = Test-Path -LiteralPath (Join-Path $InstallRoot 'Vibeface.exe')
+    manifest_exists = Test-Path -LiteralPath (Join-Path $InstallRoot '.vibeface-installed-files.json')
+    uninstaller_exists = Test-Path -LiteralPath (Join-Path $InstallRoot 'Uninstall.exe')
     registration_exists = $registered
     registration_root_matches = $matchesRoot
     registration_uninstaller_matches = $matchesUninstaller
   }
   $evidence | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidenceRoot ($Phase + '.json')) -Encoding utf8
 }
+function Assert-DiagnosticOwnedPath([string]$Root, [string]$Relative) {
+  $Root = [System.IO.Path]::GetFullPath($Root)
+  if ($Relative -notmatch '^[a-zA-Z0-9._/-]+$' -or @($Relative.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' }).Count) { throw 'Unsafe diagnostic cleanup path' }
+  $full = [System.IO.Path]::GetFullPath((Join-Path $Root $Relative))
+  $prefix = [System.IO.Path]::GetFullPath($Root) + [System.IO.Path]::DirectorySeparatorChar
+  if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Diagnostic cleanup escaped its fresh installation' }
+  $current = $full
+  while ($current.Length -ge $Root.Length) {
+    if (Test-Path -LiteralPath $current) {
+      if ((Get-Item -Force -LiteralPath $current).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'Diagnostic cleanup refuses reparse points' }
+    }
+    if ($current -eq $Root) { break }
+    $current = Split-Path $current
+  }
+  return $full
+}
+function Remove-DiagnosticInstallation([string]$Root, $Manifest) {
+  # Root was absent before this task's diagnostic process. Use only the verified
+  # portable payload list, never a manifest read from a partially written installation.
+  foreach ($relative in @($Manifest.files) + @('Uninstall.exe', '.vibeface-install-owned')) {
+    $file = Assert-DiagnosticOwnedPath $Root $relative
+    if (Test-Path -LiteralPath $file) {
+      if ((Get-Item -Force -LiteralPath $file).PSIsContainer) { throw 'Diagnostic payload path unexpectedly became a directory' }
+      Remove-Item -Force -LiteralPath $file
+    }
+  }
+  foreach ($relative in $Manifest.directories) {
+    $directory = Assert-DiagnosticOwnedPath $Root $relative
+    if (Test-Path -LiteralPath $directory) {
+      try { [System.IO.Directory]::Delete($directory) }
+      catch [System.IO.IOException] { if (($_.Exception.HResult -band 0xffff) -ne 145) { throw } }
+    }
+  }
+  if (Test-Path $registration) {
+    $state = Get-ItemProperty $registration
+    if ($state.InstallLocation -ne $Root -or $state.UninstallString -ne ('"' + (Join-Path $Root 'Uninstall.exe') + '"')) { throw 'Diagnostic cleanup cannot change another installation registration' }
+    if (@(Get-ChildItem -LiteralPath $registration).Count) { throw 'Diagnostic registration has unknown children; refusing recursive cleanup' }
+    Remove-Item -LiteralPath $registration -Confirm:$false
+  }
+  $protocol = 'HKCU:\Software\Classes\vibeface'
+  if (Test-Path ($protocol + '\shell\open\command')) {
+    if ((Get-ItemProperty ($protocol + '\shell\open\command')).'(default)' -eq ('"' + (Join-Path $Root 'Vibeface.exe') + '" "%1"')) {
+      foreach ($key in @('shell\open\command','shell\open','shell','')) {
+        $ownedKey = Join-Path $protocol $key
+        if (@(Get-ChildItem -LiteralPath $ownedKey).Count) { throw 'Diagnostic protocol has unknown children; refusing recursive cleanup' }
+        Remove-Item -LiteralPath $ownedKey -Confirm:$false
+      }
+    }
+  }
+  $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Vibeface.lnk'
+  if (Test-Path -LiteralPath $shortcut) {
+    $shell = New-Object -ComObject WScript.Shell
+    if ($shell.CreateShortcut($shortcut).TargetPath -eq (Join-Path $Root 'Vibeface.exe')) { Remove-Item -LiteralPath $shortcut }
+  }
+  if (Test-Path -LiteralPath $Root) {
+    try { [System.IO.Directory]::Delete($Root) }
+    catch [System.IO.IOException] { if (($_.Exception.HResult -band 0xffff) -ne 145) { throw } }
+  }
+}
+function Invoke-InitialInstallerDiagnostic {
+  if ((Test-Path -LiteralPath $destination) -or (Test-Path $registration)) {
+    @{phase='diagnostic-skipped'; reason='primary-left-state'} | ConvertTo-Json | Set-Content (Join-Path $evidenceRoot 'diagnostic-skipped.json') -Encoding utf8
+    return
+  }
+  $fixture = Join-Path $env:RUNNER_TEMP ('Vibeface diagnostic build ' + [guid]::NewGuid().ToString('N'))
+  node scripts/build-desktop.mjs --windows-installer-diagnostic (Split-Path $PortableApp) $fixture
+  if ($LASTEXITCODE -ne 0) { throw 'Could not compile the task-only diagnostic installer' }
+  $diagnosticRoot = Join-Path $env:RUNNER_TEMP ('Vibeface diagnostic 安装 ' + [guid]::NewGuid().ToString('N'))
+  if (Test-Path -LiteralPath $diagnosticRoot) { throw 'Diagnostic destination must not exist' }
+  $trustedManifest = Get-Content -Raw (Join-Path (Split-Path $PortableApp) '.vibeface-installed-files.json') | ConvertFrom-Json
+  if ($trustedManifest.schema -ne 1 -or $trustedManifest.app -ne 'vibeface-native-desktop') { throw 'Verified portable payload has no supported ownership list' }
+  $diagnosticExit = $null
+  try {
+    Save-InitialInstallerEvidence 'diagnostic-before-start' $null $null $diagnosticRoot
+    $process = Start-Process -FilePath (Join-Path $fixture 'diagnostic-fixture.exe') -ArgumentList ('/S /D=' + $diagnosticRoot) -Wait -PassThru -RedirectStandardOutput (Join-Path $evidenceRoot 'diagnostic-stdout.utf16.log') -RedirectStandardError (Join-Path $evidenceRoot 'diagnostic-stderr.log')
+    $diagnosticExit = $process.ExitCode
+    Save-InitialInstallerEvidence 'diagnostic-after-exit' $process.ExitCode $process.HasExited $diagnosticRoot
+  } finally {
+    try { Remove-DiagnosticInstallation $diagnosticRoot $trustedManifest }
+    finally { Save-InitialInstallerEvidence 'diagnostic-after-cleanup' $diagnosticExit $true $diagnosticRoot }
+  }
+}
+
 $unowned = Join-Path $env:RUNNER_TEMP ('Vibeface unowned ' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $unowned | Out-Null
 $beforeSentinel = Join-Path $unowned 'user-before.txt'
@@ -80,7 +163,12 @@ try {
     throw
   }
   Save-InitialInstallerEvidence 'initial-after-exit' $process.ExitCode $process.HasExited
-  if ($process.ExitCode -ne 0) { throw "The per-user installer failed with exit code $($process.ExitCode); task evidence: initial-after-exit.json" }
+  if ($process.ExitCode -ne 0) {
+    $primaryExit = $process.ExitCode
+    try { Invoke-InitialInstallerDiagnostic }
+    catch { @{phase='diagnostic-error'; error_type=$_.Exception.GetType().Name; message=$_.Exception.Message.Substring(0, [Math]::Min(1024,$_.Exception.Message.Length))} | ConvertTo-Json | Set-Content (Join-Path $evidenceRoot 'diagnostic-error.json') -Encoding utf8 }
+    throw "The primary per-user installer failed with exit code $primaryExit; task evidence: initial-after-exit.json and diagnostic-*.json/log"
+  }
   $installed = $true
   $manifest = Get-Content -Raw (Join-Path $destination '.vibeface-installed-files.json') | ConvertFrom-Json
   if ($manifest.schema -ne 1 -or $manifest.app -ne 'vibeface-native-desktop' -or $manifest.files.Count -lt 2) { throw 'Installed ownership manifest is invalid' }

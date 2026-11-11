@@ -1,0 +1,71 @@
+name: Native Windows installer diagnostic
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Completed manual ci.yml run containing the verified Windows package inputs
+        type: string
+        required: true
+      source_sha:
+        description: Exact 40-character source SHA of that run
+        type: string
+        required: true
+      source_attempt:
+        description: Exact source run attempt
+        type: string
+        default: '1'
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.12'}
+      - name: Validate and retrieve only the selected CI installer inputs
+        id: inputs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+        run: |
+          python -B scripts/native-desktop/diagnostic-inputs.py --source-run $env:SOURCE_RUN --source-sha $env:SOURCE_SHA --source-attempt $env:SOURCE_ATTEMPT --output .artifacts/installer-diagnostic-inputs --evidence .artifacts/native-installer-diagnostic/verified-inputs.json
+      - name: Locate the existing hosted installer compiler
+        shell: pwsh
+        run: |
+          $compiler = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (-not (Test-Path $compiler)) { choco install nsis --version=3.11 --yes --no-progress }
+          if (-not (Test-Path $compiler)) { throw 'No hosted NSIS compiler is available' }
+          "MAKENSIS=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install the locked existing deterministic runner without lifecycle downloads
+        shell: pwsh
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter vibeface-monorepo
+      - name: Execute the current guarded installer fixture against verified existing bytes
+        shell: pwsh
+        env:
+          INSTALLER: ${{ steps.inputs.outputs.installer }}
+          RUNTIME: ${{ steps.inputs.outputs.runtime }}
+          PORTABLE_APP: ${{ steps.inputs.outputs.portable_app }}
+          E2E_TELEMETRY_DISABLED: '1'
+        run: ./scripts/native-desktop/installer.ps1 -Installer $env:INSTALLER -Runtime $env:RUNTIME -PortableApp $env:PORTABLE_APP -Output "$PWD/.artifacts/native-installer-diagnostic"
+      - name: Keep only bounded task diagnostic records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-installer-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/native-installer-diagnostic/*.json
+            .artifacts/native-installer-diagnostic/*.log
+          if-no-files-found: warn
+          retention-days: 7

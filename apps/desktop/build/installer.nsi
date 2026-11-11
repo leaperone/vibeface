@@ -28,6 +28,24 @@ Var PlanPath
 Var PlanSegment
 Var PlanCount
 
+!ifdef INSTALLER_DIAGNOSTICS
+Var InstallerDiagnosticStage
+Var InstallerDiagnosticCount
+Var InstallerDiagnosticCheckStage
+!endif
+!macro DiagnosticStage VALUE
+!ifdef INSTALLER_DIAGNOSTICS
+  StrCpy $InstallerDiagnosticStage "${VALUE}"
+!endif
+!macroend
+
+!macro DiagnosticVacancy PATH
+!ifdef INSTALLER_DIAGNOSTICS
+  Push "VACANCY|path=${PATH}$\r$\n"
+  Call DiagnosticRecord
+!endif
+!macroend
+
 !macro CheckPath PREFIX PATH KIND
   Push "${PATH}"
   Push "${KIND}"
@@ -36,8 +54,32 @@ Var PlanCount
 !include "${FILE_MANIFEST}"
 
 !macro SafetyFunctions PREFIX
+!ifdef INSTALLER_DIAGNOSTICS
+Function ${PREFIX}DiagnosticRecord
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  IntCmp $InstallerDiagnosticCount 16 diagnostic_record_done diagnostic_record_write diagnostic_record_done
+diagnostic_record_write:
+  IntOp $InstallerDiagnosticCount $InstallerDiagnosticCount + 1
+  StrLen $1 $0
+  IntOp $1 $1 * 2
+  System::Call 'kernel32::GetStdHandle(i -11) p.r2'
+  System::Call 'kernel32::WriteFile(p r2, w r0, i r1, *i .r3, p 0)'
+diagnostic_record_done:
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+!endif
 Function ${PREFIX}Refuse
   Exch $0
+!ifdef INSTALLER_DIAGNOSTICS
+  Push "REFUSE|stage=$InstallerDiagnosticStage|message=$0|target=$INSTDIR$\r$\n"
+  Call ${PREFIX}DiagnosticRecord
+!endif
   MessageBox MB_OK|MB_ICONSTOP "$0" /SD IDOK
   Pop $0
   SetErrorLevel 1603
@@ -54,6 +96,9 @@ Function ${PREFIX}CheckPath
   Push $3
   Push $4
   Push $5
+!ifdef INSTALLER_DIAGNOSTICS
+  StrCpy $InstallerDiagnosticCheckStage "$InstallerDiagnosticStage"
+!endif
   StrCpy $3 1
 path_loop:
   ; System's e option captures the API error before plugin marshalling can change it.
@@ -62,6 +107,7 @@ path_loop:
   IntCmp $2 -1 path_missing
   IntOp $4 $2 & 0x400
   IntCmp $4 0 path_kind
+  !insertmacro DiagnosticStage "check-path.reparse"
   Push "Reparse points are not allowed in the installation path. The operation was stopped."
   Goto path_failed
 path_kind:
@@ -75,6 +121,7 @@ path_missing:
   IntCmp $5 2 path_parent
   IntCmp $5 3 path_parent
 path_invalid:
+  !insertmacro DiagnosticStage "check-path.type-or-error"
   Push "The installation path is inaccessible or conflicts with a package path. The operation was stopped."
   Goto path_failed
 path_parent:
@@ -94,6 +141,10 @@ path_done:
   Pop $1
   Return
 path_failed:
+!ifdef INSTALLER_DIAGNOSTICS
+  Push "CHECKPATH|stage=$InstallerDiagnosticCheckStage|path=$0|kind=$1|attributes=$2|saved_error=$5$\r$\n"
+  Call ${PREFIX}DiagnosticRecord
+!endif
   ; Keep the error message while restoring the six saved caller registers.
   Exch 6
   Pop $1
@@ -134,16 +185,20 @@ FunctionEnd
 !insertmacro SafetyFunctions "un."
 
 Function ValidateInstallRoot
+  !insertmacro DiagnosticStage "validate-root.full-path"
   GetFullPathName $INSTDIR "$INSTDIR"
   StrCpy $0 $INSTDIR 2
   StrCmp $0 "\\" invalid_root
   ${GetParent} "$INSTDIR" $0
   StrCmp $0 "" invalid_root
+  !insertmacro DiagnosticStage "validate-root.path"
   !insertmacro CheckPath "" "$INSTDIR" "dir"
+  !insertmacro DiagnosticStage "validate-root.registration"
   ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "InstallLocation"
   StrCmp $0 "" check_directory
   StrCmp $0 "$INSTDIR" check_directory invalid_root
 check_directory:
+  !insertmacro DiagnosticStage "validate-root.marker-or-enumeration"
   IfFileExists "$INSTDIR\.vibeface-install-owned" owned_directory
   ClearErrors
   FindFirst $0 $1 "$INSTDIR\*"
@@ -153,6 +208,7 @@ find_next:
   StrCmp $1 "." find_continue
   StrCmp $1 ".." find_continue
   FindClose $0
+  !insertmacro DiagnosticStage "validate-root.nonempty-unowned"
   Goto invalid_root
 find_continue:
   FindNext $0 $1
@@ -160,9 +216,11 @@ find_continue:
 find_empty:
   FindClose $0
 directory_empty:
+  !insertmacro DiagnosticStage "validate-root.empty-payload-paths"
   !insertmacro ValidateOwnedPaths ""
   Return
 owned_directory:
+  !insertmacro DiagnosticStage "validate-root.owned"
   Call RequireOwnedRoot
   !insertmacro ValidateOwnedPaths ""
   Return
@@ -326,18 +384,24 @@ upgrade_failed:
 upgrade_checked:
   Call RequireOwnedRoot
 install_payload:
+  !insertmacro DiagnosticStage "install-payload.path-guards"
   !insertmacro ValidateOwnedPaths ""
+  !insertmacro DiagnosticStage "install-payload.new-path-vacancy"
   !insertmacro AssertNewPayloadVacant
+  !insertmacro DiagnosticStage "install-payload.copy"
   SetOutPath "$INSTDIR"
   ClearErrors
   File /r "${APP_DIR}\*"
   IfErrors copy_failed
+  !insertmacro DiagnosticStage "install-payload.uninstaller"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   IfErrors copy_failed
+  !insertmacro DiagnosticStage "install-payload.marker"
   FileOpen $0 "$INSTDIR\.vibeface-install-owned" w
   IfErrors copy_failed
   FileWriteUTF16LE $0 "vibeface-native-install-v2$\r$\n$INSTDIR$\r$\n"
   FileClose $0
+  !insertmacro DiagnosticStage "install-payload.registration"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "DisplayName" "Vibeface"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Vibeface" "DisplayVersion" "${VERSION}"
@@ -351,6 +415,10 @@ copy_failed:
   Push "Installation could not write all owned files. User files have not been removed."
   Call Refuse
 install_done:
+!ifdef INSTALLER_DIAGNOSTICS
+  Push "RESULT|stage=install-complete|target=$INSTDIR$\r$\n"
+  Call DiagnosticRecord
+!endif
 SectionEnd
 
 Section "Uninstall"

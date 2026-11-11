@@ -153,7 +153,7 @@ function windowsInstallerManifest(application, includeFile, planFile = `${includ
     ...folders.map(name => check('${PREFIX}', name, 'dir')),
     ...files.map(name => check('${PREFIX}', name, 'file')), '!macroend',
     '!macro AssertNewPayloadVacant',
-    ...files.flatMap((name, index) => [`  IfFileExists "$INSTDIR\\${windowsPath(name)}" 0 vacant_${index}`, '  Push "A new package file conflicts with an unowned file. Nothing will be overwritten."', '  Call Refuse', `vacant_${index}:`]), '!macroend',
+    ...files.flatMap((name, index) => [`  IfFileExists "$INSTDIR\\${windowsPath(name)}" 0 vacant_${index}`, `  !insertmacro DiagnosticVacancy "$INSTDIR\\${windowsPath(name)}"`, '  Push "A new package file conflicts with an unowned file. Nothing will be overwritten."', '  Call Refuse', `vacant_${index}:`]), '!macroend',
     '!macro DeleteOwnedPayload',
     ...files.flatMap((name, index) => [check('un.', name, 'file'), `  IfFileExists "$INSTDIR\\${windowsPath(name)}" 0 removed_${index}`, '  ClearErrors', `  Delete "$INSTDIR\\${windowsPath(name)}"`, `  IfErrors 0 removed_${index}`, '  Push "An owned program file could not be removed. Close Vibeface and retry."', '  Call un.Refuse', `removed_${index}:`]), '!macroend',
     '!macro RemoveOwnedDirectories',
@@ -163,7 +163,7 @@ function windowsInstallerManifest(application, includeFile, planFile = `${includ
   return { files, directories: folders, include: output, plan };
 }
 
-function buildWindowsUpgradeFixture(portableDirectory, outputDirectory) {
+function buildWindowsInstallerFixture(portableDirectory, outputDirectory, diagnostic = false) {
   assert.equal(process.platform, 'win32', 'installer fixtures are built on the existing hosted Windows runner');
   assert(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted', 'installer fixture builds are limited to disposable hosted accounts');
   const temporaryRoot = path.resolve(process.env.RUNNER_TEMP);
@@ -174,14 +174,19 @@ function buildWindowsUpgradeFixture(portableDirectory, outputDirectory) {
   const payload = path.join(outputDirectory, 'payload');
   fs.cpSync(portableDirectory, payload, { recursive: true });
   fs.rmSync(path.join(payload, '.vibeface-installed-files.json'));
-  const collision = path.join(payload, 'resources', 'upgrade-new-file.txt');
-  assert(!fs.existsSync(collision), 'upgrade fixture path must be new to the old payload');
-  fs.writeFileSync(collision, 'new-package-payload');
+  if (!diagnostic) {
+    const collision = path.join(payload, 'resources', 'upgrade-new-file.txt');
+    assert(!fs.existsSync(collision), 'upgrade fixture path must be new to the old payload');
+    fs.writeFileSync(collision, 'new-package-payload');
+  }
   const include = path.join(outputDirectory, 'installer-files.nsh');
   const plan = path.join(outputDirectory, 'installer-paths.txt');
   windowsInstallerManifest(payload, include, plan);
+  const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
+  assert.equal(sourceInfo.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
+  assert(typeof sourceInfo.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:nightly\.[0-9]{8}\.[1-9][0-9]*|rc\.[1-9][0-9]*))?$/.test(sourceInfo.version), 'invalid source runtime version');
   run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
-    [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${path.join(outputDirectory, 'upgrade-fixture.exe')}`, `/DVERSION=${productVersion()}`, path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+    [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${path.join(outputDirectory, diagnostic ? 'diagnostic-fixture.exe' : 'upgrade-fixture.exe')}`, `/DVERSION=${sourceInfo.version}`, ...(diagnostic ? ['/DINSTALLER_DIAGNOSTICS'] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
 }
 
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
@@ -431,7 +436,9 @@ function selfTest() {
     if (args.length === 1 && args[0] === '--self-test') {
       selfTest();
     } else if (args.length === 3 && args[0] === '--windows-upgrade-fixture') {
-      buildWindowsUpgradeFixture(path.resolve(args[1]), path.resolve(args[2]));
+      buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]));
+    } else if (args.length === 3 && args[0] === '--windows-installer-diagnostic') {
+      buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]), true);
     } else {
       const options = new Map();
       let sign = false;
