@@ -99,6 +99,11 @@ test('native workspace routes preserve Task input, queue controls and directed C
     }
     return reachable;
   }, { timeout: 5000 }).toBe(true);
+  await writeFile(resolve(artifacts, 'settings-link-bounds.json'), `${JSON.stringify({
+    row: await externalChat.boundingBox(), area: await settingsScroll.boundingBox(),
+    header: await screen.getByTestId('设置', { visible: true }).boundingBox(),
+    tab: await screen.getByLabel('设置', { exact: true }).boundingBox(),
+  })}\n`, { mode: 0o600 });
   await externalChat.click();
   await expect(screen.getByTestId('外部聊天', { visible: true })).toBeVisible();
   const webhookUrl = screen.getByLabel('外部聊天地址', { exact: true });
