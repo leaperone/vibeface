@@ -2533,19 +2533,23 @@ mod tests {
                 .contains("authorization")
         );
         fixture.delivery.configure_local(settings)?;
+        assert!(matches!(
+            fixture.delivery.wallet.lock().unwrap().status(),
+            WalletStatus::Locked { .. }
+        ));
+        assert!(matches!(
+            fixture.delivery.wallet.lock().unwrap().unlock(
+                &vibeface_control::maintenance::SecretString::new("nonce cleanup test password".into()),
+            )?,
+            WalletStatus::Unlocked { address } if address == fixture.claim.terms.payee
+        ));
         {
             let mut state = fixture.observation.lock().unwrap();
             state.latest = 8;
             state.pending = 8;
         }
-        assert!(
-            fixture
-                .step(true)
-                .await?
-                .1
-                .unwrap()
-                .contains("canonical nonce")
-        );
+        let nonce_risk = fixture.step(true).await?.1.unwrap();
+        assert!(nonce_risk.contains("canonical nonce"), "{nonce_risk}");
         {
             let mut state = fixture.observation.lock().unwrap();
             state.latest = 7;
