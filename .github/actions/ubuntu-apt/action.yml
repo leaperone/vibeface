@@ -1,22 +1,22 @@
-name: Probe existing Ubuntu package mirrors
-description: Verify signed release metadata on this disposable hosted runner before optionally changing mirror priorities
+name: Check hosted Ubuntu package resolver
+description: Check existing Ubuntu package DNS and optionally repair an unavailable resolver on this disposable runner
 inputs:
   apply:
-    description: Prioritize verified existing official mirrors while retaining every candidate
+    description: Repair unavailable package DNS only on the disposable hosted runner
     default: 'false'
 runs:
   using: composite
   steps:
-    - name: Probe the current runner's official Ubuntu mirrors
+    - name: Check the current runner's Ubuntu package DNS
       if: runner.os == 'Linux'
       shell: bash
       env:
-        APPLY_MIRROR_PRIORITIES: ${{ inputs.apply }}
+        REPAIR_HOSTED_DNS: ${{ inputs.apply }}
       run: |
         options=()
-        case "$APPLY_MIRROR_PRIORITIES" in
-          true) options+=(--apply) ;;
+        case "$REPAIR_HOSTED_DNS" in
+          true) options+=(--repair) ;;
           false) ;;
           *) echo 'apply must be true or false' >&2; exit 1 ;;
         esac
-        python3 -B scripts/ci-ubuntu-mirrors.py "${options[@]}"
+        python3 -B scripts/ci-ubuntu-dns.py "${options[@]}"
