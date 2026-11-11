@@ -77,7 +77,7 @@ Rounded 12–14px cards and 24–26px chat materials establish the current langu
 - **Button/Input/Text primitives:** shared Uniwind variants with accessible labels and selected/disabled states.
 - **Chat bubbles and composer:** distinct sender grouping, attachment controls, stop/send actions, and keyboard-safe layout.
 - **Home list and workspace rows:** compact identity plus state, with clear press feedback.
-- **Notification prompt:** at system font scales of 1.3 and above, wrap the actions below the explanation instead of squeezing the text between controls.
+- **Notification prompt:** wrap the action group below the explanation when the available width and text size no longer fit one row.
 - **Sheets and modals:** protected focus for target selection, recovery, and queue actions.
 - **EmptyState and ErrorText:** a concise explanation and one retry or recovery action.
 
