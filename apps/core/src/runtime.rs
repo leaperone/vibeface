@@ -1859,10 +1859,9 @@ impl Runtime {
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
             && !matches!(method, "create_conversation" | "create_bot")
+            && !snapshot
         {
-            if !snapshot {
-                self.require_scope(&access, scope).await?;
-            }
+            self.require_scope(&access, scope).await?;
         }
         match method {
             "nodes" => {

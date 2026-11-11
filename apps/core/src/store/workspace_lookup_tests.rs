@@ -92,8 +92,10 @@ fn changes(connection: &Connection) -> Result<u64> {
 #[test]
 fn lookup_winners_and_isolation_match_the_complete_graph() -> Result<()> {
     let store = Store::open(":memory:")?;
-    let mut graph = Graph::default();
-    graph.replace_lookups = true;
+    let mut graph = Graph {
+        replace_lookups: true,
+        ..Default::default()
+    };
     graph.tasks.insert("first".into(), task("first"));
     graph.tasks.insert("second".into(), task("second"));
     for (id, task, work, at) in [
@@ -145,8 +147,10 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
     let store = Store::open(":memory:")?;
     let identity = LocalIdentity::generate();
     let network = identity.fixture_network_id()?;
-    let mut graph = Graph::default();
-    graph.replace_lookups = true;
+    let mut graph = Graph {
+        replace_lookups: true,
+        ..Default::default()
+    };
     for index in 0..1000 {
         let id = format!("task-{index}");
         graph.tasks.insert(id.clone(), task(&id));
@@ -475,8 +479,10 @@ fn lookup_read_scale_preserves_graph_oracle_without_full_graph_reads() -> Result
     use std::time::Instant;
     for size in [1000, 10000, 100000] {
         let store = Store::open(":memory:")?;
-        let mut graph = Graph::default();
-        graph.replace_lookups = true;
+        let mut graph = Graph {
+            replace_lookups: true,
+            ..Default::default()
+        };
         for index in 0..size {
             let task_id = format!("task-{index}");
             let id = format!("assignment-{index}");

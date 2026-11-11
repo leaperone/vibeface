@@ -1,6 +1,7 @@
 //! Read-only scheduler pages, including the current owner's explicitly routed observations.
 use super::schedule_delivery::SchedulerProjection;
 use super::*;
+use crate::store::scheduler_history::SchedulerHistoryQuery;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use vibeface_protocol::history::{
@@ -12,19 +13,15 @@ impl SchedulerProjection {
         &self,
         store: &Store,
         network: &str,
-        conversation: &str,
-        section: HistorySection,
-        cursor: Option<&str>,
-        limit: usize,
+        query: SchedulerHistoryQuery<'_>,
         manager: &Value,
     ) -> Result<HistoryPage<Value>> {
+        let conversation = query.conversation;
+        let section = query.section;
         store.conversation_scheduler_page(
             network,
-            conversation,
             &self.local,
-            section,
-            cursor,
-            limit,
+            query,
             |store, job| {
                 if section == HistorySection::ScopeJobs {
                     self.scope_job(store, network, job)
@@ -245,19 +242,23 @@ impl Runtime {
             let jobs = projection.history_page(
                 store,
                 &query_network,
-                &query_scope,
-                HistorySection::Jobs,
-                None,
-                50,
+                SchedulerHistoryQuery {
+                    conversation: &query_scope,
+                    section: HistorySection::Jobs,
+                    cursor: None,
+                    limit: 50,
+                },
                 &manager,
             )?;
             let scopes = projection.history_page(
                 store,
                 &query_network,
-                &query_scope,
-                HistorySection::ScopeJobs,
-                None,
-                50,
+                SchedulerHistoryQuery {
+                    conversation: &query_scope,
+                    section: HistorySection::ScopeJobs,
+                    cursor: None,
+                    limit: 50,
+                },
                 &manager,
             )?;
             let conflicts =
@@ -416,10 +417,12 @@ impl Runtime {
                 serde_json::to_value(projection.history_page(
                     store,
                     &query_network,
-                    &request.conversation_id,
-                    section,
-                    cursor,
-                    request.limit,
+                    SchedulerHistoryQuery {
+                        conversation: &request.conversation_id,
+                        section,
+                        cursor,
+                        limit: request.limit,
+                    },
                     &manager,
                 )?)?
             };

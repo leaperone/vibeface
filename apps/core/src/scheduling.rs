@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use vibeface_bridge::failure::{ExecFailure, FailureKind, ProviderStage};
+pub use vibeface_protocol::workspace::TurnExecution;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -814,5 +815,3 @@ mod lane_tests {
         assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
     }
 }
-
-pub use vibeface_protocol::workspace::TurnExecution;

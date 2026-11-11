@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::scheduler_history::SchedulerHistoryQuery;
 use vibeface_protocol::history::{HISTORY_PAGE_BYTES, HISTORY_RESPONSE_BYTES};
 
 pub(super) fn paged(store: &Store, network: &str, limit: usize) -> Result<Vec<Message>> {
@@ -682,11 +683,13 @@ fn maximal_signed_work_events_measure_the_complete_history_response() -> Result<
     );
     let observations = origin.conversation_scheduler_page(
         &net.network,
-        "c",
         &net.a.device_id()?,
-        vibeface_protocol::history::HistorySection::ScopeJobs,
-        None,
-        100,
+        SchedulerHistoryQuery {
+            conversation: "c",
+            section: vibeface_protocol::history::HistorySection::ScopeJobs,
+            cursor: None,
+            limit: 100,
+        },
         |_, job| Ok(serde_json::to_value(job)?),
     )?;
     assert!(

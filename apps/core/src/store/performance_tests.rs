@@ -388,7 +388,7 @@ fn signed_history_scale() -> Result<()> {
                     let dep = previous.hash.clone();
                     let mut body: Event = serde_json::from_str(&event.canonical_body)?;
                     body.author = net.b.device_id()?;
-                    body.seq = prev_b.map(|event| seq_of(event)).transpose()?.unwrap_or(0) + 1;
+                    body.seq = prev_b.map(seq_of).transpose()?.unwrap_or(0) + 1;
                     body.prev = prev_b.map(|event| event.hash.clone());
                     body.deps = vec![dep];
                     event = net.b.sign_event(body)?;

@@ -1,5 +1,6 @@
 //! Drives the work state machine from what the providers report and read back. Every change goes
 //! through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
+use super::agent_tools::ExecutionProviderRequest;
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::work::{
@@ -389,7 +390,7 @@ impl Runtime {
                         Ok(admitted) => Ok(admitted),
                         Err(error) => match store.accepted_work(network, &request)? {
                             Some(existing) => Ok(existing),
-                            None => return Err(error),
+                            None => Err(error),
                         },
                     }
                 }
@@ -429,9 +430,11 @@ impl Runtime {
                     &settings.identity.device_id()?,
                     &settings.providers.execution,
                     settings.manager.as_ref().map(|manager| manager.provider),
-                    agent,
-                    request.thread.as_deref(),
-                    request.continues.as_deref(),
+                    ExecutionProviderRequest {
+                        agent,
+                        thread: request.thread.as_deref(),
+                        continues: request.continues.as_deref(),
+                    },
                 )?;
                 if let Some(thread) = &request.thread {
                     match Self::ran_on_from(

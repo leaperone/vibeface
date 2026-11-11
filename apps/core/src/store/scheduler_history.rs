@@ -7,6 +7,14 @@ use vibeface_protocol::history::{
     HISTORY_MAX_LIMIT, HISTORY_PAGE_BYTES, HistoryPage, HistorySection,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) struct SchedulerHistoryQuery<'a> {
+    pub conversation: &'a str,
+    pub section: HistorySection,
+    pub cursor: Option<&'a str>,
+    pub limit: usize,
+}
+
 impl Store {
     pub(crate) fn scheduler_reply_is_present(
         &self,
@@ -36,13 +44,16 @@ impl Store {
     pub(crate) fn conversation_scheduler_page(
         &self,
         network: &str,
-        conversation: &str,
         local: &str,
-        section: HistorySection,
-        cursor: Option<&str>,
-        limit: usize,
+        query: SchedulerHistoryQuery<'_>,
         mut project: impl FnMut(&Store, &SchedulerJob) -> Result<Value>,
     ) -> Result<HistoryPage<Value>> {
+        let SchedulerHistoryQuery {
+            conversation,
+            section,
+            cursor,
+            limit,
+        } = query;
         ensure!(
             (1..=HISTORY_MAX_LIMIT).contains(&limit),
             "history limit must be 1 to 100"
@@ -493,11 +504,13 @@ mod tests {
         for _ in 0..1000 {
             let page = store.conversation_scheduler_page(
                 network,
-                "c",
                 local,
-                section,
-                cursor.as_deref(),
-                limit,
+                SchedulerHistoryQuery {
+                    conversation: "c",
+                    section,
+                    cursor: cursor.as_deref(),
+                    limit,
+                },
                 |_, job| Ok(json!(job)),
             )?;
             assert!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES);
@@ -539,11 +552,13 @@ mod tests {
         assert_eq!(jobs.last().context("outbox")?["state"], "pending_delivery");
         let first = store.conversation_scheduler_page(
             &network,
-            "c",
             &local,
-            HistorySection::ScopeJobs,
-            None,
-            3,
+            SchedulerHistoryQuery {
+                conversation: "c",
+                section: HistorySection::ScopeJobs,
+                cursor: None,
+                limit: 3,
+            },
             |_, job| Ok(json!(job)),
         )?;
         let cursor = first.next_cursor.context("older jobs")?;
@@ -551,11 +566,13 @@ mod tests {
         job(&store, "appended", 999, "new")?;
         let next = store.conversation_scheduler_page(
             &network,
-            "c",
             &local,
-            HistorySection::ScopeJobs,
-            Some(&cursor),
-            3,
+            SchedulerHistoryQuery {
+                conversation: "c",
+                section: HistorySection::ScopeJobs,
+                cursor: Some(&cursor),
+                limit: 3,
+            },
             |_, job| Ok(json!(job)),
         )?;
         assert!(
@@ -567,11 +584,13 @@ mod tests {
             store
                 .conversation_scheduler_page(
                     &network,
-                    "other",
                     &local,
-                    HistorySection::ScopeJobs,
-                    Some(&cursor),
-                    3,
+                    SchedulerHistoryQuery {
+                        conversation: "other",
+                        section: HistorySection::ScopeJobs,
+                        cursor: Some(&cursor),
+                        limit: 3,
+                    },
                     |_, job| Ok(json!(job))
                 )
                 .is_err()
@@ -580,11 +599,13 @@ mod tests {
             store
                 .conversation_scheduler_page(
                     &network,
-                    "c",
                     &local,
-                    HistorySection::Jobs,
-                    Some(&cursor),
-                    3,
+                    SchedulerHistoryQuery {
+                        conversation: "c",
+                        section: HistorySection::Jobs,
+                        cursor: Some(&cursor),
+                        limit: 3,
+                    },
                     |_, job| Ok(json!(job))
                 )
                 .is_err()
@@ -606,11 +627,13 @@ mod tests {
         let local = identity.device_id()?;
         let first = store.conversation_scheduler_page(
             &network,
-            "c",
             &local,
-            HistorySection::Unanswered,
-            None,
-            100,
+            SchedulerHistoryQuery {
+                conversation: "c",
+                section: HistorySection::Unanswered,
+                cursor: None,
+                limit: 100,
+            },
             |_, _| bail!("unanswered must not hydrate scheduler jobs"),
         )?;
         assert!(first.items.is_empty());
@@ -618,11 +641,13 @@ mod tests {
         let mut hydrated = 0;
         let jobs = store.conversation_scheduler_page(
             &network,
-            "c",
             &local,
-            HistorySection::ScopeJobs,
-            None,
-            100,
+            SchedulerHistoryQuery {
+                conversation: "c",
+                section: HistorySection::ScopeJobs,
+                cursor: None,
+                limit: 100,
+            },
             |_, job| {
                 hydrated += 1;
                 Ok(json!(job))

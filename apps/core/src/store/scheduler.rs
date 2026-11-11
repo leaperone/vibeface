@@ -3980,6 +3980,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn scheduler_memory_staged_count(&self, conversation: &str) -> Result<usize> {
         Ok(query_sessions(
             &self.connection,
@@ -3991,6 +3992,7 @@ impl Store {
         .sum())
     }
 
+    #[cfg(test)]
     pub(crate) fn scheduler_session_status(
         &self,
         key: &SessionKey,
@@ -4029,6 +4031,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn scheduler_memory_conflicts(
         &self,
         conversation: &str,

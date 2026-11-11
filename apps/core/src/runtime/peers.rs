@@ -1361,11 +1361,18 @@ impl Runtime {
                     invocation.cancel.send_replace(true);
                 }
                 if current == WriteState::Writable {
-                    let _ = epoch.fetch_update(
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                        |value| value.checked_add(1),
-                    );
+                    let mut observed = epoch.load(std::sync::atomic::Ordering::Acquire);
+                    while let Some(next) = observed.checked_add(1) {
+                        match epoch.compare_exchange_weak(
+                            observed,
+                            next,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => observed = actual,
+                        }
+                    }
                 }
                 let held = identity.device_id().and_then(|local| Self::hold_execution_fence_stops(store, &local));
                 if let Err(error) = held {
@@ -1794,7 +1801,7 @@ impl Runtime {
         let Ok(local) = self.identity.device_id() else {
             return;
         };
-        match {
+        let dropped = {
             let arg0 = (network).to_owned();
             let arg1 = (local).to_owned();
             let arg2 = (removed).to_owned();
@@ -1803,7 +1810,8 @@ impl Runtime {
                     store.drop_requests_to(&arg0, &arg1, &arg2)
                 })
                 .await
-        } {
+        };
+        match dropped {
             Ok(0) => {}
             Ok(_) => self.schedule_wakeup.notify_one(),
             Err(error) => {
@@ -2369,10 +2377,11 @@ impl Runtime {
                 let mut drained = false;
                 let mut progressed = false;
                 loop {
-                    let command = match {
+                    let pending = {
                         let arg0 = (network).to_owned();
                         node.store.call("peers.pending_peer_commands", move |store| store.pending_peer_commands(&arg0)).await
-                    } {
+                    };
+                    let command = match pending {
                         Ok(pending) => pending
                             .into_iter()
                             .find(|command| command.envelope.lane(&network) == lane),
@@ -2445,7 +2454,7 @@ impl Runtime {
                         self.store.call("peers.admit_delivery", move |store| {
                         store.authorize_node(&network, &command.origin)?;
                         if !store.peer_command_dependencies(&network, &envelope)? { return Ok(None); }
-                        Ok(store.admit_delivery(&local, &network, &conversation_id, &trigger)? )
+                        store.admit_delivery(&local, &network, &conversation_id, &trigger)
                         }).await?
                     };
                     if let Some(receipt) = receipt {

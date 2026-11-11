@@ -3892,7 +3892,6 @@ pub(super) mod tests {
             {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
-                let spec = spec;
                 node.store
                     .call("triage.test.accept_work_fixture", move |store| {
                         store.accept_work_fixture(&identity, &network, spec, now_ms())
@@ -3969,7 +3968,6 @@ pub(super) mod tests {
         {
             let identity = (node.identity).to_owned();
             let network = (network).to_owned();
-            let spec = spec;
             node.store
                 .call("triage.test.accept_work_fixture", move |store| {
                     store.accept_work_fixture(&identity, &network, spec, now_ms())
@@ -4067,7 +4065,6 @@ pub(super) mod tests {
             {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
-                let spec = spec;
                 node.store
                     .call("triage.test.accept_work_fixture", move |store| {
                         store.accept_work_fixture(&identity, &network, spec, now_ms() - window)
@@ -4786,7 +4783,6 @@ pub(super) mod tests {
                             }).await
                         }? else { bail!("claim fixture request"); };
                         if state == "unknown" { {
-                                let attempt = attempt;
                                 let result = Err(anyhow::anyhow!("response outcome unknown"));
                                 b.store.call("triage.test.finish_triage", move |store| {
                                     store.finish_triage(attempt, &result)
@@ -5566,7 +5562,6 @@ pub(super) mod tests {
                     }
                     drop(leases);
                     {
-                        let attempt = attempt;
                         let result = Err(manager::ManagerError::not_started(anyhow::anyhow!(
                             "lease checked before any transport write"
                         )));
@@ -5757,7 +5752,6 @@ pub(super) mod tests {
             assert!(node.triage_command(base.clone()).await.is_err(), "revoked permissions cannot approve a still-live request");
             let failure: Result<()> = Err(anyhow::anyhow!("the control outcome is unknown"));
             {
-                let attempt = attempt;
                 let result = failure;
                 node.store.call("triage.test.finish_triage", move |store| {
                     store.finish_triage(attempt, &result)
@@ -6327,7 +6321,6 @@ pub(super) mod tests {
             {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
-                let spec = spec;
                 node.store.call("triage.test.accept_work_fixture", move |store| {
                     store.accept_work_fixture(&identity, &network, spec, now_ms())
                 }).await
@@ -7395,7 +7388,6 @@ pub(super) mod tests {
                 {
                     let identity = (node.identity).to_owned();
                     let network_id = (network).to_owned();
-                    let body = body;
                     let blobs = vec![];
                     node.store
                         .call("triage.test.append_event", move |store| {
@@ -7888,7 +7880,6 @@ pub(super) mod tests {
             assert_eq!(node.triage_command(current).await?, raised, "a late repeated action only reads its original result");
             assert_eq!(unanswered(&node).await?.len(), 1);
             {
-                let attempt = attempt;
                 let result = Ok(());
                 node.store.call("triage.test.finish_triage", move |store| {
                     store.finish_triage(attempt, &result)
@@ -7921,7 +7912,6 @@ pub(super) mod tests {
                 failure: vibeface_bridge::failure::ExecFailure::new(vibeface_bridge::failure::FailureKind::Rejected, "fixture failed after responding"),
             }.into());
             {
-                let attempt = attempt;
                 let result = failure;
                 node.store.call("triage.test.finish_triage", move |store| {
                     store.finish_triage(attempt, &result)
@@ -7952,7 +7942,6 @@ pub(super) mod tests {
             *lock(&node.triage.active) = Some(stale.clone());
             let failure = Err(anyhow::anyhow!("unknown provider result"));
             {
-                let attempt = attempt;
                 let result = failure;
                 node.store.call("triage.test.finish_triage", move |store| {
                     store.finish_triage(attempt, &result)

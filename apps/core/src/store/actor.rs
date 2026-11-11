@@ -950,16 +950,15 @@ mod performance {
     use anyhow::Context;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn signed_fixture(
-        size: usize,
-        cascade_group: Option<usize>,
-    ) -> Result<(
-        String,
-        NetworkState,
-        Vec<SignedEvent>,
-        Vec<SignedEvent>,
-        Vec<SignedEvent>,
-    )> {
+    struct SignedFixture {
+        network: String,
+        state: NetworkState,
+        prelude: Vec<SignedEvent>,
+        events: Vec<SignedEvent>,
+        dependencies: Vec<SignedEvent>,
+    }
+
+    fn signed_fixture(size: usize, cascade_group: Option<usize>) -> Result<SignedFixture> {
         let identity = LocalIdentity::generate();
         let author = identity.device_id()?;
         let network = identity.fixture_network_id()?;
@@ -1102,14 +1101,25 @@ mod performance {
             )?;
         }
         let workload = events.split_off(5);
-        Ok((network, state, events, workload, dependencies))
+        Ok(SignedFixture {
+            network,
+            state,
+            prelude: events,
+            events: workload,
+            dependencies,
+        })
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn signed_workload_fixture_ingests_and_releases_its_pending_cascade() -> Result<()> {
         for cascade in [false, true] {
-            let (network, state, prelude, events, dependencies) =
-                signed_fixture(8, cascade.then_some(4))?;
+            let SignedFixture {
+                network,
+                state,
+                prelude,
+                events,
+                dependencies,
+            } = signed_fixture(8, cascade.then_some(4))?;
             let directory = std::env::temp_dir().join(format!(
                 "vibeface-actor-signed-fixture-{}",
                 uuid::Uuid::new_v4()
@@ -1215,11 +1225,16 @@ mod performance {
             let size = size?;
             for page in [64, 256, 1024] {
                 for cascade in [false, true] {
-                    let (network, state, prelude, events, dependencies) =
-                        tokio::task::spawn_blocking(move || {
-                            signed_fixture(size, cascade.then_some(page * 4))
-                        })
-                        .await??;
+                    let SignedFixture {
+                        network,
+                        state,
+                        prelude,
+                        events,
+                        dependencies,
+                    } = tokio::task::spawn_blocking(move || {
+                        signed_fixture(size, cascade.then_some(page * 4))
+                    })
+                    .await??;
                     let measured_events = events.len() + dependencies.len();
                     for repeat in 0..3 {
                         let directory = std::env::temp_dir()

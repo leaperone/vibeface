@@ -9,6 +9,13 @@ use crate::{
     work::{RequestedWorkKind, WorkRequest, WorkSpec},
 };
 
+/// Dispatch hints used to select the provider of an existing execution or a new work.
+pub(super) struct ExecutionProviderRequest<'a> {
+    pub(super) agent: Option<Provider>,
+    pub(super) thread: Option<&'a str>,
+    pub(super) continues: Option<&'a str>,
+}
+
 impl Runtime {
     /// The one entry for coordination tools: Cursor MCP and `vibeface tool` both land here.
     pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
@@ -1372,9 +1379,11 @@ impl Runtime {
                     &local,
                     &execution,
                     manager,
-                    agent,
-                    thread.as_deref(),
-                    continues.as_deref(),
+                    ExecutionProviderRequest {
+                        agent,
+                        thread: thread.as_deref(),
+                        continues: continues.as_deref(),
+                    },
                 )
             })
             .await
@@ -1386,11 +1395,14 @@ impl Runtime {
         local: &str,
         execution: &std::collections::BTreeSet<Provider>,
         manager: Option<Provider>,
-        agent: Option<Provider>,
-        thread: Option<&str>,
-        continues: Option<&str>,
+        request: ExecutionProviderRequest<'_>,
     ) -> Result<Provider> {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
+        let ExecutionProviderRequest {
+            agent,
+            thread,
+            continues,
+        } = request;
         let earlier = match (agent, thread, continues) {
             (Some(_), _, _) => None,
             (None, Some(thread), _) => {

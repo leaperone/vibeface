@@ -1552,8 +1552,10 @@ fn graph_at(
     network: &str,
     known: Option<&BTreeMap<String, Event>>,
 ) -> Result<Graph> {
-    let mut graph = Graph::default();
-    graph.replace_lookups = true;
+    let mut graph = Graph {
+        replace_lookups: true,
+        ..Default::default()
+    };
     let mut statement=connection.prepare("SELECT hash,envelope,lamport,created_at_ms FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted') ORDER BY lamport,created_at_ms,hash")?;
     let rows = statement.query_map([network], |row| {
         Ok((

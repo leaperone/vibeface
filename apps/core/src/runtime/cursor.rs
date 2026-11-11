@@ -453,14 +453,15 @@ impl CursorExecutor {
         work_id: &str,
         result: std::result::Result<vibeface_bridge::agent::AgentResult, AgentRunError>,
     ) {
-        let record = match {
+        let stored = {
             let work_id = work_id.to_owned();
             node.store
                 .call("cursor.work_record", move |store| {
                     store.work_record(&work_id)
                 })
                 .await
-        } {
+        };
+        let record = match stored {
             Ok(Some(record)) => record,
             Ok(None) => return,
             Err(error) => {
@@ -1260,7 +1261,7 @@ mod tests {
                 network.to_owned(),
                 id.to_owned(),
                 configuration.clone(),
-                node.config.scheduling.clone(),
+                node.config.scheduling,
                 node.provider_generation(Provider::Cursor, &node.providers())?,
             );
             node.store

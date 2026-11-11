@@ -1,5 +1,8 @@
 use super::*;
-use crate::{scheduling::TriggerKind, store::scope_projection};
+use crate::{
+    scheduling::TriggerKind,
+    store::{scheduler_history::SchedulerHistoryQuery, scope_projection},
+};
 
 const ARTIFACT_PAGE: usize = 65_536;
 /// Progress sources one conversation view follows, within the observer's own limit.
@@ -309,41 +312,49 @@ impl Runtime {
                         );
                     }
                     let works = store.conversation_works_page(network, scope, None, 50)?;
-                    let task_jobs = task_observations(&store, scope, &works.items)?;
+                    let task_jobs = task_observations(store, scope, &works.items)?;
                     let jobs = projection.history_page(
                         store,
                         network,
-                        scope,
-                        HistorySection::Jobs,
-                        None,
-                        50,
+                        SchedulerHistoryQuery {
+                            conversation: scope,
+                            section: HistorySection::Jobs,
+                            cursor: None,
+                            limit: 50,
+                        },
                         &local_manager,
                     )?;
                     let scope_jobs = projection.history_page(
                         store,
                         network,
-                        scope,
-                        HistorySection::ScopeJobs,
-                        None,
-                        50,
+                        SchedulerHistoryQuery {
+                            conversation: scope,
+                            section: HistorySection::ScopeJobs,
+                            cursor: None,
+                            limit: 50,
+                        },
                         &local_manager,
                     )?;
                     let checks = projection.history_page(
                         store,
                         network,
-                        scope,
-                        HistorySection::Checks,
-                        None,
-                        50,
+                        SchedulerHistoryQuery {
+                            conversation: scope,
+                            section: HistorySection::Checks,
+                            cursor: None,
+                            limit: 50,
+                        },
                         &local_manager,
                     )?;
                     let deliveries = projection.history_page(
                         store,
                         network,
-                        scope,
-                        HistorySection::Deliveries,
-                        None,
-                        50,
+                        SchedulerHistoryQuery {
+                            conversation: scope,
+                            section: HistorySection::Deliveries,
+                            cursor: None,
+                            limit: 50,
+                        },
                         &local_manager,
                     )?;
                     let conversation = store.conversation(network, scope)?;
@@ -390,10 +401,12 @@ impl Runtime {
                     let unanswered = projection.history_page(
                         store,
                         network,
-                        scope,
-                        HistorySection::Unanswered,
-                        None,
-                        50,
+                        SchedulerHistoryQuery {
+                            conversation: scope,
+                            section: HistorySection::Unanswered,
+                            cursor: None,
+                            limit: 50,
+                        },
                         &local_manager,
                     )?;
 
@@ -593,10 +606,12 @@ impl Runtime {
                         Ok(serde_json::to_value(projection.history_page(
                             store,
                             &network,
-                            &request.conversation_id,
-                            request.section,
-                            request.cursor.as_deref(),
-                            request.limit,
+                            SchedulerHistoryQuery {
+                                conversation: &request.conversation_id,
+                                section: request.section,
+                                cursor: request.cursor.as_deref(),
+                                limit: request.limit,
+                            },
                             &manager,
                         )?)?)
                     }
@@ -707,18 +722,19 @@ impl Runtime {
                 return Ok(None);
             }
             let mut messages = Vec::new();
-            if let Some(id) = message_id {
-                if scope_projection::message_is_main_from(&store.connection, &network, &scope, &id)? {
-                    if let Some(message) = store.message(&network, &scope, &id)? { messages.push(message); }
-                }
+            if let Some(id) = message_id
+                && scope_projection::message_is_main_from(&store.connection, &network, &scope, &id)?
+                && let Some(message) = store.message(&network, &scope, &id)?
+            {
+                messages.push(message);
             }
             let mut works = Vec::new();
-            if let Some(id) = work_id {
-                if let Some(work) = store.work(&network, &id)? {
-                    if work.conversation_id == scope && scope_projection::work_is_main_from(
-                        &store.connection, &network, &scope, &id,
-                    )? { works.push(work); }
-                }
+            if let Some(id) = work_id
+                && let Some(work) = store.work(&network, &id)?
+                && work.conversation_id == scope
+                && scope_projection::work_is_main_from(&store.connection, &network, &scope, &id)?
+            {
+                works.push(work);
             }
             let jobs = task_observations(store, &scope, &works)?;
             let works = works.iter().map(|work| work_view(work, &jobs)).collect::<Result<Vec<_>>>()?;
@@ -751,7 +767,7 @@ fn fit_history_snapshot(snapshot: &mut Value, starts: &BTreeMap<String, String>)
             sections.push((serde_json::to_vec(value)?.len(), name, section));
         }
     }
-    sections.sort_by(|left, right| right.0.cmp(&left.0));
+    sections.sort_by_key(|section| std::cmp::Reverse(section.0));
     for (previous_size, name, section) in sections {
         let coverage_size = serde_json::to_vec(&snapshot["history"][name])?.len();
         let value = section

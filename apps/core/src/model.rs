@@ -16,8 +16,6 @@ pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 
-/// A file the user attached to a message. The name belongs to the message, not the content.
-
 /// A file name as the web signs it: no path separators or control characters, at most
 /// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
 pub fn valid_attachment_name(name: &str) -> bool {
@@ -396,8 +394,6 @@ pub struct Schedule {
 fn is_zero(value: &u8) -> bool {
     *value == 0
 }
-
-/// What the user's web client does to a schedule; it never creates or edits one.
 
 /// The user's own signed message that started the turn a write stands on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

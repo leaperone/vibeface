@@ -590,6 +590,7 @@ fn session_identity(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn session_configuration(
     node: &Runtime,
     network: &str,
@@ -1212,14 +1213,11 @@ async fn turn(
             && no_execution
             && let Some(reservation) = budget.take()
         {
-            {
-                let reservation = reservation;
-                node.store
-                    .call("scheduler.refund_scheduler_budget", move |store| {
-                        store.refund_scheduler_budget(reservation, boot_id())
-                    })
-                    .await
-            }?;
+            node.store
+                .call("scheduler.refund_scheduler_budget", move |store| {
+                    store.refund_scheduler_budget(reservation, boot_id())
+                })
+                .await?;
         }
         let text = partial.lock().expect("partial text").text();
         job = {
@@ -1253,7 +1251,6 @@ async fn turn(
         && !sdk_live
         && let Some(reservation) = budget.take()
         && let Err(error) = {
-            let reservation = reservation;
             node.store
                 .call("scheduler.refund_scheduler_budget", move |store| {
                     store.refund_scheduler_budget(reservation, boot_id())
