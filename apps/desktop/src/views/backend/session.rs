@@ -2,14 +2,14 @@ use super::*;
 
 impl Backend {
     pub(super) async fn cancel_reconnect(&mut self) -> Result<()> {
-        if let Some(task) = self.reconnect_task.as_mut() {
-            if !self.reconnect_joined {
-                task.abort();
-                let _ = tokio::time::timeout(super::reads::READ_DRAIN_TIMEOUT, task)
-                    .await
-                    .context("重新连接任务尚未退出，原存储租约保持占用。")?;
-                self.reconnect_joined = true;
-            }
+        if let Some(task) = self.reconnect_task.as_mut()
+            && !self.reconnect_joined
+        {
+            task.abort();
+            let _ = tokio::time::timeout(super::reads::READ_DRAIN_TIMEOUT, task)
+                .await
+                .context("重新连接任务尚未退出，原存储租约保持占用。")?;
+            self.reconnect_joined = true;
         }
         if let Some(client) = &self.reconnect_lease {
             tokio::time::timeout(
@@ -200,25 +200,30 @@ impl Backend {
         self.state.writable = false;
         self.state.status = "正在重新验证连接，未知操作不会重发。".into();
         self.publish();
-        let endpoint = match target {
-            ReconnectTarget::Network(endpoint) => endpoint,
-            ReconnectTarget::Local(identity) => {
-                let expected = self.active_entry.clone().context("本机接入身份缺失")?;
-                let data_dir = identity.data_dir;
-                let target = tokio::task::spawn_blocking(move || {
-                    vibeface_client::LocalTarget::read(&data_dir, &expected)
-                })
-                .await??;
-                Endpoint::Local(target.grant(previous.client_id()).await?)
-            }
-        };
+        let expected = self.active_entry.clone();
+        let client_id = previous.client_id().to_owned();
         let attempt = self.state.generation;
         let profile_id = self.current_profile_id()?;
         let recovered = self.recovered.clone();
         self.reconnect_lease = Some(previous.clone());
         self.reconnect_joined = false;
         self.reconnect_task = Some(tokio::spawn(async move {
-            let result = previous.reconnect(endpoint).await;
+            let result = async {
+                let endpoint = match target {
+                    ReconnectTarget::Network(endpoint) => endpoint,
+                    ReconnectTarget::Local(identity) => {
+                        let expected = expected.context("本机接入身份缺失")?;
+                        let data_dir = identity.data_dir;
+                        let target = tokio::task::spawn_blocking(move || {
+                            vibeface_client::LocalTarget::read(&data_dir, &expected)
+                        })
+                        .await??;
+                        Endpoint::Local(target.grant(&client_id).await?)
+                    }
+                };
+                previous.reconnect(endpoint).await
+            }
+            .await;
             let _ = recovered
                 .send(Reconnected {
                     attempt,

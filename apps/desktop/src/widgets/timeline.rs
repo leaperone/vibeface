@@ -175,10 +175,10 @@ impl Timeline {
             } else {
                 None
             };
-            if let Some(index) = new_index {
-                if row.text != live[index].text || row.status != live[index].status {
-                    invalidate_row(&self.list, self.base_count + index);
-                }
+            if let Some(index) = new_index
+                && (row.text != live[index].text || row.status != live[index].status)
+            {
+                invalidate_row(&self.list, self.base_count + index);
             }
         }
         for row in &self.rows[self.base_count..] {

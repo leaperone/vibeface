@@ -48,6 +48,7 @@ pub struct Form {
     pub owner_node_id: Option<String>,
     pub editor: Editor,
     pub fields: Vec<Field>,
+    delivery_budget_id: Option<String>,
 }
 impl Form {
     pub fn new(
@@ -253,7 +254,6 @@ impl Form {
                 ("receiver_peer", "接收设备 ID", false),
                 ("provider_peer", "传输服务设备 ID", false),
                 ("mode", "传输方式 charity 或 paid", false),
-                ("acceptance", "结算条件 recoverable 或 strict", false),
                 ("max_service_amount", "最高服务费", false),
                 ("max_gas_amount", "最高网络费", false),
             ],
@@ -305,6 +305,11 @@ impl Form {
             submission_id: uuid::Uuid::new_v4().to_string(),
             generation,
             owner_node_id: values.get("_owner_node_id").cloned(),
+            delivery_budget_id: if matches!(&editor, Editor::Transfer) {
+                values.get("budget_id").cloned()
+            } else {
+                None
+            },
             editor,
             fields,
         }
@@ -327,6 +332,9 @@ impl Form {
         if let Some(node) = &self.owner_node_id {
             values.insert("_owner_node_id".into(), node.clone());
         }
+        if let Some(budget) = &self.delivery_budget_id {
+            values.insert("budget_id".into(), budget.clone());
+        }
         values
     }
     pub fn render(&self) -> AnyElement {
@@ -334,6 +342,11 @@ impl Form {
             .flex()
             .flex_col()
             .gap_4()
+            .children(self.delivery_budget_id.as_ref().map(|id| {
+                div().child(format!(
+                    "固定预付预算 {id}。受保护付费仅使用可恢复验收；更换预算需从预算列表重新准备。"
+                ))
+            }))
             .children(self.fields.iter().map(|f| {
                 let input = if let Some(area) = &f.area {
                     Textarea::new(area)

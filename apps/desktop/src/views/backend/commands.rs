@@ -901,20 +901,7 @@ impl Backend {
             }),
             Command::DeliveryConfirm(order) => Box::pin(async move {
                 {
-                    ensure!(
-                        order.phase == "prepared" && order.role == "sender",
-                        "先查询原订单，当前订单不可确认"
-                    );
-                    let current = self
-                        .client()?
-                        .read(ReadRequest::Delivery(DeliveryRead::Get {
-                            order_id: order.order_id.clone(),
-                        }))
-                        .await?;
-                    let current: TransferOrder = serde_json::from_value(current)?;
-                    validate_transfer_order(&current)?;
-                    self.validate_quote(&current).await?;
-                    ensure!(same_terms(&order, &current), "订单条款已变化，未确认付款");
+                    self.reviewed_delivery_order(&order, false).await?;
                     self.submit(Action::Delivery(vibeface_client::DeliveryAction::Confirm {
                         intent_id: order.intent_id,
                     }))
@@ -922,10 +909,42 @@ impl Backend {
                 };
                 Ok(())
             }),
-            Command::DeliveryAccept(order_id) => Box::pin(async move {
+            Command::DeliveryAccept(order) => Box::pin(async move {
+                self.reviewed_delivery_order(&order, true).await?;
                 self.submit(Action::Delivery(vibeface_client::DeliveryAction::Accept {
-                    order_id,
+                    order_id: order.order_id,
                 }))
+                .await?;
+                Ok(())
+            }),
+            Command::DeliveryConfirmBatch(orders) => Box::pin(async move {
+                let current = self.reviewed_delivery_pair(&orders, false).await?;
+                self.submit(Action::Delivery(
+                    vibeface_client::DeliveryAction::ConfirmBatch {
+                        intent_ids: [current[0].intent_id.clone(), current[1].intent_id.clone()],
+                    },
+                ))
+                .await?;
+                Ok(())
+            }),
+            Command::DeliveryAcceptBatch(orders) => Box::pin(async move {
+                let current = self.reviewed_delivery_pair(&orders, true).await?;
+                self.submit(Action::Delivery(
+                    vibeface_client::DeliveryAction::AcceptBatch {
+                        order_ids: [current[0].order_id.clone(), current[1].order_id.clone()],
+                    },
+                ))
+                .await?;
+                Ok(())
+            }),
+            Command::DeliveryFlushBudget(review) => Box::pin(async move {
+                let batch_id = self.reviewed_flush_batch(&review).await?;
+                self.submit(Action::Delivery(
+                    vibeface_client::DeliveryAction::FlushBudget {
+                        budget_id: review.budget.budget_id,
+                        batch_id,
+                    },
+                ))
                 .await?;
                 Ok(())
             }),

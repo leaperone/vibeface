@@ -666,6 +666,121 @@ impl Desktop {
                 cx,
             ))
             .child(self.button("transfer-refresh", "刷新传输记录", Command::Transfers, cx));
+        let now = vibeface_protocol::now_ms() / 1000;
+        if let Some(error) = &d.budget_error {
+            page = page.child(self.row("预算状态待核对", error.clone()));
+        }
+        page=page.child("受保护付费使用已有预付预算，仅可恢复验收；金额均为代币或原生币的最小单位整数，不填写小数。预算开户、充值和钱包解锁请在本机使用现有CLI维护。历史Strict订单仅保留查看和文件读取。");
+        for budget in &d.budgets {
+            let mut row = self.row(
+                format!("预算 {} · {}", budget.budget_id, budget.state),
+                format!(
+                    "中转 {}
+固定付款人 {} · 收款人 {} · 资产 {}
+账本存入 {} · 可用 {} · 锁定 {}
+预算账本累计赚取 {} · 提取 {} · 退款 {}（不作到账确认）
+预算累计链费上限 {} · 就绪 {} 片",
+                    budget.provider_peer,
+                    budget.payer,
+                    budget.payee,
+                    budget.asset,
+                    budget.deposit,
+                    budget.free,
+                    budget.locked,
+                    budget.earned,
+                    budget.withdrawn,
+                    budget.refunded,
+                    budget.gas_cap,
+                    budget.ready_windows.len()
+                ),
+            );
+            let offer = d
+                .providers
+                .iter()
+                .find(|provider| provider.device_id == budget.provider_peer && provider.paid)
+                .and_then(|provider| provider.offer.as_ref())
+                .and_then(|offer| offer.settlement.as_ref());
+            if budget.state == "open"
+                && d.wallet
+                    .address
+                    .as_deref()
+                    .is_some_and(|payer| payer.eq_ignore_ascii_case(&budget.payer))
+                && offer.is_some_and(|offer| offer.asset.eq_ignore_ascii_case(&budget.asset))
+            {
+                row = row.child(
+                    self.open_editor(
+                        SharedString::from(format!("prepare-budget-{}", budget.budget_id)),
+                        "使用此预算准备付费传输",
+                        Editor::Transfer,
+                        BTreeMap::from([
+                            ("mode", "paid".into()),
+                            ("budget_id", budget.budget_id.clone()),
+                            ("provider_peer", budget.provider_peer.clone()),
+                            ("max_service_amount", budget.free.clone()),
+                            ("max_gas_amount", budget.gas_cap.clone()),
+                        ]),
+                        cx,
+                    )
+                    .disabled(
+                        !self.snapshot.online
+                            || !self.snapshot.can_manage
+                            || !d.enabled
+                            || !d.paid_enabled,
+                    ),
+                );
+            }
+            if budget.provider_peer == d.node_peer
+                && budget.state != "closed"
+                && let Ok(review) = transfer_flush_review(budget, &d.orders)
+            {
+                row = row.child(
+                    self.ask(
+                        SharedString::from(format!("flush-budget-{}", budget.budget_id)),
+                        "核对并请求结算此预算就绪片段",
+                        Command::DeliveryFlushBudget(Box::new(review)),
+                        cx,
+                    )
+                    .disabled(!self.snapshot.online || !self.snapshot.can_manage),
+                );
+            }
+            page = page.child(row);
+        }
+        for (accept, label) in [(false, "确认两笔原订单"), (true, "接收两笔原订单")] {
+            for orders in transfer_batches(&d.orders, accept, now) {
+                let total = transfer_sum(orders.iter().map(|order| order.payment.total.as_str()))
+                    .unwrap_or_else(|_| "待核对".into());
+                let budget = orders[0].payment.budget_id.clone().unwrap_or_default();
+                let mut row =
+                    self.row(label, format!("固定预算 {budget} · 两单服务费合计 {total}"));
+                for order in &orders {
+                    row = row.child(self.transfer_order_review(order));
+                }
+                let command = if accept {
+                    Command::DeliveryAcceptBatch(Box::new(orders))
+                } else {
+                    Command::DeliveryConfirmBatch(Box::new(orders))
+                };
+                row = row.child(
+                    self.ask(
+                        SharedString::from(format!(
+                            "{}-{budget}",
+                            if accept {
+                                "accept-batch"
+                            } else {
+                                "confirm-batch"
+                            }
+                        )),
+                        label,
+                        command,
+                        cx,
+                    )
+                    .disabled(
+                        !self.snapshot.online || !self.snapshot.can_manage || !d.paid_enabled,
+                    ),
+                );
+                page = page.child(row);
+            }
+        }
         for provider in &d.providers {
             page = page.child(self.row(
                 format!("传输服务设备 {}", provider.device_id),
@@ -684,6 +799,21 @@ impl Desktop {
                     ),
             ));
         }
+        for provider in &d.providers {
+            if let Some(settlement) = provider
+                .offer
+                .as_ref()
+                .and_then(|offer| offer.settlement.as_ref())
+            {
+                page = page.child(self.row(
+                    format!("中转设备 {} 的结算配置", provider.device_id),
+                    format!(
+                        "链 {} · 托管合约 {} · 资产 {}",
+                        settlement.chain_id, settlement.escrow, settlement.asset
+                    ),
+                ));
+            }
+        }
         for order in &d.orders {
             let mut row = self
                 .row(
@@ -696,7 +826,16 @@ impl Desktop {
                 ))
                 .child(format!(
                     "服务费 {} · 网络费上限 {} · 付款状态 {}",
-                    order.payment.total, order.payment.gas_cap, order.payment.state
+                    order.payment.total,
+                    order.payment.gas_cap,
+                    if transfer_settlement_uncertain(order) {
+                        format!(
+                            "上次记录 {}（当前待确认）",
+                            transfer_payment_label(&order.payment.state)
+                        )
+                    } else {
+                        transfer_payment_label(&order.payment.state).to_owned()
+                    }
                 ))
                 .child(format!(
                     "传输费 {} · 暂存预留费 {} · 时效优先费 {}",
@@ -724,7 +863,7 @@ impl Desktop {
                     window.decryption_proven
                 ));
             }
-            if order.role == "sender" && order.phase == "prepared" {
+            if transfer_confirmable(order, now) {
                 row = row.child(self.ask(
                     SharedString::from(format!("confirm-{}", order.order_id)),
                     if order.mode == "paid" {
@@ -736,22 +875,73 @@ impl Desktop {
                     cx,
                 ));
             }
-            if order.role == "receiver" {
-                row = row.child(self.button(
+            if transfer_acceptable(order) {
+                row = row.child(self.ask(
                     SharedString::from(format!("accept-{}", order.order_id)),
                     "接收文件",
-                    Command::DeliveryAccept(order.order_id.clone()),
+                    Command::DeliveryAccept(order.clone()),
                     cx,
                 ));
             }
+            if order.mode == "paid" {
+                let uncertain = transfer_settlement_uncertain(order);
+                row = row
+                    .child(format!(
+                        "{}：{} / {}",
+                        if uncertain {
+                            "本单上次记录（当前待确认）"
+                        } else {
+                            "本单已赚取 / 已退款"
+                        },
+                        order.payment.earned,
+                        order.payment.refunded
+                    ))
+                    .child(format!(
+                        "固定预算 {} · {}",
+                        order
+                            .payment
+                            .budget_id
+                            .as_deref()
+                            .unwrap_or("历史订单未提供"),
+                        transfer_publication_label(order)
+                    ));
+                if let Some(settlement) = &order.payment.settlement {
+                    row = row.child(format!(
+                        "{}：{} / {} / {}",
+                        if uncertain {
+                            "预算上次累计记录（到账待确认）"
+                        } else {
+                            "预算累计赚取 / 提取 / 退款"
+                        },
+                        settlement.earned,
+                        settlement.withdrawn,
+                        settlement.refunded
+                    ));
+                    if let Some(publication) = &settlement.publication {
+                        row = row.child(format!(
+                            "批次金额 {} · 经济截止（Unix秒） {}",
+                            publication.total_amount, publication.economic_cutoff
+                        ));
+                        if let Some(risk) = &publication.availability_risk {
+                            row = row.child(format!("可用性风险：{risk}"));
+                        }
+                    }
+                }
+                if order.acceptance == "strict" {
+                    row = row.child("历史Strict订单：不提供新的准备、付款或接收操作。");
+                }
+            }
             let save_order = order.clone();
             row = row
-                .child(self.button(
-                    SharedString::from(format!("check-{}", order.order_id)),
-                    "查询原订单进度",
-                    Command::DeliveryReconcile(order.order_id.clone()),
-                    cx,
-                ))
+                .child(
+                    self.button(
+                        SharedString::from(format!("check-{}", order.order_id)),
+                        "查询原订单进度",
+                        Command::DeliveryReconcile(order.order_id.clone()),
+                        cx,
+                    )
+                    .disabled(order.mode == "paid" && order.acceptance == "strict"),
+                )
                 .child(
                     Button::new(SharedString::from(format!("save-{}", order.order_id)))
                         .label("保存文件")
@@ -887,5 +1077,142 @@ impl Desktop {
             }
         })
         .detach();
+    }
+}
+
+impl Desktop {
+    fn transfer_order_review(&self, order: &TransferOrder) -> AnyElement {
+        let mut review = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.row(
+                order.name.clone().unwrap_or_else(|| "加密文件".into()),
+                format!(
+                    "原订单 {}\n原意图 {}\n{} 字节 · 摘要 {}",
+                    order.order_id,
+                    order.intent_id,
+                    order.bytes,
+                    order.sha256.as_deref().unwrap_or("未提供")
+                ),
+            ))
+            .child(format!(
+                "来源 {} · 接收 {} · 中转 {}",
+                order.source_peer, order.receiver_peer, order.provider_peer
+            ))
+            .child(format!(
+                "固定预算 {}\n付款人 {} · 收款人 {}\n链 {} · 资产 {}",
+                order.payment.budget_id.as_deref().unwrap_or("免费，无预算"),
+                order.payment.payer.as_deref().unwrap_or("无"),
+                order.payment.provider_wallet.as_deref().unwrap_or("无"),
+                order.payment.chain_id.as_deref().unwrap_or("无"),
+                order.payment.asset.as_deref().unwrap_or("无")
+            ))
+            .child(format!(
+                "原服务费 {} · 原预算累计链费上限 {} · {}个片段",
+                order.payment.total,
+                order.payment.gas_cap,
+                order.windows.len()
+            ))
+            .child(transfer_publication_label(order));
+        if let Some(deadline) = &order.deadlines {
+            review = review.child(format!(
+                "原截止时间（Unix秒）：报价 {} · 持有 {} · 密钥 {} · 打开 {} · 保留 {} · 时效 {}",
+                deadline.quote_expires_at,
+                deadline.hold_deadline,
+                deadline.key_deadline,
+                deadline.open_deadline,
+                deadline.retain_until,
+                deadline.priority_deadline
+            ));
+        }
+        if let Some(risk) = order
+            .payment
+            .settlement
+            .as_ref()
+            .and_then(|s| s.publication.as_ref())
+            .and_then(|p| p.availability_risk.as_ref())
+        {
+            review = review.child(format!("可用性风险：{risk}"));
+        }
+        review.into_any_element()
+    }
+    pub(crate) fn delivery_confirmation(&self, command: &Command) -> Option<AnyElement> {
+        let mut review = div()
+            .id("delivery-financial-review")
+            .role(Role::Group)
+            .flex()
+            .flex_col()
+            .gap_3();
+        match command {
+            Command::DeliveryConfirm(order) | Command::DeliveryAccept(order) => {
+                review = review
+                    .aria_label(format!(
+                        "原订单 {} · 预算 {} · 原服务费 {}",
+                        order.order_id,
+                        order.payment.budget_id.as_deref().unwrap_or("免费"),
+                        order.payment.total
+                    ))
+                    .child("核对这笔原订单的固定条款")
+                    .child(self.transfer_order_review(order));
+            }
+            Command::DeliveryConfirmBatch(orders) | Command::DeliveryAcceptBatch(orders) => {
+                let total = transfer_sum(orders.iter().map(|order| order.payment.total.as_str()))
+                    .unwrap_or_else(|_| "金额待核对，不能提交".into());
+                review = review
+                    .aria_label(format!(
+                        "两笔原订单 {} 和 {} · 预算 {} · 服务费合计 {total}",
+                        orders[0].order_id,
+                        orders[1].order_id,
+                        orders[0].payment.budget_id.as_deref().unwrap_or("未提供")
+                    ))
+                    .child(format!(
+                        "核对以下两笔原订单，服务费合计 {total}；不创建第二笔订单。"
+                    ));
+                for order in orders.iter() {
+                    review = review.child(self.transfer_order_review(order));
+                }
+                review = review
+                    .child("两单使用同一固定预算；累计链费上限是该预算的一次授权，不按两单相加。");
+            }
+            Command::DeliveryFlushBudget(flush) => {
+                let budget = &flush.budget;
+                review = review
+                    .aria_label(format!(
+                        "原预算 {} · 原就绪片段 {}",
+                        budget.budget_id,
+                        budget
+                            .ready_windows
+                            .iter()
+                            .map(|window| format!("{}:{}", window.order_id, window.index))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ))
+                    .child(format!(
+                        "提交前核对的预算与片段（执行前可能变化）：{}",
+                        budget.budget_id
+                    ))
+                    .child(format!(
+                        "中转 {} · 付款人 {} · 收款人 {} · 资产 {}\n原预算累计链费上限 {}",
+                        budget.provider_peer,
+                        budget.payer,
+                        budget.payee,
+                        budget.asset,
+                        budget.gas_cap
+                    ));
+                for window in &budget.ready_windows {
+                    review = review.child(format!(
+                        "原订单 {} · 原片段 {}",
+                        window.order_id, window.index
+                    ));
+                }
+                for order in &flush.orders {
+                    review = review.child(self.transfer_order_review(order));
+                }
+                review=review.child("恢复材料可能公开。设备会在执行时选择此预算下可处理的就绪片段，列表可能在执行前变化。经济截止和可用性风险需检查原订单及后续状态；请求已接收不代表付款或收入完成。");
+            }
+            _ => return None,
+        }
+        Some(review.child("确认只提交这次意图。设备接收不代表付款、收入或到账已完成；结果未知时先检查原订单、原预算和原批次，不自动再次提交。预算建立、充值和钱包解锁仍通过发送设备现有CLI本机维护。").into_any_element())
     }
 }

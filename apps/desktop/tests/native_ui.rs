@@ -152,24 +152,26 @@ fn progress_ignores_duplicates_and_does_not_append_after_a_sequence_gap() {
 }
 #[test]
 fn target_conversation_follows_exact_task_owner() {
-    let mut snapshot = ui::Snapshot::default();
-    snapshot.bots = vec![
-        ui::Bot {
-            bot_id: "bot-a".into(),
-            conversation_id: "chat-a".into(),
+    let snapshot = ui::Snapshot {
+        bots: vec![
+            ui::Bot {
+                bot_id: "bot-a".into(),
+                conversation_id: "chat-a".into(),
+                ..Default::default()
+            },
+            ui::Bot {
+                bot_id: "bot-b".into(),
+                conversation_id: "chat-b".into(),
+                ..Default::default()
+            },
+        ],
+        tasks: vec![ui::Task {
+            task_id: "task-b".into(),
+            owner_bot: "bot-b".into(),
             ..Default::default()
-        },
-        ui::Bot {
-            bot_id: "bot-b".into(),
-            conversation_id: "chat-b".into(),
-            ..Default::default()
-        },
-    ];
-    snapshot.tasks = vec![ui::Task {
-        task_id: "task-b".into(),
-        owner_bot: "bot-b".into(),
+        }],
         ..Default::default()
-    }];
+    };
     assert_eq!(
         ui::target_conversation(
             &InputTarget::Task {

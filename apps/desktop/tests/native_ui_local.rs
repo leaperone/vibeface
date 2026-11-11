@@ -58,6 +58,10 @@ struct LocalNode {
     block_next: AtomicBool,
     blocked: AtomicBool,
     release: Notify,
+    launch_gate: watch::Sender<bool>,
+    launch_blocked: Notify,
+    launch_finished: Notify,
+    exchanged: Mutex<Vec<String>>,
     business: AtomicUsize,
 }
 impl LocalNode {
@@ -121,11 +125,18 @@ impl LocalNode {
         stream.read_exact(&mut request).await?;
         let body: Value = serde_json::from_slice(&request[end..])?;
         let mut cookie = None;
+        let mut gated_launch = false;
         let value = if headers.starts_with("POST /api/local/launch ") {
             ensure!(
                 headers.contains(&format!("Bearer {}", "a".repeat(64))),
                 "controlled launch authentication"
             );
+            let mut gate = self.launch_gate.subscribe();
+            gated_launch = *gate.borrow_and_update();
+            if gated_launch {
+                self.launch_blocked.notify_one();
+                gate.wait_for(|held| !*held).await?;
+            }
             json!({"url":self.entry.origin,"device_id":self.entry.node_id,"token":"b".repeat(64)})
         } else if headers.starts_with("POST /api/local/exchange ") {
             ensure!(
@@ -135,6 +146,7 @@ impl LocalNode {
             let client = body["device_id"]
                 .as_str()
                 .context("controlled client missing")?;
+            self.exchanged.lock().unwrap().push(client.to_owned());
             cookie = Some(format!(
                 "Set-Cookie: vibeface_local_{}={client}; HttpOnly; SameSite=Strict; Path=/api/local; Max-Age=86400\r\n",
                 self.entry.node_id
@@ -149,10 +161,17 @@ impl LocalNode {
             body.len(),
             cookie.unwrap_or_default()
         );
-        stream.write_all(response.as_bytes()).await?;
-        stream.write_all(&body).await?;
-        stream.shutdown().await?;
-        Ok(())
+        let result = async {
+            stream.write_all(response.as_bytes()).await?;
+            stream.write_all(&body).await?;
+            stream.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        if gated_launch {
+            self.launch_finished.notify_one();
+        }
+        result
     }
     async fn noise(
         self: Arc<Self>,
@@ -257,6 +276,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
         self.node.release.notify_waiters();
+        self.node.launch_gate.send_replace(false);
         for notify in self.node.connections.lock().unwrap().iter() {
             notify.notify_waiters();
         }
@@ -340,6 +360,10 @@ impl Fixture {
             block_next: AtomicBool::new(false),
             blocked: AtomicBool::new(false),
             release: Notify::new(),
+            launch_gate: watch::channel(false).0,
+            launch_blocked: Notify::new(),
+            launch_finished: Notify::new(),
+            exchanged: Mutex::new(vec![]),
             business: AtomicUsize::new(0),
         });
         let server = tokio::spawn(node.clone().serve(listener));
@@ -405,6 +429,80 @@ async fn next_error(events: &mut mpsc::Receiver<Event>) -> Result<String> {
         }
     })
     .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> Result<()> {
+    let (fixture, host) = Fixture::new().await?;
+    let (tx, _events, mut snapshots, stop, task) = Backend::spawn(
+        host,
+        &tokio::runtime::Handle::current(),
+        "controlled-local-grant-cancellation".into(),
+    );
+    tx.send(local()).await?;
+    let a = observed(&mut snapshots, |s| {
+        s.online && s.client_id.as_deref() == Some(&fixture.a)
+    })
+    .await?;
+    readonly(&a, &fixture.a);
+
+    // Hold every retry so an HTTP timeout cannot let the old actor-blocking path pass.
+    fixture.node.launch_gate.send_replace(true);
+    fixture.node.disconnect(&fixture.a)?;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        fixture.node.launch_blocked.notified(),
+    )
+    .await?;
+    let reconnecting = observed(&mut snapshots, |s| !s.online && s.identity_busy).await?;
+    assert!(reconnecting.generation > a.generation);
+    tx.send(Command::SwitchProfile(fixture.b_profile.clone()))
+        .await?;
+    let switched = observed(&mut snapshots, |s| {
+        s.profile_id.as_deref() == Some(&fixture.b_profile)
+            && s.client_id.is_none()
+            && !s.identity_busy
+    })
+    .await?;
+    assert!(switched.generation > reconnecting.generation);
+    assert!(*fixture.node.launch_gate.borrow());
+
+    let network = &fixture.node.state.genesis.network_id;
+    let outbox = fixture.a_dir.join("outbox").join(network).join(&fixture.a);
+    let old_profile = Client::open_offline(
+        Arc::new(ClientKey::open(&fixture.a_dir, PASSWORD)?),
+        Endpoint::Gateway(fixture.node.entry.clone()),
+        outbox,
+    )
+    .await
+    .context("cancelled HTTP reconnect must release A's exclusive storage lease")?;
+    drop(old_profile);
+
+    fixture.node.launch_gate.send_replace(false);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        fixture.node.launch_finished.notified(),
+    )
+    .await?;
+    tx.send(local()).await?;
+    let b = observed(&mut snapshots, |s| {
+        s.online
+            && !s.identity_busy
+            && s.profile_id.as_deref() == Some(&fixture.b_profile)
+            && s.client_id.as_deref() == Some(&fixture.b)
+    })
+    .await?;
+    readonly(&b, &fixture.b);
+    assert!(b.generation > switched.generation);
+    assert_eq!(
+        *fixture.node.exchanged.lock().unwrap(),
+        vec![fixture.a.clone(), fixture.b.clone()],
+        "the cancelled A launch response must never be exchanged for a session"
+    );
+    assert_eq!(fixture.node.business.load(Ordering::SeqCst), 0);
+    stop.send_replace(true);
+    task.await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

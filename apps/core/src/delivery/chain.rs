@@ -1650,13 +1650,7 @@ pub(super) mod tests {
             &dir,
             crate::crypto::LocalIdentity::generate(),
         )?);
-        let password = SecretString::new("synthetic configuration regression wallet".into());
-        let wallet = {
-            let mut wallet = delivery.wallet.lock().unwrap();
-            wallet.create(&password)?;
-            wallet.unlock(&password)?;
-            wallet.address()?
-        };
+        assert!(delivery.wallet.lock().unwrap().is_deferred());
         let on_nonce = Arc::new(AtomicBool::new(true));
         let on_receipt = Arc::new(AtomicBool::new(false));
         let captured_delivery = delivery.clone();
@@ -1686,7 +1680,21 @@ pub(super) mod tests {
             chain: Some(rpc.chain.config.clone()),
             ..Default::default()
         };
-        delivery.configure_local(settings.clone())?;
+        delivery
+            .configure_local(settings.clone())
+            .context("enable controlled paid delivery before creating its test wallet")?;
+        let password = SecretString::new("synthetic configuration regression wallet".into());
+        let wallet = {
+            let mut wallet = delivery.wallet.lock().unwrap();
+            assert!(!wallet.is_deferred());
+            wallet
+                .create(&password)
+                .context("create controlled paid wallet")?;
+            wallet
+                .unlock(&password)
+                .context("unlock controlled paid wallet")?;
+            wallet.address()?
+        };
         let budget_id = "44".repeat(32);
         let cap = "100000000000000";
         delivery.register_budget(

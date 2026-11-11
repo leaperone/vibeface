@@ -546,6 +546,10 @@ pub struct Delivery {
     pub max_file_bytes: u64,
     #[serde(default)]
     pub orders: Vec<TransferOrder>,
+    #[serde(default)]
+    pub budgets: Vec<TransferBudget>,
+    #[serde(default)]
+    pub budget_error: Option<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TransferOrder {
@@ -577,6 +581,10 @@ pub struct TransferOrder {
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Payment {
+    #[serde(default)]
+    pub budget_id: Option<String>,
+    #[serde(default)]
+    pub settlement: Option<TransferSettlement>,
     #[serde(default)]
     pub chain_id: Option<String>,
     #[serde(default)]
@@ -1027,6 +1035,64 @@ pub struct TransferProvider {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TransferOffer {
     pub price: String,
+    #[serde(default)]
+    pub settlement: Option<TransferOfferSettlement>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TransferOfferSettlement {
+    pub chain_id: u64,
+    pub escrow: String,
+    pub asset: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransferSettlement {
+    pub earned: String,
+    pub withdrawn: String,
+    pub refunded: String,
+    pub publication: Option<TransferPublication>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransferPublication {
+    pub state: TransferPublicationState,
+    pub total_amount: String,
+    pub economic_cutoff: u64,
+    pub availability_risk: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPublicationState {
+    PrivateReady,
+    DisclosedOutstanding,
+    FinalEarned,
+    FinalSettled,
+    ExpiredUnrevealed,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransferReadyWindow {
+    pub order_id: String,
+    pub index: u16,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransferBudget {
+    pub budget_id: String,
+    pub payer: String,
+    pub payee: String,
+    pub provider_peer: String,
+    pub asset: String,
+    pub deposit: String,
+    pub free: String,
+    pub locked: String,
+    pub earned: String,
+    pub withdrawn: String,
+    pub refunded: String,
+    pub state: String,
+    pub gas_cap: String,
+    pub ready_windows: Vec<TransferReadyWindow>,
+}
+#[derive(Clone, Debug)]
+pub struct TransferFlush {
+    pub budget: TransferBudget,
+    pub orders: Vec<TransferOrder>,
 }
 pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -1034,6 +1100,31 @@ pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
             && ["charity", "paid"].contains(&order.mode.as_str())
             && ["recoverable", "strict"].contains(&order.acceptance.as_str()),
         "传输角色或条款无效"
+    );
+    anyhow::ensure!(
+        transfer_peer_valid(&order.order_id)
+            && [
+                &order.source_peer,
+                &order.receiver_peer,
+                &order.provider_peer
+            ]
+            .iter()
+            .all(|peer| transfer_peer_valid(peer))
+            && uuid::Uuid::parse_str(&order.intent_id)
+                .is_ok_and(|id| id.to_string() == order.intent_id),
+        "订单标识无效"
+    );
+    anyhow::ensure!(
+        order.windows.len() <= 16
+            && order.bytes <= 16 * 65536
+            && order
+                .windows
+                .iter()
+                .enumerate()
+                .all(|(index, window)| window.index == index as u64
+                    && window.bytes <= 65536
+                    && window.committed_bytes <= window.bytes + 68),
+        "订单片段或大小无效"
     );
     for amount in [
         &order.payment.delivery_fee,
@@ -1045,10 +1136,42 @@ pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
         &order.payment.withdrawn,
         &order.payment.refunded,
     ] {
+        anyhow::ensure!(transfer_amount_valid(amount), "订单金额无效");
+    }
+    anyhow::ensure!(
+        transfer_sum([
+            order.payment.delivery_fee.as_str(),
+            order.payment.reservation_fee.as_str(),
+            order.payment.priority_fee.as_str()
+        ])? == order.payment.total
+            && transfer_amount_at_most(&order.payment.withdrawn, &order.payment.earned)
+            && transfer_amount_at_most(
+                &transfer_sum([
+                    order.payment.earned.as_str(),
+                    order.payment.refunded.as_str()
+                ])?,
+                &order.payment.total
+            ),
+        "订单金额不守恒"
+    );
+    if let Some(settlement) = &order.payment.settlement {
         anyhow::ensure!(
-            !amount.is_empty() && amount.len() <= 80 && amount.bytes().all(|b| b.is_ascii_digit()),
-            "订单金额无效"
+            [
+                &settlement.earned,
+                &settlement.withdrawn,
+                &settlement.refunded
+            ]
+            .iter()
+            .all(|value| transfer_amount_valid(value))
+                && transfer_amount_at_most(&settlement.withdrawn, &settlement.earned),
+            "预算结算金额无效"
         );
+        if let Some(publication) = &settlement.publication {
+            anyhow::ensure!(
+                transfer_amount_valid(&publication.total_amount),
+                "批次公开状态无效"
+            );
+        }
     }
     if order.role == "provider" {
         anyhow::ensure!(
@@ -1076,18 +1199,44 @@ pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
                 && order.payment.asset.is_none()
                 && order.payment.payer.is_none()
                 && order.payment.provider_wallet.is_none()
-                && order.payment.tx_hash.is_none(),
+                && order.payment.tx_hash.is_none()
+                && order.payment.budget_id.is_none()
+                && order.payment.settlement.is_none(),
             "免费订单包含付款条件"
         );
     } else {
         anyhow::ensure!(
             order.payment.state != "free"
-                && order.payment.chain_id.is_some()
+                && order
+                    .payment
+                    .chain_id
+                    .as_deref()
+                    .is_some_and(transfer_amount_valid)
                 && order.payment.asset.is_some()
                 && order.payment.payer.is_some()
                 && order.payment.provider_wallet.is_some(),
             "付费订单缺少固定付款信息"
         );
+        anyhow::ensure!(
+            [
+                order.payment.asset.as_deref(),
+                order.payment.payer.as_deref(),
+                order.payment.provider_wallet.as_deref()
+            ]
+            .into_iter()
+            .all(|value| value.is_some_and(transfer_address_valid)),
+            "付费订单固定地址无效"
+        );
+        if order.acceptance == "recoverable" {
+            anyhow::ensure!(
+                order
+                    .payment
+                    .budget_id
+                    .as_deref()
+                    .is_some_and(transfer_peer_valid),
+                "受保护订单缺少固定预付预算"
+            );
+        }
         let d = order
             .deadlines
             .as_ref()
@@ -1340,4 +1489,327 @@ pub fn connection_endpoint(
     };
     endpoint.validate()?;
     Ok(endpoint)
+}
+
+const TRANSFER_MAX_AMOUNT: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+pub fn transfer_amount_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+        && (value.len() < TRANSFER_MAX_AMOUNT.len()
+            || value.len() == TRANSFER_MAX_AMOUNT.len() && value <= TRANSFER_MAX_AMOUNT)
+}
+pub fn transfer_amount_at_most(value: &str, cap: &str) -> bool {
+    transfer_amount_valid(value)
+        && transfer_amount_valid(cap)
+        && (value.len() < cap.len() || value.len() == cap.len() && value <= cap)
+}
+pub fn transfer_sum<'a>(amounts: impl IntoIterator<Item = &'a str>) -> anyhow::Result<String> {
+    let mut total = "0".to_owned();
+    for amount in amounts {
+        anyhow::ensure!(
+            transfer_amount_valid(amount),
+            "金额须为256位范围内的最小单位非负整数"
+        );
+        let mut a = total.bytes().rev();
+        let mut b = amount.bytes().rev();
+        let mut carry = 0;
+        let mut digits = vec![];
+        loop {
+            let left = a.next();
+            let right = b.next();
+            if left.is_none() && right.is_none() && carry == 0 {
+                break;
+            }
+            let sum =
+                left.map_or(0, |byte| byte - b'0') + right.map_or(0, |byte| byte - b'0') + carry;
+            digits.push(b'0' + sum % 10);
+            carry = sum / 10;
+        }
+        digits.reverse();
+        total = digits.into_iter().map(char::from).collect();
+        anyhow::ensure!(transfer_amount_valid(&total), "金额合计超出256位范围");
+    }
+    Ok(total)
+}
+fn transfer_peer_valid(peer: &str) -> bool {
+    peer.len() == 64
+        && peer
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn transfer_address_valid(address: &str) -> bool {
+    address.len() == 42
+        && address.starts_with("0x")
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+pub fn parse_transfer_budgets(value: serde_json::Value) -> anyhow::Result<Vec<TransferBudget>> {
+    let budgets: Vec<TransferBudget> = decode_list(&value, "budgets")?;
+    anyhow::ensure!(budgets.len() <= 128, "预算列表超过设备上限");
+    let mut ids = std::collections::HashSet::new();
+    for budget in &budgets {
+        validate_transfer_budget(budget)?;
+        anyhow::ensure!(ids.insert(&budget.budget_id), "预算ID重复，已暂停预算操作");
+    }
+    Ok(budgets)
+}
+pub fn validate_transfer_budget(budget: &TransferBudget) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        transfer_peer_valid(&budget.budget_id)
+            && transfer_peer_valid(&budget.provider_peer)
+            && [&budget.payer, &budget.payee, &budget.asset]
+                .iter()
+                .all(|value| transfer_address_valid(value)),
+        "预算固定身份无效"
+    );
+    anyhow::ensure!(
+        !budget.payer.eq_ignore_ascii_case(&budget.payee)
+            && ["open", "closing", "closed"].contains(&budget.state.as_str()),
+        "预算角色或状态无效"
+    );
+    anyhow::ensure!(
+        [
+            &budget.deposit,
+            &budget.free,
+            &budget.locked,
+            &budget.earned,
+            &budget.withdrawn,
+            &budget.refunded,
+            &budget.gas_cap
+        ]
+        .iter()
+        .all(|value| transfer_amount_valid(value)),
+        "预算金额无效"
+    );
+    anyhow::ensure!(
+        transfer_sum([
+            budget.free.as_str(),
+            budget.locked.as_str(),
+            budget.earned.as_str(),
+            budget.refunded.as_str()
+        ])? == budget.deposit
+            && transfer_amount_at_most(&budget.withdrawn, &budget.earned),
+        "预算账目不守恒"
+    );
+    let mut windows = std::collections::HashSet::new();
+    anyhow::ensure!(
+        budget.ready_windows.len() <= 256,
+        "预算就绪片段超过设备上限"
+    );
+    for window in &budget.ready_windows {
+        anyhow::ensure!(
+            transfer_peer_valid(&window.order_id)
+                && window.index < 2
+                && windows.insert((&window.order_id, window.index)),
+            "预算就绪片段重复或无效"
+        );
+    }
+    Ok(())
+}
+pub fn transfer_confirmable(order: &TransferOrder, now: u64) -> bool {
+    order.role == "sender"
+        && order.phase == "prepared"
+        && (order.mode == "charity"
+            || order.mode == "paid"
+                && order.acceptance == "recoverable"
+                && order.payment.budget_id.is_some()
+                && order.payment.state == "prepared"
+                && order
+                    .deadlines
+                    .as_ref()
+                    .is_some_and(|deadlines| now <= deadlines.quote_expires_at))
+}
+pub fn transfer_acceptable(order: &TransferOrder) -> bool {
+    order.role == "receiver"
+        && !can_read_transfer(order)
+        && !["refunded", "failed"].contains(&order.phase.as_str())
+        && (order.mode == "charity"
+            || order.mode == "paid"
+                && order.acceptance == "recoverable"
+                && order.payment.budget_id.is_some())
+}
+pub fn validate_transfer_pair(
+    orders: &[TransferOrder; 2],
+    accept: bool,
+    now: u64,
+) -> anyhow::Result<()> {
+    for order in orders {
+        validate_transfer_order(order)?;
+        let eligible = if accept {
+            transfer_acceptable(order)
+        } else {
+            transfer_confirmable(order, now)
+        };
+        anyhow::ensure!(
+            order.mode == "paid"
+                && order.acceptance == "recoverable"
+                && order.windows.len() == 1
+                && eligible,
+            "批次需要两笔各含一个片段、当前可操作的受保护订单"
+        );
+    }
+    let [a, b] = orders;
+    anyhow::ensure!(
+        a.order_id != b.order_id
+            && a.intent_id != b.intent_id
+            && a.payment.budget_id.is_some()
+            && a.payment.budget_id == b.payment.budget_id
+            && a.source_peer == b.source_peer
+            && a.receiver_peer == b.receiver_peer
+            && a.provider_peer == b.provider_peer
+            && a.payment.payer == b.payment.payer
+            && a.payment.provider_wallet == b.payment.provider_wallet
+            && a.payment.asset == b.payment.asset
+            && a.payment.chain_id == b.payment.chain_id
+            && a.payment.gas_cap == b.payment.gas_cap,
+        "两笔订单的预算、设备或固定付款条款不同"
+    );
+    Ok(())
+}
+pub fn transfer_batches(
+    orders: &[TransferOrder],
+    accept: bool,
+    now: u64,
+) -> Vec<[TransferOrder; 2]> {
+    let mut grouped = BTreeMap::<String, Vec<TransferOrder>>::new();
+    for order in orders {
+        let eligible = if accept {
+            transfer_acceptable(order)
+        } else {
+            transfer_confirmable(order, now)
+        };
+        if order.mode == "paid"
+            && eligible
+            && let Some(id) = &order.payment.budget_id
+        {
+            grouped.entry(id.clone()).or_default().push(order.clone());
+        }
+    }
+    grouped
+        .into_values()
+        .filter_map(|orders| {
+            let pair: [TransferOrder; 2] = orders.try_into().ok()?;
+            validate_transfer_pair(&pair, accept, now).ok()?;
+            Some(pair)
+        })
+        .collect()
+}
+pub fn transfer_payment_label(state: &str) -> &'static str {
+    match state {
+        "free" => "免费",
+        "prepared" => "预算待分配",
+        "confirmed" => "预算已分配",
+        "earned" => "服务费已赚取",
+        "withdrawn" => "预算费用已提取",
+        "refunded" => "款已退回",
+        "unknown" => "付款结果未知",
+        "failed" => "付款失败",
+        _ => "付款状态待核对",
+    }
+}
+pub fn transfer_settlement_uncertain(order: &TransferOrder) -> bool {
+    ["unknown", "failed"].contains(&order.payment.state.as_str())
+        || ["reconciling", "failed"].contains(&order.phase.as_str())
+}
+pub fn transfer_publication_label(order: &TransferOrder) -> &'static str {
+    if order.mode == "charity" {
+        return "免费传输，不发生付款或预算结算";
+    }
+    if transfer_settlement_uncertain(order) {
+        return "批次状态待确认，请检查原交易";
+    }
+    let Some(publication) = order
+        .payment
+        .settlement
+        .as_ref()
+        .and_then(|settlement| settlement.publication.as_ref())
+    else {
+        return if order.payment.earned != "0" {
+            "本单费用已赚取"
+        } else if order.payment.refunded != "0" {
+            "本单费用已退款"
+        } else {
+            "等待中转设备结算已就绪批次"
+        };
+    };
+    match publication.state {
+        TransferPublicationState::PrivateReady => "恢复材料仍私密",
+        TransferPublicationState::DisclosedOutstanding => "恢复材料可能已公开，正在确认收入",
+        TransferPublicationState::FinalEarned => "本批约定费用已赚取",
+        TransferPublicationState::FinalSettled => "本批款项已赚取或退款，恢复材料可能已公开",
+        TransferPublicationState::ExpiredUnrevealed => "已过期，尚未公开恢复材料",
+    }
+}
+impl TransferBudget {
+    pub fn batch_binding(&self) -> vibeface_client::DeliveryBudgetBatch {
+        vibeface_client::DeliveryBudgetBatch {
+            budget_id: self.budget_id.clone(),
+            payer: self.payer.clone(),
+            payee: self.payee.clone(),
+            provider_peer: self.provider_peer.clone(),
+            asset: self.asset.clone(),
+            ready_windows: self
+                .ready_windows
+                .iter()
+                .map(|window| vibeface_client::DeliveryReadyWindow {
+                    order_id: window.order_id.clone(),
+                    index: window.index,
+                })
+                .collect(),
+        }
+    }
+}
+
+pub fn transfer_flush_review(
+    budget: &TransferBudget,
+    orders: &[TransferOrder],
+) -> anyhow::Result<TransferFlush> {
+    validate_transfer_budget(budget)?;
+    vibeface_client::delivery_flush_batch_id(&budget.batch_binding())?;
+    let mut selected = vec![];
+    for window in &budget.ready_windows {
+        let order = orders
+            .iter()
+            .find(|order| order.order_id == window.order_id)
+            .ok_or_else(|| anyhow::anyhow!("原就绪片段的订单尚未读回"))?;
+        validate_transfer_order(order)?;
+        anyhow::ensure!(
+            order.role == "provider"
+                && order.mode == "paid"
+                && order.acceptance == "recoverable"
+                && order.provider_peer == budget.provider_peer
+                && order.payment.budget_id.as_deref() == Some(budget.budget_id.as_str())
+                && order
+                    .payment
+                    .payer
+                    .as_deref()
+                    .is_some_and(|payer| payer.eq_ignore_ascii_case(&budget.payer))
+                && order
+                    .payment
+                    .provider_wallet
+                    .as_deref()
+                    .is_some_and(|payee| payee.eq_ignore_ascii_case(&budget.payee))
+                && order
+                    .payment
+                    .asset
+                    .as_deref()
+                    .is_some_and(|asset| asset.eq_ignore_ascii_case(&budget.asset))
+                && order
+                    .windows
+                    .iter()
+                    .any(|item| item.index == u64::from(window.index)),
+            "原就绪片段与预算或订单固定条款不同"
+        );
+        if !selected
+            .iter()
+            .any(|item: &TransferOrder| item.order_id == order.order_id)
+        {
+            selected.push(order.clone());
+        }
+    }
+    Ok(TransferFlush {
+        budget: budget.clone(),
+        orders: selected,
+    })
 }

@@ -1195,3 +1195,316 @@ fn connected_form_waits_for_actual_workspace_before_opening_business(cx: &mut Te
         Route::Home
     ));
 }
+
+mod prepaid_delivery {
+    use super::{app, ui, views};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        AnyWindowHandle, AppContext, Entity, ScrollDelta, TestAppContext, WindowOptions, point, px,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, watch};
+    use ui::*;
+    use views::backend::{Command, Event};
+    fn order(digit: char, role: &str) -> TransferOrder {
+        serde_json::from_value(json!({"order_id":digit.to_string().repeat(64),"intent_id":format!("00000000-0000-4000-8000-00000000000{}",if digit=='d'{1}else{2}),"role":role,"mode":"paid","acceptance":"recoverable","source_peer":"a".repeat(64),"receiver_peer":"b".repeat(64),"provider_peer":"c".repeat(64),"name":if role=="provider"{None}else{Some("file.bin")},"bytes":4,"sha256":if role=="provider"{None}else{Some("f".repeat(64))},"phase":if role=="sender"{"prepared"}else{"funded"},"evidence":"none","windows":[{"index":0,"bytes":4,"committed_bytes":0,"state":"pending","decryption_proven":false}],"deadlines":{"quote_expires_at":2000000000,"hold_deadline":2000000100,"key_deadline":2000000200,"open_deadline":2000000300,"retain_until":2000000400,"priority_deadline":2000000150},"payment":{"chain_id":"1","asset":format!("0x{}","3".repeat(40)),"payer":format!("0x{}","5".repeat(40)),"provider_wallet":format!("0x{}","4".repeat(40)),"budget_id":"2".repeat(64),"state":if role=="sender"{"prepared"}else{"confirmed"},"delivery_fee":"5","reservation_fee":"2","priority_fee":"3","total":"10","gas_cap":"7","earned":"0","withdrawn":"0","refunded":"0","settlement":null}})).unwrap()
+    }
+    fn budget() -> TransferBudget {
+        serde_json::from_value(json!({"budget_id":"2".repeat(64),"payer":format!("0x{}","5".repeat(40)),"payee":format!("0x{}","4".repeat(40)),"provider_peer":"c".repeat(64),"asset":format!("0x{}","3".repeat(40)),"deposit":"100","free":"100","locked":"0","earned":"0","withdrawn":"0","refunded":"0","state":"open","gas_cap":"7","ready_windows":[]})).unwrap()
+    }
+    fn snapshot(role: &str) -> Snapshot {
+        let node = match role {
+            "receiver" => "b",
+            "provider" => "c",
+            _ => "a",
+        }
+        .repeat(64);
+        Snapshot {
+            generation: 7,
+            online: true,
+            synced: true,
+            writable: true,
+            can_manage: true,
+            network: Some("controlled-network".into()),
+            client_id: Some("controlled-client".into()),
+            delivery: Delivery {
+                node_peer: node,
+                wallet: Wallet {
+                    state: "locked".into(),
+                    address: Some(if role == "provider" {
+                        budget().payee
+                    } else {
+                        budget().payer
+                    }),
+                    reason: None,
+                },
+                enabled: true,
+                charity_enabled: true,
+                paid_enabled: true,
+                max_file_bytes: 1048576,
+                budgets: vec![budget()],
+                orders: vec![order('d', role), order('e', role)],
+                providers: vec![TransferProvider {
+                    device_id: "c".repeat(64),
+                    paid: true,
+                    offer: Some(TransferOffer {
+                        price: "5".into(),
+                        settlement: Some(TransferOfferSettlement {
+                            chain_id: 1,
+                            escrow: format!("0x{}", "6".repeat(40)),
+                            asset: budget().asset,
+                        }),
+                    }),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    struct Harness {
+        window: AnyWindowHandle,
+        view: Entity<app::Desktop>,
+        commands: mpsc::Receiver<Command>,
+        _events: mpsc::Sender<Event>,
+        _snapshots: watch::Sender<Arc<Snapshot>>,
+    }
+    fn open(cx: &mut TestAppContext, snapshot: Snapshot) -> Harness {
+        cx.update(gpui_kit::init);
+        let (tx, commands) = mpsc::channel(32);
+        let (events, rx) = mpsc::channel(32);
+        let (snapshots, watch) = watch::channel(Arc::new(snapshot.clone()));
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
+                cx.new(|cx| app::Desktop::new(tx, rx, watch, window, cx))
+            })
+            .unwrap()
+        });
+        view.update(cx, |view, cx| {
+            view.snapshot = Arc::new(snapshot);
+            view.route = Route::Transfers;
+            cx.notify();
+        });
+        Harness {
+            window,
+            view,
+            commands,
+            _events: events,
+            _snapshots: snapshots,
+        }
+    }
+    fn click(h: &Harness, cx: &mut TestAppContext, id: &str) {
+        let id = gpui_kit::SharedString::from(id.to_owned());
+        h.window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                let target = window.find(id.clone());
+                if !target.visible() {
+                    let delta = px(350.) - target.bounds().center().y;
+                    window.scroll("page-scroll", ScrollDelta::Pixels(point(px(0.), delta)), cx);
+                    window.render_frame(cx);
+                }
+                window.click(id, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+    fn command(h: &mut Harness) -> Command {
+        match h.commands.try_recv().expect("explicit financial command") {
+            Command::Scoped {
+                generation,
+                command,
+            } => {
+                assert_eq!(generation, 7);
+                *command
+            }
+            _ => panic!("financial command lost its rendered scope"),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn two_original_orders_are_reviewed_before_batch_confirmation(cx: &mut TestAppContext) {
+        let mut h = open(cx, snapshot("sender"));
+        click(&h, cx, &format!("confirm-batch-{}", "2".repeat(64)));
+        assert!(h.commands.try_recv().is_err());
+        h.view.update(cx, |view, cx| {
+            let mut next = (*view.snapshot).clone();
+            next.delivery.orders[0].payment.delivery_fee = "94".into();
+            next.delivery.orders[0].payment.total = "99".into();
+            view.snapshot = Arc::new(next);
+            cx.notify();
+        });
+        h.window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    window.find("delivery-financial-review").label(),
+                    Some(
+                        format!(
+                            "两笔原订单 {} 和 {} · 预算 {} · 服务费合计 20",
+                            "d".repeat(64),
+                            "e".repeat(64),
+                            "2".repeat(64)
+                        )
+                        .as_str()
+                    )
+                );
+            })
+            .unwrap();
+        click(&h, cx, "confirm-danger");
+        match command(&mut h) {
+            Command::DeliveryConfirmBatch(orders) => {
+                assert_eq!(orders[0].order_id, "d".repeat(64));
+                assert_eq!(orders[1].order_id, "e".repeat(64));
+                assert_eq!(orders[0].payment.total, "10");
+                assert_eq!(orders[1].payment.total, "10");
+            }
+            _ => panic!("not the reviewed pair"),
+        }
+    }
+    #[gpui_kit::test]
+    fn receiver_batch_and_provider_flush_require_distinct_explicit_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let mut h = open(cx, snapshot("receiver"));
+        click(&h, cx, &format!("accept-batch-{}", "2".repeat(64)));
+        assert!(h.commands.try_recv().is_err());
+        click(&h, cx, "confirm-danger");
+        assert!(matches!(command(&mut h), Command::DeliveryAcceptBatch(_)));
+        let mut state = snapshot("provider");
+        state.delivery.budgets[0].ready_windows = vec![
+            TransferReadyWindow {
+                order_id: "d".repeat(64),
+                index: 0,
+            },
+            TransferReadyWindow {
+                order_id: "e".repeat(64),
+                index: 0,
+            },
+        ];
+        let mut h = open(cx, state);
+        click(&h, cx, &format!("flush-budget-{}", "2".repeat(64)));
+        assert!(h.commands.try_recv().is_err());
+        click(&h, cx, "confirm-danger");
+        match command(&mut h) {
+            Command::DeliveryFlushBudget(review) => {
+                assert_eq!(review.budget.ready_windows.len(), 2);
+                assert_eq!(review.orders.len(), 2);
+                assert_eq!(review.budget.budget_id, "2".repeat(64));
+                assert!(
+                    vibeface_client::delivery_flush_batch_id(&review.budget.batch_binding())
+                        .is_ok()
+                );
+            }
+            _ => panic!("not the original budget review"),
+        }
+    }
+    #[gpui_kit::test]
+    fn paid_form_uses_existing_immutable_budget_and_exposes_no_strict_choice(
+        cx: &mut TestAppContext,
+    ) {
+        let mut h = open(cx, snapshot("sender"));
+        click(&h, cx, &format!("prepare-budget-{}", "2".repeat(64)));
+        let values = h.view.read_with(cx, |view, cx| {
+            let form = view.form.as_ref().unwrap();
+            assert!(
+                !form
+                    .fields
+                    .iter()
+                    .any(|field| field.key == "acceptance" || field.key == "budget_id")
+            );
+            form.values(cx)
+        });
+        assert_eq!(values["budget_id"], "2".repeat(64));
+        assert_eq!(values["mode"], "paid");
+        assert_eq!(values["max_gas_amount"], "7");
+        click(&h, cx, "save-form");
+        match command(&mut h) {
+            Command::Save { values, .. } => {
+                assert_eq!(values["budget_id"], "2".repeat(64));
+                assert!(!values.contains_key("acceptance"));
+            }
+            _ => panic!("expected only preparation intent"),
+        }
+    }
+    #[gpui_kit::test]
+    fn permission_loss_disables_the_frozen_financial_confirmation(cx: &mut TestAppContext) {
+        let mut h = open(cx, snapshot("sender"));
+        click(&h, cx, &format!("confirm-batch-{}", "2".repeat(64)));
+        h.view.update(cx, |view, cx| {
+            view.snapshot = Arc::new(Snapshot {
+                can_manage: false,
+                ..(*view.snapshot).clone()
+            });
+            cx.notify();
+        });
+        click(&h, cx, "confirm-danger");
+        assert!(h.commands.try_recv().is_err());
+    }
+    #[test]
+    fn cross_budget_or_third_order_never_becomes_an_automatic_pair() {
+        let a = order('d', "sender");
+        let mut b = order('e', "sender");
+        b.payment.budget_id = Some("3".repeat(64));
+        assert!(validate_transfer_pair(&[a.clone(), b.clone()], false, 1).is_err());
+        assert!(transfer_batches(&[a.clone(), b], false, 1).is_empty());
+        let b = order('e', "sender");
+        let mut c = b.clone();
+        c.order_id = "9".repeat(64);
+        c.intent_id = "00000000-0000-4000-8000-000000000003".into();
+        assert!(transfer_batches(&[a, b, c], false, 1).is_empty());
+    }
+    #[test]
+    fn public_budget_and_publication_states_preserve_unknown_and_historical_strict() {
+        let mut value = serde_json::to_value(budget()).unwrap();
+        value["free"] = json!("99");
+        assert!(parse_transfer_budgets(json!({"budgets":[value]})).is_err());
+        assert!(parse_transfer_budgets(json!({"budgets":[budget(),budget()]})).is_err());
+        let mut order = order('d', "sender");
+        order.payment.settlement = Some(TransferSettlement {
+            earned: "20".into(),
+            withdrawn: "10".into(),
+            refunded: "0".into(),
+            publication: Some(TransferPublication {
+                state: TransferPublicationState::DisclosedOutstanding,
+                total_amount: "20".into(),
+                economic_cutoff: 2000000200,
+                availability_risk: Some("节点可用性待确认".into()),
+            }),
+        });
+        let decoded: TransferOrder =
+            serde_json::from_value(serde_json::to_value(&order).unwrap()).unwrap();
+        assert_eq!(
+            decoded
+                .payment
+                .settlement
+                .as_ref()
+                .unwrap()
+                .publication
+                .as_ref()
+                .unwrap()
+                .availability_risk
+                .as_deref(),
+            Some("节点可用性待确认")
+        );
+        assert_eq!(
+            transfer_publication_label(&decoded),
+            "恢复材料可能已公开，正在确认收入"
+        );
+        order.payment.state = "unknown".into();
+        assert_eq!(transfer_payment_label(&order.payment.state), "付款结果未知");
+        assert_eq!(
+            transfer_publication_label(&order),
+            "批次状态待确认，请检查原交易"
+        );
+        order.acceptance = "strict".into();
+        order.payment.budget_id = None;
+        assert!(validate_transfer_order(&order).is_ok());
+        assert!(!transfer_confirmable(&order, 1));
+        assert!(!transfer_acceptable(&order));
+        assert_eq!(
+            transfer_sum(["340282366920938463463374607431768211455", "1"]).unwrap(),
+            "340282366920938463463374607431768211456"
+        );
+    }
+}

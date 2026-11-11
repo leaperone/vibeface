@@ -7,6 +7,26 @@ impl Backend {
         let get = |key: &str| values.get(key).cloned().unwrap_or_default();
         {
             ensure!(self.state.can_manage, "仅管理设备可准备订单");
+            let mode: vibeface_client::DeliveryMode = serde_json::from_value(json!(get("mode")))?;
+            ensure!(
+                get("acceptance").is_empty() || get("acceptance") == "recoverable",
+                "新传输仅支持可恢复验收，不再准备Strict订单"
+            );
+            let acceptance = vibeface_client::DeliveryAcceptance::Recoverable;
+            let budget_id = if matches!(mode, vibeface_client::DeliveryMode::Paid) {
+                let id = get("budget_id");
+                ensure!(!id.is_empty(), "请从已有开放预算选择受保护付费传输");
+                self.prepare_budget(
+                    &id,
+                    &get("provider_peer"),
+                    &get("max_service_amount"),
+                    &get("max_gas_amount"),
+                )
+                .await?;
+                Some(id)
+            } else {
+                None
+            };
             let path = PathBuf::from(get("file"));
             let metadata = tokio::fs::metadata(&path).await?;
             ensure!(
@@ -23,10 +43,7 @@ impl Backend {
                 content.len() as u64 == metadata.len(),
                 "文件读取过程中大小改变"
             );
-            let mode: vibeface_client::DeliveryMode = serde_json::from_value(json!(get("mode")))?;
-            let acceptance: vibeface_client::DeliveryAcceptance =
-                serde_json::from_value(json!(get("acceptance")))?;
-            let intent_id=self.delivery_intent(json!({"receiver":get("receiver_peer"),"provider":get("provider_peer"),"mode":get("mode"),"acceptance":get("acceptance"),"name":name,"bytes":content.len(),"sha256":format!("{:x}",Sha256::digest(&content)),"service_cap":get("max_service_amount"),"gas_cap":get("max_gas_amount")})).await?;
+            let intent_id=self.delivery_intent(json!({"receiver":get("receiver_peer"),"provider":get("provider_peer"),"mode":get("mode"),"acceptance":"recoverable","name":name,"bytes":content.len(),"sha256":format!("{:x}",Sha256::digest(&content)),"service_cap":get("max_service_amount"),"gas_cap":get("max_gas_amount"),"budget_id":budget_id})).await?;
             self.submit(Action::Delivery(vibeface_client::DeliveryAction::Prepare(
                 vibeface_client::DeliveryPrepare {
                     intent_id,
@@ -38,6 +55,7 @@ impl Backend {
                     content_base64: base64::engine::general_purpose::STANDARD.encode(content),
                     max_service_amount: get("max_service_amount"),
                     max_gas_amount: get("max_gas_amount"),
+                    budget_id,
                 },
             )))
             .await?;

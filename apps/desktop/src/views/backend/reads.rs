@@ -64,7 +64,7 @@ pub(super) struct ReadCompleted {
     result: ReadReply,
 }
 enum ReadReply {
-    Refresh(Result<RefreshReply>),
+    Refresh(Result<Box<RefreshReply>>),
     Page {
         ticket: PageTicket,
         conversation: String,
@@ -80,6 +80,7 @@ struct DeliveryReply {
     status: Value,
     orders: Value,
     providers: Value,
+    budgets: Option<Result<Value>>,
 }
 struct RefreshReply {
     home: Value,
@@ -333,7 +334,7 @@ impl Backend {
                 .send(ReadCompleted {
                     id: result_id,
                     scope: result_scope,
-                    result: ReadReply::Refresh(result),
+                    result: ReadReply::Refresh(result.map(Box::new)),
                 })
                 .await;
         });
@@ -532,10 +533,27 @@ impl Backend {
                 let providers = client
                     .read(ReadRequest::Delivery(DeliveryRead::Providers))
                     .await?;
+                let budgets = if matches!(
+                    client.authority(),
+                    vibeface_client::ClientAuthority::Membership { can_manage: true }
+                ) && (status["paid_enabled"].as_bool() == Some(true)
+                    || orders["orders"]
+                        .as_array()
+                        .is_some_and(|orders| orders.iter().any(|order| order["mode"] == "paid")))
+                {
+                    Some(
+                        client
+                            .read(ReadRequest::Delivery(DeliveryRead::Budgets))
+                            .await,
+                    )
+                } else {
+                    None
+                };
                 Ok(DeliveryReply {
                     status,
                     orders,
                     providers,
+                    budgets,
                 })
             }
             .await;
@@ -598,7 +616,7 @@ impl Backend {
                     })
                 });
                 let applied = match result {
-                    Ok(reply) => self.apply_refresh(reply).await,
+                    Ok(reply) => self.apply_refresh(*reply).await,
                     Err(error) => {
                         self.state.online = false;
                         self.state.writable = false;
@@ -663,8 +681,13 @@ impl Backend {
                 finish_read_task(&mut self.reads.delivery).await?;
                 let again = std::mem::take(&mut self.reads.delivery_again);
                 let reply = result?;
-                self.apply_delivery_refresh(reply.status, reply.orders, reply.providers)
-                    .await?;
+                self.apply_delivery_refresh(
+                    reply.status,
+                    reply.orders,
+                    reply.providers,
+                    reply.budgets,
+                )
+                .await?;
                 if again {
                     self.start_delivery_refresh().await?;
                 }

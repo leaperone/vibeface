@@ -145,7 +145,10 @@ pub enum Command {
         paid: bool,
     },
     DeliveryConfirm(TransferOrder),
-    DeliveryAccept(String),
+    DeliveryAccept(TransferOrder),
+    DeliveryConfirmBatch(Box<[TransferOrder; 2]>),
+    DeliveryAcceptBatch(Box<[TransferOrder; 2]>),
+    DeliveryFlushBudget(Box<TransferFlush>),
     DeliveryReconcile(String),
     DeliverySave {
         order: TransferOrder,
@@ -708,6 +711,7 @@ fn settings_rows(value: &Value) -> Vec<(String, String)> {
 
 fn same_terms(a: &TransferOrder, b: &TransferOrder) -> bool {
     a.order_id == b.order_id
+        && a.role == b.role
         && a.intent_id == b.intent_id
         && a.mode == b.mode
         && a.acceptance == b.acceptance
@@ -726,6 +730,7 @@ fn same_terms(a: &TransferOrder, b: &TransferOrder) -> bool {
         && a.payment.gas_cap == b.payment.gas_cap
         && a.payment.payer == b.payment.payer
         && a.payment.provider_wallet == b.payment.provider_wallet
+        && a.payment.budget_id == b.payment.budget_id
         && a.deadlines == b.deadlines
 }
 
@@ -740,25 +745,24 @@ fn parse_optional_bool(value: &str) -> Result<Option<bool>> {
 
 impl Command {
     pub fn requires_session(&self) -> bool {
-        match self {
+        !matches!(
+            self,
             Self::SwitchProfile(_)
-            | Self::ConfirmIdentityBackup(_)
-            | Self::ReconcileIdentity
-            | Self::DiscardIdentity
-            | Self::Host(_)
-            | Self::Disconnect
-            | Self::Refresh => false,
-            Self::Save {
-                editor:
-                    Editor::Connect
-                    | Editor::ConnectLocal
-                    | Editor::CreateNetwork
-                    | Editor::Join
-                    | Editor::Recovery,
-                ..
-            } => false,
-            _ => true,
-        }
+                | Self::ConfirmIdentityBackup(_)
+                | Self::ReconcileIdentity
+                | Self::DiscardIdentity
+                | Self::Host(_)
+                | Self::Disconnect
+                | Self::Refresh
+                | Self::Save {
+                    editor: Editor::Connect
+                        | Editor::ConnectLocal
+                        | Editor::CreateNetwork
+                        | Editor::Join
+                        | Editor::Recovery,
+                    ..
+                }
+        )
     }
 }
 
@@ -958,6 +962,9 @@ impl Command {
             Self::DeliveryConfigure { .. }
                 | Self::DeliveryConfirm(_)
                 | Self::DeliveryAccept(_)
+                | Self::DeliveryConfirmBatch(_)
+                | Self::DeliveryAcceptBatch(_)
+                | Self::DeliveryFlushBudget(_)
                 | Self::DeliveryReconcile(_)
         ) {
             return snapshot.online && snapshot.can_manage;
@@ -1013,6 +1020,14 @@ impl Backend {
 }
 
 #[cfg(test)]
+impl Backend {
+    fn test_phase(phase: &'static str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "native backend phase: {phase}");
+    }
+}
+
+#[cfg(test)]
 mod frame_tests {
     use super::Backend;
 
@@ -1026,13 +1041,5 @@ mod frame_tests {
             frames.iter().all(|(_, size)| *size <= 256 * 1024),
             "native composed futures exceed the256KiB generator budget: {frames:?}"
         );
-    }
-}
-
-#[cfg(test)]
-impl Backend {
-    fn test_phase(phase: &'static str) {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "native backend phase: {phase}");
     }
 }

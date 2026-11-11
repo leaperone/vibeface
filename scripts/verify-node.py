@@ -270,6 +270,13 @@ async function connect(input) {
         send(id, method, params);
       });
     },
+    // The server completed the request, but Python never receives its successful body.
+    async dropResponse(method, params) {
+      const response = await this.request(method, params);
+      if (Object.hasOwn(response, 'error')) throw new Error(`request rejected before reply discard: ${response.error}`);
+      close(new Error('application reply discarded'));
+      return { sent: true, application_reply_discarded: true };
+    },
     // The request leaves, then the connection drops before any answer: an unknown write.
     drop(method, params) { send(String(++sequence), method, params); close(new Error('dropped after send')); return { sent: true }; },
   };
@@ -379,6 +386,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const connection = connections.get(input.connection || 'main');
         if (!connection) throw new Error('no connection');
         if (input.op === 'request') result = await connection.request(input.method, input.params || {});
+        else if (input.op === 'drop_response') result = await connection.dropResponse(input.method, input.params || {});
         else if (input.op === 'drop') result = connection.drop(input.method, input.params || {});
         else if (input.op === 'events') result = connection.events;
         else throw new Error('unknown client command');
@@ -390,6 +398,65 @@ for await (const line of createInterface({ input: process.stdin })) {
 for (const connection of connections.values()) connection.close();
 for (const key of roots.values()) key.free();
 """
+
+
+def client_response_drop_selfcheck():
+    start = CLIENT_SOURCE.index("  const send =")
+    end = CLIENT_SOURCE.index("\n}\nfor await", start)
+    factory = "const factory = new Function('pending', 'events', 'close', 'queued', 'channel', 'socket', 'encoder', " \
+              + json.dumps("let sequence = 0; let closed = false; let failure;\n" + CLIENT_SOURCE[start:end]) + ");\n"
+    check = r"""
+import assert from 'node:assert/strict';
+function fixture() {
+  const pending = new Map();
+  let sent;
+  let closes = 0;
+  const channel = { sealMessage: bytes => [bytes] };
+  const socket = { send: bytes => { sent = JSON.parse(new TextDecoder().decode(bytes)); } };
+  const connection = factory(pending, [], () => { closes++; }, [], channel, socket, new TextEncoder());
+  return { connection, pending, sent: () => sent, closes: () => closes,
+    deliver(response) {
+      const request = pending.get(response.id);
+      if (!request) return false;
+      pending.delete(response.id); clearTimeout(request.timer); request.resolve(response); return true;
+    },
+  };
+}
+const params = { method: 'create_bot', bot_id: 'fixed-bot', attestation: { signature: 'fixed-signed-fixture' } };
+const success = fixture();
+const outstanding = success.connection.dropResponse('rpc', params);
+let exposed = false;
+outstanding.then(() => { exposed = true; });
+await Promise.resolve();
+assert.equal(exposed, false); assert.equal(success.closes(), 0);
+assert.deepEqual(success.sent().params, params);
+assert.equal(success.deliver({ id: 'wrong-id', result: {} }), false);
+assert.equal(success.closes(), 0);
+assert.equal(success.deliver({ id: success.sent().id, result: { private: 'MUST-NOT-REACH-PYTHON' } }), true);
+const marker = await outstanding;
+assert.deepEqual(marker, { sent: true, application_reply_discarded: true });
+assert.equal(JSON.stringify(marker).includes('MUST-NOT-REACH-PYTHON'), false);
+assert.equal(success.closes(), 1); assert.equal(success.pending.size, 0);
+for (const error of ['authoritative fixture refusal', '', null]) {
+  const rejected = fixture();
+  const response = rejected.connection.dropResponse('rpc', params);
+  rejected.deliver({ id: rejected.sent().id, error, result: { private: 'MUST-NOT-REACH-PYTHON' } });
+  await assert.rejects(response, /request rejected before reply discard/);
+  assert.equal(rejected.closes(), 0); assert.equal(rejected.pending.size, 0);
+}
+const immediate = fixture();
+assert.deepEqual(immediate.connection.drop('rpc', params), { sent: true });
+assert.deepEqual(immediate.sent().params, params);
+assert.equal(immediate.closes(), 1); assert.equal(immediate.pending.size, 0);
+console.log(JSON.stringify({ status: 'PASS', matching_response_required: true, success_body_exposed: false,
+  rejected_responses: 3, immediate_drop_preserved: true, network_sockets: 0 }));
+"""
+    result = subprocess.run(["node", "--input-type=module"], input=factory + check, text=True, capture_output=True)
+    require(result.returncode == 0, "the response-drop helper selfcheck passes without a Node service or network")
+    value = json.loads(result.stdout)
+    require(value["status"] == "PASS" and value["success_body_exposed"] is False,
+            "successful replies stay private to the discard boundary")
+    print(result.stdout.strip())
 
 
 class Client:
@@ -5534,11 +5601,13 @@ def phase4_acceptance(options):
                    "owner_attestation": a.client.command("attest", network_id=network, scope_id=conversation, body={
                        "type": "conversation_owner", "scheduler_node": a.device_id, "epoch": 1}),
                    "attestation": a.client.attestation("create_bot", dict(definition))}
-        at_p.command("drop", method="rpc", params=request)
+        lost_reply = at_p.command("drop_response", method="rpc", params=request)
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "P's successful creation reply is discarded before the application receives its body")
         at_p.connect(p.device_id)
         at_p.authenticate()
         at_b = browser(b)
-        wait_for("P's creation, whose answer was lost, reaches B", lambda: any(
+        wait_for("P's committed creation, whose application reply was discarded, reaches B", lambda: any(
             bot["bot_id"] == "p4-bot" for bot in at_b.rpc("bots")["bots"]), timeout=60)
         retried = at_b.call("rpc", request)["bot"]
         original = next(bot for bot in definitions_of(at_p.rpc("bots")["bots"]) if bot["bot_id"] == "p4-bot")
@@ -5546,7 +5615,8 @@ def phase4_acceptance(options):
         wait_for("the conversation reaches A", lambda: converged(members, network), timeout=60)
         owners = {client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] for client in (a.client, at_b, at_p)}
         require(owners == {a.device_id}, "every entrance records the owner the browser signed")
-        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A")
+        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A",
+               reply_boundary="discarded_before_application")
 
         first_dir = folder("p4-first", released=True)
         side_effect = workspace / "p4-side-effect.txt"
@@ -6705,9 +6775,11 @@ def auto_route_acceptance(options):
                     "report_results": False}
         target.client.message_arguments(original)
         signed = {**original, "attestation": target.client.attestation("message", dict(original))}
-        target.client.command("drop", method="rpc", params={"method": "message", **signed})
+        lost_reply = target.client.command("drop_response", method="rpc", params={"method": "message", **signed})
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "the durable input reply is discarded before the application receives its body")
         marker = workspace / "auto-route-count.txt"
-        wait_for("exactly one Agent write starts after the dropped send", lambda:
+        wait_for("exactly one Agent write starts after the committed input's application reply is discarded", lambda:
                  marker.exists() and marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         target.client.connect()
         target.client.authenticate()
@@ -6719,7 +6791,8 @@ def auto_route_acceptance(options):
         require(duplicate["trigger"] == trigger, "resubmitting the unchanged signed request returns the original job")
         require_quiet("a same-ID resubmission never repeats the host write", lambda:
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
-        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
+        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1,
+               reply_boundary="discarded_before_application")
 
         joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
@@ -7538,6 +7611,7 @@ if __name__ == "__main__":
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--client-response-drop-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check the free mesh, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="retired Strict full-delivery runner; fails explicitly without starting paid work")
         modes.add_argument("--delivery-protected", action="store_true", help="run fresh two-order protected budgets with five genuine receipts in the bounded Linux proof sandbox")
@@ -7557,7 +7631,8 @@ if __name__ == "__main__":
         try:
             needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
                                  or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin
-                                 or arguments.delivery or arguments.delivery_protected_selfcheck)
+                                 or arguments.delivery or arguments.delivery_protected_selfcheck
+                                 or arguments.client_response_drop_selfcheck)
             if needs_process:
                 require(arguments.binary is not None, "--binary is required for Node process acceptance")
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
@@ -7586,6 +7661,8 @@ if __name__ == "__main__":
                 native_provider_selfcheck(arguments)
             elif arguments.native_clipboard_selfcheck:
                 native_clipboard_selfcheck(arguments)
+            elif arguments.client_response_drop_selfcheck:
+                client_response_drop_selfcheck()
             elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.delivery_protected_selfcheck:

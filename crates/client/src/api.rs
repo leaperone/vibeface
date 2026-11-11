@@ -119,6 +119,7 @@ pub enum DeliveryRead {
     Status,
     List,
     Providers,
+    Budgets,
     Get { order_id: String },
     FindIntent { intent_id: String },
     Read { order_id: String },
@@ -282,6 +283,33 @@ pub struct DeliveryPrepare {
     pub content_base64: String,
     pub max_service_amount: String,
     pub max_gas_amount: String,
+    pub budget_id: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeliveryReadyWindow {
+    pub order_id: String,
+    pub index: u16,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryBudgetBatch {
+    pub budget_id: String,
+    pub payer: String,
+    pub payee: String,
+    pub provider_peer: String,
+    pub asset: String,
+    pub ready_windows: Vec<DeliveryReadyWindow>,
+}
+/// A flush intent commits the original budget terms and exact one or two ready windows.
+pub fn delivery_flush_batch_id(batch: &DeliveryBudgetBatch) -> Result<String> {
+    let batch = canonical_budget_batch(batch.clone())?;
+    ensure!(
+        (1..=2).contains(&batch.ready_windows.len()),
+        "a flush requires one or two original ready windows"
+    );
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        "vibeface:delivery-flush:v1",
+        batch,
+    ))?)))
 }
 #[derive(Clone)]
 pub enum DeliveryAction {
@@ -299,6 +327,16 @@ pub enum DeliveryAction {
     },
     Reconcile {
         order_id: String,
+    },
+    ConfirmBatch {
+        intent_ids: [String; 2],
+    },
+    AcceptBatch {
+        order_ids: [String; 2],
+    },
+    FlushBudget {
+        budget_id: String,
+        batch_id: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1203,8 +1241,7 @@ impl Client {
         }
         let mut operation = self.prepare(action)?;
         operation.prerequisites = prerequisites;
-        db.prepare(&operation)?;
-        Ok(operation.snapshot)
+        db.prepare(&operation)
     }
     /// Local staging survives transport loss; only an admitted writer changes Prepared to Unknown.
     pub async fn submit(&self, action: Action) -> Result<OperationSnapshot> {
@@ -1254,7 +1291,7 @@ impl Client {
     }
     async fn send_prepared(&self, id: String) -> Result<OperationSnapshot> {
         let lookup = id.clone();
-        let operation = self.stored(move |db| db.get(&lookup)).await?;
+        let mut operation = self.stored(move |db| db.get(&lookup)).await?;
         ensure!(
             operation.snapshot.target_node == self.target,
             "original operation cannot switch target"
@@ -1294,6 +1331,7 @@ impl Client {
         if !self.stored(move |db| db.can_begin(&check)).await? {
             return self.stored(move |db| Ok(db.get(&id)?.snapshot)).await;
         }
+        operation = self.bind_delivery_effect(operation).await?;
         let sent = async {
             if let Some(conversation_id) = &operation.upload_scope {
                 for attachment in &operation.attachments {
@@ -1378,6 +1416,13 @@ impl Client {
         if op.snapshot.state != OperationState::Unknown {
             return Ok(op.snapshot);
         }
+        if matches!(&op.reconciliation, Reconciliation::DeliveryBatch { .. }) {
+            return self.reconcile_delivery_batch(op).await;
+        }
+        if matches!(&op.reconciliation, Reconciliation::DeliveryFlush { .. }) {
+            // No authoritative flush receipt exists. A budget balance is not an admission receipt.
+            return Ok(op.snapshot);
+        }
         let result=match &op.reconciliation {
             Reconciliation::Input {conversation_id,message_id,target} => self.connection.call("rpc",json!({"method":"input_receipt","conversation_id":conversation_id,"message_id":message_id,"target":target})).await?,
             Reconciliation::Memory {conversation_id,memory_id} => self.connection.call("rpc",json!({"method":"memory_state","conversation_id":conversation_id,"memory_id":memory_id,"operation_id":op.snapshot.id})).await?,
@@ -1397,7 +1442,7 @@ impl Client {
             Reconciliation::Settings {kind}=>self.connection.call(crate::settings::read_method(*kind),json!({})).await?,
             Reconciliation::StopReply {conversation_id,..}=>self.connection.call("rpc",json!({"method":"conversation","conversation_id":conversation_id})).await?,
             Reconciliation::StopWork {conversation_id,work_id}=>self.connection.call("rpc",json!({"method":"work_detail","conversation_id":conversation_id,"work_id":work_id})).await?,
-            Reconciliation::Manual => return Ok(op.snapshot),
+            Reconciliation::DeliveryBatch { .. } | Reconciliation::DeliveryFlush { .. } | Reconciliation::Manual => return Ok(op.snapshot),
         };
         let state = match &op.reconciliation {
             Reconciliation::Input {
@@ -1535,6 +1580,11 @@ impl Client {
                     let request: Value = serde_json::from_slice(&op.bytes)?;
                     if operation == "prepare" {
                         validate_delivery_prepare(&request["params"], &result["order"])?;
+                        ensure!(
+                            result["order"]["role"] == "sender"
+                                && result["order"]["source_peer"] == op.snapshot.target_node,
+                            "prepared receipt belongs to another sender Node"
+                        );
                     }
                     match operation.as_str() {
                         "prepare" => Some(OperationState::Accepted),
@@ -1588,7 +1638,9 @@ impl Client {
                 )
                 .then_some(OperationState::Accepted)
             }
-            Reconciliation::Manual => None,
+            Reconciliation::DeliveryBatch { .. }
+            | Reconciliation::DeliveryFlush { .. }
+            | Reconciliation::Manual => None,
         };
         if let Some(state) = state {
             let id = op.snapshot.id;
@@ -1997,6 +2049,7 @@ impl Client {
                         json!({"op":"configure","enabled":enabled,"charity_enabled":charity_enabled,"paid_enabled":paid_enabled})
                     }
                     DeliveryAction::Prepare(prepare) => {
+                        validate_new_delivery_prepare(&prepare)?;
                         id = format!("prepare-{}", prepare.intent_id);
                         let mut value = serde_json::to_value(prepare)?;
                         value["op"] = json!("prepare");
@@ -2013,8 +2066,53 @@ impl Client {
                     DeliveryAction::Reconcile { order_id } => {
                         json!({"op":"reconcile","order_id":order_id})
                     }
+                    DeliveryAction::ConfirmBatch { intent_ids } => {
+                        let ids = canonical_delivery_pair(intent_ids, true)?;
+                        reconciliation = Reconciliation::DeliveryBatch {
+                            kind: crate::outbox::DeliveryBatchKind::Confirm,
+                            ids: ids.clone(),
+                            binding: None,
+                        };
+                        let params = json!({"op":"confirm_batch","intent_ids":ids});
+                        id = self.operation_id(
+                            "delivery",
+                            &json!({"target_node":self.target,"request":params}),
+                        )?;
+                        params
+                    }
+                    DeliveryAction::AcceptBatch { order_ids } => {
+                        let ids = canonical_delivery_pair(order_ids, false)?;
+                        reconciliation = Reconciliation::DeliveryBatch {
+                            kind: crate::outbox::DeliveryBatchKind::Accept,
+                            ids: ids.clone(),
+                            binding: None,
+                        };
+                        let params = json!({"op":"accept_batch","order_ids":ids});
+                        id = self.operation_id(
+                            "delivery",
+                            &json!({"target_node":self.target,"request":params}),
+                        )?;
+                        params
+                    }
+                    DeliveryAction::FlushBudget {
+                        budget_id,
+                        batch_id,
+                    } => {
+                        vibeface_secure::membership::validate_hash(&budget_id)?;
+                        vibeface_secure::membership::validate_hash(&batch_id)?;
+                        id = self.operation_id("delivery", &json!({"target_node":self.target,"budget_id":budget_id,"batch_id":batch_id}))?;
+                        reconciliation = Reconciliation::DeliveryFlush {
+                            budget_id: budget_id.clone(),
+                            batch_id,
+                            binding: None,
+                        };
+                        json!({"op":"flush_budget","budget_id":budget_id})
+                    }
                 };
-                if params["op"] != "configure" {
+                if !matches!(
+                    params["op"].as_str(),
+                    Some("configure" | "confirm_batch" | "accept_batch" | "flush_budget")
+                ) {
                     reconciliation = Reconciliation::Delivery {
                         intent_id: params["intent_id"].as_str().map(str::to_owned),
                         order_id: params["order_id"].as_str().map(str::to_owned),
@@ -2075,7 +2173,35 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
     let request: Value = serde_json::from_slice(&op.bytes)?;
     if request["method"] == "delivery" {
         match request["params"]["op"].as_str() {
-            Some("prepare") => validate_delivery_prepare(&request["params"], result)?,
+            Some("prepare") => {
+                validate_delivery_prepare(&request["params"], result)?;
+                ensure!(
+                    result["role"] == "sender" && result["source_peer"] == op.snapshot.target_node,
+                    "prepared order belongs to another sender Node"
+                );
+            }
+            Some("confirm_batch" | "accept_batch") => {
+                let Reconciliation::DeliveryBatch {
+                    binding: Some(binding),
+                    ..
+                } = &op.reconciliation
+                else {
+                    anyhow::bail!("protected batch was not bound before admission");
+                };
+                validate_delivery_batch_orders(
+                    binding,
+                    result["orders"]
+                        .as_array()
+                        .context("batch acknowledgement omitted orders")?,
+                )?;
+            }
+            Some("flush_budget") => {
+                ensure!(
+                    result["budget_id"] == request["params"]["budget_id"]
+                        && result["queued"] == true,
+                    "flush admission is unconfirmed"
+                );
+            }
             Some("confirm") => ensure!(
                 result["intent_id"] == request["params"]["intent_id"],
                 "delivery confirmation identity mismatch"
@@ -2277,6 +2403,7 @@ impl ReadRequest {
                     DeliveryRead::Status => json!({"op":"status"}),
                     DeliveryRead::List => json!({"op":"list"}),
                     DeliveryRead::Providers => json!({"op":"providers"}),
+                    DeliveryRead::Budgets => json!({"op":"budgets"}),
                     DeliveryRead::Get { order_id } => json!({"op":"get","order_id":order_id}),
                     DeliveryRead::FindIntent { intent_id } => {
                         json!({"op":"find_intent","intent_id":intent_id})
@@ -2457,6 +2584,476 @@ mod tests {
     }
 }
 
+fn canonical_delivery_pair(mut ids: [String; 2], intents: bool) -> Result<[String; 2]> {
+    for id in &ids {
+        if intents {
+            ensure!(
+                uuid::Uuid::parse_str(id)?.to_string() == *id,
+                "delivery intent must be a canonical UUID"
+            );
+        } else {
+            vibeface_secure::membership::validate_hash(id)?;
+        }
+    }
+    ensure!(
+        ids[0] != ids[1],
+        "a protected batch needs two distinct original IDs"
+    );
+    ids.sort();
+    Ok(ids)
+}
+fn canonical_address(value: &str) -> Result<String> {
+    let bytes = value
+        .strip_prefix("0x")
+        .context("delivery address must have a 0x prefix")?;
+    ensure!(
+        bytes.len() == 40 && bytes.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid delivery address"
+    );
+    Ok(value.to_ascii_lowercase())
+}
+fn canonical_budget_batch(mut batch: DeliveryBudgetBatch) -> Result<DeliveryBudgetBatch> {
+    vibeface_secure::membership::validate_hash(&batch.budget_id)?;
+    vibeface_secure::membership::validate_hash(&batch.provider_peer)?;
+    batch.payer = canonical_address(&batch.payer)?;
+    batch.payee = canonical_address(&batch.payee)?;
+    batch.asset = canonical_address(&batch.asset)?;
+    ensure!(
+        batch.payer != batch.payee,
+        "payer and provider wallet must be distinct"
+    );
+    for window in &batch.ready_windows {
+        vibeface_secure::membership::validate_hash(&window.order_id)?;
+        ensure!(
+            window.index < 2,
+            "protected window exceeds the Node profile"
+        );
+    }
+    batch.ready_windows.sort();
+    ensure!(
+        !batch
+            .ready_windows
+            .windows(2)
+            .any(|pair| pair[0] == pair[1]),
+        "duplicate ready window"
+    );
+    Ok(batch)
+}
+fn validate_new_delivery_prepare(prepare: &DeliveryPrepare) -> Result<()> {
+    uuid::Uuid::parse_str(&prepare.intent_id)?;
+    ensure!(
+        matches!(&prepare.acceptance, DeliveryAcceptance::Recoverable),
+        "new deliveries support recoverable acceptance only"
+    );
+    match &prepare.mode {
+        DeliveryMode::Paid => vibeface_secure::membership::validate_hash(
+            prepare
+                .budget_id
+                .as_deref()
+                .context("paid preparation requires an existing protected budget")?,
+        )?,
+        DeliveryMode::Charity => ensure!(
+            prepare.budget_id.is_none(),
+            "charity preparation cannot use a budget"
+        ),
+    }
+    Ok(())
+}
+fn delivery_text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("delivery binding field missing")
+}
+fn delivery_authorization(order: &Value) -> Result<Value> {
+    let mut authorization = serde_json::Map::new();
+    for key in [
+        "order_id",
+        "intent_id",
+        "role",
+        "mode",
+        "acceptance",
+        "source_peer",
+        "receiver_peer",
+        "provider_peer",
+        "name",
+        "bytes",
+        "sha256",
+        "deadlines",
+    ] {
+        authorization.insert(
+            key.into(),
+            order
+                .get(key)
+                .cloned()
+                .context("delivery order omitted an original term")?,
+        );
+    }
+    let payment = order
+        .get("payment")
+        .context("delivery payment binding missing")?;
+    let mut fixed = serde_json::Map::new();
+    for key in [
+        "chain_id",
+        "asset",
+        "payer",
+        "provider_wallet",
+        "delivery_fee",
+        "reservation_fee",
+        "priority_fee",
+        "total",
+        "gas_cap",
+        "budget_id",
+    ] {
+        fixed.insert(
+            key.into(),
+            payment
+                .get(key)
+                .cloned()
+                .context("delivery payment omitted an original term")?,
+        );
+    }
+    for field in [
+        "delivery_fee",
+        "reservation_fee",
+        "priority_fee",
+        "total",
+        "gas_cap",
+    ] {
+        let amount = delivery_text(payment, field)?;
+        ensure!(decimal_at_most(amount, amount), "invalid protected amount");
+    }
+    ensure!(
+        order["bytes"].as_u64().is_some(),
+        "invalid delivery byte size"
+    );
+    vibeface_secure::membership::validate_hash(delivery_text(order, "sha256")?)?;
+    authorization.insert("payment".into(), Value::Object(fixed));
+    let windows = order["windows"]
+        .as_array()
+        .context("delivery windows missing")?;
+    ensure!(
+        windows.len() == 1 && windows[0]["index"] == 0,
+        "a two-order batch requires one window per order"
+    );
+    authorization.insert("windows".into(), json!([{"index":0,"bytes":windows[0].get("bytes").context("delivery window size missing")?}]));
+    Ok(Value::Object(authorization))
+}
+#[derive(PartialEq, Eq)]
+struct DeliveryBatchTerms {
+    budget_id: String,
+    provider_peer: String,
+    payer: String,
+    payee: String,
+    asset: String,
+    chain_id: String,
+}
+fn delivery_batch_binding(
+    kind: crate::outbox::DeliveryBatchKind,
+    ids: &[String; 2],
+    orders: &[Value; 2],
+    target: &str,
+) -> Result<crate::outbox::DeliveryBatchBinding> {
+    use crate::outbox::DeliveryBatchKind;
+    let mut fixed = Vec::new();
+    let mut binding: Option<DeliveryBatchTerms> = None;
+    for (id, order) in ids.iter().zip(orders) {
+        let payment = &order["payment"];
+        for peer in ["source_peer", "receiver_peer", "provider_peer"] {
+            vibeface_secure::membership::validate_hash(delivery_text(order, peer)?)?;
+        }
+        let order_id = delivery_text(order, "order_id")?;
+        vibeface_secure::membership::validate_hash(order_id)?;
+        let intent = delivery_text(order, "intent_id")?;
+        uuid::Uuid::parse_str(intent)?;
+        ensure!(
+            order["mode"] == "paid" && order["acceptance"] == "recoverable",
+            "protected batches require recoverable paid orders"
+        );
+        match kind {
+            DeliveryBatchKind::Confirm => ensure!(
+                intent == id && order["role"] == "sender" && order["source_peer"] == target,
+                "confirmation batch belongs to another sender or intent"
+            ),
+            DeliveryBatchKind::Accept => ensure!(
+                order_id == id && order["role"] == "receiver" && order["receiver_peer"] == target,
+                "acceptance batch belongs to another receiver or order"
+            ),
+        }
+        let budget = delivery_text(payment, "budget_id")?.to_owned();
+        vibeface_secure::membership::validate_hash(&budget)?;
+        let provider = delivery_text(order, "provider_peer")?.to_owned();
+        vibeface_secure::membership::validate_hash(&provider)?;
+        let terms = DeliveryBatchTerms {
+            budget_id: budget,
+            provider_peer: provider,
+            payer: canonical_address(delivery_text(payment, "payer")?)?,
+            payee: canonical_address(delivery_text(payment, "provider_wallet")?)?,
+            asset: canonical_address(delivery_text(payment, "asset")?)?,
+            chain_id: delivery_text(payment, "chain_id")?.to_owned(),
+        };
+        if let Some(first) = &binding {
+            ensure!(
+                first == &terms,
+                "batch orders do not share their fixed budget, provider, payer and asset"
+            );
+        } else {
+            binding = Some(terms);
+        }
+        fixed.push(delivery_authorization(order)?);
+    }
+    ensure!(
+        orders[0]["order_id"] != orders[1]["order_id"]
+            && orders[0]["intent_id"] != orders[1]["intent_id"],
+        "batch members are duplicated"
+    );
+    let DeliveryBatchTerms {
+        budget_id,
+        provider_peer,
+        payer,
+        payee,
+        asset,
+        chain_id,
+    } = binding.context("delivery batch is empty")?;
+    Ok(crate::outbox::DeliveryBatchBinding {
+        budget_id,
+        provider_peer,
+        payer,
+        payee,
+        asset,
+        chain_id,
+        orders: fixed
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("delivery batch must have exactly two members"))?,
+    })
+}
+fn validate_delivery_batch_orders(
+    binding: &crate::outbox::DeliveryBatchBinding,
+    orders: &[Value],
+) -> Result<()> {
+    ensure!(
+        orders.len() == 2,
+        "batch response must contain both original orders"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for order in orders {
+        let id = delivery_text(order, "order_id")?;
+        ensure!(seen.insert(id), "batch response duplicated an order");
+        let expected = binding
+            .orders
+            .iter()
+            .find(|expected| expected["order_id"] == id)
+            .context("batch response identifies a foreign order")?;
+        ensure!(
+            delivery_authorization(order)? == *expected,
+            "batch response changed original authorization terms"
+        );
+    }
+    Ok(())
+}
+
+impl Client {
+    async fn bind_delivery_effect(&self, operation: Operation) -> Result<Operation> {
+        use crate::outbox::DeliveryBatchKind;
+        if matches!(
+            &operation.reconciliation,
+            Reconciliation::DeliveryBatch { .. } | Reconciliation::DeliveryFlush { .. }
+        ) {
+            ensure!(
+                operation.snapshot.network_id == self.network_id()
+                    && operation.snapshot.client_id == self.client_id()
+                    && operation.snapshot.target_node == self.target,
+                "protected delivery belongs to another client, network or target"
+            );
+        }
+        let request: Value = serde_json::from_slice(&operation.bytes)?;
+        if request["method"] == "delivery" && request["params"]["op"] == "prepare" {
+            let prepare: DeliveryPrepare = serde_json::from_value(request["params"].clone())?;
+            validate_new_delivery_prepare(&prepare)?;
+        }
+        let reconciliation = match &operation.reconciliation {
+            Reconciliation::DeliveryBatch { kind, ids, binding } => {
+                let (name, field) = match kind {
+                    DeliveryBatchKind::Confirm => ("confirm_batch", "intent_ids"),
+                    DeliveryBatchKind::Accept => ("accept_batch", "order_ids"),
+                };
+                ensure!(
+                    request["method"] == "delivery"
+                        && request["params"]["op"] == name
+                        && request["params"][field] == json!(ids),
+                    "stored batch request differs from its original IDs"
+                );
+                let mut rows = Vec::new();
+                for id in ids {
+                    let row = match kind {
+                        DeliveryBatchKind::Confirm => self
+                            .connection
+                            .call("delivery", json!({"op":"find_intent","intent_id":id}))
+                            .await?["order"]
+                            .clone(),
+                        DeliveryBatchKind::Accept => {
+                            self.connection
+                                .call("delivery", json!({"op":"get","order_id":id}))
+                                .await?
+                        }
+                    };
+                    ensure!(
+                        row.is_object(),
+                        "both original batch orders must be available before admission"
+                    );
+                    if matches!(kind, DeliveryBatchKind::Confirm) {
+                        ensure!(
+                            row["phase"] == "prepared",
+                            "batch confirmation needs the original prepared orders"
+                        );
+                    } else {
+                        ensure!(
+                            !matches!(row["phase"].as_str(), Some("failed" | "refunded")),
+                            "batch acceptance needs live receiver orders"
+                        );
+                    }
+                    rows.push(row);
+                }
+                let rows: [Value; 2] = rows
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("batch requires two original orders"))?;
+                let fresh = delivery_batch_binding(*kind, ids, &rows, &self.target)?;
+                if let Some(original) = binding {
+                    ensure!(
+                        original == &fresh,
+                        "original batch authorization changed before admission"
+                    );
+                }
+                Reconciliation::DeliveryBatch {
+                    kind: *kind,
+                    ids: ids.clone(),
+                    binding: Some(fresh),
+                }
+            }
+            Reconciliation::DeliveryFlush {
+                budget_id,
+                batch_id,
+                binding,
+            } => {
+                ensure!(
+                    request["method"] == "delivery"
+                        && request["params"]["op"] == "flush_budget"
+                        && request["params"]["budget_id"] == *budget_id,
+                    "stored flush request differs from its original budget"
+                );
+                let budgets = self
+                    .connection
+                    .call("delivery", json!({"op":"budgets"}))
+                    .await?;
+                let rows = budgets["budgets"]
+                    .as_array()
+                    .context("protected budget list missing")?;
+                let mut selected = rows.iter().filter(|row| row["budget_id"] == *budget_id);
+                let row = selected
+                    .next()
+                    .context("original flush budget is unavailable")?;
+                ensure!(selected.next().is_none(), "protected budget is duplicated");
+                let fresh = canonical_budget_batch(serde_json::from_value(row.clone())?)?;
+                ensure!(
+                    fresh.provider_peer == self.target
+                        && delivery_flush_batch_id(&fresh)? == *batch_id,
+                    "flush ready windows or fixed budget terms changed"
+                );
+                let status = self
+                    .connection
+                    .call("delivery", json!({"op":"status"}))
+                    .await?;
+                ensure!(
+                    status["node_peer"] == self.target
+                        && canonical_address(delivery_text(&status["wallet"], "address")?)?
+                            == fresh.payee,
+                    "flush must use the fixed provider Node and wallet"
+                );
+                if let Some(original) = binding {
+                    ensure!(original == &fresh, "original flush authorization changed");
+                }
+                Reconciliation::DeliveryFlush {
+                    budget_id: budget_id.clone(),
+                    batch_id: batch_id.clone(),
+                    binding: Some(fresh),
+                }
+            }
+            _ => return Ok(operation),
+        };
+        self.require_active()?;
+        let id = operation.snapshot.id;
+        self.stored(move |db| db.bind_delivery(&id, reconciliation))
+            .await
+    }
+    async fn reconcile_delivery_batch(&self, operation: Operation) -> Result<OperationSnapshot> {
+        use crate::outbox::DeliveryBatchKind;
+        let Reconciliation::DeliveryBatch { kind, ids, binding } = &operation.reconciliation else {
+            anyhow::bail!("not a delivery batch");
+        };
+        let Some(binding) = binding else {
+            return Ok(operation.snapshot);
+        };
+        let mut receipts = Vec::new();
+        let mut all = true;
+        for (id, expected) in ids.iter().zip(&binding.orders) {
+            let order_id = delivery_text(expected, "order_id")?.to_owned();
+            if matches!(kind, DeliveryBatchKind::Confirm) {
+                let found = self
+                    .connection
+                    .call("delivery", json!({"op":"find_intent","intent_id":id}))
+                    .await?;
+                if found["order"].is_null() {
+                    all = false;
+                } else {
+                    ensure!(
+                        found["order"]["intent_id"] == *id
+                            && delivery_authorization(&found["order"])? == *expected,
+                        "batch intent lookup changed original order"
+                    );
+                }
+            }
+            let result = self
+                .connection
+                .call("delivery", json!({"op":"receipt","order_id":order_id}))
+                .await?;
+            let receipt = &result["receipt"];
+            if receipt.is_null() || result["order"].is_null() {
+                all = false;
+                receipts.push(result);
+                continue;
+            }
+            ensure!(
+                receipt["network_id"] == operation.snapshot.network_id
+                    && receipt["node_id"] == operation.snapshot.target_node
+                    && receipt["order_id"] == expected["order_id"]
+                    && receipt["intent_id"] == expected["intent_id"],
+                "batch receipt belongs to another identity or member"
+            );
+            ensure!(
+                delivery_authorization(&result["order"])? == *expected,
+                "batch receipt changed protected budget or original terms"
+            );
+            let flag = match kind {
+                DeliveryBatchKind::Confirm => "confirmed",
+                DeliveryBatchKind::Accept => "accepted",
+            };
+            if receipt[flag] != true || receipt["authorized_by"] != operation.snapshot.client_id {
+                all = false;
+            }
+            receipts.push(result);
+        }
+        let result = json!({"receipts":receipts,"all_authorized":all});
+        let id = operation.snapshot.id;
+        if all {
+            self.stored(move |db| db.settle(&id, OperationState::Accepted, result))
+                .await
+        } else {
+            self.stored(move |db| db.observe_unknown(&id, result)).await
+        }
+    }
+}
+
 fn validate_delivery_prepare(request: &Value, order: &Value) -> Result<()> {
     use base64::Engine;
     for field in [
@@ -2472,6 +3069,10 @@ fn validate_delivery_prepare(request: &Value, order: &Value) -> Result<()> {
             "delivery preparation changed {field}"
         );
     }
+    ensure!(
+        order["payment"]["budget_id"] == request["budget_id"],
+        "delivery preparation changed protected budget"
+    );
     let data = base64::engine::general_purpose::STANDARD.decode(
         request["content_base64"]
             .as_str()
@@ -3426,4 +4027,638 @@ fn terminal_reply(state: &Value) -> bool {
         state.as_str(),
         Some("cancelled" | "interrupted" | "completed" | "failed" | "rejected")
     )
+}
+
+#[cfg(test)]
+mod prepaid_tests {
+    use super::*;
+    use crate::connection::tests::{receive, send, server};
+    use vibeface_secure::{
+        Identity,
+        membership::{Genesis, Member, NetworkState},
+    };
+
+    const PAYER: &str = "0x1111111111111111111111111111111111111111";
+    const PAYEE: &str = "0x2222222222222222222222222222222222222222";
+    const ASSET: &str = "0x3333333333333333333333333333333333333333";
+    struct Evidence {
+        orders: [Value; 2],
+        budget: DeliveryBudgetBatch,
+        receipts: [bool; 2],
+        receipt_client: String,
+        receipt_node: String,
+        receipt_network: String,
+        mutation_count: usize,
+        packets: Vec<Value>,
+        reads: Vec<String>,
+        drop_ack: bool,
+        absent_first: bool,
+        corrupt_budget: bool,
+    }
+    fn orders(target: &str, receiver: bool) -> [Value; 2] {
+        [1u8, 2].map(|index| json!({
+            "order_id":format!("{index:064x}"),"intent_id":format!("00000000-0000-4000-8000-{index:012x}"),
+            "role":if receiver{"receiver"}else{"sender"},"mode":"paid","acceptance":"recoverable",
+            "source_peer":if receiver{"a".repeat(64)}else{target.into()},"receiver_peer":if receiver{target.into()}else{"b".repeat(64)},"provider_peer":"c".repeat(64),
+            "name":format!("fixture-{index}.bin"),"bytes":1,"sha256":hex::encode(Sha256::digest([index])),
+            "phase":if receiver{"cipher_held"}else{"prepared"},"evidence":"none",
+            "payment":{"state":"prepared","chain_id":"31337","asset":ASSET,"payer":PAYER,"provider_wallet":PAYEE,
+                "delivery_fee":"1","reservation_fee":"1","priority_fee":"0","total":"2","gas_cap":"3","budget_id":"d".repeat(64)},
+            "deadlines":{"quote_expires_at":10,"hold_deadline":20,"key_deadline":30,"open_deadline":40,"retain_until":50,"priority_deadline":25},
+            "windows":[{"index":0,"bytes":1,"committed_bytes":69,"state":"pending","decryption_proven":false}]
+        }))
+    }
+    fn budget(target: &str, orders: &[Value; 2]) -> DeliveryBudgetBatch {
+        DeliveryBudgetBatch {
+            budget_id: "d".repeat(64),
+            payer: PAYER.into(),
+            payee: PAYEE.into(),
+            provider_peer: target.into(),
+            asset: ASSET.into(),
+            ready_windows: orders
+                .iter()
+                .map(|order| DeliveryReadyWindow {
+                    order_id: order["order_id"].as_str().unwrap().into(),
+                    index: 0,
+                })
+                .collect(),
+        }
+    }
+    async fn fixture(
+        node_secret: &str,
+        state: NetworkState,
+        client_id: String,
+        evidence: Arc<Mutex<Evidence>>,
+    ) -> Result<(Endpoint, tokio::task::JoinHandle<Result<()>>)> {
+        let node = Identity::from_secret_hex(node_secret)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let entry = crate::Entry {
+            origin: format!("http://{}", listener.local_addr()?),
+            node_id: node.device_id(),
+        };
+        let task = tokio::spawn(async move {
+            let (mut socket, mut channel) = server(listener, &node).await?;
+            loop {
+                let request = match receive(&mut socket, &mut channel).await {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                let mut drop_ack = false;
+                let result = match request["method"].as_str() {
+                    Some("authenticate") => {
+                        json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}})
+                    }
+                    Some("directory") => {
+                        json!({"state":state,"now_ms":vibeface_protocol::now_ms()})
+                    }
+                    Some("subscribe") => json!({}),
+                    Some("write_state") => json!({"state":"writable"}),
+                    Some("delivery") => {
+                        let params = &request["params"];
+                        let op = params["op"].as_str().context("delivery op")?;
+                        let mut saved = evidence.lock().unwrap();
+                        saved.reads.push(op.into());
+                        match op {
+                            "budgets" => json!({"budgets":[saved.budget]}),
+                            "status" => {
+                                json!({"node_peer":node.device_id(),"wallet":{"state":"unlocked","address":PAYEE}})
+                            }
+                            "find_intent" => {
+                                json!({"order":saved.orders.iter().enumerate().find(|(index,order)|order["intent_id"]==params["intent_id"]&&!(saved.absent_first&&*index==0)).map(|(_,order)|order)})
+                            }
+                            "get" => saved
+                                .orders
+                                .iter()
+                                .find(|order| order["order_id"] == params["order_id"])
+                                .context("original order")?
+                                .clone(),
+                            "receipt" => {
+                                let index = saved
+                                    .orders
+                                    .iter()
+                                    .position(|order| order["order_id"] == params["order_id"])
+                                    .context("original receipt")?;
+                                let mut order = saved.orders[index].clone();
+                                if saved.corrupt_budget {
+                                    order["payment"]["budget_id"] = json!("e".repeat(64));
+                                }
+                                json!({"order":order,"receipt":{"network_id":saved.receipt_network,"node_id":saved.receipt_node,"order_id":saved.orders[index]["order_id"],"intent_id":saved.orders[index]["intent_id"],"authorized_by":saved.receipt_client,"confirmed":saved.receipts[index],"accepted":saved.receipts[index]}})
+                            }
+                            "confirm_batch" | "accept_batch" | "flush_budget" => {
+                                saved.mutation_count += 1;
+                                saved.packets.push(request.clone());
+                                drop_ack = saved.drop_ack;
+                                saved.drop_ack = false;
+                                if op == "flush_budget" {
+                                    json!({"budget_id":saved.budget.budget_id,"queued":true})
+                                } else {
+                                    saved.receipts = [true, true];
+                                    json!({"orders":saved.orders})
+                                }
+                            }
+                            _ => {
+                                anyhow::bail!("fixture refuses non-allowlisted delivery operation")
+                            }
+                        }
+                    }
+                    _ => anyhow::bail!("fixture refuses non-delivery business effects"),
+                };
+                if drop_ack {
+                    socket.close(None).await?;
+                    break;
+                }
+                send(
+                    &mut socket,
+                    &mut channel,
+                    json!({"id":request["id"],"result":result}),
+                )
+                .await?;
+            }
+            Ok(())
+        });
+        Ok((Endpoint::Gateway(entry), task))
+    }
+    struct Setup {
+        dir: PathBuf,
+        node_secret: String,
+        state: NetworkState,
+        key: Arc<ClientKey>,
+        client: Client,
+        evidence: Arc<Mutex<Evidence>>,
+        server: tokio::task::JoinHandle<Result<()>>,
+    }
+    async fn setup_prepaid(receiver: bool, flush: bool, drop_ack: bool) -> Result<Setup> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-prepaid-client-{}", uuid::Uuid::new_v4()));
+        let mut key = ClientKey::create(&dir.join("key"), "controlled prepaid fixture password")?;
+        let node = Identity::generate()?;
+        let state = NetworkState::new(Genesis::create(
+            &Identity::generate()?,
+            Member::client(&key.identity, "fixture", true)?,
+            Member::node(&node, "fixture Node")?,
+        )?)?;
+        let mut rows = orders(&node.device_id(), receiver);
+        if flush {
+            for order in &mut rows {
+                order["provider_peer"] = json!(node.device_id());
+            }
+        }
+        let evidence = Arc::new(Mutex::new(Evidence {
+            budget: budget(rows[0]["provider_peer"].as_str().unwrap(), &rows),
+            orders: rows,
+            receipts: [false, false],
+            receipt_client: key.device_id().into(),
+            receipt_node: node.device_id(),
+            receipt_network: state.genesis.network_id.clone(),
+            mutation_count: 0,
+            packets: vec![],
+            reads: vec![],
+            drop_ack,
+            absent_first: false,
+            corrupt_budget: false,
+        }));
+        let (endpoint, server) = fixture(
+            &node.secret_hex(),
+            state.clone(),
+            key.device_id().into(),
+            evidence.clone(),
+        )
+        .await?;
+        let Endpoint::Gateway(entry) = &endpoint else {
+            unreachable!()
+        };
+        key.remember(&state.genesis.network_id, entry.clone())?;
+        let key = Arc::new(key);
+        let client = Client::open(key.clone(), endpoint, dir.join("outbox")).await?;
+        Ok(Setup {
+            dir,
+            node_secret: node.secret_hex(),
+            state,
+            key,
+            client,
+            evidence,
+            server,
+        })
+    }
+    fn batch_action(receiver: bool, evidence: &Evidence) -> DeliveryAction {
+        if receiver {
+            DeliveryAction::AcceptBatch {
+                order_ids: std::array::from_fn(|index| {
+                    evidence.orders[index]["order_id"].as_str().unwrap().into()
+                }),
+            }
+        } else {
+            DeliveryAction::ConfirmBatch {
+                intent_ids: std::array::from_fn(|index| {
+                    evidence.orders[index]["intent_id"].as_str().unwrap().into()
+                }),
+            }
+        }
+    }
+    #[test]
+    fn prepaid_prepare_and_flush_bind_only_supported_terms() -> Result<()> {
+        let rows = orders(&"a".repeat(64), false);
+        let mut batch = budget(&"c".repeat(64), &rows);
+        let original = delivery_flush_batch_id(&batch)?;
+        batch.ready_windows.reverse();
+        assert_eq!(delivery_flush_batch_id(&batch)?, original);
+        batch.payer = "0x4444444444444444444444444444444444444444".into();
+        assert_ne!(delivery_flush_batch_id(&batch)?, original);
+        batch.ready_windows.push(batch.ready_windows[0].clone());
+        assert!(delivery_flush_batch_id(&batch).is_err());
+        let prepare = DeliveryPrepare {
+            intent_id: uuid::Uuid::new_v4().to_string(),
+            receiver_peer: "a".repeat(64),
+            provider_peer: "b".repeat(64),
+            mode: DeliveryMode::Paid,
+            acceptance: DeliveryAcceptance::Strict,
+            name: "fixture".into(),
+            content_base64: "eA==".into(),
+            max_service_amount: "2".into(),
+            max_gas_amount: "3".into(),
+            budget_id: Some("d".repeat(64)),
+        };
+        assert!(validate_new_delivery_prepare(&prepare).is_err());
+        let mut prepare = prepare;
+        prepare.acceptance = DeliveryAcceptance::Recoverable;
+        prepare.budget_id = None;
+        assert!(validate_new_delivery_prepare(&prepare).is_err());
+        prepare.mode = DeliveryMode::Charity;
+        assert!(validate_new_delivery_prepare(&prepare).is_ok());
+        prepare.budget_id = Some("d".repeat(64));
+        assert!(validate_new_delivery_prepare(&prepare).is_err());
+        assert!(canonical_delivery_pair(["a".repeat(64), "a".repeat(64)], false).is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn lost_prepaid_batch_ack_reconciles_both_original_members_without_resend() -> Result<()>
+    {
+        for receiver in [false, true] {
+            let Setup {
+                dir,
+                node_secret,
+                state,
+                key,
+                client,
+                evidence,
+                server,
+            } = setup_prepaid(receiver, false, true).await?;
+            let action = batch_action(receiver, &evidence.lock().unwrap());
+            let operation = client.submit(Action::Delivery(action.clone())).await?;
+            assert_eq!(operation.state, OperationState::Unknown);
+            let id = operation.id.clone();
+            let lookup = id.clone();
+            let original = client.stored(move |db| db.get(&lookup)).await?;
+            let bytes = original.bytes.clone();
+            let financial_binding = serde_json::to_value(&original.reconciliation)?;
+            assert!(matches!(
+                original.reconciliation,
+                Reconciliation::DeliveryBatch {
+                    binding: Some(_),
+                    ..
+                }
+            ));
+            server.await??;
+            client.close();
+            client.wait_for_read_storage().await;
+            drop(client);
+            // Reopen the actual durable outbox, rather than relying on in-memory bindings.
+            let (endpoint, server) = fixture(
+                &node_secret,
+                state.clone(),
+                key.device_id().into(),
+                evidence.clone(),
+            )
+            .await?;
+            let client = Client::open(key.clone(), endpoint, dir.join("outbox")).await?;
+            {
+                let mut evidence = evidence.lock().unwrap();
+                evidence.receipts = [true, false];
+                evidence.reads.clear();
+            }
+            assert_eq!(client.reconcile(&id).await?.state, OperationState::Unknown);
+            assert_eq!(
+                evidence
+                    .lock()
+                    .unwrap()
+                    .reads
+                    .iter()
+                    .filter(|op| op.as_str() == "receipt")
+                    .count(),
+                2
+            );
+            if !receiver {
+                evidence.lock().unwrap().absent_first = true;
+                assert_eq!(client.reconcile(&id).await?.state, OperationState::Unknown);
+                evidence.lock().unwrap().absent_first = false;
+            }
+            {
+                let mut evidence = evidence.lock().unwrap();
+                evidence.receipts = [true, true];
+                evidence.receipt_client = "e".repeat(64);
+            }
+            assert_eq!(client.reconcile(&id).await?.state, OperationState::Unknown);
+            evidence.lock().unwrap().receipt_client = key.device_id().into();
+            evidence.lock().unwrap().corrupt_budget = true;
+            assert!(client.reconcile(&id).await.is_err());
+            evidence.lock().unwrap().corrupt_budget = false;
+            evidence.lock().unwrap().receipt_node = "f".repeat(64);
+            assert!(client.reconcile(&id).await.is_err());
+            evidence.lock().unwrap().receipt_node = client.target_node().into();
+            evidence.lock().unwrap().receipt_network = "f".repeat(64);
+            assert!(client.reconcile(&id).await.is_err());
+            evidence.lock().unwrap().receipt_network = state.genesis.network_id.clone();
+            let mut reversed = action;
+            match &mut reversed {
+                DeliveryAction::ConfirmBatch { intent_ids } => intent_ids.reverse(),
+                DeliveryAction::AcceptBatch { order_ids } => order_ids.reverse(),
+                _ => unreachable!(),
+            }
+            let before = client
+                .pending()
+                .await?
+                .into_iter()
+                .find(|operation| operation.id == id)
+                .context("durable unknown batch")?;
+            let staged = client
+                .stage_after(Action::Delivery(reversed.clone()), vec![])
+                .await?;
+            assert_eq!(staged.id, id);
+            assert_eq!(staged.state, OperationState::Unknown);
+            assert_eq!(staged.result, before.result);
+            let repeated = client.submit(Action::Delivery(reversed.clone())).await?;
+            assert_eq!(repeated.id, id);
+            assert_eq!(repeated.state, OperationState::Unknown);
+            assert_eq!(evidence.lock().unwrap().mutation_count, 1);
+            let accepted = client.reconcile(&id).await?;
+            assert_eq!(accepted.state, OperationState::Accepted);
+            let staged = client
+                .stage_after(Action::Delivery(reversed), vec![])
+                .await?;
+            assert_eq!(staged.id, id);
+            assert_eq!(staged.state, OperationState::Accepted);
+            assert_eq!(staged.result, accepted.result);
+            let lookup = id.clone();
+            assert_eq!(
+                client.stored(move |db| Ok(db.get(&lookup)?.bytes)).await?,
+                bytes
+            );
+            let lookup = id.clone();
+            assert_eq!(
+                client
+                    .stored(move |db| Ok(serde_json::to_value(db.get(&lookup)?.reconciliation)?))
+                    .await?,
+                financial_binding
+            );
+            client.close();
+            drop(client);
+            drop(key);
+            server.abort();
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn live_prepaid_batch_ack_preserves_both_original_ids_and_terms() -> Result<()> {
+        for receiver in [false, true] {
+            let setup = setup_prepaid(receiver, false, false).await?;
+            let action = batch_action(receiver, &setup.evidence.lock().unwrap());
+            let operation = setup
+                .client
+                .submit(Action::Delivery(action.clone()))
+                .await?;
+            assert_eq!(operation.state, OperationState::Accepted);
+            let staged = setup
+                .client
+                .stage_after(Action::Delivery(action), vec![])
+                .await?;
+            assert_eq!(staged.state, OperationState::Accepted);
+            assert_eq!(staged.result, operation.result);
+            let evidence = setup.evidence.lock().unwrap();
+            assert_eq!(evidence.mutation_count, 1);
+            let ids = if receiver {
+                &evidence.packets[0]["params"]["order_ids"]
+            } else {
+                &evidence.packets[0]["params"]["intent_ids"]
+            };
+            let field = if receiver { "order_id" } else { "intent_id" };
+            assert_eq!(
+                ids,
+                &json!([evidence.orders[0][field], evidence.orders[1][field]])
+            );
+            drop(evidence);
+            setup.client.close();
+            setup.server.abort();
+            drop(setup.client);
+            drop(setup.key);
+            std::fs::remove_dir_all(setup.dir)?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn flush_admission_and_lost_ack_are_distinct_and_stable() -> Result<()> {
+        for drop_ack in [false, true] {
+            let setup = setup_prepaid(false, true, drop_ack).await?;
+            let batch = setup.evidence.lock().unwrap().budget.clone();
+            let batch_id = delivery_flush_batch_id(&batch)?;
+            let action = DeliveryAction::FlushBudget {
+                budget_id: batch.budget_id.clone(),
+                batch_id: batch_id.clone(),
+            };
+            let result = setup
+                .client
+                .submit(Action::Delivery(action.clone()))
+                .await?;
+            assert_eq!(
+                result.state,
+                if drop_ack {
+                    OperationState::Unknown
+                } else {
+                    OperationState::Accepted
+                }
+            );
+            let staged = setup
+                .client
+                .stage_after(Action::Delivery(action.clone()), vec![])
+                .await?;
+            assert_eq!(staged.state, result.state);
+            assert_eq!(staged.result, result.result);
+            if drop_ack {
+                setup.server.await??;
+                let (endpoint, server) = fixture(
+                    &setup.node_secret,
+                    setup.state.clone(),
+                    setup.key.device_id().into(),
+                    setup.evidence.clone(),
+                )
+                .await?;
+                let client = setup.client.reconnect(endpoint).await?;
+                setup.evidence.lock().unwrap().budget.ready_windows.clear();
+                assert!(
+                    client
+                        .read(ReadRequest::Delivery(DeliveryRead::Budgets))
+                        .await?["budgets"][0]["ready_windows"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    client.reconcile(&result.id).await?.state,
+                    OperationState::Unknown,
+                    "changed budget readback is not a lost flush admission receipt"
+                );
+                assert_eq!(client.submit(Action::Delivery(action)).await?.id, result.id);
+                let mut later = batch.clone();
+                later.ready_windows.remove(0);
+                let pending = client
+                    .submit(Action::Delivery(DeliveryAction::FlushBudget {
+                        budget_id: later.budget_id.clone(),
+                        batch_id: delivery_flush_batch_id(&later)?,
+                    }))
+                    .await?;
+                assert_eq!(
+                    pending.state,
+                    OperationState::Prepared,
+                    "unknown original flush blocks a later batch"
+                );
+                assert_eq!(setup.evidence.lock().unwrap().mutation_count, 1);
+                client.close();
+                drop(client);
+                server.abort();
+            } else {
+                setup.client.close();
+                setup.server.abort();
+            }
+            drop(setup.client);
+            drop(setup.key);
+            std::fs::remove_dir_all(setup.dir)?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn duplicate_protected_staging_rejects_added_removed_and_replaced_unknown_prerequisites()
+    -> Result<()> {
+        for flush in [false, true] {
+            for initially_dependent in [false, true] {
+                let setup = setup_prepaid(false, flush, false).await?;
+                let first = setup.client.stage(Action::TestWebhook).await?;
+                let second = setup.client.stage(Action::ConfirmWritable).await?;
+                for id in [first.id.clone(), second.id.clone()] {
+                    assert_eq!(
+                        setup
+                            .client
+                            .stored(move |db| Ok(db.begin(&id)?.snapshot))
+                            .await?
+                            .state,
+                        OperationState::Unknown
+                    );
+                }
+                let action = if flush {
+                    let batch = setup.evidence.lock().unwrap().budget.clone();
+                    DeliveryAction::FlushBudget {
+                        budget_id: batch.budget_id.clone(),
+                        batch_id: delivery_flush_batch_id(&batch)?,
+                    }
+                } else {
+                    batch_action(false, &setup.evidence.lock().unwrap())
+                };
+                let original_prerequisites = if initially_dependent {
+                    vec![first.id.clone()]
+                } else {
+                    vec![]
+                };
+                let original = setup
+                    .client
+                    .stage_after(
+                        Action::Delivery(action.clone()),
+                        original_prerequisites.clone(),
+                    )
+                    .await?;
+                let lookup = original.id.clone();
+                let payload = setup
+                    .client
+                    .stored(move |db| Ok(serde_json::to_vec(&db.get(&lookup)?)?))
+                    .await?;
+                let changed = if initially_dependent {
+                    vec![]
+                } else {
+                    vec![first.id.clone()]
+                };
+                assert!(
+                    setup
+                        .client
+                        .stage_after(Action::Delivery(action.clone()), changed)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    setup
+                        .client
+                        .stage_after(Action::Delivery(action.clone()), vec![second.id])
+                        .await
+                        .is_err()
+                );
+                let duplicate = setup
+                    .client
+                    .stage_after(Action::Delivery(action), original_prerequisites)
+                    .await?;
+                assert_eq!(duplicate.id, original.id);
+                assert_eq!(duplicate.state, OperationState::Prepared);
+                let lookup = original.id;
+                assert_eq!(
+                    setup
+                        .client
+                        .stored(move |db| Ok(serde_json::to_vec(&db.get(&lookup)?)?))
+                        .await?,
+                    payload
+                );
+                assert_eq!(
+                    setup.evidence.lock().unwrap().mutation_count,
+                    0,
+                    "prerequisite changes are refused before any delivery send"
+                );
+                setup.client.close();
+                setup.server.abort();
+                drop(setup.client);
+                drop(setup.key);
+                std::fs::remove_dir_all(setup.dir)?;
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn mismatched_batch_or_stale_flush_is_rejected_before_write_admission() -> Result<()> {
+        let setup = setup_prepaid(false, false, false).await?;
+        setup.evidence.lock().unwrap().orders[1]["payment"]["budget_id"] = json!("e".repeat(64));
+        let action = batch_action(false, &setup.evidence.lock().unwrap());
+        assert!(setup.client.submit(Action::Delivery(action)).await.is_err());
+        assert_eq!(setup.evidence.lock().unwrap().mutation_count, 0);
+        setup.client.close();
+        setup.server.abort();
+        drop(setup.client);
+        drop(setup.key);
+        std::fs::remove_dir_all(setup.dir)?;
+        let setup = setup_prepaid(false, true, false).await?;
+        let original = setup.evidence.lock().unwrap().budget.clone();
+        let batch_id = delivery_flush_batch_id(&original)?;
+        setup.evidence.lock().unwrap().budget.payer =
+            "0x4444444444444444444444444444444444444444".into();
+        assert!(
+            setup
+                .client
+                .submit(Action::Delivery(DeliveryAction::FlushBudget {
+                    budget_id: original.budget_id,
+                    batch_id
+                }))
+                .await
+                .is_err()
+        );
+        assert_eq!(setup.evidence.lock().unwrap().mutation_count, 0);
+        setup.client.close();
+        setup.server.abort();
+        drop(setup.client);
+        drop(setup.key);
+        std::fs::remove_dir_all(setup.dir)?;
+        Ok(())
+    }
 }

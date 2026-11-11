@@ -61,6 +61,16 @@ pub(crate) enum Reconciliation {
         order_id: Option<String>,
         operation: String,
     },
+    DeliveryBatch {
+        kind: DeliveryBatchKind,
+        ids: [String; 2],
+        binding: Option<DeliveryBatchBinding>,
+    },
+    DeliveryFlush {
+        budget_id: String,
+        batch_id: String,
+        binding: Option<crate::DeliveryBudgetBatch>,
+    },
     StopReply {
         conversation_id: String,
         trigger: String,
@@ -73,6 +83,22 @@ pub(crate) enum Reconciliation {
         kind: crate::SettingsKind,
     },
     Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DeliveryBatchKind {
+    Confirm,
+    Accept,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeliveryBatchBinding {
+    pub budget_id: String,
+    pub provider_peer: String,
+    pub payer: String,
+    pub payee: String,
+    pub asset: String,
+    pub chain_id: String,
+    pub orders: [Value; 2],
 }
 
 pub struct Outbox {
@@ -292,7 +318,7 @@ impl Outbox {
                 })?;
         Ok(serde_json::from_slice(&bytes)?)
     }
-    pub(crate) fn prepare(&mut self, operation: &Operation) -> Result<()> {
+    pub(crate) fn prepare(&mut self, operation: &Operation) -> Result<OperationSnapshot> {
         ensure!(
             operation.snapshot.network_id == self.network
                 && operation.snapshot.client_id == self.client,
@@ -319,10 +345,11 @@ impl Outbox {
             let old: Operation = serde_json::from_slice(&bytes)?;
             ensure!(
                 old.bytes == operation.bytes
-                    && old.snapshot.target_node == operation.snapshot.target_node,
-                "business ID already has a different signed operation"
+                    && old.snapshot.target_node == operation.snapshot.target_node
+                    && old.prerequisites == operation.prerequisites,
+                "business ID already has different request bytes, target or prerequisites"
             );
-            return Ok(());
+            return Ok(old.snapshot);
         }
         tx.execute("DELETE FROM operations WHERE state IN ('accepted','closed_by_user') AND rowid NOT IN (SELECT rowid FROM operations WHERE state IN ('accepted','closed_by_user') ORDER BY rowid DESC LIMIT 64) AND NOT EXISTS(SELECT 1 FROM operations pending,json_each(CAST(pending.payload AS TEXT),'$.prerequisites') dependency WHERE pending.state!='accepted' AND dependency.value=operations.id)", [])?;
         let count: u64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
@@ -373,7 +400,69 @@ impl Outbox {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(operation.snapshot.clone())
+    }
+    /// Add verified financial binding before admission without changing a single request byte.
+    pub(crate) fn bind_delivery(
+        &mut self,
+        id: &str,
+        reconciliation: Reconciliation,
+    ) -> Result<Operation> {
+        let mut operation = self.get(id)?;
+        ensure!(
+            operation.snapshot.state == OperationState::Prepared,
+            "delivery binding is immutable after admission"
+        );
+        match (&operation.reconciliation, &reconciliation) {
+            (
+                Reconciliation::DeliveryBatch {
+                    kind: old_kind,
+                    ids: old_ids,
+                    binding: old,
+                },
+                Reconciliation::DeliveryBatch {
+                    kind,
+                    ids,
+                    binding: Some(binding),
+                },
+            ) => {
+                ensure!(
+                    old_kind == kind
+                        && old_ids == ids
+                        && old.as_ref().is_none_or(|old| old == binding),
+                    "original delivery batch identity or terms changed"
+                );
+            }
+            (
+                Reconciliation::DeliveryFlush {
+                    budget_id: old_budget,
+                    batch_id: old_batch,
+                    binding: old,
+                },
+                Reconciliation::DeliveryFlush {
+                    budget_id,
+                    batch_id,
+                    binding: Some(binding),
+                },
+            ) => {
+                ensure!(
+                    old_budget == budget_id
+                        && old_batch == batch_id
+                        && old.as_ref().is_none_or(|old| old == binding),
+                    "original flush batch identity or terms changed"
+                );
+            }
+            _ => anyhow::bail!("not a prepared protected delivery binding"),
+        }
+        operation.reconciliation = reconciliation;
+        ensure!(
+            self.db.execute(
+                "UPDATE operations SET payload=?2 WHERE id=?1 AND state='prepared'",
+                params![id, serde_json::to_vec(&operation)?]
+            )? == 1,
+            "delivery changed before binding was committed"
+        );
+        Ok(operation)
     }
     pub(crate) fn dismiss_rejected(&mut self, id: &str) -> Result<()> {
         let operation = self.get(id)?;

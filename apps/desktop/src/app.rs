@@ -1698,7 +1698,26 @@ impl Render for Desktop {
             );
         }
         if let Some(command) = &self.confirmation {
-            main=main.child(div().px_6().py_3().flex().gap_3().child(match command{Command::RestoreProfile{..}=>"按已读取的原始变更恢复此字段，其他配置保留。名称、模型等通过原Bot提交修改请求，执行结果仍需核对。",Command::SwitchProfile(_)=>"切换会关闭当前连接。原身份、待发操作和恢复计划保留；未知写入需回原档案核对。",Command::StopWork{..}=>"停止请求会转发到执行设备，结果以设备确认的状态为准。",Command::ResolveWork{..}=>"仅记录你已经核实的结果，不重新执行工作。",Command::ConfirmIdentityBackup(_)=>"请确认新恢复文件已保存，并核对显示的路径与摘要。",Command::DeliveryConfirm(_)=>"按已显示的文件、费用与截止时间确认。结果未知时先查询原订单。",_=>"请确认此操作。删除或撤销可能无法恢复。"}).child(self.button("confirm-danger","确认执行",command.clone(),cx)));
+            if let Some(summary) = self.delivery_confirmation(command) {
+                main = main.child(
+                    div()
+                        .px_6()
+                        .py_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .id("delivery-confirmation-details")
+                                .max_h(px(340.))
+                                .overflow_y_scroll()
+                                .child(summary),
+                        )
+                        .child(self.button("confirm-danger", "确认执行", command.clone(), cx)),
+                );
+            } else {
+                main=main.child(div().px_6().py_3().flex().gap_3().child(match command{Command::RestoreProfile{..}=>"按已读取的原始变更恢复此字段，其他配置保留。名称、模型等通过原Bot提交修改请求，执行结果仍需核对。",Command::SwitchProfile(_)=>"切换会关闭当前连接。原身份、待发操作和恢复计划保留；未知写入需回原档案核对。",Command::StopWork{..}=>"停止请求会转发到执行设备，结果以设备确认的状态为准。",Command::ResolveWork{..}=>"仅记录你已经核实的结果，不重新执行工作。",Command::ConfirmIdentityBackup(_)=>"请确认新恢复文件已保存，并核对显示的路径与摘要。",Command::DeliveryConfirm(_)=>"按已显示的文件、费用与截止时间确认。结果未知时先查询原订单。",_=>"请确认此操作。删除或撤销可能无法恢复。"}).child(self.button("confirm-danger","确认执行",command.clone(),cx)));
+            }
         }
         if matches!(self.route, Route::Chat(_) | Route::History(_)) {
             main = main.child(content);
