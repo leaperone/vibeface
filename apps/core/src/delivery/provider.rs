@@ -453,8 +453,10 @@ impl Delivery {
                     "hold requires the paid protocol"
                 );
                 {
-                    self.paid_state(&stored.order).await?;
-                    self.queue_hold(&stored, index, seal)?;
+                    let chain = self.chain().await?;
+                    let position = chain.confirmed_position().await?;
+                    self.paid_state_at(&chain, &position, &stored.order).await?;
+                    self.queue_hold(&chain, &stored, index, seal).await?;
                     if stored.view.windows[index as usize].state == WindowState::Pending {
                         stored.view.windows[index as usize].state = WindowState::Held;
                     }

@@ -212,6 +212,24 @@ impl Wallet {
     ) -> Result<SignedBytes> {
         let wallet = self.address()?;
         let transaction = chain::checked_transaction(config, intent, wallet, nonce)?;
+        self.sign_checked_transaction(transaction)
+    }
+
+    pub(super) fn sign_publication_recovery(
+        &self,
+        config: &ChainConfig,
+        original: &super::store::SignedTransaction,
+        intent: &SpendIntent,
+    ) -> Result<SignedBytes> {
+        let transaction =
+            chain::checked_publication_recovery(config, original, intent, self.address()?)?;
+        self.sign_checked_transaction(transaction)
+    }
+
+    fn sign_checked_transaction(
+        &self,
+        transaction: alloy_consensus::TxEip1559,
+    ) -> Result<SignedBytes> {
         let signature = self.sign_hash(transaction.signature_hash())?;
         let envelope = TxEnvelope::from(transaction.into_signed(signature));
         let raw = envelope.encoded_2718();
@@ -459,6 +477,98 @@ mod tests {
         assert_eq!(store.transaction(&original.id)?, signed);
         drop(store);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonce_recovery_signer_only_spends_the_original_reveal_nonce_on_the_pinned_getter()
+    -> Result<()> {
+        use alloy_consensus::Transaction;
+        use alloy_eips::eip2718::Decodable2718;
+        use alloy_sol_types::SolCall;
+        let key = SigningKey::from_slice(&[2; 32])?;
+        let wallet = Wallet {
+            path: PathBuf::new(),
+            address: Some(Address::from_public_key(key.verifying_key())),
+            key: Some(key),
+            load_error: None,
+        };
+        let config = chain::tests::config();
+        let mut intent = chain::tests::approval_intent(wallet.address()?)?;
+        let (target, calldata) = super::super::budget::BudgetAction::Reveal {
+            budget_id: [3; 32],
+            items: vec![super::super::budget::Reveal {
+                window: super::super::budget::WindowRef {
+                    order_id: "04".repeat(32),
+                    index: 0,
+                },
+                capsule: vec![5; 80],
+            }],
+        }
+        .encode(&config, wallet.address()?)?;
+        intent.id = format!("budget-{}/reveal-{}-0", "03".repeat(32), "06".repeat(8));
+        intent.to = chain::address_hex(target);
+        intent.calldata = format!("0x{}", hex::encode(calldata));
+        intent.gas_limit = super::super::budget::REVEAL_GAS_LIMIT;
+        intent.gas_cap = "100000000000000000".into();
+        let signed = wallet.sign_transaction(&config, &intent, 7)?;
+        let original = super::super::store::SignedTransaction {
+            intent,
+            nonce: 7,
+            raw_tx: Some(signed.raw_tx),
+            tx_hash: Some(signed.tx_hash),
+            phase: "signed".into(),
+            block_number: None,
+            block_hash: None,
+            error: None,
+        };
+        let mut intent = original.intent.clone();
+        intent.id = format!("{}/nonce-0", original.intent.id);
+        intent.gas_limit = chain::NONCE_RECOVERY_GAS_LIMIT;
+        intent.calldata = format!(
+            "0x{}",
+            hex::encode(chain::abi::profileIdCall {}.abi_encode())
+        );
+        let signed = wallet.sign_publication_recovery(&config, &original, &intent)?;
+        assert!(
+            wallet.sign_transaction(&config, &intent, 7).is_err(),
+            "nonce recovery must not widen the ordinary action whitelist"
+        );
+        let raw = hex::decode(signed.raw_tx.trim_start_matches("0x"))?;
+        let transaction = TxEnvelope::decode_2718(&mut raw.as_slice())?;
+        assert_eq!(transaction.nonce(), 7);
+        assert_eq!(transaction.kind(), alloy_primitives::TxKind::Call(target));
+        assert_eq!(transaction.value(), alloy_primitives::U256::ZERO);
+        assert_eq!(
+            transaction.input().as_ref(),
+            chain::abi::profileIdCall {}.abi_encode()
+        );
+        for case in 0..8 {
+            let mut wrong = intent.clone();
+            match case {
+                0 => wrong.chain_id += 1,
+                1 => wrong.wallet = chain::address_hex(Address::repeat_byte(9)),
+                2 => wrong.to = wrong.wallet.clone(),
+                3 => wrong.value = "1".into(),
+                4 => wrong.calldata.push_str("00"),
+                5 => wrong.gas_limit += 1,
+                6 => wrong.gas_cap = "200000000000000000".into(),
+                7 => wrong.max_fee_per_gas = "1000000000000".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                wallet
+                    .sign_publication_recovery(&config, &original, &wrong)
+                    .is_err()
+            );
+        }
+        let mut wrong_original = original;
+        wrong_original.intent = chain::tests::approval_intent(wallet.address()?)?;
+        assert!(
+            wallet
+                .sign_publication_recovery(&config, &wrong_original, &intent)
+                .is_err()
+        );
         Ok(())
     }
 

@@ -849,6 +849,87 @@ impl ServiceStore {
             |intent, nonce| sign(intent, nonce).map(Some),
         )
     }
+    pub(super) fn publication_recoveries(&self, id: &str) -> Result<Vec<SignedTransaction>> {
+        self.value(&format!("protected-nonce:{id}"))?
+            .map(|body| serde_json::from_slice(&body).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+    pub(super) fn signed_publication_recovery(
+        &mut self,
+        original: &SignedTransaction,
+        intent: &SpendIntent,
+        sign: impl FnOnce(&SignedTransaction, &SpendIntent) -> Result<(String, String)>,
+    ) -> Result<SignedTransaction> {
+        let current = self.transaction(&original.intent.id)?;
+        ensure!(
+            current.intent == original.intent
+                && current.nonce == original.nonce
+                && current.raw_tx == original.raw_tx
+                && current.tx_hash == original.tx_hash,
+            "original publication changed before nonce recovery"
+        );
+        let key = format!("protected-nonce:{}", original.intent.id);
+        ensure!(key.len() <= 160, "nonce recovery identity is too long");
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let body: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT body FROM private_values WHERE id=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut recoveries: Vec<SignedTransaction> = body
+            .map(|body| serde_json::from_slice(&body))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            intent.id == format!("{}/nonce-{}", original.intent.id, recoveries.len())
+                && intent.chain_id == original.intent.chain_id
+                && intent.wallet == original.intent.wallet,
+            "nonce recovery must append to the original publication ledger"
+        );
+        let (raw, hash) = sign(original, intent)?;
+        check_signed_bytes(&raw, &hash)?;
+        let recovery = SignedTransaction {
+            intent: intent.clone(),
+            nonce: original.nonce,
+            raw_tx: Some(raw),
+            tx_hash: Some(hash),
+            phase: "signed".into(),
+            block_number: None,
+            block_hash: None,
+            error: None,
+        };
+        recoveries.push(recovery.clone());
+        let body = serde_json::to_vec(&recoveries)?;
+        ensure!(body.len() <= 1024 * 1024, "nonce recovery ledger is full");
+        tx.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![key,body])?;
+        check_capacity_limits(&tx, self.capacity, self.max_orders)?;
+        tx.commit()?;
+        Ok(recovery)
+    }
+    pub(super) fn observe_publication_recovery(
+        &self,
+        id: &str,
+        hash: &str,
+        observed: &super::chain::TxObservation,
+    ) -> Result<()> {
+        let mut recoveries = self.publication_recoveries(id)?;
+        let recovery = recoveries
+            .iter_mut()
+            .find(|recovery| recovery.tx_hash.as_deref() == Some(hash))
+            .context("nonce recovery hash is not in its original ledger")?;
+        recovery.phase = observed.phase.clone();
+        recovery.block_number = observed.block_number;
+        recovery.block_hash = observed.block_hash.clone();
+        recovery.error = observed.error.clone();
+        self.put_value(
+            &format!("protected-nonce:{id}"),
+            &serde_json::to_vec(&recoveries)?,
+        )
+    }
     fn reserve_transaction_inner(
         &mut self,
         intent: &SpendIntent,
@@ -1173,6 +1254,9 @@ fn transaction_class(db: &Connection, id: &str) -> Result<usize> {
     }
 }
 fn private_class(db: &Connection, id: &str, body: &[u8]) -> Result<usize> {
+    if let Some(intent) = id.strip_prefix("protected-nonce:") {
+        return transaction_class(db, intent);
+    }
     if let Some(order) = id.strip_prefix("order-observation:") {
         return Ok(order_class(db, order)?.unwrap_or(0));
     }

@@ -909,7 +909,19 @@ impl Delivery {
                 availability_risk: claim.risk,
             }))
     }
-    pub(super) fn queue_hold(&self, order: &StoredOrder, index: u16, seal: Vec<u8>) -> Result<()> {
+    pub(super) async fn queue_hold(
+        &self,
+        chain: &chain::Chain,
+        order: &StoredOrder,
+        index: u16,
+        seal: Vec<u8>,
+    ) -> Result<()> {
+        chain
+            .verify_hold(
+                &Statement::window(&order.order.unsigned, index, Relation::Hold)?,
+                &seal,
+            )
+            .await?;
         let item = HoldAuthorization {
             window: WindowRef {
                 order_id: order.view.order_id.clone(),
@@ -1586,6 +1598,185 @@ impl Delivery {
         }
         Ok(())
     }
+    async fn reconcile_publication_nonce(
+        &self,
+        chain: &chain::Chain,
+        claim: &PublicationClaim,
+        original: &super::store::SignedTransaction,
+        observed: &chain::TxObservation,
+        execute: bool,
+    ) -> Result<(Option<chain::TxObservation>, Option<String>)> {
+        let mut observations = vec![observed.clone()];
+        let recoveries = self.with_store(|s| s.publication_recoveries(&original.intent.id))?;
+        for recovery in &recoveries {
+            let observed = chain.observe(recovery).await?;
+            self.with_store(|s| {
+                s.observe_publication_recovery(
+                    &original.intent.id,
+                    recovery
+                        .tx_hash
+                        .as_deref()
+                        .context("nonce recovery has no hash")?,
+                    &observed,
+                )
+            })?;
+            observations.push(observed);
+        }
+        let terminal: Vec<_> = observations
+            .iter()
+            .filter(|observation| {
+                matches!(observation.phase.as_str(), "confirmed" | "reverted")
+                    && observation.block_number.is_some()
+                    && observation.block_hash.is_some()
+            })
+            .collect();
+        ensure!(
+            terminal.len() <= 1,
+            "multiple canonical transactions claim the same publication nonce"
+        );
+        if let Some(terminal) = terminal.first() {
+            return Ok((Some((**terminal).clone()), None));
+        }
+        if !execute || super::now() < claim.terms.economic_cutoff {
+            return Ok((None, None));
+        }
+        let paused = |reason: &str| Ok((None, Some(reason.to_owned())));
+        let (chain_now, base_fee) = chain.publication_clock().await?;
+        if chain_now < claim.terms.economic_cutoff
+            || super::now().abs_diff(chain_now) > claim.terms.policy.clock_skew_seconds
+        {
+            return paused(
+                "nonce cleanup paused until local and chain clocks agree after the economic cutoff",
+            );
+        }
+        let config = self.config();
+        if config.publication_policy.as_ref() != Some(&claim.terms.policy)
+            || self
+                .authorize_transaction(&original.intent, chain.config())
+                .await
+                .is_err()
+            || !matches!(self.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), WalletStatus::Unlocked { address } if address == claim.terms.payee)
+        {
+            return paused(
+                "nonce cleanup paused: original authorization and unlocked wallet are required",
+            );
+        }
+        let wallet = chain::address(&original.intent.wallet)?;
+        let latest = chain.latest_nonce(wallet).await?;
+        let pending = chain.pending_nonce(wallet).await?;
+        if latest != original.nonce
+            || pending < original.nonce
+            || pending > original.nonce && !observations.iter().any(|o| o.phase == "submitted")
+            || observations.iter().any(|o| o.block_number.is_some())
+        {
+            return paused("nonce cleanup awaits the original hashes and canonical nonce outcome");
+        }
+        let prior = recoveries
+            .last()
+            .map(|recovery| &recovery.intent)
+            .unwrap_or(&original.intent);
+        let prior_fee = chain::amount(&prior.max_fee_per_gas)?;
+        let prior_priority = chain::amount(&prior.max_priority_fee_per_gas)?;
+        let enough = base_fee
+            .checked_add(prior_priority)
+            .is_some_and(|fee| fee <= prior_fee);
+        let recovery = if let Some(recovery) = recoveries.last().filter(|_| enough) {
+            recovery.clone()
+        } else {
+            let bump = |fee: U256| -> Result<U256> {
+                fee.checked_mul(U256::from(9))
+                    .and_then(|fee| fee.checked_add(U256::from(7)))
+                    .map(|fee| (fee / U256::from(8)).max(U256::from(1)))
+                    .context("nonce recovery fee overflow")
+            };
+            let priority = bump(prior_priority)?;
+            let fee = bump(prior_fee)?.max(
+                base_fee
+                    .checked_add(priority)
+                    .context("nonce recovery fee overflow")?,
+            );
+            let reserved = U256::from(original.intent.gas_limit)
+                .checked_mul(chain::amount(&original.intent.max_fee_per_gas)?)
+                .context("publication gas cost overflow")?;
+            let cost = U256::from(chain::NONCE_RECOVERY_GAS_LIMIT)
+                .checked_mul(fee)
+                .context("nonce recovery gas cost overflow")?;
+            if cost > reserved || fee > U256::from(u128::MAX) {
+                return paused(
+                    "nonce cleanup paused: current fee exceeds the original reserved gas cost",
+                );
+            }
+            if chain::amount(&chain.native_balance(wallet).await?)? < cost {
+                return paused("nonce cleanup paused: insufficient native gas balance");
+            }
+            let intent = super::store::SpendIntent {
+                id: format!("{}/nonce-{}", original.intent.id, recoveries.len()),
+                chain_id: original.intent.chain_id,
+                wallet: original.intent.wallet.clone(),
+                to: original.intent.to.clone(),
+                calldata: format!("0x{}", hex::encode(abi::profileIdCall {}.abi_encode())),
+                value: "0".into(),
+                gas_limit: chain::NONCE_RECOVERY_GAS_LIMIT,
+                gas_cap: original.intent.gas_cap.clone(),
+                max_fee_per_gas: fee.to_string(),
+                max_priority_fee_per_gas: priority.to_string(),
+            };
+            self.authorize_transaction(&original.intent, chain.config())
+                .await?;
+            ensure!(
+                self.config().publication_policy.as_ref() == Some(&claim.terms.policy),
+                "publication policy changed before nonce cleanup signing"
+            );
+            let wallet = self
+                .wallet
+                .lock()
+                .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
+            self.with_store(|s| {
+                s.signed_publication_recovery(original, &intent, |original, intent| {
+                    let signed =
+                        wallet.sign_publication_recovery(chain.config(), original, intent)?;
+                    Ok((signed.raw_tx, signed.tx_hash))
+                })
+            })?
+        };
+        chain::checked_publication_recovery(chain.config(), original, &recovery.intent, wallet)?;
+        let (chain_now, base_fee) = chain.publication_clock().await?;
+        let cost = U256::from(recovery.intent.gas_limit)
+            .checked_mul(chain::amount(&recovery.intent.max_fee_per_gas)?)
+            .context("nonce recovery gas cost overflow")?;
+        let maximum_fee = chain::amount(&recovery.intent.max_fee_per_gas)?;
+        if super::now() < claim.terms.economic_cutoff
+            || chain_now < claim.terms.economic_cutoff
+            || super::now().abs_diff(chain_now) > claim.terms.policy.clock_skew_seconds
+            || !base_fee
+                .checked_add(chain::amount(&recovery.intent.max_priority_fee_per_gas)?)
+                .is_some_and(|fee| fee <= maximum_fee)
+            || chain::amount(&chain.native_balance(wallet).await?)? < cost
+            || chain.latest_nonce(wallet).await? != original.nonce
+            || chain.pending_nonce(wallet).await? != pending
+        {
+            return paused(
+                "nonce cleanup paused: clock, gas balance, fee or nonce changed before broadcast",
+            );
+        }
+        self.authorize_transaction(&original.intent, chain.config())
+            .await?;
+        ensure!(
+            self.config().publication_policy.as_ref() == Some(&claim.terms.policy)
+                && matches!(self.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), WalletStatus::Unlocked { address } if address == claim.terms.payee),
+            "nonce cleanup authorization or unlocked wallet changed before broadcast"
+        );
+        let signed = chain::SignedBytes {
+            raw_tx: recovery
+                .raw_tx
+                .context("nonce recovery has no signed bytes")?,
+            tx_hash: recovery.tx_hash.context("nonce recovery has no hash")?,
+        };
+        let _ = chain.broadcast(&signed).await;
+        paused(
+            "nonce cleanup submitted; original reveal and cleanup hashes still require canonical reconciliation",
+        )
+    }
     async fn reconcile_publication(
         &self,
         chain: &chain::Chain,
@@ -1602,6 +1793,7 @@ impl Delivery {
         let position = chain.confirmed_position().await?;
         let mut last = None;
         let mut terminal_blocks = Vec::new();
+        let mut nonce_risk = None;
         for id in &claim.attempts {
             let transaction = self.with_store(|s| s.transaction(id))?;
             let observed = chain.observe(&transaction).await?;
@@ -1614,13 +1806,19 @@ impl Delivery {
                     observed.error.as_deref(),
                 )
             })?;
-            if matches!(observed.phase.as_str(), "confirmed" | "reverted")
-                && observed.block_hash.is_some()
-                && let Some(number) = observed.block_number
-            {
+            let (terminal, risk) = self
+                .reconcile_publication_nonce(chain, claim, &transaction, &observed, execute)
+                .await?;
+            nonce_risk = risk.or(nonce_risk);
+            if let Some(number) = terminal.as_ref().and_then(|observed| observed.block_number) {
                 terminal_blocks.push(number);
+                if !matches!(observed.phase.as_str(), "confirmed" | "reverted") {
+                    self.with_store(|s| s.observe_transaction(id, "conflicted", None, None,
+                        Some("original publication nonce was canonically consumed by its recorded cleanup transaction")))?;
+                }
             }
-            if observed.phase != "reverted" {
+            if observed.phase != "reverted" && (terminal.is_none() || observed.phase == "confirmed")
+            {
                 last = Some((transaction, observed));
             }
         }
@@ -1685,7 +1883,7 @@ impl Delivery {
             claim.state = ClaimState::FinalEarned {
                 first_possible_at: disclosed,
             };
-            claim.risk = None;
+            claim.risk = nonce_risk;
             return self.save_claim(claim);
         }
         if matches!(claim.state, ClaimState::FinalEarned { .. }) {
@@ -1737,19 +1935,27 @@ impl Delivery {
                     settlement_candidate: Some(evidence),
                 }
             };
-            claim.risk = Some("original windows and amounts ended in earned or refunded state; recovery material may remain disclosed".into());
+            claim.risk = nonce_risk.or_else(|| Some("original windows and amounts ended in earned or refunded state; recovery material may remain disclosed".into()));
             return self.save_claim(claim);
         }
         if all_windows_earned {
-            claim.risk = Some("windows earned less than the authorized whole-order amount; original bonus conditions were missed".into());
+            claim.risk = nonce_risk.or_else(|| Some("windows earned less than the authorized whole-order amount; original bonus conditions were missed".into()));
             return self.save_claim(claim);
         }
         let now = super::now().max(chain_now);
-        if now >= claim.terms.economic_cutoff {
+        let cleanup_started = self.with_store(|s| {
+            for id in &claim.attempts {
+                if !s.publication_recoveries(id)?.is_empty() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if now >= claim.terms.economic_cutoff || cleanup_started {
             if disclosed.is_none() {
                 claim.state = ClaimState::ExpiredUnrevealed;
             }
-            claim.risk = Some("economic deadline passed; unearned payment cannot be promised, reconciliation continues".into());
+            claim.risk = nonce_risk.or_else(|| Some("economic deadline passed; unearned payment cannot be promised, reconciliation continues".into()));
             return self.save_claim(claim);
         }
         if !live_held {
@@ -1966,6 +2172,7 @@ mod tests {
         current_reorg: bool,
         current_hash_changed: bool,
         broken: bool,
+        hold_valid: Option<bool>,
         quote: Option<(BudgetTerms, vibeface_delivery::SignedKeyBinding)>,
     }
     impl Observation {
@@ -2022,6 +2229,457 @@ mod tests {
         dir: std::path::PathBuf,
         now: u64,
     }
+
+    struct NonceObservation {
+        receipts: std::collections::BTreeMap<String, (bool, u64)>,
+        known: Vec<super::super::store::SignedTransaction>,
+        latest: u64,
+        pending: u64,
+        base_fee: u64,
+        balance: u64,
+        broken: bool,
+    }
+    struct NonceFixture {
+        delivery: Delivery,
+        rpc: chain::tests::RpcFixture,
+        observation: Arc<Mutex<NonceObservation>>,
+        original: super::super::store::SignedTransaction,
+        claim: PublicationClaim,
+        dir: std::path::PathBuf,
+    }
+    impl NonceFixture {
+        async fn new(expired: bool, disclosed: bool) -> Result<Self> {
+            use alloy_consensus::{Transaction, TxEnvelope};
+            use alloy_eips::eip2718::Decodable2718;
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.artifacts/audit-shortlist/nonce-tests")
+                .join(uuid::Uuid::new_v4().to_string());
+            crate::config::private_dir(&dir)?;
+            let delivery = Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
+            let wallet = {
+                let mut wallet = delivery.wallet.lock().unwrap();
+                wallet.create(&vibeface_control::maintenance::SecretString::new(
+                    "nonce cleanup test password".into(),
+                ))?;
+                wallet.address()?
+            };
+            let config = chain::tests::config();
+            let escrow = chain::address(&config.escrow)?;
+            let observation = Arc::new(Mutex::new(NonceObservation {
+                receipts: Default::default(),
+                known: Vec::new(),
+                latest: 7,
+                pending: 7,
+                base_fee: 1,
+                balance: u64::MAX,
+                broken: false,
+            }));
+            let observed = observation.clone();
+            let rpc = chain::tests::rpc_fixture(config, move |request| {
+                let state = observed.lock().unwrap();
+                let block = |number: u64| json!({"number":format!("0x{number:x}"),
+                    "hash":format!("0x{}","55".repeat(32)),
+                    "timestamp":format!("0x{:x}",super::super::now()),
+                    "baseFeePerGas":format!("0x{:x}",state.base_fee)});
+                match request["method"].as_str().unwrap() {
+                    "eth_getBlockByNumber" => block(if request["params"][0] == "latest" {20} else {
+                        u64::from_str_radix(request["params"][0].as_str().unwrap().trim_start_matches("0x"),16).unwrap()
+                    }),
+                    "eth_blockNumber" => json!("0x14"),
+                    "eth_getTransactionCount" => json!(format!("0x{:x}",if request["params"][1]=="latest" {state.latest} else {state.pending})),
+                    "eth_getBalance" => json!(format!("0x{:x}",state.balance)),
+                    "eth_getTransactionReceipt" => {
+                        if state.broken { return json!(false); }
+                        let Some((success,number)) = state.receipts.get(request["params"][0].as_str().unwrap()) else {return Value::Null;};
+                        json!({"transactionHash":request["params"][0],"from":chain::address_hex(wallet),
+                            "to":chain::address_hex(escrow),"blockNumber":format!("0x{number:x}"),
+                            "blockHash":block(*number)["hash"],"status":if *success {"0x1"}else{"0x0"}})
+                    }
+                    "eth_getTransactionByHash" => state.known.iter().find(|tx| tx.tx_hash.as_deref()==request["params"][0].as_str())
+                        .map(|tx| json!({"hash":tx.tx_hash,"nonce":format!("0x{:x}",tx.nonce),"from":tx.intent.wallet,
+                            "to":tx.intent.to,"input":tx.intent.calldata})).unwrap_or(Value::Null),
+                    "eth_sendRawTransaction" => {
+                        let raw = hex::decode(request["params"][0].as_str().unwrap().trim_start_matches("0x")).unwrap();
+                        let tx = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+                        assert_eq!(tx.nonce(),7);
+                        assert_eq!(tx.kind(),alloy_primitives::TxKind::Call(escrow));
+                        assert_eq!(tx.value(),U256::ZERO);
+                        assert_eq!(tx.input().as_ref(),abi::profileIdCall {}.abi_encode());
+                        json!(format!("0x{}",hex::encode(alloy_primitives::keccak256(&raw))))
+                    }
+                    method => panic!("nonce cleanup sent forbidden RPC {method}"),
+                }
+            }).await?;
+            let cap = "100000000000000000";
+            delivery.configure_local(super::super::DeliveryConfig {
+                enabled: true,
+                paid_enabled: true,
+                chain: Some(rpc.chain.config().clone()),
+                publication_policy: Some(policy()),
+                provider_gas_cap: cap.into(),
+                ..Default::default()
+            })?;
+            let budget_id = "bb".repeat(32);
+            delivery.with_store(|store| {
+                store.put_value(
+                    &record_key(&budget_id),
+                    &serde_json::to_vec(&BudgetRecord {
+                        terms: BudgetTerms {
+                            budget_id: budget_id.clone(),
+                            chain_id: 31337,
+                            escrow: chain::address_hex(escrow),
+                            payer: chain::address_hex(Address::repeat_byte(0x11)),
+                            payee: chain::address_hex(wallet),
+                            provider_peer: delivery.identity.device_id()?,
+                            asset: rpc.chain.config().asset.clone(),
+                            deposit: "17".into(),
+                        },
+                        payer_gas_cap: cap.into(),
+                        provider_gas_cap: cap.into(),
+                        network_id: None,
+                        authorized_by: None,
+                        role: Role::Provider,
+                    })?,
+                )
+            })?;
+            let cutoff = if expired {
+                super::super::now() - 1
+            } else {
+                super::super::now() + 100
+            };
+            let mut claim = PublicationClaim {
+                id: "aa".repeat(32),
+                terms: ClaimTerms {
+                    budget_id: budget_id.clone(),
+                    payee: chain::address_hex(wallet),
+                    items: vec![Reveal {
+                        window: WindowRef {
+                            order_id: "cc".repeat(32),
+                            index: 0,
+                        },
+                        capsule: vec![7; 80],
+                    }],
+                    economic_cutoff: cutoff,
+                    total_amount: "17".into(),
+                    gas_cap: cap.into(),
+                    policy: policy(),
+                    expected_earned: Default::default(),
+                },
+                state: if disclosed {
+                    ClaimState::DisclosedOutstanding {
+                        first_possible_at: cutoff - 100,
+                        settlement_candidate: None,
+                    }
+                } else {
+                    ClaimState::PrivateReady
+                },
+                attempts: Vec::new(),
+                risk: None,
+                checked_at_ms: 0,
+            };
+            delivery.save_claim(&claim)?;
+            let intent = rpc.chain.prepare_publication_intent(
+                format!("{}/reveal-{}-0", group(&budget_id), &claim.id[..16]),
+                wallet,
+                BudgetAction::Reveal {
+                    budget_id: parse_word(&budget_id)?,
+                    items: claim.terms.items.clone(),
+                },
+                cap.into(),
+                &policy(),
+            )?;
+            claim.attempts.push(intent.id.clone());
+            let original = delivery.with_store(|store| {
+                store.signed_publication_transaction(
+                    &intent,
+                    7,
+                    &group(&budget_id),
+                    cap,
+                    (&claim.key(), &serde_json::to_vec(&claim)?),
+                    |intent, nonce| {
+                        let signed = delivery.wallet.lock().unwrap().sign_transaction(
+                            rpc.chain.config(),
+                            intent,
+                            nonce,
+                        )?;
+                        Ok((signed.raw_tx, signed.tx_hash))
+                    },
+                )
+            })?;
+            Ok(Self {
+                delivery,
+                rpc,
+                observation,
+                original,
+                claim,
+                dir,
+            })
+        }
+        async fn step(
+            &self,
+            execute: bool,
+        ) -> Result<(Option<chain::TxObservation>, Option<String>)> {
+            let original = self
+                .delivery
+                .with_store(|store| store.transaction(&self.original.intent.id))?;
+            let observed = self.rpc.chain.observe(&original).await?;
+            self.delivery.with_store(|store| {
+                store.observe_transaction(
+                    &original.intent.id,
+                    &observed.phase,
+                    observed.block_number,
+                    observed.block_hash.as_deref(),
+                    observed.error.as_deref(),
+                )
+            })?;
+            self.delivery
+                .reconcile_publication_nonce(
+                    &self.rpc.chain,
+                    &self.claim,
+                    &original,
+                    &observed,
+                    execute,
+                )
+                .await
+        }
+        fn recoveries(&self) -> Result<Vec<super::super::store::SignedTransaction>> {
+            self.delivery
+                .with_store(|store| store.publication_recoveries(&self.original.intent.id))
+        }
+        fn sent(&self) -> Vec<String> {
+            self.rpc
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "eth_sendRawTransaction")
+                .map(|request| request["params"][0].as_str().unwrap().to_owned())
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_private_and_disclosed_nonces_recover_without_disclosing_reveal_bytes()
+    -> Result<()> {
+        for disclosed in [false, true] {
+            let fixture = NonceFixture::new(true, disclosed).await?;
+            let (_, risk) = fixture.step(true).await?;
+            assert!(risk.unwrap().contains("nonce cleanup submitted"));
+            let recoveries = fixture.recoveries()?;
+            assert_eq!(recoveries.len(), 1);
+            assert_eq!(recoveries[0].nonce, fixture.original.nonce);
+            assert_ne!(recoveries[0].raw_tx, fixture.original.raw_tx);
+            assert_eq!(fixture.sent(), vec![recoveries[0].raw_tx.clone().unwrap()]);
+            assert_eq!(
+                fixture
+                    .delivery
+                    .with_store(|s| s.transaction(&fixture.original.intent.id))?
+                    .intent,
+                fixture.original.intent
+            );
+            assert!(!matches!(
+                fixture.claim.state,
+                ClaimState::FinalEarned { .. }
+            ));
+            {
+                let mut state = fixture.observation.lock().unwrap();
+                state
+                    .receipts
+                    .insert(recoveries[0].tx_hash.clone().unwrap(), (disclosed, 10));
+                state.latest = 8;
+                state.pending = 8;
+            }
+            assert_eq!(
+                fixture.step(true).await?.0.unwrap().phase,
+                if disclosed { "confirmed" } else { "reverted" }
+            );
+            assert_eq!(fixture.sent().len(), 1);
+        }
+        let fixture = NonceFixture::new(false, false).await?;
+        fixture.step(true).await?;
+        assert!(fixture.recoveries()?.is_empty());
+        assert!(fixture.sent().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonce_cleanup_pauses_for_locked_revoked_unknown_and_over_budget_fees() -> Result<()> {
+        let fixture = NonceFixture::new(true, false).await?;
+        fixture.delivery.wallet.lock().unwrap().lock();
+        assert!(fixture.step(true).await?.1.unwrap().contains("unlocked"));
+        fixture.delivery.wallet.lock().unwrap().unlock(
+            &vibeface_control::maintenance::SecretString::new("nonce cleanup test password".into()),
+        )?;
+        let settings = fixture.delivery.config();
+        let mut revoked = settings.clone();
+        revoked.paid_enabled = false;
+        fixture.delivery.configure_local(revoked)?;
+        assert!(
+            fixture
+                .step(true)
+                .await?
+                .1
+                .unwrap()
+                .contains("authorization")
+        );
+        fixture.delivery.configure_local(settings)?;
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state.latest = 8;
+            state.pending = 8;
+        }
+        assert!(
+            fixture
+                .step(true)
+                .await?
+                .1
+                .unwrap()
+                .contains("canonical nonce")
+        );
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state.latest = 7;
+            state.pending = 7;
+            state.base_fee = 200_000_000_000;
+        }
+        assert!(
+            fixture
+                .step(true)
+                .await?
+                .1
+                .unwrap()
+                .contains("reserved gas cost")
+        );
+        fixture.observation.lock().unwrap().base_fee = 1;
+        fixture.observation.lock().unwrap().balance = 0;
+        assert!(fixture.step(true).await?.1.unwrap().contains("gas balance"));
+        fixture.observation.lock().unwrap().broken = true;
+        assert!(fixture.step(true).await.is_err());
+        assert!(fixture.recoveries()?.is_empty());
+        assert!(fixture.sent().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_restarts_reuses_bytes_and_late_receipts_allow_the_next_contiguous_spend()
+    -> Result<()> {
+        let mut fixture = NonceFixture::new(true, false).await?;
+        fixture.step(true).await?;
+        let first = fixture.recoveries()?.remove(0);
+        let identity = fixture.delivery.identity.clone();
+        fixture.delivery = Delivery::open(&fixture.dir, identity)?;
+        assert!(fixture.step(true).await?.1.unwrap().contains("unlocked"));
+        assert_eq!(fixture.sent().len(), 1);
+        fixture.delivery.wallet.lock().unwrap().unlock(
+            &vibeface_control::maintenance::SecretString::new("nonce cleanup test password".into()),
+        )?;
+        fixture.step(true).await?;
+        assert_eq!(fixture.recoveries()?.len(), 1);
+        assert_eq!(fixture.sent(), vec![first.raw_tx.clone().unwrap(); 2]);
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state
+                .receipts
+                .insert(first.tx_hash.clone().unwrap(), (false, 10));
+            state.latest = 8;
+            state.pending = 8;
+        }
+        assert_eq!(fixture.step(true).await?.0.unwrap().phase, "reverted");
+        let original = fixture
+            .delivery
+            .with_store(|store| store.transaction(&fixture.original.intent.id))?;
+        assert_eq!(original.raw_tx, fixture.original.raw_tx);
+        assert_ne!(original.phase, "confirmed");
+        let mut next = fixture.original.intent.clone();
+        next.id = format!(
+            "{}/withdraw-after-cleanup",
+            group(&fixture.claim.terms.budget_id)
+        );
+        next.calldata = format!(
+            "0x{}",
+            hex::encode(
+                abi::withdrawBudgetCall {
+                    id: parse_word(&fixture.claim.terms.budget_id)?.into()
+                }
+                .abi_encode()
+            )
+        );
+        next.gas_limit = 100_000;
+        let next = fixture.delivery.with_store(|store| {
+            store.signed_budget_transaction(
+                &next,
+                8,
+                &group(&fixture.claim.terms.budget_id),
+                &fixture.claim.terms.gas_cap,
+                |intent, nonce| {
+                    let signed = fixture.delivery.wallet.lock().unwrap().sign_transaction(
+                        fixture.rpc.chain.config(),
+                        intent,
+                        nonce,
+                    )?;
+                    Ok((signed.raw_tx, signed.tx_hash))
+                },
+            )
+        })?;
+        assert_eq!(next.nonce, 8);
+        for success in [false, true] {
+            let fixture = NonceFixture::new(true, true).await?;
+            fixture.step(true).await?;
+            {
+                let mut state = fixture.observation.lock().unwrap();
+                state
+                    .receipts
+                    .insert(fixture.original.tx_hash.clone().unwrap(), (success, 10));
+                state.latest = 8;
+                state.pending = 8;
+            }
+            assert_eq!(
+                fixture.step(true).await?.0.unwrap().phase,
+                if success { "confirmed" } else { "reverted" }
+            );
+            assert_eq!(fixture.recoveries()?.len(), 1);
+            assert_eq!(fixture.sent().len(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pending_underpriced_reveal_uses_fee_bumps_within_its_existing_reservation()
+    -> Result<()> {
+        let fixture = NonceFixture::new(true, true).await?;
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state.known.push(fixture.original.clone());
+            state.pending = 8;
+            state.base_fee = 10_000_000_000;
+        }
+        fixture.step(true).await?;
+        let first = fixture.recoveries()?.remove(0);
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state.known.push(first.clone());
+            state.base_fee = 25_000_000_000;
+        }
+        fixture.step(true).await?;
+        let recoveries = fixture.recoveries()?;
+        assert_eq!(recoveries.len(), 2);
+        assert_eq!(recoveries[1].nonce, fixture.original.nonce);
+        assert!(
+            chain::amount(&recoveries[1].intent.max_fee_per_gas)?
+                > chain::amount(&first.intent.max_fee_per_gas)?
+        );
+        for recovery in &recoveries {
+            chain::checked_publication_recovery(
+                fixture.rpc.chain.config(),
+                &fixture.original,
+                &recovery.intent,
+                chain::address(&fixture.claim.terms.payee)?,
+            )?;
+        }
+        assert_eq!(fixture.sent().len(), 2);
+        Ok(())
+    }
+
     impl PublicationFixture {
         async fn new(phases: [u8; 2]) -> Result<Self> {
             Self::with_claims(phases, true).await
@@ -2108,6 +2766,7 @@ mod tests {
                 current_reorg: false,
                 current_hash_changed: false,
                 broken: false,
+                hold_valid: Some(true),
                 quote: None,
             }));
             {
@@ -2205,6 +2864,16 @@ mod tests {
                         getter!(CONTROL_ROOT_1Call, alloy_primitives::FixedBytes::<16>::from_slice(&second));
                         if data==format!("0x{}",hex::encode(abi::getProfileCall {}.abi_encode())) {
                             return encoded(rpc_profile.abi_bytes().unwrap());
+                        }
+                        if data.starts_with(&format!("0x{}",hex::encode(abi::verifyCall::SELECTOR))) {
+                            assert_eq!(request["params"][0]["to"], format!("0x{}","55".repeat(20)));
+                            let proof=abi::verifyCall::abi_decode_validate(&hex::decode(data.trim_start_matches("0x")).unwrap()).unwrap();
+                            assert!(rpc_orders.iter().any(|order| (0..2).any(|index|
+                                proof.journalDigest.as_slice()==Statement::window(&order.order.unsigned,index,Relation::Hold).unwrap().digest())));
+                            return match state.hold_valid {
+                                Some(valid) => encoded(abi::verifyCall::abi_encode_returns(&valid)),
+                                None => Value::Null,
+                            };
                         }
                         if let Some((terms, binding)) = &state.quote {
                             if data == format!("0x{}",hex::encode(abi::getBudgetCall {id:parse_word(&terms.budget_id).unwrap().into()}.abi_encode())) {
@@ -2510,6 +3179,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_hold_proofs_leave_the_budget_queue_available_for_valid_retries() -> Result<()>
+    {
+        let fixture = PublicationFixture::with_current_orders([0, 0]).await?;
+        let order = &fixture.orders[1];
+        let budget = order.view.payment.budget_id.as_ref().unwrap();
+        let window = WindowRef {
+            order_id: order.view.order_id.clone(),
+            index: 0,
+        };
+        let mut seal = vec![0; 260];
+        seal[..4].copy_from_slice(&[0x73, 0xc4, 0x57, 0xba]);
+        for valid in [Some(false), None] {
+            fixture.observation.lock().unwrap().hold_valid = valid;
+            assert!(
+                fixture
+                    .delivery
+                    .queue_hold(&fixture.rpc.chain, order, 0, seal.clone())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .delivery
+                    .with_store(|store| store.value(&hold_key(&window)))?
+                    .is_none()
+            );
+        }
+        fixture.observation.lock().unwrap().hold_valid = Some(true);
+        for index in [1, 0, 0] {
+            fixture
+                .delivery
+                .queue_hold(&fixture.rpc.chain, order, index, seal.clone())
+                .await?;
+        }
+        assert_eq!(
+            fixture.delivery.budget_ready_windows(budget).await?,
+            vec![
+                window,
+                WindowRef {
+                    order_id: order.view.order_id.clone(),
+                    index: 1
+                }
+            ],
+            "a rejected seal and a temporary verifier failure cannot poison the same budget"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn review_regression_old_active_budget_survives_new_history_for_ready_hold_and_publication()
     -> Result<()> {
         let mut fixture = PublicationFixture::with_current_orders([0, 0]).await?;
@@ -2552,7 +3270,8 @@ mod tests {
         for window in &windows {
             fixture
                 .delivery
-                .queue_hold(&active, window.index, seal.clone())?;
+                .queue_hold(&fixture.rpc.chain, &active, window.index, seal.clone())
+                .await?;
         }
         assert_eq!(
             fixture.delivery.budget_ready_windows(&id).await?,
