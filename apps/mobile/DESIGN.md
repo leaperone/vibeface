@@ -6,6 +6,9 @@ colors:
   background-dark: "oklch(0.175 0.006 270)"
   foreground-light: "oklch(0.21 0.012 270)"
   foreground-dark: "oklch(0.955 0.004 270)"
+  primary-light: "oklch(0.24 0.016 270)"
+  primary-foreground-light: "oklch(0.985 0.002 270)"
+  primary-dark: "oklch(0.94 0.005 270)"
   brand-light: "oklch(0.53 0.2 280)"
   brand-dark: "oklch(0.72 0.15 280)"
   muted-light: "oklch(0.965 0.004 270)"
@@ -13,22 +16,24 @@ colors:
 typography:
   body:
     fontFamily: "Geist"
-    fontSize: "15px"
+    fontSize: "16px"
     lineHeight: "24px"
   meta:
     fontFamily: "Geist"
     fontSize: "13px"
-    lineHeight: "20px"
+    lineHeight: "18px"
 rounded:
   base: "0.625rem"
+  control: "0.5rem"
   xl: "0.875rem"
 spacing:
   unit: "4px"
   screen: "16px"
 components:
   button-primary:
-    backgroundColor: "{colors.brand-light}"
-    rounded: "{rounded.base}"
+    backgroundColor: "{colors.primary-light}"
+    textColor: "{colors.primary-foreground-light}"
+    rounded: "{rounded.control}"
   card:
     backgroundColor: "{colors.background-light}"
     rounded: "{rounded.xl}"
@@ -40,17 +45,19 @@ components:
 
 **Creative North Star: "Quiet control room"**
 
+Working description of the incumbent implementation, pending qualitative confirmation.
+
 The mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.
 
 **Key Characteristics:** native, calm, task-first, accessible, interruption-aware.
 
 ## Colors
 
-Mobile consumes the same semantic tokens from `packages/theme/theme.css` through Uniwind. Violet marks brand and primary action. Muted surfaces group content; success, warning, danger, and info states remain text-and-icon backed.
+Mobile consumes the same semantic tokens from `packages/theme/theme.css` through Uniwind. Default buttons use the neutral `primary`/`primary-foreground` pair. Violet marks brand and focus; the chat send control may use the current Bot tint. Muted surfaces group content; success, warning, danger, and info states remain text-and-icon backed.
 
 ## Typography
 
-Geist is used for UI text and Geist Mono for code, IDs, and logs. The existing 15/24 body and 13/20 metadata scale favors readable mobile density. Keep headings short enough to wrap without hiding the action that follows.
+Geist is used for UI text and Geist Mono for code, IDs, and logs. The existing 16/24 body and 13/18 metadata scale favors readable mobile density. Keep headings short enough to wrap without hiding the action that follows.
 
 ## Layout
 
@@ -82,11 +89,3 @@ Rounded 12–14px cards and 24–26px chat materials establish the current langu
 - Don't use blur, gradients, or animation as decoration.
 - Don't rely on color alone for connection, delivery, or recovery state.
 - Don't add a second mobile design language beside the existing UI primitives.
-
-## Current review notes
-
-- **Critique:** chat and workspace flows have the clearest hierarchy; secondary device/recovery screens should preserve the same action-first structure.
-- **Audit:** source includes accessibility labels, selected states, safe-area handling, reduced motion/transparency behavior, and keyboard-aware layouts. Real simulator/device rendering remains required for acceptance.
-- **Distill:** retain native navigation, current conversation, composer, and one primary action; avoid nested containers that repeat the same surface treatment.
-- **Layout:** preserve the vertical path: title/context → content → primary action/composer. Keep sheets bounded and scrollable for long targets or queues.
-- **Optimize:** no measured bottleneck is present in source alone. Profile message lists, markdown rendering, and keyboard transitions before adding memoization or virtualization.

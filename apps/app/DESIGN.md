@@ -6,6 +6,9 @@ colors:
   background-dark: "oklch(0.175 0.006 270)"
   foreground-light: "oklch(0.21 0.012 270)"
   foreground-dark: "oklch(0.955 0.004 270)"
+  primary-light: "oklch(0.24 0.016 270)"
+  primary-foreground-light: "oklch(0.985 0.002 270)"
+  primary-dark: "oklch(0.94 0.005 270)"
   brand-light: "oklch(0.53 0.2 280)"
   brand-dark: "oklch(0.72 0.15 280)"
   muted-light: "oklch(0.965 0.004 270)"
@@ -23,14 +26,16 @@ typography:
     lineHeight: "20px"
 rounded:
   base: "0.625rem"
+  control: "0.5rem"
   xl: "0.875rem"
 spacing:
   unit: "4px"
   page: "16px"
 components:
   button-primary:
-    backgroundColor: "{colors.brand-light}"
-    rounded: "{rounded.base}"
+    backgroundColor: "{colors.primary-light}"
+    textColor: "{colors.primary-foreground-light}"
+    rounded: "{rounded.control}"
   card:
     backgroundColor: "{colors.background-light}"
     rounded: "{rounded.xl}"
@@ -42,13 +47,15 @@ components:
 
 **Creative North Star: "Quiet control room"**
 
+Working description of the incumbent implementation, pending qualitative confirmation.
+
 The web app is an Operate surface. It keeps attention on the current conversation or task while the sidebar provides stable orientation. Geist, cool neutral surfaces, and a restrained violet brand accent make state changes legible without turning the workspace into a dashboard of competing signals.
 
 **Key Characteristics:** calm, task-first, state-explicit, keyboard-friendly, responsive.
 
 ## Colors
 
-The shared source of truth is `packages/theme/theme.css`. Light mode uses white surfaces and cool near-black text; dark mode separates page, card, popover, and sidebar by tonal steps. Violet is reserved for focus, selection, brand identity, and primary action. Success, warning, danger, and info colors communicate state and must be paired with text or icon labels.
+The shared source of truth is `packages/theme/theme.css`. Light mode uses white surfaces and cool near-black text; dark mode separates page, card, popover, and sidebar by tonal steps. Default buttons use the neutral `primary`/`primary-foreground` pair. Violet marks focus, selection, and brand identity; conversation send controls may use the current Bot tint. Success, warning, danger, and info colors communicate state and must be paired with text or icon labels.
 
 ## Typography
 
@@ -85,11 +92,3 @@ The base radius is 10px, with 14px cards and 20px sheets where the component alr
 - Don't introduce gradients, decorative blur, or new color families without a product decision.
 - Don't use color alone for status.
 - Don't create one-off spacing or component variants when an existing primitive fits.
-
-## Current review notes
-
-- **Critique:** hierarchy is strongest in the workspace shell and conversation view; secondary settings and inbox rows should retain the same heading-to-metadata contrast.
-- **Audit:** the source shows explicit focus, reduced-motion, safe-area, overflow, and touch-target handling. Rendered browser/device checks are still required for final acceptance.
-- **Distill:** keep sidebar, header, current task/conversation, and one clear recovery action; remove decorative wrappers before adding new containers.
-- **Layout:** preserve the single reading path: navigation → current context → task content → action. Use grouping and proximity before extra cards.
-- **Optimize:** no source evidence justifies speculative memoization or virtualization. Measure route load, interaction latency, and long-list behavior before changing runtime code.
