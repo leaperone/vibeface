@@ -368,4 +368,3 @@ function CheckSummary({ check }: { check: CoordinationCheck }) {
     {check.detail ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{check.detail}</p> : null}
   </li>
 }
-
