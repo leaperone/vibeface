@@ -43,7 +43,7 @@ command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-ww
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml"]
+trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-www.yml"]
 command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
 
 [[domain_check]]
@@ -64,5 +64,5 @@ language = "zh"
 
 [[domain_check]]
 name = "Official deployment command"
-trigger_paths = ["scripts/deploy.py", "scripts/deploy-run.py", "scripts/deploy-activate.py", "deploy/**", ".github/workflows/deploy-services.yml", ".github/workflows/release.yml", "scripts/check-release-workflow.py"]
+trigger_paths = ["scripts/deploy.py", "scripts/deploy-run.py", "scripts/deploy-activate.py", "deploy/**", ".github/workflows/deploy-*.yml", ".github/workflows/release.yml", ".github/workflows/release-www.yml", "scripts/release-entry.py", "scripts/check-release-workflow.py"]
 command = "python3 -B scripts/deploy.py self-test && python3 -B scripts/deploy-run.py self-test && python3 -B scripts/deploy-activate.py --self-test && python3 -B deploy/runtime.py self-test && python3 -B deploy/static-config.py --self-test && python3 -B scripts/check-release-workflow.py --self-test"

@@ -17,6 +17,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 TARGET = 'x86_64-pc-windows-msvc'
 LIMIT = 1024 * 1024 * 1024
+SOURCE_WORKFLOWS = frozenset({'.github/workflows/ci.yml', '.github/workflows/ci-desktop-acceptance.yml'})
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('release', ROOT / 'scripts/release.py')
 release = importlib.util.module_from_spec(spec)
@@ -36,7 +37,8 @@ def github(path, binary=False):
 
 def validate_run(run, repository, run_id, source, attempt):
     require(str(run.get('id')) == run_id and run.get('head_sha') == source, 'source run or SHA mismatch')
-    require(run.get('path') == '.github/workflows/ci.yml' and run.get('event') == 'workflow_dispatch', 'inputs must come from manual ci.yml')
+    require(run.get('path') in SOURCE_WORKFLOWS and run.get('event') == 'workflow_dispatch',
+            'inputs must come from an exact allowed manual Desktop acceptance or historical CI workflow')
     require(run.get('repository', {}).get('full_name') == repository
             and run.get('head_repository', {}).get('full_name') == repository, 'source run belongs to another repository')
     require(run.get('run_attempt') == attempt and run.get('status') == 'completed', 'source attempt must be exact and completed')
@@ -178,7 +180,10 @@ def self_test():
            'repository': {'full_name': repository}, 'head_repository': {'full_name': repository},
            'run_attempt': 1, 'status': 'completed', 'run_started_at': '2026-11-11T00:00:00Z', 'updated_at': '2026-11-11T01:00:00Z'}
     validate_run(run, repository, '123', source, 1)
-    for field, value in [('head_sha','b'*40), ('event','schedule'), ('path','.github/workflows/release.yml'), ('run_attempt',2)]:
+    validate_run(dict(run, path='.github/workflows/ci-desktop-acceptance.yml'), repository, '123', source, 1)
+    for field, value in [('head_sha','b'*40), ('event','schedule'), ('path','.github/workflows/release.yml'), ('path','.github/workflows/ci-desktop.yml'),
+                         ('path','.github/workflows/ci-native-diagnostics.yml'), ('path','.github/workflows/ci-desktop-acceptance.yml.backup'),
+                         ('path','.github/workflows/ci-desktop-acceptance.yml@refs/heads/main'), ('run_attempt',2)]:
         altered = dict(run, **{field:value})
         try: validate_run(altered, repository, '123', source, 1)
         except ValueError: pass

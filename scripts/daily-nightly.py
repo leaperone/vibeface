@@ -21,6 +21,7 @@ from nightly_source import (DailyPlan, BOT, PATHS, blob, checkout, generated, gi
 ROOT = Path(__file__).resolve().parent.parent
 REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
+NIGHTLY = '.github/workflows/nightly.yml'
 RELEASE = '.github/workflows/release.yml'
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
@@ -167,18 +168,19 @@ def release_dispatch_tag(app):
 
 
 def start_release(app, source):
+    workflow, extra_inputs = release.release_workflow(source, app)
     tag = release_dispatch_tag(app)
     ensure_tag(tag, source)
     state = release_state(tag)
-    runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+    runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
     if state and not state['draft']:
         return runs
     if not runs:
         require(state is None, 'draft release has no original run; original bytes cannot be recovered')
         # The release workflow only builds unless publish is requested explicitly.
-        inputs = dict(app=app, tag=tag, publish='true')
-        runs = reconcile_write(lambda: api('actions/workflows/release.yml/dispatches', 'POST', dict(ref=tag, inputs=inputs)),
-                               lambda: matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'}), bool, 'release workflow dispatch')
+        inputs = dict(extra_inputs, tag=tag, publish='true')
+        runs = reconcile_write(lambda: api('actions/workflows/' + workflow.split('/')[-1] + '/dispatches', 'POST', dict(ref=tag, inputs=inputs)),
+                               lambda: matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'}), bool, 'release workflow dispatch')
     return runs
 
 
@@ -233,11 +235,12 @@ def recover_publisher(app, run, source):
 
 
 def finish_release(app, source, deadline):
+    workflow, _ = release.release_workflow(source, app)
     tag = release_dispatch_tag(app)
     restored = set()
     while time.monotonic() < deadline:
         require(tag_sha(tag) == source, 'release tag changed source')
-        runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+        runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         state = release_state(tag)
         active = [run for run in runs if run['status'] != 'completed']
         if not active:
@@ -275,11 +278,12 @@ def publish_daily(source, deadline, groups=RELEASES):
             except Exception as error:
                 errors.append(f'{app}: {error}')
     for app in started:
+        workflow, _ = release.release_workflow(source, app)
         tag = release_dispatch_tag(app)
-        runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+        runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         while any(run['status'] != 'completed' for run in runs) and time.monotonic() < deadline:
             time.sleep(15)
-            runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+            runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         print(json.dumps(dict(app=app, runs=[dict(id=run['id'], url=run['html_url'], status=run['status'],
                                                 conclusion=run['conclusion']) for run in runs])))
         if any(run['status'] != 'completed' for run in runs):
@@ -330,12 +334,13 @@ def completed_source(source):
         try:
             groups = RELEASES if release.validate_source(source, 'product')['ci_run_id'] else ('product',)
             for app in groups:
+                workflow, _ = release.release_workflow(source, app)
                 tag = release_dispatch_tag(app)
                 require(release.parse_tag(tag)[2] == 'nightly', 'recovery only accepts Nightly groups')
                 if tag_sha(tag) != source:
                     return False
                 state = release_state(tag)
-                runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+                runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
                 if not (state and not state['draft'] and len(runs) == 1
                         and runs[0]['status'] == 'completed' and runs[0]['conclusion'] == 'success'):
                     return False
@@ -394,7 +399,7 @@ def run_daily(run_id):
             'daily coordinator only accepts its original main schedule run')
     original = api(f'actions/runs/{run_id}')
     source = os.environ.get('GITHUB_SHA')
-    require(original['event'] == 'schedule' and original['head_branch'] == 'main' and original['path'] == CI
+    require(original['event'] == 'schedule' and original['head_branch'] == 'main' and original['path'] == NIGHTLY
             and original['head_sha'] == source and original['repository']['full_name'] == REPO
             and original['head_repository']['full_name'] == REPO and str(original['id']) == str(run_id),
             'untrusted daily schedule source')
@@ -579,6 +584,22 @@ def self_test():
         git('update-ref', 'refs/heads/main', legacy_batch, root=root)
         git('tag', 'v0.0.1-nightly.20261016.1', legacy, root=root)
         git('tag', 'v0.0.1-nightly.20261016.2', legacy_batch, root=root)
+        (root / '.github/workflows').mkdir(parents=True)
+        # Commit the historical contracts themselves; HEAD may already use the split entries.
+        (root / CI).write_text("name: CI\non:\n  schedule:\n    - cron: '23 */4 * * *'\n"
+                              "jobs:\n  ci-gate:\n    runs-on: ubuntu-24.04\n"
+                              "    steps:\n      - run: 'true'\n")
+        (root / RELEASE).write_text("name: Release\non:\n  workflow_dispatch:\n    inputs:\n"
+                                   "      app:\n        type: choice\n        options: [product, www]\n"
+                                   "      tag:\n        type: string\n"
+                                   "      publish:\n        type: boolean\n        default: false\n"
+                                   "jobs:\n  identity:\n    runs-on: ubuntu-24.04\n"
+                                   "    steps:\n      - run: 'true'\n")
+        git('add', '.', root=root)
+        git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'historical workflow fixture', root=root)
+        old_base = git('rev-parse', 'HEAD', root=root)
+        for path in (CI, RELEASE, NIGHTLY, '.github/workflows/release-www.yml'):
+            (root / path).write_bytes((ROOT / path).read_bytes())
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
         with patch('release.ROOT', root), patch(f'{__name__}.time.sleep'):
@@ -763,10 +784,13 @@ def self_test():
                         repository=dict(full_name=REPO), head_repository=dict(full_name=REPO),
                         status='completed', conclusion='success', html_url='https://example.invalid/main-ci')
             schedule = dict(good, id=42, event='schedule', head_sha=base, created_at='2026-11-06T00:23:00Z',
-                            status='in_progress', conclusion=None)
+                            status='in_progress', conclusion=None, path=NIGHTLY)
             ci_context = dict(ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
-            jobs = [dict(name='ci-gate', status='completed', conclusion='success')]
+            jobs = [dict(name='Nightly validation gate', status='completed', conclusion='success')]
+            original_run = release.run
             def ci_api(*args, **kwargs):
+                if args[0] == 'git':
+                    return original_run(*args, **kwargs)
                 return json.dumps([dict(jobs=jobs)] if args[-1].endswith('per_page=100') else schedule)
             with patch('release.run', side_effect=ci_api):
                 assert release.require_ci(ci_context)['id'] == 42
@@ -775,12 +799,74 @@ def self_test():
                                {'head_repository': dict(full_name='other/repo')}, {'created_at': '2026-11-06T04:23:00Z'}):
                     with patch.dict(schedule, change):
                         rejected(lambda: release.require_ci(ci_context))
-                for job_list in ([], [dict(jobs[0], conclusion='failure')], [dict(jobs[0], status='in_progress')], jobs * 2):
-                    with patch('release.run', side_effect=lambda *args: json.dumps([dict(jobs=job_list)] if args[-1].endswith('per_page=100') else schedule)):
-                        rejected(lambda: release.require_ci(ci_context), 'ci-gate')
+                for job_list in ([], [dict(jobs[0], conclusion='failure')], [dict(jobs[0], conclusion='skipped')],
+                                 [dict(jobs[0], status='in_progress')], [dict(name=jobs[0]['name'])], jobs * 2,
+                                 [dict(jobs[0], name='checks / Nightly validation gate')]):
+                    with patch('release.run', side_effect=lambda *args, **kwargs: original_run(*args, **kwargs) if args[0] == 'git'
+                               else json.dumps([dict(jobs=job_list)] if args[-1].endswith('per_page=100') else schedule)):
+                        rejected(lambda: release.require_ci(ci_context), 'Nightly validation gate')
+                for pinned, path, gate in ((old_base, CI, 'ci-gate'), (base, NIGHTLY, 'Nightly validation gate')):
+                    pinned_context = dict(ci_context, ci_source_commit=pinned)
+                    pinned_run = dict(schedule, head_sha=pinned, path=path)
+                    for crossed_path in (CI, NIGHTLY):
+                        for crossed_gate in ('ci-gate', 'Nightly validation gate'):
+                            def pinned_api(*args, **kwargs):
+                                if args[0] == 'git':
+                                    return original_run(*args, **kwargs)
+                                return json.dumps([dict(jobs=[dict(jobs[0], name=crossed_gate)])]
+                                                  if args[-1].endswith('per_page=100') else dict(pinned_run, path=crossed_path))
+                            with patch('release.run', side_effect=pinned_api):
+                                if crossed_path == path and crossed_gate == gate:
+                                    assert release.require_ci(pinned_context)['head_sha'] == pinned
+                                else:
+                                    rejected(lambda: release.require_ci(pinned_context))
+            assert release.release_workflow(old_base, 'product') == (RELEASE, dict(app='product'))
+            assert release.release_workflow(old_base, 'www') == (RELEASE, dict(app='www'))
+            assert release.release_workflow(base, 'product') == (RELEASE, {})
+            assert release.release_workflow(base, 'www') == ('.github/workflows/release-www.yml', {})
+            for pinned in (old_base, base):
+                for app in RELEASES:
+                    workflow, extra = release.release_workflow(pinned, app)
+                    dispatch_tag = ('www-v' if app == 'www' else 'v') + '0.0.1-nightly.20261106.1'
+                    dispatched = []; discovered = []
+                    expected_run = dict(good, head_sha=pinned, path=workflow, head_branch=dispatch_tag,
+                                        event='workflow_dispatch')
+                    def dispatch_api(path, method='GET', data=None):
+                        assert path == 'actions/workflows/' + workflow.split('/')[-1] + '/dispatches'
+                        assert method == 'POST' and data == dict(ref=dispatch_tag, inputs=dict(extra, tag=dispatch_tag, publish='true'))
+                        dispatched.append(data)
+                        discovered.append(expected_run)
+                        raise ValueError('dispatch accepted but response lost')
+                    def dispatch_pages(path, key=None):
+                        assert path == ('actions/workflows/' + workflow.split('/')[-1] + '/runs?head_sha='
+                                        + pinned + '&branch=' + quote(dispatch_tag, safe=''))
+                        assert key == 'workflow_runs'
+                        return discovered
+                    with patch(f'{__name__}.api', side_effect=dispatch_api), patch(f'{__name__}.pages', side_effect=dispatch_pages), \
+                            patch(f'{__name__}.ensure_tag'), patch(f'{__name__}.release_state', return_value=None), \
+                            patch(f'{__name__}.release_dispatch_tag', return_value=dispatch_tag):
+                        assert start_release(app, pinned) == [expected_run]
+                        assert start_release(app, pinned) == [expected_run] and len(dispatched) == 1
+                        # Even a response from the selected endpoint must match its exact source-era path.
+                        for wrong in (dict(expected_run, path=CI), dict(expected_run, head_sha=advanced),
+                                      dict(expected_run, event='schedule'), dict(expected_run, head_branch='main')):
+                            discovered[:] = [wrong]
+                            assert matching_runs(workflow, pinned, dispatch_tag, {'push', 'workflow_dispatch'}) == []
+            rejected(lambda: release.nightly_ci_identity(legacy), 'missing Core CI')
+            rejected(lambda: release.nightly_ci_identity('HEAD'), 'invalid workflow source')
+            rejected(lambda: release.nightly_ci_identity(base[:12]), 'invalid workflow source')
+            workflow_blob = git('rev-parse', base + ':' + CI)
+            malformed_workflows = git('mktree', data=(f'100644 blob {workflow_blob}\tci.yml\n'
+                f'120000 blob {workflow_blob}\tnightly.yml\n100644 blob {workflow_blob}\trelease.yml\n').encode())
+            malformed_github = git('mktree', data=f'040000 tree {malformed_workflows}\tworkflows\n'.encode())
+            malformed_tree = git('mktree', data=f'040000 tree {malformed_github}\t.github\n'.encode())
+            malformed_source = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                                   'commit-tree', malformed_tree, '-m', 'malformed workflow tree fixture')
+            rejected(lambda: release.nightly_ci_identity(malformed_source), 'malformed workflow source tree')
+            rejected(lambda: release.release_workflow(malformed_source, 'www'), 'malformed workflow source tree')
             with patch('release.run', return_value=json.dumps([dict(workflow_runs=[dict(good, head_sha=base)])])):
                 assert release.require_ci(dict(ci_source_commit=base, ci_run_id='', nightly_batch=''))['id'] == 1
-                for change in ({'event': 'schedule'}, {'head_sha': advanced}, {'path': RELEASE},
+                for change in ({'event': 'schedule'}, {'head_sha': advanced}, {'path': RELEASE}, {'path': NIGHTLY},
                                {'status': 'in_progress'}, {'conclusion': 'failure'}):
                     with patch('release.run', return_value=json.dumps([dict(workflow_runs=[dict(good, **({'head_sha': base} | change))])])):
                         rejected(lambda: release.require_ci(dict(ci_source_commit=base, ci_run_id='', nightly_batch='')))
@@ -818,7 +904,7 @@ def self_test():
                     writes.append((path, method, data))
                     if path.endswith('/dispatches'):
                         # A real daily release must request publication, not a build-only dry run.
-                        assert data == dict(ref=tag, inputs=dict(app='product', tag=tag, publish='true'))
+                        assert data == dict(ref=tag, inputs=dict(tag=tag, publish='true'))
                         remote['runs'] = [dict(good, head_branch=tag, event='workflow_dispatch', path=RELEASE)]
                     else:
                         raise AssertionError('unexpected write')
@@ -988,7 +1074,7 @@ def self_test():
                     rejected(lambda: run_daily(42))
                     no_write.assert_not_called()
 
-    workflow = (ROOT / CI).read_text()
+    workflow = (ROOT / NIGHTLY).read_text()
     assert "cron: '23 */4 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
     assert "if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}" in workflow
     npm = (ROOT / '.github/workflows/npm-publish.yml').read_text()
@@ -996,6 +1082,24 @@ def self_test():
     assert 'NPM_TOKEN' not in npm and 'secrets.' not in npm
     nightly_job = workflow.split('  daily-nightly:', 1)[1]
     assert 'NIGHTLY_RELEASE_TOKEN' not in nightly_job and 'pull-requests:' not in nightly_job
+    assert 'name: Release / Nightly\n' in workflow and 'run-name:' in workflow
+    checks_job = workflow.split('  checks:', 1)[1].split('  ci-gate:', 1)[0]
+    assert 'secrets: inherit' in checks_job, 'Nightly Core checks require the existing platform signing identities'
+    assert 'uses: ./.github/workflows/ci.yml' in checks_job and 'package_policy:' not in checks_job
+    assert workflow.count('uses: ./.github/workflows/ci.yml') == 1
+    gate_job = workflow.split('  ci-gate:', 1)[1].split('  daily-nightly:', 1)[0]
+    assert 'name: Nightly validation gate\n' in gate_job and 'needs: [checks]' in gate_job
+    assert 'if: always()' in gate_job and 'checkout' not in gate_job
+    assert "set(checks) != {'checks'}" in gate_job and ".get('result') != 'success'" in gate_job
+    assert 'needs: [ci-gate]' in nightly_job and 'ref: ${{ github.sha }}' in nightly_job
+    import textwrap
+    gate_code = textwrap.dedent(gate_job.split("python3 - <<'PYTHON'\n", 1)[1].split('          PYTHON', 1)[0])
+    for result in ({'checks': {'result': 'success'}}, {'checks': {'result': 'failure'}},
+                   {'checks': {'result': 'cancelled'}}, {'checks': {'result': 'skipped'}},
+                   {'checks': {}}, {}, {'unexpected': {'result': 'success'}}):
+        tested = subprocess.run([sys.executable, '-c', gate_code], env=dict(os.environ, NIGHTLY_NEEDS=json.dumps(result)),
+                                capture_output=True, text=True)
+        assert (tested.returncode == 0) == (result == {'checks': {'result': 'success'}})
     print('four-hour Nightly real-Git, batch identity, reconciliation and original-artifact self-tests passed')
 
 

@@ -1,0 +1,62 @@
+name: Release / Nightly
+run-name: >-
+  Nightly · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ github.sha }}
+
+on:
+  schedule:
+    - cron: '23 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  checks:
+    name: Validate complete Nightly source
+    if: github.event_name != 'schedule' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  ci-gate:
+    name: Nightly validation gate
+    needs: [checks]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all Nightly validation checks
+        env:
+          NIGHTLY_NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          checks = json.loads(os.environ['NIGHTLY_NEEDS'])
+          if set(checks) != {'checks'} or checks['checks'].get('result') != 'success':
+              raise SystemExit('Nightly validation is incomplete: ' + json.dumps(checks))
+          print('Complete Nightly validation passed')
+          PYTHON
+
+  daily-nightly:
+    needs: [ci-gate]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: daily-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Reconcile tag-only Nightly sources and immutable archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"

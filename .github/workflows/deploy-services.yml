@@ -1,13 +1,11 @@
-name: deploy-services
-run-name: Deploy ${{ inputs.service }} from ${{ inputs.tag }} (apply=${{ inputs.apply }})
+name: Reusable / Deploy service
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       service:
         description: Official service to deploy
-        type: choice
-        options: [all, node, app, www]
+        type: string
         required: true
       tag:
         description: Exact published product tag, or website tag for www

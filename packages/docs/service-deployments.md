@@ -20,21 +20,21 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 
 `--service` 支持以下目标：
 
-| 目标 | 交付内容 |
-| --- | --- |
-| `all` | 官方公共节点和 App，不含官网 |
-| `node` | 香港官方公共节点的 Core 容器：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额，不含前端文件 |
-| `app` | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
-| `www` | 独立官网静态容器，使用精确 `www-v<version>` Tag |
+| 目标 | GitHub Actions 入口 | 交付内容 |
+| --- | --- | --- |
+| `all` | Deploy / Product services（`deploy-product.yml`） | 在同一次运行中串行部署官方公共节点和 App，不含官网 |
+| `node` | Deploy / Node（`deploy-node.yml`） | 香港官方公共节点的 Core 容器：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额，不含前端文件 |
+| `app` | Deploy / Web App（`deploy-app.yml`） | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
+| `www` | Deploy / Website（`deploy-www.yml`） | 独立官网静态容器，使用精确 `www-v<version>` Tag |
 
-产品目标接受精确 Stable、RC、Nightly `v<version>`，官网只接受对应 `www-v<version>`。不自动跟随渠道。所有目标使用同一个 `deploy-services.yml`。部署命令以 `apply=true` 启动流水线；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。
+产品目标接受精确 Stable、RC、Nightly `v<version>`，官网只接受对应 `www-v<version>`。不自动跟随渠道。每个入口固定部署目标，只接收 Tag 和 `apply`；`deploy-services.yml` 是共用的可复用实现，不接受手动派发。所有入口共用该实现中的全局部署并发锁，正在运行的部署不会被后续请求取消。部署命令从 main 以 `apply=true` 启动对应入口；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。运行名称包含目标、Tag、执行意图和分支，便于核对运行记录。
 
 ```sh
 python3 scripts/deploy.py release --service www --tag '<WEBSITE_TAG>'
-gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=node -f tag='<PRODUCT_TAG>' -F apply=false
+gh workflow run deploy-node.yml --ref '<BRANCH>' -f tag='<PRODUCT_TAG>' -F apply=false
 ```
 
-真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、共享发布来源规则（main 或受信机械 Nightly）、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+真实激活仅允许从 main 执行。派发成功仅表示 GitHub 接收请求，须继续跟踪对应入口到终态；派发响应未知时先查询相同 Tag 的运行记录，不能直接重发。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、共享发布来源规则（main 或受信机械 Nightly）、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
 
 激活前同时核对传输归档的 SHA256 和导入后的 image ID。归档中的镜像必须与调用方指定的 `--image` 一致；摘要正确不能替代镜像身份校验。
 

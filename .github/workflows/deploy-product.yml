@@ -1,0 +1,26 @@
+name: Deploy / Product services
+run-name: Deploy Product services from ${{ inputs.tag }} (${{ inputs.apply && 'apply' || 'dry run' }}, ${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact published product tag
+        type: string
+        required: true
+      apply:
+        description: Activate the verified containers on the configured hosts
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-services.yml
+    with:
+      service: all
+      tag: ${{ inputs.tag }}
+      apply: ${{ inputs.apply }}
+    secrets: inherit

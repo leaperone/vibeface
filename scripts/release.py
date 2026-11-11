@@ -141,20 +141,62 @@ def validate_source(source, release_app, root=None):
         ROOT = previous
 
 
+def source_workflows(source):
+    """Read release entry paths from an exact immutable commit, never the checkout."""
+    require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid workflow source commit')
+    require(run('git', 'rev-parse', '--verify', source + '^{commit}') == source,
+            'workflow source must be an exact commit')
+    paths = {'.github/workflows/' + name for name in ('ci.yml', 'nightly.yml', 'release.yml', 'release-www.yml')}
+    entries = run('git', 'ls-tree', '-z', source, '--', *sorted(paths))
+    found = set()
+    for entry in entries.split('\0'):
+        if not entry:
+            continue
+        header, separator, path = entry.partition('\t')
+        fields = header.split()
+        require(separator and len(fields) == 3 and fields[0] in ('100644', '100755')
+                and fields[1] == 'blob' and re.fullmatch(COMMIT, fields[2])
+                and path in paths and path not in found, 'malformed workflow source tree')
+        found.add(path)
+    return found
+
+
+def nightly_ci_identity(source):
+    paths = source_workflows(source)
+    require('.github/workflows/ci.yml' in paths, 'workflow source is missing Core CI')
+    if '.github/workflows/nightly.yml' in paths:
+        return '.github/workflows/nightly.yml', 'Nightly validation gate'
+    return '.github/workflows/ci.yml', 'ci-gate'
+
+
+def release_workflow(source, app):
+    """Return the source-era release entry and its fixed dispatch input contract."""
+    require(app in RELEASES, 'release app must be product or www')
+    paths = source_workflows(source)
+    require('.github/workflows/release.yml' in paths, 'workflow source is missing Product release')
+    split = '.github/workflows/release-www.yml' in paths
+    path = '.github/workflows/release-www.yml' if app == 'www' and split else '.github/workflows/release.yml'
+    return path, ({} if split else dict(app=app))
+
+
 def require_ci(context):
     """Main tags require push success; detached Nightlies require their original schedule gate."""
     source, run_id = context['ci_source_commit'], context['ci_run_id']
+    require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid CI source commit')
     def api(path):
         return json.loads(run('gh', 'api', f'repos/{GITHUB_REPO}/' + path))
     if run_id:
+        require(isinstance(run_id, str) and re.fullmatch(r'[1-9][0-9]*', run_id), 'invalid original Nightly run ID')
+        workflow, gate = nightly_ci_identity(source)
         candidates = [api(f'actions/runs/{run_id}')]
     else:
+        workflow = '.github/workflows/ci.yml'
         batches = json.loads(run('gh', 'api', '--paginate', '--slurp',
             f'repos/{GITHUB_REPO}/actions/workflows/ci.yml/runs?head_sha={source}&branch=main&event=push&per_page=100'))
         candidates = [item for page in batches for item in page['workflow_runs']]
     for candidate in candidates:
         if not (candidate['head_sha'] == source and candidate['head_branch'] == 'main'
-                and candidate['path'] == '.github/workflows/ci.yml'
+                and candidate['path'] == workflow
                 and candidate['repository']['full_name'] == GITHUB_REPO
                 and candidate['head_repository']['full_name'] == GITHUB_REPO):
             continue
@@ -168,11 +210,11 @@ def require_ci(context):
         require(batch == context['nightly_batch'], 'Nightly CI run does not match its original batch')
         pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
                               f'repos/{GITHUB_REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100'))
-        gates = [job for page in pages for job in page['jobs'] if job['name'] == 'ci-gate']
-        require(len(gates) == 1 and gates[0]['status'] == 'completed' and gates[0]['conclusion'] == 'success',
-                'original Nightly schedule ci-gate did not succeed')
+        gates = [job for page in pages for job in page['jobs'] if job['name'] == gate]
+        require(len(gates) == 1 and gates[0].get('status') == 'completed' and gates[0].get('conclusion') == 'success',
+                f'original Nightly schedule {gate} did not succeed')
         return candidate
-    raise ValueError('release requires the exact trusted main push CI or original Nightly schedule ci-gate')
+    raise ValueError('release requires the exact trusted main push CI or original Nightly schedule gate')
 
 
 def expected_release_kind_for_component(app):

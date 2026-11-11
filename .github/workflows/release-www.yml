@@ -1,0 +1,120 @@
+name: Release / Website
+run-name: >-
+  Release / Website / ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || github.ref_name }} /
+  ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+on:
+  push:
+    tags: ['www-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact declared tag; leave empty for a build-only run
+        type: string
+        default: ''
+      publish:
+        description: Publish an existing tag after verification
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    name: Validate website release identity
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - id: plan
+        name: Validate build and publication identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/release-entry.py --app www
+  static:
+    name: Build and verify website
+    needs: [identity]
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+      - run: pnpm install --frozen-lockfile
+      - name: Build and verify website assets
+        run: |
+          pnpm --dir apps/www typecheck
+          pnpm --dir apps/www build
+          pnpm --dir apps/www check:static
+          python3 -B scripts/release.py component www --input apps/www/dist/client --output .artifacts/static
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: static-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/static/*
+          if-no-files-found: error
+  collect:
+    name: Collect complete website / collect
+    needs: [identity, static]
+    if: always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
+      - name: Assert the collection source
+        env:
+          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.static.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/app
+      - name: Collect website assets without rebuilding
+        run: mv .artifacts/input/app .artifacts/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: release-artifact
+        with:
+          name: www-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/release/*
+          if-no-files-found: error
+  publish:
+    name: Publish verified website / publish
+    needs: [identity, collect]
+    if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.collect.outputs.release_artifact_id }}
+          merge-multiple: true
+          path: .artifacts/release
+      - name: Publish the verified complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/release.py plan --app www --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/release.py publish www .artifacts/release

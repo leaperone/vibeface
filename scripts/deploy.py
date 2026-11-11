@@ -17,12 +17,17 @@ import release
 from unittest import TestCase
 
 SERVICES = ('all', 'node', 'app', 'www')
+DEPLOY_WORKFLOWS = {'node': 'deploy-node.yml', 'app': 'deploy-app.yml',
+                    'www': 'deploy-www.yml', 'all': 'deploy-product.yml'}
 REPOSITORY = 'leaperone/vibeface'
 
 
 def gh(*args):
     result = subprocess.run(['gh', *args], capture_output=True, text=True)
-    release.require(result.returncode == 0, 'GitHub request failed; inspect authenticated CLI access and retry the read-only plan')
+    failure = ('Deployment dispatch result is unknown; inspect workflow runs for the selected tag before retrying'
+               if args[:2] == ('workflow', 'run') else
+               'GitHub request failed; inspect authenticated CLI access and retry the read-only plan')
+    release.require(result.returncode == 0, failure)
     return result.stdout
 
 
@@ -126,18 +131,20 @@ def previous(tag):
 
 
 def selection(service, tag):
+    release.require(service in SERVICES, 'invalid deployment service')
     kind, _, _ = release.parse_tag(tag)
     release.require((service == 'www') == (kind == 'www'), 'website deployments require a www tag; other services require a product tag')
     return ['node', 'app'] if service == 'all' else [service]
 
 
 def execute(action, service, tag):
+    release.require(action in ('plan', 'release'), 'invalid deployment action')
     targets = selection(service, tag)
     info = plan(tag)
     info.update(service=service, targets=targets)
     if action == 'release':
-        gh('workflow', 'run', 'deploy-services.yml', '--repo', REPOSITORY, '--ref', 'main',
-           '-f', f'service={service}', '-f', f'tag={tag}', '-f', 'apply=true')
+        gh('workflow', 'run', DEPLOY_WORKFLOWS[service], '--repo', REPOSITORY, '--ref', 'main',
+           '-f', f'tag={tag}', '-f', 'apply=true')
     return info
 
 
@@ -306,18 +313,40 @@ def self_test():
             assert str(error) == 'offline GitHub failure'
         else:
             raise AssertionError('GitHub failure accepted as a first release')
-    with patch(__name__ + '.plan', return_value={'tag': tag, 'source_sha': sha}), \
+    for service, workflow, selected_tag, targets in (
+            ('node', 'deploy-node.yml', tag, ['node']),
+            ('app', 'deploy-app.yml', tag, ['app']),
+            ('www', 'deploy-www.yml', 'www-v0.0.1', ['www']),
+            ('all', 'deploy-product.yml', tag, ['node', 'app'])):
+        with patch(__name__ + '.plan', return_value={'tag': selected_tag, 'source_sha': sha}) as verify_plan, \
+                patch(__name__ + '.gh') as command:
+            assert execute('plan', service, selected_tag)['targets'] == targets
+            verify_plan.assert_called_once_with(selected_tag)
+            command.assert_not_called()
+            verify_plan.reset_mock()
+            assert execute('release', service, selected_tag)['targets'] == targets
+            verify_plan.assert_called_once_with(selected_tag)
+            command.assert_called_once_with('workflow', 'run', workflow, '--repo', REPOSITORY,
+                                           '--ref', 'main', '-f', f'tag={selected_tag}', '-f', 'apply=true')
+    with patch(__name__ + '.plan', side_effect=ValueError('unverified release')), \
             patch(__name__ + '.gh') as command:
-        execute('plan', 'all', tag)
+        with TestCase().assertRaisesRegex(ValueError, 'unverified release'):
+            execute('release', 'node', tag)
         command.assert_not_called()
-        execute('release', 'app', tag)
-        command.assert_called_once_with('workflow', 'run', 'deploy-services.yml', '--repo', REPOSITORY,
-                                        '--ref', 'main', '-f', 'service=app', '-f', f'tag={tag}', '-f', 'apply=true')
+    with patch(__name__ + '.plan', return_value={'tag': tag, 'source_sha': sha}), \
+            patch('subprocess.run', return_value=subprocess.CompletedProcess(['gh'], 1, '', '')) as dispatch:
+        with TestCase().assertRaisesRegex(ValueError, 'dispatch result is unknown'):
+            execute('release', 'app', tag)
+        assert dispatch.call_count == 1, 'retried a deployment with an unknown result'
     assert selection('all', tag) == ['node', 'app']
     assert selection('www', 'www-v0.0.1') == ['www']
-    for service, wrong_tag in (('www', tag), ('app', 'www-v0.0.1'), ('all', 'www-v0.0.1')):
-        with TestCase().assertRaises(ValueError, msg='accepted wrong deployment group'):
-            selection(service, wrong_tag)
+    for service, wrong_tag in (('www', tag), ('node', 'www-v0.0.1'), ('app', 'www-v0.0.1'),
+                               ('all', 'www-v0.0.1'), ('invalid', tag)):
+        with patch(__name__ + '.plan') as verify_plan, patch(__name__ + '.gh') as command:
+            with TestCase().assertRaises(ValueError, msg='accepted wrong deployment group'):
+                execute('release', service, wrong_tag)
+            verify_plan.assert_not_called()
+            command.assert_not_called()
     scratch = release.ROOT / '.artifacts'
     scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=scratch, prefix='deploy-check-') as temp:

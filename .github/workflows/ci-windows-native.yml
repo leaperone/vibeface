@@ -1,5 +1,4 @@
-name: Windows native checks
-# Called from ci.yml so a manual dispatch on a branch can reach it; it never dispatches on its own.
+name: Reusable / Windows native checks
 on:
   workflow_call:
     inputs:
