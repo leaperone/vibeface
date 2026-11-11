@@ -9526,14 +9526,17 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unknown() -> Result<()> {
+    async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unknown()
+    -> Result<()> {
         use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
         with_node(async |node, admin, dir| {
             with_agent(&node);
             controlled_pi(&node, &dir, "reply")?;
             let allowed = dir.join("allowed");
             std::fs::create_dir(&allowed)?;
-            node.settings.lock().unwrap().roots = vec![allowed.canonicalize()?];
+            let allowed = allowed.canonicalize()?;
+            let missing_root = dir.join("missing-configured-root");
+            node.settings.lock().unwrap().roots = vec![allowed.clone()];
             bot(&node, &admin, "c", "Bot", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "root-refusal-source").await?;
@@ -9544,10 +9547,13 @@ pub(super) mod tests {
                     Ok((store.version_vector(&network)?, store.scheduler_jobs("c")?.len()))
                 }).await?
             };
-            for (call_ref, cwd, definite) in [
-                ("outside-root", dir.clone(), true),
-                ("missing-path", allowed.join("not-created"), false),
+            for (call_ref, cwd, roots, definite) in [
+                ("outside-root", dir.clone(), vec![allowed.clone()], true),
+                ("missing-path", allowed.join("not-created"), vec![allowed.clone()], false),
+                ("missing-root", dir.clone(), vec![missing_root.clone()], false),
+                ("unmatched-and-missing-root", dir.clone(), vec![allowed.clone(), missing_root.clone()], false),
             ] {
+                node.settings.lock().unwrap().roots = roots;
                 let request = WorkRequest {
                     work_id: WorkSpec::id("c", &trigger, call_ref),
                     conversation: "c".into(), trigger: trigger.clone(), target: local.clone(),
@@ -9578,6 +9584,41 @@ pub(super) mod tests {
                 }).await?;
                 assert!(pi_fixture_log(&dir)?.is_empty(), "{call_ref} must not invoke the provider");
             }
+            let request = WorkRequest {
+                work_id: WorkSpec::id("c", &trigger, "matching-root"),
+                conversation: "c".into(),
+                trigger,
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "matching-root".into(),
+                kind: RequestedWorkKind::Agent(Some(Provider::Pi)),
+                model: None,
+                cwd: allowed.display().to_string(),
+                title: "root authorization".into(),
+                prompt: "admit only; do not execute".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            node.settings.lock().unwrap().roots = vec![missing_root.clone(), allowed];
+            let admitted = node.accept_dispatch(&network, request.clone(), &Value::Null).await?;
+            assert!(admitted.created, "a valid matching root permits admission despite another root's I/O error");
+            assert_eq!(admitted.record.state, crate::work::WorkState::Accepted);
+            node.settings.lock().unwrap().roots = vec![missing_root];
+            let duplicate = node.accept_dispatch(&network, request.clone(), &Value::Null).await?;
+            assert!(!duplicate.created, "durable admission is read before changed root settings");
+            assert_eq!(duplicate.spec, admitted.spec);
+            assert_eq!(duplicate.record, admitted.record);
+            let stored_network = network.clone();
+            node.store.call("triage.test.matching_root_admitted_once", move |store| {
+                assert!(store.accepted_work(&stored_network, &request)?.is_some());
+                assert_eq!(store.work_records()?.len(), 1);
+                assert_eq!(store.scheduler_jobs("c")?.len(), baseline.1);
+                assert_eq!(crate::store::context_after(&store.connection, &stored_network, "c", None, &VersionVector::new())?
+                    .events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 1);
+                Ok(())
+            }).await?;
+            assert!(pi_fixture_log(&dir)?.is_empty(), "admission and its retry do not start a provider");
             node.finish_manager_attempt(&attempt).await;
             Ok(())
         }).await

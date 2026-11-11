@@ -173,13 +173,25 @@ impl Runtime {
     ) -> Result<()> {
         if spec.thread.is_none() || !spec.cwd.is_empty() {
             let path = std::fs::canonicalize(&spec.cwd).context("execution path does not exist")?;
+            let roots = settings
+                .roots
+                .iter()
+                .map(std::fs::canonicalize)
+                .collect::<Vec<_>>();
+            let allowed = roots
+                .iter()
+                .filter_map(|root| root.as_ref().ok())
+                .any(|root| path.starts_with(root));
+            if !allowed {
+                for root in roots {
+                    root.context("configured execution root cannot be resolved")?;
+                }
+            }
             ensure!(
-                settings
-                    .roots
-                    .iter()
-                    .filter_map(|root| std::fs::canonicalize(root).ok())
-                    .any(|root| path.starts_with(root)),
-                AdmissionRejected::new("execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots")
+                allowed,
+                AdmissionRejected::new(
+                    "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+                )
             );
             ensure!(path.is_dir(), "execution path must be a directory");
         }
