@@ -993,7 +993,9 @@ impl Runtime {
                         "wrong membership network"
                     );
                     self.install_membership(incoming).await?;
-                    net.peer_restarted(peer);
+                    if reply["type"] == "revoked" {
+                        net.peer_restarted(peer);
+                    }
                 }
                 return Err(error);
             }
@@ -4837,6 +4839,13 @@ mod tests {
                 revocation.clone(),
             )?)?;
             a.install_membership(next).await?;
+            // Keep this round from racing B's background sync for the removed-node quota.
+            b.sync_peers
+                .lock()
+                .unwrap()
+                .entry(member.clone())
+                .or_default()
+                .running = true;
             for node in [&a, &b] {
                 node.start_network().await?;
             }
