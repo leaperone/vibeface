@@ -1,4 +1,6 @@
-name: npm Nightly publication
+name: Release / npm Nightly
+run-name: >-
+  Release / npm Nightly / ${{ inputs.tag }} / ${{ inputs.publish && 'publish' || 'validate only' }}
 
 on:
   workflow_call:
@@ -34,6 +36,7 @@ concurrency:
 
 jobs:
   npm:
+    name: Publish npm Nightly / npm
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     environment: npm-release

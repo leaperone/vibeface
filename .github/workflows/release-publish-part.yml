@@ -1,4 +1,4 @@
-name: Publish verified release part
+name: Reusable / Publish verified release part
 on:
   workflow_call:
     inputs:

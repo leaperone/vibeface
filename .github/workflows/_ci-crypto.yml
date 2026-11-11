@@ -1,0 +1,47 @@
+name: Reusable / Browser cryptography
+
+on:
+  workflow_call:
+    inputs:
+      source_sha: {type: string, required: true}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: crypto-web
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Build shared browser cryptography
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          npm install -g binaryen@132.0.0
+          bash scripts/build-web-crypto.sh
+          cargo build -p vibeface-secure --example secure-probe --locked
+          node scripts/crypto-client.mjs --self-test --native-probe target/debug/examples/secure-probe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crypto-web-${{ inputs.source_sha }}
+          path: |
+            apps/app/generated/vibeface_secure.js
+            apps/app/generated/vibeface_secure_bg.wasm
+            apps/app/generated/*.d.ts
+            apps/app/generated/.vibeface-build.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+

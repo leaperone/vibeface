@@ -1,11 +1,14 @@
-name: mobile
+name: CI / Mobile acceptance
+run-name: >-
+  Mobile acceptance · ${{ github.event_name }} · ${{ github.ref_name }} ·
+  ${{ (inputs.android_only || inputs.platforms == 'android') && 'Android native build' || inputs.platforms == 'ios' && 'iOS simulator UI' || github.event_name == 'workflow_dispatch' && 'Android native build + iOS simulator UI' || 'no platform selected' }}
 
-# Extended platform build: run by hand or from the delivery proof workflow.
+# iOS simulator acceptance and Android native builds, separate from device archives.
 on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: Native mobile platforms to build and verify
+        description: Android native build or iOS simulator UI acceptance
         type: choice
         options: [all, android, ios]
         default: all
@@ -16,8 +19,8 @@ on:
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'automatic' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  group: ci-mobile-ui-${{ github.workflow }}-${{ github.ref }}-${{ inputs.android_only && 'android' || inputs.platforms || 'all' }}${{ github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -27,6 +30,7 @@ env:
 
 jobs:
   android:
+    name: Android native build
     if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -74,6 +78,7 @@ jobs:
           if-no-files-found: error
 
   ios:
+    name: iOS simulator acceptance
     if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
     timeout-minutes: 90

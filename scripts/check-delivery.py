@@ -39,7 +39,7 @@ def hex_bytes(value, length=None):
     return bytes.fromhex(value)
 
 ITEMS = ("prepare", "relation-1", "relation-2", "relation-3", "relation-4", "accept")
-WORKFLOW_PATH = ".github/workflows/ci.yml"
+WORKFLOW_PATH = ".github/workflows/delivery-small.yml"
 DEADLINE_ENV = "VIBEFACE_DELIVERY_DEADLINE_UNIX_MS"
 ITEM_CEILING_SECONDS = 5 * 60 * 60 + 30 * 60
 PROOF_NAMES = {"manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]}
@@ -1507,9 +1507,13 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
         return {**producer, "runAttempt": attempt, "artifactId": artifact_id,
             "artifactName": f"delivery-small-{item}-{commit}-101-{attempt}", "artifactDigest": "sha256:" + "0" * 64}
 
+    assert WORKFLOW_PATH == ".github/workflows/delivery-small.yml"
+    checked_producer(producer)
+    for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
+        must_reject(lambda: checked_producer({**producer, "workflowPath": path}))
     run_api = {"id": 101, "path": WORKFLOW_PATH, "event": "workflow_dispatch", "head_sha": commit, "repository": {"full_name": producer["repository"]}, "head_repository": {"full_name": producer["repository"]}, "run_attempt": 2, "run_started_at": "2026-10-30T00:00:00Z"}
     checked_run_api(run_api, producer, 101, 2)
-    for field, value in (("path", "other.yml"), ("event", "push"), ("head_sha", "b" * 40), ("run_attempt", 3)):
+    for field, value in (("path", "other.yml"), ("path", ".github/workflows/ci.yml"), ("path", ".github/workflows/delivery-live.yml"), ("event", "push"), ("head_sha", "b" * 40), ("run_attempt", 3)):
         must_reject(lambda: checked_run_api({**run_api, field: value}, producer, 101, 2))
     artifact_api = {"id": 1, "name": origin_for("prepare", 1)["artifactName"], "digest": "sha256:" + "0" * 64, "size_in_bytes": 100, "expired": False,
         "expires_at": "2999-01-01T00:00:00Z", "created_at": "2026-10-30T00:01:00Z", "workflow_run": {"id": 101, "head_sha": commit}}
@@ -1631,6 +1635,9 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": producer["repository"], "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": commit, "GITHUB_WORKFLOW_REF": producer["repository"] + "/" + WORKFLOW_PATH + "@refs/heads/test"}):
             assert current_producer(commit) == producer
             must_reject(lambda: current_producer("f" * 40))
+            for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
+                with patch.dict(os.environ, {"GITHUB_WORKFLOW_REF": producer["repository"] + "/" + path + "@refs/heads/test"}):
+                    must_reject(lambda: current_producer(commit))
 
         incoming = base / "incoming"
         incoming.mkdir(mode=0o700)
@@ -1799,7 +1806,8 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
         assert "max-parallel: 1" in workflow and "fail-fast: false" in workflow
         assert "fromJSON(needs.delivery-small-prepare.outputs.matrix)" in workflow
         assert "needs: [delivery-small-prepare, delivery-small-proofs]" in workflow
-        assert "inputs.delivery_small && 'delivery-small'" in workflow
+        assert "group: ci-delivery-small" in workflow and "cancel-in-progress: false" in workflow
+        assert "inputs.prepare_only" in workflow and "inputs.resume_run" in workflow
         assert workflow.count("path: ${{ steps.run.outputs.public-directory }}") == 3
         assert ".artifacts/vdp/canonical/small/*/public" not in workflow
 
