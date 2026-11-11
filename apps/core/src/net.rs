@@ -614,6 +614,16 @@ impl Net {
         }
     }
 
+    /// Uses current admission on the next SYNC dial while active requests finish.
+    pub fn forget_sync_connection(&self, device_id: &str) {
+        if let Ok(id) = endpoint_id(device_id) {
+            self.connections
+                .lock()
+                .expect("connection cache")
+                .remove(&(id, SYNC));
+        }
+    }
+
     /// Drops connections to a peer that restarted. QUIC cannot tell they are dead until its
     /// idle timeout, so requests on them would hang that long.
     pub fn peer_restarted(&self, device_id: &str) {

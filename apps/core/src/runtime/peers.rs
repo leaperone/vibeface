@@ -994,7 +994,7 @@ impl Runtime {
                     );
                     self.install_membership(incoming).await?;
                     if reply["type"] == "revoked" {
-                        net.peer_restarted(peer);
+                        net.forget_sync_connection(peer);
                     }
                 }
                 return Err(error);
@@ -1015,7 +1015,7 @@ impl Runtime {
                 .await?;
                 // The peer decided how to serve this connection when it took it; the next
                 // round dials again.
-                net.peer_restarted(peer);
+                net.forget_sync_connection(peer);
             }
             return removed.map(|()| false);
         }
@@ -4247,6 +4247,60 @@ mod tests {
         }
         .await;
         stop_nodes(nodes).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_policy_redial_preserves_active_streams_and_other_protocols() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for (node, peer) in [(&a, &ib), (&b, &ia)] {
+                node.install_membership(state.clone()).await?;
+                node.sync_peers
+                    .lock()
+                    .unwrap()
+                    .entry(peer.device_id()?)
+                    .or_default()
+                    .running = true;
+                node.start_network().await?;
+            }
+            let peer = ia.device_id()?;
+            let net = b.net()?.clone();
+            net.learn(&a.net()?.addr()).await;
+            let sync = net.connect(&peer, net::SYNC).await?;
+            let rpc = net.connect(&peer, net::RPC).await?;
+            let (mut send, mut recv) = sync.open_bi().await?;
+            net.forget_sync_connection(&peer);
+            assert!(
+                sync.close_reason().is_none(),
+                "an active sync stream must finish"
+            );
+            assert!(
+                rpc.close_reason().is_none(),
+                "another protocol must stay connected"
+            );
+            net::write_frame(&mut send, &b.hello(&network).await?).await?;
+            send.finish()?;
+            let reply = tokio::time::timeout(PEER_TIMEOUT, net::read_frame(&mut recv))
+                .await??
+                .context("the active sync stream returned no reply")?;
+            assert_eq!(reply["network_id"].as_str(), Some(network.as_str()));
+            assert_ne!(
+                net.connect(&peer, net::SYNC).await?.stable_id(),
+                sync.stable_id()
+            );
+            assert_eq!(
+                net.connect(&peer, net::RPC).await?.stable_id(),
+                rpc.stable_id()
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
