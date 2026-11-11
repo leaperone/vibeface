@@ -144,6 +144,7 @@ pub enum Command {
         charity: bool,
         paid: bool,
     },
+    DeliveryRestart(TransferOrder),
     DeliveryConfirm(TransferOrder),
     DeliveryAccept(TransferOrder),
     DeliveryConfirmBatch(Box<[TransferOrder; 2]>),
@@ -960,6 +961,7 @@ impl Command {
         if matches!(
             self,
             Self::DeliveryConfigure { .. }
+                | Self::DeliveryRestart(_)
                 | Self::DeliveryConfirm(_)
                 | Self::DeliveryAccept(_)
                 | Self::DeliveryConfirmBatch(_)
@@ -967,7 +969,12 @@ impl Command {
                 | Self::DeliveryFlushBudget(_)
                 | Self::DeliveryReconcile(_)
         ) {
-            return snapshot.online && snapshot.can_manage;
+            return snapshot.online
+                && snapshot.can_manage
+                && match self {
+                    Self::DeliveryRestart(order) => delivery::can_restart_transfer(order),
+                    _ => true,
+                };
         }
         true
     }

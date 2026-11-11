@@ -1463,6 +1463,33 @@ mod prepaid_delivery {
         assert!(h.commands.try_recv().is_err());
     }
     #[test]
+    fn batch_counterparties_can_differ_while_the_acting_node_stays_fixed() {
+        let sender = order('d', "sender");
+        let mut other_receiver = order('e', "sender");
+        other_receiver.receiver_peer = "9".repeat(64);
+        assert!(
+            validate_transfer_pair(&[sender.clone(), other_receiver.clone()], false, 1).is_ok()
+        );
+        assert_eq!(
+            transfer_batches(&[sender.clone(), other_receiver.clone()], false, 1).len(),
+            1
+        );
+        other_receiver.source_peer = "8".repeat(64);
+        assert!(validate_transfer_pair(&[sender, other_receiver], false, 1).is_err());
+
+        let receiver = order('d', "receiver");
+        let mut other_sender = order('e', "receiver");
+        other_sender.source_peer = "9".repeat(64);
+        assert!(validate_transfer_pair(&[receiver.clone(), other_sender.clone()], true, 1).is_ok());
+        assert_eq!(
+            transfer_batches(&[receiver.clone(), other_sender.clone()], true, 1).len(),
+            1
+        );
+        other_sender.receiver_peer = "8".repeat(64);
+        assert!(validate_transfer_pair(&[receiver, other_sender], true, 1).is_err());
+    }
+
+    #[test]
     fn cross_budget_or_third_order_never_becomes_an_automatic_pair() {
         let a = order('d', "sender");
         let mut b = order('e', "sender");
@@ -1527,5 +1554,90 @@ mod prepaid_delivery {
             transfer_sum(["340282366920938463463374607431768211455", "1"]).unwrap(),
             "340282366920938463463374607431768211456"
         );
+    }
+}
+
+mod explicit_delivery_restart {
+    use super::*;
+    use std::collections::BTreeMap;
+    fn completed() -> ui::TransferOrder {
+        serde_json::from_value(serde_json::json!({"order_id":"d".repeat(64),"intent_id":"00000000-0000-4000-8000-000000000001",
+            "role":"sender","mode":"charity","acceptance":"recoverable","source_peer":"a".repeat(64),
+            "receiver_peer":"b".repeat(64),"provider_peer":"c".repeat(64),"name":"file.bin","bytes":4,"sha256":"f".repeat(64),
+            "phase":"recoverable","evidence":"charity_receipt","windows":[{"index":0,"bytes":4,"committed_bytes":4,"state":"held","decryption_proven":false}],
+            "payment":{"state":"free","delivery_fee":"0","reservation_fee":"0","priority_fee":"0","total":"0","gas_cap":"0","earned":"0","withdrawn":"0","refunded":"0"}})).unwrap()
+    }
+    #[gpui_kit::test]
+    fn completed_sender_has_explicit_restart_entry_that_only_requests_review(
+        cx: &mut TestAppContext,
+    ) {
+        let order = completed();
+        let mut state = fixture();
+        state.can_manage = true;
+        state.delivery.orders = vec![order.clone()];
+        let mut h = open(cx, Route::Transfers, state);
+        click(&h, cx, &format!("restart-{}", order.order_id));
+        let (generation, command) = scoped(h.commands.try_recv().unwrap());
+        assert_eq!(generation, 7);
+        let Command::DeliveryRestart(review) = command else {
+            panic!("restart must only request a fresh original-order review");
+        };
+        assert_eq!(review.intent_id, order.intent_id);
+        assert_eq!(review.order_id, order.order_id);
+        assert!(
+            h.commands.try_recv().is_err(),
+            "restart click cannot confirm or submit a prepare operation"
+        );
+    }
+    #[gpui_kit::test]
+    fn restart_form_keeps_original_context_immutable_and_requires_file_reselection(
+        cx: &mut TestAppContext,
+    ) {
+        let h = open(cx, Route::Transfers, fixture());
+        let order = completed();
+        let review = serde_json::to_string(&order).unwrap();
+        h.window
+            .update(cx, |_, window, cx| {
+                h.view.update(cx, |view, cx| {
+                    view.edit(
+                        views::forms::Editor::Transfer,
+                        BTreeMap::from([
+                            ("_restart_order_id", order.order_id.clone()),
+                            ("_restart_intent_id", order.intent_id.clone()),
+                            ("_restart_review", review.clone()),
+                            ("budget_id", "budget-original".into()),
+                            ("receiver_peer", order.receiver_peer.clone()),
+                            ("max_service_amount", "0".into()),
+                        ]),
+                        window,
+                        cx,
+                    );
+                    let form = view.form.as_ref().unwrap();
+                    assert!(form.fields.iter().all(
+                        |field| !field.key.starts_with("_restart") && field.key != "budget_id"
+                    ));
+                    let values = form.values(cx);
+                    assert_eq!(values["_restart_order_id"], order.order_id);
+                    assert_eq!(values["_restart_intent_id"], order.intent_id);
+                    assert_eq!(values["_restart_review"], review);
+                    assert_eq!(values["budget_id"], "budget-original");
+                    assert_eq!(
+                        values["file"], "",
+                        "restart never reuses a prior local path implicitly"
+                    );
+                });
+            })
+            .unwrap();
+    }
+    #[test]
+    fn unknown_and_unmanaged_snapshots_do_not_offer_restart() {
+        let mut state = fixture();
+        state.can_manage = true;
+        let mut order = completed();
+        assert!(Command::DeliveryRestart(order.clone()).available(&state));
+        order.phase = "transferring".into();
+        assert!(!Command::DeliveryRestart(order).available(&state));
+        state.can_manage = false;
+        assert!(!Command::DeliveryRestart(completed()).available(&state));
     }
 }

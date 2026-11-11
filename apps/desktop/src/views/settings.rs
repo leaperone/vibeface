@@ -879,6 +879,15 @@ impl Desktop {
                     window.decryption_proven
                 ));
             }
+            let restart = Command::DeliveryRestart(order.clone());
+            if restart.available(&self.snapshot) {
+                row = row.child(self.button(
+                    SharedString::from(format!("restart-{}", order.order_id)),
+                    "作为新订单再次发送",
+                    restart,
+                    cx,
+                ));
+            }
             if transfer_confirmable(order, now) {
                 row = row.child(self.ask(
                     SharedString::from(format!("confirm-{}", order.order_id)),

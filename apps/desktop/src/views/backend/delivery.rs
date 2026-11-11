@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TransferTerms {
@@ -82,7 +83,11 @@ impl Backend {
         self.publish();
         Ok(())
     }
-    pub(super) async fn delivery_intent(&self, terms: Value) -> Result<String> {
+    pub(super) async fn delivery_intent(
+        &mut self,
+        terms: Value,
+        restart: Option<TransferOrder>,
+    ) -> Result<String> {
         let client = self.client()?;
         let terms: TransferTerms = serde_json::from_value(terms)?;
         let target = self
@@ -91,15 +96,79 @@ impl Backend {
             .context("当前设备未确认")?
             .node_id
             .clone();
+        let network = client.network_id().to_owned();
+        let identity = client.client_id().to_owned();
+        let original = if let Some(review) = restart {
+            let current: TransferOrder = serde_json::from_value(
+                self.client()?
+                    .read(ReadRequest::Delivery(DeliveryRead::Get {
+                        order_id: review.order_id.clone(),
+                    }))
+                    .await?,
+            )?;
+            validate_reviewed_terms(&review, &current)?;
+            ensure!(
+                can_restart_transfer(&current),
+                "原发送尚未明确结束，不会创建另一笔意图"
+            );
+            Some(current)
+        } else {
+            None
+        };
         let path = self.client_directory()?.join("delivery-intents.json");
-        remember_transfer_intent(
-            path,
-            client.network_id().into(),
-            client.client_id().into(),
-            target,
-            terms,
-        )
-        .await
+        remember_transfer_intent(path, network, identity, target, terms, original).await
+    }
+    pub(super) async fn open_delivery_restart(&mut self, original: TransferOrder) -> Result<()> {
+        ensure!(
+            self.state.can_manage && self.state.online,
+            "重新发送需要当前管理连接"
+        );
+        let current: TransferOrder = serde_json::from_value(
+            self.client()?
+                .read(ReadRequest::Delivery(DeliveryRead::Get {
+                    order_id: original.order_id.clone(),
+                }))
+                .await?,
+        )?;
+        validate_reviewed_terms(&original, &current)?;
+        ensure!(
+            can_restart_transfer(&current),
+            "原发送尚未明确结束，请先查询原订单"
+        );
+        let entries = read_intents(self.client_directory()?.join("delivery-intents.json")).await?;
+        let intent = entries
+            .values()
+            .find(|intent| intent.intent_id == current.intent_id)
+            .context("原发送意图已被替换或不在此档案中，请先查看已有的新订单")?;
+        validate_restart_intent(
+            intent,
+            &current,
+            self.client()?.network_id(),
+            self.client()?.client_id(),
+            self.client()?.target_node(),
+        )?;
+        let terms = &intent.terms;
+        let review = serde_json::to_string(&current)?;
+        let mut values = BTreeMap::from([
+            ("receiver_peer", terms.receiver.clone()),
+            ("provider_peer", terms.provider.clone()),
+            ("mode", terms.mode.clone()),
+            ("acceptance", terms.acceptance.clone()),
+            ("max_service_amount", terms.service_cap.clone()),
+            ("max_gas_amount", terms.gas_cap.clone()),
+            ("_restart_order_id", current.order_id),
+            ("_restart_intent_id", current.intent_id),
+            ("_restart_review", review),
+        ]);
+        if let Some(budget) = &terms.budget_id {
+            values.insert("budget_id", budget.clone());
+        }
+        self.emit(Event::EditForm {
+            editor: Editor::Transfer,
+            values,
+        })
+        .await?;
+        Ok(())
     }
     pub(super) async fn fresh_delivery_budgets(&self) -> Result<Vec<TransferBudget>> {
         parse_transfer_budgets(
@@ -220,19 +289,82 @@ impl Backend {
         Ok(())
     }
 }
+fn read_intents_now(path: &Path) -> Result<BTreeMap<String, TransferIntent>> {
+    if !path.try_exists()? {
+        return Ok(BTreeMap::new());
+    }
+    let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
+        path,
+        4 * 1024 * 1024,
+        "文件传输意图",
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
 async fn read_intents(path: PathBuf) -> Result<BTreeMap<String, TransferIntent>> {
-    tokio::task::spawn_blocking(move || {
-        if !path.try_exists()? {
-            return Ok(BTreeMap::new());
-        }
-        let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
-            &path,
-            4 * 1024 * 1024,
-            "文件传输意图",
-        )?;
-        Ok(serde_json::from_slice(&bytes)?)
-    })
-    .await?
+    tokio::task::spawn_blocking(move || read_intents_now(&path)).await?
+}
+
+pub(super) fn can_restart_transfer(order: &TransferOrder) -> bool {
+    if order.role != "sender"
+        || order.acceptance != "recoverable"
+        || validate_transfer_order(order).is_err()
+    {
+        return false;
+    }
+    if order.mode == "charity" {
+        return order.phase == "recoverable"
+            && order.evidence == "charity_receipt"
+            && !order.windows.is_empty()
+            && order.windows.iter().all(|window| {
+                matches!(window.state.as_str(), "held" | "key_published" | "earned")
+            });
+    }
+    order.phase == "paid"
+        && matches!(
+            order.payment.state.as_str(),
+            "earned" | "withdrawn" | "confirmed"
+        )
+        && !order.windows.is_empty()
+        && order.windows.iter().all(|window| window.state == "earned")
+        || order.phase == "refunded"
+            && order.payment.state == "refunded"
+            && order.payment.refunded == order.payment.total
+}
+
+fn validate_restart_intent(
+    intent: &TransferIntent,
+    order: &TransferOrder,
+    network: &str,
+    client: &str,
+    target: &str,
+) -> Result<()> {
+    ensure!(
+        can_restart_transfer(order),
+        "原发送尚未明确结束，不会创建另一笔意图"
+    );
+    ensure!(
+        intent.intent_id == order.intent_id
+            && intent.network_id == network
+            && intent.client_id == client
+            && intent.target_node == target
+            && order.source_peer == target,
+        "原发送不属于当前网络、身份或目标设备"
+    );
+    let terms = &intent.terms;
+    ensure!(
+        terms.receiver == order.receiver_peer
+            && terms.provider == order.provider_peer
+            && terms.mode == order.mode
+            && terms.acceptance == order.acceptance
+            && order.name.as_deref() == Some(terms.name.as_str())
+            && order.bytes == terms.bytes
+            && order.sha256.as_deref() == Some(terms.sha256.as_str())
+            && terms.budget_id == order.payment.budget_id
+            && amount_at_most(&order.payment.total, &terms.service_cap)
+            && amount_at_most(&order.payment.gas_cap, &terms.gas_cap),
+        "原文件、预算或最高金额与本机发送条款不一致"
+    );
+    Ok(())
 }
 fn amount_at_most(amount: &str, cap: &str) -> bool {
     if amount.is_empty()
@@ -255,40 +387,52 @@ async fn remember_transfer_intent(
     client: String,
     target: String,
     terms: TransferTerms,
+    restart: Option<TransferOrder>,
 ) -> Result<String> {
-    let fingerprint = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(
-            &json!({"network":network,"client":client,"target":target,"terms":terms})
-        )?)
-    );
-    let mut entries = read_intents(path.clone()).await?;
-    if let Some(intent) = entries.get(&fingerprint) {
-        ensure!(
-            intent.network_id == network
-                && intent.client_id == client
-                && intent.target_node == target
-                && intent.terms == terms,
-            "本机发送记录与原预算或条款不一致，未创建第二笔意图"
-        );
-        return Ok(intent.intent_id.clone());
-    }
-    let intent_id = uuid::Uuid::new_v4().to_string();
-    entries.insert(
-        fingerprint,
-        TransferIntent {
-            intent_id: intent_id.clone(),
-            network_id: network,
-            client_id: client,
-            target_node: target,
-            terms,
-        },
-    );
+    // The single Backend actor owns this profile. Compare and replace in one storage
+    // operation so no await separates its existing-ID check from the atomic private write.
     tokio::task::spawn_blocking(move || {
-        vibeface_bridge::platform::privatefs::write_atomic(&path, &serde_json::to_vec(&entries)?)
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(
+                &json!({"network":network,"client":client,"target":target,"terms":terms})
+            )?)
+        );
+        let mut entries = read_intents_now(&path)?;
+        if let Some(intent) = entries.get(&fingerprint) {
+            ensure!(
+                intent.network_id == network
+                    && intent.client_id == client
+                    && intent.target_node == target
+                    && intent.terms == terms,
+                "本机发送记录与原预算或条款不一致，未创建第二笔意图"
+            );
+            if let Some(original) = &restart {
+                validate_restart_intent(intent, original, &network, &client, &target)?;
+            } else {
+                return Ok(intent.intent_id.clone());
+            }
+        } else {
+            ensure!(
+                restart.is_none(),
+                "再次发送必须选择原文件和完全相同的条款；已有新的一次请先查询"
+            );
+        }
+        let intent_id = uuid::Uuid::new_v4().to_string();
+        entries.insert(
+            fingerprint,
+            TransferIntent {
+                intent_id: intent_id.clone(),
+                network_id: network,
+                client_id: client,
+                target_node: target,
+                terms,
+            },
+        );
+        vibeface_bridge::platform::privatefs::write_atomic(&path, &serde_json::to_vec(&entries)?)?;
+        Ok(intent_id)
     })
-    .await??;
-    Ok(intent_id)
+    .await?
 }
 fn validate_order_budget(order: &TransferOrder, budget: &TransferBudget) -> Result<()> {
     validate_transfer_budget(budget)?;
@@ -476,17 +620,36 @@ mod prepaid_tests {
         let path = root.join("delivery-intents.json");
         let a = terms(&"2".repeat(64));
         let b = terms(&"3".repeat(64));
-        let first =
-            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), a.clone())
-                .await?;
+        let first = remember_transfer_intent(
+            path.clone(),
+            "n".into(),
+            "c".into(),
+            "t".into(),
+            a.clone(),
+            None,
+        )
+        .await?;
         assert_eq!(
-            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), a.clone())
-                .await?,
+            remember_transfer_intent(
+                path.clone(),
+                "n".into(),
+                "c".into(),
+                "t".into(),
+                a.clone(),
+                None
+            )
+            .await?,
             first
         );
-        let second =
-            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), b.clone())
-                .await?;
+        let second = remember_transfer_intent(
+            path.clone(),
+            "n".into(),
+            "c".into(),
+            "t".into(),
+            b.clone(),
+            None,
+        )
+        .await?;
         assert_ne!(first, second);
         let mut entries = read_intents(path.clone()).await?;
         assert_eq!(entries.len(), 2);
@@ -497,7 +660,7 @@ mod prepaid_tests {
             .terms = b;
         vibeface_bridge::platform::privatefs::write_atomic(&path, &serde_json::to_vec(&entries)?)?;
         assert!(
-            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), a)
+            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), a, None)
                 .await
                 .is_err()
         );
@@ -524,8 +687,15 @@ mod prepaid_tests {
         vibeface_bridge::platform::privatefs::write_atomic(&path, &serde_json::to_vec(&entries)?)?;
         let terms: TransferTerms = serde_json::from_value(legacy)?;
         assert_eq!(
-            remember_transfer_intent(path.clone(), "n".into(), "c".into(), "t".into(), terms)
-                .await?,
+            remember_transfer_intent(
+                path.clone(),
+                "n".into(),
+                "c".into(),
+                "t".into(),
+                terms,
+                None
+            )
+            .await?,
             original
         );
         assert_eq!(read_intents(path).await?.len(), 1);
@@ -554,5 +724,226 @@ mod prepaid_tests {
         changed.payee = format!("0x{}", "6".repeat(40));
         assert!(validate_order_budget(&original, &changed).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    fn terms() -> TransferTerms {
+        TransferTerms {
+            receiver: "b".repeat(64),
+            provider: "c".repeat(64),
+            mode: "paid".into(),
+            acceptance: "recoverable".into(),
+            name: "file.bin".into(),
+            bytes: 4,
+            sha256: "f".repeat(64),
+            service_cap: "100".into(),
+            gas_cap: "7".into(),
+            budget_id: Some("2".repeat(64)),
+        }
+    }
+    fn terminal(id: &str) -> TransferOrder {
+        serde_json::from_value(json!({"order_id":"d".repeat(64),"intent_id":id,"role":"sender",
+            "mode":"paid","acceptance":"recoverable","source_peer":"a".repeat(64),
+            "receiver_peer":"b".repeat(64),"provider_peer":"c".repeat(64),"name":"file.bin",
+            "bytes":4,"sha256":"f".repeat(64),"phase":"paid","evidence":"recoverable",
+            "windows":[{"index":0,"bytes":4,"committed_bytes":4,"state":"earned","decryption_proven":false}],
+            "deadlines":{"quote_expires_at":2000000000,"hold_deadline":2000000100,"key_deadline":2000000200,
+                "open_deadline":2000000300,"retain_until":2000000400,"priority_deadline":2000000150},
+            "payment":{"chain_id":"1","asset":format!("0x{}","3".repeat(40)),"payer":format!("0x{}","5".repeat(40)),
+                "provider_wallet":format!("0x{}","4".repeat(40)),"budget_id":"2".repeat(64),"state":"earned",
+                "delivery_fee":"5","reservation_fee":"2","priority_fee":"3","total":"10","gas_cap":"7",
+                "earned":"10","withdrawn":"0","refunded":"0","settlement":null}})).unwrap()
+    }
+    #[tokio::test]
+    async fn ordinary_prepare_reuses_intent_and_only_explicit_terminal_restart_replaces_it()
+    -> Result<()> {
+        let root = std::env::temp_dir().join(format!("native-restart-{}", uuid::Uuid::new_v4()));
+        vibeface_bridge::platform::privatefs::create_dir(&root)?;
+        let path = root.join("delivery-intents.json");
+        let target = "a".repeat(64);
+        let first = remember_transfer_intent(
+            path.clone(),
+            "network".into(),
+            "client".into(),
+            target.clone(),
+            terms(),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            remember_transfer_intent(
+                path.clone(),
+                "network".into(),
+                "client".into(),
+                target.clone(),
+                terms(),
+                None
+            )
+            .await?,
+            first
+        );
+        let order = terminal(&first);
+        validate_transfer_order(&order)?;
+        let next = remember_transfer_intent(
+            path.clone(),
+            "network".into(),
+            "client".into(),
+            target.clone(),
+            terms(),
+            Some(order.clone()),
+        )
+        .await?;
+        assert_ne!(next, first);
+        assert_eq!(read_intents(path.clone()).await?.len(), 1);
+        assert_eq!(
+            remember_transfer_intent(
+                path.clone(),
+                "network".into(),
+                "client".into(),
+                target.clone(),
+                terms(),
+                None
+            )
+            .await?,
+            next
+        );
+        let unchanged = std::fs::read(&path)?;
+        assert!(
+            remember_transfer_intent(
+                path.clone(),
+                "network".into(),
+                "client".into(),
+                target,
+                terms(),
+                Some(order)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&path)?,
+            unchanged,
+            "repeated old restart cannot create a third operation"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn unknown_or_changed_file_caps_budget_and_profile_cannot_mint_restart_intents()
+    -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("native-restart-denied-{}", uuid::Uuid::new_v4()));
+        vibeface_bridge::platform::privatefs::create_dir(&root)?;
+        let path = root.join("delivery-intents.json");
+        let target = "a".repeat(64);
+        let first = remember_transfer_intent(
+            path.clone(),
+            "network".into(),
+            "client".into(),
+            target.clone(),
+            terms(),
+            None,
+        )
+        .await?;
+        let original = terminal(&first);
+        let unchanged = std::fs::read(&path)?;
+        let mut unknown = original.clone();
+        unknown.phase = "reconciling".into();
+        unknown.payment.state = "unknown".into();
+        assert!(
+            remember_transfer_intent(
+                path.clone(),
+                "network".into(),
+                "client".into(),
+                target.clone(),
+                terms(),
+                Some(unknown)
+            )
+            .await
+            .is_err()
+        );
+        for changed in [
+            "name",
+            "sha256",
+            "bytes",
+            "service_cap",
+            "gas_cap",
+            "budget",
+        ] {
+            let mut altered = terms();
+            match changed {
+                "name" => altered.name = "different.bin".into(),
+                "sha256" => altered.sha256 = "e".repeat(64),
+                "bytes" => altered.bytes = 5,
+                "service_cap" => altered.service_cap = "101".into(),
+                "gas_cap" => altered.gas_cap = "8".into(),
+                _ => altered.budget_id = Some("3".repeat(64)),
+            }
+            assert!(
+                remember_transfer_intent(
+                    path.clone(),
+                    "network".into(),
+                    "client".into(),
+                    target.clone(),
+                    altered,
+                    Some(original.clone())
+                )
+                .await
+                .is_err()
+            );
+        }
+        for (network, client, node) in [
+            ("other-network", "client", target.clone()),
+            ("network", "other-client", target.clone()),
+            ("network", "client", "e".repeat(64)),
+        ] {
+            assert!(
+                remember_transfer_intent(
+                    path.clone(),
+                    network.into(),
+                    client.into(),
+                    node,
+                    terms(),
+                    Some(original.clone())
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path)?,
+            unchanged,
+            "all denials retain the original durable mapping"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn restart_requires_exact_terminal_evidence_and_recoverable_acceptance() {
+        let order = terminal("00000000-0000-4000-8000-000000000001");
+        assert!(can_restart_transfer(&order));
+        let mut refunded = order.clone();
+        refunded.phase = "refunded".into();
+        refunded.payment.state = "refunded".into();
+        refunded.payment.earned = "0".into();
+        refunded.payment.refunded = "10".into();
+        assert!(can_restart_transfer(&refunded));
+        refunded.payment.refunded = "9".into();
+        assert!(!can_restart_transfer(&refunded));
+        refunded.payment.refunded = "10".into();
+        refunded.payment.state = "unknown".into();
+        assert!(!can_restart_transfer(&refunded));
+        let mut changed = order.clone();
+        changed.windows[0].state = "pending".into();
+        assert!(!can_restart_transfer(&changed));
+        let mut changed = order.clone();
+        changed.role = "receiver".into();
+        assert!(!can_restart_transfer(&changed));
+        let mut changed = order;
+        changed.acceptance = "strict".into();
+        assert!(!can_restart_transfer(&changed));
     }
 }

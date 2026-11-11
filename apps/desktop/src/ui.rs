@@ -1655,8 +1655,11 @@ pub fn validate_transfer_pair(
             && a.intent_id != b.intent_id
             && a.payment.budget_id.is_some()
             && a.payment.budget_id == b.payment.budget_id
-            && a.source_peer == b.source_peer
-            && a.receiver_peer == b.receiver_peer
+            && (if accept {
+                a.receiver_peer == b.receiver_peer
+            } else {
+                a.source_peer == b.source_peer
+            })
             && a.provider_peer == b.provider_peer
             && a.payment.payer == b.payment.payer
             && a.payment.provider_wallet == b.payment.provider_wallet

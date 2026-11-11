@@ -899,6 +899,10 @@ impl Backend {
                 .await?;
                 Ok(())
             }),
+            Command::DeliveryRestart(order) => Box::pin(async move {
+                self.open_delivery_restart(order).await?;
+                Ok(())
+            }),
             Command::DeliveryConfirm(order) => Box::pin(async move {
                 {
                     self.reviewed_delivery_order(&order, false).await?;

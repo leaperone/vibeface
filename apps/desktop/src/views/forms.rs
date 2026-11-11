@@ -49,6 +49,9 @@ pub struct Form {
     pub editor: Editor,
     pub fields: Vec<Field>,
     delivery_budget_id: Option<String>,
+    delivery_restart_order_id: Option<String>,
+    delivery_restart_intent_id: Option<String>,
+    delivery_restart_review: Option<String>,
 }
 impl Form {
     pub fn new(
@@ -310,6 +313,21 @@ impl Form {
             } else {
                 None
             },
+            delivery_restart_order_id: if matches!(&editor, Editor::Transfer) {
+                values.get("_restart_order_id").cloned()
+            } else {
+                None
+            },
+            delivery_restart_intent_id: if matches!(&editor, Editor::Transfer) {
+                values.get("_restart_intent_id").cloned()
+            } else {
+                None
+            },
+            delivery_restart_review: if matches!(&editor, Editor::Transfer) {
+                values.get("_restart_review").cloned()
+            } else {
+                None
+            },
             editor,
             fields,
         }
@@ -335,6 +353,15 @@ impl Form {
         if let Some(budget) = &self.delivery_budget_id {
             values.insert("budget_id".into(), budget.clone());
         }
+        if let Some(id) = &self.delivery_restart_order_id {
+            values.insert("_restart_order_id".into(), id.clone());
+        }
+        if let Some(id) = &self.delivery_restart_intent_id {
+            values.insert("_restart_intent_id".into(), id.clone());
+        }
+        if let Some(review) = &self.delivery_restart_review {
+            values.insert("_restart_review".into(), review.clone());
+        }
         values
     }
     pub fn render(&self) -> AnyElement {
@@ -342,6 +369,7 @@ impl Form {
             .flex()
             .flex_col()
             .gap_4()
+            .children(self.delivery_restart_order_id.as_ref().map(|id| div().child(format!("作为新订单再次发送：原订单 {id}。请重新选择同名、同内容的原文件；原条款和金额上限必须保持一致，不会自动确认或付款。"))))
             .children(self.delivery_budget_id.as_ref().map(|id| {
                 div().child(format!(
                     "固定预付预算 {id}。受保护付费仅使用可恢复验收；更换预算需从预算列表重新准备。"
