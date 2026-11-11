@@ -2258,9 +2258,11 @@ mod tests {
             let delivery = Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
             let wallet = {
                 let mut wallet = delivery.wallet.lock().unwrap();
-                wallet.create(&vibeface_control::maintenance::SecretString::new(
+                let password = vibeface_control::maintenance::SecretString::new(
                     "nonce cleanup test password".into(),
-                ))?;
+                );
+                wallet.create(&password)?;
+                wallet.unlock(&password)?;
                 wallet.address()?
             };
             let config = chain::tests::config();
@@ -2477,10 +2479,6 @@ mod tests {
                     .intent,
                 fixture.original.intent
             );
-            assert!(!matches!(
-                fixture.claim.state,
-                ClaimState::FinalEarned { .. }
-            ));
             {
                 let mut state = fixture.observation.lock().unwrap();
                 state
@@ -2494,6 +2492,12 @@ mod tests {
                 if disclosed { "confirmed" } else { "reverted" }
             );
             assert_eq!(fixture.sent().len(), 1);
+            let persisted = fixture.delivery.claims()?.remove(0);
+            assert_eq!(persisted.state.name(), fixture.claim.state.name());
+            assert_eq!(
+                persisted.state.first_possible_at(),
+                fixture.claim.state.first_possible_at()
+            );
         }
         let fixture = NonceFixture::new(false, false).await?;
         fixture.step(true).await?;
