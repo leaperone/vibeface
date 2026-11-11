@@ -36,13 +36,8 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     Ok(value)
 }
 
-fn scheduler_item_pending(error: anyhow::Error) -> Result<()> {
-    if error.is::<rusqlite::Error>() || error.is::<std::io::Error>() || error.is::<reqwest::Error>()
-    {
-        return Err(error);
-    }
+fn scheduler_item_pending(error: anyhow::Error) {
     tracing::warn!(event = "schedule.item_pending", %error, "scheduler item waits for reconciliation");
-    Ok(())
 }
 
 impl Runtime {
@@ -84,7 +79,7 @@ impl Runtime {
         Ok(true)
     }
 
-    async fn workspace_execution_roots(&self) -> Result<Vec<String>> {
+    fn workspace_execution_roots(&self) -> Result<Vec<String>> {
         let snapshot = self.settings_snapshot();
         let mut paths = snapshot.roots;
         if let Some(manager) = snapshot.manager {
@@ -109,27 +104,40 @@ impl Runtime {
         network: &str,
         local: &str,
         message_id: &str,
-        roots: &[String],
     ) -> Result<crate::scheduling::AdmissionReceipt> {
         let input = store
             .workspace_input(network, message_id)?
             .context("input not found")?;
         let resolved = store.resolve_input_target(network, &input.input.route.target)?;
-        if let Some(task_id) = &resolved.task_id
-            && resolved.owner_node == local
-        {
-            store.ensure_workspace_assignment(&self.identity, network, task_id, roots, now_ms())?;
-        }
+        let roots = match (&resolved.task_id, resolved.owner_node == local) {
+            (Some(task_id), true) => {
+                let roots = self.workspace_execution_roots()?;
+                store.ensure_workspace_assignment(
+                    &self.identity,
+                    network,
+                    task_id,
+                    &roots,
+                    now_ms(),
+                )?;
+                roots
+            }
+            _ => Vec::new(),
+        };
         let receipt = store.admit_workspace_input(network, local, message_id)?;
         if receipt.state == "queued"
             && let Some(task_id) = &resolved.task_id
             && resolved.owner_node == local
-            && let Err(error) =
-                store.ensure_workspace_assignment(&self.identity, network, task_id, roots, now_ms())
+            && let Err(error) = store.ensure_workspace_assignment(
+                &self.identity,
+                network,
+                task_id,
+                &roots,
+                now_ms(),
+            )
         {
             scheduler_item_pending(
                 error.context(format!("accepted input assignment {message_id}")),
-            )?;
+            );
         }
         Ok(receipt)
     }
@@ -144,14 +152,12 @@ impl Runtime {
             return Ok(());
         }
         let local = self.identity.device_id()?;
-        let roots = self.workspace_execution_roots().await?;
         for message_id in pending {
             let admission = self.admit_saved_workspace_input(
                 &mut *self.store.lock().await,
                 network,
                 &local,
                 &message_id,
-                &roots,
             );
             match admission {
                 Ok(receipt) => {
@@ -163,7 +169,7 @@ impl Runtime {
                     self.outbox_wakeup.notify_one();
                 }
                 Err(error) => {
-                    scheduler_item_pending(error.context(format!("input admission {message_id}")))?
+                    scheduler_item_pending(error.context(format!("input admission {message_id}")))
                 }
             }
         }
@@ -180,7 +186,7 @@ impl Runtime {
         let jobs = self.store.lock().await.workspace_scheduler_jobs()?;
         for job in jobs {
             if let Err(error) = self.reconcile_workspace_job(network, &job).await {
-                scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)))?;
+                scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)));
             }
         }
         let assignments = self
@@ -195,7 +201,7 @@ impl Runtime {
             {
                 scheduler_item_pending(
                     error.context(format!("workspace assignment {}", assignment.assignment_id)),
-                )?;
+                );
             }
         }
         if self.store.lock().await.version_vector(network)? != before {
@@ -283,7 +289,7 @@ impl Runtime {
             job,
             now_ms(),
         ) {
-            scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)))?;
+            scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)));
         }
         Ok(())
     }
@@ -538,7 +544,7 @@ impl Runtime {
                 "the conversation moved to another owner; its turn here stops"
             );
             if let Err(error) = self.fence_manager_attempt(&attempt).await {
-                scheduler_item_pending(error.context(format!("moved turn {attempt}")))?;
+                scheduler_item_pending(error.context(format!("moved turn {attempt}")));
             }
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
@@ -572,7 +578,7 @@ impl Runtime {
         };
         for (scope, trigger, attempt) in abandoned {
             if let Err(error) = self.fence_manager_attempt(&attempt).await {
-                scheduler_item_pending(error.context(format!("abandoned turn {attempt}")))?;
+                scheduler_item_pending(error.context(format!("abandoned turn {attempt}")));
                 continue;
             }
             let requeued = self.store.lock().await.requeue_abandoned_scheduler_claim(
@@ -650,7 +656,7 @@ impl Runtime {
         let mut ran = false;
         loop {
             if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &key.scope {
-                let roots = self.workspace_execution_roots().await?;
+                let roots = self.workspace_execution_roots()?;
                 if self
                     .store
                     .lock()
@@ -998,7 +1004,6 @@ impl Runtime {
             "invalid input identity or sequence"
         );
         let local = self.identity.device_id()?;
-        let roots = self.workspace_execution_roots().await?;
         let (message, receipt) = {
             let mut store = self.store.lock().await;
             let resolved = store.resolve_input_target(network, &request.route.target)?;
@@ -1026,7 +1031,6 @@ impl Runtime {
                 network,
                 &local,
                 &message_id,
-                &roots,
             ) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -1420,13 +1424,14 @@ mod tests {
     #[tokio::test]
     async fn saved_inputs_retry_admission_after_capacity_and_storage_failures() -> Result<()> {
         use crate::{
-            runtime::triage::tests::{bot, node},
+            runtime::triage::tests::{bot, claim_reply, node},
             scheduling::{TriggerKind, message_trigger},
         };
         for case in ["capacity", "storage"] {
             let (node, admin, directory) = node().await?;
             let result = async {
                 bot(&node, &admin, "c", "Pending admission", &[]).await?;
+                bot(&node, &admin, "healthy", "Healthy reply", &[]).await?;
                 let network = node.network_id().await?;
                 let message_id = format!("pending-{case}");
                 let trigger = message_trigger(&message_id);
@@ -1456,13 +1461,11 @@ mod tests {
                 assert_eq!(accepted["state"], "pending_admission");
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
                 assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
-                let tick = node.schedule_tick().await;
-                if case == "storage" {
-                    assert!(tick.expect_err("global storage errors remain visible").is::<rusqlite::Error>());
-                } else {
-                    tick?;
-                }
+                let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
+                node.schedule_tick().await?;
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
+                assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
+                assert_eq!(node.store.lock().await.scheduler_job("healthy", &healthy)?.context("recovered unrelated reply")?.state, JobState::Queued);
                 {
                     let store = node.store.lock().await;
                     if case == "capacity" {
@@ -1491,6 +1494,93 @@ mod tests {
             result?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_roots_do_not_block_main_input_admission_or_reply_recovery()
+    -> Result<()> {
+        use crate::{
+            model::EventBody,
+            runtime::triage::tests::{bot, claim_reply, node},
+            scheduling::{SessionScope, TriggerKind, message_trigger},
+            workspace::{InputIntent, InputTarget, WORKSPACE_SCOPE, WorkspaceCommand},
+        };
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            for scope in ["c", "task-bot", "healthy"] {
+                bot(&node, &admin, scope, scope, &[]).await?;
+            }
+            let network = node.network_id().await?;
+            let root = directory.join("workspace");
+            std::fs::create_dir(&root)?;
+            node.settings.lock().unwrap().roots = vec![directory.clone(), root.clone()];
+            let signed = signed_main_input(&admin, &network, "c", "z-main-input", "main input", vec![], 1)?;
+            let input = json!({"conversation_id":"c","message_id":"z-main-input",
+                "target":{"kind":"bot_main","bot_id":"c"},"intent":"continue","sequence":1,
+                "text":"main input","attachments":[],"report_results":true,"attestation":signed.attestation()});
+            {
+                let store = node.store.lock().await;
+                for index in 0..crate::scheduling::MAX_PENDING_JOBS {
+                    let id = format!("capacity-{index}");
+                    crate::store::scheduler::admit_from(&store.connection, &network, "c",
+                        &message_trigger(&id), TriggerKind::Human, &id)?;
+                }
+            }
+            let access = test_access(network.clone(), true, Some("c".into()));
+            let accepted = node.accept_chat_message(&access, &input).await?;
+            assert_eq!(accepted["accepted"], true);
+            assert_eq!(accepted["state"], "pending_admission");
+            std::fs::remove_dir(&root)?;
+            let command = WorkspaceCommand::CreateTask {
+                task_id:"task".into(), channel_id:None, parent_task_id:None, owner_bot:"task-bot".into(),
+                title:"task".into(), request:"perform task".into(), expected_result:"result".into(),
+                source_events:vec![], dependencies:vec![], reply_only:false,
+            };
+            let signed = admin.attest(&network, WORKSPACE_SCOPE, EventBody::WorkspaceCommanded {
+                command_id:"create-task".into(), command:command.clone(), attestation:None, acting_assignment:None, cause:None,
+            })?;
+            node.store.lock().await.apply_workspace_command(&node.identity, &network, "create-task", command,
+                signed.attestation().cloned(), None, None, now_ms())?;
+            let signed = admin.attest(&network, "task-bot", EventBody::InputPosted {
+                message_id:"a-task-input".into(), target:InputTarget::Task { task_id:"task".into() },
+                intent:InputIntent::Continue, sequence:1, expected_revision:Some(1), text:"task input".into(),
+                attachments:vec![], report_results:Some(true), attestation:None,
+            })?;
+            let input = json!({"conversation_id":"task-bot","message_id":"a-task-input",
+                "target":{"kind":"task","task_id":"task"},"intent":"continue","sequence":1,
+                "expected_revision":1,"text":"task input","attachments":[],"report_results":true,
+                "attestation":signed.attestation()});
+            let access = test_access(network.clone(), true, Some("task-bot".into()));
+            let accepted = node.accept_chat_message(&access, &input).await?;
+            assert_eq!(accepted["accepted"], true);
+            assert_eq!(accepted["state"], "pending_admission");
+            let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
+            node.store.lock().await.connection.execute(
+                "DELETE FROM scheduler_jobs WHERE trigger LIKE 'message:capacity-%'", []
+            )?;
+            for _ in 0..2 {
+                node.schedule_tick().await?;
+                let store = node.store.lock().await;
+                assert_eq!(store.scheduler_job("c", &message_trigger("z-main-input"))?.context("admitted Main input")?.state, JobState::Queued);
+                assert_eq!(store.scheduler_job("healthy", &healthy)?.context("recovered unrelated reply")?.state, JobState::Queued);
+                assert!(store.scheduler_job("task-bot", &message_trigger("a-task-input"))?.is_none());
+                assert!(store.workspace_task(&network, "task")?.context("task")?.current_assignment.is_none());
+                assert_eq!(store.pending_workspace_input_admissions(&network)?, ["a-task-input"]);
+            }
+            std::fs::create_dir(&root)?;
+            node.schedule_tick().await?;
+            let store = node.store.lock().await;
+            let job = store.scheduler_job("task-bot", &message_trigger("a-task-input"))?.context("admitted task input")?;
+            assert_eq!(job.state, JobState::Queued);
+            assert_eq!(job.scope, SessionScope::WorkspaceTask { task_id:"task".into() });
+            assert!(store.workspace_task(&network, "task")?.context("task")?.current_assignment.is_some());
+            assert!(store.pending_workspace_input_admissions(&network)?.is_empty());
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
     }
 
     #[tokio::test]
