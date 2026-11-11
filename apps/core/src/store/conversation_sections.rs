@@ -645,7 +645,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let f = fixture()?;
+        let mut f = fixture()?;
         // This fixture measures projection reads, independently of event ingestion costs.
         f.store.connection.execute(
             "WITH RECURSIVE ids(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM ids WHERE i<99999)
@@ -679,11 +679,13 @@ mod tests {
                     observed.fetch_add(1, Ordering::Relaxed);
                     false
                 }),
-            );
+            )?;
             let page = f
                 .store
                 .conversation_sessions_page(&f.network, "c", Some(&cursor), 100);
-            f.store.connection.progress_handler(0, None::<fn() -> bool>);
+            f.store
+                .connection
+                .progress_handler(0, None::<fn() -> bool>)?;
             assert_eq!(page?.items.len(), 100);
             assert!(
                 steps.load(Ordering::Relaxed) < 10_000,

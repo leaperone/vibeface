@@ -4002,15 +4002,15 @@ mod tests {
             let saved = r.store.call("peers.save_peer_command", { let network = network.to_owned(); let sender_id = sender_id.to_owned(); let command = command.to_owned(); move |store| store.save_peer_command(
                 &network, &sender_id, &command.envelope, now_ms(),
             ) }).await?;
-            r.store.call("peers.execute_batch", { move |store| Ok(store.connection.execute_batch("PRAGMA query_only=ON")?) }).await?;
+            r.store.call("peers.execute_batch", move |store| Ok(store.connection.execute_batch("PRAGMA query_only=ON")?)).await?;
             let unwritten = r.process_peer_command(&network, &saved).await;
-            r.store.call("peers.execute_batch", { move |store| Ok(store.connection.execute_batch("PRAGMA query_only=OFF")?) }).await?;
+            r.store.call("peers.execute_batch", move |store| Ok(store.connection.execute_batch("PRAGMA query_only=OFF")?)).await?;
             assert!(unwritten.unwrap_err().is::<rusqlite::Error>(),
                 "a failed refusal receipt write stays retryable");
             let pending = r.store.call("peers.pending_peer_commands", { let network = network.to_owned(); move |store| store.pending_peer_commands(&network) }).await?;
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].state, PeerAdmissionState::Saved);
-            assert!(r.store.call("peers.scheduler_jobs", { move |store| store.scheduler_jobs("c") }).await?.is_empty());
+            assert!(r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs("c")).await?.is_empty());
             assert!(r.store.call("peers.held_answer_receipt", { let network = network.to_owned(); move |store| store.held_answer_receipt(&network, "c", "a-q-held") }).await?.is_none());
             for node in [&a, &r] { node.start_network().await?; }
             a.net()?.learn(&r.net()?.addr()).await;
@@ -4030,7 +4030,7 @@ mod tests {
             ) }).await?;
             assert_eq!(rejected.state, PeerAdmissionState::Rejected);
             assert!(r.store.call("peers.pending_peer_commands", { let network = network.to_owned(); move |store| store.pending_peer_commands(&network) }).await?.is_empty());
-            assert!(r.store.call("peers.scheduler_jobs", { move |store| store.scheduler_jobs("c") }).await?.is_empty());
+            assert!(r.store.call("peers.scheduler_jobs", move |store| store.scheduler_jobs("c")).await?.is_empty());
             assert!(r.store.call("peers.held_answer_receipt", { let network = network.to_owned(); move |store| store.held_answer_receipt(&network, "c", "a-q-held") }).await?.is_none());
             anyhow::Ok(())
         }.await;
