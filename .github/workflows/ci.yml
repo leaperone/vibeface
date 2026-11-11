@@ -17,6 +17,11 @@ on:
         description: 'Run controlled tests for each successfully compiled native package'
         type: boolean
         default: false
+      native_test_scope:
+        description: 'With native_prepare and native_tests, select all controlled tests or Desktop only'
+        type: choice
+        options: [all, desktop]
+        default: all
       native_frames:
         description: 'Measure native async frames and inspect controlled cold start without the full runtime suite'
         type: boolean
@@ -1343,8 +1348,10 @@ jobs:
           CLIENT_COMPILE: ${{ steps.compile.outputs.vibeface-client }}
           CORE_COMPILE: ${{ steps.compile.outputs.vibeface-core }}
           DESKTOP_COMPILE: ${{ steps.compile.outputs.vibeface-desktop }}
+          VIBEFACE_NATIVE_TEST_SCOPE: ${{ inputs.native_test_scope }}
         run: |
           result=0
+          if [[ "$VIBEFACE_NATIVE_TEST_SCOPE" == all ]]; then
           for package in vibeface-protocol vibeface-bridge vibeface-client; do
             if [[ "$package" == vibeface-client && "$CLIENT_COMPILE" != success ]]; then continue; fi
             if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
@@ -1355,6 +1362,7 @@ jobs:
             if [[ "$filter" == conversation_history ]]; then test_options+=(--nocapture); fi
             if ! cargo test --locked -p vibeface-core --lib "$filter" -- "${test_options[@]}" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
+          fi
           if [[ "$DESKTOP_COMPILE" == success ]]; then
             if ! xvfb-run -a cargo test --locked -p vibeface-desktop --features native-ui-tests --no-fail-fast -- --test-threads=1 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           fi
@@ -1390,6 +1398,7 @@ jobs:
           BENCHMARK_OUTCOME: ${{ steps.native-benchmarks.outcome }}
           FRAME_OUTCOME: ${{ steps.native-frames.outcome }}
           OFFLINE_DIAGNOSTIC_OUTCOME: ${{ steps.native-offline-diagnostic.outcome }}
+          VIBEFACE_NATIVE_TEST_SCOPE: ${{ inputs.native_test_scope }}
         run: |
           mkdir -p .artifacts/native-prepare
           cp Cargo.lock .artifacts/native-prepare/Cargo.lock
@@ -1403,7 +1412,8 @@ jobs:
                   'lockfile': os.environ['LOCKFILE_OUTCOME'], 'formatting': os.environ['FORMATTING_OUTCOME'],
                   'compile': os.environ['COMPILE_OUTCOME'], 'tests': os.environ['TEST_OUTCOME'],
                   'benchmarks': os.environ['BENCHMARK_OUTCOME'], 'native_frames': os.environ['FRAME_OUTCOME'],
-                  'offline_diagnostic': os.environ['OFFLINE_DIAGNOSTIC_OUTCOME'], 'publishing': False}
+                  'offline_diagnostic': os.environ['OFFLINE_DIAGNOSTIC_OUTCOME'],
+                  'test_scope': os.environ['VIBEFACE_NATIVE_TEST_SCOPE'], 'publishing': False}
           (root / 'outcomes.json').write_text(json.dumps(data, indent=2) + '\n')
           PYMETA
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
