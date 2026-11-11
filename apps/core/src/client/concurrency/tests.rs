@@ -181,7 +181,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         let (mut control, _) = tokio::time::timeout(DEADLINE, self.probes.accept()).await??;
         let mut byte = [0];
         tokio::time::timeout(DEADLINE, control.read_exact(&mut byte)).await??;
-        ensure!(byte == [b'R'], "fixture did not reach the held probe");
+        ensure!(byte == *b"R", "fixture did not reach the held probe");
         Ok(control)
     }
 
