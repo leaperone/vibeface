@@ -25,7 +25,7 @@ typography:
     lineHeight: "18px"
 rounded:
   base: "0.625rem"
-  control: "0.5rem"
+  control: "0.625rem"
   xl: "0.875rem"
 spacing:
   unit: "4px"

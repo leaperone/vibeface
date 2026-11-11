@@ -38,7 +38,7 @@ typography:
     lineHeight: "20px"
 rounded:
   base: "0.625rem"
-  control: "0.5rem"
+  control: "0.625rem"
   inline-code: "4px"
   xl: "0.875rem"
 spacing:

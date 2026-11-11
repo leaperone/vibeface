@@ -213,35 +213,35 @@
       "refersTo": "button-primary",
       "description": "Neutral primary action; CSS translation of the native primitive.",
       "html": "<button class=\"ds-button\">保存</button>",
-      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}"
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}"
     },
     {
       "name": "Outline button",
       "kind": "button",
       "description": "Secondary action using existing semantic tokens.",
       "html": "<button class=\"ds-button ds-outline\">取消</button>",
-      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-outline{background:oklch(1 0 0);color:oklch(0.21 0.012 270);border-color:oklch(0.915 0.006 270)}.ds-outline:hover{background:oklch(0.965 0.004 270)}"
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-outline{background:oklch(1 0 0);color:oklch(0.21 0.012 270);border-color:oklch(0.915 0.006 270)}.ds-outline:hover{background:oklch(0.965 0.004 270)}"
     },
     {
       "name": "Ghost button",
       "kind": "button",
       "description": "Secondary action using existing semantic tokens.",
       "html": "<button class=\"ds-button ds-ghost\">取消</button>",
-      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-ghost{background:transparent;color:oklch(0.21 0.012 270);border-color:transparent}.ds-ghost:hover{background:oklch(0.965 0.004 270)}"
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-ghost{background:transparent;color:oklch(0.21 0.012 270);border-color:transparent}.ds-ghost:hover{background:oklch(0.965 0.004 270)}"
     },
     {
       "name": "Input",
       "kind": "input",
       "description": "Editable field; native TextInput translated for the design panel.",
       "html": "<input class=\"ds-input\" aria-label=\"任务名称\" placeholder=\"任务名称\">",
-      "css": ".ds-input{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;min-height:44px;padding:4px 12px;border:1px solid oklch(0.895 0.007 270);border-radius:8px;background:transparent;color:oklch(0.21 0.012 270)}.ds-input::placeholder{color:oklch(0.51 0.014 270)}.ds-input:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-input:disabled{opacity:.5}"
+      "css": ".ds-input{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;min-height:44px;padding:4px 12px;border:1px solid oklch(0.895 0.007 270);border-radius:10px;background:transparent;color:oklch(0.21 0.012 270)}.ds-input::placeholder{color:oklch(0.51 0.014 270)}.ds-input:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-input:disabled{opacity:.5}"
     },
     {
       "name": "Navigation row",
       "kind": "nav",
       "description": "Native list-row translation.",
       "html": "<nav><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">消息</a></nav>",
-      "css": ".ds-nav{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:8px;color:oklch(0.21 0.012 270);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:oklch(0.965 0.004 270)}.ds-nav:focus-visible{outline:2px solid oklch(0.6 0.17 280)}"
+      "css": ".ds-nav{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:10px;color:oklch(0.21 0.012 270);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:oklch(0.965 0.004 270)}.ds-nav:focus-visible{outline:2px solid oklch(0.6 0.17 280)}"
     },
     {
       "name": "List group",

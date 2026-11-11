@@ -243,35 +243,35 @@
       "refersTo": "button-primary",
       "description": "Default neutral primary action.",
       "html": "<button class=\"ds-button\">保存</button>",
-      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}"
+      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}"
     },
     {
       "name": "Outline button",
       "kind": "button",
       "description": "Secondary action using existing semantic tokens.",
       "html": "<button class=\"ds-button ds-outline\">取消</button>",
-      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-outline{background:var(--background);color:var(--foreground);border-color:var(--border)}.ds-outline:hover{background:var(--muted)}"
+      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-outline{background:var(--background);color:var(--foreground);border-color:var(--border)}.ds-outline:hover{background:var(--muted)}"
     },
     {
       "name": "Ghost button",
       "kind": "button",
       "description": "Secondary action using existing semantic tokens.",
       "html": "<button class=\"ds-button ds-ghost\">取消</button>",
-      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:8px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-ghost{background:transparent;color:var(--foreground);border-color:transparent}.ds-ghost:hover{background:var(--muted)}"
+      "css": ".ds-button{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:var(--primary);color:var(--primary-foreground);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,var(--primary) 88%,transparent)}.ds-button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-ghost{background:transparent;color:var(--foreground);border-color:transparent}.ds-ghost:hover{background:var(--muted)}"
     },
     {
       "name": "Input",
       "kind": "input",
       "description": "Single-line field.",
       "html": "<input class=\"ds-input\" aria-label=\"任务名称\" placeholder=\"任务名称\">",
-      "css": ".ds-input{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;min-height:36px;padding:4px 12px;border:1px solid var(--input);border-radius:8px;background:transparent;color:var(--foreground)}.ds-input::placeholder{color:var(--muted-foreground)}.ds-input:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-input:disabled{opacity:.5}"
+      "css": ".ds-input{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;min-height:36px;padding:4px 12px;border:1px solid var(--input);border-radius:10px;background:transparent;color:var(--foreground)}.ds-input::placeholder{color:var(--muted-foreground)}.ds-input:focus-visible{outline:2px solid var(--ring);outline-offset:2px}.ds-input:disabled{opacity:.5}"
     },
     {
       "name": "Navigation row",
       "kind": "nav",
       "description": "Workspace navigation row.",
       "html": "<nav><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">消息</a></nav>",
-      "css": ".ds-nav{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:8px;color:var(--foreground);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:var(--muted)}.ds-nav:focus-visible{outline:2px solid var(--ring)}"
+      "css": ".ds-nav{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:10px;color:var(--foreground);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:var(--muted)}.ds-nav:focus-visible{outline:2px solid var(--ring)}"
     },
     {
       "name": "List group",
