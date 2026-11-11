@@ -36,11 +36,15 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 协调器只用 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，不合入 main。以原 schedule run 的精确 main SHA 作唯一 parent，生成普通机械版本提交，只改七个版本文件中的发行版本、Cargo.lock 三个本仓包版本及 Android、iOS 构建号，保留 marketing version、依赖和其他内容。共享验证器对比完整 tree，并运行 `cargo metadata --locked --no-deps` 核对 Core、CLI、Desktop 三个本仓包的清单版本（这条命令带 `--no-deps` 时不校验锁文件），不以路径白名单放行。
 
-原 run 的 UTC `created_at` 向下取整到四小时批次，版本日期仍取该 run 的 `YYYYMMDD`。提交记录原 schedule run ID、批次和上一可信产品 Nightly 来源。移动构建号从 main 与上一可信 Nightly 取数值上界后加一；iOS 按数字分段比较，末段溢出时停止，不回绕。协调器全局串行。同批次、延迟或跨日恢复保持原版本、构建号、提交与 artifact；上一来源完整发布且 npm 成功、main 无新提交时跳过。部分 Tag、Release 或 npm 必须先恢复原来源，不新建版本覆盖。
+原 run 的 UTC `created_at` 向下取整到四小时批次，版本日期仍取该 run 的 `YYYYMMDD`。提交记录原 schedule run ID、批次和上一可信产品 Nightly 来源。移动构建号从 main 与上一可信 Nightly 取数值上界后加一；iOS 按数字分段比较，末段溢出时停止，不回绕。协调器全局串行。同批次、延迟或跨日恢复保持原版本、构建号、提交与 artifact；上一来源完整发布且 npm 成功、main 无新提交时跳过。部分 Tag、Release 或 npm 必须先恢复原来源，或经 main 明确审查弃用后由下一批分配新版本，不覆盖原来源。
 
 所有发布入口统一验证 main 来源或精确机械 Nightly。detached 提交仅允许 Nightly；Stable/RC 仍要求 main。机械 Nightly 的 CI 证明必须是原 schedule run 的精确仓库、workflow path、main、parent SHA 和成功的根级 gate。来源门根据原 CI SHA 的精确文件树选择 workflow 和根级 gate，新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整个 run success。正常 main Tag 仍要求同一 SHA 的 main push CI success。Tag、制品与 provenance 的 source 始终是实际版本提交，不替换为 parent。
 
+历史来源只在完整可信发布或 main 审查过的明确弃用声明处停止验证。成功锚点要求精确产品 Tag/SHA、同仓唯一成功的原 release run、成功 `collect` 与 `publish-product`、完整公开 `release.json` 和每个远端附件的 SHA-256；只下载有大小上限的 manifest，不下载历史载荷。当前来源和边界来源本身仍须通过 main parent、BOT、完整机械 tree、版本与原 CI 校验。缺少远端摘要时停止，不退回整包下载；没有可信边界时最多验证 16 个来源，超限失败关闭。
+
 新来源按发布组派发 `release.yml` 或 `release-www.yml`；历史来源由精确源码树选择原入口。产品与官网并行发布，产品最终完整清单和 npm 分别核对。Tag 只创建，冲突立即停止；未知响应先读远端对账，不重复写入。仅从原运行的完整不可变 artifact 重跑失败 publisher；原产品和 npm artifact 完整时可恢复原 npm 发布。缺失、过期或字节冲突时停止。自动 Nightly 不部署、不上传 TestFlight 或 App Store；仍构建设备归档，签名配置完整时导出 IPA。不要在人工会话中无授权调用自动协调入口。
+
+自动 publisher 恢复的总 `run_attempt` 上限为 3。生产者失败、原 artifact 不可用、同 Tag 多个原 run 或达到自动恢复上限时，保留失败证据，按[明确弃用 Nightly 来源](../../../packages/docs/releasing.md#明确弃用-nightly-来源)通过 PR 在 `scripts/nightly-abandoned.json` 记录精确 source、两组 Tag、全部原 run ID 和原因。声明只从 `origin/main` 读取，所有关联 run/job 都须已终态，未知 dispatch 或运行中结果禁止弃用。该来源仍是失败；下一批沿用它的构建号上界分配更高版本，同批不再恢复。未发布的组须确认 Tag、Release 和 run 均不存在。
 
 ## 准备并验证版本
 
@@ -86,7 +90,7 @@ GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Ta
 ## 处理现存 tag 与失败
 
 - 同名本地或远端 tag 已存在：解析 annotated tag 的最终 commit 并核对 SHA。不同提交立即停止，禁止覆盖、强推、删除重建或改保护规则。同一提交的本地 tag 可直接推送；远端已存在则检查已有 Release 和关联 runs，已成功就报告已有结果。
-- 相同 tag、相同源码的构建因基础设施失败时，先对账并保留已有制品，再重跑失败任务。需要重新派发时使用 `gh workflow run "$WORKFLOW" --repo leaperone/vibeface --ref "$TAG" -f tag="$TAG" -F publish=true`。自动 Nightly 的 tag 不重新派发：协调器要求每个 tag 只有一个 release run，出现第二个 run 就判定该来源未完成并停止，只重跑原 run 的失败 job。不重新打 tag，不覆盖已上传字节；若重建结果与已上传制品不同，停止重试并使用新版本。
+- 相同 tag、相同源码的构建因基础设施失败时，先对账并保留已有制品，再重跑失败任务。自动 Nightly 只用 `gh run rerun <原-run-id> --repo leaperone/vibeface --failed` 重跑原运行的失败 publisher，复用完整的原不可变 artifact，不重新 dispatch；原制品不可恢复时按明确弃用流程处理。其他 Tag 确需重新派发时使用 `gh workflow run "$WORKFLOW" --repo leaperone/vibeface --ref "$TAG" -f tag="$TAG" -F publish=true`。不重新打 tag，不覆盖已上传字节；若重建结果与已上传制品不同，停止重试并使用新版本。
 - 修复源码必须走新 PR 和新版本、新 tag。构建中的同一 Release 允许追加其他已校验平台的附件；已公开字节和 tag 不覆盖、不删除。回滚也通过新版本交付修正。
 - 推送或发布返回结果未知时，先查询远端 tag、Release 和 Actions 对账，再决定下一步。不要直接重发。
 

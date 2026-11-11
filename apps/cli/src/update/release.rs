@@ -881,6 +881,121 @@ pub(crate) fn same_package_bytes(left: &Path, right: &Path) -> Result<bool> {
     Ok(tree(left)? == tree(right)?)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedRelease {
+    data_dir: PathBuf,
+    device_id: String,
+    package_digest: String,
+}
+
+/// Only a confirmed, sealed candidate grants permission to remove an unchanged package later.
+pub(super) fn retain_committed(
+    root: &Path,
+    data: &Path,
+    device_id: &str,
+    previous: &Path,
+    candidate: &Path,
+) -> Result<()> {
+    super::owned_directory(root)?;
+    super::owned_directory(data)?;
+    let releases = root.join("releases");
+    super::owned_directory(&releases)?;
+    let journal_exists = || -> std::io::Result<bool> {
+        match fs::symlink_metadata(data.join("update-pending.json")) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+    ensure!(
+        !journal_exists()?,
+        "an activation journal still references this Node's releases"
+    );
+    let current = super::installed(root)?;
+    ensure!(
+        current == candidate,
+        "committed package is no longer current"
+    );
+    let receipt = |package: &Path| -> Result<PathBuf> {
+        let name = package
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("release directory has no version")?;
+        ensure!(
+            package.parent() == Some(releases.as_path())
+                && Version::parse(name)?.to_string() == name,
+            "release is outside the updater namespace"
+        );
+        Ok(releases.join(format!(".updater-{name}.json")))
+    };
+    let package_digest = |package: &Path| -> Result<String> {
+        super::owned_directory(package)?;
+        verify_sealed_contents(package, host_target()?)?;
+        let contents = tree(package)?;
+        ensure!(
+            package.file_name().and_then(|name| name.to_str())
+                == Some(super::manifest(package)?.version.to_string().as_str()),
+            "release directory does not match its package version"
+        );
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&contents)?)))
+    };
+    let path = receipt(candidate)?;
+    let record = CommittedRelease {
+        data_dir: data.to_path_buf(),
+        device_id: device_id.to_owned(),
+        package_digest: package_digest(candidate)?,
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let saved: CommittedRelease = serde_json::from_slice(
+                &privatefs::read_private_bounded(&path, 4096, "committed release receipt")?,
+            )?;
+            ensure!(
+                saved.data_dir == record.data_dir
+                    && saved.device_id == record.device_id
+                    && saved.package_digest == record.package_digest,
+                "committed release receipt belongs to another package or Node"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            privatefs::create_durable(&path, &serde_json::to_vec(&record)?)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    for entry in fs::read_dir(&releases)? {
+        let package = entry?.path();
+        if package == current || package == previous || executable.starts_with(&package) {
+            continue;
+        }
+        let Ok(path) = receipt(&package) else {
+            continue;
+        };
+        let Ok(bytes) = privatefs::read_private_bounded(&path, 4096, "committed release receipt")
+        else {
+            continue;
+        };
+        let Ok(saved) = serde_json::from_slice::<CommittedRelease>(&bytes) else {
+            continue;
+        };
+        if saved.data_dir != data
+            || saved.device_id != device_id
+            || package_digest(&package).ok().as_ref() != Some(&saved.package_digest)
+        {
+            continue;
+        }
+        ensure!(
+            super::installed(root)? == current && !journal_exists()?,
+            "the active release changed during retention"
+        );
+        fs::remove_dir_all(&package)?;
+        fs::remove_file(path)?;
+        privatefs::sync_dir(&releases)?;
+    }
+    Ok(())
+}
+
 fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
     let build = verify_sealed_contents(package, &release.target)?;
     ensure!(
@@ -962,7 +1077,7 @@ async fn verify_binary(binary: &Path, version: &Version, name: &str) -> Result<(
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize)]
 enum TreeEntry {
     Directory,
     File {

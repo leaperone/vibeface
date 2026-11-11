@@ -36,7 +36,7 @@ vibeface wallet --data-dir "$VDP_SOURCE" budget status --budget-id "$VDP_BUDGET_
 
 ## Hold、批次揭钥和提款
 
-R 明确接受订单，完整密文落盘后产生 Hold。P 的请求处理器只耐久保存 Hold 授权，不立即公开 E。R 等待批次是正常可恢复状态；实际恢复后不会再自动启动 Open 证明。显式 Open 仅能为已经 Earned 的窗口增加解密证据，不能阻止付款。
+R 明确接受订单，完整密文落盘后产生 Hold。P 先核对接收方同意签名，再用已核验部署的 adapter 对同一 Hold statement 验证 seal，通过后才耐久保存授权，不立即公开 E。无效证明或临时 RPC 错误不占用队列，可重新提交有效证明。R 等待批次是正常可恢复状态；实际恢复后不会再自动启动 Open 证明。显式 Open 仅能为已经 Earned 的窗口增加解密证据，不能阻止付款。
 
 P 可以在现有实验室预算区或本机 CLI 先查看就绪窗口，再明确结算当前最多两个窗口：
 
@@ -73,13 +73,17 @@ P 必须显式配置本机 `publication_policy`，未配置时不提供受保护
 
 W 是本机最多两个活动 claim 和一个历史复查槽的调度界；每槽有 10 秒执行截止，轮询间隔 1 秒。I/F/S 分别是配置明确承担的 canonical 执行、后续最终性和时钟误差边界。网络或主机不满足这些边界时必须报告可用性风险，配置数字本身不证明边界已经成立。
 
-publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变签名 attempt。五种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、FinalSettled、ExpiredUnrevealed。签好 raw 仍是私密状态。
+publication claim 与签名 attempt 分开。claim 固定预算、payee、窗口/E、完整金额截止、目标金额、原累计 cap 和 policy；每个 nonce 一份不可变原 reveal attempt，同 nonce 的清理候选另存不可变签名账本。五种状态是 PrivateReady、DisclosedOutstanding、FinalEarned、FinalSettled、ExpiredUnrevealed。签好 raw 仍是私密状态。
 
-已赚取或已结束的 claim 仍按原 hash 只读对账每份 attempt，不用窗口收入推断某笔原交易成功。FinalSettled 表示本批原窗口和奖金权利已全部结束，款项可能部分赚取、其余退款，且恢复材料可能已公开。只有全部原 attempt 各自已 canonical confirmed 或 reverted、同 anchor 的逐窗费用及奖金与 earned/refunded 精确核对后，才记录候选终态；再经过原 F+S 的本机与 confirmed 链时间双重等待、重新验证原 anchor 和全部终态，才释放活动槽。未知、浅确认、重组、时钟异常或未结奖金会清除候选并继续占槽。claim、首次披露事实、原签名和累计 cap 不删除。FinalSettled 的历史复查发现反证或无法确认终态时恢复 Outstanding 并重新占槽，阻止新增队列绕过不确定结果。FinalEarned 保留从首次可能披露时刻起 policy.margin() 的原延迟释放规则；历史读取失败或超时会保留该状态并显示风险，不自动重新占槽。完整 canonical 读取确认已赚取条件不再成立时，才沿既有路径恢复 Outstanding；若只观察到某份 attempt 重组而后续读取失败，仍按前述历史风险规则处理。这是原 I/F/S 假设边界，不构成绝对最终性保证。
+已赚取或已结束的 claim 仍按原 hash 对账每份 attempt，不用窗口收入推断某笔原交易成功。经济截止后的 nonce 清理也持续对账。FinalSettled 表示本批原窗口和奖金权利已全部结束，款项可能部分赚取、其余退款，且恢复材料可能已公开。只有每个原 nonce 各有 canonical confirmed 或 reverted 的原交易或无害清理交易、同 anchor 的逐窗费用及奖金与 earned/refunded 精确核对后，才记录候选终态；再经过原 F+S 的本机与 confirmed 链时间双重等待、重新验证原 anchor 和全部终态，才释放活动槽。未知、浅确认、重组、时钟异常或未结奖金会清除候选并继续占槽。claim、首次披露事实、原签名和累计 cap 不删除。FinalSettled 的历史复查发现反证或无法确认终态时恢复 Outstanding 并重新占槽，阻止新增队列绕过不确定结果。FinalEarned 保留从首次可能披露时刻起 policy.margin() 的原延迟释放规则；历史读取失败或超时会保留该状态并显示风险，不自动重新占槽。完整 canonical 读取确认已赚取条件不再成立时，才沿既有路径恢复 Outstanding；若只观察到某份 attempt 重组而后续读取失败，仍按前述历史风险规则处理。这是原 I/F/S 假设边界，不构成绝对最终性保证。
 
 产品 publication 路径禁止任何含 E 的 estimateGas、eth_call、simulation。公开固定材料的 `experiment-delivery.mjs` 故障对照会故意调用 `revealBatch.staticCall` 并绕过 Node gate；这些原始提前披露/回滚反例不构成产品 gate 通过，也不改写旧 FAIL。有限两窗 reveal 使用离线固定 800000 gas：没有 verifier 调用，每项固定 80 字节及有界 storage/事件；相关真实有限形状和合成账务用例检查该上界。runtime 改变时须重新核对，不能用真实 E 去估算。首次外发前检查原 cap、原生币余额、固定 fee 足额和无低 nonce 阻塞；raw、nonce、claim 关联原子落盘。紧邻首次可能含 E 的 RPC 再检查 `now + W + I + F + S < economic_cutoff`，耐久记录可能披露，之后才广播。RPC 超时或错误仍是 Outstanding，不能按失败另付。
 
-已可能披露的同一 claim 恢复只受原经济截止和原累计授权限制，不重新套完整首次余量；否则合法披露后的临界回滚会被本机错误阻断。canonical revert 消耗 nonce 后，先对账所有原 attempt 和窗口，再按同一 claim、固定收款人及原总 cap 生成新 nonce attempt。未知、pending nonce 前进都不证明失败。当前固定费率模式没有同 nonce 自动加价/替换承诺；原 raw 可在回滚后原 nonce 合法时原样重播。
+已可能披露的同一 claim 恢复只受原经济截止和原累计授权限制，不重新套完整首次余量；否则合法披露后的临界回滚会被本机错误阻断。canonical revert 消耗 nonce 后，先对账所有原 attempt 和窗口，再按同一 claim、固定收款人及原总 cap 生成新 nonce attempt。未知、pending nonce 前进都不证明失败。经济截止前维持固定费率；原 raw 仅可在原披露 gate 和 nonce 条件仍成立时原样重播。
+
+经济截止后不再广播含 E 的 reveal。原 nonce 未终结时，专用签名动作只允许同 chain、wallet、nonce 对固定 escrow 调用零 value、精确 calldata 的 `profileId()` getter。原 reveal 和各份清理 raw/hash 分别保留，发送不同字节前先核对全部 hash 和 latest/pending nonce。清理使用固定 30000 gas，可在原 reveal 已预留的最大 gas 成本内提高费用，不额外消耗一份累计 gas 预算。只有一个同 nonce 候选能在 canonical 链上消耗 gas。清理交易 confirmed 或 reverted 均表示 nonce 已消耗，原 reveal 单独记为 conflicted，绝不据此记为 earned。
+
+重启后继续使用原清理账本。钱包锁定、原授权撤销、paid/lab 关闭、时钟不符、余额不足、配额不足或当前 fee 超出原预留成本时保留记录并暂停；恢复条件后继续处理。它不承诺任意费率和资源条件下的活性。
 
 完整 17 由 10 传输费、2 预留费和有条件奖金 5 组成；承诺完整17的经济截止是 keyDeadline 与 priorityDeadline 的较早值。奖金为0的订单只受 keyDeadline；首次在奖金截止后组建的合法 base-only claim 只计原条款仍能赚取的费用，页面显示原报价与该批目标金额，不声称仍能赚17。已经生成的完整金额 claim 不悄悄改价、延长截止或重置 cap。
 

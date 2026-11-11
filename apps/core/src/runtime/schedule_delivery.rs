@@ -110,6 +110,10 @@ impl SchedulerProjection {
     }
 }
 
+fn scheduler_item_pending(error: anyhow::Error) {
+    tracing::warn!(event = "schedule.item_pending", %error, "scheduler item waits for reconciliation");
+}
+
 impl Runtime {
     async fn prepare_scope_input(&self, network: &str, key: &SessionKey) -> Result<bool> {
         let input = {
@@ -161,8 +165,7 @@ impl Runtime {
             .await
     }
 
-    async fn workspace_execution_roots(&self) -> Result<Vec<String>> {
-        let snapshot = self.settings_snapshot();
+    fn workspace_execution_roots(snapshot: NodeSettings) -> Result<Vec<String>> {
         let mut paths = snapshot.roots;
         if let Some(manager) = snapshot.manager {
             paths.push(manager.workspace);
@@ -180,129 +183,112 @@ impl Runtime {
         Ok(roots)
     }
 
+    fn admit_saved_workspace_input(
+        store: &mut Store,
+        identity: &LocalIdentity,
+        settings: NodeSettings,
+        network: &str,
+        local: &str,
+        message_id: &str,
+    ) -> Result<crate::scheduling::AdmissionReceipt> {
+        let input = store
+            .workspace_input(network, message_id)?
+            .context("input not found")?;
+        let resolved = store.resolve_input_target(network, &input.input.route.target)?;
+        let roots = match (&resolved.task_id, resolved.owner_node == local) {
+            (Some(task_id), true) => {
+                let roots = Self::workspace_execution_roots(settings)?;
+                store.ensure_workspace_assignment(identity, network, task_id, &roots, now_ms())?;
+                roots
+            }
+            _ => Vec::new(),
+        };
+        let receipt = store.admit_workspace_input(network, local, message_id)?;
+        if receipt.state == "queued"
+            && let Some(task_id) = &resolved.task_id
+            && resolved.owner_node == local
+            && let Err(error) =
+                store.ensure_workspace_assignment(identity, network, task_id, &roots, now_ms())
+        {
+            scheduler_item_pending(
+                error.context(format!("accepted input assignment {message_id}")),
+            );
+        }
+        Ok(receipt)
+    }
+
+    async fn reconcile_workspace_inputs(&self, network: &str) -> Result<()> {
+        let pending = self
+            .store
+            .call("schedule_delivery.pending_workspace_input_admissions", {
+                let network = network.to_owned();
+                move |store| store.pending_workspace_input_admissions(&network)
+            })
+            .await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let local = self.identity.device_id()?;
+        for message_id in pending {
+            let admission = self
+                .store
+                .call("retry_workspace_input", {
+                    let identity = self.identity.clone();
+                    let settings = self.settings_snapshot();
+                    let network = network.to_owned();
+                    let local = local.clone();
+                    let message_id = message_id.clone();
+                    move |store| {
+                        Self::admit_saved_workspace_input(
+                            store,
+                            &identity,
+                            settings,
+                            &network,
+                            &local,
+                            &message_id,
+                        )
+                    }
+                })
+                .await;
+            match admission {
+                Ok(receipt) => {
+                    self.publish_changed(
+                        network,
+                        &receipt.conversation_id,
+                        Changed::Job(&receipt.trigger),
+                    );
+                    self.outbox_wakeup.notify_one();
+                }
+                Err(error) => {
+                    scheduler_item_pending(error.context(format!("input admission {message_id}")))
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn reconcile_workspace_jobs(self: &Arc<Self>, network: &str) -> Result<()> {
+        let local = self.identity.device_id()?;
         let before = self
             .store
-            .call("version_vector", {
+            .call("workspace_authorized_version", {
                 let network = network.to_owned();
-                move |store| store.version_vector(&network)
+                let local = local.clone();
+                move |store| {
+                    store.authorize_node(&network, &local)?;
+                    store.version_vector(&network)
+                }
             })
             .await?;
         let jobs = self
             .store
-            .call("workspace_scheduler_jobs", |store| {
-                store.workspace_scheduler_jobs()
+            .call("schedule_delivery.workspace_scheduler_jobs", {
+                move |store| store.workspace_scheduler_jobs()
             })
             .await?;
         for job in jobs {
-            let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope else {
-                continue;
-            };
-            let task = self
-                .store
-                .call("workspace_task", {
-                    let network = network.to_owned();
-                    let task_id = task_id.to_owned();
-                    move |store| store.workspace_task(&network, &task_id)
-                })
-                .await?;
-            let Some(task) = task else {
-                continue;
-            };
-            let active_fenced = matches!(
-                job.state,
-                JobState::Claimed { .. } | JobState::Running { .. } | JobState::Steering { .. }
-            ) && !self
-                .store
-                .call("workspace_task_input_allowed", {
-                    let network = network.to_owned();
-                    let task_id = task_id.to_owned();
-                    move |store| store.workspace_task_input_allowed(&network, &task_id)
-                })
-                .await?;
-            if active_fenced
-                || (task.action != crate::workspace::TaskAction::Continue
-                    && matches!(
-                        job.state,
-                        JobState::Queued
-                            | JobState::Claimed { .. }
-                            | JobState::Running { .. }
-                            | JobState::Steering { .. }
-                    ))
-            {
-                let stopped = self
-                    .store
-                    .call("request_manager_cancel", {
-                        let identity = self.identity.to_owned();
-                        let network = network.to_owned();
-                        let conversation_id = job.conversation_id.to_owned();
-                        let trigger = job.trigger.to_owned();
-                        move |store| {
-                            store.request_manager_cancel(
-                                &identity,
-                                &network,
-                                &conversation_id,
-                                &trigger,
-                            )
-                        }
-                    })
-                    .await?;
-                if let Some(JobState::Cancelling { attempt }) = stopped.map(|job| job.state) {
-                    let node = self.clone();
-                    self.background_tasks.spawn(async move {
-                        if let Err(error) = node.fence_manager_attempt(&attempt.id).await {
-                            tracing::warn!(event="workspace.manager_fence_pending",%error,"manager cancellation remains pending");
-                        }
-                    })?;
-                }
-                let works = self
-                    .store
-                    .call("works", {
-                        let network = network.to_owned();
-                        let conversation_id = job.conversation_id.to_owned();
-                        move |store| store.works(&network, &conversation_id)
-                    })
-                    .await?;
-                for work in works {
-                    if work.outcome.is_none()
-                        && self
-                            .store
-                            .call("scheduler_work_in_scope", {
-                                let network = network.to_owned();
-                                let job = job.to_owned();
-                                let work_id = work.work_id.to_owned();
-                                move |store| store.scheduler_work_in_scope(&network, &job, &work_id)
-                            })
-                            .await?
-                    {
-                        let node = self.clone();
-                        let network = network.to_owned();
-                        let conversation = job.conversation_id.clone();
-                        self.background_tasks.spawn(async move {
-                            if let Err(error) = node.stop_work(&network, &conversation, &work.work_id).await {
-                                tracing::warn!(event="workspace.work_stop_pending",%error,"work cancellation remains pending");
-                            }
-                        })?;
-                    }
-                }
-                self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
-            }
-            if !matches!(
-                job.state,
-                JobState::Steering { .. } | JobState::Steered { .. }
-            ) && let Err(error) = self
-                .store
-                .call("settle_workspace_assignment", {
-                    let identity = self.identity.to_owned();
-                    let network = network.to_owned();
-                    let job = job.to_owned();
-                    move |store| {
-                        store.settle_workspace_assignment(&identity, &network, &job, now_ms())
-                    }
-                })
-                .await
-            {
-                tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment lifecycle remains pending");
+            if let Err(error) = self.reconcile_workspace_job(network, &job).await {
+                scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)));
             }
         }
         let assignments = self
@@ -313,64 +299,13 @@ impl Runtime {
             })
             .await?;
         for assignment in assignments {
-            if assignment.execution_node != self.identity.device_id()? {
-                continue;
-            }
-            if let Some(work_id) = &assignment.work_id {
-                let task = self
-                    .store
-                    .call("workspace_task", {
-                        let network = network.to_owned();
-                        let task_id = assignment.task_id.to_owned();
-                        move |store| store.workspace_task(&network, &task_id)
-                    })
-                    .await?
-                    .context("assignment task missing")?;
-                if task.action != crate::workspace::TaskAction::Continue
-                    || !self
-                        .store
-                        .call("workspace_task_input_allowed", {
-                            let network = network.to_owned();
-                            let task_id = assignment.task_id.to_owned();
-                            move |store| store.workspace_task_input_allowed(&network, &task_id)
-                        })
-                        .await?
-                {
-                    let node = self.clone();
-                    let network = network.to_owned();
-                    let work_id = work_id.clone();
-                    let conversation = self
-                        .store
-                        .call("work", {
-                            let network = network.as_str().to_owned();
-                            let work_id = work_id.to_owned();
-                            move |store| store.work(&network, &work_id)
-                        })
-                        .await?
-                        .map(|work| work.conversation_id);
-                    if let Some(conversation) = conversation {
-                        self.background_tasks.spawn(async move {
-                            if let Err(error) = node.stop_work(&network, &conversation, &work_id).await {
-                                tracing::warn!(event="workspace.assignment_stop_pending",%error,"assignment cancellation remains pending");
-                            }
-                        })?;
-                    }
-                }
-                self.store
-                    .call("settle_workspace_work_assignment", {
-                        let identity = self.identity.to_owned();
-                        let network = network.to_owned();
-                        let assignment = assignment.to_owned();
-                        move |store| {
-                            store.settle_workspace_work_assignment(
-                                &identity,
-                                &network,
-                                &assignment,
-                                now_ms(),
-                            )
-                        }
-                    })
-                    .await?;
+            if let Err(error) = self
+                .reconcile_workspace_work(network, &local, &assignment)
+                .await
+            {
+                scheduler_item_pending(
+                    error.context(format!("workspace assignment {}", assignment.assignment_id)),
+                );
             }
         }
         if self
@@ -384,6 +319,192 @@ impl Runtime {
         {
             self.publish_changed(network, crate::workspace::WORKSPACE_SCOPE, Changed::Reload);
             self.schedule_wakeup.notify_one();
+        }
+        Ok(())
+    }
+
+    async fn reconcile_workspace_job(
+        self: &Arc<Self>,
+        network: &str,
+        job: &SchedulerJob,
+    ) -> Result<()> {
+        let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope else {
+            return Ok(());
+        };
+        let task = self
+            .store
+            .call("schedule_delivery.workspace_task", {
+                let network = network.to_owned();
+                let task_id = task_id.to_owned();
+                move |store| store.workspace_task(&network, &task_id)
+            })
+            .await?;
+        let Some(task) = task else {
+            return Ok(());
+        };
+        let active_fenced = matches!(
+            job.state,
+            JobState::Claimed { .. } | JobState::Running { .. } | JobState::Steering { .. }
+        ) && !self
+            .store
+            .call("schedule_delivery.workspace_task_input_allowed", {
+                let network = network.to_owned();
+                let task_id = task_id.to_owned();
+                move |store| store.workspace_task_input_allowed(&network, &task_id)
+            })
+            .await?;
+        if active_fenced
+            || (task.action != crate::workspace::TaskAction::Continue
+                && matches!(
+                    job.state,
+                    JobState::Queued
+                        | JobState::Claimed { .. }
+                        | JobState::Running { .. }
+                        | JobState::Steering { .. }
+                ))
+        {
+            let stopped = self
+                .store
+                .call("schedule_delivery.request_manager_cancel", {
+                    let identity = self.identity.clone();
+                    let network = network.to_owned();
+                    let job = job.to_owned();
+                    move |store| {
+                        store.request_manager_cancel(
+                            &identity,
+                            &network,
+                            &job.conversation_id,
+                            &job.trigger,
+                        )
+                    }
+                })
+                .await?;
+            if let Some(JobState::Cancelling { attempt }) = stopped.map(|job| job.state) {
+                let node = self.clone();
+                self.background_tasks.spawn(async move {
+                    if let Err(error) = node.fence_manager_attempt(&attempt.id).await {
+                        tracing::warn!(event="workspace.manager_fence_pending",%error,"manager cancellation remains pending");
+                    }
+                })?;
+            }
+            let works = self
+                .store
+                .call("schedule_delivery.works", {
+                    let network = network.to_owned();
+                    let job = job.to_owned();
+                    move |store| store.works(&network, &job.conversation_id)
+                })
+                .await?;
+            for work in works {
+                if work.outcome.is_none()
+                    && self
+                        .store
+                        .call("schedule_delivery.scheduler_work_in_scope", {
+                            let network = network.to_owned();
+                            let job = job.to_owned();
+                            let work = work.to_owned();
+                            move |store| {
+                                store.scheduler_work_in_scope(&network, &job, &work.work_id)
+                            }
+                        })
+                        .await?
+                {
+                    let node = self.clone();
+                    let network = network.to_owned();
+                    let conversation = job.conversation_id.clone();
+                    self.background_tasks.spawn(async move {
+                        if let Err(error) = node.stop_work(&network, &conversation, &work.work_id).await {
+                            tracing::warn!(event="workspace.work_stop_pending",%error,"work cancellation remains pending");
+                        }
+                    })?;
+                }
+            }
+            self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
+        }
+        if !matches!(
+            job.state,
+            JobState::Steering { .. } | JobState::Steered { .. }
+        ) && let Err(error) = self
+            .store
+            .call("schedule_delivery.settle_workspace_assignment", {
+                let identity = self.identity.clone();
+                let network = network.to_owned();
+                let job = job.to_owned();
+                move |store| store.settle_workspace_assignment(&identity, &network, &job, now_ms())
+            })
+            .await
+        {
+            scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)));
+        }
+        Ok(())
+    }
+
+    async fn reconcile_workspace_work(
+        self: &Arc<Self>,
+        network: &str,
+        local: &str,
+        assignment: &crate::workspace::Assignment,
+    ) -> Result<()> {
+        if assignment.execution_node != local {
+            return Ok(());
+        }
+        if let Some(work_id) = &assignment.work_id {
+            let task = self
+                .store
+                .call("schedule_delivery.workspace_task", {
+                    let network = network.to_owned();
+                    let assignment = assignment.to_owned();
+                    move |store| store.workspace_task(&network, &assignment.task_id)
+                })
+                .await?
+                .context("assignment task missing")?;
+            if task.action != crate::workspace::TaskAction::Continue
+                || !self
+                    .store
+                    .call("schedule_delivery.workspace_task_input_allowed", {
+                        let network = network.to_owned();
+                        let assignment = assignment.to_owned();
+                        move |store| {
+                            store.workspace_task_input_allowed(&network, &assignment.task_id)
+                        }
+                    })
+                    .await?
+            {
+                let node = self.clone();
+                let network = network.to_owned();
+                let work_id = work_id.clone();
+                let conversation = self
+                    .store
+                    .call("schedule_delivery.work", {
+                        let network = network.to_owned();
+                        let work_id = work_id.to_owned();
+                        move |store| store.work(network.as_str(), &work_id)
+                    })
+                    .await?
+                    .map(|work| work.conversation_id);
+                if let Some(conversation) = conversation {
+                    self.background_tasks.spawn(async move {
+                        if let Err(error) = node.stop_work(&network, &conversation, &work_id).await {
+                            tracing::warn!(event="workspace.assignment_stop_pending",%error,"assignment cancellation remains pending");
+                        }
+                    })?;
+                }
+            }
+            self.store
+                .call("schedule_delivery.settle_workspace_work_assignment", {
+                    let identity = self.identity.clone();
+                    let network = network.to_owned();
+                    let assignment = assignment.to_owned();
+                    move |store| {
+                        store.settle_workspace_work_assignment(
+                            &identity,
+                            &network,
+                            &assignment,
+                            now_ms(),
+                        )
+                    }
+                })
+                .await?;
         }
         Ok(())
     }
@@ -502,7 +623,15 @@ impl Runtime {
         let Some(network) = self.store.call("network", |store| store.network()).await? else {
             return Ok(());
         };
+        self.store
+            .call("schedule_delivery.authorize_node", {
+                let identity = self.identity.clone();
+                let network = network.to_owned();
+                move |store| store.authorize_node(&network, &identity.device_id()?)
+            })
+            .await?;
         self.finish_incompatible_tasks(&network, None).await?;
+        self.reconcile_workspace_inputs(&network).await?;
         self.reconcile_workspace_jobs(&network).await?;
         // A conversation that moved to a newer owner stops its turn here; a cancel the SDK does
         // not confirm ends as interrupted and waits for reconciliation like any other.
@@ -522,7 +651,9 @@ impl Runtime {
                 attempt,
                 "the conversation moved to another owner; its turn here stops"
             );
-            self.fence_manager_attempt(&attempt).await?;
+            if let Err(error) = self.fence_manager_attempt(&attempt).await {
+                scheduler_item_pending(error.context(format!("moved turn {attempt}")));
+            }
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
         let workers = self.schedule_workers.lock().await.clone();
@@ -563,7 +694,10 @@ impl Runtime {
                 .await?
         };
         for (scope, trigger, attempt) in abandoned {
-            self.fence_manager_attempt(&attempt).await?;
+            if let Err(error) = self.fence_manager_attempt(&attempt).await {
+                scheduler_item_pending(error.context(format!("abandoned turn {attempt}")));
+                continue;
+            }
             let requeued = self
                 .store
                 .call("requeue_abandoned_scheduler_claim", {
@@ -653,7 +787,7 @@ impl Runtime {
                 return Ok(ran);
             }
             if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &key.scope {
-                let roots = self.workspace_execution_roots().await?;
+                let roots = Self::workspace_execution_roots(self.settings_snapshot())?;
                 if self
                     .store
                     .call("ensure_workspace_assignment", {
@@ -1100,13 +1234,13 @@ impl Runtime {
             "invalid input identity or sequence"
         );
         let local = self.identity.device_id()?;
-        let roots = self.workspace_execution_roots().await?;
         let (message, receipt) = {
             let identity = self.identity.clone();
             let network = network.clone();
             let scope = scope.clone();
             let message_id = message_id.clone();
             let attestation = attestation(input)?;
+            let settings = self.settings_snapshot();
             self.store.call("accept_chat_message", move |store| {
             let resolved = store.resolve_input_target(&network, &request.route.target)?;
             ensure!(
@@ -1128,48 +1262,20 @@ impl Runtime {
                 attestation,
                 now_ms(),
             )?;
-            let admission = (|| -> Result<_> {
-                if let Some(task_id) = &resolved.task_id
-                    && resolved.owner_node == local
-                {
-                    store.ensure_workspace_assignment(
-                        &identity,
-                        &network,
-                        task_id,
-                        &roots,
-                        now_ms(),
-                    )?;
-                }
-                let receipt = store.admit_workspace_input(&network, &local, &message_id)?;
-                if receipt.state == "queued"
-                    && let Some(task_id) = &resolved.task_id
-                    && resolved.owner_node == local
-                    && let Err(error) = store.ensure_workspace_assignment(
-                        &identity,
-                        &network,
-                        task_id,
-                        &roots,
-                        now_ms(),
-                    )
-                {
-                    tracing::debug!(%error, "accepted task input waits for assignment recovery");
-                }
-                Ok(receipt)
-            })();
-            let receipt = match admission {
+            let receipt = match Self::admit_saved_workspace_input(
+                store, &identity, settings, &network, &local, &message_id,
+            ) {
                 Ok(receipt) => receipt,
-                Err(error) => store
-                    .refuse_workspace_input(
-                        &network,
-                        &message_id,
-                        &crate::logging::scrub(&error.to_string()),
-                    )
-                    .unwrap_or(crate::scheduling::AdmissionReceipt {
+                Err(error) => {
+                    tracing::warn!(event = "schedule.input_admission_pending", %error, message_id,
+                        "saved input waits for admission retry");
+                    crate::scheduling::AdmissionReceipt {
                         network_id: network.clone(),
                         conversation_id: scope.clone(),
                         trigger: crate::scheduling::message_trigger(&message_id),
-                        state: "unknown".into(),
-                    }),
+                        state: "pending_admission".into(),
+                    }
+                }
             };
             Ok((message, receipt))
             }).await?
@@ -1515,6 +1621,239 @@ mod tests {
     use crate::runtime::test_support::{
         access as test_access, manager_settings, signed_main_input,
     };
+
+    #[tokio::test]
+    async fn saved_inputs_retry_admission_after_capacity_and_storage_failures() -> Result<()> {
+        use crate::{
+            runtime::triage::tests::{bot, claim_reply, node},
+            scheduling::{TriggerKind, message_trigger},
+        };
+        for case in ["capacity", "storage"] {
+            let (node, admin, directory) = node().await?;
+            let result = async {
+                bot(&node, &admin, "c", "Pending admission", &[]).await?;
+                bot(&node, &admin, "healthy", "Healthy reply", &[]).await?;
+                let network = node.network_id().await?;
+                let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
+                let message_id = format!("pending-{case}");
+                let trigger = message_trigger(&message_id);
+                node.store.call("fixture_block_input_admission", {
+                    let network = network.clone();
+                    move |store| {
+                    if case == "capacity" {
+                        for index in 0..crate::scheduling::MAX_PENDING_JOBS {
+                            let id = format!("capacity-{index}");
+                            crate::store::scheduler::admit_from(&store.connection, &network, "c",
+                                &message_trigger(&id), TriggerKind::Human, &id)?;
+                        }
+                    } else {
+                        store.connection.execute_batch(
+                            "CREATE TRIGGER fail_input_admission BEFORE INSERT ON scheduler_jobs
+                             WHEN NEW.trigger='message:pending-storage'
+                             BEGIN SELECT RAISE(FAIL,'controlled admission write failure'); END;"
+                        )?;
+                    }
+                    Ok(())
+                    }
+                }).await?;
+                let signed = signed_main_input(&admin, &network, "c", &message_id, "saved input", vec![], 1)?;
+                let input = json!({"conversation_id":"c","message_id":message_id,
+                    "target":{"kind":"bot_main","bot_id":"c"},"intent":"continue","sequence":1,
+                    "text":"saved input","attachments":[],"report_results":true,"attestation":signed.attestation()});
+                let access = test_access(network.clone(), true, Some("c".into()));
+                let accepted = node.accept_chat_message(&access, &input).await?;
+                assert_eq!(accepted["accepted"], true);
+                assert_eq!(accepted["state"], "pending_admission");
+                assert!(node.store.call("schedule_delivery.scheduler_job", { let trigger = trigger.to_owned(); move |store| store.scheduler_job("c", &trigger) }).await?.is_none());
+                assert_eq!(node.store.call("schedule_delivery.pending_workspace_input_admissions", { let network = network.to_owned(); move |store| store.pending_workspace_input_admissions(&network) }).await?, std::slice::from_ref(&message_id));
+                node.schedule_tick().await?;
+                assert!(node.store.call("schedule_delivery.scheduler_job", { let trigger = trigger.to_owned(); move |store| store.scheduler_job("c", &trigger) }).await?.is_none());
+                assert_eq!(node.store.call("schedule_delivery.pending_workspace_input_admissions", { let network = network.to_owned(); move |store| store.pending_workspace_input_admissions(&network) }).await?, std::slice::from_ref(&message_id));
+                assert_eq!(node.store.call("schedule_delivery.scheduler_job", { let healthy = healthy.to_owned(); move |store| store.scheduler_job("healthy", &healthy) }).await?.context("recovered unrelated reply")?.state, JobState::Queued);
+                node.store.call("fixture_unblock_input_admission", move |store| {
+                    if case == "capacity" {
+                        store.connection.execute("DELETE FROM scheduler_jobs WHERE trigger LIKE 'message:capacity-%'", [])?;
+                    } else {
+                        store.connection.execute_batch("DROP TRIGGER fail_input_admission;")?;
+                    }
+                    Ok(())
+                }).await?;
+                node.schedule_tick().await?;
+                node.schedule_tick().await?;
+                node.store.call("fixture_verify_input_admission", {
+                    let network = network.clone();
+                    let trigger = trigger.clone();
+                    let message_id = message_id.clone();
+                    let local = node.identity.device_id()?;
+                    move |store| {
+                assert_eq!(store.scheduler_job("c", &trigger)?.context("retried input")?.state, JobState::Queued);
+                assert_eq!(store.scheduler_jobs("c")?.len(), 1);
+                assert!(store.pending_workspace_input_admissions(&network)?.is_empty());
+                assert_eq!(store.input_receipt(&network, &local, &message_id)?.context("receipt")?["stage"], "owner_accepted");
+                store.connection.execute("DELETE FROM scheduler_jobs WHERE trigger=?", [&trigger])?;
+                Ok(())
+                    }
+                }).await?;
+                node.schedule_tick().await?;
+                assert!(node.store.call("schedule_delivery.scheduler_job", { let trigger = trigger.to_owned(); move |store| store.scheduler_job("c", &trigger) }).await?.is_none(),
+                    "a cleared admission marker never replays historical input");
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            node.shutdown().await;
+            drop(node);
+            std::fs::remove_dir_all(directory)?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_roots_do_not_block_main_input_admission_or_reply_recovery()
+    -> Result<()> {
+        use crate::{
+            model::EventBody,
+            runtime::triage::tests::{bot, claim_reply, node},
+            scheduling::{SessionScope, TriggerKind, message_trigger},
+            workspace::{InputIntent, InputTarget, WORKSPACE_SCOPE, WorkspaceCommand},
+        };
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            for scope in ["c", "task-bot", "healthy"] {
+                bot(&node, &admin, scope, scope, &[]).await?;
+            }
+            let network = node.network_id().await?;
+            let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
+            let root = directory.join("workspace");
+            std::fs::create_dir(&root)?;
+            node.settings.lock().unwrap().roots = vec![directory.clone(), root.clone()];
+            let signed = signed_main_input(&admin, &network, "c", "z-main-input", "main input", vec![], 1)?;
+            let input = json!({"conversation_id":"c","message_id":"z-main-input",
+                "target":{"kind":"bot_main","bot_id":"c"},"intent":"continue","sequence":1,
+                "text":"main input","attachments":[],"report_results":true,"attestation":signed.attestation()});
+            node.store.call("fixture_fill_input_capacity", {
+                let network = network.clone();
+                move |store| {
+                for index in 0..crate::scheduling::MAX_PENDING_JOBS {
+                    let id = format!("capacity-{index}");
+                    crate::store::scheduler::admit_from(&store.connection, &network, "c",
+                        &message_trigger(&id), TriggerKind::Human, &id)?;
+                }
+                Ok(())
+                }
+            }).await?;
+            let access = test_access(network.clone(), true, Some("c".into()));
+            let accepted = node.accept_chat_message(&access, &input).await?;
+            assert_eq!(accepted["accepted"], true);
+            assert_eq!(accepted["state"], "pending_admission");
+            std::fs::remove_dir(&root)?;
+            let command = WorkspaceCommand::CreateTask {
+                task_id:"task".into(), channel_id:None, parent_task_id:None, owner_bot:"task-bot".into(),
+                title:"task".into(), request:"perform task".into(), expected_result:"result".into(),
+                source_events:vec![], dependencies:vec![], reply_only:false,
+            };
+            let signed = admin.attest(&network, WORKSPACE_SCOPE, EventBody::WorkspaceCommanded {
+                command_id:"create-task".into(), command:command.clone(), attestation:None, acting_assignment:None, cause:None,
+            })?;
+            node.store.call("schedule_delivery.apply_workspace_command", { let identity = node.identity.clone(); let network = network.to_owned(); let command = command.to_owned(); let signed = signed.to_owned(); move |store| store.apply_workspace_command(&identity, &network, "create-task", command,
+                signed.attestation().cloned(), None, None, now_ms()) }).await?;
+            let signed = admin.attest(&network, "task-bot", EventBody::InputPosted {
+                message_id:"a-task-input".into(), target:InputTarget::Task { task_id:"task".into() },
+                intent:InputIntent::Continue, sequence:1, expected_revision:Some(1), text:"task input".into(),
+                attachments:vec![], report_results:Some(true), attestation:None,
+            })?;
+            let input = json!({"conversation_id":"task-bot","message_id":"a-task-input",
+                "target":{"kind":"task","task_id":"task"},"intent":"continue","sequence":1,
+                "expected_revision":1,"text":"task input","attachments":[],"report_results":true,
+                "attestation":signed.attestation()});
+            let access = test_access(network.clone(), true, Some("task-bot".into()));
+            let accepted = node.accept_chat_message(&access, &input).await?;
+            assert_eq!(accepted["accepted"], true);
+            assert_eq!(accepted["state"], "pending_admission");
+            node.store.call("schedule_delivery.execute", { move |store| Ok(store.connection.execute(
+                "DELETE FROM scheduler_jobs WHERE trigger LIKE 'message:capacity-%'", []
+            )?) }).await?;
+            for _ in 0..2 {
+                node.schedule_tick().await?;
+                node.store.call("fixture_verify_missing_task_root", {
+                    let network = network.clone();
+                    let healthy = healthy.clone();
+                    move |store| {
+                assert_eq!(store.scheduler_job("c", &message_trigger("z-main-input"))?.context("admitted Main input")?.state, JobState::Queued);
+                assert_eq!(store.scheduler_job("healthy", &healthy)?.context("recovered unrelated reply")?.state, JobState::Queued);
+                assert!(store.scheduler_job("task-bot", &message_trigger("a-task-input"))?.is_none());
+                assert!(store.workspace_task(&network, "task")?.context("task")?.current_assignment.is_none());
+                assert_eq!(store.pending_workspace_input_admissions(&network)?, ["a-task-input"]);
+                Ok(())
+                    }
+                }).await?;
+            }
+            std::fs::create_dir(&root)?;
+            node.schedule_tick().await?;
+            node.store.call("fixture_verify_restored_task_root", {
+                let network = network.clone();
+                move |store| {
+            let job = store.scheduler_job("task-bot", &message_trigger("a-task-input"))?.context("admitted task input")?;
+            assert_eq!(job.state, JobState::Queued);
+            assert_eq!(job.scope, SessionScope::WorkspaceTask { task_id:"task".into() });
+            assert!(store.workspace_task(&network, "task")?.context("task")?.current_assignment.is_some());
+            assert!(store.pending_workspace_input_admissions(&network)?.is_empty());
+            Ok(())
+                }
+            }).await?;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn inconsistent_workspace_assignments_do_not_block_unrelated_reply_recovery() -> Result<()>
+    {
+        use crate::runtime::triage::tests::{bot, claim_reply, node};
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "Healthy reply", &[]).await?;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let (trigger, _) = claim_reply(&node, &admin, "c", "healthy", crate::scheduler::boot_id()).await?;
+            let broken = crate::workspace::Assignment {
+                submitted_result: None, trigger_message_id: None, source_event: None,
+                assignment_id: "broken".into(), task_id: "missing-task".into(), started_revision: 1,
+                bot_id: "c".into(), execution_node: local, bot_owner_epoch: 1, channel_owner_epoch: None,
+                work_id: Some("missing-work".into()), basis: Default::default(), resource_roots: vec![],
+                automatic: false, accepted_revision: None, adopted_revision: None, completed_revision: None,
+                state: crate::workspace::AssignmentState::Proposed, result: None,
+                event_hash: "a".repeat(64), created_at_ms: now_ms(),
+            };
+            node.store.call("fixture_inconsistent_workspace_assignment", {
+                let network = network.clone();
+                move |store| {
+                    store.connection.execute(
+                        "UPDATE workspace_projection SET state=json_set(state,'$.assignments.broken',json(?)) WHERE network_id=?",
+                        rusqlite::params![serde_json::to_string(&broken)?, network],
+                    )?;
+                    crate::store::workspace::rebuild_lookup_projection(&store.connection, &network)
+                }
+            }).await?;
+            node.schedule_tick().await?;
+            assert_eq!(node.store.call("schedule_delivery.scheduler_job", { let trigger = trigger.to_owned(); move |store| store.scheduler_job("c", &trigger) }).await?.context("recovered unrelated reply")?.state, JobState::Queued);
+            node.store.call("schedule_delivery.execute_batch", { move |store| Ok(store.connection.execute_batch(
+                "ALTER TABLE workspace_projection RENAME TO unavailable_workspace_projection;"
+            )?) }).await?;
+            let error = node.schedule_tick().await.expect_err("global store failures abort the tick");
+            assert!(error.is::<rusqlite::Error>());
+            node.store.call("schedule_delivery.execute_batch", { move |store| Ok(store.connection.execute_batch(
+                "ALTER TABLE unavailable_workspace_projection RENAME TO workspace_projection;"
+            )?) }).await?;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
 
     #[tokio::test]
     async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {

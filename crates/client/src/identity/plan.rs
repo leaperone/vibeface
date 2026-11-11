@@ -265,6 +265,89 @@ impl IdentityPlan {
 mod tests {
     use super::*;
     #[test]
+    fn recovery_readback_requires_the_exact_checkpoint_and_valid_signed_state() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("identity-receipt-{}", uuid::Uuid::new_v4()));
+        let mut key = ClientKey::create(&dir.join("key"), "client passphrase")?;
+        let root = Identity::generate()?;
+        let node = Identity::generate()?;
+        let mut state = NetworkState::new(vibeface_secure::membership::Genesis::create(
+            &root,
+            Member::client(&key.identity, "cli", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        let now = now_ms() as u64;
+        let next = Identity::generate()?;
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &next.device_id(),
+            state.project_at(now)?.members,
+            vec![],
+            now,
+        )?;
+        let backup = RecoveryMaterial {
+            version: 1,
+            network_id: network.clone(),
+            root_secret_key: Zeroizing::new(next.secret_hex()),
+            genesis: state.genesis.clone(),
+            checkpoints: vec![checkpoint.clone()],
+            events: vec![],
+        };
+        let mut plan = IdentityPlan::prepare(
+            &key,
+            Entry {
+                origin: "http://127.0.0.1:1".into(),
+                node_id: node.device_id(),
+            },
+            &dir.join("recovery.json"),
+            &backup,
+            "recovery password",
+            json!({"genesis":state.genesis,"checkpoints":[checkpoint],"events":[]}),
+        )?;
+        assert!(
+            plan.record_receipt(
+                &mut key,
+                &json!({
+                    "network_id":network,"state":state,"now_ms":now,"principal":{"can_manage":true}
+                })
+            )
+            .is_err(),
+            "management alone cannot confirm the original checkpoint"
+        );
+        for status in ["waiting", "stopped"] {
+            let reply = json!({"network_id":network,"recovery":{"status":status,"checkpoint_hash":checkpoint.hash()?}});
+            let mut wrong = reply.clone();
+            wrong["recovery"]["checkpoint_hash"] = json!("another-checkpoint");
+            assert!(plan.record_receipt(&mut key, &wrong).is_err());
+            wrong = reply.clone();
+            wrong["network_id"] = json!("another-network");
+            assert!(plan.record_receipt(&mut key, &wrong).is_err());
+            plan.record_receipt(&mut key, &reply)?;
+            assert_eq!(
+                plan.state(),
+                if status == "waiting" {
+                    IdentityOperationState::Recorded
+                } else {
+                    IdentityOperationState::Stopped
+                }
+            );
+        }
+        state.recover_at(checkpoint.clone(), now)?;
+        let mut reply = json!({"network_id":network,"state":state,"now_ms":now});
+        plan.record_receipt(&mut key, &reply)?;
+        assert_eq!(plan.state(), IdentityOperationState::Recorded);
+        reply["network_id"] = json!("another-network");
+        assert!(plan.record_receipt(&mut key, &reply).is_err());
+        reply["network_id"] = json!(network);
+        reply["state"]["checkpoints"][0]["signature"] = json!("invalid");
+        assert!(plan.record_receipt(&mut key, &reply).is_err());
+        drop(plan);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn encrypted_plan_restores_the_same_backup_and_never_regenerates_unknown_recovery() -> Result<()>
     {
         let dir = std::env::temp_dir().join(format!("identity-plan-{}", uuid::Uuid::new_v4()));

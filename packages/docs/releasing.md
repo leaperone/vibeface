@@ -30,11 +30,23 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 三个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对 Core、CLI、Desktop 三个本仓包的清单版本，带 `--no-deps` 时不校验锁文件，`Cargo.lock` 的内容由完整 tree 比对覆盖。仅路径白名单不能放行发布。
 
-原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，不分配新版本覆盖。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
+原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，或经 main 明确审查弃用后由下一批分配新版本，不覆盖原来源。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
 
 机械 Nightly 的发布门验证普通单 parent、parent 在 main、精确机械 tree，以及原 schedule run 的仓库、workflow path、main、SHA 与成功 `ci-gate`。来源门根据原 CI SHA 的精确文件树选择 workflow 和根级 gate，新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整个 schedule run 成功，避免循环。Stable、RC 及直接位于 main 的 Tag 仍要求原有 main push CI success。所有制品、Tag、`source_commit` 与 provenance 始终绑定实际版本提交，可信 parent 仅用于 CI 证明。
 
+历史验证在完整发布或经 main 审查的弃用声明处停止。完整发布锚点要求精确受保护产品 Tag 与源码 SHA、同仓唯一成功 release run、成功 `collect` 和 `publish-product`、完整公开 manifest 的身份及精确附件集合，以及 GitHub 返回的每个附件 SHA-256。只下载不超过 1 MiB 的 `release.json`；缺少 API 摘要时失败，不整包下载历史载荷。当前来源与锚点自身都继续验证 main parent、BOT、完整机械 tree 和版本；边界来源的原 CI 也须通过。没有可信边界时最多验证 16 个来源，超限停止。协调器只完整验证最新可信来源和原批次候选，不对每个旧 Tag 重做源码检验。
+
 Tag 只创建一次，随后用 `GITHUB_TOKEN` 按发布组精确 dispatch `release.yml` 或 `release-www.yml` 并指定 `publish=true`。历史来源由精确源码树选择原发布入口，恢复仍核对原运行身份。产品与官网可并行发布。响应未知时先查询远端 Tag 和原 run，对账后继续，不重复副作用；已有 Tag 指向其他 SHA 时停止。发布恢复复用原运行和完整不可变 artifact，不重建或覆盖公开字节。npm 失败保持失败；原制品缺失、过期或字节冲突时停止。
+
+### 明确弃用 Nightly 来源
+
+自动 publisher 恢复的总 `run_attempt` 上限为 3，包含原运行。达到上限、生产者失败、原 artifact 缺失或过期，以及同一 Tag 有多个 release run 时，先核对所有原 run 和公开字节。能恢复时使用 `gh run rerun <原-run-id> --failed`，不要重新 dispatch 同一个 Tag，也不重建已经公开的载荷。
+
+确认不可恢复后，通过 PR 向 `scripts/nightly-abandoned.json` 的数组追加声明，并合入 main。每条声明必须包含 `source_commit`、非空 `reason` 与 `releases`。机械 Nightly 的 `releases` 同时包含 `product` 和 `www`，各自记录精确 `tag` 与全部原 `run_ids` 整数；直接位于 main 的旧产品 Nightly 仅记录 `product`。尚未启动的组允许空 `run_ids`，但 Tag、Release 和 run 必须全部不存在。现存 Tag 却找不到 run 表示 dispatch 结果未知，不能弃用。
+
+协调器只读取 `origin/main` 的声明。原 run ID 集合必须与同仓、同源码、同 Tag、同 workflow 的远端集合完全一致，每个关联 run 和 job 均须已终态。运行中、未知结论或无法读取远端事实时停止，不分配新版本。声明不修改、删除 Tag、附件、原 run 或失败状态；它把该精确来源标为已审查的失败，不能代替成功发布或 npm 成功。
+
+机械弃用边界仍验证该来源的唯一 main parent、BOT、完整机械 tree、版本和原 schedule gate；直接位于 main 的旧来源沿用精确 main push CI 证明。下一批在已核实来源的构建号上界上递增，并使用新版本；即使业务源码没有变化也会继续。同一批次被弃用后不再恢复，工作区中的声明修改不生效。经 main 审查的持久声明使后续批次可以一致地识别弃用，避免重新派发或反复恢复原失败。
 
 ## 独立部署发布
 
@@ -145,6 +157,8 @@ gh workflow run release-www.yml --ref <branch> -F publish=false
 npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 更新，不使用本节的 Rust 自更新器。
 
 Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。新版更新器跳过缺少完整 `release.json` 的构建中 Release，再比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。已安装旧客户端可能先消费自己平台已经齐备的完整包与校验文件；目标不齐时失败并保留现版。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
+
+更新确认提交后，安装目录保留当前包与最近一次 journal 的 previous。清理只处理同一 Node 曾确认提交、内容摘要未改变且不再引用的旧包，并保护正在执行的 CLI 包。未知目录、未提交候选、残留 staging、其他 Node 的记录和含链接的包均保留；失败或中断且 journal 尚在时不清理。
 
 更新器没有默认策略；先用 `update configure` 明确指定渠道、是否自动更新及安装根目录，再检查或应用更新。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
 

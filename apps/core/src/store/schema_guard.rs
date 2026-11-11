@@ -540,7 +540,8 @@ mod tests {
             init_current_db(&db)?;
             db.execute_batch(
                 "ALTER TABLE messages RENAME COLUMN target TO missing_target;
-                 ALTER TABLE scheduler_jobs RENAME COLUMN scope TO missing_scope;",
+                 ALTER TABLE scheduler_jobs RENAME COLUMN scope TO missing_scope;
+                 ALTER TABLE events RENAME COLUMN causal_clock TO missing_clock;",
             )?;
             db.execute(
                 "INSERT INTO identity_meta(key,value) VALUES('device','test-device')",
@@ -555,6 +556,7 @@ mod tests {
         assert!(message.contains("data_schema_mismatch"));
         assert!(message.contains("messages.target"));
         assert!(message.contains("scheduler_jobs.scope"));
+        assert!(message.contains("events.causal_clock"));
         assert_eq!(std::fs::read(&path)?, before);
 
         std::fs::remove_dir_all(dir)?;
@@ -768,8 +770,8 @@ mod tests {
         }
         db.execute_batch(
             "INSERT INTO networks(network_id,bundle) VALUES('network','{}');
-             INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind)
-             VALUES('network','author',1,'event','conversation',1,1,1,'invalid signed envelope',1,1,'bot_changed');",
+             INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,causal_chain,causal_clock)
+             VALUES('network','author',1,'event','conversation',1,1,1,'invalid signed envelope',1,1,'bot_changed','event','{}');",
         )?;
         assert!(install_derived_objects(&db).is_err());
         for &table in DERIVED_TABLES {

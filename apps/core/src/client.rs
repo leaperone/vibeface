@@ -1804,7 +1804,7 @@ fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str)
             json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
         );
     }
-    for checkpoint in &state.checkpoints {
+    for checkpoint in state.checkpoints.iter().rev() {
         if checkpoint
             .directory
             .as_ref()
@@ -4367,6 +4367,54 @@ mod tests {
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result
+    }
+
+    #[test]
+    fn recovery_status_returns_the_latest_stopped_checkpoint_for_this_client() -> Result<()> {
+        let (root, manager, node, recovering) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&manager, "manager", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        let now = crate::runtime::now_ms() as u64 - 100;
+        let mut latest = String::new();
+        for at_ms in [now, now + 1] {
+            let mut members = state.genesis.members();
+            members.push(Member::client(&recovering, "recovering", true)?);
+            let checkpoint = RootCheckpoint::recovery(
+                &state,
+                &root,
+                &LocalIdentity::generate().device_id()?,
+                members,
+                vec![],
+                at_ms,
+            )?;
+            latest = checkpoint.hash()?;
+            state.recover_at(checkpoint, at_ms)?;
+            let veto = GovernanceEvent::unsigned(
+                &state.project_at(at_ms)?,
+                &manager.device_id()?,
+                GovernanceAction::Veto {
+                    checkpoint: latest.clone(),
+                    at_ms,
+                },
+            )?
+            .sign(&manager)?;
+            state.append(veto)?;
+        }
+        let view = state.project_at(now + 2)?;
+        assert_eq!(view.stopped.len(), 2);
+        assert_eq!(
+            recovery_status(&state, &view, &recovering.device_id()?)?,
+            json!({"status":"stopped","checkpoint_hash":latest})
+        );
+        Ok(())
     }
 
     #[tokio::test]

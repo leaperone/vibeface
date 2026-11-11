@@ -163,4 +163,6 @@ For a pull request, start from `main`, use a separate branch, and run the checks
 
 ## License
 
-This repository does not include a `LICENSE` file yet. Until a license is published, all rights are reserved.
+Vibeface's original source does not include a `LICENSE` file yet. Until a license is published, all rights to that source are reserved.
+
+Third-party files retain their own licenses. In `contracts/delivery/vendor/`, the two Groth16 verifier implementations are licensed under GPL-3.0, the other RISC Zero files under Apache-2.0, and OpenZeppelin's `SafeCast.sol` under MIT. See each file's license header. The reservation above does not replace those licenses or waive obligations when using or distributing the vendored contracts.

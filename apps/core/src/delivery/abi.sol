@@ -27,6 +27,7 @@
         function profileId() external view returns (bytes32);
         function adapter() external view returns (address);
         function verifier() external view returns (address);
+        function verify(bytes seal, bytes32 journalDigest) external view returns (bool);
         function imageId() external view returns (bytes32);
         function CONTROL_ROOT() external view returns (bytes32);
         function CONTROL_ROOT_0() external view returns (bytes16);

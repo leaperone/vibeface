@@ -28,7 +28,7 @@
 
 1. Node 给请求分配 `request_id`，挂起并记入 `node.log`（方法和线程，不含命令文本），然后作为 `needs_input` 事件（带 `request_id`）立即唤醒本机协调 Agent。事件只含方法、原因和问题，命令、补丁和路径不进事件。
 2. Agent 用 `vibeface requests` 查看挂起的请求（含完整参数），用 `vibeface respond <request_id> '<result-json>'` 回答。只有仍在待处理队列、且没有已提问 `question_id` 的请求能这样回答；同一 `request_id` 只回答一次，重复调用返回第一次的结果。
-3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题>` 在负责该线程的 Bot 聊天里提问。挂起的审批只用 Node 给出的“允许本次”（原请求支持时）和“拒绝”，`--choice` 只用于普通提问。提问挂住请求直到有回答，不设超时。本人回答保存为签名消息后，持有原请求的 Node 领取一条独立的私有回答控制（占一次 `daily_decision_limit` 额度），在新的协调会话里核验原请求、传输代次、权限和响应 schema，只向仍活跃的原请求应答一次；它不进入 Bot 的 Main/Task 回合，Agent 不能用 `respond` 替本人回答已提问的请求，结果未知时不重放。线程不属于任何 Bot 时立即兜底。
+3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题>` 在负责该线程的 Bot 聊天里提问。挂起的审批只用 Node 给出的“允许本次”（原请求支持时）和“拒绝”，`--choice` 只用于普通提问。提问挂住请求直到有回答，不设超时。本人回答保存为签名消息后，持有原请求的 Node 领取一条独立的私有回答控制（计入分诊次数，但不受 `daily_decision_limit` 预算暂停影响），在新的协调会话里核验原请求、传输代次、权限和响应 schema，只向仍活跃的原请求应答一次；它不进入 Bot 的 Main/Task 回合，Agent 不能用 `respond` 替本人回答已提问的请求，结果未知时不重放。线程不属于任何 Bot 时立即兜底。
 4. 没有配置协调 Agent、唤醒失败，或 Agent 120 秒内既没回答也没提问时，Node 按方法给出确定的拒绝并记录：
 
 | 请求 | 兜底回复 |

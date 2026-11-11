@@ -4872,7 +4872,7 @@ def npm_service_acceptance(options):
             and file_sha256(baseline / "baseline.tgz") == pin["sha256"]
             and file_sha256(baseline / "release.json") == pin["manifest_sha256"]
             and pin["builds"][target]["data_epoch"] == build["data_epoch"],
-            "the immutable baseline pins a different real source, this exact candidate and the current data format")
+            "the immutable baseline pins a different real source, this exact candidate and the same data epoch")
 
     artifacts.mkdir(parents=True, exist_ok=True)
     run = artifacts / ("npm-service-" + uuid.uuid4().hex[:10])
@@ -4896,7 +4896,7 @@ def npm_service_acceptance(options):
               "baseline_artifact_id": os.environ.get("NPM_BASELINE_ARTIFACT_ID", ""),
               "candidate_declared_version": {1: "higher", 0: "same", -1: "lower"}[version_order],
               "business_source_relation": pin["business_source_relation"], "real_provider_calls": 0,
-              "replacement": "public current-format baseline to a different-source immutable CI candidate",
+              "replacement": "public same-epoch baseline to a different-source immutable CI candidate",
               "not_checked": ["historical-format migration", "real AI Providers",
                               "full lifecycle of the immutable public baseline; only the candidate lifecycle is required"]}
     node, owned = None, False
@@ -4934,6 +4934,9 @@ def npm_service_acceptance(options):
                 "refused npm service operations preserve existing data and service files")
 
     def idle_guards():
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
         rejected("install-updater", "npm installations are updated with npm")
         with (node.directory / "update.lock").open("r+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4942,9 +4945,6 @@ def npm_service_acceptance(options):
         rejected("install", "recover the pending update")
         (node.directory / "update-pending.json").unlink()
         before = persistent()
-        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
-        require(update["distribution"] == "npm" and update["automatic"] is False,
-                "npm owns updates and disables the built-in updater")
         command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
         require(persistent() == before, "npm automatic update exits without changing persistent data")
 
@@ -4983,24 +4983,10 @@ def npm_service_acceptance(options):
         report["native_pids"].append(pid)
         return pid
 
-    try:
-        candidate = run / "candidate-prefix"
-        reinstall(candidate, package)
-        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
-        require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
-                "the independent npm prefix contains the exact immutable CI candidate")
-        reinstall(prefix, baseline / "baseline.tgz")
-        require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
-                and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
-                "the first installed service package is the verified public baseline")
-        import release
-        with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
-            checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
-        expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
-        require(release.files(vendor, ("FILES.sha256",)) == expected_files,
-                "every installed baseline vendor byte matches the immutable published package")
-        shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-        node = Node(run, "NPM", binary, workspace, helper)
+    def create_history(name):
+        nonlocal node
+        previous_invocations = len(fixture_records(run))
+        node = Node(run, name, binary, workspace, helper)
         node.configure(bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                        manager=fixture_manager_settings(run, workspace), app_server=SPAWN_APP_SERVER)
         node.start()
@@ -5022,6 +5008,27 @@ def npm_service_acceptance(options):
         require(any(row["message_id"] == "npm-service-message" and row["attachments"] for row in messages)
                 and any(row["role"] == "assistant" for row in messages), "preservation starts with real nonempty message history")
         invocation_count = len(fixture_records(run))
+        require(invocation_count == previous_invocations + 1, "one controlled fixture call creates this Node's history")
+        return conversation, attachment, digest, messages, invocation_count
+
+    try:
+        candidate = run / "candidate-prefix"
+        reinstall(candidate, package)
+        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+        require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
+                "the independent npm prefix contains the exact immutable CI candidate")
+        reinstall(prefix, baseline / "baseline.tgz")
+        require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
+                and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
+                "the first installed service package is the verified public baseline")
+        import release
+        with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
+            checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
+        expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
+        require(release.files(vendor, ("FILES.sha256",)) == expected_files,
+                "every installed baseline vendor byte matches the immutable published package")
+        shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
+        conversation, attachment, digest, messages, invocation_count = create_history("NPM")
         require(invocation_count == 1, "one controlled fixture call creates the message history")
         update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
         require(update["distribution"] == "npm" and update["automatic"] is False,
@@ -5063,10 +5070,44 @@ def npm_service_acceptance(options):
         require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
                 "npm replacement preserves the immutable input and installed service definition")
         stopped()
-        service("start")
-        running()
+        database_sha256 = file_sha256(node.directory / "node.sqlite3")
+        access = command([binary, "access", "--json", "--data-dir", node.directory], check=False)
+        if access.returncode != 0 and "data_schema_mismatch" in access.stderr:
+            schema_digests = []
+            for commit in (pin["source_context"]["ci_source_commit"], build["source_commit"]):
+                config = command(["git", "show", f"{commit}:apps/core/src/config.rs"]).stdout
+                fingerprint = re.search(r'DATA_EPOCH_SCHEMA_SHA256: &str\s*=\s*"([0-9a-f]{64})"', config)
+                require(fingerprint is not None, "both reviewed sources declare their data schema fingerprint")
+                schema_digests.append(fingerprint[1])
+            require(schema_digests[0] != schema_digests[1], "schema rejection corresponds to a declared format change")
+            refused = command([binary, "serve", "--data-dir", node.directory], check=False)
+            require(refused.returncode != 0 and "data_schema_mismatch" in refused.stderr,
+                    "the candidate refuses to start an incompatible baseline schema")
+            require(persistent() == (saved_files, saved_events)
+                    and file_sha256(node.directory / "node.sqlite3") == database_sha256
+                    and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                    "schema rejection leaves baseline identity, config, database and attachment bytes intact")
+            service("uninstall")
+            stopped()
+            report["schema_compatibility"] = {"status": "rejected", "baseline": schema_digests[0],
+                                               "candidate": schema_digests[1]}
+            passed("incompatible public baseline is refused without migration or data loss")
+            conversation, attachment, digest, messages, invocation_count = create_history("NPM-CANDIDATE")
+            node.client.close()
+            node.stop()
+            stopped()
+            idle_guards()
+            saved_files, saved_events = persistent()
+            service("install")
+            running()
+            passed("candidate starts a fresh data directory with nonempty history and attachment")
+        else:
+            service("start")
+            running()
+            report["schema_compatibility"] = {"status": "accepted"}
+            passed("published-to-candidate npm replacement starts with the original baseline data")
         preserved()
-        passed("published-to-candidate npm replacement preserves identity, config, signed history and attachment bytes")
+        passed("candidate service preserves identity, config, signed history and attachment bytes")
         rejected("install", "stop the node before installing its npm service")
         service("stop")
         stopped()
@@ -5081,7 +5122,7 @@ def npm_service_acceptance(options):
         service("restart")
         require(running() != previous, "the candidate's native manager restart replaces its PID")
         preserved()
-        passed("candidate install, stop, start, restart and concurrency guards preserve baseline data")
+        passed("candidate install, stop, start, restart and concurrency guards preserve its original data")
         service("uninstall")
         stopped()
         require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
@@ -7599,7 +7640,7 @@ if __name__ == "__main__":
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--conversation-history", action="store_true", help="check bounded conversation history through a real isolated Core process")
         modes.add_argument("--npm-service", action="store_true", help="check real npm user services only on a fresh GitHub-hosted POSIX runner")
-        modes.add_argument("--npm-baseline-pin", action="store_true", help="pin one public current-format npm baseline and its complete product provenance")
+        modes.add_argument("--npm-baseline-pin", action="store_true", help="pin one public same-epoch npm baseline and its complete product provenance")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")

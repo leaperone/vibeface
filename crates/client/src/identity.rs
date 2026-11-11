@@ -921,6 +921,138 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn recovery_lost_reply_is_read_back_once_and_refusal_does_not_enroll() -> Result<()> {
+        use crate::connection::Refused;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use vibeface_secure::Handshake;
+
+        for accepted in [true, false] {
+            let dir = temp_dir("recover-reconcile");
+            let mut key = ClientKey::create(&dir, "client passphrase")?;
+            let root = Identity::generate()?;
+            let node = Identity::generate()?;
+            let genesis = vibeface_secure::membership::Genesis::create(
+                &root,
+                Member::client(&Identity::generate()?, "previous client", true)?,
+                Member::node(&node, "node")?,
+            )?;
+            let network = genesis.network_id.clone();
+            let recovery_file = dir.join("recovery.json");
+            write_recovery_file(
+                &recovery_file,
+                &RecoveryMaterial {
+                    version: 1,
+                    network_id: network.clone(),
+                    root_secret_key: Zeroizing::new(root.secret_hex()),
+                    genesis,
+                    checkpoints: vec![],
+                    events: vec![],
+                },
+                "recovery passphrase",
+            )?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let entry = Entry {
+                origin: format!("http://{}", listener.local_addr()?),
+                node_id: node.device_id(),
+            };
+            let server_network = network.clone();
+            let serving = tokio::spawn(async move {
+                let mut checkpoint = None;
+                let mut writes = 0;
+                for _ in 0..3 {
+                    let (stream, _) = listener.accept().await?;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    assert!(matches!(socket.next().await.unwrap()?, Message::Text(_)));
+                    let mut handshake = Handshake::signed(false, &node, None, PROLOGUE)?;
+                    let frame = socket.next().await.unwrap()?;
+                    handshake.read(&frame.into_data())?;
+                    socket
+                        .send(Message::Binary(handshake.write(&[])?.into()))
+                        .await?;
+                    let frame = socket.next().await.unwrap()?;
+                    handshake.read(&frame.into_data())?;
+                    let mut channel = handshake.finish()?;
+                    while let Some(frame) = socket.next().await {
+                        let Some(plain) = channel.open_record(&frame?.into_data())? else {
+                            continue;
+                        };
+                        let request: Value = serde_json::from_slice(&plain)?;
+                        let result = match request["method"].as_str().unwrap() {
+                            "info" => json!({"initialized":false}),
+                            "recover" => {
+                                writes += 1;
+                                let state: NetworkState = serde_json::from_value(json!({
+                                    "genesis":request["params"]["genesis"],
+                                    "checkpoints":request["params"]["checkpoints"],
+                                    "events":request["params"]["events"],
+                                }))?;
+                                state.project()?;
+                                checkpoint = Some(state.checkpoints[0].hash()?);
+                                if accepted {
+                                    break;
+                                }
+                                let response =
+                                    json!({"id":request["id"],"error":"recovery refused"});
+                                for record in
+                                    channel.seal_message(&serde_json::to_vec(&response)?)?
+                                {
+                                    socket.send(Message::Binary(record.into())).await?;
+                                }
+                                break;
+                            }
+                            "authenticate" => {
+                                if accepted {
+                                    json!({"network_id":server_network,"recovery":{"status":"waiting","checkpoint_hash":checkpoint}})
+                                } else {
+                                    json!({})
+                                }
+                            }
+                            method => panic!("unexpected method {method}"),
+                        };
+                        let response = json!({"id":request["id"],"result":result});
+                        for record in channel.seal_message(&serde_json::to_vec(&response)?)? {
+                            socket.send(Message::Binary(record.into())).await?;
+                        }
+                        if matches!(request["method"].as_str(), Some("info" | "authenticate")) {
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(writes)
+            });
+            let mut plan = prepare_recovery(
+                &key,
+                entry.clone(),
+                &recovery_file,
+                "recovery passphrase",
+                &dir.join("next-recovery.json"),
+                "recovered client",
+                Some("fixture-capability"),
+            )
+            .await?;
+            assert_eq!(plan.state(), IdentityOperationState::Prepared);
+            assert!(key.network_id().is_none());
+            let result = plan.submit(&mut key).await;
+            assert_eq!(serving.await??, 1, "recover must never be resubmitted");
+            let reopened = ClientKey::open(&dir, "client passphrase")?;
+            if accepted {
+                assert_eq!(result?["recovery"]["status"], "waiting");
+                assert_eq!(plan.state(), IdentityOperationState::Recorded);
+                assert_eq!(reopened.network_id(), Some(network.as_str()));
+                assert_eq!(reopened.entry(), Some(&entry));
+            } else {
+                assert!(result.unwrap_err().is::<Refused>());
+                assert_eq!(plan.state(), IdentityOperationState::Unknown);
+                assert!(reopened.network_id().is_none() && reopened.entry().is_none());
+            }
+            drop(plan);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn gateway_urls_become_client_websockets() -> Result<()> {
         assert_eq!(

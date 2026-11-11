@@ -66,6 +66,14 @@ table "events" {
     null = true
     type = text
   }
+  column "causal_chain" {
+    null = false
+    type = text
+  }
+  column "causal_clock" {
+    null = false
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.hash]
   }
@@ -96,6 +104,22 @@ table "events" {
   index "events_input_identity" {
     columns = [column.network_id, column.subject]
     where = "kind = 'input_posted'"
+  }
+  index "events_causal_chain" {
+    unique  = true
+    columns = [column.network_id, column.causal_chain, column.seq]
+  }
+  index "events_workspace_causal" {
+    columns = [column.network_id, column.causal_chain, column.seq]
+    where   = "effective = 1 AND kind IN ('workspace_commanded','input_posted')"
+  }
+  index "events_workspace_order" {
+    columns = [column.network_id, column.lamport, column.created_at_ms, column.hash]
+    where   = "effective = 1 AND kind IN ('workspace_commanded','input_posted')"
+  }
+  index "events_owner_causal" {
+    columns = [column.network_id, column.scope_id, column.causal_chain, column.seq]
+    where   = "kind = 'conversation_owner'"
   }
 }
 table "event_blobs" {

@@ -1,7 +1,9 @@
 //! Reads and local records for Node-to-Node sync: log ranges, heads, the signed address book,
 //! scheduler deliveries and resumable attachment downloads.
 use super::{
-    Store, log, message_from,
+    Store,
+    admission::{AdmissionRejected, authorize_peer_node_from},
+    log, message_from,
     scheduler::{admit_from, admit_work_result_from},
 };
 use crate::{
@@ -268,7 +270,7 @@ impl Store {
             ensure!(
                 super::bot_settings::find_bot(&tx, network, &assignment.bot_id)?.conversation_id
                     == conversation,
-                "assignment belongs to another Bot conversation"
+                AdmissionRejected::new("assignment belongs to another Bot conversation")
             );
             Some(assignment)
         } else {
@@ -296,23 +298,23 @@ impl Store {
                 super::workspace::resolve_input_target_from(&tx, network, &route.target)?;
             ensure!(
                 resolved.conversation_id == conversation,
-                "input belongs to another Bot conversation"
+                AdmissionRejected::new("input belongs to another Bot conversation")
             );
             Some(resolved.owner_node)
         } else {
             conversation_owner
         };
-        super::authorize_node_from(&tx, network, local)?;
+        authorize_peer_node_from(&tx, network, local)?;
         ensure!(
             owner.as_deref() == Some(local),
-            "this Node does not schedule the conversation"
+            AdmissionRejected::new("this Node does not schedule the conversation")
         );
         let receipt = match trigger.split_once(':') {
             Some(("assignment", _)) => {
                 let assignment = assignment.as_ref().expect("assignment trigger parsed");
                 ensure!(
                     super::workspace::assignment_admission_allowed_from(&tx, network, assignment)?,
-                    "assignment authorization or revision is stale"
+                    AdmissionRejected::new("assignment authorization or revision is stale")
                 );
                 super::scheduler::admit_assignment_from(&tx, network, local, assignment)?
             }
@@ -322,7 +324,7 @@ impl Store {
                 };
                 ensure!(
                     message.role == Role::User,
-                    "only user messages are delivered"
+                    AdmissionRejected::new("only user messages are delivered")
                 );
                 if held_input.is_some() {
                     let Some(receipt) = super::triage::held_answer_receipt_from(
@@ -346,7 +348,7 @@ impl Store {
                         .context("answer question has not arrived")?;
                     ensure!(
                         question["conversation_id"] == conversation,
-                        "answer belongs to another conversation"
+                        AdmissionRejected::new("answer belongs to another conversation")
                     );
                     admit_from(
                         &tx,
@@ -380,7 +382,7 @@ impl Store {
                 };
                 ensure!(
                     message.role == Role::Bot,
-                    "only bot messages are delivered as bot message turns"
+                    AdmissionRejected::new("only bot messages are delivered as bot message turns")
                 );
                 admit_from(
                     &tx,
@@ -391,9 +393,9 @@ impl Store {
                     message_id,
                 )?
             }
-            _ => anyhow::bail!(
+            _ => anyhow::bail!(AdmissionRejected::new(
                 "only user and bot messages, assignments and work results are delivered"
-            ),
+            )),
         };
         tx.commit()?;
         Ok(Some(receipt))

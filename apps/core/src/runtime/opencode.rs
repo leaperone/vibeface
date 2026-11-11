@@ -907,8 +907,15 @@ impl Opencode {
         vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
         vibeface_protocol::validate_id(message_id).map_err(anyhow::Error::msg)?;
         let id = message_id.to_owned();
-        let conn = (self.running().await)
-            .context("no opencode serve runs; the next one reads this work back")?;
+        let (conn, _serving) = if infer_work_end {
+            let (conn, serving) = self.conn().await?;
+            (conn, Some(serving))
+        } else {
+            (
+                self.running().await.context("no opencode serve runs")?,
+                None,
+            )
+        };
         let Some(found) = self.session(&conn, session).await? else {
             return Ok(Probe::Missing);
         };
@@ -3687,14 +3694,11 @@ mod tests {
         until(&node, |state| matches!(state, WorkState::Running { .. })).await?;
         drop(node);
         let node = Arc::new(Runtime::reopen(&place.dir.join("node")).await?);
-        assert!(node.probe_work(&network, "w-1", true).await.is_err());
-        assert_eq!(
-            place.recorded("argv").lines().count(),
-            1,
-            "a probe started no serve"
-        );
-        drop(node.opencode.conn().await?);
-        node.probe_work(&network, "w-1", true).await?;
+        node.reconcile_works(&network).await?;
+        assert_eq!(place.recorded("argv").lines().count(), 1, "not due yet");
+        node.live_probe_at
+            .store(now_ms() - 60_000, std::sync::atomic::Ordering::Relaxed);
+        node.reconcile_works(&network).await?;
         let record = until(&node, WorkState::finished).await?;
         assert_eq!(
             record.state,
@@ -3721,13 +3725,14 @@ mod tests {
             crate::work::transition(&mut work, Signal::ThreadCreated(session.into()));
             work
         };
-        assert!(server.probe(&on("ses_gone")).await.is_err());
+        assert!(server.probe_reply("ses_gone", "msg_gone").await.is_err());
         assert!(
             place.recorded("argv").is_empty(),
-            "a probe started no serve"
+            "reply probes do not start a serve"
         );
-        let (conn, _serving) = server.conn().await?;
         assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
+        assert_eq!(place.recorded("argv").lines().count(), 1);
+        let (conn, _serving) = server.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
         let created = server.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;

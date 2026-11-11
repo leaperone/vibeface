@@ -115,6 +115,17 @@ function verifyApplication(root, target, receipt) {
   return { application, resources, runtime, sealed };
 }
 
+function verifyMacEntitlements(permissions) {
+  assert(permissions && typeof permissions === 'object' && !Array.isArray(permissions), 'invalid macOS entitlement dictionary');
+  for (const key of ['com.apple.security.network.client', 'com.apple.security.network.server']) {
+    assert.equal(permissions[key], true, `the native application must declare ${key}`);
+  }
+  assert(!permissions['com.apple.security.device.camera'], 'the native application has no camera capture implementation and must not request camera access');
+  for (const key of ['com.apple.security.cs.allow-jit', 'com.apple.security.cs.allow-unsigned-executable-memory', 'com.apple.security.cs.disable-library-validation', 'com.apple.security.cs.disable-executable-page-protection', 'com.apple.security.cs.allow-dyld-environment-variables', 'com.apple.security.get-task-allow', 'get-task-allow']) {
+    assert(!permissions[key], `the native application must not weaken its hardened runtime with ${key}`);
+  }
+}
+
 /** Real signature assessment; an unsigned preview is reported, never presented as signed. */
 function verifySignature(application, target, receipt) {
   if (target === 'x86_64-pc-windows-msvc') {
@@ -146,6 +157,9 @@ function verifySignature(application, target, receipt) {
   assert.equal(described.status, 0, 'cannot read the application signature');
   assert(/flags=0x[0-9a-f]+\([^)]*runtime/.test(described.stdout + described.stderr),
     'the signed application must use the hardened runtime');
+  const entitlements = run('codesign', ['--display', '--entitlements', ':-', application]);
+  const permissions = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', '-'], { input: entitlements }));
+  verifyMacEntitlements(permissions);
   const assessment = spawnSync('spctl', ['-a', '-vvv', '-t', 'exec', application], { encoding: 'utf8' });
   assert.equal(assessment.status, 0, `Gatekeeper rejected the application: ${assessment.stderr}`);
   assert(assessment.stderr.includes('source=Notarized Developer ID'), 'the published application must be notarized');
@@ -212,6 +226,16 @@ function selfTest() {
   fs.mkdirSync(artifacts, { recursive: true });
   const scratch = fs.mkdtempSync(path.join(artifacts, 'desktop-verify-'));
   try {
+    const nativePermissions = { 'com.apple.security.network.client': true, 'com.apple.security.network.server': true };
+    verifyMacEntitlements(nativePermissions);
+    assert.throws(() => verifyMacEntitlements({ ...nativePermissions, 'com.apple.security.network.client': false }), /must declare/);
+    assert.throws(() => verifyMacEntitlements({ ...nativePermissions, 'com.apple.security.device.camera': true }), /no camera capture implementation/);
+    for (const key of ['com.apple.security.cs.allow-jit', 'com.apple.security.cs.allow-unsigned-executable-memory', 'com.apple.security.cs.disable-library-validation', 'com.apple.security.cs.disable-executable-page-protection', 'com.apple.security.cs.allow-dyld-environment-variables', 'com.apple.security.get-task-allow', 'get-task-allow']) {
+      assert.throws(() => verifyMacEntitlements({ ...nativePermissions, [key]: true }), /must not weaken/);
+    }
+    const entitlementSource = fs.readFileSync(path.join(repo, 'apps/desktop/build/entitlements.mac.plist'), 'utf8');
+    const configuredPermissions = Object.fromEntries([...entitlementSource.matchAll(/<key>([^<]+)<\/key>\s*<(true|false)\s*\/>/g)].map(match => [match[1], match[2] === 'true']));
+    verifyMacEntitlements(configuredPermissions);
     const version = '9.9.9-nightly.20261107.1';
     const commit = 'a'.repeat(40);
     const write = (file, content) => {

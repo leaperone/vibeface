@@ -361,7 +361,7 @@ impl StoreActor {
                         if table == "networks" {
                             network_dirty.store(true, Ordering::Release);
                         }
-                    }));
+                    }))?;
                 let committed = worker_publication.clone();
                 store.connection.commit_hook(Some(move || {
                     if committed.network_dirty.swap(false, Ordering::AcqRel) {
@@ -370,11 +370,11 @@ impl StoreActor {
                         committed.invalidate(ClientAuthorityState::Updating);
                     }
                     false
-                }));
+                }))?;
                 let rolled_back = worker_publication.network_dirty.clone();
                 store.connection.rollback_hook(Some(move || {
                     rolled_back.store(false, Ordering::Release);
-                }));
+                }))?;
                 worker_publication.refresh(store)
             })
             .await?;

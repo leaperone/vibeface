@@ -7,6 +7,9 @@ settings:
 overrides:
   '@e2e-dev/mobile@0.12.4>agent-device': 0.21.32
 
+patchedDependencies:
+  uniffi-bindgen-react-native@0.31.0-6: 4a8a6bb5e2ff6b78c277689466a91a304ac6dd7ac7dc0ce1178fcd1d2a8a9ef6
+
 importers:
 
   .:
@@ -353,7 +356,7 @@ importers:
         version: 0.31.0-6
       uniffi-bindgen-react-native:
         specifier: 0.31.0-6
-        version: 0.31.0-6
+        version: 0.31.0-6(patch_hash=4a8a6bb5e2ff6b78c277689466a91a304ac6dd7ac7dc0ce1178fcd1d2a8a9ef6)
     devDependencies:
       '@vibeface/client':
         specifier: workspace:*
@@ -14080,7 +14083,7 @@ snapshots:
 
   unicorn-magic@0.3.0: {}
 
-  uniffi-bindgen-react-native@0.31.0-6: {}
+  uniffi-bindgen-react-native@0.31.0-6(patch_hash=4a8a6bb5e2ff6b78c277689466a91a304ac6dd7ac7dc0ce1178fcd1d2a8a9ef6): {}
 
   unified@11.0.5:
     dependencies:

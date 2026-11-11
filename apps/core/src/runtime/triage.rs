@@ -9,7 +9,10 @@ use crate::{
     model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
     net,
     providers::Provider,
-    store::triage::{BudgetStatus, TriageAdmission},
+    store::{
+        admission::AdmissionRejected,
+        triage::{BudgetStatus, TriageAdmission},
+    },
     triage::{
         self, AgentEvent, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl,
         HeldAnswerRequest, HookRequest, OutboxEntry, RequestKind, Severity, TriageConfig,
@@ -1303,51 +1306,52 @@ impl Runtime {
         let network = network.to_owned();
         let conversation = conversation.to_owned();
         let message_id = message_id.to_owned();
-        let receipt = self
-            .store
-            .call("triage.accept_answer_delivery", move |store| {
-                let Some(message) = store.message(&network, &conversation, &message_id)? else {
-                    return Ok(None);
-                };
-                let Some(question_id) = &message.answers else {
-                    return Ok(None);
-                };
-                let question = store
-                    .question(&network, question_id)?
-                    .context("answer question is missing")?;
-                let Some(request_id) = question["about"]["request_id"].as_str() else {
-                    return Ok(None);
-                };
-                ensure!(
-                    question["about"]["node"] == node,
-                    "this Node does not hold the answer's request"
-                );
-                if let Some(receipt) =
-                    store.held_answer_receipt(&network, &conversation, &message_id)?
-                {
-                    return Ok(Some(receipt));
-                }
-                let request = lock(&requests)
-                    .get(request_id)
-                    .cloned()
-                    .context("the original request is no longer waiting on this Node")?;
-                ensure!(
-                    request.question_id.as_deref() == Some(question_id),
-                    "the held request belongs to another question"
-                );
-                store.queue_answer_control(
-                    &network,
-                    question_id,
-                    &request.answer_binding(&node),
-                    AnswerAuthority::Signed,
-                    now_ms(),
-                )?;
-                let receipt = store
-                    .held_answer_receipt(&network, &conversation, &message_id)?
-                    .context("answer control receipt was not saved")?;
-                Ok(Some(receipt))
-            })
-            .await?;
+        let receipt =
+            self.store
+                .call("triage.accept_answer_delivery", move |store| {
+                    let Some(message) = store.message(&network, &conversation, &message_id)? else {
+                        return Ok(None);
+                    };
+                    let Some(question_id) = &message.answers else {
+                        return Ok(None);
+                    };
+                    let question = store
+                        .question(&network, question_id)?
+                        .context("answer question is missing")?;
+                    let Some(request_id) = question["about"]["request_id"].as_str() else {
+                        return Ok(None);
+                    };
+                    ensure!(
+                        question["about"]["node"] == node,
+                        AdmissionRejected::new("this Node does not hold the answer's request")
+                    );
+                    if let Some(receipt) =
+                        store.held_answer_receipt(&network, &conversation, &message_id)?
+                    {
+                        return Ok(Some(receipt));
+                    }
+                    let request = lock(&requests).get(request_id).cloned().context(
+                        AdmissionRejected::new(
+                            "the original request is no longer waiting on this Node",
+                        ),
+                    )?;
+                    ensure!(
+                        request.question_id.as_deref() == Some(question_id),
+                        AdmissionRejected::new("the held request belongs to another question")
+                    );
+                    store.queue_answer_control(
+                        &network,
+                        question_id,
+                        &request.answer_binding(&node),
+                        AnswerAuthority::Signed,
+                        now_ms(),
+                    )?;
+                    let receipt = store
+                        .held_answer_receipt(&network, &conversation, &message_id)?
+                        .context("answer control receipt was not saved")?;
+                    Ok(Some(receipt))
+                })
+                .await?;
         if receipt.is_some() {
             self.triage.wake.notify_one();
         }
@@ -5149,6 +5153,62 @@ pub(super) mod tests {
             assert_eq!(
                 answered_once(&mut server).await["result"],
                 json!({"decision":"decline"})
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn explicit_approval_answers_bypass_exhausted_triage_budget_once() -> Result<()> {
+        with_node(async |node, admin, _| {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Approval", &["t-1"]).await?;
+            let network = node.network_id().await?;
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            let (question, request_id) = raise_for(&node).await?;
+            let limit = node.config.daily_decision_limit;
+            let budget_network = network.clone();
+            node.store
+                .call("triage.test.exhaust_explicit_answer_budget", move |store| {
+                    store.connection.execute(
+                        "INSERT INTO budget_days(network_id,day,used) VALUES(?1,date('now'),?2)",
+                        rusqlite::params![format!("triage:{budget_network}"), limit],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            node.ingest_agent_event(turn("ordinary-pending", "ordinary-turn", "/tmp"))
+                .await?;
+            signed_answer_fact(&node, &admin, &question, "允许本次").await?;
+            node.expire_requests().await?;
+            assert!(
+                lock(&node.triage.requests)[&request_id]
+                    .answer_by_ms
+                    .is_some()
+            );
+            node.wake_agent().await?;
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"accept"})
+            );
+            assert!(!lock(&node.triage.requests).contains_key(&request_id));
+            assert_eq!(node.triage_status().await?["budget"]["used"], limit + 1);
+            node.wake_agent().await?;
+            assert_eq!(
+                node.triage_status().await?["budget"]["used"],
+                limit + 1,
+                "the explicit answer is charged once"
+            );
+            assert_eq!(
+                node.pending_events().await?.len(),
+                1,
+                "ordinary triage remains paused after the explicit answer"
+            );
+            assert_eq!(
+                node.triage_status().await?["budget"]["paused_reason"],
+                "budget_exhausted"
             );
             Ok::<_, anyhow::Error>(())
         })

@@ -17,6 +17,7 @@ const LOCAL_CHAIN_ID: u64 = 31_337;
 const MAX_RPC_BYTES: usize = 512 * 1024;
 const MAX_CALLDATA_BYTES: usize = 64 * 1024;
 const MAX_GAS_LIMIT: u64 = 30_000_000;
+pub(super) const NONCE_RECOVERY_GAS_LIMIT: u64 = 30_000;
 const CONTROL_ROOT: &str = "0xa54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56";
 const BN254_CONTROL_ID: &str = "0x04446e66d300eb7fb45c9726bb53c793dda407a62e9601618bb43c5c14657ac0";
 
@@ -185,6 +186,28 @@ impl Chain {
 
     pub fn config(&self) -> &ChainConfig {
         &self.config
+    }
+
+    pub(super) async fn verify_hold(&self, statement: &Statement, seal: &[u8]) -> Result<()> {
+        let input = abi::DeliveryStatement::abi_decode_validate(statement.abi_bytes())?;
+        validate_statement(&self.config, &input)?;
+        ensure!(input.relation == 3, "hold proof has another relation");
+        validate_seal(seal)?;
+        let adapter = self
+            .call(address(&self.config.escrow)?, abi::adapterCall {})
+            .await?;
+        ensure!(
+            self.call(
+                adapter,
+                abi::verifyCall {
+                    seal: seal.to_vec().into(),
+                    journalDigest: statement.digest().into(),
+                },
+            )
+            .await?,
+            "receiver hold proof verification failed"
+        );
+        Ok(())
     }
 
     async fn verify_deployment(&self) -> Result<()> {
@@ -1103,6 +1126,57 @@ pub(super) fn checked_transaction(
     wallet: Address,
     nonce: u64,
 ) -> Result<TxEip1559> {
+    let transaction = bounded_transaction(config, intent, wallet, nonce)?;
+    validate_calldata(
+        config,
+        address(&intent.to)?,
+        transaction.input.as_ref(),
+        wallet,
+    )?;
+    Ok(transaction)
+}
+
+pub(super) fn checked_publication_recovery(
+    config: &ChainConfig,
+    original: &SignedTransaction,
+    intent: &SpendIntent,
+    wallet: Address,
+) -> Result<TxEip1559> {
+    let reveal = checked_transaction(config, &original.intent, wallet, original.nonce)?;
+    ensure!(
+        is_disclosure_calldata(&reveal.input)
+            && original.raw_tx.is_some()
+            && original.tx_hash.is_some()
+            && intent
+                .id
+                .starts_with(&format!("{}/nonce-", original.intent.id))
+            && intent.chain_id == original.intent.chain_id
+            && intent.wallet == original.intent.wallet
+            && intent.to == original.intent.to
+            && intent.gas_cap == original.intent.gas_cap
+            && intent.gas_limit == NONCE_RECOVERY_GAS_LIMIT
+            && intent.calldata == data_hex(&abi::profileIdCall {}.abi_encode()),
+        "nonce recovery must name its original reveal and the fixed escrow getter"
+    );
+    let recovery = bounded_transaction(config, intent, wallet, original.nonce)?;
+    ensure!(
+        U256::from(recovery.gas_limit)
+            .checked_mul(U256::from(recovery.max_fee_per_gas))
+            .context("nonce recovery gas cost overflow")?
+            <= U256::from(reveal.gas_limit)
+                .checked_mul(U256::from(reveal.max_fee_per_gas))
+                .context("publication gas cost overflow")?,
+        "nonce recovery exceeds the original reserved gas cost"
+    );
+    Ok(recovery)
+}
+
+fn bounded_transaction(
+    config: &ChainConfig,
+    intent: &SpendIntent,
+    wallet: Address,
+    nonce: u64,
+) -> Result<TxEip1559> {
     config.validate()?;
     ensure!(
         intent.chain_id == config.chain_id
@@ -1127,7 +1201,6 @@ pub(super) fn checked_transaction(
     );
     let target = address(&intent.to)?;
     let input = hex_data(&Value::String(intent.calldata.clone()), MAX_CALLDATA_BYTES)?;
-    validate_calldata(config, target, &input, wallet)?;
     Ok(TxEip1559 {
         chain_id: config.chain_id,
         nonce,

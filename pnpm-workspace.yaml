@@ -3,6 +3,8 @@ packages:
   - apps/*
 overrides:
   '@e2e-dev/mobile@0.12.4>agent-device': 0.21.32
+patchedDependencies:
+  uniffi-bindgen-react-native@0.31.0-6: patches/uniffi-bindgen-react-native@0.31.0-6.patch
 allowBuilds:
   esbuild: true
   lightningcss: true
