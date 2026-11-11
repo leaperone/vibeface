@@ -12,6 +12,19 @@ use gpui_kit::{
 };
 use std::collections::BTreeMap;
 
+const RELAY_FEE_AUTHORIZATION_NOTE: &str =
+    "中转设备的链费支出沿用本机既有授权、限额和公开规则；付款方的金额不是中转设备的支出限额。";
+
+fn order_fee_authorization_label(order: &TransferOrder) -> String {
+    if order.mode == "charity" {
+        "免费传输，不使用预付预算".into()
+    } else if order.role == "sender" {
+        format!("原付款方累计链费上限 {}", order.payment.gas_cap)
+    } else {
+        "此订单视图不提供中转设备的本机链费授权".into()
+    }
+}
+
 impl Desktop {
     pub(crate) fn devices(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut page = self
@@ -679,7 +692,7 @@ impl Desktop {
 固定付款人 {} · 收款人 {} · 资产 {}
 账本存入 {} · 可用 {} · 锁定 {}
 预算账本累计赚取 {} · 提取 {} · 退款 {}（不作到账确认）
-预算累计链费上限 {} · 就绪 {} 片",
+本机记录的付款方累计链费上限 {} · 就绪 {} 片",
                     budget.provider_peer,
                     budget.payer,
                     budget.payee,
@@ -694,6 +707,9 @@ impl Desktop {
                     budget.ready_windows.len()
                 ),
             );
+            if budget.provider_peer == d.node_peer {
+                row = row.child(RELAY_FEE_AUTHORIZATION_NOTE);
+            }
             let offer = d
                 .providers
                 .iter()
@@ -825,9 +841,9 @@ impl Desktop {
                     order.receiver_peer, order.provider_peer
                 ))
                 .child(format!(
-                    "服务费 {} · 网络费上限 {} · 付款状态 {}",
+                    "服务费 {} · {} · 付款状态 {}",
                     order.payment.total,
-                    order.payment.gas_cap,
+                    order_fee_authorization_label(order),
                     if transfer_settlement_uncertain(order) {
                         format!(
                             "上次记录 {}（当前待确认）",
@@ -1109,11 +1125,20 @@ impl Desktop {
                 order.payment.asset.as_deref().unwrap_or("无")
             ))
             .child(format!(
-                "原服务费 {} · 原预算累计链费上限 {} · {}个片段",
+                "原服务费 {} · {}个片段",
                 order.payment.total,
-                order.payment.gas_cap,
                 order.windows.len()
             ))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "delivery-order-fee-{}",
+                        order.order_id
+                    )))
+                    .role(Role::Note)
+                    .aria_label(order_fee_authorization_label(order))
+                    .child(order_fee_authorization_label(order)),
+            )
             .child(transfer_publication_label(order));
         if let Some(deadline) = &order.deadlines {
             review = review.child(format!(
@@ -1173,7 +1198,7 @@ impl Desktop {
                     review = review.child(self.transfer_order_review(order));
                 }
                 review = review
-                    .child("两单使用同一固定预算；累计链费上限是该预算的一次授权，不按两单相加。");
+                    .child("两单使用同一固定预算；付款方累计链费授权不按两单相加，中转设备沿用其本机已有授权和限额。");
             }
             Command::DeliveryFlushBudget(flush) => {
                 let budget = &flush.budget;
@@ -1193,13 +1218,23 @@ impl Desktop {
                         budget.budget_id
                     ))
                     .child(format!(
-                        "中转 {} · 付款人 {} · 收款人 {} · 资产 {}\n原预算累计链费上限 {}",
-                        budget.provider_peer,
-                        budget.payer,
-                        budget.payee,
-                        budget.asset,
-                        budget.gas_cap
-                    ));
+                        "中转 {} · 付款人 {} · 收款人 {} · 资产 {}",
+                        budget.provider_peer, budget.payer, budget.payee, budget.asset,
+                    ))
+                    .child(
+                        div()
+                            .id("delivery-payer-chain-fee-cap")
+                            .role(Role::Note)
+                            .aria_label(format!("本机记录的付款方累计链费上限 {}", budget.gas_cap))
+                            .child(format!("本机记录的付款方累计链费上限 {}", budget.gas_cap)),
+                    )
+                    .child(
+                        div()
+                            .id("delivery-provider-spending-note")
+                            .role(Role::Note)
+                            .aria_label(RELAY_FEE_AUTHORIZATION_NOTE)
+                            .child(RELAY_FEE_AUTHORIZATION_NOTE),
+                    );
                 for window in &budget.ready_windows {
                     review = review.child(format!(
                         "原订单 {} · 原片段 {}",

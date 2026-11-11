@@ -1349,6 +1349,16 @@ mod prepaid_delivery {
                         .as_str()
                     )
                 );
+                assert_eq!(
+                    window
+                        .within("delivery-financial-review")
+                        .find(gpui_kit::SharedString::from(format!(
+                            "delivery-order-fee-{}",
+                            "d".repeat(64)
+                        )))
+                        .label(),
+                    Some("原付款方累计链费上限 7")
+                );
             })
             .unwrap();
         click(&h, cx, "confirm-danger");
@@ -1372,6 +1382,10 @@ mod prepaid_delivery {
         click(&h, cx, "confirm-danger");
         assert!(matches!(command(&mut h), Command::DeliveryAcceptBatch(_)));
         let mut state = snapshot("provider");
+        state.delivery.budgets[0].gas_cap = "0".into();
+        for order in &mut state.delivery.orders {
+            order.payment.gas_cap = "0".into();
+        }
         state.delivery.budgets[0].ready_windows = vec![
             TransferReadyWindow {
                 order_id: "d".repeat(64),
@@ -1385,6 +1399,13 @@ mod prepaid_delivery {
         let mut h = open(cx, state);
         click(&h, cx, &format!("flush-budget-{}", "2".repeat(64)));
         assert!(h.commands.try_recv().is_err());
+        h.window.update(cx,|_,window,cx| {
+            window.render_frame(cx);
+            let review=window.within("delivery-financial-review");
+            assert_eq!(review.find("delivery-payer-chain-fee-cap").label(),Some("本机记录的付款方累计链费上限 0"));
+            assert_eq!(review.find("delivery-provider-spending-note").label(),Some("中转设备的链费支出沿用本机既有授权、限额和公开规则；付款方的金额不是中转设备的支出限额。"));
+            assert_eq!(review.find(gpui_kit::SharedString::from(format!("delivery-order-fee-{}","d".repeat(64)))).label(),Some("此订单视图不提供中转设备的本机链费授权"));
+        }).unwrap();
         click(&h, cx, "confirm-danger");
         match command(&mut h) {
             Command::DeliveryFlushBudget(review) => {
