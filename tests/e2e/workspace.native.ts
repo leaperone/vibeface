@@ -89,6 +89,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   const settingsScroll = device.locator('role=scroll-area').filter({ has: externalChat });
   await settingsScroll.scrollUntilVisible(externalChat, { direction: 'down' });
   let previousRowTop: number | undefined;
+  const linkLayout: { y: number; height: number; top: number; bottom: number; settled: boolean }[] = [];
   await expect.poll(async () => {
     const row = await externalChat.boundingBox(), area = await settingsScroll.boundingBox();
     const header = await screen.getByTestId('设置', { visible: true }).boundingBox();
@@ -96,7 +97,8 @@ test('native workspace routes preserve Task input, queue controls and directed C
     assert(row && area && header && tab, 'The settings link and native chrome expose bounds');
     const top = Math.max(area.y, header.y + header.height), bottom = Math.min(area.y + area.height, tab.y);
     const reachable = row.y >= top && row.y + row.height <= bottom;
-    const settled = previousRowTop === row.y;
+    const settled = previousRowTop !== undefined && Math.abs(previousRowTop - row.y) < 1;
+    linkLayout.push({ y: row.y, height: row.height, top, bottom, settled });
     previousRowTop = row.y;
     if (!reachable) {
       const x = area.x + area.width / 2;
@@ -104,7 +106,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
       await screen.swipe(row.y < top ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
     }
     return reachable && settled;
-  }, { timeout: 5000 }).toBe(true);
+  }, { timeout: 5000 }).toBe(true).finally(() => writeFile(resolve(artifacts, 'settings-link-layout.json'), `${JSON.stringify(linkLayout)}\n`, { mode: 0o600 }));
   await externalChat.click();
   await expect(screen.getByTestId('外部聊天', { visible: true })).toBeVisible();
   const webhookUrl = screen.getByLabel('外部聊天地址', { exact: true });
