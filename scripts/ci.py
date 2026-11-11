@@ -22,11 +22,11 @@ PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface
 DEPENDENTS = {
     "protocol": ("bridge", "control"),
     "bridge": ("control",),
-    "secure": ("node", "secure-ffi"),
+    "secure": ("control", "node", "secure-ffi"),
     "node": (),
     "control": ("node", "cli"),
     "cli": (),
-    "secure-ffi": (),
+    "secure-ffi": ("node",),
     "delivery": ("node",),
 }
 CRATES = {
@@ -571,7 +571,7 @@ def self_test():
         assert not mobile["rust_packages"] and not mobile["docs_only"]
     for path in ("packages/client/src/lib/transport.ts", "packages/client/src/avatar/face.ts", "packages/client/src/avatar/derived-faces.json", "packages/theme/theme.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"):
         assert make_plan([path])["mobile"], path
-    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
+    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-core", "vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     for path in ("README.md", "README.zh-CN.md"):
@@ -608,7 +608,7 @@ def self_test():
         "node": ["vibeface-core"],
         "bridge": ["vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface-core", "vibeface-secure-ffi"],
+        "secure": ["vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi"],
         "control": ["vibeface-core", "vibeface-control", "vibeface"],
         "cli": ["vibeface"],
         "delivery": ["vibeface-core", "vibeface-delivery"],

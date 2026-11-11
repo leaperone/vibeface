@@ -633,6 +633,7 @@ async fn orphan_recovery_checks_the_recorded_process_before_ending_its_tree() ->
         wrong[0]["identity"]["value"] = serde_json::json!("another-process-start");
         vibeface_bridge::platform::privatefs::write_atomic(&file, &serde_json::to_vec(&wrong)?)?;
         CursorAgent::kill_orphan(&file);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(
             !pending.is_finished(),
             "a stale identifier cannot end another CLI process"

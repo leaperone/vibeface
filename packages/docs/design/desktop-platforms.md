@@ -6,8 +6,8 @@ Windows、macOS 和 Linux 使用 Electron 桌面宿主，复用 React 业务界�
 
 ```text
 macOS / Windows / Linux
-  Electron 主进程 → 启动器与本机节点管理 → 捆绑的 Rust CLI / Core
-  Electron 业务窗口 → 内置 React 客户端 → 加密连接本机或远端 Node
+  Electron 主进程 → 本机节点管理 → 捆绑的 Rust CLI / Core
+  Electron 客户端窗口 → 内置 React 客户端 → 加密连接本机或远端 Node
 
 iOS / Android
   React Native App → 共享客户端与密码学模块 → 加密连接远端 Node
@@ -16,9 +16,9 @@ Node Core → 持久记录、同步、调度 → Provider / SDK → 所在电脑
 CLI → 本机控制、服务注册、安装与更新
 ```
 
-桌面负责窗口、单实例、菜单/托盘、系统交互以及启动、离线和设置状态。Core 继续负责持久化、同步、调度与 Provider。业务窗口开启 sandbox、contextIsolation，关闭 nodeIntegration，不向页面暴露任意进程、文件或管理者能力。
+桌面负责窗口、单实例、菜单/托盘、系统交互以及启动、离线和设置状态。Core 继续负责持久化、同步、调度与 Provider。客户端窗口开启 sandbox、contextIsolation，关闭 nodeIntegration，不向页面暴露任意进程、文件或管理者能力。
 
-启动器与业务窗口分开。启动器只能通过校验过的窄 IPC 操作本机运行。业务页面来自安装包内经过清单校验的 Web 文件，固定使用 `vibeface-app://app/` 来源；即使没有本机 Node，也能打开客户端并使用邀请链接。原有非导出设备私钥保存在这个固定来源的 IndexedDB 内，不复制既有浏览器私钥。
+桌面只有一个客户端窗口。本机节点管理在客户端的设置页，只能通过校验过的窄 IPC 操作本机运行。业务页面来自安装包内经过清单校验的 Web 文件，固定使用 `vibeface-app://app/` 来源；即使没有本机 Node，也能打开客户端并使用邀请链接。原有非导出设备私钥保存在这个固定来源的 IndexedDB 内，不复制既有浏览器私钥。
 
 业务页通过专用 preload 使用本机接入和 LAN 传输，不获得通用命令、文件或 HTTP 能力。本机接入由主进程重新检查所选节点的目录、设备身份和私有 loopback 来源；长期启动能力和 HttpOnly cookie 保留在主进程。首次注册继续使用已有身份确认、恢复文件下载和保存确认流程。普通远端入口继续使用现有 WebSocket 与 Noise；LAN 使用捆绑 Core 的客户端桥接模式和原有 Iroh QUIC，客户端模式不初始化节点。
 

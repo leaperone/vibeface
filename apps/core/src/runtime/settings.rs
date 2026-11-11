@@ -781,7 +781,6 @@ impl Runtime {
         }
         let active = self.manager_controls.lock().await;
         if !active.is_empty() || self.triage.turn.try_lock().is_err() {
-            self.pending_provider_launches.store(true, SeqCst);
             return Ok(false);
         }
         let store = self.store.lock().await;
@@ -792,10 +791,7 @@ impl Runtime {
                     crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
                 ) && !work.state.finished()
             }),
-            Err(error) => {
-                self.pending_provider_launches.store(true, SeqCst);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let busy_job = match store.scheduler_jobs_all() {
             Ok(jobs) => jobs.iter().any(|job| {
@@ -804,13 +800,9 @@ impl Runtime {
                     "claimed" | "running" | "cancelling" | "reconciling" | "steering"
                 )
             }),
-            Err(error) => {
-                self.pending_provider_launches.store(true, SeqCst);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         if busy_work || busy_job {
-            self.pending_provider_launches.store(true, SeqCst);
             return Ok(false);
         }
         drop(store);
@@ -1041,7 +1033,7 @@ impl ProposalInput {
                 mode: AppServerMode::System,
                 socket: Some(socket),
             }),
-            codex_home: existing(self.codex_home, "codex_home", Path::is_dir)?,
+            codex_home: None,
             bins: self
                 .bins
                 .into_iter()
@@ -1087,12 +1079,7 @@ impl Runtime {
                 .iter()
                 .any(|provider| provider.on_app_server())
             || given.app_server.is_some()
-            || given.codex_home.is_some()
             || given.codex_sessions.is_some();
-        let host = discovery::Host {
-            codex_home: given.codex_home.clone().or(self.host.codex_home.clone()),
-            ..self.host.clone()
-        };
         let (mut local, mut manager, mut triage) = (
             self.providers(),
             self.settings_snapshot().manager,
@@ -1110,7 +1097,7 @@ impl Runtime {
                 triage: &mut triage,
             },
             codex.then_some(Provider::Codex),
-            &host,
+            &self.host,
         )?;
         let (mut local, mut manager, mut triage) = (
             self.providers(),
@@ -1757,7 +1744,7 @@ mod tests {
             &bin,
             r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
-names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME', 'CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']
+names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME', 'OPENCODE_DISABLE_PROJECT_CONFIG', 'OPENCODE_CONFIG_PROJECT_DISABLE', 'OPENCODE_DISABLE_CLAUDE_CODE', 'CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']
 pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args': sys.argv[1:], 'env': {name: os.environ.get(name) for name in names}, 'auth': os.environ.get('FAKE_LOGIN_AUTH')}))
 "#,
         )?;
@@ -1823,9 +1810,7 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
                 );
             }
             for (name, value) in roots.env(provider) {
-                if observed["env"].get(&name).is_some() {
-                    assert_eq!(observed["env"][name], value);
-                }
+                assert_eq!(observed["env"][&name], value, "{name}");
             }
             if provider == Provider::Opencode {
                 for name in [

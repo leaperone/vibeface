@@ -123,4 +123,22 @@ describe('ManagedNodeController deadlines', () => {
     })
     await expect(hung.updateBackground('device')).rejects.toThrow('managed Node operation failed')
   })
+
+  it('fails a command that cannot be spawned without leaving an unhandled rejection', async () => {
+    const unhandled: unknown[] = []
+    const record = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', record)
+    try {
+      const missing = new ManagedNodeController({
+        profileDir: '/tmp/profile',
+        bundledCli: { command: '/nonexistent/vibeface-cli' },
+        commandTimeoutMs: () => 2_000,
+      })
+      await expect(missing.status()).rejects.toThrow()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    } finally {
+      process.off('unhandledRejection', record)
+    }
+    expect(unhandled).toEqual([])
+  })
 })

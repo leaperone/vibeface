@@ -828,7 +828,7 @@ export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: re
   return works
 }
 
-/** A pushed change: the records it touched, or null when it carries none. */
+/** A pushed change: the records it touched. */
 export function parseRecords(value: unknown): ConversationRecords {
   const data = record(value)
   const last = data.last_message == null ? null : record(data.last_message)

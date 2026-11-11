@@ -1,4 +1,4 @@
-import { getRouter } from '@/router'
+import type { AnyRouter } from '@tanstack/react-router'
 
 declare global {
   interface Window {
@@ -7,9 +7,9 @@ declare global {
 }
 
 /** Lets the desktop host open in-window routes without a full reload. */
-export function installDesktopNavigation(): void {
+export function installDesktopNavigation(router: AnyRouter): void {
   if (typeof window === 'undefined' || !window.vibefaceClient) return
   window.__vibefaceNavigate = (path: string) => {
-    void getRouter().navigate({ to: path })
+    void router.navigate({ to: path })
   }
 }

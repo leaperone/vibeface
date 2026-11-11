@@ -136,14 +136,18 @@ The platform package is written to `.artifacts/packages/`. See [source setup](pa
 │   ├── app/         # Web app
 │   ├── cli/         # Command line
 │   ├── core/        # Node service
+│   ├── desktop/     # Desktop app
 │   ├── mobile/      # iOS and Android apps
 │   └── www/         # Public website
 ├── crates/          # Shared Rust libraries
 ├── packages/
 │   ├── client/      # Shared app client
 │   ├── docs/        # User and developer guides
+│   ├── secure-native/ # Rust crypto bindings for the mobile apps
 │   └── theme/       # Shared styles
+├── config/          # Official public node address
 ├── contracts/       # Experimental file delivery contracts
+├── deploy/          # Container deployment for the official services
 ├── scripts/         # Build, package, and verification tools
 ├── tests/           # Fixtures and end-to-end tests
 └── install.sh       # Package installer

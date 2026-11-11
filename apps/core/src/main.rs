@@ -70,10 +70,10 @@ async fn main() -> Result<()> {
     let mut desktop_parent = desktop_parent::DesktopParent::watch(args.desktop_parent_stdin)?;
     let data_dir = args
         .data_dir
-        .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
         .context("--data-dir or VIBEFACE_DATA_DIR is required")?;
-    vibeface_core::logging::init(Some(&data_dir), false);
+    // Opening the log first would leave `node.log` in an empty directory and skip initialization.
     vibeface_core::control::prepare_start(&data_dir)?;
+    vibeface_core::logging::init(Some(&data_dir), false);
     let app_dir = match args.app_dir {
         Some(path) => {
             anyhow::ensure!(

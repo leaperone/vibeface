@@ -96,7 +96,7 @@ impl Runtime {
 
     async fn reconcile_workspace_jobs(self: &Arc<Self>, network: &str) -> Result<()> {
         let before = self.store.lock().await.version_vector(network)?;
-        let jobs = self.store.lock().await.scheduler_jobs_all()?;
+        let jobs = self.store.lock().await.workspace_scheduler_jobs()?;
         for job in jobs {
             let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope else {
                 continue;

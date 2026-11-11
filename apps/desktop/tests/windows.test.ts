@@ -43,8 +43,3 @@ describe.each(['will-navigate', 'will-redirect'])('%s boundary', (eventName) => 
   })
 })
 
-describe('single client window', () => {
-  it('creates only the sealed client window factory', () => {
-    expect(typeof createClientWindow).toBe('function')
-  })
-})

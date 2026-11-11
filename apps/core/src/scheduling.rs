@@ -1,5 +1,5 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
-//! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
+//! A job is keyed by `(conversation, trigger)`, so retries and sync never add a second one.
 use crate::{
     model::{Schedule, VersionVector, WorkOutcome},
     providers::Provider,
@@ -426,7 +426,7 @@ pub struct TurnRuntime {
 pub struct SchedulerJob {
     pub conversation_id: String,
     pub scope: SessionScope,
-    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`,
+    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`, `assignment:<assignment_id>`,
     /// `bot_message:<message_id>` or `schedule:<schedule_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,

@@ -564,12 +564,15 @@ async function cleanup() {
 
 await ensurePrivateDirectory(controlRoot, { root });
 await prepareProfileParent();
+function authorized(value, token) {
+  if (typeof value !== 'string') return false;
+  const received = Buffer.from(value);
+  const expected = Buffer.from(`Bearer ${token}`);
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
 const token = randomBytes(32).toString('hex');
 const control = createServer(async (request, response) => {
-  const authorization = request.headers.authorization;
-  const expected = `Bearer ${token}`;
-  if (request.method !== 'POST' || request.url !== '/' || typeof authorization !== 'string'
-    || authorization.length !== expected.length || !timingSafeEqual(Buffer.from(authorization), Buffer.from(expected))) {
+  if (request.method !== 'POST' || request.url !== '/' || !authorized(request.headers.authorization, token)) {
     response.writeHead(403).end(); return;
   }
   if (changing || stopping) { response.writeHead(409).end(); return; }

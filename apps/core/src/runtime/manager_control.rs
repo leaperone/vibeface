@@ -856,7 +856,7 @@ pub(super) mod tests {
                 let job = store.claim_next_fixture(&node.identity, &network, "c", &node.boot, "lease-fence")?.context("Task claim")?.job;
                 let attempt = job.state.attempt().context("attempt")?.id.clone();
                 store.mark_started("c", &job.trigger, &attempt)?;
-                store.started_workspace_assignment(&node.identity, &network, &job, now_ms())?;
+                store.settle_workspace_assignment(&node.identity, &network, &job, now_ms())?;
                 (job, first, attempt)
             };
             let _cancel = node.register_manager_attempt_fixture("lease-token".into(), test_access(network.clone(), false, Some("c".into())), &attempt, &job.trigger, crate::providers::Provider::Codex).await?;

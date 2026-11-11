@@ -83,12 +83,13 @@ type DeviceContextValue = {
   downloadUnsavedRecovery(): Promise<void>
   /** Drops the kept file once the person confirmed it is saved, or it no longer matters. */
   forgetUnsavedRecovery(): void
-  /** The name this browser last saw a device listed under, kept past its removal. */
   joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>
+  /** The name this browser last saw a device listed under, kept past its removal. */
+  entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   /** Whether the link's computer would still take it, asked before the person names this device; null: no answer, so the form stays. */
   checkInvite(link: string): Promise<InviteState | null>

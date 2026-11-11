@@ -136,7 +136,8 @@ export function ChannelWorkspace({ channelId }: { channelId: string }) {
   latest.current = workspace
   useEffect(() => { void latest.current.readWorkspaceState({ channel_id: channelId }).then(() => replyTask ? latest.current.readWorkspaceState({ task_id: replyTask }) : undefined).catch(setReadError) }, [channelId, workspace.generation, replyTask])
   const channel = workspace.workspaceState?.channels.find((item) => item.channel_id === channelId)
-  const botId = recipient || channel?.coordinator_bot
+  // A remembered recipient that was deleted or left the channel gives way to the coordinator.
+  const botId = recipient && channel?.members.includes(recipient) && workspace.bots.some((item) => item.bot_id === recipient) ? recipient : channel?.coordinator_bot
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const tasks = (workspace.workspaceState?.tasks ?? []).filter((item) => item.channel_id === channelId)
   const selectedTask = replyTask ? tasks.find((item) => item.task_id === replyTask) : [...tasks].reverse().find((item) => item.owner_bot === botId && !['completed', 'cancelled'].includes(item.state))
@@ -217,7 +218,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   return <section className="conversation-screen" aria-label={channelId ? '频道对话' : '任务对话'}>
     <label className="mx-auto grid w-full max-w-(--page-width) shrink-0 gap-1 px-4 pt-3 text-meta text-muted-foreground sm:px-6">{channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'}<Input type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入关键词" /></label>
     <Chat key={channelId ?? scopeTaskId} entries={entries} empty={<EmptyState icon={MessagesSquare} title={history ? '发送一条交代开始对话' : '正在读取任务历史'} />} />
-    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} busy={false} label={`发给 ${label}`} sendLabel={sendLabel} target={<div className="grid w-full min-w-0 gap-2">
+    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`发给 ${label}`} sendLabel={sendLabel} target={<div className="grid w-full min-w-0 gap-2">
       <span className="truncate" title={label}>{busy ? '补充给' : '发送给'} · {label}</span>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {targetControl}
@@ -265,9 +266,9 @@ function WorkspaceTaskContext({ task }: { task: WorkspaceTask }) {
   const [error, setError] = useState<unknown>(null)
   const latest = useRef(workspace)
   latest.current = workspace
+  const target: InputTarget = task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id }
   useEffect(() => {
     let active = true
-    const target: InputTarget = task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id }
     setContext(null); setError(null)
     void latest.current.readScopeContext({ target }).then((value) => { if (active) { setContext(value); setError(null) } }, (cause) => { if (active) setError(cause) })
     return () => { active = false }
@@ -280,7 +281,7 @@ function WorkspaceTaskContext({ task }: { task: WorkspaceTask }) {
     <p>依赖任务 · {task.dependencies.length ? task.dependencies.map((id) => workspace.workspaceState?.tasks.find((item) => item.task_id === id)?.title ?? id).join('、') : '无'}</p>
     <Details label="来源与固定依据"><p className="break-all">任务来源事件 · {task.request_event}</p>{task.source_events.map((source) => <p key={source} className="break-all">引用来源 · {source}</p>)}{assignment ? <p className="break-all">本轮依据 · {JSON.stringify(assignment.basis)}</p> : null}</Details>
     <p className="text-muted-foreground">任务历史和 Bot 的长期记忆分别保存。执行服务的会话缓存由执行设备管理。本轮采用的内容以来源记录为准，补充的接收与回合归属以输入状态为准。</p>
-    <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={() => { setError(null); void workspace.readScopeContext({ target: { kind: "task", task_id: task.task_id } }).then(setContext, setError) }}>重新读取上下文</Button>
+    <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={() => { setError(null); void workspace.readScopeContext({ target }).then(setContext, setError) }}>重新读取上下文</Button>
     <InlineError error={error} />
     {context?.available ? <ScopeContextDetails context={context.context} /> : <p className="text-muted-foreground">{context ? context.reason || '这个任务尚无已编译的上下文。' : error ? '本次未读到任务上下文。' : '正在查询这个任务的上下文。'}</p>}
     <Button asChild variant="ghost" size="sm" className="justify-self-start"><Link to="/b/$botId" params={{ botId: task.owner_bot }}>打开 Bot 上下文</Link></Button>

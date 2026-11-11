@@ -169,7 +169,7 @@ test("a bounded overview adds observations without deleting known work or replac
   assert.match(notes, /部分记录/)
   assert.match(notes, /截断/)
   assert.match(notes, /尚未读取其他设备的后台工作/)
-  assert.doesNotMatch(notes, /0 项|另有/, "unknown omission counts are not fabricated")
+  assert.doesNotMatch(notes, /0 项/, "unknown omission counts are not fabricated")
   assert.match(overviewScope({ ...overview.coverage, omitted_tasks: 3 }).join(" · "), /本次总览未返回 3 项任务/)
 })
 

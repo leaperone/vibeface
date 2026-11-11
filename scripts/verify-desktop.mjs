@@ -43,7 +43,6 @@ function readReceipt(input, target, version) {
   assert(SIGNING_STATES.includes(receipt.signing) && typeof receipt.signed === 'boolean', 'invalid desktop signing status');
   assert.equal(receipt.signed, ['developer-id-notarized', 'authenticode'].includes(receipt.signing), 'desktop signing status and signed flag disagree');
   assert(!receipt.signed || receipt.signing === platform.signing, 'desktop signing kind does not match its platform');
-  assert(receipt.signing !== 'platform-checksums' || target.endsWith('-unknown-linux-gnu'), 'platform checksums are Linux-only');
   assert(target.endsWith('-unknown-linux-gnu') ? receipt.signing === 'platform-checksums' : receipt.signing !== 'platform-checksums',
     'desktop signing status does not match its platform');
   assert.equal(receipt.runtime.archive, `vibeface-${version}-${target}.tar.gz`, 'the runtime must be this platform CLI bundle');

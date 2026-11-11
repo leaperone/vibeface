@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Windows%20x64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/install.md)
 
 </div>
 
@@ -136,14 +136,18 @@ bash scripts/package-node.sh
 │   ├── app/         # 网页应用
 │   ├── cli/         # 命令行
 │   ├── core/        # Node 本机服务
+│   ├── desktop/     # 桌面应用
 │   ├── mobile/      # iOS 和 Android 应用
 │   └── www/         # 公共网站
 ├── crates/          # 共享 Rust 库
 ├── packages/
 │   ├── client/      # 共享应用客户端
 │   ├── docs/        # 用户和开发者指南
+│   ├── secure-native/ # 移动应用使用的 Rust 加密绑定
 │   └── theme/       # 共享样式
+├── config/          # 官方公共节点地址
 ├── contracts/       # 实验性文件交付合约
+├── deploy/          # 官方服务的容器部署
 ├── scripts/         # 构建、打包和验证工具
 ├── tests/           # 测试夹具和端到端测试
 └── install.sh       # 安装脚本

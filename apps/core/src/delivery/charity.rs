@@ -388,6 +388,7 @@ impl Delivery {
         self.with_store(|store| {
             let previous = store
                 .value("charity-receiving-current")?
+                .map(Zeroizing::new)
                 .map(|bytes| serde_json::from_slice::<ReceivingMaterial>(&bytes))
                 .transpose()?;
             if let Some(material) = &previous {
@@ -872,6 +873,10 @@ impl Delivery {
                         return Ok(());
                     }
                 }
+                ensure!(
+                    now() <= stored.order.terms.retain_until,
+                    "charity delivery expired without a receipt"
+                );
                 if !stored.notified {
                     self.charity_authorized(stored).await?;
                     charity_request(

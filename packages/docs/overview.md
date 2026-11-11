@@ -64,7 +64,7 @@ Bot 的协调角色与任务执行角色可以选择不同产品，各自的原�
 | `apps/core` | Rust 后台 `vibeface-core`，负责身份、存储、同步、调度和执行。 |
 | `apps/cli` | `vibeface` 命令行，负责启动、服务管理、更新与命令交互。 |
 | `apps/mobile` | 原生 iOS、Android 客户端，通过共享协议连接 Node。 |
-| `apps/desktop` | macOS、Windows 桌面客户端，复用操作界面，并管理本机 Node 的连接与生命周期。 |
+| `apps/desktop` | macOS、Windows、Linux 桌面客户端，复用操作界面，并管理本机 Node 的连接与生命周期。 |
 
 安装包把 CLI、Core 和静态网页放在同一个发行目录，便于一起安装与更新，但三者职责独立。网页独立部署并不提供一台执行电脑，也不会自动获得你的设备权限。`app.vibeface.dev` 的可用性以实际部署为准，本地上手使用 `http://localhost:4790`。
 

@@ -2888,7 +2888,14 @@ def protected_package_dispatch(package_input, expected, run_directory):
     container = protected_container(original, package, expected, run, common, git_directory, name)
     process = None
     returncode = 1
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(*_):
+        raise InterruptedError("Protected native acceptance interrupted")
+
     try:
+        # The docker client runs in its own session, so only this handler lets a terminated host reach the cleanup below.
+        signal.signal(signal.SIGTERM, interrupted)
         process = subprocess.Popen(container, cwd=ROOT, start_new_session=True)
         returncode = process.wait()
     finally:
@@ -2905,6 +2912,7 @@ def protected_package_dispatch(package_input, expected, run_directory):
                 terminate_owned(process)
             except Exception:
                 returncode = returncode or 1
+            signal.signal(signal.SIGTERM, previous_term)
         try:
             public, passed = protected_public(run, expected, returncode)
         except Exception:
@@ -3039,7 +3047,16 @@ def self_test_protected(original):
              patch("socket.socket", forbidden), patch("time.time", side_effect=[0, LIVE_TIMEOUT_SECONDS + 1]), \
              patch.dict(os.environ, {"GITHUB_OUTPUT": ""}), patch("builtins.print"):
             protected_package_dispatch(package, expected, run)
-        process.wait.assert_called_once_with()
+            process.wait.assert_called_once_with()
+            previous_term = signal.getsignal(signal.SIGTERM)
+            terminated = Mock(wait=Mock(side_effect=lambda: os.kill(os.getpid(), signal.SIGTERM) or time.sleep(5)), poll=Mock(side_effect=[None, 0]))
+            with patch("subprocess.Popen", return_value=terminated), patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as cleanup, \
+                 patch("subprocess.check_output", side_effect=[str(common) + "\n", str(common / "worktrees/task") + "\n"]):
+                try: protected_package_dispatch(package, expected, Path(temporary) / "terminated")
+                except InterruptedError: pass
+                else: raise AssertionError("a terminated protected host must not report success")
+            assert [call.args[0][:2] for call in cleanup.call_args_list] == [["docker", "stop"], ["docker", "rm"]], "a terminated host must stop its container"
+            assert signal.getsignal(signal.SIGTERM) is previous_term
         assert "timeout" not in build.call_args.kwargs, "the native stages must not inherit the old UI total timeout"
     with tempfile.TemporaryDirectory(prefix="protected-npm-cache-selftest-", dir=ARTIFACTS) as temporary:
         run = Path(temporary); package = run / "package"; package.mkdir()

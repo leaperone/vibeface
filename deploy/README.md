@@ -12,7 +12,7 @@ python3 deploy/static-config.py --role app --component .artifacts/deploy/app/com
 
 App 使用制品内 `_headers` 的 CSP 和缓存规则，保留 `/_shell.html` 回退，缺失 API、SDK 和资源返回 404。静态容器以 UID/GID 101 运行，只监听容器内 8080，由 Compose 映射到配置中的宿主回环端口。
 
-远端需有 Docker Compose、Python 3.12 或更新版本和 systemd；静态角色另需 Nginx。脚本只用 `systemctl is-active`、`is-enabled`、`start`、`stop`、`enable`、`disable`，systemd 219（CentOS 7）即可。先导入镜像，再在宿主以 root 执行 `scripts/deploy-activate.py`。将 `deploy/` 放在该脚本同级目录或父目录。镜像参数必须是已导入的 `sha256:` image ID，不使用可移动 tag。
+远端需有 Docker Compose、Python 3.12 或更新版本和 systemd；静态角色另需 Nginx。脚本不启停宿主 systemd 服务；首次安装时只按文本读取 unit 文件和 drop-in 检查是否引用 `data_dir`，静态角色切换后执行 `systemctl reload nginx.service`，systemd 219（CentOS 7）即可。先导入镜像，再在宿主以 root 执行 `scripts/deploy-activate.py`。将 `deploy/` 放在该脚本同级目录或父目录。镜像参数必须是已导入的 `sha256:` image ID，不使用可移动 tag。
 
 ```sh
 python3 scripts/deploy-activate.py --config /run/private/deploy.json \
@@ -107,7 +107,7 @@ Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一�
 
 激活日志和 Compose 文件留在私有 `deploy_dir`。旧 Nginx 文件和离线备份只供激活中回滚；确认新容器后删除，同时删除其他旧 release 目录和上一版镜像，主机只保留当前版本。需要留档时在激活前把数据拷到本地。镜像健康需同时满足容器 running/healthy 与 Core inspect 的 running、版本和 device ID。失败时先停新容器，再恢复旧容器，并恢复 Nginx；全新安装没有旧服务，只停新容器；不会自动覆盖现有数据。中断后的非终态日志会先回滚并退出，检查旧服务后可重跑原命令。新容器无法确认停止时拒绝启动旧进程。确认后的同一请求会再次核对实际容器健康。
 
-`deploy-services` 部署 node 时，无论是否 `apply`，先选择候选发布时间之前最近的完整产品 Release，复用制品与摘要校验后构建旧 Core 镜像。旧 Core 初始化并启动 fixture，再在它运行时原子写入候选 Core 生成的完整配置，随后激活候选镜像并重复激活，核对原身份、bootstrap 文件、epoch 和数据库中的初始化记录保留。两个镜像只替换 fixture 的 `public-bootstrap.json`；数据格式和配置均按各自发布版实际生成，不做兼容迁移。fixture 只用回环地址、独立 mesh 和生成的数据。缺少历史完整产品 Release 时输出 `first_release`，验证首次安装和重复激活；其他查询、校验或升级错误一律停止。演练失败则不触碰主机。
+`deploy-services` 部署 node 时，无论是否 `apply`，先选择候选发布时间之前最近的完整产品 Release，复用制品与摘要校验后构建旧 Core 镜像。旧 Core 初始化并启动 fixture，再在它运行时原子写入候选 Core 生成的完整配置，随后激活候选镜像并重复激活，核对原身份、bootstrap 文件、epoch 和数据库中的初始化记录保留。两个镜像只替换 fixture 的 `public-bootstrap.json`；数据格式和配置均按各自发布版实际生成，不做兼容迁移。fixture 对外公布的地址（`public_url`、`relay_url`、bootstrap anchor）都是回环，Core 仍按公共节点配置以 host network 监听 runner 的 `0.0.0.0:4792` 和 `0.0.0.0:3340`，使用独立 mesh 和生成的数据。缺少历史完整产品 Release 时输出 `first_release`，验证首次安装和重复激活；其他查询、校验或升级错误一律停止。演练失败则不触碰主机。
 
 本地验证入口均不访问生产服务。
 
