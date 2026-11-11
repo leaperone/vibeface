@@ -29,11 +29,11 @@ typography:
   badge:
     fontSize: "11px"
   body:
-    fontFamily: "Geist Variable, -apple-system, BlinkMacSystemFont, system-ui, sans-serif"
+    fontFamily: "Geist Variable, -apple-system, BlinkMacSystemFont, PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif"
     fontSize: "15px"
     lineHeight: "24px"
   meta:
-    fontFamily: "Geist Variable, -apple-system, BlinkMacSystemFont, system-ui, sans-serif"
+    fontFamily: "Geist Variable, -apple-system, BlinkMacSystemFont, PingFang SC, Hiragino Sans GB, Microsoft YaHei, system-ui, sans-serif"
     fontSize: "13px"
     lineHeight: "20px"
 rounded:
@@ -58,9 +58,9 @@ components:
 
 ## Overview
 
-**Creative North Star: "Quiet control room"**
+**Creative North Star: "Quiet personal workspace"**
 
-Working description of the incumbent implementation, pending qualitative confirmation.
+This description records the incumbent interface; the source tokens below define the system.
 
 The web app is an Operate surface. It keeps attention on the current conversation or task while the sidebar provides stable orientation. Geist, cool neutral surfaces, and a restrained violet brand accent make state changes legible without turning the workspace into a dashboard of competing signals.
 

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-11T19:05:18.003160+00:00",
+  "generatedAt": "2026-11-11T19:54:07.567418+00:00",
   "title": "Design System: Vibeface Web App",
   "extensions": {
     "colorMeta": {
@@ -290,8 +290,8 @@
     }
   ],
   "narrative": {
-    "northStar": "Quiet control room",
-    "overview": "**Creative North Star: \"Quiet control room\"**\n\nWorking description of the incumbent implementation, pending qualitative confirmation.\n\nThe web app is an Operate surface. It keeps attention on the current conversation or task while the sidebar provides stable orientation. Geist, cool neutral surfaces, and a restrained violet brand accent make state changes legible without turning the workspace into a dashboard of competing signals.\n\n**Key Characteristics:** calm, task-first, state-explicit, keyboard-friendly, responsive.",
+    "northStar": "Quiet personal workspace",
+    "overview": "**Creative North Star: \"Quiet personal workspace\"**\n\nThis description records the incumbent interface; the source tokens below define the system.\n\nThe web app is an Operate surface. It keeps attention on the current conversation or task while the sidebar provides stable orientation. Geist, cool neutral surfaces, and a restrained violet brand accent make state changes legible without turning the workspace into a dashboard of competing signals.\n\n**Key Characteristics:** calm, task-first, state-explicit, keyboard-friendly, responsive.",
     "keyCharacteristics": [
       "calm",
       "task-first",

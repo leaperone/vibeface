@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-11T19:05:18.003795+00:00",
+  "generatedAt": "2026-11-11T19:54:07.568201+00:00",
   "title": "Design System: Vibeface Mobile App",
   "extensions": {
     "colorMeta": {
@@ -260,8 +260,8 @@
     }
   ],
   "narrative": {
-    "northStar": "Quiet control room",
-    "overview": "**Creative North Star: \"Quiet control room\"**\n\nWorking description of the incumbent implementation, pending qualitative confirmation.\n\nThe mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.\n\n**Key Characteristics:** native, calm, task-first, accessible, interruption-aware.",
+    "northStar": "Quiet personal workspace",
+    "overview": "**Creative North Star: \"Quiet personal workspace\"**\n\nThis description records the incumbent interface; the source tokens below define the system.\n\nThe mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.\n\n**Key Characteristics:** native, calm, task-first, accessible, interruption-aware.",
     "keyCharacteristics": [
       "native",
       "calm",

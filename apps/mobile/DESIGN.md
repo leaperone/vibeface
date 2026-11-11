@@ -44,9 +44,9 @@ components:
 
 ## Overview
 
-**Creative North Star: "Quiet control room"**
+**Creative North Star: "Quiet personal workspace"**
 
-Working description of the incumbent implementation, pending qualitative confirmation.
+This description records the incumbent interface; the source tokens below define the system.
 
 The mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.
 
@@ -77,6 +77,7 @@ Rounded 12–14px cards and 24–26px chat materials establish the current langu
 - **Button/Input/Text primitives:** shared Uniwind variants with accessible labels and selected/disabled states.
 - **Chat bubbles and composer:** distinct sender grouping, attachment controls, stop/send actions, and keyboard-safe layout.
 - **Home list and workspace rows:** compact identity plus state, with clear press feedback.
+- **Notification prompt:** at system font scales of 1.3 and above, wrap the actions below the explanation instead of squeezing the text between controls.
 - **Sheets and modals:** protected focus for target selection, recovery, and queue actions.
 - **EmptyState and ErrorText:** a concise explanation and one retry or recovery action.
 
