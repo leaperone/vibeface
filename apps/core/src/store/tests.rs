@@ -5885,12 +5885,15 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
     store.post_input_fixture(&net.a, &net.network, signed_user(net, "m1", "hi", true)?, 2)?;
     write(&mut store, net, &fleet.x, "x1", 3)?;
     let ledgers = |store: &Store| -> Result<Vec<String>> {
-        let derived = [
+        let shared_or_query_cache = [
             "events",
             "event_blobs",
             "log_heads",
             "pending_events",
             "networks",
+            // Rebuilds advance this local read-cache epoch to invalidate old cursors.
+            // It is not an execution, scheduling, identity or side-effect ledger.
+            "conversation_history_revisions",
         ];
         let tables: Vec<String> = store
             .connection
@@ -5900,7 +5903,10 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
         let mut rows = Vec::new();
         for table in tables
             .iter()
-            .filter(|t| !reduce::TABLES.contains(&t.as_str()) && !derived.contains(&t.as_str()))
+            .filter(|t| {
+                !reduce::TABLES.contains(&t.as_str())
+                    && !shared_or_query_cache.contains(&t.as_str())
+            })
         {
             let mut statement = store
                 .connection

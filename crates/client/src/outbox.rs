@@ -741,7 +741,7 @@ mod lease_tests {
         let mut db = Outbox::open(&dir, "network", "client")?;
         let file = db.store_attachment("draft.txt", b"must survive")?;
         let orphan = db.store_attachment("orphan.txt", b"not referenced")?;
-        db.retain_attachments("message-draft", &[file.clone()])?;
+        db.retain_attachments("message-draft", std::slice::from_ref(&file))?;
         drop(db);
         let db = Outbox::open(&dir, "network", "client")?;
         db.collect_attachments(&[])?;

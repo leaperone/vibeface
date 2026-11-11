@@ -6335,6 +6335,32 @@ def delivery_free_state(nodes, spy):
     return {"wallet_files": wallets, "transaction_rows": transactions, "chain_rpc_calls": spy.calls}
 
 
+def require_disabled_delivery(node, state):
+    require(state["availability"] == {"state": "disabled"}
+            and state["enabled"] is False and state["paid_enabled"] is False,
+            "object delivery starts disabled with paid delivery inactive")
+    # Disabled delivery defers opening the independent keystore, so it cannot claim the
+    # loaded-wallet state `absent`. Other Unavailable reasons must still fail this check.
+    require(state["wallet"] == {
+        "state": "unavailable",
+        "reason": "delivery wallet is inactive until paid delivery is enabled",
+        "address": None,
+    } and state["receiver_key"] is None,
+            "disabled object delivery keeps its wallet and receiving key inactive")
+    require(not os.path.lexists(node.directory / "delivery-wallet.json")
+            and not os.path.lexists(node.directory / "delivery"),
+            "disabled object delivery creates no independent wallet or service store")
+
+
+def delivery_public_report(report):
+    public = {"status": report["status"], "mode": report["mode"],
+              "binary_sha256": report["binary_sha256"], "profile_sha256": report["profile_sha256"],
+              "passed_cases": sorted(report["cases"])}
+    if "failure" in report:
+        public["failure"] = {"type": report["failure"]["type"]}
+    return public
+
+
 def delivery_call(node, op, **params):
     def attempt():
         response = node.client.command("request", method="delivery", params={"op": op, **params})
@@ -6452,13 +6478,17 @@ def delivery_charity_acceptance(options):
                            for node in (source, receiver)}
         for node in (source, receiver):
             state = call(node, "status")
-            require(state["enabled"] is False and state["wallet"]["state"] == "absent",
-                    "object delivery starts disabled with no independent wallet")
+            require_disabled_delivery(node, state)
         everyone = {node.device_id for node in nodes}
         wait_for("every Node learns every record through the free mesh", lambda: all(
             {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]} == everyone for node in nodes),
             timeout=90)
-        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone))
+        for node in (source, receiver):
+            require_disabled_delivery(node, call(node, "status"))
+        service_stores = sum(os.path.lexists(node.directory / "delivery") for node in nodes)
+        require(service_stores == 0, "the disabled mesh creates no delivery service stores on any Node")
+        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone),
+               service_store_directories=service_stores)
         for node in (source, receiver):
             state = call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
             require(state["enabled"] and not state["paid_enabled"], "manager explicitly enables charity")
@@ -6569,6 +6599,7 @@ def delivery_charity_acceptance(options):
             node.stop()
         spy.close()
         private_json(run / "summary.json", report)
+        private_json(run / "report.json", delivery_public_report(report))
         print("Delivery report: " + str(run / "summary.json"), flush=True)
     return report
 

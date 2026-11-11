@@ -410,6 +410,12 @@ impl std::fmt::Display for Revoked {
     }
 }
 impl std::error::Error for Revoked {}
+
+struct AuthenticatedSession {
+    connection: Connection,
+    authority: ClientAuthority,
+    proof: crate::profile::CachedProfile,
+}
 #[derive(Clone)]
 pub struct Client {
     key: Arc<ClientKey>,
@@ -434,18 +440,17 @@ impl Client {
         endpoint: Endpoint,
         outbox_dir: PathBuf,
     ) -> Result<Self> {
-        let (connection, network, authority, proof) =
-            match Self::authenticate(&key, &endpoint).await {
-                Ok(value) => value,
-                Err(error) => {
-                    if error.is::<Revoked>() {
-                        Self::invalidate_cached(&key, &endpoint, &outbox_dir).await?;
-                    }
-                    return Err(error);
+        let session = match Self::authenticate(&key, &endpoint).await {
+            Ok(value) => value,
+            Err(error) => {
+                if error.is::<Revoked>() {
+                    Self::invalidate_cached(&key, &endpoint, &outbox_dir).await?;
                 }
-            };
+                return Err(error);
+            }
+        };
         let client_id = key.device_id().to_owned();
-        let outbox_network = network.clone();
+        let outbox_network = session.proof.network_id.clone();
         let outbox = tokio::task::spawn_blocking(move || {
             Outbox::open(&outbox_dir, &outbox_network, &client_id)
         })
@@ -453,10 +458,7 @@ impl Client {
         Self::attach(
             key,
             endpoint,
-            connection,
-            network,
-            authority,
-            proof,
+            session,
             Arc::new(Mutex::new(outbox)),
             Arc::new(Semaphore::new(8)),
             Arc::new(Mutex::new(BTreeMap::new())),
@@ -602,15 +604,7 @@ impl Client {
     ) -> Result<Self> {
         Self::open(key, Endpoint::Local(grant), outbox_dir).await
     }
-    async fn authenticate(
-        key: &ClientKey,
-        endpoint: &Endpoint,
-    ) -> Result<(
-        Connection,
-        String,
-        ClientAuthority,
-        crate::profile::CachedProfile,
-    )> {
+    async fn authenticate(key: &ClientKey, endpoint: &Endpoint) -> Result<AuthenticatedSession> {
         let network = match endpoint {
             Endpoint::Local(grant) => {
                 ensure!(
@@ -626,7 +620,7 @@ impl Client {
             key.network_id().is_none_or(|known| known == network),
             "entry belongs to another personal network"
         );
-        let connection = Connection::open_endpoint(&endpoint, &key.identity).await?;
+        let connection = Connection::open_endpoint(endpoint, &key.identity).await?;
         let authentication = connection.call("authenticate", json!({})).await?;
         if authentication["revoked"] == true || authentication["node_revoked"] == true {
             return Err(Revoked.into());
@@ -683,19 +677,26 @@ impl Client {
             write_gate: 0,
             revoked: false,
         };
-        Ok((connection, network, authority, proof))
+        Ok(AuthenticatedSession {
+            connection,
+            authority,
+            proof,
+        })
     }
     async fn attach(
         key: Arc<ClientKey>,
         endpoint: Endpoint,
-        connection: Connection,
-        network: String,
-        authority: ClientAuthority,
-        mut proof: crate::profile::CachedProfile,
+        session: AuthenticatedSession,
         outbox: Arc<Mutex<Outbox>>,
         writes: Arc<Semaphore>,
         decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
     ) -> Result<Self> {
+        let AuthenticatedSession {
+            connection,
+            authority,
+            mut proof,
+        } = session;
+        let network = proof.network_id.clone();
         let event_network = network.clone();
         let (events, _) = broadcast::channel(128);
         let generation = uuid::Uuid::new_v4().to_string();
@@ -760,33 +761,29 @@ impl Client {
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
     pub async fn reconnect(&self, endpoint: Endpoint) -> Result<Self> {
-        let (connection, network, authority, proof) =
-            match Self::authenticate(&self.key, &endpoint).await {
-                Ok(value) => value,
-                Err(error) => {
-                    if error.is::<Revoked>() {
-                        let target = endpoint.node_id().to_owned();
-                        if target == self.target {
-                            self.revoked.store(true, Ordering::Release);
-                            self.connection.close();
-                        }
-                        self.stored(move |db| db.invalidate_profile(&target))
-                            .await?;
+        let session = match Self::authenticate(&self.key, &endpoint).await {
+            Ok(value) => value,
+            Err(error) => {
+                if error.is::<Revoked>() {
+                    let target = endpoint.node_id().to_owned();
+                    if target == self.target {
+                        self.revoked.store(true, Ordering::Release);
+                        self.connection.close();
                     }
-                    return Err(error);
+                    self.stored(move |db| db.invalidate_profile(&target))
+                        .await?;
                 }
-            };
+                return Err(error);
+            }
+        };
         ensure!(
-            network == self.network,
+            session.proof.network_id == self.network,
             "reconnect cannot switch outbox networks"
         );
         let next = Self::attach(
             self.key.clone(),
             endpoint,
-            connection,
-            network,
-            authority,
-            proof,
+            session,
             self.outbox.clone(),
             self.writes.clone(),
             self.decision_tokens.clone(),
@@ -2957,16 +2954,17 @@ mod offline_tests {
             client.send_staged("must-stay-local").await?.state,
             OperationState::Prepared
         );
-        let saved = evidence.lock().expect("fixture");
-        assert!(saved.counts.is_empty());
-        assert_eq!(
-            saved.controls,
-            vec![
-                json!({"method":"cancel_manager","conversation_id":"chat","trigger":"message:original"}),
-                json!({"method":"interrupt_work","conversation_id":"chat","work_id":"original-work"})
-            ]
-        );
-        drop(saved);
+        {
+            let saved = evidence.lock().expect("fixture");
+            assert!(saved.counts.is_empty());
+            assert_eq!(
+                saved.controls,
+                vec![
+                    json!({"method":"cancel_manager","conversation_id":"chat","trigger":"message:original"}),
+                    json!({"method":"interrupt_work","conversation_id":"chat","work_id":"original-work"})
+                ]
+            );
+        }
         client.close();
         drop(client);
         server.await??;

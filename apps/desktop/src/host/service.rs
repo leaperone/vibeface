@@ -178,10 +178,7 @@ pub(crate) async fn invoke(
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command
-        .spawn()
-        .context("无法运行随包 CLI。")
-        .map_err(|_| anyhow::anyhow!("无法运行随包 CLI。"))?;
+    let mut child = command.spawn().context("无法运行随包 CLI。")?;
     let stdout = child.stdout.take().context("CLI 输出管道缺失。")?;
     let stderr = child.stderr.take().context("CLI 错误管道缺失。")?;
     let timeout = Duration::from_secs(if action == BackgroundAction::Update {
@@ -211,5 +208,25 @@ pub(crate) async fn invoke(
                 _ => bail!("后台节点操作超时，结果未知。请刷新状态核对，勿重复操作。"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vibeface_bridge::platform::privatefs;
+
+    #[tokio::test]
+    async fn cli_spawn_failure_retains_the_underlying_os_error_without_command_arguments() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vf-cli-spawn-error-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir_new(&root)?;
+        let binary = root.join(if cfg!(windows) { "missing-cli.exe" } else { "missing-cli" });
+        let error = invoke(&binary, &root, BackgroundAction::Status, None).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::NotFound));
+        assert!(error.to_string().contains("无法运行随包 CLI"));
+        assert!(!format!("{error:#}").contains("--profile-dir"));
+        assert!(!format!("{error:#}").contains(root.to_string_lossy().as_ref()));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

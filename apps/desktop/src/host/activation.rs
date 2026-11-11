@@ -86,6 +86,44 @@ impl ActivationQueue {
     }
 }
 
+#[cfg(unix)]
+fn private_runtime_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+        Err(error) => return Err(error).context("无法创建桌面私有激活目录。"),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "桌面激活目录必须是当前账号的普通私有目录。"
+    );
+    // Never repair an existing directory owned by somebody else or reachable by other users.
+    privatefs::ensure_private(path, "桌面激活目录")
+}
+
+fn activation_endpoint(profile: &Path) -> Result<Endpoint> {
+    let key = format!("{:x}", Sha256::digest(profile.to_string_lossy().as_bytes()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // prepare_profile has already verified that this directory belongs to this account.
+        let account = std::fs::metadata(profile)?.uid();
+        let directory = std::path::PathBuf::from(format!("/tmp/vibeface-desktop-{account}"));
+        private_runtime_directory(&directory)?;
+        let endpoint = Endpoint::in_private_dir(&directory, &format!("{}.sock", &key[..32]))?;
+        // A 128-bit profile hash leaves room even for Darwin's /private/tmp spelling.
+        use std::os::unix::ffi::OsStrExt;
+        ensure!(endpoint.path().as_os_str().as_bytes().len() < 104, "桌面激活端点超过系统路径限制。");
+        Ok(endpoint)
+    }
+    #[cfg(windows)]
+    {
+        Endpoint::in_private_dir(profile, &format!("desktop-{}.sock", &key[..16]))
+    }
+}
+
 pub enum InstanceClaim {
     Primary(SingleInstance),
     Forwarded,
@@ -100,8 +138,7 @@ impl SingleInstance {
     pub async fn claim(profile: &Path, argv: &[String]) -> Result<InstanceClaim> {
         super::prepare_profile(profile)?;
         let profile = std::fs::canonicalize(profile)?;
-        let key = format!("{:x}", Sha256::digest(profile.to_string_lossy().as_bytes()));
-        let endpoint = Endpoint::in_private_dir(&profile, &format!("desktop-{}.sock", &key[..16]))?;
+        let endpoint = activation_endpoint(&profile)?;
         endpoint.ensure_private("桌面激活端点")?;
         let lock_path = profile.join("desktop-instance.lock");
         let lock = privatefs::open_or_create(&lock_path)?;
@@ -201,5 +238,28 @@ impl SingleInstance {
 impl Drop for SingleInstance {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn activation_runtime_directory_refuses_links_and_permissive_permissions() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vf-activation-root-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir_new(&root)?;
+        let directory = root.join("private");
+        private_runtime_directory(&directory)?;
+        privatefs::ensure_private(&directory, "synthetic activation directory")?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
+        assert!(private_runtime_directory(&directory).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let alias = root.join("alias");
+        symlink(&directory, &alias)?;
+        assert!(private_runtime_directory(&alias).is_err());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

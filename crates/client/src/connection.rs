@@ -209,7 +209,7 @@ impl Connection {
                             .into(),
                     ))
                     .await?;
-                Transport::Web(socket)
+                Transport::Web(Box::new(socket))
             }
             Endpoint::Local(grant) => {
                 let (socket, _) = tokio_tungstenite::connect_async_with_config(
@@ -218,7 +218,7 @@ impl Connection {
                     false,
                 )
                 .await?;
-                Transport::Web(socket)
+                Transport::Web(Box::new(socket))
             }
             Endpoint::Preferred { .. } => {
                 bail!("preferred route was not resolved before Noise handshake")
@@ -348,8 +348,11 @@ async fn run(
                     if pending.contains_key(&request.id) {
                         let _ = request.reply.send(Err(anyhow::anyhow!("request already in flight"))); continue;
                     }
-                    if let Some(before_write)=request.before_write.take() {
-                        if let Err(error)=before_write().await {let _=request.reply.send(Err(error));continue;}
+                    if let Some(before_write) = request.before_write.take()
+                        && let Err(error) = before_write().await
+                    {
+                        let _ = request.reply.send(Err(error));
+                        continue;
                     }
                     ensure!(!*shutdown.borrow(),"connection closed before write");
                     let records = channel.seal_message(&request.bytes)?;
@@ -404,7 +407,7 @@ fn websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConf
         .max_write_buffer_size(256 * 1024)
 }
 enum Transport {
-    Web(Socket),
+    Web(Box<Socket>),
     Lan(Arc<LanStream>),
 }
 impl Transport {
@@ -423,7 +426,7 @@ impl Transport {
     fn split(self) -> (Writer, Reader) {
         match self {
             Self::Web(s) => {
-                let (w, r) = s.split();
+                let (w, r) = (*s).split();
                 (Writer::Web(w), Reader::Web(r))
             }
             Self::Lan(s) => (Writer::Lan(s.clone()), Reader::Lan(s)),

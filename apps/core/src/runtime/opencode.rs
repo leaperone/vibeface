@@ -57,8 +57,6 @@ pub struct Opencode {
     unresolved_uses: std::sync::Mutex<HashMap<String, Use>>,
     /// Sessions a work is being sent into now.
     starting: std::sync::Mutex<BTreeSet<String>>,
-    /// Works whose start runs in this process and has yet to claim its session.
-    sending: std::sync::Mutex<BTreeSet<String>>,
     cancelled_inputs: std::sync::Mutex<BTreeSet<String>>,
 }
 
@@ -283,7 +281,6 @@ impl Opencode {
             users: Default::default(),
             unresolved_uses: Default::default(),
             starting: Default::default(),
-            sending: Default::default(),
             cancelled_inputs: Default::default(),
         })
     }
@@ -1812,7 +1809,6 @@ impl Executor for Opencode {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let id = work.work_id.as_str();
-            let sending = Claim::take(&self.sending, id);
             let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let mut files = Vec::new();
             for image in args["images"].as_array().into_iter().flatten() {
@@ -1863,28 +1859,31 @@ impl Executor for Opencode {
                     }
                 }
             };
-            // Two runs in one session would end each other's turns. A work not known to be sent
-            // holds the session too, unless its own start has yet to try for the session here.
+            // A pinned session is already Starting at admission. Only a durable native
+            // reservation makes that unfinished start a possible session writer.
             let _claim = match thread {
                 Some(_) => {
                     let claim = Claim::take(&self.starting, &session);
-                    drop(sending);
-                    let runs = {
+                    let holder = {
                         let session = session.to_owned();
+                        let work_id = id.to_owned();
                         node.store
                             .call("opencode.work_records_on_thread", move |store| {
-                                store.work_records_on_thread(&session)
+                                for run in store.work_records_on_thread(&session)? {
+                                    if run.work_id == work_id || run.state.finished() {
+                                        continue;
+                                    }
+                                    if matches!(run.state, WorkState::Starting { .. })
+                                        && !store.work_native_submission_reserved(&run.work_id)?
+                                    {
+                                        continue;
+                                    }
+                                    return Ok(Some(run));
+                                }
+                                Ok(None)
                             })
                             .await
                     }?;
-                    let holder = runs.into_iter().find(|run| {
-                        run.work_id != id
-                            && !run.state.finished()
-                            && !(matches!(run.state, WorkState::Starting { .. })
-                                && (self.sending.lock())
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .contains(&run.work_id))
-                    });
                     let busy = match (&claim, &holder) {
                         (None, _) => {
                             Some("opencode is starting another work in this session".to_owned())
@@ -1907,10 +1906,7 @@ impl Executor for Opencode {
                     }
                     claim
                 }
-                None => {
-                    drop(sending);
-                    None
-                }
+                None => None,
             };
             // Journaled before the send: a restart reads the run back by the work's message.
             let signal = Signal::ThreadCreated(session.clone());
@@ -3977,7 +3973,12 @@ mod tests {
             call_ref: "w-2".into(),
             ..first.clone()
         };
-        for work in [&first, &second] {
+        let waiting = WorkSpec {
+            work_id: "w-waiting".into(),
+            call_ref: "w-waiting".into(),
+            ..first.clone()
+        };
+        for work in [&first, &second, &waiting] {
             let (identity, network, work) = (node.identity.clone(), network.clone(), work.clone());
             node.store
                 .call("opencode.accept_fixture", move |store| {
@@ -3991,10 +3992,11 @@ mod tests {
             node.start_work(opencode.as_ref(), &network, &first, Some(&session), &args),
             node.start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
         );
+        let starts = [one, two];
         assert_eq!(
-            [one, two].iter().filter(|start| start.is_err()).count(),
+            starts.iter().filter(|start| start.is_err()).count(),
             1,
-            "the refused start says so"
+            "the refused start says so: {starts:?}"
         );
         assert_eq!(
             place.prompts().len(),
@@ -4018,6 +4020,23 @@ mod tests {
             );
         }
         assert_eq!(rejected, 1, "the other was refused");
+        let (waiting, reserved) = node
+            .store
+            .call("opencode.waiting_work", move |store| {
+                Ok((
+                    store.work_record("w-waiting")?.context("waiting work")?,
+                    store.work_native_submission_reserved("w-waiting")?,
+                ))
+            })
+            .await?;
+        assert_eq!(
+            waiting.state,
+            WorkState::Starting {
+                thread: Some(session),
+            },
+            "the admitted peer still awaits its first native submission"
+        );
+        assert!(!reserved, "an admitted peer does not reserve the session");
         Ok(())
     }
 

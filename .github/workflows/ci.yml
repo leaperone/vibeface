@@ -1343,7 +1343,7 @@ jobs:
             if [[ "$package" == vibeface-client && "$CLIENT_COMPILE" != success ]]; then continue; fi
             if ! cargo test --locked -p "$package" 2>&1 | tee -a .artifacts/native-prepare/tests.log; then result=1; fi
           done
-          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests fresh_main_input_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests workspace::lookup_tests scheduler::context_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
+          for filter in store::actor store::schema_guard store::client_receipts store::tests::performance_tests fresh_main_input_tests conversation_history conversation_sections conversation_settings scheduler_history hold_query_tests workspace::lookup_tests scheduler::context_tests memory_sync_conflicts overwritten attachment_scope workspace_channel_upload_and_download client:: local_access:: runtime::permission_fences runtime::work_input runtime::opencode::tests:: a_rebuild_never_touches_local_ledgers a_waiting_recovery cli_round_trip runtime::pi::transport_tests runtime::codex_server delivery::isolation_tests delivery::wallet delivery::keys delivery::charity; do
             if [[ "$CORE_COMPILE" != success ]]; then break; fi
             test_options=(--test-threads=1)
             if [[ "$filter" == conversation_history ]]; then test_options+=(--nocapture); fi
