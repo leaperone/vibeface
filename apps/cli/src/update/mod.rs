@@ -715,7 +715,7 @@ async fn recover_with_service(
         fs::remove_file(&pending)?;
         privatefs::sync_dir(data)?;
         if confirmed {
-            retain_committed_artifacts(policy, data, &journal);
+            retain_committed_releases(policy, data, &journal);
         }
         eprintln!(
             "Recovered {} program; business data was kept.",
@@ -899,7 +899,7 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
             automatic: false,
             install_root: root.to_owned(),
         };
-        retain_committed_artifacts(&policy, data, &journal);
+        retain_committed_releases(&policy, data, &journal);
     }
     Ok(())
 }
@@ -1194,6 +1194,16 @@ fn retain_committed_artifacts(policy: &Policy, data: &Path, journal: &Journal) {
     if journal.candidate == journal.previous {
         return;
     }
+    retain_committed_releases(policy, data, journal);
+    if let Err(error) = prune_committed_backups(policy, data, journal) {
+        eprintln!("Update committed; backup retention could not finish: {error:#}");
+    }
+}
+
+fn retain_committed_releases(policy: &Policy, data: &Path, journal: &Journal) {
+    if journal.candidate == journal.previous {
+        return;
+    }
     if let Err(error) = release::retain_committed(
         &policy.install_root,
         data,
@@ -1202,9 +1212,6 @@ fn retain_committed_artifacts(policy: &Policy, data: &Path, journal: &Journal) {
         &journal.candidate,
     ) {
         eprintln!("Update committed; release retention could not finish: {error:#}");
-    }
-    if let Err(error) = prune_committed_backups(policy, data, journal) {
-        eprintln!("Update committed; backup retention could not finish: {error:#}");
     }
 }
 

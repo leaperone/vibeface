@@ -924,14 +924,13 @@ pub(super) fn retain_committed(
     };
     let package_digest = |package: &Path| -> Result<String> {
         super::owned_directory(package)?;
+        let contents = tree(package)?;
         ensure!(
             package.file_name().and_then(|name| name.to_str())
                 == Some(super::manifest(package)?.version.to_string().as_str()),
             "release directory does not match its package version"
         );
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&tree(
-            package,
-        )?)?)))
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&contents)?)))
     };
     for package in [previous, candidate] {
         let path = receipt(package)?;

@@ -15,6 +15,7 @@ from urllib.parse import quote
 sys.dont_write_bytecode = True
 import release
 from nightly_source import (DailyPlan, BOT, PATHS, blob, checkout, generated, git, metadata,
+                            abandoned_source,
                             next_build_numbers, next_ios_build_number, nightly_order, recovered_plan,
                             scratch, verify_tree, versions_at)
 
@@ -37,6 +38,7 @@ PART_PUBLISHERS = (
     'publish-desktop-x86_64-pc-windows-msvc',
     'publish-android', 'publish-ios')
 PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'release-failed', 'publish', 'npm')
+MAX_PUBLISHER_ATTEMPTS = 3
 require = release.require
 
 
@@ -215,6 +217,8 @@ def original_artifacts(app, run, source):
 
 def recover_publisher(app, run, source):
     require(app in RELEASES, 'only the product and www release groups can be recovered')
+    require(type(run['run_attempt']) is int and 0 < run['run_attempt'] < MAX_PUBLISHER_ATTEMPTS,
+            'publisher attempt limit reached; review the original failure and declare an explicit Nightly abandonment')
     jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
     producers = [job for job in jobs if job_leaf(job) == PRODUCER]
     require(len(producers) == 1 and producers[0]['conclusion'] == 'success',
@@ -290,7 +294,7 @@ def publish_daily(source, deadline, groups=RELEASES):
 
 def trusted_nightlies(tags, batch):
     """Either group may be the sole surviving tag of a partially published source."""
-    trusted = {}
+    trusted = {}; candidates = []; values_by_source = {}
     for tag in tags:
         try:
             app, value, channel = release.parse_tag(tag)
@@ -299,18 +303,35 @@ def trusted_nightlies(tags, batch):
         if channel != 'nightly':
             continue
         source = git('rev-parse', tag + '^{commit}')
+        subject = git('show', '-s', '--format=%s', source)
+        original_batch = subject == 'chore(release): nightly ' + batch
         try:
             require(set(git('ls-tree', '-r', '--name-only', source, '--', *PATHS).splitlines()) == set(PATHS),
                     'Nightly candidate predates the current release layout')
+            if source not in values_by_source:
+                values_by_source[source] = versions_at(source)
+            values = values_by_source[source]
+            require(values['cli' if app == 'product' else 'www'] == value, 'Nightly tag version mismatch')
+            candidates.append((nightly_order(values['cli']), tag, source, app, original_batch))
+        except ValueError:
+            require(not original_batch, 'existing Nightly batch tag has an invalid immutable source')
+            require(not re.fullmatch(r'chore\(release\): nightly [0-9]{10}', subject),
+                    'existing mechanical Nightly source is invalid or unresolved; reconcile it before allocating')
+    checked = 0
+    for order, tag, source, app, original_batch in sorted(candidates, reverse=True):
+        if trusted and not original_batch:
+            continue
+        checked += 1
+        require(checked <= 16, 'too many invalid Nightly candidates; reconcile immutable tags before continuing')
+        try:
             context = release.validate_source(source, app)
             if app == 'www' and not context['ci_run_id']:
                 continue
-            values = versions_at(source)
-            require(values['cli' if app == 'product' else 'www'] == value, 'Nightly tag version mismatch')
-            order = nightly_order(values['cli'])
         except ValueError:
-            require(git('show', '-s', '--format=%s', source) != 'chore(release): nightly ' + batch,
-                    'existing Nightly batch tag has an invalid immutable source')
+            require(not original_batch, 'existing Nightly batch tag has an invalid immutable source')
+            require(not re.fullmatch(r'chore\(release\): nightly [0-9]{10}',
+                                     git('show', '-s', '--format=%s', source)),
+                    'existing mechanical Nightly source is invalid or unresolved; reconcile it before allocating')
             continue
         trusted[source] = (order, tag, source, context)
     return [(tag, source, context) for _, tag, source, context in sorted(trusted.values(), reverse=True)]
@@ -360,19 +381,22 @@ def ensure_source(batch, base, run_id):
         source = sources.pop()
         plan = recovered_plan(source)
         require(plan.base == base and plan.run_id == str(run_id), 'Nightly batch differs from its original schedule source')
+        require(not abandoned_source(source, plan, release.validate_source(source, 'product')),
+                'this Nightly batch was explicitly abandoned; wait for the next schedule batch')
         return source, completed_source(source)
-    # Finish the previous source before allocating anything new, even across schedule batches.
+    # A reviewed abandonment preserves the failed source and permits a later batch to advance.
     previous = ''
     if trusted:
         _, previous, context = trusted[0]
-        if not completed_source(previous):
+        complete = completed_source(previous)
+        if not complete and not abandoned_source(previous, recovered_plan(previous) if context['ci_run_id'] else None, context):
             return previous, False
         require(subprocess.run(['git', 'merge-base', '--is-ancestor', context['ci_source_commit'], base],
                                cwd=release.ROOT, capture_output=True).returncode == 0,
                 'unstarted Nightly source predates the previous main source')
         require(batch[:8] >= versions_at(previous)['cli'].split('-nightly.')[1].split('.')[0],
                 'unstarted Nightly batch predates the previous Nightly; refusing a downgrade')
-        if context['ci_source_commit'] == base:
+        if complete and context['ci_source_commit'] == base:
             return previous, True
     plan = plan_versions(batch, base, tags, run_id, previous)
     with checkout(base) as clean:
@@ -426,6 +450,8 @@ def run_daily(run_id):
 
 def self_test():
     from unittest.mock import patch
+    import nightly_source
+    real_anchor = nightly_source.complete_release_anchor
 
     with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token'}):
         with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as transport:
@@ -465,6 +491,8 @@ def self_test():
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
         (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
         (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
+        (root / 'scripts').mkdir()
+        (root / nightly_source.ABANDONED).write_text('[]\n')
         git('init', '--initial-branch=main', root=root)
         legacy_blob = git('hash-object', '-w', '--stdin', root=root, data=(root / 'Cargo.lock').read_bytes())
         legacy_tree = git('mktree', root=root, data=f'100644 blob {legacy_blob}\tCargo.lock\n'.encode())
@@ -477,7 +505,8 @@ def self_test():
         git('tag', 'v0.0.1-nightly.20261016.2', legacy_batch, root=root)
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
-        with patch('release.ROOT', root), patch(f'{__name__}.time.sleep'):
+        with patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
+                patch('nightly_source.complete_release_anchor', return_value=False):
             assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile', 'desktop')
             base = git('rev-parse', 'HEAD')
             git('update-ref', 'refs/remotes/origin/main', base)
@@ -767,6 +796,9 @@ def self_test():
                 assert recovered_ids[f'product-release-{merged}-'] == 51 + product_prefixes.index(f'product-release-{merged}-')
                 assert recover_publisher('product', failing, merged)['run_attempt'] == 2
                 assert writes == ['actions/runs/1/rerun-failed-jobs']
+                with patch.dict(failing, {'run_attempt': MAX_PUBLISHER_ATTEMPTS}):
+                    rejected(lambda: recover_publisher('product', failing, merged), 'attempt limit')
+                assert writes == ['actions/runs/1/rerun-failed-jobs']
                 for artifacts in ([], good_artifacts[:-1],
                                   [dict(item, name=(item['name'][:-1] + '2') if item['name'].startswith(f'npm-package-{merged}-') else item['name']) for item in good_artifacts],
                                   [dict(item, expired=True) if item['name'].startswith(f'npm-package-{merged}-') else item for item in good_artifacts],
@@ -874,6 +906,156 @@ def self_test():
                 with patch.dict(os.environ, dict(environment, **changes)), patch(f'{__name__}.api') as no_write:
                     rejected(lambda: run_daily(42))
                     no_write.assert_not_called()
+
+            # A complete public release is a bounded historical proof, not a self-reported manifest.
+            history = [head]
+            batch_time = datetime.datetime(2026, 11, 7, tzinfo=datetime.timezone.utc)
+            for index in range(nightly_source.MAX_HISTORY + 2):
+                candidate = plan_versions((batch_time + datetime.timedelta(hours=index * 4)).strftime('%Y%m%d%H'),
+                                          advanced, ['v' + versions_at(history[-1])['cli']], str(100 + index), history[-1])
+                history.append(commit_files({}, candidate))
+            anchor = history[-2]
+            anchor_plan = recovered_plan(anchor)
+            anchor_context = dict(ci_source_commit=advanced, ci_run_id=anchor_plan.run_id, nightly_batch=anchor_plan.batch)
+            anchor_tag = 'v' + anchor_plan.versions['cli']
+            anchor_run = dict(good, id=200, path=RELEASE, event='workflow_dispatch', head_branch=anchor_tag, head_sha=anchor)
+            manifest = dict(app='product', version=anchor_plan.versions['cli'], tag=anchor_tag,
+                            source_commit=anchor, channel='nightly', schema=release.SCHEMA_VERSION,
+                            assets=[dict(name=name, size=1, sha256='a' * 64)
+                                    for name in sorted(release.product_payload_names(anchor_plan.versions['cli']))])
+            public_state = dict(draft=False)
+            def refresh_assets():
+                import hashlib
+                data = (json.dumps(manifest) + '\n').encode()
+                public_state['assets'] = [dict(asset, digest='sha256:' + asset['sha256']) for asset in manifest['assets']]
+                public_state['assets'].append(dict(name='release.json', size=len(data),
+                                                   digest='sha256:' + hashlib.sha256(data).hexdigest()))
+                return data
+            manifest_bytes = refresh_assets()
+            anchor_jobs = [dict(name=name, status='completed', conclusion='success') for name in ('collect', 'publish-product')]
+            def anchor_api(path, missing=False):
+                if path.startswith('git/ref/tags/'):
+                    return dict(object=dict(type='commit', sha=anchor)) if path.endswith(anchor_tag) else None
+                if path.startswith('releases/tags/'):
+                    return public_state
+                if path.startswith('actions/workflows/'):
+                    return dict(total_count=1, workflow_runs=[anchor_run])
+                if path.startswith('actions/runs/'):
+                    return dict(total_count=len(anchor_jobs), jobs=anchor_jobs)
+                raise AssertionError(path)
+            real_subprocess_run = subprocess.run
+            downloads = []
+            def download_manifest(args, **kwargs):
+                if args[:3] == ['gh', 'release', 'download']:
+                    assert args[args.index('--pattern') + 1] == 'release.json'
+                    downloads.append(args[3])
+                    (Path(args[args.index('--dir') + 1]) / 'release.json').write_bytes(manifest_bytes)
+                    return subprocess.CompletedProcess(args, 0)
+                return real_subprocess_run(args, **kwargs)
+            with patch('nightly_source.github', side_effect=anchor_api), patch('release.require_ci', return_value=schedule), \
+                    patch('subprocess.run', side_effect=download_manifest):
+                assert real_anchor(anchor, anchor_plan, anchor_context)
+                for changes in ({'draft': True},):
+                    with patch.dict(public_state, changes):
+                        assert not real_anchor(anchor, anchor_plan, anchor_context)
+                for changes in ({'status': 'in_progress'}, {'conclusion': 'failure'}, {'head_sha': 'b' * 40},
+                                {'path': CI}, {'repository': dict(full_name='other/repo')}):
+                    with patch.dict(anchor_run, changes):
+                        assert not real_anchor(anchor, anchor_plan, anchor_context)
+                with patch('nightly_source.release_runs', return_value=[anchor_run, anchor_run]):
+                    assert not real_anchor(anchor, anchor_plan, anchor_context)
+                with patch.dict(anchor_jobs[0], {'conclusion': 'failure'}):
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'publisher')
+                with patch.dict(manifest, {'source_commit': 'b' * 40}):
+                    manifest_bytes = refresh_assets()
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'identity mismatch')
+                manifest_bytes = refresh_assets()
+                with patch.dict(public_state['assets'][0], {'digest': None}):
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'remote SHA-256')
+                nightly_source._verified_sources.clear()
+                with patch('nightly_source.complete_release_anchor', side_effect=real_anchor), \
+                        patch('nightly_source.metadata', wraps=metadata) as checks:
+                    assert release.validate_source(history[-1], 'product')['ci_source_commit'] == advanced
+                    assert checks.call_count == 2, 'history validation must stop at the directly previous complete release'
+                assert set(downloads) == {anchor_tag}, 'no historical payload was downloaded'
+            nightly_source._verified_sources.clear()
+            rejected(lambda: release.validate_source(history[-1], 'product'), 'fixed limit')
+
+            # Reviewed main declarations keep failures failed while several later batches advance.
+            reviewed_main = advanced
+            declarations = []; failed_sources = {}; associated_runs = {}
+            def review_abandonments(records):
+                nonlocal reviewed_main
+                git('checkout', '--detach', '-q', reviewed_main)
+                (root / nightly_source.ABANDONED).write_text(json.dumps(records, indent=2) + '\n')
+                git('add', nightly_source.ABANDONED)
+                git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+                    'commit', '-qm', 'record reviewed failed Nightly sources')
+                reviewed_main = git('rev-parse', 'HEAD')
+                git('update-ref', 'refs/remotes/origin/main', reviewed_main)
+            def failed_api(path, missing=False):
+                if path.startswith('git/ref/tags/'):
+                    tag = path.split('/')[-1]
+                    return dict(object=dict(type='commit', sha=failed_sources[tag])) if tag in failed_sources else None
+                if path.startswith('releases/tags/'):
+                    return None
+                if path.startswith('actions/workflows/'):
+                    tag = path.split('&branch=')[1].split('&')[0]
+                    runs = associated_runs.get(tag, [])
+                    return dict(total_count=len(runs), workflow_runs=runs)
+                if path.startswith('actions/runs/'):
+                    return dict(total_count=1, jobs=[dict(name='collect', status='completed', conclusion='failure')])
+                raise AssertionError(path)
+            failed_source = history[-1]
+            latest_batch = datetime.datetime.strptime(recovered_plan(failed_source).batch, '%Y%m%d%H')
+            with patch('nightly_source.github', side_effect=failed_api), patch('release.require_ci', return_value=schedule), \
+                    patch(f'{__name__}.completed_source', return_value=False), patch(f'{__name__}.git', side_effect=fixture_git):
+                for index in range(3):
+                    failed_plan = recovered_plan(failed_source)
+                    reason = ('original producer failed', 'duplicate original runs', 'original artifact expired')[index]
+                    record = dict(source_commit=failed_source, reason=reason + '; preserve its published evidence', releases={})
+                    for app in RELEASES:
+                        tag = release.release_tag_for(app, failed_plan.versions['cli' if app == 'product' else 'www'])
+                        run = dict(good, id=300 + index * 2 + len(record['releases']), path=RELEASE,
+                                   event='workflow_dispatch', head_branch=tag, head_sha=failed_source, conclusion='failure')
+                        git('tag', tag, failed_source)
+                        failed_sources[tag] = failed_source
+                        associated_runs[tag] = [run]
+                        if index == 1 and app == 'product':
+                            associated_runs[tag].append(dict(run, id=run['id'] + 1000))
+                        record['releases'][app] = dict(tag=tag, run_ids=[item['id'] for item in associated_runs[tag]])
+                    declarations.append(record)
+                    review_abandonments(declarations)
+                    remote_tags = '\n'.join(source + '\trefs/tags/' + tag for tag, source in failed_sources.items())
+                    current_context = release.validate_source(failed_source, 'product')
+                    assert abandoned_source(failed_source, failed_plan, current_context)
+                    active_run = associated_runs[record['releases']['product']['tag']][0]
+                    with patch.dict(active_run, {'status': 'in_progress', 'conclusion': None}):
+                        rejected(lambda: abandoned_source(failed_source, failed_plan, current_context), 'active or unknown')
+                        with patch(f'{__name__}.plan_versions', side_effect=AssertionError('active source was skipped')):
+                            rejected(lambda: ensure_source((latest_batch + datetime.timedelta(hours=4)).strftime('%Y%m%d%H'),
+                                                           reviewed_main, 500 + index))
+                    with patch.dict(active_run, {'id': 999}):
+                        rejected(lambda: abandoned_source(failed_source, failed_plan, current_context), 'all associated')
+                    rejected(lambda: ensure_source(failed_plan.batch, failed_plan.base, failed_plan.run_id), 'explicitly abandoned')
+                    latest_batch += datetime.timedelta(hours=4)
+                    next_source, complete = ensure_source(latest_batch.strftime('%Y%m%d%H'), reviewed_main, 400 + index)
+                    next_plan = recovered_plan(next_source)
+                    assert not complete and next_plan.previous == failed_source
+                    assert nightly_order(next_plan.versions['cli']) > nightly_order(failed_plan.versions['cli'])
+                    assert next_plan.android_code > failed_plan.android_code
+                    assert nightly_source.ios_number(next_plan.ios_build_number) > nightly_source.ios_number(failed_plan.ios_build_number)
+                    failed_source = next_source
+                # Working-tree edits cannot authorize abandonment; a new main also invalidates cached declarations.
+                (root / nightly_source.ABANDONED).write_text('[]\n')
+                assert abandoned_source(declarations[-1]['source_commit'], recovered_plan(declarations[-1]['source_commit']),
+                                        release.validate_source(declarations[-1]['source_commit'], 'product'))
+                git('checkout', '--', nightly_source.ABANDONED)
+                review_abandonments([])
+                rejected(lambda: release.validate_source(failed_source, 'product'), 'fixed limit')
+            print('bounded Nightly history: two metadata checks and only the complete manifest downloaded; '
+                  'forged/partial/failed anchors refused; three reviewed producer/duplicate-run/artifact abandonments '
+                  'advanced versions and mobile builds; active/unknown runs and removed main declarations refused')
 
     workflow = (ROOT / CI).read_text()
     assert "cron: '23 */4 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
