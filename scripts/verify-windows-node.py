@@ -502,6 +502,12 @@ class Node:
         ], env=self.environment()).stdout)
         require(access["device_id"], "local access pins the node identity")
         self.device_id = access["device_id"]
+        configuration = json.loads((self.directory / "config.json").read_text(encoding="utf-8"))
+        network = configuration["network"]
+        # A free TCP port may be excluded for UDP on Windows. Keep real QUIC on
+        # loopback and let its UDP bind allocate a port, independently of HTTP.
+        network["bind"] = "127.0.0.1:0"
+        self.configure(network=network)
 
     def environment(self):
         base = {
