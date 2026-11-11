@@ -925,6 +925,13 @@ struct EpochView {
     clients: BTreeSet<String>,
     nodes: BTreeSet<String>,
     signed_removals: BTreeSet<String>,
+    removal: RemovalEvidence,
+}
+
+#[derive(Default)]
+struct RemovalEvidence {
+    support: BTreeSet<String>,
+    before: BTreeSet<String>,
 }
 
 impl CheckedHistory<'_> {
@@ -1005,6 +1012,15 @@ impl CheckedHistory<'_> {
     }
 
     fn project(&self, epoch: usize, basis: &BTreeSet<String>) -> Result<EpochView> {
+        self.project_with_removal(epoch, basis, None)
+    }
+
+    fn project_with_removal(
+        &self,
+        epoch: usize,
+        basis: &BTreeSet<String>,
+        removed: Option<&str>,
+    ) -> Result<EpochView> {
         let root = &self.epochs[self.epochs[epoch].scope];
         let variables: Vec<_> = basis
             .iter()
@@ -1141,6 +1157,55 @@ impl CheckedHistory<'_> {
             effects = next;
         }
         ensure!(stable, "governance effect projection did not converge");
+        let mut removal = RemovalEvidence::default();
+        if let Some(device) = removed {
+            let revocation = variables.iter().enumerate()
+                .filter(|(index, (_, entry))| effects[*index] == Effect::Yes
+                    && matches!(&entry.event.action, GovernanceAction::Revoke(revocation) if revocation.device_id == device))
+                .min_by_key(|(_, (hash, entry))| (entry.ancestors.len(), *hash))
+                .map(|(index, _)| index);
+            let node = variables.iter().enumerate()
+                .filter(|(index, (_, entry))| effects[*index] == Effect::Yes
+                    && matches!(&entry.event.action, GovernanceAction::Grant { member } if member.device_id == device && member.kind == IdentityKind::Node))
+                .min_by_key(|(_, (hash, entry))| (entry.ancestors.len(), *hash))
+                .map(|(index, _)| index);
+            let indices: BTreeMap<_, _> = variables
+                .iter()
+                .enumerate()
+                .map(|(index, (hash, _))| (hash.as_str(), index))
+                .collect();
+            let mut pending: Vec<_> = revocation.into_iter().chain(node).collect();
+            if let Some(index) = revocation {
+                removal.before.insert(variables[index].0.clone());
+                removal
+                    .before
+                    .extend(variables[index].1.ancestors.iter().cloned());
+            }
+            while let Some(index) = pending.pop() {
+                let (hash, entry) = variables[index];
+                if !removal.support.insert(hash.clone()) {
+                    continue;
+                }
+                for ancestor in &entry.ancestors {
+                    if let Some(index) = indices.get(ancestor.as_str()) {
+                        pending.push(*index);
+                    } else {
+                        removal.support.insert(ancestor.clone());
+                    }
+                }
+                // Authority and barriers also depend on concurrent events outside `parents`.
+                let gate = &gates[index];
+                pending.extend(&gate.permission.revokes);
+                for grant in &gate.permission.grants {
+                    pending.push(grant.effect);
+                    pending.extend(&grant.superseded_by);
+                }
+                for barrier in &gate.barriers {
+                    pending.push(barrier.effect);
+                    pending.extend(&barrier.promotions);
+                }
+            }
+        }
         let mut members = BTreeMap::new();
         let mut revoked: BTreeMap<_, _> = root
             .retired
@@ -1232,6 +1297,7 @@ impl CheckedHistory<'_> {
             clients,
             nodes,
             signed_removals,
+            removal,
         })
     }
 
@@ -1263,13 +1329,13 @@ impl CheckedHistory<'_> {
         parent: usize,
         checkpoint: &RootCheckpoint,
         hash: &str,
-    ) -> Result<(bool, Option<u64>, bool)> {
+    ) -> Result<(bool, Option<u64>, bool, BTreeSet<String>)> {
         let Some(electorate) = self.electorate(parent, checkpoint)? else {
-            return Ok((false, None, true));
+            return Ok((false, None, true, BTreeSet::new()));
         };
-        let mut vetoed = false;
-        let mut approved = None::<u64>;
-        for entry in self.events.values().filter(|entry| {
+        let mut veto = None::<String>;
+        let mut approval = None::<(u64, String)>;
+        for (event_hash, entry) in self.events.iter().filter(|(_, entry)| {
             entry.event.epoch == parent as u64 + 1
                 && electorate.contains(&entry.event.issuer)
                 && checkpoint
@@ -1281,17 +1347,29 @@ impl CheckedHistory<'_> {
                 GovernanceAction::Veto {
                     checkpoint: target,
                     at_ms,
-                } if target == hash && *at_ms < checkpoint.effective_at_ms() => vetoed = true,
+                } if target == hash && *at_ms < checkpoint.effective_at_ms() => {
+                    veto.get_or_insert_with(|| event_hash.clone());
+                }
                 GovernanceAction::Approve {
                     checkpoint: target,
                     at_ms,
                 } if target == hash && *at_ms < checkpoint.effective_at_ms() => {
-                    approved = Some(approved.map_or(*at_ms, |known| known.min(*at_ms)));
+                    if approval.as_ref().is_none_or(|(known, _)| *at_ms < *known) {
+                        approval = Some((*at_ms, event_hash.clone()));
+                    }
                 }
                 _ => {}
             }
         }
-        Ok((vetoed, approved, false))
+        let support = veto
+            .clone()
+            .or_else(|| approval.as_ref().map(|(_, hash)| hash.clone()));
+        Ok((
+            veto.is_some(),
+            approval.map(|(at, _)| at),
+            false,
+            support.into_iter().collect(),
+        ))
     }
 }
 
@@ -1480,6 +1558,168 @@ impl NetworkState {
     /// The directory in effect now.
     pub fn project(&self) -> Result<AuthorizationView> {
         self.project_at(now_ms())
+    }
+
+    /// Signed evidence of this Node's current removal, excluding later member grants and
+    /// renames it has not proved it already holds. Recovery and effect barriers stay verifiable.
+    pub fn removal_state(&self, device: &str, known: Option<&Self>) -> Result<Self> {
+        self.removal_state_at(device, known, now_ms())
+    }
+
+    fn removal_state_at(&self, device: &str, known: Option<&Self>, now: u64) -> Result<Self> {
+        // A denial is a bounded recovery path, not a second unbounded directory sync.
+        ensure!(
+            self.checkpoints.len() <= MAX_CHECKPOINTS && self.events.len() <= MAX_GOVERNANCE_EVENTS,
+            "removal evidence exceeds the recovery sync limit"
+        );
+        ensure!(
+            self.project_at(now)?.removed_node(device),
+            "Node is not currently removed"
+        );
+        let mut known_events = BTreeSet::new();
+        let mut known_checkpoints = BTreeSet::new();
+        if let Some(known) = known {
+            ensure!(
+                known.genesis == self.genesis,
+                "different personal-network genesis"
+            );
+            ensure!(
+                known.checkpoints.len() <= MAX_CHECKPOINTS
+                    && known.events.len() <= MAX_GOVERNANCE_EVENTS,
+                "known removal history exceeds the recovery sync limit"
+            );
+            known.project_at(now)?;
+            for event in &known.events {
+                known_events.insert(event.hash()?);
+            }
+            for checkpoint in &known.checkpoints {
+                known_checkpoints.insert(checkpoint.hash()?);
+            }
+        }
+        let epochs = self.epochs(now)?;
+        let current = live(&epochs);
+        let history = self.checked_history()?;
+        // An earlier removal stops being a proof after a live recovery restored this Node.
+        let restored = (1..=current)
+            .rev()
+            .find(|index| {
+                epochs[*index].standing == Standing::Live
+                    && self.checkpoints[*index - 1]
+                        .directory
+                        .as_ref()
+                        .is_some_and(|directory| {
+                            directory
+                                .members
+                                .iter()
+                                .any(|member| member.device_id == device)
+                        })
+            })
+            .unwrap_or(0);
+        let boundary = (restored..=current)
+            .find(|index| {
+                epochs[*index].standing == Standing::Live
+                    && epochs[*index].view.revoked.contains_key(device)
+            })
+            .context("current removal has no signed evidence")?;
+        'prefix: for index in boundary..=current {
+            if epochs[index].standing != Standing::Live {
+                continue;
+            }
+            for checkpoint in &self.checkpoints[boundary..index] {
+                if checkpoint.directory.is_some()
+                    && !known_checkpoints.contains(&checkpoint.hash()?)
+                {
+                    continue 'prefix;
+                }
+            }
+            let mut evidence = history
+                .project_with_removal(index, &history.basis(index), Some(device))?
+                .removal;
+            // A retired Node may have joined in an earlier scope. Preserve its signed Node
+            // identity and authority support so the verifier can admit the old-Node channel.
+            let mut scopes = BTreeSet::new();
+            for earlier in (0..=index).rev() {
+                if epochs[earlier].standing == Standing::Live
+                    && epochs[earlier].view.nodes.contains(device)
+                    && scopes.insert(epochs[earlier].scope)
+                {
+                    let previous = history
+                        .project_with_removal(earlier, &history.basis(earlier), Some(device))?
+                        .removal;
+                    evidence.support.extend(previous.support);
+                    evidence.before.extend(previous.before);
+                }
+            }
+            let mut pending = Vec::new();
+            for (offset, checkpoint) in self.checkpoints[..index].iter().enumerate() {
+                pending.extend(checkpoint.heads.iter().cloned());
+                let parent = history.epochs[offset + 1]
+                    .parent
+                    .expect("checkpoint has a parent");
+                if checkpoint.directory.is_some() {
+                    let (_, _, _, votes) =
+                        history.votes(parent, checkpoint, &checkpoint.hash()?)?;
+                    pending.extend(votes);
+                }
+                for head in checkpoint.heads.iter().filter(|_| offset < boundary) {
+                    if let Some(entry) = history.events.get(head) {
+                        evidence.before.insert(head.clone());
+                        evidence.before.extend(entry.ancestors.iter().cloned());
+                    }
+                }
+            }
+            pending.extend(evidence.support.iter().cloned());
+            while let Some(hash) = pending.pop() {
+                let Some(entry) = history.events.get(&hash) else {
+                    continue 'prefix;
+                };
+                if entry.event.epoch > index as u64 + 1 {
+                    continue 'prefix;
+                }
+                if evidence.support.insert(hash) {
+                    pending.extend(entry.ancestors.iter().cloned());
+                }
+            }
+            if evidence.support.iter().any(|hash| {
+                matches!(
+                    &history.events[hash].event.action,
+                    GovernanceAction::Grant { .. }
+                ) && !evidence.before.contains(hash)
+                    && !known_events.contains(hash)
+            }) {
+                continue;
+            }
+            let proof = Self {
+                genesis: self.genesis.clone(),
+                checkpoints: self.checkpoints[..index].to_vec(),
+                events: self
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event
+                            .hash()
+                            .is_ok_and(|hash| evidence.support.contains(&hash))
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            if !proof
+                .project_at(now)
+                .is_ok_and(|view| view.removed_node(device))
+            {
+                continue;
+            }
+            if let Some(known) = known
+                && !known
+                    .merge(&proof)
+                    .and_then(|merged| merged.project_at(now))
+                    .is_ok_and(|view| view.removed_node(device))
+            {
+                continue;
+            }
+            return Ok(proof);
+        }
+        bail!("current removal cannot be proved without disclosing later member changes")
     }
 
     /// Checks the complete signed history and returns the directory in effect at `now_ms`.
@@ -1792,8 +2032,8 @@ impl NetworkState {
             };
             let checkpoint = &self.checkpoints[index - 1];
             let rotation = checkpoint.directory.is_none();
-            let (stopped, approved_at_ms, incomplete) = if rotation {
-                (false, None, false)
+            let (stopped, approved_at_ms, incomplete, _) = if rotation {
+                (false, None, false, BTreeSet::new())
             } else {
                 history.votes(
                     parent,
@@ -2102,6 +2342,168 @@ mod tests {
         assert!(Member::new("00".repeat(32).as_str(), IdentityKind::Client, "x", false).is_err());
         assert!(Member::new(&id(&node), IdentityKind::Node, "n", true).is_err());
         assert!(Member::new(&id(&node), IdentityKind::Node, " ", false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_evidence_uses_the_effective_revoke_and_its_concurrent_barriers() -> Result<()> {
+        let (_, a, node, mut base) = setup()?;
+        let (b, c, later) = (identity(), identity(), identity());
+        for manager in [&b, &c] {
+            base.append(GovernanceEvent::grant(
+                &a,
+                &base.project()?,
+                Member::client(manager, "manager", true)?,
+            )?)?;
+        }
+        let view = base.project()?;
+        let x = GovernanceEvent::revoke(&b, &view, cut(&a, 0))?;
+        let r1 = GovernanceEvent::revoke(&a, &view, cut(&node, 0))?;
+        let r2 = GovernanceEvent::revoke(&b, &view, cut(&node, 0))?;
+        let mut receiver = base.clone();
+        receiver.append(x.clone())?;
+        let mut first = receiver.clone();
+        first.append(r1.clone())?;
+        first.append(r2.clone())?;
+        let proof = first.removal_state_at(&id(&node), None, T)?;
+        assert!(proof.events.contains(&r2) && !proof.events.contains(&r1));
+        assert!(
+            receiver
+                .merge(&proof)?
+                .project_at(T)?
+                .removed_node(&id(&node))
+        );
+
+        let y = GovernanceEvent::revoke(&c, &view, cut(&b, 0))?;
+        let mut stronger = receiver.clone();
+        stronger.append(y.clone())?;
+        stronger.append(r1.clone())?;
+        stronger.append(GovernanceEvent::grant(
+            &c,
+            &stronger.project()?,
+            Member::client(&later, "later-private-name", false)?,
+        )?)?;
+        let proof = stronger.removal_state_at(&id(&node), None, T)?;
+        assert!(
+            proof.events.contains(&r1) && proof.events.contains(&x) && proof.events.contains(&y)
+        );
+        assert!(
+            receiver
+                .merge(&proof)?
+                .project_at(T)?
+                .removed_node(&id(&node)),
+            "the noncausal Y barrier is required to keep X ineffective at the receiver"
+        );
+        assert!(!serde_json::to_string(&proof)?.contains(&id(&later)));
+        assert!(!serde_json::to_string(&proof)?.contains("later-private-name"));
+        Ok(())
+    }
+
+    #[test]
+    fn removal_evidence_fails_closed_when_effect_support_would_disclose_a_later_grant() -> Result<()>
+    {
+        let (_, a, node, mut state) = setup()?;
+        let (b, c, d) = (identity(), identity(), identity());
+        for manager in [&b, &d] {
+            state.append(GovernanceEvent::grant(
+                &a,
+                &state.project()?,
+                Member::client(manager, "manager", true)?,
+            )?)?;
+        }
+        let view = state.project()?;
+        state.append(GovernanceEvent::revoke(&a, &view, cut(&node, 0))?)?;
+        state.append(GovernanceEvent::revoke(&b, &view, cut(&a, 0))?)?;
+        state.append(GovernanceEvent::grant(
+            &d,
+            &state.project()?,
+            Member::client(&c, "private-manager", true)?,
+        )?)?;
+        let known = state.clone();
+        state.append(GovernanceEvent::revoke(&c, &state.project()?, cut(&b, 0))?)?;
+        assert!(state.project_at(T)?.removed_node(&id(&node)));
+        assert!(state.removal_state_at(&id(&node), None, T).is_err());
+        let proof = state.removal_state_at(&id(&node), Some(&known), T)?;
+        assert!(known.merge(&proof)?.project_at(T)?.removed_node(&id(&node)));
+        let mut forged = known;
+        forged.events.last_mut().unwrap().signature = "00".repeat(64);
+        assert!(
+            state
+                .removal_state_at(&id(&node), Some(&forged), T)
+                .is_err(),
+            "self-reported identities do not authorize disclosure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_evidence_follows_a_restoration_and_omits_later_recovery_directories() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &state.project()?,
+            cut(&node, 0),
+        )?)?;
+        let next = identity();
+        let restored = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &id(&next),
+            vec![Member::client(&a, "a", true)?, Member::node(&node, "node")?],
+            vec![],
+            0,
+        )?;
+        state.recover_at(restored, T)?;
+        let known = state.clone();
+        let removal = GovernanceEvent::revoke(&a, &state.project_at(T)?, cut(&node, 0))?;
+        state.append(removal.clone())?;
+        let later = identity();
+        let mut members = state.project_at(T)?.members;
+        members.push(Member::client(&later, "future-private-directory", false)?);
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &next,
+            &id(&identity()),
+            members,
+            vec![cut(&node, 0)],
+            0,
+        )?;
+        state.recover_at(checkpoint, T)?;
+        let proof = state.removal_state_at(&id(&node), Some(&known), T)?;
+        assert_eq!(
+            proof.checkpoints.len(),
+            1,
+            "the proof follows the restoration and stops before the later directory"
+        );
+        assert!(proof.events.contains(&removal));
+        assert!(known.merge(&proof)?.project_at(T)?.removed_node(&id(&node)));
+        assert!(!serde_json::to_string(&proof)?.contains(&id(&later)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_late_veto_or_local_rotation_rescinds_a_removal_proof() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &id(&identity()),
+            vec![Member::client(&a, "a", true)?],
+            vec![cut(&node, 0)],
+            0,
+        )?;
+        state.recover_at(checkpoint.clone(), 0)?;
+        let proof = state.removal_state_at(&id(&node), None, T)?;
+        assert!(proof.project_at(T)?.removed_node(&id(&node)));
+        let event = veto(&a, &state.project_at(0)?, &checkpoint, 1)?;
+        let mut vetoed = state.clone();
+        vetoed.append(event)?;
+        assert!(vetoed.project_at(T)?.node(&id(&node)).is_ok());
+        assert!(vetoed.removal_state_at(&id(&node), None, T).is_err());
+        let rotation = RootCheckpoint::rotation(&state, &root, &id(&identity()), 1)?;
+        state.recover_at(rotation, 1)?;
+        assert!(state.project_at(T)?.node(&id(&node)).is_ok());
+        assert!(state.removal_state_at(&id(&node), None, T).is_err());
         Ok(())
     }
 

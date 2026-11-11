@@ -274,6 +274,8 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`。入口通过持久 PeerEnvelope 短准入投递，远端先保存命令并返回 `saved`，缺失的事件由后台同步补齐，只有 `owner_accepted` 才结清入口 outbox。同一逻辑目标按 sequence 顺序投递，不同目标独立推进，同一远端设备的其他 scope 不等待慢请求。未知且没有保存证据的命令阻止同目标后项越过。首次发送前在 Store 内绑定目标 Node，可能已发送后只查询原身份，不自动转投另一 Node。客户端保存入口回执后继续回读逐条输入状态，历史确认接纳后才清理普通本地 outbox 项，拒绝或未知项继续保留。
 
+远端只将明确的权限、原始意图、owner epoch 或取消等业务拒绝记为 `rejected`。存储、IO、队列及其他结果未明的错误保留原命令的 `saved` 或 `waiting_dependencies`，按同一 command ID 重试；已存在的 owner receipt、Work 或停止事实优先用于对账，回执保存失败也不会重新执行工作。
+
 回合以 `owner_epoch` 为 fence。领取 job 时记下当时的 `owner_epoch`，之后工具调用的权限检查要求本机仍是负责人且 epoch 未变，换走再换回也算失效。旧负责人收到更高 epoch 的 `conversation_owner` 后立即拒绝该回合的后续工具写入，并走停止回复的取消路径结束它：取消得到确认时回复状态为已停止，未确认时记为中断并留待核对，不重做也不交给新负责人重放。Agent 任务在工作所在设备运行，不受负责人 fence。
 
 新负责人从共享记录推导旧负责人留下的未回复消息，列在 `conversation` 调度队列的 `unanswered` 里，按会话顺序给出。未回复指本会话的本人消息没有 `status = completed` 的回复，没有 `message_steered` 记录，本机也没有它的 job 或 outbox 条目。只有本机是负责人且 bot 未删除时才列出。网页显示“N 条消息没等到回复”，本人选择回复后经 `reply_unanswered` 在本机排队，不会自动重放；选择“不回复”则经 `dismiss_unanswered` 在本机把它们记为开始前已取消，不执行任何操作。这条记录和队列一样只在本机：会话再换到第三台设备时，那里会重新列出，仍需本人决定。排队按 trigger 去重，重试不会再排，结果未知时重读会话即可对账。回复 ID 由 `(会话, trigger, owner_epoch)` 派生，所以新负责人的回复不会和旧负责人已写的停止或中断回复冲突。
@@ -440,6 +442,8 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 `sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。这些私人通道接受连接时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共节点不在任何个人网络里，私人 `sync`、`blob` 和 `rpc` 一律拒绝；显式启用文件交付时，只在独立 `vibeface/service/1` 上按服务规则接收。
 
+历史上确为 Node 的被移除设备只可在 `sync` 上交换 `hello` 和 `membership`，每个 Node 跨连接只处理 1 个请求，本机共 4 个，每个请求含读取、处理和响应最多 10 秒，请求与撤销证明各限 256 KiB。它推来的签名治理事件仍可带来迟到否决；checkpoint 不从该通道安装，因此持恢复文件也不能推入倒签的找回或 rotation。每次先合入治理事件再检查当前成员资格，只有真正恢复为成员 Node 后才返回完整历史。仍被移除时只回复可独立验签的本次撤销证明，包含并发权限屏障所需的证据，不披露后续无关成员或名称。证明以最多 64 个 checkpoint、合计 1024 条治理事件为计算边界；超过边界、证明必须带上对方未以本次完整签名状态证明已知的后续授予或更名，或无法证明撤销时，明确拒绝而不回传全量。Hello 失败后，本机仍认定为成员的已认证对端可再接收一次纯 `membership` 交换，让合法迟到否决仍能收敛；本轮不算历史同步成功，下一连接重新同步。
+
 ### 同步
 
 1. 双方交换 `{"type":"hello", network_id, vector: {author: [max_seq, head_hash]}, boot, membership_epoch, membership, forks}`。成员目录摘要不同时交换 `membership`，双方都合并为并集。
@@ -481,7 +485,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### Relay 与公共节点
 
-启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。设了 `relay_max_clients_per_ip` 时 relay 只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它，同一 IPv4 地址或 IPv6 /56 超出上限的连接直接关闭；转发的连接任一方向结束即关闭两端，客户端连接开启 TCP keepalive。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
+启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。relay 始终只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它；设了 `relay_max_clients_per_ip` 时，同一 IPv4 地址或 IPv6 /56 超出上限的连接直接关闭。前置代理为每条连接生成随机的一次性私有绑定，替换首个请求自带的同名头，准入时必须消费有效绑定，成员 Node 也不例外。缺失、伪造、已消费或重复的绑定均拒绝，所以健康检查之后经 keepalive 或管线化发来的未绑定升级，以及绕过前置代理的未绑定后端连接，都不能接入 relay。转发的连接任一方向结束即关闭两端，客户端连接开启 TCP keepalive。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
 公共节点是不加入个人网络的 Node，通常同时提供开放 relay（`relay_open`）和面向任何设备的浏览器转发（`forwarding.any`），并在全网记录里宣告 `relay` 和 `gateway` 角色。它不运行调度、执行和同步，不保存个人网络的事件或附件。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。浏览器经它的 `/api/client` 按设备编号连到成员 Node，它转发 Noise 密文，看不到内容，但能看到浏览器地址、目标设备编号、时间和流量大小。部署步骤见[从外网访问](node.md#从外网访问)。
 

@@ -592,6 +592,7 @@ pub struct Runtime {
     background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
     peer_delivery_locks: peers::PeerDeliveryLocks,
+    removed_sync_limits: peers::RemovedSyncLimits,
     /// Two syncs downloading the same attachment would share one staging file.
     /// ponytail: one download at a time; per-attachment locks if parallel downloads matter.
     blob_fetch: Mutex<()>,
@@ -873,6 +874,7 @@ impl Runtime {
             background_tasks: BackgroundTasks::new(),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
+            removed_sync_limits: peers::RemovedSyncLimits::default(),
             blob_fetch: Mutex::new(()),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),

@@ -925,7 +925,7 @@ pub async fn spawn_relay(
 }
 
 /// Passes each connection on to the relay unless its client address already holds `per_ip`,
-/// numbering it in a header the relay's access check reads, and counts its bytes.
+/// giving it a private binding in a header the relay's access check reads, and counts its bytes.
 async fn relay_front(
     listener: tokio::net::TcpListener,
     relay: SocketAddr,
@@ -976,7 +976,7 @@ async fn front_connection(
     let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
     let head = tokio::time::timeout(
         Duration::from_secs(10),
-        relay::read_head(&mut client, front),
+        relay::read_head(&mut client, &front),
     );
     let Ok(Some((head, received))) = head.await else {
         return;
