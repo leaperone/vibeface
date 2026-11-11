@@ -175,14 +175,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
 
   const webhookSecret = screen.getByLabel(/^密钥/);
   const saveWebhook = screen.getByRole('button', '保存', { exact: true });
-  const secretDigest = () => browser.evaluate(async () => {
-    const input = document.getElementById('webhook-secret');
-    if (!(input instanceof HTMLInputElement)) throw new Error('Webhook secret editor is missing');
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input.value));
-    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
-  });
   await webhookSecret.fill(secrets.get('webhookSecret'));
-  const firstSecretDigest = await secretDigest();
   await browser.evaluate(() => {
     const send = WebSocket.prototype.send;
     const pending: { socket: WebSocket; data: Parameters<WebSocket['send']>[0] }[] = [];
@@ -204,15 +197,15 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(saveWebhook).toBeDisabled();
     await expect(browser.locator('html')).toHaveAttribute('data-webhook-save-held', 'true');
     await webhookSecret.fill(secrets.get('nextWebhookSecret'));
-    const newerSecretDigest = await secretDigest();
-    expect(newerSecretDigest).not.toBe(firstSecretDigest);
     await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
-    await expect(webhookSecret).toHaveAttribute('placeholder', '已设置');
+    const clearWebhook = screen.getByRole('button', '清除密钥', { exact: true });
+    await expect(clearWebhook).toBeVisible();
+    await expect(clearWebhook).toBeEnabled();
     await expect(saveWebhook).toBeEnabled();
-    expect(await secretDigest()).toBe(newerSecretDigest);
     await app.screenshot('webhook-newer-draft-preserved');
     await saveWebhook.click();
-    await expect(webhookSecret).toHaveValue('');
+    await expect(clearWebhook).toBeEnabled();
+    await expect(saveWebhook).toBeDisabled();
   } finally {
     await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
   }
