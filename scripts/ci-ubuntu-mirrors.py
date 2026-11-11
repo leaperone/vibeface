@@ -2,6 +2,7 @@
 """Probe the hosted Ubuntu runner's existing mirrors before optionally reordering them."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -25,7 +26,18 @@ PORTS = {"http://ports.ubuntu.com/ubuntu-ports/", "https://ports.ubuntu.com/ubun
 
 def source_plan(text, architecture):
     blocks = []
-    for paragraph in re.split(r"\n\s*\n", text.strip()):
+    for number, paragraph in enumerate(re.split(r"\n\s*\n", text.strip())):
+        if number < 8:
+            public = {}
+            for line in paragraph.splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key in ("Types", "URIs", "Suites", "Signed-By"):
+                    value = value.strip()
+                    if key == "URIs":
+                        value = re.sub(r"(?<=://)[^/\s]*@", "[redacted]@", value)
+                        value = re.sub(r"[?#]\S*", "[redacted]", value)
+                    public[key] = value[:256]
+            print("ubuntu_source=" + json.dumps(public, sort_keys=True), flush=True)
         fields = {}
         for line in paragraph.splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
@@ -38,7 +50,9 @@ def source_plan(text, architecture):
             fields[key] = value.strip()
         if fields.get("Enabled", "yes") == "no":
             continue
-        if fields.get("Signed-By") != KEYRING or fields.get("Types") != "deb":
+        types = fields.get("Types", "").split()
+        if (fields.get("Signed-By") != KEYRING or "deb" not in types
+                or len(types) != len(set(types)) or not set(types) <= {"deb", "deb-src"}):
             raise ValueError("expected the runner's signed Ubuntu deb sources")
         uris = fields.get("URIs", "").split()
         expected = {"mirror+file:/etc/apt/apt-mirrors.txt"} if architecture == "amd64" else PORTS
