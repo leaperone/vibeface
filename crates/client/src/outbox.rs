@@ -102,8 +102,9 @@ pub(crate) struct DeliveryBatchBinding {
 }
 
 pub struct Outbox {
-    _lock: std::fs::File,
     db: Connection,
+    // Fields drop in order: close SQLite before another client can obtain its lease.
+    _lock: std::fs::File,
     dir: PathBuf,
     network: String,
     client: String,
@@ -111,6 +112,9 @@ pub struct Outbox {
 impl Outbox {
     pub(crate) fn stored_network(dir: &Path, client: &str) -> Result<String> {
         privatefs::ensure_private(dir, "client outbox directory")?;
+        let lock = privatefs::open_or_create(&dir.join("outbox.lock"))?;
+        lock.try_lock()
+            .context("outbox is already open in another client")?;
         let path = dir.join("outbox.sqlite3");
         privatefs::ensure_private(&path, "client outbox")?;
         drop(privatefs::open_no_follow(&path)?);
@@ -169,8 +173,8 @@ impl Outbox {
         }
         privatefs::sync_dir(dir)?;
         let outbox = Self {
-            _lock: lock,
             db,
+            _lock: lock,
             dir: dir.to_owned(),
             network: network.into(),
             client: client.into(),
@@ -759,6 +763,33 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stored_network_requires_the_outbox_lease_before_reading_sqlite() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("native-network-lease-{}", uuid::Uuid::new_v4()));
+        let network = "11".repeat(32);
+        let writer = Outbox::open(&dir, &network, "client-a")?;
+        assert_eq!(
+            Outbox::stored_network(&dir, "client-a")
+                .unwrap_err()
+                .to_string(),
+            "outbox is already open in another client"
+        );
+        drop(writer);
+        assert_eq!(Outbox::stored_network(&dir, "client-a")?, network);
+        assert_eq!(
+            Outbox::stored_network(&dir, "client-b")
+                .unwrap_err()
+                .to_string(),
+            "private pending data belongs to another client"
+        );
+        let reopened = Outbox::open(&dir, &network, "client-a")?;
+        assert!(reopened.snapshots()?.is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn operation(id: &str) -> Operation {
         Operation {
             snapshot:OperationSnapshot {id:id.into(),network_id:"network-a".into(),client_id:"client-a".into(),target_node:"node-a".into(),state:OperationState::Prepared,sequence:Some(1),result:None},

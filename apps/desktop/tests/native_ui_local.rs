@@ -431,6 +431,17 @@ async fn next_error(events: &mut mpsc::Receiver<Event>) -> Result<String> {
     .await?
 }
 
+fn assert_outbox_locked(error: anyhow::Error) {
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(|io| (io.kind(), io.raw_os_error()));
+    assert!(
+        error.to_string().contains("already open"),
+        "expected the exclusive outbox lease refusal; underlying IO kind/code: {io:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> Result<()> {
     let (fixture, host) = Fixture::new().await?;
@@ -475,12 +486,10 @@ async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> R
         outbox.clone(),
     )
     .await;
-    assert!(
+    assert_outbox_locked(
         retired_profile
             .err()
-            .context("retired A must retain its exclusive storage lease for profile reuse")?
-            .to_string()
-            .contains("already open")
+            .context("retired A must retain its exclusive storage lease for profile reuse")?,
     );
 
     fixture.node.launch_gate.send_replace(false);
@@ -544,12 +553,10 @@ async fn local_profile_round_trip_reuses_its_lease_and_cancels_old_reconnect_wit
         outbox.clone(),
     )
     .await;
-    assert!(
+    assert_outbox_locked(
         locked
             .err()
-            .context("active A must hold its real exclusive outbox lease")?
-            .to_string()
-            .contains("already open")
+            .context("active A must hold its real exclusive outbox lease")?,
     );
     tx.send(Command::SwitchProfile(fixture.b_profile.clone()))
         .await?;

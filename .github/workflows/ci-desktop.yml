@@ -80,10 +80,13 @@ jobs:
           "$PY" -B scripts/checksum.py ".artifacts/packages/$name.tar.gz.sha256"
           mkdir -p .artifacts/runtime
           tar -xzf "${archives[0]}" -C .artifacts/runtime
-          {
-            printf 'dir=%s\n' "$PWD/.artifacts/runtime/$name"
-            printf 'archive=%s\n' "$PWD/${archives[0]}"
-          } >> "$GITHUB_OUTPUT"
+          "$PY" -B - "$name" "${archives[0]}" <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import sys
+
+          print('dir=' + str((Path('.artifacts/runtime') / sys.argv[1]).resolve(strict=True)))
+          print('archive=' + str(Path(sys.argv[2]).resolve(strict=True)))
+          PY
       - name: Verify native Windows processes and private platform operations
         if: runner.os == 'Windows'
         env:
