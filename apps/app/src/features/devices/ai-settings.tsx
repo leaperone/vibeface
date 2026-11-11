@@ -686,10 +686,10 @@ function EndpointDetails({ endpoint, working, busy, save }: { endpoint: Provider
   const [token, setToken] = useState("")
   const [deleting, setDeleting] = useState(false)
   const models = [...new Set(modelText.split(/[,，\n]/).map((model) => model.trim()).filter(Boolean))]
-  const dirty = Boolean(token) || protocol !== (endpoint?.protocol ?? "openai_compatible") || baseUrl.trim() !== (endpoint?.base_url ?? "") || models.join("\n") !== (endpoint?.models.join("\n") ?? "")
+  const dirty = Boolean(token.trim()) || protocol !== (endpoint?.protocol ?? "openai_compatible") || baseUrl.trim() !== (endpoint?.base_url ?? "") || models.join("\n") !== (endpoint?.models.join("\n") ?? "")
   return <form className="grid gap-2" onSubmit={(event) => {
     event.preventDefault()
-    void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
+    void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token.trim() ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
   }}>
     <label className="grid gap-1 text-meta">协议
       <NativeSelect className="w-full" value={protocol} disabled={working} onChange={(event) => setProtocol(event.target.value as EndpointProtocol)}>

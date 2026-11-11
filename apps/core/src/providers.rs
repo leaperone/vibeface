@@ -1143,13 +1143,13 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
         "a variable value must be 1 to 4096 characters"
     );
-    // opencode substitutes the token into JSON text unescaped.
+    // opencode substitutes the token into JSON text unescaped, then expands `{file:..}` in it.
     ensure!(
         name != OPENCODE_ENDPOINT_KEY
-            || !value
-                .chars()
-                .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control()),
-        "the endpoint token cannot contain quotes, backslashes or whitespace"
+            || !value.chars().any(|c| {
+                matches!(c, '"' | '\\' | '{' | '}') || c.is_whitespace() || c.is_control()
+            }),
+        "the endpoint token cannot contain quotes, backslashes, braces or whitespace"
     );
     Ok(())
 }
@@ -2468,7 +2468,7 @@ requires_openai_auth = false
                 "options":{"baseURL":"https://api.example.test/v1","apiKey":"no-token"},
                 "models":{"model-a":{},"model-b":{}}}}})
         );
-        for token in ["has space", "quo\"te", "back\\slash"] {
+        for token in ["has space", "quo\"te", "back\\slash", "{file:~/.ssh/id}"] {
             assert!(
                 local
                     .env
