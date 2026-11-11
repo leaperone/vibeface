@@ -9526,6 +9526,64 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unknown() -> Result<()> {
+        use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
+        with_node(async |node, admin, dir| {
+            with_agent(&node);
+            controlled_pi(&node, &dir, "reply")?;
+            let allowed = dir.join("allowed");
+            std::fs::create_dir(&allowed)?;
+            node.settings.lock().unwrap().roots = vec![allowed.canonicalize()?];
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "root-refusal-source").await?;
+            let local = node.identity.device_id()?;
+            let baseline = {
+                let network = network.clone();
+                node.store.call("triage.test.root_refusal_baseline", move |store| {
+                    Ok((store.version_vector(&network)?, store.scheduler_jobs("c")?.len()))
+                }).await?
+            };
+            for (call_ref, cwd, definite) in [
+                ("outside-root", dir.clone(), true),
+                ("missing-path", allowed.join("not-created"), false),
+            ] {
+                let request = WorkRequest {
+                    work_id: WorkSpec::id("c", &trigger, call_ref),
+                    conversation: "c".into(), trigger: trigger.clone(), target: local.clone(),
+                    dispatcher: local.clone(), call_ref: call_ref.into(),
+                    kind: RequestedWorkKind::Agent(Some(Provider::Pi)), model: None,
+                    cwd: cwd.display().to_string(), title: "root authorization".into(),
+                    prompt: "must not execute".into(), continues: None, parent: None, thread: None,
+                };
+                let error = match node.accept_dispatch(&network, request.clone(), &Value::Null).await {
+                    Err(error) => error,
+                    Ok(_) => anyhow::bail!("{call_ref} unexpectedly admitted work"),
+                };
+                assert_eq!(error.is::<AdmissionRejected>(), definite, "{call_ref}: {error:#}");
+                if definite {
+                    assert_eq!(error.to_string(), "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots");
+                } else {
+                    assert_eq!(error.downcast_ref::<std::io::Error>().context("original filesystem failure")?.kind(), std::io::ErrorKind::NotFound);
+                }
+                let network = network.clone();
+                let baseline = baseline.clone();
+                node.store.call("triage.test.root_refusal_no_side_effects", move |store| {
+                    assert!(store.accepted_work(&network, &request)?.is_none());
+                    assert!(store.work_record(&request.work_id)?.is_none());
+                    assert!(store.work_records()?.is_empty());
+                    assert_eq!(store.version_vector(&network)?, baseline.0);
+                    assert_eq!(store.scheduler_jobs("c")?.len(), baseline.1);
+                    Ok(())
+                }).await?;
+                assert!(pi_fixture_log(&dir)?.is_empty(), "{call_ref} must not invoke the provider");
+            }
+            node.finish_manager_attempt(&attempt).await;
+            Ok(())
+        }).await
+    }
+
+    #[tokio::test]
     async fn admitted_local_retries_keep_the_frozen_selection_after_models_and_permissions_change()
     -> Result<()> {
         let (node, admin, dir) = node()

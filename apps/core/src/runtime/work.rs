@@ -179,7 +179,7 @@ impl Runtime {
                     .iter()
                     .filter_map(|root| std::fs::canonicalize(root).ok())
                     .any(|root| path.starts_with(root)),
-                "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+                AdmissionRejected::new("execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots")
             );
             ensure!(path.is_dir(), "execution path must be a directory");
         }
