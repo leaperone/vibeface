@@ -127,6 +127,17 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 | pi | npm 包 `@earendil-works/pi-coding-agent` 的 `pi` | pi 里的 `/login`，或所用服务的密钥变量 | 每轮和每个任务一个 `pi --mode rpc --no-extensions` 进程 |
 | opencode | `opencode` | AI 设置提供带私有 XDG 与 DB 路径的 `opencode --standalone auth login`，或现有认证环境 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
 
+#### opencode 自定义模型服务
+
+不想登录 opencode 账户时，可以在 opencode 的**设置 → 自定义模型服务**里填一个兼容 API 的端点：协议（`openai_compatible`、`anthropic` 或 `openai`）、Base URL、API Token 和至少一个模型名。保存后 Node 在下一轮重启自己的 `opencode serve`，Bot 和执行任务的模型写成 `custom/<模型名>`。Token 只能写入、不回显，存在本机私有的 Provider 环境文件，变量名为 `OPENCODE_ENDPOINT_API_KEY`，不进 `config.json`、共享记录或工具载荷；不填 Token 时不发送认证头，适合本机 Ollama、LM Studio 一类服务。CLI 用同一个入口：
+
+```bash
+printf '%s' '{"opencode_endpoint":{"protocol":"openai_compatible","base_url":"https://api.example.com/v1","models":["model-a"],"api_key":"<Token>"}}' \
+  | vibeface provider configure opencode -
+```
+
+`opencode_endpoint` 省略 `api_key` 时保留已存的 Token，给 `null` 时删除；整个 `opencode_endpoint` 为 `null` 时删除端点和 Token。
+
 程序先使用保存的路径和 PATH，再查 Node 的 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。npm wrapper 的启动环境会补齐所需 Node；必要时只向登记登录 shell 查询 PATH。自定义安装仍无法发现时，在设置里填程序绝对路径和所需 PATH。
 
 模型留空时用各自的默认模型；opencode 写成 `provider/model`。Codex 和 pi 可在检查状态后提供模型列表，网页和手机保留手填模型。目录未取得或不完整时，不会清空已有配置。登录未确认时显示提醒并允许尝试，只有程序缺失、明确需要登录等已确认的问题才阻止发送。Claude Code 的进度按整条消息更新。
