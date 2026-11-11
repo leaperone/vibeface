@@ -3,7 +3,6 @@
 
 import argparse
 import hashlib
-import http.client
 import json
 import math
 import os
@@ -18,7 +17,6 @@ import sys
 import tarfile
 import tempfile
 import time
-import urllib.parse
 import uuid
 import zipfile
 
@@ -32,7 +30,6 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 PUBLIC = ARTIFACTS / "live-public"
 UI = ROOT / "tests/e2e/.artifacts/vdp/live-ui"
-UI_TIMEOUT_MS = 3_600_000
 LIVE_TIMEOUT_SECONDS = 20_700
 LIVE_PROGRESS = {
     "inside": ("verify-inputs", "packaged-runtime", "node-rebuild", "guest-toolchain", "guest-build", "guest-info",
@@ -196,155 +193,6 @@ def checked_android(directory, expected):
     return apk.resolve(), value
 
 
-def control_descriptor(path):
-    metadata = path.lstat()
-    parent = path.parent.lstat()
-    if path != UI / "control.json" or path.parent.is_symlink() or parent.st_uid != os.getuid() or parent.st_gid != os.getgid() or parent.st_mode & 0o777 != 0o700 or path.is_symlink() or metadata.st_uid != os.getuid() or metadata.st_gid != os.getgid() or metadata.st_mode & 0o777 != 0o600:
-        raise ValueError("Read only this host user's exact private UI descriptor")
-    value = json.loads(regular(path, 2048))
-    url = urllib.parse.urlsplit(value.get("url", ""))
-    if set(value) != {"schemaVersion", "url", "token"} or value["schemaVersion"] != 1 or not re.fullmatch(r"[a-f0-9]{64}", value.get("token", "")) or url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port or url.path not in ("", "/") or url.query or url.fragment or url.username or url.password:
-        raise ValueError("UI descriptor must name one authenticated literal loopback controller")
-    return value
-
-
-def controller(value, path, body=None):
-    headers = {"Authorization": "Bearer " + value["token"]}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    connection = http.client.HTTPConnection("127.0.0.1", urllib.parse.urlsplit(value["url"]).port, timeout=10)
-    try:
-        connection.request("GET" if body is None else "POST", path, None if body is None else json.dumps(body).encode(), headers)
-        response = connection.getresponse()
-        if response.status != 200:
-            raise ValueError("Actual loopback controller rejected its fixed operation")
-        data = response.read(65537)
-        if len(data) > 65536:
-            raise ValueError("UI controller response exceeded its public bound")
-    finally:
-        connection.close()
-    result = json.loads(data)
-    if set(result) != {"ok", "result"} or result["ok"] is not True:
-        raise ValueError("Actual UI controller rejected its bounded operation")
-    return result["result"]
-
-
-def wait_owned(description, deadline, predicate, processes=(), observe=None):
-    while time.monotonic() < deadline:
-        if observe is not None:
-            observe()
-        if any(process.poll() is not None for process in processes):
-            raise RuntimeError(description + " stopped before readiness")
-        value = predicate()
-        if value:
-            return value
-        time.sleep(0.25)
-    raise TimeoutError(description + " exceeded its explicit runtime limit")
-
-
-class AndroidHost:
-    def __init__(self):
-        self.process = None
-        self.reverse = {}
-        self.server_port = None
-        self.log = None
-
-    def adb(self, *arguments, check=True):
-        result = subprocess.run([str(self.sdk / "platform-tools/adb"), "-P", str(self.server_port), *arguments], env=self.environment, capture_output=True, timeout=20)
-        if check and result.returncode:
-            raise RuntimeError("Task Android command failed")
-        return result.stdout.decode().strip()
-
-    def start(self):
-        self.sdk = UI / "android-sdk"
-        self.sdk.mkdir(parents=True, exist_ok=False)
-        for name in ("android-user", "android-emulator", "avd"):
-            (UI / name).mkdir(mode=0o700)
-        self.server_port = available_port()
-        self.environment = {**os.environ, "ANDROID_SDK_ROOT": str(self.sdk), "ANDROID_HOME": str(self.sdk), "ANDROID_USER_HOME": str(UI / "android-user"),
-            "ANDROID_EMULATOR_HOME": str(UI / "android-emulator"), "ANDROID_AVD_HOME": str(UI / "avd"),
-            "ANDROID_ADB_SERVER_PORT": str(self.server_port), "ADB_SERVER_SOCKET": f"tcp:127.0.0.1:{self.server_port}",
-            "AGENT_DEVICE_HOME": str(UI / "agent-device"), "AGENT_DEVICE_STATE_DIR": str(UI / "agent-device"),
-            "PLAYWRIGHT_BROWSERS_PATH": str(UI / "browsers"), "E2E_TELEMETRY_DISABLED": "1"}
-        manager = android_tool("sdkmanager")
-        log = UI / "private-android-setup.log"
-        command("install task Android runtime", [manager, "--sdk_root=" + str(self.sdk), "cmdline-tools;20.0", "platform-tools", "emulator", "system-images;android-35;default;x86_64"], log, env=self.environment, input=b"y\n" * 64, timeout=900)
-        avdmanager = str(self.sdk / "cmdline-tools/20.0/bin/avdmanager")
-        name = "vdp-paid-" + uuid.uuid4().hex[:12]
-        command("create dedicated task AVD", [avdmanager, "create", "avd", "--name", name, "--package", "system-images;android-35;default;x86_64", "--device", "pixel_6", "--path", str(UI / "avd" / (name + ".avd"))], log, env=self.environment, input=b"no\n", timeout=120)
-        self.environment["PATH"] = str(self.sdk / "platform-tools") + os.pathsep + self.environment["PATH"]
-        port = next(port for port in range(5554, 5683, 2) if port_free(port) and port_free(port + 1))
-        self.serial = f"emulator-{port}"
-        self.adb("start-server")
-        self.log = log.open("ab")
-        self.process = subprocess.Popen([str(self.sdk / "emulator/emulator"), "-avd", name, "-port", str(port), "-no-window", "-no-audio", "-no-boot-anim", "-no-snapshot", "-wipe-data", "-gpu", "swiftshader_indirect", "-memory", "2048", "-cores", "2"], env=self.environment, stdout=self.log, stderr=self.log)
-        wait_owned("task Android boot", time.monotonic() + 300, lambda: self.adb("-s", self.serial, "shell", "getprop", "sys.boot_completed", check=False) == "1", (self.process,))
-        self.adb("-s", self.serial, "root")
-        self.adb("-s", self.serial, "wait-for-device")
-        if self.adb("-s", self.serial, "shell", "id", "-u") != "0" or self.adb("-s", self.serial, "shell", "getprop", "ro.product.cpu.abi") != "x86_64":
-            raise ValueError("Only the task root x86_64 AVD may inspect its saved transfer")
-        return self.environment
-
-    def save_reverse(self, port):
-        local = f"tcp:{port}"
-        mappings = [line.split() for line in self.adb("-s", self.serial, "reverse", "--list").splitlines()]
-        self.reverse[local] = next((entry[2] for entry in mappings if len(entry) == 3 and entry[1] == local), None)
-
-    def close(self):
-        failed = False
-        try:
-            if self.server_port is not None and hasattr(self, "serial"):
-                for local, original in self.reverse.items():
-                    try:
-                        mappings = [line.split() for line in self.adb("-s", self.serial, "reverse", "--list").splitlines()]
-                        current = {entry[1]: entry[2] for entry in mappings if len(entry) == 3}
-                        if local in current and current[local] != original:
-                            self.adb("-s", self.serial, "reverse", "--remove", local)
-                        if original is not None and current.get(local) != original:
-                            self.adb("-s", self.serial, "reverse", local, original)
-                    except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                        failed = True
-                for arguments in (("-s", self.serial, "emu", "kill"), ("kill-server",)):
-                    try:
-                        self.adb(*arguments, check=arguments == ("kill-server",))
-                    except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                        failed = True
-        finally:
-            if self.process is not None and self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-            if self.log is not None:
-                self.log.close()
-        if failed:
-            raise RuntimeError("Dedicated Android cleanup did not fully confirm its owned reverse and ADB server")
-
-
-def available_port():
-    with socket.socket() as server:
-        server.bind(("127.0.0.1", 0))
-        return server.getsockname()[1]
-
-
-def port_free(port):
-    try:
-        with socket.socket() as server:
-            server.bind(("127.0.0.1", port))
-        return True
-    except OSError:
-        return False
-
-
-def live_container(command, package, expected, name):
-    result = command[:-4]
-    result.extend(["--name", name, "--network", "host", "--env", "TOKIO_WORKER_THREADS=2", "--env", f"VIBEFACE_DELIVERY_UI_UID={os.getuid()}", "--env", f"VIBEFACE_DELIVERY_UI_GID={os.getgid()}", command[-4], "python3", "scripts/run-delivery-live.py", "--inside",
-                   "--package", str(Path("/work") / package.relative_to(ROOT)), "--source-commit", expected])
-    return result
-
-
 def terminate_owned(process):
     if process is None or process.poll() is not None:
         return
@@ -360,156 +208,6 @@ def terminate_owned(process):
         except ProcessLookupError:
             pass
         process.wait(timeout=5)
-
-
-def join_owned(container, ui, android, deadline, observe=None):
-    while time.monotonic() < deadline:
-        if observe is not None:
-            observe()
-        proof_status, ui_status = container.poll(), ui.poll()
-        if proof_status not in (None, 0) or ui_status not in (None, 0) or android.poll() is not None:
-            raise RuntimeError("A genuine proof, actual UI or dedicated Android process failed")
-        if proof_status == ui_status == 0:
-            return
-        time.sleep(0.25)
-    raise TimeoutError("Proof and UI processes did not both finish within the acceptance bound")
-
-
-def remaining_ui_timeout_ms(deadline):
-    remaining = int((deadline - time.monotonic()) * 1000)
-    if not 0 < remaining <= LIVE_TIMEOUT_SECONDS * 1000:
-        raise TimeoutError("Paid UI total timeout must remain within the original live deadline")
-    return remaining
-
-
-def finish_failed_ui_evidence(container, ui, descriptor, deadline):
-    if container is None or ui is None or container.poll() is not None or ui.poll() in (None, 0):
-        return
-    until = min(deadline, time.monotonic() + 60)
-    if descriptor is not None:
-        try:
-            controller(descriptor, "/abort", {"role": "web"})
-        except (OSError, ValueError, http.client.HTTPException):
-            pass
-    while container.poll() is None and time.monotonic() < until:
-        time.sleep(0.25)
-
-
-def cleanup_owned(android, proof_process, ui_process, name, descriptor, success):
-    failed = False
-    if not success and descriptor is not None:
-        try:
-            controller(descriptor, "/abort", {"role": "web"})
-        except (OSError, ValueError, http.client.HTTPException):
-            pass
-    try:
-        terminate_owned(ui_process)
-    except (OSError, subprocess.SubprocessError):
-        failed = True
-    if proof_process is not None:
-        try:
-            stopped = subprocess.run(["docker", "stop", "--time", "10", name], capture_output=True, timeout=30)
-            if proof_process.poll() is None and stopped.returncode:
-                subprocess.run(["docker", "rm", "--force", name], capture_output=True, timeout=20, check=True)
-        except (OSError, subprocess.SubprocessError):
-            failed = True
-    try:
-        terminate_owned(proof_process)
-    except (OSError, subprocess.SubprocessError):
-        failed = True
-    try:
-        android.close()
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        failed = True
-    try:
-        (UI / "control.json").unlink(missing_ok=True)
-    except OSError:
-        failed = True
-    return failed
-
-
-def dispatch(package_input, android_input, expected):
-    source_commit(expected)
-    apk, android_provenance = checked_android(android_input, expected)
-    UI.mkdir(parents=True, mode=0o700, exist_ok=True)
-    if UI.is_symlink() or UI.stat().st_uid != os.getuid() or UI.stat().st_gid != os.getgid():
-        raise ValueError("Live UI requires this host user's dedicated task directory")
-    UI.chmod(0o700)
-    if any((UI / path).exists() or (UI / path).is_symlink() for path in ("control.json", "ordinary-paid-ui.bin", "android-sdk", "public", "e2e", "agent-device", "inside-progress.json", "paid-progress.json")):
-        raise ValueError("Live acceptance requires fresh task UI, Android and driver state")
-    PUBLIC.mkdir(parents=True, mode=0o755, exist_ok=False)
-    PUBLIC.chmod(0o755)
-    (PUBLIC / "ui").mkdir(mode=0o755)
-    checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
-    package = unpack_package(package_input)
-    checked_package(package, expected)
-    for name in ("cargo", "risc0", "canonical"):
-        (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="live-build-context-", dir=ARTIFACTS) as directory:
-        context = Path(directory)
-        for name in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
-            target = context / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / name, target)
-        build, container = checks["sandbox_commands"](context)
-        subprocess.run(build, cwd=ROOT, check=True)
-    android, proof_process, ui_process, descriptor = AndroidHost(), None, None, None
-    name = "vdp-live-" + uuid.uuid4().hex
-    deadline = time.monotonic() + LIVE_TIMEOUT_SECONDS
-    success, cleanup_failure = False, False
-    observe = progress_observer(expected)
-    previous_term = signal.getsignal(signal.SIGTERM)
-
-    def interrupted(*_):
-        raise InterruptedError("Live proof and UI dispatcher interrupted")
-
-    signal.signal(signal.SIGTERM, interrupted)
-    try:
-        environment = android.start()
-        with (UI / "private-container.log").open("ab") as proof_log, (UI / "private-ui.log").open("ab") as ui_log:
-            proof_process = subprocess.Popen(live_container(container, package, expected, name), cwd=ROOT,
-                                             stdout=proof_log, stderr=proof_log, start_new_session=True)
-            control = UI / "control.json"
-            descriptor = wait_owned("early paid UI pairing controller", deadline,
-                lambda: control_descriptor(control) if control.exists() else None, (proof_process, android.process), observe=observe)
-            facts = controller(descriptor, "/facts")
-            if facts.get("stage") not in ("bootstrap", "inspections"):
-                raise ValueError("The first paid UI controller must expose pairing and inspections before ordinary mutations")
-            receiver = urllib.parse.urlsplit(facts["nodes"]["android"]["url"])
-            if receiver.scheme != "http" or receiver.hostname != "127.0.0.1" or not receiver.port or receiver.path not in ("", "/") or receiver.query or receiver.fragment or receiver.username or receiver.password:
-                raise ValueError("Only the actual receiver's loopback port may receive an ADB reverse")
-            android.save_reverse(receiver.port)
-            environment = {**environment, "VIBEFACE_DELIVERY_UI_CONTROL": str(control), "VIBEFACE_E2E_ANDROID_APK": str(apk),
-                "VIBEFACE_E2E_ANDROID_SERIAL": android.serial, "VIBEFACE_DELIVERY_UI_TIMEOUT_MS": str(UI_TIMEOUT_MS),
-                "VIBEFACE_DELIVERY_UI_TOTAL_TIMEOUT_MS": str(remaining_ui_timeout_ms(deadline))}
-            authority = UI / "xauthority"
-            os.close(os.open(authority, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-            ui_process = subprocess.Popen(["xvfb-run", "--auto-servernum", "--server-num", "91", "--auth-file", str(authority),
-                "--error-file", str(UI / "private-display.log"), "--server-args=-screen 0 1440x1000x24 -nolisten tcp",
-                "pnpm", "exec", "e2e", "run", "--config", "tests/e2e/e2e.paid.config.ts", "--workers", "2", "--headed",
-                "--no-cache", "--retries", "0", "--video=off"], cwd=ROOT, env=environment, stdout=ui_log, stderr=ui_log, start_new_session=True)
-            join_owned(proof_process, ui_process, android.process, deadline, observe=observe)
-            finalize_ui(android_provenance)
-            success = True
-    except BaseException as error:
-        observe()
-        reason = "deadline-exceeded" if isinstance(error, TimeoutError) else "interrupted" if isinstance(error, InterruptedError) else "failed"
-        try:
-            print("STAGE delivery-live host-stop " + reason, flush=True)
-        except OSError:
-            pass
-        finish_failed_ui_evidence(proof_process, ui_process, descriptor, deadline)
-        raise
-    finally:
-        try:
-            cleanup_failure = cleanup_owned(android, proof_process, ui_process, name, descriptor, success)
-        finally:
-            signal.signal(signal.SIGTERM, previous_term)
-        if not success or cleanup_failure:
-            mark_host_failure(expected, "owned_cleanup_failed" if cleanup_failure else "live_ui_or_proof_failed", observe())
-        if cleanup_failure:
-            raise RuntimeError("Live acceptance failed to confirm cleanup of its owned processes")
-    print("PASS delivery-live thirteen genuine proofs and actual Web and Android paid delivery", flush=True)
 
 
 def resources():
@@ -1149,6 +847,7 @@ def public_exports(run, report, compiled):
 
 
 def checked_ui_evidence(summary, web, android, report):
+    """Validate archived Strict/13-proof UI evidence, including its original filenames."""
     ordinary = summary["ordinary"]
     web_fields = {"status", "orderId", "intentId", "bytes", "sha256", "actualPairing", "actualFileSelection", "actualQuotation", "actualPaymentConfirmation", "reloadPreservedIntent", "settledWhileReceiverAppOffline", "earned", "withdrawn", "refunded", "quotationScreenshot"}
     android_fields = {"status", "orderId", "intentId", "bytes", "sha256", "actualPairing", "actualAcceptance", "backgroundObserved", "receiverReverseRemoved", "existingAppConnectionTerminated", "actualOfflineVisible", "settledWhileBackgrounded", "sameOrderResumed", "actualSavedFile", "offlineScreenshot", "savedScreenshot"}
@@ -1271,118 +970,8 @@ def checked_capacity_case(report):
     return {"bytes": case["bytes"], "maxFileBytes": case["max_file_bytes"], "capacityBoundary": True, "sha256": case["sha256"]}
 
 
-def inside(package, expected):
-    if ROOT != Path("/work") or os.uname().machine != "x86_64" or os.environ.get("TOKIO_WORKER_THREADS") != "2":
-        raise ValueError("Live acceptance requires the canonical Linux sandbox and two Tokio worker threads")
-    subprocess.run(["git", "config", "--global", "--add", "safe.directory", "/work"], check=True)
-    source_commit(expected)
-    run = ARTIFACTS / ("live-runs/" + uuid.uuid4().hex)
-    run.mkdir(parents=True, mode=0o700)
-    owner = [os.environ.get("VIBEFACE_DELIVERY_UI_" + field, "") for field in ("UID", "GID")]
-    if any(not re.fullmatch(r"[0-9]{1,10}", value) or int(value) >= 2 ** 32 for value in owner):
-        raise ValueError("The host must supply bounded numeric UI owner IDs")
-    public_ui = PUBLIC / "ui"
-    if PUBLIC.is_symlink() or not PUBLIC.is_dir() or PUBLIC.stat().st_uid != int(owner[0]) or PUBLIC.stat().st_gid != int(owner[1]) or set(PUBLIC.iterdir()) != {public_ui} or public_ui.is_symlink() or not public_ui.is_dir() or public_ui.stat().st_uid != int(owner[0]) or public_ui.stat().st_gid != int(owner[1]) or list(public_ui.iterdir()):
-        raise ValueError("The host must create one fresh public directory owned by its task user")
-    enter = progress_writer("inside", expected)
-    log = run / "private-task.log"
-    cgroup, initial = resources()
-    summary = {"schemaVersion": 1, "status": "FAIL", "sourceCommit": expected, "mode": "local TestToken on loopback chain 31337",
-               "notChecked": ["real assets or public deployment", "absolute chain finality", "iOS paid delivery"]}
-    environment = {**os.environ, "CARGO_BUILD_JOBS": "2", "TOKIO_WORKER_THREADS": "2"}
-    started = time.monotonic()
-    try:
-        enter("verify-inputs")
-        for component in ("crypto", "web"):
-            command("verify " + component + " build inputs", ["python3", "scripts/build-inputs.py", "check", component], log)
-        info = checked_package(package, expected)
-        binary, core, module = package / "vibeface", package / "vibeface-core", package / "web/vibeface_secure.js"
-        environment["VIBEFACE_APP_DIR"] = str(package / "web")
-        provenance = "same-run verified Linux package"
-        enter("packaged-runtime")
-        if not runtime(binary, module, run / "packaged-runtime", log, environment):
-            enter("node-rebuild")
-            flags = subprocess.check_output(["python3", "scripts/release-rustflags.py"], cwd=ROOT, env={**environment, "CARGO_TARGET_DIR": "/artifacts/node-target"}, text=True).strip()
-            command("build current CLI and Core for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "-p", "vibeface-core", "--target-dir", "/artifacts/node-target"],
-                    log, env={**environment, "CARGO_ENCODED_RUSTFLAGS": flags})
-            binary = Path("/artifacts/node-target/release/vibeface")
-            core = Path("/artifacts/node-target/release/vibeface-core")
-            if not runtime(binary, module, run / "rebuilt-runtime", log, environment):
-                raise RuntimeError("Source-built Node failed the sandbox runtime check")
-            provenance = "actual current-source build after explicit packaged GLIBC incompatibility"
-        summary["node"] = {"origin": provenance, "sha256": digest(binary), "coreSha256": digest(core), "packageSourceCommit": info["source_commit"],
-                           "webRuntimePassed": True, "wasmSha256": digest(package / "web/vibeface_secure_bg.wasm")}
-        enter("guest-toolchain")
-        command("install fixed guest compiler", ["python3", "scripts/install-delivery-toolchain.py"], log, env=environment)
-        enter("guest-build")
-        command("build canonical actual guest and host", ["bash", "crates/delivery/proof/build.sh"], log, env=environment)
-        prover = Path("/artifacts/proof-target/release/vibeface-delivery-prover")
-        enter("guest-info")
-        compiled = json.loads(subprocess.check_output([str(prover), "info"], cwd=ROOT, env=environment))
-        checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
-        profile = checks["load_profile"](compiled)
-        summary["guest"] = compiled
-        probe_target = Path("/artifacts/delivery-probe-target")
-        enter("probe-build")
-        command("build real source-bound QUIC probe", ["cargo", "+1.98.1", "build", "--manifest-path", "tests/fixtures/delivery-probe/Cargo.toml", "--locked", "--target-dir", str(probe_target)],
-                log, env={**environment, "VIBEFACE_PROBE_SOURCE_ROOT": "/work"})
-        enter("evm-install")
-        command("install local EVM dependencies", ["node", "contracts/delivery/install.mjs"], log)
-        configuration = run / "acceptance.json"
-        write_private(configuration, {"schema_version": 1, "deployment_file": str(run / "deployment.json"),
-            "prover": {"program": str(prover), "r0vm": "/opt/vdp/bin/r0vm", "cgroup": str(cgroup), "profile": profile},
-            "max_service_amount": "1000000", "source_gas_cap_wei": "1000000000000000000",
-            "provider_gas_cap_wei": "1000000000000000000", "register_key_gas_cap_wei": "1000000000000000000",
-            "settlement_observer": "/work/contracts/delivery/observe-settlement.mjs"})
-        try:
-            enter("paid-acceptance")
-            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary), "--core-binary", str(core),
-                "--app-dir", str(package / "web"), "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
-                "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/crates/delivery/proof/profile.json",
-                "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log,
-                env={**environment, "VIBEFACE_DELIVERY_PROGRESS_COMMIT": expected})
-        except RuntimeError:
-            summary["failureStage"] = "paid-process-acceptance"
-            try:
-                summary["failureDiagnostic"] = failed_acceptance_diagnostic(run, log)
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                summary["failureDiagnostic"] = {"available": False}
-            try:
-                preserved = preserve_strict_evidence(run, compiled, profile, prover)
-                if preserved is not None:
-                    summary["partialEvidence"] = preserved
-            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-                print("UNVERIFIED delivery-live strict-only partial evidence unavailable", flush=True)
-            raise
-        enter("public-export")
-        results = list((run / "process").glob("delivery-paid-*/summary.json"))
-        if len(results) != 1:
-            raise ValueError("Expected exactly one actual paid process acceptance result")
-        evidence = public_exports(results[0].parent, json.loads(regular(results[0])), compiled)
-        summary.update(status="PROOFS_PASS", **evidence)
-    finally:
-        final, delta, resource_failure = None, None, None
-        try:
-            _, final = resources()
-            delta = oom_delta(initial, final)
-            if any(delta.values()):
-                resource_failure = "oom_events_increased"
-        except (OSError, ValueError, KeyError):
-            resource_failure = "resource_observation_failed"
-        if resource_failure:
-            summary.update(status="FAIL", resourceFailure=resource_failure)
-        write_private(PUBLIC / "summary.json", summary)
-        write_private(PUBLIC / "resources.json", {"scope": "entire sandbox including builds, Nodes, EVM and local prover", "initial": initial,
-                      "final": final, "oomEventsDelta": delta, "resourceStatus": "FAIL" if resource_failure else "PASS",
-                      "elapsedSeconds": time.monotonic() - started, "sourceCommit": expected})
-        for name in ("summary.json", "resources.json"):
-            (PUBLIC / name).chmod(0o644)
-        if resource_failure:
-            raise RuntimeError("Live delivery resource acceptance failed: " + resource_failure)
-    print("PASS delivery-live thirteen genuine proofs; awaiting the host UI process join", flush=True)
-
-
 def self_test_ui(directory):
+    """Check historical APK, progress and UI report formats without launching the retired UI."""
     from copy import deepcopy
     from unittest.mock import Mock, patch
 
@@ -1421,75 +1010,6 @@ def self_test_ui(directory):
         for abi in ANDROID_ABIS:
             archive.writestr(f"lib/{abi}/libvibeface-secure-native.so", b"\x7fELF\x02\x01" + bytes(14))
     rejected(lambda: apk_native_libraries(foreign))
-    ui = directory / "ui"
-    ui.mkdir(mode=0o700)
-    descriptor = ui / "control.json"
-    value = {"schemaVersion": 1, "url": "http://127.0.0.1:12345", "token": "a" * 64}
-    write_private(descriptor, value)
-    with patch(f"{__name__}.UI", ui):
-        assert control_descriptor(descriptor) == value
-        with patch("http.client.HTTPConnection") as connection:
-            connection.return_value.getresponse.return_value.status = 200
-            connection.return_value.getresponse.return_value.read.return_value = b'{"ok":true,"result":{"actual":true}}'
-            assert controller(value, "/facts") == {"actual": True}
-            connection.assert_called_once_with("127.0.0.1", 12345, timeout=10)
-            connection.return_value.getresponse.return_value.status = 302
-            rejected(lambda: controller(value, "/facts"))
-            connection.return_value.close.assert_called()
-        descriptor.chmod(0o644)
-        rejected(lambda: control_descriptor(descriptor))
-        descriptor.chmod(0o600)
-        with patch("os.getuid", return_value=os.getuid() + 1):
-            rejected(lambda: control_descriptor(descriptor))
-        for url in ("http://localhost:12345", "http://example.com:12345", "http://user:pass@127.0.0.1:12345", "http://127.0.0.1:12345/other", "https://127.0.0.1:12345"):
-            descriptor.write_text(json.dumps({**value, "url": url}))
-            rejected(lambda: control_descriptor(descriptor))
-        descriptor.unlink()
-        descriptor.symlink_to(apk)
-        rejected(lambda: control_descriptor(descriptor))
-        descriptor.unlink()
-        ready = Mock(poll=Mock(return_value=0))
-        running = Mock(poll=Mock(return_value=None))
-        failed = Mock(poll=Mock(return_value=1))
-        with patch("time.monotonic", return_value=100):
-            assert remaining_ui_timeout_ms(100.75) == 750
-            rejected(lambda: remaining_ui_timeout_ms(100))
-            rejected(lambda: remaining_ui_timeout_ms(100 + LIVE_TIMEOUT_SECONDS + 1))
-        with patch(f"{__name__}.controller", side_effect=OSError("closed private controller")) as abort, patch("time.monotonic", side_effect=[100, 100.5, 101]), patch("time.sleep") as pause:
-            finish_failed_ui_evidence(running, failed, value, 101)
-            abort.assert_called_once_with(value, "/abort", {"role": "web"})
-            assert pause.call_count == 1
-        with patch(f"{__name__}.controller") as abort, patch("time.monotonic", side_effect=[100, 160]), patch("time.sleep") as pause:
-            original = RuntimeError("original paid UI failure")
-            try:
-                try:
-                    raise original
-                except RuntimeError:
-                    finish_failed_ui_evidence(running, failed, value, 500)
-                    raise
-            except RuntimeError as raised:
-                assert raised is original
-            pause.assert_not_called()
-        with patch(f"{__name__}.controller") as abort:
-            finish_failed_ui_evidence(running, ready, value, time.monotonic() + 10)
-            abort.assert_not_called()
-        join_owned(ready, ready, running, time.monotonic() + 10)
-        for processes in ((failed, running, running), (running, failed, running), (ready, ready, ready)):
-            rejected(lambda: join_owned(*processes, time.monotonic() + 10))
-        rejected(lambda: join_owned(running, running, running, time.monotonic() - 1))
-        rejected(lambda: wait_owned("failed process", time.monotonic() + 10, lambda: True, (failed,)))
-        host = Mock()
-        with patch(f"{__name__}.terminate_owned") as stop, patch(f"{__name__}.controller") as abort, patch("subprocess.run", return_value=Mock(returncode=0)) as docker:
-            assert cleanup_owned(host, running, running, "vdp-live-self-test", value, False) is False
-            abort.assert_called_once_with(value, "/abort", {"role": "web"})
-            assert stop.call_args_list[0].args == (running,) and stop.call_count == 2
-            assert docker.call_args.args[0] == ["docker", "stop", "--time", "10", "vdp-live-self-test"]
-            host.close.assert_called_once()
-        host = Mock(close=Mock(side_effect=RuntimeError("owned AVD cleanup failure")))
-        with patch(f"{__name__}.terminate_owned", side_effect=[OSError("UI cleanup failure"), None]) as stop, patch("subprocess.run", side_effect=OSError("Docker cleanup failure")):
-            assert cleanup_owned(host, running, running, "vdp-live-self-test", None, True) is True
-            assert stop.call_count == 2
-            host.close.assert_called_once()
     progress_ui, progress_public = directory / "progress-private", directory / "progress-public"
     progress_ui.mkdir(mode=0o700)
     progress_public.mkdir(mode=0o700)
@@ -1506,26 +1026,13 @@ def self_test_ui(directory):
         assert observe() == expected and len(output.call_args_list) == 2
         assert set(progress_public.iterdir()) == {progress_public / "ui"}
         enter("probe-build")
-        with patch("time.monotonic", side_effect=[0, 2]), patch("time.sleep"):
-            try:
-                wait_owned("pending command", 1, lambda: None, (running,), observe=observe)
-            except TimeoutError as error:
-                assert str(error) == "pending command exceeded its explicit runtime limit"
-            else:
-                raise AssertionError("Progress must not accept an unfinished command")
-        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside probe-build",)
         expected["inside"] = "probe-build"
-        original = RuntimeError("private-business-error")
-        with patch("time.monotonic", return_value=0):
-            try:
-                wait_owned("failing command", 1, Mock(side_effect=original), observe=observe)
-            except RuntimeError as error:
-                assert error is original
+        assert observe() == expected
+        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside probe-build",)
         enter("paid-acceptance")
-        with patch("time.monotonic", side_effect=[0, 2]), patch("time.sleep"):
-            rejected(lambda: join_owned(running, ready, running, 1, observe=observe))
-        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside paid-acceptance",)
         expected["inside"] = "paid-acceptance"
+        assert observe() == expected
+        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside paid-acceptance",)
         snapshot = progress_ui / "paid-progress.json"
         valid = json.loads(snapshot.read_bytes())
         for changed in ({**valid, "stage": "private-wallet-marker"}, {**valid, "sourceCommit": "2" * 40},
@@ -1551,48 +1058,6 @@ def self_test_ui(directory):
         assert "retired" in str(error)
     else:
         raise AssertionError("The retired paid runner must reject before starting any work")
-    def checked_android_homes(*args, env, **kwargs):
-        for variable, name in (("ANDROID_USER_HOME", "android-user"), ("ANDROID_EMULATOR_HOME", "android-emulator"), ("ANDROID_AVD_HOME", "avd")):
-            home = Path(env[variable])
-            assert home == directory / "android-start" / name
-            assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700, "Private Android homes must exist before SDK commands"
-
-    with (
-        patch(f"{__name__}.UI", directory / "android-start"),
-        patch(f"{__name__}.android_tool", side_effect=lambda name: "/bootstrap-sdk/cmdline-tools/20.0/bin/" + name) as bootstrap,
-        patch(f"{__name__}.command", side_effect=checked_android_homes) as setup,
-        patch(f"{__name__}.available_port", return_value=12345),
-        patch(f"{__name__}.port_free", return_value=True),
-        patch(f"{__name__}.wait_owned"),
-        patch("subprocess.Popen"),
-    ):
-        host = AndroidHost()
-        host.adb = Mock(side_effect=["", "", "", "0", "x86_64"])
-        try:
-            environment = host.start()
-            install, create = setup.call_args_list
-            tool = Path(create.args[1][0])
-            assert tool.name == "avdmanager" and tool.parents[3] == host.sdk
-            assert "cmdline-tools;" + tool.parents[1].name in install.args[1]
-            assert "--sdk_root=" + str(host.sdk) in install.args[1]
-            assert environment["ANDROID_SDK_ROOT"] == environment["ANDROID_HOME"] == str(host.sdk)
-            bootstrap.assert_called_once_with("sdkmanager")
-        finally:
-            if host.log is not None:
-                host.log.close()
-    host = AndroidHost()
-    host.server_port, host.serial = 12345, "emulator-5554"
-    host.reverse = {"tcp:43210": "tcp:43210", "tcp:43211": None}
-    host.adb = Mock(side_effect=["fixture tcp:43210 tcp:55555\nfixture tcp:43211 tcp:43211", "", "", "fixture tcp:43211 tcp:43211", "", "", ""])
-    host.close()
-    assert host.adb.call_args_list[1].args == ("-s", "emulator-5554", "reverse", "--remove", "tcp:43210")
-    assert host.adb.call_args_list[2].args == ("-s", "emulator-5554", "reverse", "tcp:43210", "tcp:43210")
-    assert not any("--remove-all" in call.args for call in host.adb.call_args_list)
-    host = AndroidHost()
-    host.server_port, host.serial, host.reverse = 12345, "emulator-5554", {"tcp:43210": None}
-    host.adb = Mock(return_value="")
-    host.close()
-    assert not any("--remove" in call.args for call in host.adb.call_args_list)
     with patch("os.killpg") as kill:
         process = Mock(pid=987654, poll=Mock(return_value=None), wait=Mock(side_effect=[subprocess.TimeoutExpired("fixture", 10), 0]))
         terminate_owned(process)
@@ -2073,24 +1538,6 @@ def self_test():
                 raise AssertionError("Wrong commits and both tracked and untracked drift must fail with bounded filename diagnostics")
     checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
     _, original = checks["sandbox_commands"](Path("/context"))
-    package = ROOT / ".artifacts/vdp/live-input/package"
-    command_line = live_container(original, package, "1" * 40, "vdp-live-self-test")
-    mounts = [command_line[index + 1] for index, value in enumerate(command_line) if value == "--mount"]
-    assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
-        (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"),
-        (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
-    assert "--privileged" not in command_line
-    assert command_line.count("--network") == 1 and command_line[command_line.index("--network") + 1] == "host"
-    assert "--user" not in command_line
-    assert command_line[command_line.index("--memory") + 1] == command_line[command_line.index("--memory-swap") + 1] == "11g"
-    assert command_line[command_line.index("--pids-limit") + 1] == "64"
-    environments = [command_line[index + 1] for index, value in enumerate(command_line) if value == "--env"]
-    assert environments == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1", "TOKIO_WORKER_THREADS=2",
-                             f"VIBEFACE_DELIVERY_UI_UID={os.getuid()}", f"VIBEFACE_DELIVERY_UI_GID={os.getgid()}"]
-    assert command_line[-1] == "1" * 40 and command_line[-3] == str(Path("/work/.artifacts/vdp/live-input/package"))
-    assert command_line.count(original[-4]) == 1
-    assert not {"--env-file", "-e", "--privileged"}.intersection(command_line)
-    assert not any("sock" in argument or "RISC0_DEV_MODE" in argument or "RISC0_SKIP_BUILD" in argument for argument in command_line)
     snapshot = {"memory.events": "low 0\nhigh 0\nmax 1\noom 2\noom_kill 1\noom_group_kill 0\n"}
     assert not any(oom_delta(snapshot, {"memory.events": snapshot["memory.events"].replace("max 1", "max 99")}).values())
     for name, before in (("oom", 2), ("oom_kill", 1), ("oom_group_kill", 0)):

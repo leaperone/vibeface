@@ -512,9 +512,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn webhook_signature_binds_the_timestamp() {
-        assert!(signature(b"k", 1, "{}").starts_with("v1="));
-        assert_ne!(signature(b"k", 1, "{}"), signature(b"k", 2, "{}"));
+    fn webhook_signature_binds_key_timestamp_and_body() {
+        // Independently calculated with Python's hmac and hashlib.sha256.
+        for (key, timestamp, body, expected) in [
+            (
+                "k",
+                1,
+                "{}",
+                "v1=3dd49b2593d0f9a349e9e71c4bde3e2b862c2be4003fe9b4ba81332029310158",
+            ),
+            (
+                "k",
+                2,
+                "{}",
+                "v1=e88316f27de1b4d6d8a38d786b5870d908cb2c869d3efa0bbea87d48d5f045bf",
+            ),
+            (
+                "other",
+                1,
+                "{}",
+                "v1=33cceac70bf472beef819acfef3ff275ea09cef9bef3f97bfa68427d08a638af",
+            ),
+            (
+                "k",
+                1,
+                r#"{"ok":true}"#,
+                "v1=421862481ecbfb67a061ca38c82bd57998319671736e40f8529e5e57b59d8d1b",
+            ),
+        ] {
+            assert_eq!(signature(key.as_bytes(), timestamp, body), expected);
+        }
     }
 
     #[test]

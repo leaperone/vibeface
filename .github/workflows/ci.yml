@@ -122,6 +122,7 @@ jobs:
           node scripts/publish-npm.mjs --self-test
           node scripts/build-desktop.mjs --self-test
           node scripts/verify-desktop.mjs --self-test
+          node --experimental-vm-modules --test apps/core/extensions/pi.test.mjs
       - run: cargo fmt --all -- --check
 
   www:

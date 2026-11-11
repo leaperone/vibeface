@@ -281,14 +281,33 @@ function selfTest() {
     for (const platform of Object.keys(PLATFORMS).filter(target => !target.endsWith('-unknown-linux-gnu'))) {
       assert.throws(() => signingState(platform, true), /configured signing certificate/, platform);
     }
+    const restore = { ...process.env };
+    Object.assign(process.env, {
+      VIBEFACE_CODESIGN_IDENTITY: 'fixture-identity',
+      VIBEFACE_CODESIGN_TEAM: 'fixture-team',
+      VIBEFACE_NOTARY_KEY: 'fixture-key-path',
+      VIBEFACE_NOTARY_KEY_ID: 'fixture-key-id',
+      VIBEFACE_NOTARY_ISSUER: 'fixture-issuer',
+    });
+    try {
+      assert.deepEqual(signingState('aarch64-apple-darwin', true), { signed: true, signing: 'developer-id-notarized' });
+      assert.deepEqual(notaryEnvironment('aarch64-apple-darwin', true), {
+        APPLE_API_KEY: 'fixture-key-path',
+        APPLE_API_KEY_ID: 'fixture-key-id',
+        APPLE_API_ISSUER: 'fixture-issuer',
+      });
+      assert.deepEqual(notaryEnvironment('aarch64-apple-darwin', false), {}, 'an unsigned build never reads notary keys');
+    } finally {
+      process.env = restore;
+    }
     // A partial macOS credential set must never pass as signed, and never reaches notarization.
     for (const absent of MAC_SIGNING_VARS) {
       const environment = Object.fromEntries(MAC_SIGNING_VARS.filter(name => name !== absent).map(name => [name, 'set']));
       const restore = { ...process.env };
       Object.assign(process.env, environment);
+      delete process.env[absent];
       try {
         assert.throws(() => signingState('aarch64-apple-darwin', true), /configured signing certificate/, absent);
-        assert.deepEqual(notaryEnvironment('aarch64-apple-darwin', false), {}, 'an unsigned build never reads notary keys');
       } finally {
         process.env = restore;
       }

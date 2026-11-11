@@ -364,36 +364,62 @@ mod tests {
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
         let executable = package.join(PROGRAMS[0]);
-        let install = command(&root, &data, &executable, Action::Install).unwrap();
-        let mut expected = expected_script_call(&root.join("current").join(SERVICE_SCRIPT));
-        expected.extend([
-            "install".into(),
-            "--data-dir".into(),
-            data.clone().into_os_string(),
-            "--binary".into(),
-            root.join("current").join(PROGRAMS[0]).into_os_string(),
-        ]);
-        assert_eq!(whole_call(&install), expected);
-        let stop = command(&root, &data, &executable, Action::Stop).unwrap();
-        assert_eq!(
-            whole_call(&stop).len(),
-            expected_script_call(Path::new("script")).len() + 3
-        );
+        let data_arg = data.clone().into_os_string();
+        let binary_arg = root.join("current").join(PROGRAMS[0]).into_os_string();
+        for (action, arguments) in [
+            (
+                Action::Install,
+                vec![
+                    "install".into(),
+                    "--data-dir".into(),
+                    data_arg.clone(),
+                    "--binary".into(),
+                    binary_arg.clone(),
+                ],
+            ),
+            (
+                Action::Start,
+                vec!["start".into(), "--data-dir".into(), data_arg.clone()],
+            ),
+            (
+                Action::Stop,
+                vec!["stop".into(), "--data-dir".into(), data_arg.clone()],
+            ),
+            (
+                Action::Restart,
+                vec!["restart".into(), "--data-dir".into(), data_arg.clone()],
+            ),
+            (
+                Action::Status,
+                vec!["status".into(), "--data-dir".into(), data_arg.clone()],
+            ),
+            (
+                Action::Uninstall,
+                vec!["uninstall".into(), "--data-dir".into(), data_arg.clone()],
+            ),
+            (
+                Action::InstallUpdater,
+                vec![
+                    "install-updater".into(),
+                    "--data-dir".into(),
+                    data_arg.clone(),
+                    "--binary".into(),
+                    binary_arg,
+                ],
+            ),
+            (
+                Action::UninstallUpdater,
+                vec!["uninstall-updater".into(), "--data-dir".into(), data_arg],
+            ),
+        ] {
+            let operation = command(&root, &data, &executable, action).unwrap();
+            let mut expected = expected_script_call(&root.join("current").join(SERVICE_SCRIPT));
+            expected.extend(arguments);
+            assert_eq!(whole_call(&operation), expected);
+        }
         let unrelated = root.join("local-build");
         std::fs::write(&unrelated, b"another binary").unwrap();
         assert!(command(&root, &data, &unrelated, Action::Install).is_err());
-        for action in [
-            Action::Stop,
-            Action::Status,
-            Action::Uninstall,
-            Action::InstallUpdater,
-            Action::UninstallUpdater,
-        ] {
-            assert!(command(&root, &data, &executable, action).is_ok());
-        }
-        for action in [Action::Install, Action::Start, Action::Restart] {
-            assert!(command(&root, &data, &executable, action).is_ok());
-        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

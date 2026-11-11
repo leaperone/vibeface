@@ -46,10 +46,6 @@ describe('businessUrl', () => {
     expect(businessUrl(access(), inspect())).toBe(`http://127.0.0.1:4791/#local=${TOKEN}&node=${DEVICE}`)
   })
 
-  it('never loads the public 4790 listener for a local session', () => {
-    expect(businessUrl(access(), inspect())).not.toContain('4790')
-  })
-
   it('keeps the path and query Core produced', () => {
     const url = businessUrl(
       access(`http://127.0.0.1:4790/join?from=cli#local=${TOKEN}&node=${DEVICE}`),

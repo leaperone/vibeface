@@ -253,11 +253,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_refuses_non_open_input_before_network_setup() {
+    async fn bridge_refuses_non_open_input_before_network_setup() -> Result<()> {
+        let node = Identity::generate()?;
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "type": "close", "device_id": node.device_id(),
+            "addrs": ["127.0.0.1:1"], "timeout_ms": 1
+        }))?;
+        request.push(b'\n');
         let (input, mut writer) = duplex(256);
-        writer.write_all(b"{\"type\":\"close\"}\n").await.unwrap();
+        writer.write_all(&request).await?;
         drop(writer);
-        assert!(run_io(input, tokio::io::sink()).await.is_err());
+        assert_eq!(
+            run_io(input, tokio::io::sink())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "first bridge request must open a stream"
+        );
+        Ok(())
     }
 
     #[tokio::test]

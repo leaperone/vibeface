@@ -75,6 +75,9 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     const group = browser.locator('[data-message-id="task-group:message:report"]');
     const groupLabel = '4 个任务 · 1 进行中 · 2 待处理';
     const order = await browser.evaluate(() => [...document.querySelectorAll('[data-message-id]')].map(item => item.getAttribute('data-message-id')));
+    for (const id of ['report', 'task-group:message:report', 'report-reply']) {
+      assert(order.includes(id), `the conversation contains ${id}`);
+    }
     assert(order.indexOf('report') < order.indexOf('task-group:message:report') && order.indexOf('task-group:message:report') < order.indexOf('report-reply'), 'tasks stay between the originating request and its reply');
     assert(order.includes(`task-group:work:${work}`), 'nested triggers resolve to the visible request');
     assert(!order.includes(historyAnswer), 'an answered Main input stays folded into its question');

@@ -1697,14 +1697,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_cancel_confirmation_requires_the_provider_terminal() {
-        assert_eq!(
-            Provider::Cursor.capabilities()["cancel_confirmation_evidence"],
-            "provider_terminal"
-        );
-    }
-
-    #[test]
     fn the_execution_set_decides_whether_codex_runs_work() {
         let mut local = Local {
             switches: Providers::default(),
@@ -2220,6 +2212,9 @@ requires_openai_auth = false
             );
             let summary = provider.capabilities();
             assert_eq!(summary, serde_json::to_value(&descriptor).unwrap());
+            if provider == Provider::Cursor {
+                assert_eq!(summary["cancel_confirmation_evidence"], "provider_terminal");
+            }
             assert!(summary.get("observed").is_none());
             assert!(summary.get("env").is_none());
         }
