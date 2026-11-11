@@ -371,6 +371,51 @@ $allow = @($rules | Where-Object {
     return True
 
 
+def config_acl_comparison(value):
+    """Keep only bounded ACL facts, never paths, file contents or PowerShell error text."""
+    require(isinstance(value, dict), "fixture ACL diagnostic must be an object")
+    result = {}
+    for label in ("original", "verified"):
+        source = value.get(label)
+        require(isinstance(source, dict), "fixture ACL diagnostic is missing a descriptor")
+        owner = source.get("owner")
+        sddl = source.get("sddl")
+        require(isinstance(owner, str) and re.fullmatch(r"S-\d+(?:-\d+)+", owner)
+                and len(owner) <= 256, "fixture ACL diagnostic owner is not a SID")
+        require(isinstance(sddl, str) and re.fullmatch(r"[A-Za-z0-9_:;(){}.,\-]*", sddl)
+                and len(sddl) <= 1536, "fixture ACL diagnostic is not a bounded owner/access SDDL")
+        fields = {"owner": owner, "sddl": sddl}
+        for name in ("control_flags", "rule_count", "inherited_count"):
+            number = source.get(name)
+            require(type(number) is int and 0 <= number <= 65535,
+                    "fixture ACL diagnostic count or flags are invalid")
+            fields[name] = number
+        for name in ("protected", "canonical", "dacl_present", "dacl_auto_inherited",
+                     "dacl_auto_inherit_required", "dacl_defaulted", "owner_defaulted"):
+            require(type(source.get(name)) is bool, "fixture ACL diagnostic flag is invalid")
+            fields[name] = source[name]
+        rules = source.get("rules")
+        require(isinstance(rules, list) and len(rules) <= 8,
+                "fixture ACL diagnostic rule sample is invalid")
+        fields["rules"] = []
+        for rule in rules:
+            require(isinstance(rule, dict) and isinstance(rule.get("sid"), str)
+                    and re.fullmatch(r"S-\d+(?:-\d+)+", rule["sid"])
+                    and len(rule["sid"]) <= 256, "fixture ACL diagnostic trustee is not a SID")
+            normalized = {"sid": rule["sid"]}
+            for name in ("access_type", "rights", "inheritance", "propagation"):
+                number = rule.get(name)
+                require(type(number) is int and -(2 ** 31) <= number < 2 ** 32,
+                        "fixture ACL diagnostic rule mask is invalid")
+                normalized[name] = number
+            require(type(rule.get("inherited")) is bool,
+                    "fixture ACL diagnostic inherited flag is invalid")
+            normalized["inherited"] = rule["inherited"]
+            fields["rules"].append(normalized)
+        result[label] = fields
+    return result
+
+
 def copy_private_config_security(source, temporary):
     """Copy validated owner/DACL onto this fixture's empty replacement before writing data."""
     require(source.name == "config.json", "only the fixture config may be replaced")
@@ -426,13 +471,48 @@ $replacement.SetSecurityDescriptorSddlForm($descriptor, $sections)
 Set-Acl -LiteralPath $temporary -AclObject $replacement
 $verified = Read-PrivateAcl $temporary $false
 if ($verified.GetSecurityDescriptorSddlForm($sections) -cne $descriptor) {
+    function Read-AclFacts($acl) {
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+        $flags = [int] $raw.ControlFlags
+        $rules = @($acl.GetAccessRules($true, $true, $sidType))
+        $normalized = @($rules | Select-Object -First 8 | ForEach-Object {
+            @{sid=$_.IdentityReference.Value; access_type=[int]$_.AccessControlType;
+              rights=[long]$_.FileSystemRights; inheritance=[int]$_.InheritanceFlags;
+              propagation=[int]$_.PropagationFlags; inherited=[bool]$_.IsInherited}
+        })
+        return @{owner=$acl.GetOwner($sidType).Value;
+            sddl=$acl.GetSecurityDescriptorSddlForm($sections);
+            control_flags=$flags; protected=[bool]$acl.AreAccessRulesProtected;
+            canonical=[bool]$acl.AreAccessRulesCanonical; rule_count=$rules.Count;
+            inherited_count=@($rules | Where-Object {$_.IsInherited}).Count;
+            dacl_present=(($flags -band 4) -ne 0);
+            dacl_defaulted=(($flags -band 8) -ne 0);
+            dacl_auto_inherit_required=(($flags -band 256) -ne 0);
+            dacl_auto_inherited=(($flags -band 1024) -ne 0);
+            owner_defaulted=(($flags -band 1) -ne 0); rules=$normalized}
+    }
+    $facts = @{original=(Read-AclFacts $original); verified=(Read-AclFacts $verified)}
+    [Console]::Out.WriteLine('VIBEFACE_CONFIG_ACL_COMPARE ' + ($facts | ConvertTo-Json -Depth 6 -Compress))
     throw 'fixture replacement did not preserve the original owner and protected DACL'
 }
 """
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
-    run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-        env={**os.environ, 'VIBEFACE_ACL_FIXTURE': str(source),
-             'VIBEFACE_ACL_TEMPORARY': str(temporary)})
+    result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                 check=False,
+                 env={**os.environ, 'VIBEFACE_ACL_FIXTURE': str(source),
+                      'VIBEFACE_ACL_TEMPORARY': str(temporary)})
+    if result.returncode != 0:
+        # PowerShell's CLIXML stderr is path-bearing and run() truncates it. Preserve only
+        # the safe structured comparison emitted above, without changing any ACL assertion.
+        marker = 'VIBEFACE_CONFIG_ACL_COMPARE '
+        output = result.stdout[:16384].decode('utf-8-sig', errors='replace')
+        for line in output.splitlines():
+            if line.startswith(marker):
+                facts = config_acl_comparison(json.loads(line[len(marker):]))
+                raise AssertionError('fixture replacement did not preserve the original owner '
+                                     'and protected DACL; ACL comparison: '
+                                     + json.dumps(facts, separators=(',', ':'), ensure_ascii=True))
+        raise AssertionError('fixture config security validation or copy failed')
 
 
 def maintenance_probe(pipe_name):

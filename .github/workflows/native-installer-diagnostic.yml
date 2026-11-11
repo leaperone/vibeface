@@ -51,6 +51,36 @@ jobs:
           SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
         run: |
           python -B scripts/native-desktop/diagnostic-inputs.py --source-run $env:SOURCE_RUN --source-sha $env:SOURCE_SHA --source-attempt $env:SOURCE_ATTEMPT --output .artifacts/installer-diagnostic-inputs --evidence .artifacts/native-installer-diagnostic/verified-inputs.json
+      - name: Check config security replacement using the verified CLI
+        shell: pwsh
+        env:
+          RUNTIME: ${{ steps.inputs.outputs.runtime }}
+        run: |
+          @'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import tempfile
+
+          spec = importlib.util.spec_from_file_location('windows_node_fixture', 'scripts/verify-windows-node.py')
+          fixture = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(fixture)
+          with tempfile.TemporaryDirectory(prefix='vibeface-config-security-') as directory:
+              workspace = Path(directory) / fixture.WORKSPACE_NAME
+              workspace.mkdir()
+              provider = fixture.FakeProvider(workspace / 'unstarted fixture provider')
+              node = fixture.Node(Path(os.environ['RUNTIME']), workspace, fixture.NODE_NAME, provider)
+              fixture.check_private_paths(node)
+              before = json.loads((node.directory / 'config.json').read_text(encoding='utf-8'))
+              node.configure(network=dict(before['network']))
+              fixture.check_private_paths(node)
+              after = json.loads((node.directory / 'config.json').read_text(encoding='utf-8'))
+              fixture.require(before == after, 'a second protected replacement preserves all config fields')
+              fixture.require(after['network']['bind'] == '127.0.0.1:0', 'the fixture retains ephemeral real UDP allocation')
+          print('Verified CLI config security replacement and unchanged content passed; no Node daemon or Provider was started')
+          '@ | python -B -
+          if ($LASTEXITCODE -ne 0) { throw 'Verified CLI config security replacement failed' }
       - name: Locate the existing hosted installer compiler
         shell: pwsh
         run: |
