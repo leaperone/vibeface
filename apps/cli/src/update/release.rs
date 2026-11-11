@@ -899,10 +899,18 @@ pub(super) fn retain_committed(
     candidate: &Path,
 ) -> Result<()> {
     super::owned_directory(root)?;
+    super::owned_directory(data)?;
     let releases = root.join("releases");
     super::owned_directory(&releases)?;
+    let journal_exists = || -> std::io::Result<bool> {
+        match fs::symlink_metadata(data.join("update-pending.json")) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
     ensure!(
-        !data.join("update-pending.json").try_exists()?,
+        !journal_exists()?,
         "an activation journal still references this Node's releases"
     );
     let current = super::installed(root)?;
@@ -980,7 +988,7 @@ pub(super) fn retain_committed(
             continue;
         }
         ensure!(
-            super::installed(root)? == current && !data.join("update-pending.json").try_exists()?,
+            super::installed(root)? == current && !journal_exists()?,
             "the active release changed during retention"
         );
         fs::remove_dir_all(&package)?;

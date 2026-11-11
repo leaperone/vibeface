@@ -2670,6 +2670,12 @@ mod tests {
         assert!(release::retain_committed(&root, &data, "device", &second, &third).is_err());
         assert!(first.is_dir() && second.is_dir());
         fs::remove_file(data.join("update-pending.json"))?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing-journal", data.join("update-pending.json"))?;
+            assert!(release::retain_committed(&root, &data, "device", &second, &third).is_err());
+            fs::remove_file(data.join("update-pending.json"))?;
+        }
         release::retain_committed(&root, &data, "device", &second, &third)?;
         assert!(!first.exists());
         assert!(!root.join("releases/.updater-1.0.0.json").exists());
