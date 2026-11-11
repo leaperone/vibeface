@@ -213,7 +213,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `set_primary_bot` | `conversation_id`、`attestation` | 本人选定主 Bot，写入 `bots` scope |
 | `set_bot_project` | `conversation_id`、`project`（`{ target_node, cwd }` 或 `null`）、`attestation` | 本人换掉或清空机器人的项目文件夹，在它的会话写 `BotProjectSet`（签名事件体 `{"type":"bot_project_set", project}`），投影进 `bot_profiles` 的 `project` 字段，不建表、不改数据纪元；与当前相同时不写 |
 | `set_bot_avatar` | `conversation_id`、`version`（字符串或 `null`）、`avatar`（`{ outline, eyes, hue }` 或 `null`），两项必填；`attestation` | 本人给机器人挑长相或恢复默认，`version` 是本人看到的 `avatar_version`（`bots` 里的值）。当前已是 `avatar` 时不写并返回当前 bot；否则当前版本不等于 `version` 时拒绝（`the bot's face changed since you saw it; nothing was written`），客户端删掉这条待写、刷新、不重发；相等时在它的会话写 `BotAvatarSet`（签名事件体 `{"type":"bot_avatar_set", version, avatar}`），投影进 `bot_profiles` 的 `avatar` 字段，与聊天修改按 rank 后写者胜。任何修改都换新版本，改回原长相也一样，所以重放不会盖掉之后的修改。比较只在接收写入的 Node 上做，读取与追加在同一把存储锁内。返回 `{ bot }`，含新的 `avatar_version` |
-| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重；与现有 Bot 重名（忽略大小写和首尾空格）时拒绝 |
+| `create_bot` | 必需 `bot_id`、`conversation_id`、`name`、`scheduler_node`、`attestation`、`owner_attestation`；可选 `instructions`（默认空字符串）、`project` | 创建机器人和它的会话，完整请求精确去重；与现有 Bot 重名（忽略大小写和首尾空格）时拒绝 |
 | `delete_bot` | `conversation_id`、`attestation` | 本人删除机器人，在它的会话写 `BotDeleted`；已删除时不写。本机停下它正在跑和排队的回合，并中断它派到本机的工作，其他设备收到删除后各自停下自己的。返回 `{ written, primary }`，`primary` 为删除后的主 Bot 会话 ID |
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
 | `control_memory` | `conversation_id`、`memory_id`、`base`、`after`、`attestation`、`operation_id` | 本人新增、接管编辑或删除记忆。签名体为 `{type:"memory_controlled", memory_id, base, after}`。返回 `{state, operation_id, current}`，state 为 applied、already_recorded、superseded 或 conflict。先核验签名和操作身份，再查 receipt，未见才在同一事务比较本机 base 并追加；conflict 不写入 |
@@ -239,6 +239,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `notifications` | `client_id` | 该客户端尚未确认的通知 |
 | `ack` | `notification_id`、`client_id`、`attestation` | 写入 `NotificationAcked` |
 | `dismiss_work` | `conversation_id`、`work_id`、`attestation` | 本人从待处理关掉一个失败、被拒或未接收的工作：在该会话写 `NotificationAcked { notification_id: work_id, client_id: "inbox" }`（签名事件体 `{"type":"notification_acked", notification_id, client_id}`），不建表；已关掉时不写，重试只读回。工作没有失败时拒绝。返回 `{ dismissed: true }` |
+
+`create_bot` 的两个签名都使用新会话的 `conversation_id` 作为作用域。`attestation` 签署 `{type:"bot_created", bot_id, name, instructions, project?}`；`owner_attestation` 单独签署 `{type:"conversation_owner", scheduler_node, epoch:1}`。`scheduler_node` 是本人选择的首个负责人，不由接收请求的入口代选。
 
 `bot_id`、`message_id`、`conversation_id` 和 `call_ref` 标识业务写入。重试保留原身份和内容，同 ID 换内容会被拒绝。协调 Agent 的 token 只能调用 `nodes`。
 
@@ -339,7 +341,11 @@ Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `reconc
 
 Provider 初始只收到 `tool_search`、`tool_describe`、`tool_call`、`context`、`read_skill` 和 `call_lookup`。`tool_search { query?, offset?, limit? }` 返回本轮有权发现的领域工具及 `more/next`；`tool_describe { tool }` 返回原始 schema 和 effect；`tool_call { tool, arguments, call_ref? }` 进入同一领域 router，先解析实际目标再执行权限检查。目录不授予权限，也不能包装私有内部工具或再次嵌套发现工具。稳定指纹覆盖完整目录，未初始展示的 schema 变化同样会失效会话。
 
-`conversation.scheduler.context` 是本机或可达 owner 报告的限长观测，只包含 stable/dynamic 指纹、session generation、各分段 coverage、字节数、Provider 和真实阶段。`compiled` 仅表示已编译，不表示已发送；实际 Provider 回合回调和终态才推进 `started/completed/failed/cancelled/interrupted/unknown`。owner 不可达时不以入口的 Provider 状态代替。`records.context` 更新本机观测，客户端保留远端 owner 的状态。`bot_settings.memory_conflicts` 和 `records.memory_conflicts` 仅含冲突 ID、epoch/revision 和原因，不含候选文本。
+`conversation.scheduler.context` 是本机或可达 owner 报告的限长观测，只包含 stable/dynamic 指纹、session generation、各分段 coverage、字节数、Provider 和真实阶段。`compiled` 仅表示已编译，不表示已发送；实际 Provider 回合回调和终态才推进 `started/completed/failed/cancelled/interrupted/unknown`。owner 不可达时不以入口的 Provider 状态代替。
+
+`records` 推送只包含 `type`、`conversation_id`、`messages`、`works`、`history_authority` 和 `refresh_metadata:true`。其中消息和工作是精确补丁，空数组不删除已加载历史。它不携带 jobs、context 或 Memory 冲突列表。客户端收到刷新标记后读取有界 `conversation`，需要完整分区时按 `history` 的游标继续读取，合并规则见[会话历史分页](#会话历史分页)。
+
+`scheduler.jobs`、`scheduler.scope_jobs`、`bot_settings.memory_staged_count` 和 `bot_settings.memory_conflicts` 属于入口本机。远端负责人的观察分别位于 `scheduler.remote.jobs`、`scheduler.remote.scope_jobs`、`scheduler.remote.memory_staged_count` 和 `scheduler.remote.memory_conflicts`，不能写进入口的本机列表。两类 Memory 冲突只公开身份、epoch/revision 和原因，不含候选文本。负责人不可达时保留空的远端观察及未完成覆盖状态，不用本机状态冒充负责人状态。
 
 队列的 `lane` 按触发来源区分 `main/task/schedule_routine/bot_message`；main 和 bot_message 共用主会话，task 按 work_id、routine 按 trigger 隔离 session 和 worker。`hold_reason` 来自实际 claim gate，可为 `active_turn`、`steering_settlement`、`provider_serial`、`task_limit`、`machine_slot`、`pending_check` 或 `backend_config_pending`。pending check 只阻止与该未知结果共享执行边界的回合；不会自动重放写操作。`context.session_status` 为可选的 `{resumable,pending_generation}`，无可验证配置观察时省略，配置从下一回合生效。
 
@@ -536,13 +542,19 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 | `configure` | `enabled`、`charity_enabled`、`paid_enabled` 三个布尔值，不接收钱包口令、链或 prover 路径。 |
 | `list`、`get` | 当前个人网络的订单列表，或精确 `order_id` 的详情。 |
 | `find_intent` | 当前网络下精确 `intent_id` 的订单，返回 `{order: ...}` 或 `{order: null}`。 |
-| `prepare` | UUID `intent_id`、双方及服务 PeerID、模式、验收条件、文件名、base64 内容、服务费和链费上限。固定订单与报价，尚未付款。 |
-| `confirm` | 原 `intent_id`，先持久化授权并返回，后台继续证明、付款和传输。 |
+| `prepare` | UUID `intent_id`、`receiver_peer`、`provider_peer`、`mode`、`acceptance`、`name`、`content_base64`、`max_service_amount`、`max_gas_amount`。paid 另需已选预付预算的 `budget_id`，只接受 `acceptance:"recoverable"`。准备订单不授权预算分配。 |
+| `confirm` | 原 `intent_id`，先持久化授权并返回，后台继续证明、预算分配和传输；返回不证明链上成功。 |
+| `confirm_batch` | `intent_ids`：两个不同的原 prepared UUID；仅授权同一预算、合计最多两个窗口的付费发送订单，返回 `{orders}`。 |
 | `accept` | 原 `order_id`，仅接收端接受，后台按已授权条款继续。 |
+| `accept_batch` | `order_ids`：两个不同的原订单 ID；仅接收端授权同一预算、合计最多两个窗口的有效付费接收订单，返回 `{orders}`。 |
 | `reconcile` | 原 `order_id`，核对原意图和原交易，不创建替代付款。 |
 | `read` | 已接受订单的完整文件，返回 `name`、`content_base64`、`sha256` 和 `bytes`，不是新的接收授权。 |
 
-订单按当前网络隔离。接收端和发送端的写授权在后台副作用前再次核对。撤销管理成员或配置变化会停止当前执行步骤；锁定钱包只能观察原交易。公共节点上的 P 没有私人网络，后台仅按已接受的服务订单和本机预算发布 E、提款或对账。
+批量请求仍发给加密客户端方法 `delivery`，其 `params` 分别为 `{"op":"confirm_batch","intent_ids":["<原 A UUID>","<原 B UUID>"]}` 和 `{"op":"accept_batch","order_ids":["<原 A order_id>","<原 B order_id>"]}`。必须使用原准备或接收记录中的身份，不能另造 ID 补齐批次。
+
+P 的 `ready_windows` 表示已耐久收到 Hold 请求，不表示已经揭钥或付款。本人通过 `wallet budget flush --budget-id <budget_id>` 显式授权选中的窗口，后台才继续已有授权的 holdBatch、publication claim 和累计提款。`prepared`、排队状态或确认 ACK 都不能代替原链上的预算分配、Earned 和实际提款证据，详见[受保护预算结算](paid-delivery.md#hold批次揭钥和提款)。
+
+订单按当前网络隔离。接收端和发送端的写授权在后台副作用前再次核对。撤销管理成员或配置变化会停止当前执行步骤；锁定钱包只能观察原交易。网络异常或结果未知时，按原 `intent_id`、`order_id` 和 `budget_id` 查询原记录与原链状态，不换 UUID、改价、重置 gas cap 或另建订单处理未知结果。改变业务内容须由本人明确创建新订单，不能通过重试切换原订单的公益/付费方式。公共节点上的 P 没有私人网络，后台仅按已接受的服务订单和本机预算发布 E、提款或对账。
 
 ### 服务传输
 

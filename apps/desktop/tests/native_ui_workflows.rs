@@ -1720,3 +1720,42 @@ mod explicit_delivery_restart {
         assert!(!Command::DeliveryRestart(completed()).available(&state));
     }
 }
+
+#[gpui_kit::test]
+fn critical_events_are_drained_after_snapshot_sender_closes(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Chat("chat-a".into()), fixture());
+    enter_message(&h, cx, "queued input before backend shutdown");
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    assert!(h.view.read_with(cx, |view, _| view.sending));
+    let Harness {
+        view,
+        events,
+        _snapshots: snapshots,
+        ..
+    } = h;
+    drop(snapshots);
+    cx.run_until_parked();
+    events
+        .try_send(Event::Scoped {
+            generation: 7,
+            profile_id: None,
+            event: Box::new(Event::Notice("final backend notice".into())),
+        })
+        .unwrap();
+    events
+        .try_send(Event::Scoped {
+            generation: 7,
+            profile_id: None,
+            event: Box::new(Event::InputStored(ack)),
+        })
+        .unwrap();
+    drop(events);
+    cx.run_until_parked();
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.notice.as_deref(), Some("final backend notice"));
+        assert!(!view.notice_is_error);
+        assert!(!view.sending);
+        assert_eq!(view.composer.read(cx).value().as_str(), "");
+    });
+}

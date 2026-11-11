@@ -117,7 +117,43 @@ impl Desktop {
                 cx.notify();
             }
         });
-        let event_task=cx.spawn_in(window,async move|this,cx|{loop{let event=tokio::select!{event=events.recv()=>{let Some(event)=event else{break};event},changed=snapshots.changed()=>{if changed.is_err(){break}Event::Snapshot(snapshots.borrow_and_update().clone())}};let latest=if matches!(&event,Event::Scoped{..}){Some(snapshots.borrow_and_update().clone())}else{None};if cx.update(|window,cx|this.update(cx,|this,cx|{if let Some(latest)=latest{this.receive(Event::Snapshot(latest),window,cx);}this.receive(event,window,cx);cx.notify();})).is_err(){break;}}});
+        let event_task = cx.spawn_in(window, async move |this, cx| {
+            let mut snapshots_open = true;
+            loop {
+                let event = tokio::select! {
+                    event = events.recv() => {
+                        let Some(event) = event else { break };
+                        event
+                    },
+                    changed = snapshots.changed(), if snapshots_open => {
+                        if changed.is_err() {
+                            snapshots_open = false;
+                            continue;
+                        }
+                        Event::Snapshot(snapshots.borrow_and_update().clone())
+                    }
+                };
+                let latest = if matches!(&event, Event::Scoped { .. }) {
+                    Some(snapshots.borrow_and_update().clone())
+                } else {
+                    None
+                };
+                if cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            if let Some(latest) = latest {
+                                this.receive(Event::Snapshot(latest), window, cx);
+                            }
+                            this.receive(event, window, cx);
+                            cx.notify();
+                        })
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             route: Route::Connect,
             snapshot: Arc::new(Snapshot {
