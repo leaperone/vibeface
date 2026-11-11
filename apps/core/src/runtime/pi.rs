@@ -2259,7 +2259,10 @@ mod tests {
                 "PI_CODING_AGENT_SESSION_DIR".into(),
                 dir.join("sessions").display().to_string(),
             ),
-            ("FAKE_PI_LOG".into(), dir.join("log").display().to_string()),
+            (
+                "FAKE_PI_RECORDS_DIR".into(),
+                dir.join("pi-log-records").display().to_string(),
+            ),
             ("FAKE_PI_MODE".into(), mode.into()),
         ])
     }
@@ -2278,11 +2281,7 @@ mod tests {
     }
 
     fn log(dir: &Path) -> Vec<Value> {
-        std::fs::read_to_string(dir.join("log"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        super::super::triage::tests::pi_fixture_log(dir).unwrap_or_else(|error| panic!("{error:#}"))
     }
 
     fn prompts(dir: &Path) -> Vec<Value> {
@@ -2357,19 +2356,17 @@ mod tests {
     async fn wait_for_abort(dir: &Path) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let aborted = std::fs::read_to_string(dir.join("log"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                let aborted = super::super::triage::tests::pi_fixture_log(dir)?
+                    .iter()
                     .any(|entry| entry["abort"] == true);
                 if aborted {
-                    return;
+                    return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .context("the cancelled pi turn received an abort")
+        .context("the cancelled pi turn received an abort")?
     }
 
     fn release(dir: &Path) {

@@ -9028,8 +9028,8 @@ pub(super) mod tests {
                     Some(dir.join("pi-sessions").display().to_string()),
                 ),
                 (
-                    "FAKE_PI_LOG".into(),
-                    Some(dir.join("pi.log").display().to_string()),
+                    "FAKE_PI_RECORDS_DIR".into(),
+                    Some(dir.join("pi-log-records").display().to_string()),
                 ),
                 ("FAKE_PI_MODE".into(), Some(mode.into())),
             ]),
@@ -9037,11 +9037,99 @@ pub(super) mod tests {
         Ok(())
     }
 
-    fn pi_fixture_log(dir: &Path) -> Result<Vec<Value>> {
-        let text = std::fs::read_to_string(dir.join("pi.log")).unwrap_or_default();
-        text.lines()
-            .map(|line| Ok(serde_json::from_str(line)?))
+    pub(in crate::runtime) fn pi_fixture_log(dir: &Path) -> Result<Vec<Value>> {
+        let directory = dir.join("pi-log-records");
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read Pi fixture record directory {}", directory.display())
+                });
+            }
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let path = entry
+                .with_context(|| {
+                    format!("list Pi fixture record directory {}", directory.display())
+                })?
+                .path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read Pi fixture record {}", path.display()))?;
+                let record: Value = serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "parse complete Pi fixture record {} ({} bytes)",
+                        path.display(),
+                        bytes.len()
+                    )
+                })?;
+                ensure!(
+                    record.is_object(),
+                    "Pi fixture record {} must be an object ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                );
+                Ok(record)
+            })
             .collect()
+    }
+
+    #[test]
+    fn pi_fixture_records_are_complete_ordered_and_ignore_unpublished_files() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-pi-records-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            assert!(pi_fixture_log(&dir)?.is_empty());
+            let records = dir.join("pi-log-records");
+            config::private_dir(&records)?;
+            std::fs::write(records.join(".unfinished.tmp"), b"{\"prompt\":")?;
+            for (name, prompt) in [("0002.json", "second"), ("0001.json", "first")] {
+                let temporary = records.join(format!(".{name}.tmp"));
+                std::fs::write(&temporary, serde_json::to_vec(&json!({"prompt":prompt}))?)?;
+                std::fs::rename(temporary, records.join(name))?;
+            }
+            assert_eq!(
+                pi_fixture_log(&dir)?,
+                vec![json!({"prompt":"first"}), json!({"prompt":"second"})]
+            );
+            let invalid = records.join("0003.json");
+            std::fs::write(&invalid, b"{\"prompt\":\"incomplete")?;
+            let error = pi_fixture_log(&dir).expect_err("a published partial record must fail");
+            let message = format!("{error:#}");
+            assert!(message.contains("0003.json") && message.contains("bytes"));
+            assert!(
+                !message.contains("incomplete"),
+                "diagnostics do not include record contents"
+            );
+            std::fs::remove_file(invalid)?;
+            std::fs::remove_dir_all(&records)?;
+            std::fs::write(&records, b"a file is not a record directory")?;
+            assert!(
+                pi_fixture_log(&dir).is_err(),
+                "directory I/O errors cannot become an empty log"
+            );
+            Ok(())
+        })();
+        match (result, std::fs::remove_dir_all(&dir)) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("Pi record fixture cleanup also failed: {cleanup}")))
+            }
+            (Ok(()), Err(error)) => Err(error.into()),
+            (result, Ok(())) => result,
+        }
     }
 
     async fn task_bot(
@@ -9380,16 +9468,18 @@ pub(super) mod tests {
     #[tokio::test]
     async fn admitted_local_retries_keep_the_frozen_selection_after_models_and_permissions_change()
     -> Result<()> {
-        let (node, admin, dir) = node().await?;
+        let (node, admin, dir) = node()
+            .await
+            .context("open frozen-selection retry fixture")?;
         let result = async {
             with_agent(&node);
-            controlled_pi(&node, &dir, "reply")?;
+            controlled_pi(&node, &dir, "reply").context("configure frozen-selection Pi fixture")?;
             node.providers.lock().unwrap().switches.execution_models.insert(Provider::Pi, "fake/frozen".into());
             node.settings.lock().unwrap().roots = vec![dir.clone()];
-            bot(&node, &admin, "c", "Bot", &[]).await?;
-            let network = node.network_id().await?;
-            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = node.manager_access_fixture("retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
+            bot(&node, &admin, "c", "Bot", &[]).await.context("create frozen-selection Bot")?;
+            let network = node.network_id().await.context("read frozen-selection network")?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await.context("start frozen-selection manager attempt")?;
+            let access = node.manager_access_fixture("retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await.context("authorize frozen-selection manager attempt")?;
             let args = |call: &str, explicit: bool| -> Result<Value> {
                 let cwd = dir.join(call);
                 std::fs::create_dir(&cwd)?;
@@ -9401,7 +9491,8 @@ pub(super) mod tests {
             for (call, explicit) in [("explicit", true), ("implicit", false), ("provider-default", false)] {
                 if call == "provider-default" { node.providers.lock().unwrap().switches.execution_models.remove(&Provider::Pi); }
                 let args = args(call, explicit)?;
-                let first = node.tool(access.clone(), "track_work", args.clone()).await?;
+                let first = node.tool(access.clone(), "track_work", args.clone()).await
+                    .with_context(|| format!("admit {call} Pi work with its original frozen selection"))?;
                 assert_eq!(first["may_send"], false);
                 assert_eq!(first["resolved"], json!({"provider":"pi","model":if call == "provider-default" { Value::Null } else { json!("fake/frozen") }}));
                 original.push((args, first));
@@ -9411,11 +9502,11 @@ pub(super) mod tests {
                     if {
                         node.store.call("triage.test.work_records", move |store| {
                             store.work_records()
-                        }).await
+                        }).await.context("read admitted Pi work records for completion")
                     }?.iter().all(|run| run.state.finished()) { break Ok::<_, anyhow::Error>(()); }
                     tokio::task::yield_now().await;
                 }
-            }).await??;
+            }).await.context("wait for all frozen-selection Pi works to finish")??;
             {
                 let _controls = node.manager_controls.lock().await;
                 let mut providers = node.providers.lock().unwrap();
@@ -9424,7 +9515,8 @@ pub(super) mod tests {
                 node.settings.lock().unwrap().manager = None;
             }
             for (args, first) in &original {
-                let retried = node.tool(access.clone(), "track_work", args.clone()).await?;
+                let retried = node.tool(access.clone(), "track_work", args.clone()).await
+                    .with_context(|| format!("retry admitted Pi work {} after changing models and permissions", args["call_ref"]))?;
                 assert_eq!(retried["resolved"], first["resolved"]);
                 assert_eq!(retried["may_send"], false);
                 assert_eq!(retried["work_id"], first["work_id"]);
@@ -9440,12 +9532,16 @@ pub(super) mod tests {
                 assert_eq!(store.work_records()?.len(), 3);
                 assert_eq!(crate::store::context_after(&store.connection, &network, "c", None, &VersionVector::new())?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 3);
                 Ok(())
-            }).await?;
+            }).await.context("verify frozen-selection work and dispatch counts")?;
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())
         }.await;
-        cleanup(node, dir).await?;
-        result
+        match (result, cleanup(node, dir).await) {
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "frozen-selection fixture cleanup also failed: {cleanup:#}"
+            ))),
+            (Ok(()), result) | (result, Ok(())) => result,
+        }
     }
 
     #[tokio::test]
