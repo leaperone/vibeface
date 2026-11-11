@@ -9,6 +9,18 @@ on:
     - cron: '23 */4 * * *'
   workflow_dispatch:
     inputs:
+      installer_source_run:
+        description: 'Optional completed CI run for isolated Windows installer diagnostics'
+        type: string
+        default: ''
+      installer_source_sha:
+        description: 'Exact source SHA for the selected installer diagnostic input run'
+        type: string
+        default: ''
+      installer_source_attempt:
+        description: 'Selected installer source attempt'
+        type: string
+        default: '1'
       native_prepare:
         description: 'Prepare the native workspace lockfile and rustfmt patch, then compile without publishing'
         type: boolean
@@ -1226,9 +1238,20 @@ jobs:
           gh auth setup-git
           python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"
 
+  native-installer-diagnostic:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.installer_source_run != '' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/native-installer-diagnostic.yml
+    with:
+      source_run: ${{ inputs.installer_source_run }}
+      source_sha: ${{ inputs.installer_source_sha }}
+      source_attempt: ${{ inputs.installer_source_attempt }}
+
   native-prepare:
     name: Prepare native lockfile, formatting and compiler evidence
-    if: github.event_name == 'workflow_dispatch' && inputs.native_prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.native_prepare && inputs.installer_source_run == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     defaults:
