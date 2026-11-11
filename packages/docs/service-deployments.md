@@ -31,10 +31,14 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 
 ```sh
 python3 scripts/deploy.py release --service www --tag '<WEBSITE_TAG>'
-gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRODUCT_TAG>' -F apply=false
+gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=node -f tag='<PRODUCT_TAG>' -F apply=false
 ```
 
-真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、main 归属、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+真实激活仅允许从 main 执行。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、共享发布来源规则（main 或受信机械 Nightly）、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+
+激活前同时核对传输归档的 SHA256 和导入后的 image ID。归档中的镜像必须与调用方指定的 `--image` 一致；摘要正确不能替代镜像身份校验。
+
+`node` 无论是否 `apply` 都先在 runner 演练。脚本选择候选发布时间之前最近的完整产品 Release，排除候选本身、Draft 和缺少最终 manifest 或必要组件的发布，并核对其 `release.json`、来源和附件摘要。旧 Core 初始化并启动隔离 fixture 后，脚本原子换入候选 Core 生成的完整配置，再激活候选镜像并验证重复激活、原身份和初始化数据保留。fixture 只用回环地址、独立 mesh 和生成的数据，不带 Provider 或部署凭证。没有历史完整产品 Release 时明确输出 `first_release`，只演练首次安装和重复激活；查询、校验或升级失败都停止，不退到更老版本或略过升级。
 
 ## 配置部署目标
 
@@ -55,8 +59,8 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 
 ## 保留身份并核对上线
 
-公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。替换现有 systemd 服务时，它先进入维护并正常退出，保存备份后再激活；全新安装没有旧服务，校验已初始化的数据目录并备份后直接启动容器，失败时只停新容器。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
+公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。从宿主 systemd 服务迁入前，须由维护者先停旧服务并完成数据交接；脚本不自动迁移或停止宿主进程。全新安装没有旧服务，校验已初始化的数据目录并备份后直接启动容器，失败时只停新容器。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
 
-公共节点不提供网页文件。`node.vibeface.dev` 是指向 `8.217.72.118` 的 DNS-only A 记录，浏览器直接连接 `https://node.vibeface.dev:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的域名证书，安装到数据目录后 Core 不重启即换用。部署前必须在阿里云安全组对公网开放 TCP 4792、UDP 4792 和 TCP 3340（TCP 80 供 acme.sh 签证书），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点主机上的网页接入、relay 和全网的 UDP 端口，都不经过 App 主机。
+公共节点不提供网页文件。`node.vibeface.dev` 是指向 `84.54.3.78` 的 DNS-only A 记录，浏览器直接连接 `https://node.vibeface.dev:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的域名证书，安装到数据目录后 Core 不重启即换用。部署前必须确认目标主机与提供商防火墙对公网开放 TCP 4792、UDP 4792 和 TCP 3340（TCP 80 供 acme.sh 签证书），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点主机上的网页接入、relay 和全网的 UDP 端口，都不经过 App 主机。
 
 部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表全网公网 UDP 入网、relay 连接、浏览器排队接入、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。

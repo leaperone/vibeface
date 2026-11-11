@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Select published product artifacts independently of publishing a release."""
 import argparse
+import datetime
 import hashlib
 import json
 import re
@@ -81,9 +82,47 @@ def plan(tag):
     else:
         raise ValueError('tag nesting is too deep')
     source = obj['sha']
-    comparison = json.loads(gh('api', f'repos/{REPOSITORY}/compare/{source}...main'))
-    release.require(comparison['merge_base_commit']['sha'] == source, 'release is not on main')
+    fetch = ['git', 'fetch', '--tags']
+    if release.run('git', 'rev-parse', '--is-shallow-repository') == 'true':
+        fetch.append('--unshallow')
+    subprocess.run([*fetch, 'origin', 'main', 'refs/tags/' + tag], cwd=release.ROOT, check=True)
+    release.require(release.run('git', 'rev-parse', tag + '^{commit}') == source, 'fetched release tag source mismatch')
+    release.validate_source(source, kind)
     return verify(tag, manifest, published, source)
+
+
+def previous(tag):
+    """Select the last complete product release published no later than the candidate."""
+    kind, _, _ = release.parse_tag(tag)
+    release.require(kind == 'product', 'Core rehearsal requires a product release')
+    selected = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
+    release.require(selected['tag_name'] == tag and not selected['draft'], 'candidate release is not published')
+    cutoff = datetime.datetime.fromisoformat(selected['published_at'].replace('Z', '+00:00'))
+    pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{REPOSITORY}/releases?per_page=100'))
+    release.require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
+                    'invalid release listing')
+    published_releases = [published for page in pages for published in page]
+    release.require(any(published['tag_name'] == tag for published in published_releases),
+                    'candidate is missing from the release listing')
+    candidates = []
+    for published in published_releases:
+        name = published['tag_name']
+        if published['draft'] or name == tag or not re.fullmatch('v' + release.VERSION, name):
+            continue
+        _, version, _ = release.parse_tag(name)
+        names = {asset['name'] for asset in published['assets']}
+        required = {f'vibeface-core-{version}-x86_64-unknown-linux-gnu.tar.gz',
+                    f'vibeface-app-{version}.tar.gz'}
+        required |= {asset_name + '.sha256' for asset_name in required} | {'release.json'}
+        if not required <= names:
+            continue
+        date = datetime.datetime.fromisoformat(published['published_at'].replace('Z', '+00:00'))
+        if date <= cutoff:
+            candidates.append((date, name))
+    if not candidates:
+        return None
+    # A final manifest claims completeness; failed verification must not fall back to an older release.
+    return plan(max(candidates)[1])
 
 
 def selection(service, tag):
@@ -197,17 +236,76 @@ def self_test():
         f'repos/{REPOSITORY}/releases/assets/1': content,
         f'repos/{REPOSITORY}/git/ref/tags/{tag}': json.dumps({'object': {'type': 'tag', 'sha': 'd' * 40}}),
         f'repos/{REPOSITORY}/git/tags/{"d" * 40}': json.dumps({'object': {'type': 'commit', 'sha': sha}}),
-        f'repos/{REPOSITORY}/compare/{sha}...main': json.dumps({'merge_base_commit': {'sha': sha}}),
     }
-    with patch(__name__ + '.gh', side_effect=lambda *args: routes[args[-1]]):
+    with patch(__name__ + '.gh', side_effect=lambda *args: routes[args[-1]]), \
+            patch('release.run', return_value=sha), patch('subprocess.run'), patch('release.validate_source') as source_gate:
         assert plan(tag)['source_sha'] == sha
-        for route, bad in ((f'repos/{REPOSITORY}/releases/assets/1', content + ' '),
-                           (f'repos/{REPOSITORY}/compare/{sha}...main',
-                            json.dumps({'merge_base_commit': {'sha': 'e' * 40}}))):
+        source_gate.assert_called_once_with(sha, 'product')
+        for route, bad in ((f'repos/{REPOSITORY}/releases/assets/1', content + ' '),):
             saved = routes[route]; routes[route] = bad
             with TestCase().assertRaises(ValueError, msg='accepted changed manifest or non-main source'):
                 plan(tag)
             routes[route] = saved
+    def listed(name, date, draft=False, complete=True):
+        names = {f'vibeface-core-{name[1:]}-x86_64-unknown-linux-gnu.tar.gz',
+                 f'vibeface-app-{name[1:]}.tar.gz'}
+        names |= {name + '.sha256' for name in names}
+        if complete:
+            names.add('release.json')
+        return {'tag_name': name, 'draft': draft, 'published_at': date,
+                'assets': [{'name': value} for value in sorted(names)]}
+    baseline = 'v0.0.1-nightly.20261107.1'
+    candidate = listed(tag, '2026-11-08T12:00:00Z')
+    pages = [[listed('v0.0.1-nightly.20261110.1', '2026-11-10T12:00:00Z'), candidate,
+              listed('v0.0.1-nightly.20261108.2', '2026-11-08T11:00:00Z', draft=True),
+              listed('v0.0.1-nightly.20261108.3', '2026-11-08T10:00:00Z', complete=False),
+              listed('www-v0.0.1', '2026-11-08T11:00:00Z')],
+             [listed('v0.0.1-nightly.20261106.1', '2026-11-06T12:00:00Z'),
+              listed(baseline, '2026-11-07T12:00:00Z')]]
+    missing_component = listed('v0.0.1-nightly.20261108.4', '2026-11-08T11:30:00Z')
+    missing_component['assets'].pop(0)
+    pages[0].append(missing_component)
+    for response, expected in ((pages, baseline), ([pages[0]], None)):
+        with patch(__name__ + '.gh', side_effect=[json.dumps(candidate), json.dumps(response)]) as query, \
+                patch(__name__ + '.plan', return_value={'tag': baseline}) as verify_previous:
+            assert previous(tag) == ({'tag': expected} if expected else None)
+            query.assert_called_with('api', '--paginate', '--slurp', f'repos/{REPOSITORY}/releases?per_page=100')
+            if expected:
+                verify_previous.assert_called_once_with(expected)
+            else:
+                verify_previous.assert_not_called()
+    with patch(__name__ + '.gh', side_effect=[json.dumps(candidate), json.dumps(pages)]), \
+            patch(__name__ + '.plan', side_effect=ValueError('invalid previous manifest')) as verify_previous:
+        try:
+            previous(tag)
+        except ValueError as error:
+            assert str(error) == 'invalid previous manifest'
+        else:
+            raise AssertionError('fell back after a previous release verification failure')
+        verify_previous.assert_called_once_with(baseline)
+    for response in (dict(candidate, published_at='invalid'), dict(candidate, draft=True)):
+        with patch(__name__ + '.gh', return_value=json.dumps(response)):
+            try:
+                previous(tag)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('invalid release metadata accepted as a first release')
+    for response in ([], [[]], ['invalid page']):
+        with patch(__name__ + '.gh', side_effect=[json.dumps(candidate), json.dumps(response)]):
+            try:
+                previous(tag)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('invalid release listing accepted as a first release')
+    with patch(__name__ + '.gh', side_effect=ValueError('offline GitHub failure')):
+        try:
+            previous(tag)
+        except ValueError as error:
+            assert str(error) == 'offline GitHub failure'
+        else:
+            raise AssertionError('GitHub failure accepted as a first release')
     with patch(__name__ + '.plan', return_value={'tag': tag, 'source_sha': sha}), \
             patch(__name__ + '.gh') as command:
         execute('plan', 'all', tag)

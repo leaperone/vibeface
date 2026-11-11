@@ -26,15 +26,15 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 ## 每 4 小时 Nightly 的发布约束
 
-协调入口仍是 `ci.yml` 的 `daily-nightly`。定时扩展检查使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起，只在 main 的 `ci-gate` 成功后执行协调。手动 CI 和普通 main push 不触发自动 Nightly。各产品组件分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每个四小时批次仍递增版本。
+协调入口是 `ci.yml` 的 `daily-nightly`。配置保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每个槽位都发生。仅 main schedule 的 `ci-gate` 成功后启动自动 Nightly。手动 CI 和普通 main push 不触发它，手动扩展检查不能补发 Nightly。
 
-每四小时机械版本 PR 自动 squash 已授权并默认开启，需配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
+协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对本仓包版本和锁文件。仅路径白名单不能放行发布。
 
-原 schedule run 的 `created_at` 转为 UTC 后，向下取整到 00、04、08、12、16、20 时的批次。批次分支为 `bot/daily-nightly/YYYYMMDDHH`，版本日期仍为原 run 的 `YYYYMMDD`。同日不同批次各建一个版本 PR，并继续递增 Nightly 序号、Android versionCode 与 iOS buildNumber；协调器全局串行。延迟启动或跨日重跑仍恢复原批次唯一 PR、版本、实际 squash SHA 和留存制品，校验完整机械 tree、作者、base、head，以及 Android versionCode 与 iOS buildNumber 的准确单次递增。恢复沿用已经准备的构建号，不再递增。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已晚于该批次，则停止初始化，避免版本倒退。已有批次 PR 格式不符合时停止，不另建替代 PR 或重新分配版本。
+原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，不分配新版本覆盖。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
 
-只有实际合并 SHA 的 main push CI success 放行。产品与官网可并行启动独立发布运行，产品内部按依赖并行构建；不再先公开 Core、App 再启动 CLI。由 `GITHUB_TOKEN` 创建 Tag 后显式 dispatch，并指定 `publish=true`。
+机械 Nightly 的发布门验证普通单 parent、parent 在 main、精确机械 tree，以及原 schedule run 的仓库、workflow path、main、SHA 与成功 `ci-gate`。不等待包含协调 job 的整个 schedule run 成功，避免循环。Stable、RC 及直接位于 main 的 Tag 仍要求原有 main push CI success。所有制品、Tag、`source_commit` 与 provenance 始终绑定实际版本提交，可信 parent 仅用于 CI 证明。
 
-网络响应未知时先查询 PR、ref 或原 run 对账。发布恢复复用原运行的完整产品 artifact，禁止重建后覆盖公开字节。npm 失败单独报告失败；核对 registry 后恢复原 npm artifact，不把 GitHub Release 成功当作 npm 成功。缺失、过期或字节冲突的原制品阻止恢复。
+Tag 只创建一次，随后用 `GITHUB_TOKEN` 精确 dispatch `release.yml` 并指定 `publish=true`。产品与官网可并行发布。响应未知时先查询远端 Tag 和原 run，对账后继续，不重复副作用；已有 Tag 指向其他 SHA 时停止。发布恢复复用原运行和完整不可变 artifact，不重建或覆盖公开字节。npm 失败保持失败；原制品缺失、过期或字节冲突时停止。
 
 ## 独立部署发布
 
@@ -79,7 +79,7 @@ cd vibeface-<version>-<target>
 
 自定义 Rust 编译参数通过 `RUSTFLAGS` 或 `CARGO_ENCODED_RUSTFLAGS` 传入，后者优先。发布脚本保留这些参数并追加路径映射；按 Cargo 的优先级，此时不使用配置文件中的 `rustflags`。
 
-运行任务前须另装并登录相应 Provider。Cursor 管理路径使用已安装的官方 Agent CLI 及其订阅登录，显式环境认证仍可使用。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
+运行任务前须另装并登录相应 Provider。Cursor 管理路径使用已安装的官方 Agent CLI 和订阅登录，继承的认证环境变量会被清除，显式认证覆盖也被拒绝。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
 ## CI 验证范围
 
@@ -87,7 +87,7 @@ cd vibeface-<version>-<target>
 
 质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`packages/docs/` 触发门户构建；`main` 的纯 App 改动只构建 Linux x64 包并验收网页资源，不运行 Core 库业务测试。`main` 保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品在扩展检查执行。`ci-gate` 要求本次计划中的任务全部成功。
 
-打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。安装包不含 Provider SDK，验收不安装或导入 Provider SDK，也不开启模型会话。
 
 源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
@@ -206,7 +206,7 @@ npm trust github @leaperone/vibeface --repo leaperone/vibeface --file npm-publis
 
 GitHub 的同名 environment 及 tag 访问策略由仓库远端设置控制。仓库代码不会自动创建 npm trust，也不能证明设置已生效。保存 trust 后仍需一次真实 tag 发布确认 OIDC、provenance 和公开 registry 结果；本地自检和 dry run 不证明真实发布权限。不要把登录凭证发到聊天或写入仓库。
 
-手动入口默认 `publish=false`，只接受与输入相同的 tag ref。它要求该 tag 和源码 SHA 只有一个成功的 `release.yml` run，以及一个有效 npm artifact；无法唯一定位时停止。该 tag 必须已经包含本工作流与脚本。dry run 命令如下：
+手动入口默认 `publish=false`，只接受与输入相同的 tag ref。它要求该 Tag 和源码 SHA 只有一个已完成的 `release.yml` run，且 `collect`、`publish-product` 均成功，再使用唯一有效的原 npm artifact。总 run 可因 npm 失败而标红，不要求整体 success；无法唯一定位时停止。该 tag 必须已经包含本工作流与脚本。dry run 命令如下：
 
 ```sh
 gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \

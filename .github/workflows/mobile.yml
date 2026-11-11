@@ -103,7 +103,7 @@ jobs:
       # same inputs, Xcode image and Rust toolchain instead of spending its build again.
       - name: Key the simulator app by its inputs
         id: app
-        run: echo "key=ios-simulator-app-$ImageOS-$ImageVersion-$( (rustc -V; node -v) | shasum -a 256 | cut -c1-16)-${{ hashFiles('apps/mobile/**', 'packages/**', '!packages/docs/**', 'crates/**', 'config/**', 'package.json', 'pnpm-workspace.yaml', 'Cargo.toml', 'Cargo.lock', 'pnpm-lock.yaml', 'scripts/build-mobile-secure.sh', 'scripts/release-rustflags.py', '!**/node_modules/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=ios-simulator-app-$ImageOS-$ImageVersion-$( (rustc -V; node -v) | shasum -a 256 | cut -c1-16)-${{ hashFiles('apps/mobile/**', 'packages/**', '!packages/docs/**', 'crates/**', 'config/**', 'package.json', 'pnpm-workspace.yaml', 'Cargo.toml', 'Cargo.lock', 'pnpm-lock.yaml', 'scripts/build-mobile-secure.sh', 'scripts/release-rustflags.py', '.github/workflows/mobile.yml', '!**/node_modules/**') }}" >> "$GITHUB_OUTPUT"
       - name: Restore the simulator app built from the same inputs
         id: app_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25

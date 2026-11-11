@@ -3,6 +3,7 @@ import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import { awaitsAnswer, workApproval } from "./questions.ts"
 import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+import { isJobState, isTerminalJobState, jobStates, type JobState } from "./types.ts"
 
 export const contextStages = {
   compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },
@@ -266,12 +267,6 @@ const sameObservedJob = (left: WorkspaceActivityJob, right: WorkspaceActivityJob
   const leftSource = jobSource(left, localNode), rightSource = jobSource(right, localNode)
   return leftSource !== null && leftSource === rightSource
 }
-const terminalJobStates = new Set(["completed", "failed", "cancelled", "interrupted", "rejected", "steered"])
-const activeJobStates = new Set(["claimed", "running", "steering", "cancelling", "publishing", "reconciling"])
-const jobStateRank: Record<string, number> = {
-  queued: 10, pending_delivery: 10, claimed: 20, running: 30, steering: 35, cancelling: 40, publishing: 50,
-  completed: 60, interrupted: 60, cancelled: 60, steered: 60, rejected: 65, failed: 65, reconciling: 80, unknown: 100, unverified: 100,
-}
 const jobFailure = (job: ManagerJob | OverviewJob) => "failure" in job ? job.failure : undefined
 
 function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): WorkspaceActivityJob {
@@ -279,19 +274,19 @@ function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): Workspa
   if (!first) throw new Error("任务观察不能为空。")
   const jobs = entries.map((entry) => entry.job)
   const states = new Set(jobs.map((job) => job.state))
-  const terminalStates = new Set(jobs.map((job) => job.state).filter((state) => terminalJobStates.has(state)))
+  const terminalStates = new Set(jobs.map((job) => job.state).filter(isTerminalJobState))
   const outcomes = new Set(jobs.flatMap((job) => job.outcome ? [job.outcome] : []))
   const runtimes = jobs.flatMap((job) => job.runtime ? [job.runtime] : [])
   const runtimeIds = new Set(runtimes.map((runtime) => JSON.stringify([runtime.delivery_id, runtime.generation, runtime.session_generation, runtime.provider, runtime.model, runtime.reasoning_effort])))
   const ownerEpochs = new Set(jobs.flatMap((job) => "owner_epoch" in job && job.owner_epoch !== null ? [job.owner_epoch] : []))
-  const hasUnknownState = jobs.some((job) => !(job.state in jobStateRank))
+  const hasUnknownState = jobs.some((job) => !isJobState(job.state))
   const pendingCheck = jobs.some((job) => job.pending_check === true)
   const queueStates = new Set(["queued", "pending_delivery"])
   const recoveryStates = new Set(["claimed", "steering"])
   const recoveryRollback = jobs.some((job) => queueStates.has(job.state)) && jobs.some((job) => recoveryStates.has(job.state))
   const attemptConflict = runtimeIds.size > 1 || ownerEpochs.size > 1
-  const uncertain = pendingCheck || hasUnknownState || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1 || (terminalStates.size > 0 && jobs.some((job) => activeJobStates.has(job.state))) || recoveryRollback || attemptConflict || jobs.some((job) => job.state === "steered" && job.outcome === "unknown")
-  const state = uncertain ? "unknown" : [...states].sort((left, right) => jobStateRank[right]! - jobStateRank[left]!)[0] ?? "unknown"
+  const uncertain = pendingCheck || hasUnknownState || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1 || (terminalStates.size > 0 && jobs.some((job) => isJobState(job.state) && jobStates[job.state].phase === 'active')) || recoveryRollback || attemptConflict || jobs.some((job) => job.state === "steered" && job.outcome === "unknown")
+  const state = uncertain ? "unknown" : [...states].filter(isJobState).sort((left, right) => jobStates[right].rank - jobStates[left].rank)[0] ?? "unknown"
   const primary = entries.find((entry) => entry.job.state === state) ?? entries[0]
   const failure = jobs.map(jobFailure).find(Boolean)
   const runtime = primary.job.runtime ?? runtimes[0]
@@ -424,13 +419,13 @@ export function parseSummarySteps(summary: string): SummaryStep[] | null {
   return steps
 }
 
-const schedulerStates: Record<string, { label: string; group: "open" | "history" }> = {
+const schedulerStates: Partial<Record<JobState, { label: string; group: "open" | "history" }>> = {
   queued: { label: "排队中", group: "open" }, claimed: { label: "已领取", group: "open" }, running: { label: "执行中", group: "open" },
   steering: { label: "补充中", group: "open" }, cancelling: { label: "停止中", group: "open" }, publishing: { label: "回复同步中", group: "open" },
   pending_delivery: { label: "等待设备接收", group: "open" }, reconciling: { label: "正在查询上次回复", group: "open" }, steered: { label: "补充已结算", group: "history" }, completed: { label: "已完成", group: "history" },
   failed: { label: "失败", group: "history" }, cancelled: { label: "已取消", group: "history" }, interrupted: { label: "已中断", group: "history" },
 }
-export const schedulerStatus = (state: string): { label: string; group: "open" | "history" | "unknown" } => schedulerStates[state] ?? { label: "状态未知", group: "unknown" }
+export const schedulerStatus = (state: string): { label: string; group: "open" | "history" | "unknown" } => (isJobState(state) ? schedulerStates[state] : undefined) ?? { label: "状态未知", group: "unknown" }
 
 /** Muting is independent of the device's reachability and never proves that a provider session is alive. */
 export function externalSessionStatus(session: Pick<SessionHandoff, "node">, nodes: readonly NodeInfo[]): "revoked" | "unknown" | "offline" | "reachable" {

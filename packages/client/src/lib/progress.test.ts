@@ -15,6 +15,11 @@ test('resync is a snapshot request and does not alter live progress', () => {
 test('only the normalized progress contract crosses the changed boundary', () => {
   const event = manager(1, { type: 'text_snapshot', text: '', item_id: 'reply-a' })
   assert.equal(event.type, 'manager_progress')
+  for (const sequence of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.deepEqual(manager(sequence, { type: 'text_snapshot', text: '' }), { type: 'invalidate' })
+  }
+  assert.deepEqual(manager(1, { type: 'text_snapshot', text: '' }, ''), { type: 'invalidate' })
+  assert.deepEqual(manager(1, { type: 'status', text: '' }), { type: 'invalidate' })
   for (const value of [
     null, [], { type: 'unknown' },
     { type: 'manager_progress', conversation_id: 'chat-a', trigger: 'turn-a', progress: { provider: 'arbitrary-json' } },

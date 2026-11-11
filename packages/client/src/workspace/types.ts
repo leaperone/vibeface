@@ -146,6 +146,19 @@ export type TurnRuntime = {
   stage: ProviderStage; execution: 'not_started' | 'started' | 'unknown'; attempted_at_ms: number
   switched_from: { provider: ProviderId; model: string | null; reasoning_effort: string | null } | null; switch_reason: FailureKind | null
 }
+export const jobStates = {
+  queued: { rank: 10, phase: 'waiting' }, pending_delivery: { rank: 10, phase: 'waiting' },
+  claimed: { rank: 20, phase: 'active' }, running: { rank: 30, phase: 'active' }, steering: { rank: 35, phase: 'active' },
+  cancelling: { rank: 40, phase: 'active' }, publishing: { rank: 50, phase: 'active' }, reconciling: { rank: 80, phase: 'active' },
+  completed: { rank: 60, phase: 'ended' }, interrupted: { rank: 60, phase: 'ended' }, cancelled: { rank: 60, phase: 'ended' },
+  steered: { rank: 60, phase: 'steered' }, rejected: { rank: 65, phase: 'ended' }, failed: { rank: 65, phase: 'ended' },
+  unknown: { rank: 100, phase: 'unknown' }, unverified: { rank: 100, phase: 'unknown' },
+} as const
+export type JobState = keyof typeof jobStates
+export function isJobState(state: string): state is JobState { return Object.hasOwn(jobStates, state) }
+/** A steered input settles separately from the reply whose stream it joined. */
+export const isReplyEnded = (state: string) => isJobState(state) && jobStates[state].phase === 'ended'
+export const isTerminalJobState = (state: string) => isReplyEnded(state) || state === 'steered'
 export type ManagerJob = {
   trigger: string
   state: string

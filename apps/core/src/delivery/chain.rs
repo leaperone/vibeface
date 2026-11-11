@@ -1,9 +1,9 @@
 use super::store::{SignedTransaction, SpendIntent};
 use crate::net::mesh::record::Settlement;
 use alloy_consensus::TxEip1559;
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
+use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use alloy_sol_types::{SolCall, SolStruct, SolValue, eip712_domain};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -11,7 +11,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use vibeface_delivery::{Amount, Order, ProofProfile, Relation, Statement, Word};
+use vibeface_delivery::{Amount, ProofProfile, Relation, Statement, Word};
 
 const LOCAL_CHAIN_ID: u64 = 31_337;
 const MAX_RPC_BYTES: usize = 512 * 1024;
@@ -20,11 +20,11 @@ const MAX_GAS_LIMIT: u64 = 30_000_000;
 const CONTROL_ROOT: &str = "0xa54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56";
 const BN254_CONTROL_ID: &str = "0x04446e66d300eb7fb45c9726bb53c793dda407a62e9601618bb43c5c14657ac0";
 
-mod abi {
+pub(super) mod abi {
     include!(concat!(env!("OUT_DIR"), "/delivery_abi.rs"));
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub rpc_url: String,
@@ -87,6 +87,7 @@ impl ChainConfig {
 }
 
 pub enum Call {
+    Budget(Box<super::budget::BudgetAction>),
     Approve {
         amount: Amount,
     },
@@ -94,35 +95,10 @@ pub enum Call {
         statement: Statement,
         seal: Vec<u8>,
     },
-    Fund {
-        order: Box<Order>,
-        source_seals: Vec<Vec<u8>>,
-        wallet_signature: Vec<u8>,
-    },
-    Hold {
-        order_id: Word,
-        index: u16,
-        seal: Vec<u8>,
-    },
-    Publish {
-        order_id: Word,
-        index: u16,
-        capsule: Vec<u8>,
-    },
     Open {
         order_id: Word,
         index: u16,
         seal: Vec<u8>,
-    },
-    Refund {
-        order_id: Word,
-        index: u16,
-    },
-    RefundBonus {
-        order_id: Word,
-    },
-    Withdraw {
-        order_id: Word,
     },
 }
 
@@ -205,6 +181,10 @@ impl Chain {
         };
         chain.verify_deployment().await?;
         Ok(chain)
+    }
+
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
     }
 
     async fn verify_deployment(&self) -> Result<()> {
@@ -324,6 +304,41 @@ impl Chain {
         )
     }
 
+    pub async fn native_balance(&self, wallet: Address) -> Result<String> {
+        Ok(quantity(
+            &self
+                .rpc("eth_getBalance", json!([address_hex(wallet), "latest"]))
+                .await?,
+        )?
+        .to_string())
+    }
+
+    pub async fn budget_at(
+        &self,
+        position: &ChainPosition,
+        id: B256,
+    ) -> Result<super::budget::BudgetSnapshot> {
+        let value = self
+            .call_at(
+                address(&self.config.escrow)?,
+                abi::getBudgetCall { id },
+                position,
+            )
+            .await?;
+        super::budget::BudgetSnapshot::from_chain(&self.config, id, value, position.clone())
+    }
+
+    pub async fn order_budget_at(&self, position: &ChainPosition, id: Word) -> Result<Word> {
+        Ok(self
+            .call_at(
+                address(&self.config.escrow)?,
+                abi::orderBudgetCall { id: id.into() },
+                position,
+            )
+            .await?
+            .into())
+    }
+
     pub async fn current_key(&self, receiver_peer: Word) -> Result<KeyRecord> {
         let position = self.confirmed_position().await?;
         let result = self
@@ -350,13 +365,19 @@ impl Chain {
 
     pub async fn confirmed_order(&self, order_id: Word) -> Result<OrderState> {
         let position = self.confirmed_position().await?;
+        let result = self.order_at(&position, order_id).await?;
+        self.verify_position(&position).await?;
+        Ok(result)
+    }
+
+    pub async fn order_at(&self, position: &ChainPosition, order_id: Word) -> Result<OrderState> {
         let result = self
             .call_at(
                 address(&self.config.escrow)?,
                 abi::getOrderCall {
                     id: order_id.into(),
                 },
-                &position,
+                position,
             )
             .await?;
         ensure!(
@@ -488,6 +509,10 @@ impl Chain {
         let cap = amount(&gas_cap)?;
         ensure!(cap > U256::ZERO, "delivery gas cap must be positive");
         let (target, calldata) = encode_call(&self.config, call, wallet)?;
+        ensure!(
+            !is_disclosure_calldata(&calldata),
+            "recovery material requires a durable protected publication claim; estimation is forbidden"
+        );
         let gas = quantity_u64(&self.rpc("eth_estimateGas", json!([{"from":address_hex(wallet),"to":address_hex(target),"data":data_hex(&calldata),"value":"0x0"}])).await?)?;
         let gas_limit = gas
             .checked_add(gas / 5)
@@ -526,7 +551,58 @@ impl Chain {
         Ok(intent)
     }
 
-    async fn broadcast(&self, transaction: &SignedBytes) -> Result<String> {
+    pub(super) fn prepare_publication_intent(
+        &self,
+        id: String,
+        wallet: Address,
+        action: super::budget::BudgetAction,
+        gas_cap: String,
+        policy: &super::budget::PublicationPolicy,
+    ) -> Result<SpendIntent> {
+        policy.validate()?;
+        let (target, calldata) = action.encode(&self.config, wallet)?;
+        ensure!(
+            calldata.starts_with(&abi::revealBatchCall::SELECTOR),
+            "offline publication only signs a bounded reveal batch"
+        );
+        let intent = SpendIntent {
+            id,
+            chain_id: self.config.chain_id,
+            wallet: address_hex(wallet),
+            to: address_hex(target),
+            calldata: data_hex(&calldata),
+            value: "0".into(),
+            gas_limit: super::budget::REVEAL_GAS_LIMIT,
+            gas_cap,
+            max_fee_per_gas: policy.max_fee_per_gas.clone(),
+            max_priority_fee_per_gas: policy.priority_fee_per_gas.clone(),
+        };
+        checked_transaction(&self.config, &intent, wallet, 0)?;
+        Ok(intent)
+    }
+
+    pub(super) async fn publication_clock(&self) -> Result<(u64, U256)> {
+        let block = self
+            .rpc("eth_getBlockByNumber", json!(["latest", false]))
+            .await?;
+        Ok((
+            quantity_u64(&block["timestamp"])?,
+            quantity(&block["baseFeePerGas"])?,
+        ))
+    }
+
+    pub(super) async fn latest_nonce(&self, wallet: Address) -> Result<u64> {
+        quantity_u64(
+            &self
+                .rpc(
+                    "eth_getTransactionCount",
+                    json!([address_hex(wallet), "latest"]),
+                )
+                .await?,
+        )
+    }
+
+    pub(super) async fn broadcast(&self, transaction: &SignedBytes) -> Result<String> {
         let raw = hex_data(
             &Value::String(transaction.raw_tx.clone()),
             MAX_CALLDATA_BYTES + 1024,
@@ -587,7 +663,7 @@ impl Chain {
             }
             (transaction.intent, transaction.nonce)
         } else {
-            delivery.authorize_spend(id).await?;
+            delivery.authorize_spend(id, &self.config).await?;
             let intent = self
                 .prepare_intent(id.to_owned(), wallet, call, gas_cap.to_owned())
                 .await?;
@@ -603,7 +679,7 @@ impl Chain {
         intent: &SpendIntent,
         pending_nonce: u64,
     ) -> Result<()> {
-        delivery.authorize_transaction(intent).await?;
+        delivery.authorize_transaction(intent, &self.config).await?;
         let group = intent
             .id
             .split('/')
@@ -657,6 +733,13 @@ impl Chain {
         id: &str,
     ) -> Result<TxObservation> {
         let mut transaction = delivery.with_store(|store| store.transaction(id))?;
+        ensure!(
+            !is_disclosure_calldata(&hex_data(
+                &Value::String(transaction.intent.calldata.clone()),
+                MAX_CALLDATA_BYTES
+            )?),
+            "protected publication attempts are reconciled only through their durable claim"
+        );
         let wallet = address(&transaction.intent.wallet)?;
         checked_transaction(&self.config, &transaction.intent, wallet, transaction.nonce)?;
         if transaction.raw_tx.is_none() {
@@ -696,7 +779,7 @@ impl Chain {
             let nonce_available =
                 matches!(&pending_nonce, Ok(nonce) if *nonce <= transaction.nonce);
             let authorized = delivery
-                .authorize_transaction(&transaction.intent)
+                .authorize_transaction(&transaction.intent, &self.config)
                 .await
                 .is_ok();
             let unlocked = matches!(delivery.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), super::wallet::WalletStatus::Unlocked { address } if address == transaction.intent.wallet);
@@ -904,6 +987,20 @@ impl Chain {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        if matches!(method, "eth_estimateGas" | "eth_call" | "debug_traceCall")
+            && let Some(data) = params
+                .get(0)
+                .and_then(|call| call.get("data"))
+                .and_then(Value::as_str)
+        {
+            ensure!(
+                !is_disclosure_calldata(&hex_data(
+                    &Value::String(data.to_owned()),
+                    MAX_CALLDATA_BYTES
+                )?),
+                "recovery material must never be sent to an estimate, call or simulation"
+            );
+        }
         let id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let mut response = self
             .client
@@ -949,6 +1046,7 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
     config.validate()?;
     let escrow = address(&config.escrow)?;
     let calldata = match call {
+        Call::Budget(action) => return action.encode(config, wallet),
         Call::Approve { amount } => {
             return Ok((
                 address(&config.asset)?,
@@ -973,84 +1071,6 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
             }
             .abi_encode()
         }
-        Call::Fund {
-            order,
-            source_seals,
-            wallet_signature,
-        } => {
-            order.verify()?;
-            config.profile.check_order(&order.unsigned)?;
-            ensure!(
-                order.unsigned.terms.payer == wallet.into_array()
-                    && order.unsigned.terms.asset == address(&config.asset)?.into_array(),
-                "delivery payer or asset mismatch"
-            );
-            ensure!(
-                source_seals.len() == order.unsigned.windows.len() && wallet_signature.len() == 65,
-                "incomplete delivery source proofs or wallet quote"
-            );
-            for seal in &source_seals {
-                validate_seal(seal)?;
-            }
-            let input = abi::DeliveryStatement::abi_decode_validate(
-                Statement::window(&order.unsigned, 0, Relation::Source)?.abi_bytes(),
-            )?;
-            validate_statement(config, &input)?;
-            let specs = order
-                .unsigned
-                .windows
-                .iter()
-                .map(|spec| abi::WindowSpec {
-                    index: spec.index,
-                    offset: spec.offset,
-                    plaintextBytes: spec.plaintext_bytes,
-                    ciphertextBytes: spec.ciphertext_bytes,
-                    ciphertextHash: spec.ciphertext_hash.into(),
-                    capsuleHash: spec.capsule_hash.into(),
-                    plaintextCommitment: spec.plaintext_commitment.into(),
-                    deliveryFee: U256::from_be_bytes(spec.delivery_fee.to_be_bytes()),
-                    reservationFee: U256::from_be_bytes(spec.reservation_fee.to_be_bytes()),
-                })
-                .collect();
-            abi::fundCall {
-                input,
-                specs,
-                seals: source_seals.into_iter().map(Bytes::from).collect(),
-                walletSignature: wallet_signature.into(),
-            }
-            .abi_encode()
-        }
-        Call::Hold {
-            order_id,
-            index,
-            seal,
-        } => {
-            validate_order_index(order_id, index)?;
-            validate_seal(&seal)?;
-            abi::holdCall {
-                id: order_id.into(),
-                index,
-                seal: seal.into(),
-            }
-            .abi_encode()
-        }
-        Call::Publish {
-            order_id,
-            index,
-            capsule,
-        } => {
-            validate_order_index(order_id, index)?;
-            ensure!(
-                capsule.len() == 80,
-                "delivery capsule must contain exactly 80 bytes"
-            );
-            abi::publishCall {
-                id: order_id.into(),
-                index,
-                capsule: capsule.into(),
-            }
-            .abi_encode()
-        }
         Call::Open {
             order_id,
             index,
@@ -1065,28 +1085,6 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
             }
             .abi_encode()
         }
-        Call::Refund { order_id, index } => {
-            validate_order_index(order_id, index)?;
-            abi::refundCall {
-                id: order_id.into(),
-                index,
-            }
-            .abi_encode()
-        }
-        Call::RefundBonus { order_id } => {
-            validate_order_index(order_id, 0)?;
-            abi::refundBonusCall {
-                id: order_id.into(),
-            }
-            .abi_encode()
-        }
-        Call::Withdraw { order_id } => {
-            validate_order_index(order_id, 0)?;
-            abi::withdrawCall {
-                id: order_id.into(),
-            }
-            .abi_encode()
-        }
     };
     ensure!(
         calldata.len() <= MAX_CALLDATA_BYTES,
@@ -1095,7 +1093,10 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
     Ok((escrow, calldata))
 }
 
-fn validate_statement(config: &ChainConfig, input: &abi::DeliveryStatement) -> Result<()> {
+pub(super) fn validate_statement(
+    config: &ChainConfig,
+    input: &abi::DeliveryStatement,
+) -> Result<()> {
     Statement::from_bytes(&input.abi_encode())?;
     ensure!(
         input.chainId == U256::from(config.chain_id)
@@ -1193,54 +1194,12 @@ fn validate_calldata(
             ensure!(call.input.relation == 1, "invalid delivery key relation");
             validate_seal(&call.seal)?;
         }
-        value if value == abi::fundCall::SELECTOR => {
-            let call = exact!(fundCall);
-            validate_statement(config, &call.input)?;
-            ensure!(
-                call.input.relation == 2
-                    && call.input.payer == wallet
-                    && call.input.asset == address(&config.asset)?
-                    && call.specs.len() == call.input.windowCount as usize
-                    && call.seals.len() == call.specs.len()
-                    && call.walletSignature.len() == 65,
-                "invalid authorized delivery funding call"
-            );
-            for seal in call.seals {
-                validate_seal(&seal)?;
-            }
-        }
-        value if value == abi::holdCall::SELECTOR => {
-            let call = exact!(holdCall);
-            validate_order_index(call.id.into(), call.index)?;
-            validate_seal(&call.seal)?;
-        }
         value if value == abi::openCall::SELECTOR => {
             let call = exact!(openCall);
             validate_order_index(call.id.into(), call.index)?;
             validate_seal(&call.seal)?;
         }
-        value if value == abi::publishCall::SELECTOR => {
-            let call = exact!(publishCall);
-            validate_order_index(call.id.into(), call.index)?;
-            ensure!(call.capsule.len() == 80, "invalid delivery capsule");
-        }
-        value if value == abi::refundCall::SELECTOR => {
-            let call = exact!(refundCall);
-            validate_order_index(call.id.into(), call.index)?;
-        }
-        value if value == abi::refundBonusCall::SELECTOR => {
-            let call = exact!(refundBonusCall);
-            validate_order_index(call.id.into(), 0)?;
-        }
-        value if value == abi::cancelCall::SELECTOR => {
-            let call = exact!(cancelCall);
-            validate_order_index(call.id.into(), 0)?;
-        }
-        value if value == abi::withdrawCall::SELECTOR => {
-            let call = exact!(withdrawCall);
-            validate_order_index(call.id.into(), 0)?;
-        }
-        _ => bail!("delivery wallet refuses an unknown contract action"),
+        _ => return super::budget::validate_calldata(config, input, wallet),
     }
     Ok(())
 }
@@ -1259,19 +1218,23 @@ pub fn quote_wallet_digest(
     .eip712_signing_hash(&domain))
 }
 
-fn validate_order_index(order_id: Word, index: u16) -> Result<()> {
+pub(super) fn validate_order_index(order_id: Word, index: u16) -> Result<()> {
     ensure!(
         order_id != [0; 32] && index < 16,
         "invalid delivery order or window index"
     );
     Ok(())
 }
-fn validate_seal(seal: &[u8]) -> Result<()> {
+pub(super) fn validate_seal(seal: &[u8]) -> Result<()> {
     ensure!(
         seal.len() == 260 && seal[..4] == [0x73, 0xc4, 0x57, 0xba],
         "delivery proof must use the pinned Groth16 selector and size"
     );
     Ok(())
+}
+
+fn is_disclosure_calldata(input: &[u8]) -> bool {
+    input.starts_with(&abi::revealBatchCall::SELECTOR)
 }
 fn window_state(window: abi::ChainWindow) -> Result<WindowState> {
     ensure!(
@@ -1366,7 +1329,7 @@ fn word(value: &str) -> Result<B256> {
     ensure!(bytes.len() == 32, "invalid delivery bytes32 length");
     Ok(B256::from_slice(&bytes))
 }
-fn amount(value: &str) -> Result<U256> {
+pub(super) fn amount(value: &str) -> Result<U256> {
     Ok(U256::from_be_bytes(
         Amount::from_decimal_str(value)?.to_be_bytes(),
     ))
@@ -1501,6 +1464,52 @@ fn verify_code_template(actual: &[u8], template: &CodeTemplate) -> Result<()> {
 pub(super) mod tests {
     use super::*;
 
+    pub struct RpcFixture {
+        pub chain: Chain,
+        pub requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for RpcFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    pub async fn rpc_fixture(
+        mut config: ChainConfig,
+        response: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> Result<RpcFixture> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        config.rpc_url = format!("http://{}/", listener.local_addr()?);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let response = std::sync::Arc::new(response);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let captured = captured.clone();
+                let response = response.clone();
+                async move {
+                    captured.lock().unwrap().push(request.clone());
+                    axum::Json(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":response(&request)}),
+                    )
+                }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok(RpcFixture {
+            chain: Chain {
+                config,
+                client: reqwest::Client::new(),
+                request_id: AtomicU64::new(1),
+            },
+            requests,
+            task,
+        })
+    }
+
     pub fn config() -> ChainConfig {
         ChainConfig {
             rpc_url: "http://127.0.0.1:8545".into(),
@@ -1624,6 +1633,151 @@ pub(super) mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn changing_deployment_during_nonce_or_receipt_wait_stops_signing_and_rebroadcast()
+    -> Result<()> {
+        use super::super::{
+            Delivery, DeliveryConfig,
+            budget::{BudgetSnapshot, BudgetTerms},
+        };
+        use std::sync::{Arc, atomic::AtomicBool};
+        use vibeface_control::maintenance::SecretString;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("chain-configuration-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Arc::new(Delivery::open(
+            &dir,
+            crate::crypto::LocalIdentity::generate(),
+        )?);
+        let password = SecretString::new("synthetic configuration regression wallet".into());
+        let wallet = {
+            let mut wallet = delivery.wallet.lock().unwrap();
+            wallet.create(&password)?;
+            wallet.unlock(&password)?;
+            wallet.address()?
+        };
+        let on_nonce = Arc::new(AtomicBool::new(true));
+        let on_receipt = Arc::new(AtomicBool::new(false));
+        let captured_delivery = delivery.clone();
+        let nonce_switch = on_nonce.clone();
+        let receipt_switch = on_receipt.clone();
+        let rpc = rpc_fixture(config(), move |request| {
+            let method = request["method"].as_str().unwrap();
+            if method == "eth_getTransactionCount" && nonce_switch.swap(false, Ordering::SeqCst)
+                || method == "eth_getTransactionReceipt"
+                    && receipt_switch.swap(false, Ordering::SeqCst)
+            {
+                let mut changed = captured_delivery.config();
+                changed.chain.as_mut().unwrap().rpc_url = "http://127.0.0.1:9/".into();
+                captured_delivery.configure_local(changed).unwrap();
+            }
+            match method {
+                "eth_estimateGas" => json!("0x5208"),
+                "eth_gasPrice" | "eth_maxPriorityFeePerGas" => json!("0x1"),
+                "eth_getTransactionCount" => json!("0x0"),
+                _ => Value::Null,
+            }
+        })
+        .await?;
+        let settings = DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(rpc.chain.config.clone()),
+            ..Default::default()
+        };
+        delivery.configure_local(settings.clone())?;
+        let budget_id = "44".repeat(32);
+        let cap = "100000000000000";
+        delivery.register_budget(
+            &BudgetSnapshot {
+                terms: BudgetTerms {
+                    budget_id: budget_id.clone(),
+                    chain_id: rpc.chain.config.chain_id,
+                    escrow: rpc.chain.config.escrow.clone(),
+                    asset: rpc.chain.config.asset.clone(),
+                    payer: address_hex(wallet),
+                    payee: address_hex(Address::repeat_byte(3)),
+                    provider_peer: "55".repeat(32),
+                    deposit: "100".into(),
+                },
+                locked: "0".into(),
+                earned: "0".into(),
+                withdrawn: "0".into(),
+                refunded: "0".into(),
+                free: "100".into(),
+                max_claim_until: 0,
+                state: "open".into(),
+                position: ChainPosition {
+                    block_number: 1,
+                    block_hash: data_hex(&[0x55; 32]),
+                    timestamp: 1,
+                },
+            },
+            cap,
+        )?;
+        let fresh_id = format!("budget-{budget_id}/fresh");
+        let resume_id = format!("budget-{budget_id}/resume");
+        for id in [&fresh_id, &resume_id] {
+            delivery.with_store(|s| s.put_value(&format!("local-spend:{id}"), b"owner"))?;
+        }
+        assert!(
+            rpc.chain
+                .execute(
+                    &delivery,
+                    &fresh_id,
+                    Call::Approve {
+                        amount: Amount::from_u64(100)
+                    },
+                    cap
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            delivery
+                .with_store(|s| s.find_transaction(&fresh_id))?
+                .is_none(),
+            "a changed route cannot reserve or sign a new transaction"
+        );
+        delivery.configure_local(settings)?;
+        let mut intent = approval_intent(wallet)?;
+        intent.id = resume_id.clone();
+        let reserved = delivery.with_store(|s| {
+            s.reserve_budget_transaction(&intent, 0, &format!("budget-{budget_id}"), cap)
+        })?;
+        let signed = delivery.wallet.lock().unwrap().sign_transaction(
+            rpc.chain.config(),
+            &intent,
+            reserved.nonce,
+        )?;
+        delivery.with_store(|s| s.sign_transaction(&resume_id, &signed.raw_tx, &signed.tx_hash))?;
+        let before = delivery.with_store(|s| s.transaction(&resume_id))?;
+        on_receipt.store(true, Ordering::SeqCst);
+        assert_eq!(
+            rpc.chain
+                .reconcile_transaction(&delivery, &resume_id)
+                .await?
+                .phase,
+            "unknown"
+        );
+        let after = delivery.with_store(|s| s.transaction(&resume_id))?;
+        assert_eq!(after.intent, before.intent);
+        assert_eq!(after.nonce, before.nonce);
+        assert_eq!(after.raw_tx, before.raw_tx);
+        assert_eq!(after.tx_hash, before.tx_hash);
+        assert!(
+            !rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "eth_sendRawTransaction"),
+            "configuration changes during awaits cannot reach broadcast"
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn signer_accepts_only_fixed_actions_exact_amounts_and_bounded_gas() -> Result<()> {
         let config = config();
@@ -1677,6 +1831,10 @@ pub(super) mod tests {
             receipt_observation(10, "hash".into(), false, 11, 2)?.phase,
             "reverted"
         );
+        assert_eq!(
+            receipt_observation(10, "hash".into(), false, 10, 2)?.phase,
+            "confirming"
+        );
         assert!(receipt_observation(10, "hash".into(), true, 9, 2).is_err());
         assert_eq!(observation("unknown", None, None, None).block_hash, None);
         Ok(())
@@ -1727,5 +1885,106 @@ pub(super) mod tests {
             assert!(amount(value).is_err(), "{value}");
         }
         assert_eq!(quantity_u64(&json!("0x0")).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reveal_preparation_never_estimates_or_simulates_recovery_material() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut config = config();
+        config.rpc_url = format!("http://{}/", listener.local_addr()?);
+        let chain = Chain {
+            config,
+            client: reqwest::Client::new(),
+            request_id: AtomicU64::new(1),
+        };
+        let policy = super::super::budget::PublicationPolicy {
+            watchdog_seconds: 32,
+            inclusion_seconds: 5,
+            finality_seconds: 5,
+            clock_skew_seconds: 2,
+            max_fee_per_gas: "3000000000".into(),
+            priority_fee_per_gas: "1000000000".into(),
+        };
+        let reveal = || super::super::budget::BudgetAction::Reveal {
+            budget_id: [0x33; 32],
+            items: vec![super::super::budget::Reveal {
+                window: super::super::budget::WindowRef {
+                    order_id: "44".repeat(32),
+                    index: 0,
+                },
+                capsule: vec![0x55; 80],
+            }],
+        };
+        let wallet = Address::repeat_byte(0x22);
+        let cap = "10000000000000000";
+        assert!(
+            chain
+                .prepare_intent(
+                    "budget-test/reveal-first".into(),
+                    wallet,
+                    Call::Budget(Box::new(reveal())),
+                    cap.into()
+                )
+                .await
+                .is_err()
+        );
+        let offline = chain.prepare_publication_intent(
+            "budget-test/reveal-first".into(),
+            wallet,
+            reveal(),
+            cap.into(),
+            &policy,
+        )?;
+        assert_eq!(offline.gas_limit, super::super::budget::REVEAL_GAS_LIMIT);
+        assert!(
+            offline
+                .calldata
+                .starts_with(&data_hex(&abi::revealBatchCall::SELECTOR))
+        );
+        assert!(
+            chain
+                .prepare_publication_intent(
+                    "budget-test/reveal-first".into(),
+                    wallet,
+                    reveal(),
+                    "1".into(),
+                    &policy
+                )
+                .is_err()
+        );
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("disclosure-reconciler-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery =
+            super::super::Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
+        delivery.configure_local(super::super::DeliveryConfig {
+            enabled: true,
+            ..Default::default()
+        })?;
+        let mut disguised = offline;
+        disguised.id = "ordinary/disguised".into();
+        delivery.with_store(|store| {
+            store.signed_budget_transaction(&disguised, 0, "ordinary", cap, |_, _| {
+                Ok(("0x02".into(), format!("0x{}", "aa".repeat(32))))
+            })
+        })?;
+        let error = chain
+            .reconcile_transaction(&delivery, &disguised.id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("durable claim"),
+            "calldata guard also rejects E under an unrelated intent name"
+        );
+        drop(delivery);
+        std::fs::remove_dir_all(dir)?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "no E-bearing preparation may contact any RPC"
+        );
+        Ok(())
     }
 }

@@ -1,11 +1,25 @@
 import assert from "node:assert/strict"
 import type { SessionScope } from './types.ts'
+import { isReplyEnded, isTerminalJobState } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
+
+test('steered inputs settle without ending their shared reply stream', () => {
+  for (const state of ['completed', 'failed', 'cancelled', 'interrupted', 'rejected']) {
+    assert.equal(isReplyEnded(state), true)
+    assert.equal(isTerminalJobState(state), true)
+  }
+  assert.equal(isReplyEnded('steered'), false)
+  assert.equal(isTerminalJobState('steered'), true)
+  for (const state of ['publishing', 'pending_delivery', 'future_state', 'toString']) {
+    assert.equal(isReplyEnded(state), false)
+    assert.equal(isTerminalJobState(state), false)
+  }
+})
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
   bot_id, conversation_id, name, instructions: "", models: {}, skills: null, avatar: null, avatar_version: null,

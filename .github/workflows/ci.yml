@@ -10,11 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       delivery_live:
-        description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
+        description: 'Run five fresh Linux x86_64 native-only proofs and budget settlement; non-Linux, npm and hosted desktop acceptance checks are not selected'
         type: boolean
         default: false
       delivery_small:
         description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
+        type: boolean
+        default: false
+      delivery_small_prepare_only:
+        description: 'With delivery_small, run only preparation and execute controls without proofs or settlement'
         type: boolean
         default: false
       delivery_small_resume_run:
@@ -35,7 +39,7 @@ on:
         type: boolean
         default: false
       desktop:
-        description: 'Also run Windows platform checks and real Mac, Windows and Linux desktop tests'
+        description: 'Also run Windows platform checks and real Mac and Windows desktop tests'
         type: boolean
         default: false
 
@@ -64,6 +68,7 @@ jobs:
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
       delivery: ${{ steps.select.outputs.delivery }}
+      delivery_live: ${{ steps.select.outputs.delivery_live }}
       package: ${{ steps.select.outputs.package }}
       package_matrix: ${{ steps.select.outputs.package_matrix }}
       package_mode: ${{ steps.select.outputs.package_mode }}
@@ -106,6 +111,8 @@ jobs:
         if: needs.plan.outputs.rust == 'true'
         run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
+        env:
+          GOTOOLCHAIN: go1.26.3
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
@@ -119,7 +126,7 @@ jobs:
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py", "scripts/nightly_source.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
@@ -766,7 +773,7 @@ jobs:
 
   delivery-small-proofs:
     needs: delivery-small-prepare
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small && !inputs.delivery_small_prepare_only
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -801,7 +808,7 @@ jobs:
 
   delivery-small-accept:
     needs: [delivery-small-prepare, delivery-small-proofs]
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && !inputs.delivery_small_prepare_only && needs.delivery-small-prepare.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -829,15 +836,9 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  delivery-android:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    uses: ./.github/workflows/mobile.yml
-    with:
-      android_only: true
-
   delivery-live:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    needs: [plan, package, crypto-web, web, delivery-android]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.package.result == 'success' && needs.crypto-web.result == 'success' && needs.web.result == 'success' && needs.plan.outputs.delivery_live == 'true' && (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    needs: [plan, package, crypto-web, web]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -856,122 +857,37 @@ jobs:
         with:
           name: web-${{ github.sha }}
           path: apps/app/dist/client
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: vibeface-android-${{ github.sha }}
-          path: .artifacts/vdp/live-android
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: 11.9.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install recording and KVM access tools
+      - name: Require native Linux x86_64 runner
         run: |
-          printf 'https://archive.ubuntu.com/ubuntu\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg acl
-      - name: Prepare host Web and Android drivers without model calls
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/tests/e2e/.artifacts/vdp/live-ui/browsers
-        run: |
-          pnpm install --frozen-lockfile --filter .
-          pnpm test:e2e:check
-          pnpm exec e2e-web install chromium --with-deps
-          command -v Xvfb
-          command -v xvfb-run
-          command -v xauth
-          command -v ffmpeg
-          command -v ffprobe
-          test -c /dev/kvm
-          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
-      - name: Generate genuine local proofs and verify actual Web and Android delivery
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+      - name: Run fresh protected native receipts, recovery and cumulative payment
+        id: protected
         env:
           SOURCE_COMMIT: ${{ github.sha }}
-        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --android .artifacts/vdp/live-android --source-commit "$SOURCE_COMMIT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
+        run: python3 scripts/run-delivery-live.py --protected-package .artifacts/vdp/live-package --source-commit "$SOURCE_COMMIT"
+      - name: Preserve only the reviewed public native evidence
+        if: ${{ always() && steps.protected.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: delivery-live-public-${{ github.sha }}
-          path: |
-            .artifacts/vdp/live-public/key-binding.receipt
-            .artifacts/vdp/live-public/key-binding.json
-            .artifacts/vdp/live-public/relation-*-window-*.receipt
-            .artifacts/vdp/live-public/relation-*-window-*.json
-            .artifacts/vdp/live-public/settlement.json
-            .artifacts/vdp/live-public/settlement-observation.json
-            .artifacts/vdp/live-public/key-lifecycle/rotate.receipt
-            .artifacts/vdp/live-public/key-lifecycle/rotate.json
-            .artifacts/vdp/live-public/key-lifecycle/revoke.receipt
-            .artifacts/vdp/live-public/key-lifecycle/revoke.json
-            .artifacts/vdp/live-public/key-lifecycle/register.receipt
-            .artifacts/vdp/live-public/key-lifecycle/register.json
-            .artifacts/vdp/live-public/key-lifecycle/summary.json
-            .artifacts/vdp/live-public/key-lifecycle/mixed-held.json
-            .artifacts/vdp/live-public/ordinary-settlement/key-binding.receipt
-            .artifacts/vdp/live-public/ordinary-settlement/key-binding.json
-            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.receipt
-            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.json
-            .artifacts/vdp/live-public/ordinary-settlement/settlement.json
-            .artifacts/vdp/live-public/ordinary-settlement/settlement-observation.json
-            .artifacts/vdp/live-public/branches/index.json
-            .artifacts/vdp/live-public/branches/core-restored.json
-            .artifacts/vdp/live-public/branches/key-rotate.json
-            .artifacts/vdp/live-public/branches/key-revoke.json
-            .artifacts/vdp/live-public/branches/key-register.json
-            .artifacts/vdp/live-public/branches/branch-offline-refund.json
-            .artifacts/vdp/live-public/branches/branch-partial-refund.json
-            .artifacts/vdp/live-public/branches/branch-held-timeout.json
-            .artifacts/vdp/live-public/branches/branch-strict-late-open.json
-            .artifacts/vdp/live-public/branches/branch-late-priority.json
-            .artifacts/vdp/live-public/branches/branch-hold-reorg.json
-            .artifacts/vdp/live-public/branches/branch-capsule-reorg.json
-            .artifacts/vdp/live-public/branches/branch-keeper.json
-            .artifacts/vdp/live-public/branches/branch-token-false.json
-            .artifacts/vdp/live-public/branches/branch-token-frozen.json
-            .artifacts/vdp/live-public/branches/branch-token-fee.json
-            .artifacts/vdp/live-public/branches/branch-token-sender-tax.json
-            .artifacts/vdp/live-public/branches/branch-token-precision.json
-            .artifacts/vdp/live-public/branches/branch-token-nonreturn.json
-            .artifacts/vdp/live-public/branches/branch-token-reentrancy.json
-            .artifacts/vdp/live-public/branches/branch-node-refund-hook.json
-            .artifacts/vdp/live-public/branches/branch-incoming-false.json
-            .artifacts/vdp/live-public/branches/branch-incoming-frozen.json
-            .artifacts/vdp/live-public/branches/branch-incoming-fee.json
-            .artifacts/vdp/live-public/branches/branch-incoming-sender-tax.json
-            .artifacts/vdp/live-public/branches/branch-incoming-precision.json
-            .artifacts/vdp/live-public/branches/branch-incoming-reentrancy.json
-            .artifacts/vdp/live-public/branches/branch-incoming-nonreturn.json
-            .artifacts/vdp/live-public/branches/branch-mixed-held-rotate.json
-            .artifacts/vdp/live-public/ui/web.json
-            .artifacts/vdp/live-public/ui/android.json
-            .artifacts/vdp/live-public/ui/web.png
-            .artifacts/vdp/live-public/ui/android-offline.png
-            .artifacts/vdp/live-public/ui/android.png
-            .artifacts/vdp/live-public/ui/ui-inspections.json
-            .artifacts/vdp/live-public/ui/web-partial-refund.png
-            .artifacts/vdp/live-public/ui/web-unknown-transaction.png
-            .artifacts/vdp/live-public/ui/android-key-before.png
-            .artifacts/vdp/live-public/ui/android-key-rotated.png
-            .artifacts/vdp/live-public/ui/web-settled.png
-            .artifacts/vdp/live-public/ui/video-metadata.json
-            .artifacts/vdp/live-public/ui/web-confirm.mp4
-            .artifacts/vdp/live-public/ui/android-accept-offline.mp4
-            .artifacts/vdp/live-public/ui/android-resume-save.mp4
-            .artifacts/vdp/live-public/summary.json
-            .artifacts/vdp/live-public/resources.json
-          if-no-files-found: warn
+          name: delivery-protected-public-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.protected.outputs.public-directory }}
+          if-no-files-found: error
           retention-days: 14
 
   npm-package:
     needs: [plan, package]
     if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
     runs-on: ubuntu-24.04
+    outputs:
+      baseline_artifact: ${{ steps.baseline.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -989,6 +905,21 @@ jobs:
         with:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm/leaperone-vibeface-*.tgz*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Pin one complete public npm baseline for every service runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIBEFACE_RELEASE_SCRATCH: ${{ github.workspace }}/.artifacts/npm-baseline-source
+        run: python3 scripts/verify-node.py --npm-baseline-pin --artifacts .artifacts/npm-service-baseline
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: baseline
+        with:
+          name: npm-service-baseline-${{ github.sha }}
+          path: |
+            .artifacts/npm-service-baseline/baseline.tgz
+            .artifacts/npm-service-baseline/pin.json
+            .artifacts/npm-service-baseline/release.json
           if-no-files-found: error
           retention-days: 14
 
@@ -1016,6 +947,12 @@ jobs:
         with:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        with:
+          artifact-ids: ${{ needs.npm-package.outputs.baseline_artifact }}
+          path: .artifacts/npm-service-baseline
+          merge-multiple: true
       - name: Install npm artifact without lifecycle scripts
         id: install
         env:
@@ -1045,6 +982,30 @@ jobs:
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+      - name: Verify native npm service and package replacement
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        env:
+          VENDOR: ${{ steps.install.outputs.vendor }}
+          PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+          NPM_BASELINE_ARTIFACT_ID: ${{ needs.npm-package.outputs.baseline_artifact }}
+        run: |
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            if compgen -G "$HOME/.vibeface*" >/dev/null; then exit 1; fi
+            [[ "${XDG_CONFIG_HOME:-$HOME/.config}" == "$HOME/.config" ]]
+            for directory in "$HOME/.config/systemd/user" /etc/systemd/user /usr/lib/systemd/user /usr/local/lib/systemd/user; do
+              if compgen -G "$directory/vibeface*" >/dev/null || compgen -G "$directory/*/vibeface*" >/dev/null; then exit 1; fi
+            done
+            service_uid="$(id -u)"
+            sudo loginctl enable-linger "$(id -un)"
+            sudo systemctl start "user@$service_uid.service"
+            export XDG_RUNTIME_DIR="/run/user/$service_uid"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            [[ -S "$XDG_RUNTIME_DIR/bus" ]]
+            /usr/bin/systemctl --user show-environment >/dev/null
+          fi
+          prefix="$PWD/.artifacts/npm-installed"
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm-service --npm-service --npm-package ".artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz" --npm-baseline .artifacts/npm-service-baseline
 
   windows-native:
     needs: [plan, package]
@@ -1224,7 +1185,7 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && '--desktop' || '' }}
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.delivery_live == 'true' && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop' || '' }}
 
   daily-nightly:
     needs: ci-gate
@@ -1237,22 +1198,16 @@ jobs:
     permissions:
       contents: write
       actions: write
-      pull-requests: read
     steps:
-      - name: Require the Nightly release token
-        env:
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
-        run: test -n "$NIGHTLY_RELEASE_TOKEN" || { echo '::error::NIGHTLY_RELEASE_TOKEN is missing'; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-      - name: Reconcile four-hour version PR and immutable Nightly archives
+      - name: Reconcile tag-only Nightly sources and immutable archives
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
         run: |
           gh auth setup-git
           python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"
