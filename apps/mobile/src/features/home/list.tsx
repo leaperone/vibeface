@@ -117,15 +117,16 @@ function NotifyTip() {
   const shared = useLive()
   const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
   const [closed, setClosed] = useState(() => readStorage(tipClosed, false))
+  const [wrapActions, setWrapActions] = useState(false)
   const { busy, error, run } = useRun()
   if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
     <View className="min-h-16 flex-row flex-wrap items-center gap-3 rounded-xl border border-border bg-card py-2.5 ps-3 pe-1">
       <View className="min-w-48 flex-1 flex-row items-center gap-3">
         <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
-        <Text className="min-w-0 flex-1 font-medium">{waitingCopy.notifyTip}</Text>
+        <Text className="min-w-0 flex-1 font-medium" onLayout={(event) => setWrapActions(event.nativeEvent.layout.height > 24)}>{waitingCopy.notifyTip}</Text>
       </View>
-      <View className="ms-auto flex-row items-center">
+      <View className={cn('ms-auto flex-row items-center', wrapActions && 'basis-full justify-end')}>
         <Button size="sm" className="min-h-12" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
         <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
       </View>
