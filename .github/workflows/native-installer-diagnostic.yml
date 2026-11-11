@@ -66,6 +66,18 @@ jobs:
           spec = importlib.util.spec_from_file_location('windows_node_fixture', 'scripts/verify-windows-node.py')
           fixture = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(fixture)
+          execute = fixture.run
+
+          def observe_acl_command(arguments, **kwargs):
+              result = execute(arguments, **kwargs)
+              if str(arguments[0]).casefold() == 'powershell.exe' and result.returncode:
+                  # Only this generated fixture's ACL command is observed; no config content is read.
+                  print('CONTROLLED_ACL_STDOUT_PREFIX_HEX ' + result.stdout[:96].hex())
+                  error = result.stderr.decode(errors='replace').replace(str(workspace), '[generated fixture workspace]')
+                  print('CONTROLLED_ACL_ERROR ' + error[:6000])
+              return result
+
+          fixture.run = observe_acl_command
           with tempfile.TemporaryDirectory(prefix='vibeface-config-security-') as directory:
               workspace = Path(directory) / fixture.WORKSPACE_NAME
               workspace.mkdir()
