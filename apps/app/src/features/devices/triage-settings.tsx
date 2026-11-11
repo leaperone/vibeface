@@ -72,7 +72,7 @@ export function TriageSettings() {
   // Until a chat is connected there is nothing to forward, so only connecting shows.
   const connected = Boolean(settings.webhook_url)
 
-  const webhookForm = <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then((result) => { if (result !== null) setSecret("") }) }}>
+  const webhookForm = <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then((result) => { if (result !== null) setSecret((current) => current === secret ? "" : current) }) }}>
     <div className="grid gap-0.5">
       <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}
         <a href={waitingCopy.forwardHelp} target="_blank" rel="noopener noreferrer" aria-label="怎么接" title="怎么接" className="hit-area relative ms-auto text-muted-foreground hover:text-foreground"><CircleHelp aria-hidden="true" className="size-4" /></a>

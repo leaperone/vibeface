@@ -62,7 +62,13 @@ export type AppServerMode = 'system' | 'spawn'
 export type ProviderChange = {
   provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
   env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
+  /** opencode only. `null` removes the endpoint and its token; `api_key` omitted keeps the stored token, `null` deletes it. */
+  opencode_endpoint?: { protocol: EndpointProtocol; base_url: string; models: string[]; api_key?: string | null } | null
 }
+export const endpointProtocols = ['openai_compatible', 'anthropic', 'openai'] as const
+export type EndpointProtocol = typeof endpointProtocols[number]
+/** opencode's custom model service; its models run as `custom/<model>`. The token never comes back, only whether one is stored. */
+export type ProviderEndpoint = { protocol: EndpointProtocol; base_url: string; models: string[]; has_api_key: boolean }
 export function canSetProviderEnvironment(provider: ProviderId, name: string): boolean {
   return provider !== 'cursor' || !['CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE'].includes(name)
 }
@@ -94,6 +100,8 @@ export type ProviderStatus = {
   readiness: ProviderReadiness
   probe: { provider: ProviderId; config_id: string; checked_at_ms: number | null; launch: { state: 'unchecked' | 'starting' | 'launchable' } | { state: 'failed'; issue: ProbeIssue }; authentication: 'unverified' | 'authenticated' | 'not_required' | 'sign_in_required'; catalog: ModelCatalog; version: string | null }
   observed: ProviderObservations
+  /** opencode only; always `null` for the other providers. */
+  endpoint: ProviderEndpoint | null
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
@@ -398,8 +406,11 @@ export function parseProvider(value: unknown): ProviderStatus {
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
   const observed = record(v.observed)
+  const endpoint = v.endpoint === null ? null : record(v.endpoint, '自定义模型服务')
+  if (endpoint && provider !== 'opencode') throw new Error('只有 opencode 可以使用自定义模型服务。')
   return {
     provider,
+    endpoint: endpoint === null ? null : { protocol: oneOf(endpoint.protocol, endpointProtocols), base_url: text(endpoint.base_url), models: strings(endpoint.models), has_api_key: boolean(endpoint.has_api_key) },
     authentication_source: oneOf(v.authentication_source, authenticationSources),
     setup: setup === null ? null : { directory: setup.directory === null ? null : text(setup.directory), command: text(setup.command) },
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),

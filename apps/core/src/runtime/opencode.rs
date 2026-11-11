@@ -442,9 +442,7 @@ impl Opencode {
         let port = std::net::TcpListener::bind("127.0.0.1:0")?
             .local_addr()?
             .port();
-        let permission = json!({"*":"allow","question":"deny"});
-        let settings = json!({"$schema":"https://opencode.ai/config.json","autoupdate":false,
-            "share":"disabled","permission":permission,"agent":{"build":{"permission":permission}}});
+        let settings = serve_settings(&launch.env);
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
@@ -1634,6 +1632,27 @@ fn parse_model(model: &str) -> Result<Option<Value>, ExecFailure> {
             format!("opencode names models provider/model, not {model:?}"),
         )),
     }
+}
+
+/// The serve's configuration: the launch's own (a custom endpoint) under the Node's fixed
+/// settings, which win.
+fn serve_settings(launch: &BTreeMap<String, String>) -> Value {
+    let mut settings = launch
+        .get("OPENCODE_CONFIG_CONTENT")
+        .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let permission = json!({"*":"allow","question":"deny"});
+    for (key, value) in [
+        ("$schema", json!("https://opencode.ai/config.json")),
+        ("autoupdate", json!(false)),
+        ("share", json!("disabled")),
+        ("permission", permission.clone()),
+        ("agent", json!({"build":{"permission":permission}})),
+    ] {
+        settings[key] = value;
+    }
+    settings
 }
 
 fn tool_base_environment(launch: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -4265,5 +4284,23 @@ mod tests {
             parse_model("flash").map_err(|failure| failure.kind),
             Err(FailureKind::NoModel)
         );
+    }
+
+    #[test]
+    fn serve_settings_keep_the_endpoint_under_fixed_permissions() {
+        let permission = json!({"*":"allow","question":"deny"});
+        let launch = BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".to_owned(),
+            json!({"provider":{"custom":{"npm":"@ai-sdk/openai"}},
+                "permission":{"*":"ask"},"share":"auto"})
+            .to_string(),
+        )]);
+        let settings = serve_settings(&launch);
+        assert_eq!(settings["provider"]["custom"]["npm"], "@ai-sdk/openai");
+        assert_eq!(settings["permission"], permission);
+        assert_eq!(settings["agent"]["build"]["permission"], permission);
+        assert_eq!(settings["share"], "disabled");
+        assert_eq!(settings["autoupdate"], false);
+        assert_eq!(serve_settings(&BTreeMap::new())["permission"], permission);
     }
 }

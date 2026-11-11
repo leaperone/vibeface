@@ -27,7 +27,7 @@ export default {
   }],
   workers: 1,
   retries: 0,
-  secrets: { recoveryPassword: randomBytes(24).toString('base64url') },
+  secrets: { recoveryPassword: randomBytes(24).toString('base64url'), webhookSecret: randomBytes(24).toString('base64url'), nextWebhookSecret: randomBytes(24).toString('base64url') },
   output: resolve(localArtifacts, 'results'),
   cache: { dir: resolve(localArtifacts, 'cache') },
 } satisfies E2EConfig;

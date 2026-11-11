@@ -22,7 +22,7 @@ import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
-import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
+import { deviceCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
@@ -195,6 +195,7 @@ test("workspace preserves bot and message requests while routing native decision
     secure: { attestationPayload: (network: string, scope: string, body: string) => { const event = JSON.parse(body); assert.equal(typeof event.type, "string"); assert.equal(event.attestation, undefined); return `${network}|${scope}|${body}` } },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
+    inputLock: <T,>(name: string, save: () => Promise<T>) => globalThis.navigator.locks.request(name, save),
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
@@ -747,6 +748,73 @@ test("workspace preserves bot and message requests while routing native decision
       conversationHold = null
       await render().refresh()
       assert.equal(render().pendingMessages.length, 0)
+    })
+
+    await t.test('two tabs preserve target order while the earlier input is still signing', async () => {
+      const otherHooks = hookHarness()
+      const loadOther = moduleLoader(sandbox, (specifier, filename) => {
+        if (specifier === 'react') return otherHooks.react
+        if (specifier.endsWith('/lib/node.ts')) return { ...nodeSettings, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+        if (specifier === 'react/jsx-runtime') return { jsx: () => null }
+        return loadOther(resolve(dirname(filename), specifier))
+      }, (filename) => readFileSync(filename, 'utf8') + (filename.endsWith('/workspace/context.tsx') ? '\nexport { useWorkspaceState }\n' : ''))
+      const otherModule = loadOther(resolve(clientRoot, 'workspace/context.tsx'))
+      const otherHook = otherModule.useWorkspaceState
+      assert.ok(typeof otherHook === 'function')
+      const follower = { leader: () => false, post() {}, listen: () => () => {} }
+      const other = () => {
+        otherHooks.reset()
+        const state: Workspace = otherHook(platform, activeConnection, undefined, follower)
+        otherHooks.afterRender.splice(0).forEach((run) => run())
+        return state
+      }
+      const sign = platform.transport.signClient, gate = deferred()
+      let signing = false
+      platform.transport.signClient = async (domain, payload) => {
+        if (payload.includes('"text":"first tab input"')) { signing = true; await gate.promise }
+        return sign(domain, payload)
+      }
+      const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
+      const previousOutbox = new Map(outboxItems)
+      const independentBot = { ...bot, bot_id: 'other-tab-bot', conversation_id: 'other-tab-chat' }
+      let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, sameTabSecond: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
+      try {
+        knownBots = [bot, independentBot]
+        await render().refresh()
+        other(); other().setView('chat'); other()
+        await new Promise(setImmediate); other(); await new Promise(setImmediate)
+        assert.equal(other().writable, true)
+        const before = messages.length
+        first = other().sendMessage('first tab input')
+        await new Promise(setImmediate)
+        assert.equal(signing, true, 'the follower reserved its sequence and is waiting on signing')
+        independent = render().sendMessage('independent tab input', [], [], { target: { kind: 'bot_main', bot_id: independentBot.bot_id }, conversation_id: independentBot.conversation_id })
+        await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a different target must remain independent of the held signature')
+        sameTabSecond = other().sendMessage('earlier same tab second input')
+        await new Promise(setImmediate)
+        second = render().sendMessage('second tab input')
+        await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
+        gate.resolve(null)
+        assert.deepEqual(await Promise.all([first, sameTabSecond, second, independent]), [true, true, true, true])
+        await render().refresh(); await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'earlier same tab second input', 'second tab input'])
+        assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
+        assert.equal(Number(messages[before + 3].sequence), Number(messages[before + 2].sequence) + 1)
+      } finally {
+        gate.resolve(null)
+        await Promise.allSettled([first, sameTabSecond, second, independent])
+        platform.transport.signClient = sign
+        knownBots = previousBots
+        for (const effect of otherHooks.effects.values()) effect.cleanup?.()
+        await render().refresh(); await new Promise(setImmediate)
+        outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        transcript = previousTranscript
+        messages.splice(previousMessages)
+        await render().refresh()
+      }
     })
 
     await t.test('attachment upload holds target order while later drafts remain locally recoverable', async () => {
@@ -1696,7 +1764,7 @@ test('opening AI settings connects only Cursor and retains focus until it can re
     const unreadable = outcome === 'unreadable' || outcome === 'same-device-reconnected'
     const provider: ProviderStatus = {
       provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
-      execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
+      endpoint: null, execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
       state: 'off', issues: [], readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } },
       probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1813,7 +1881,7 @@ test("automatic connection checks the three local services without changing uses
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
-      execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
+      endpoint: null, execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
       state: 'starting', issues: [], readiness: { state: 'starting' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'starting' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'app_server_starting' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1892,7 +1960,7 @@ test("compact system provider cards use external service evidence without local 
     const item: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
       app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
-      execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
+      endpoint: null, execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
       env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'launchable' }, authentication, catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' }, authenticated: { status: 'confirmed', evidence: 'provider_probe' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1945,7 +2013,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
   for (const platform of ['web', 'mobile']) for (const example of cases) await t.test(`${platform} ${example.name}`, () => {
     const item: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
-      execution_model: 'saved-model', execution_readiness: example.execution_readiness,
+      endpoint: null, execution_model: 'saved-model', execution_readiness: example.execution_readiness,
       setup: { directory: '/private/provider', command: 'codex --home /private/provider login' }, installed: true,
       home: null, sessions: null, env: [], state: example.readiness.state, issues: [], readiness: example.readiness,
       observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1986,6 +2054,61 @@ test("provider cards keep summary readiness, setup and execution details in thei
         assert.ok(execution)
         assert.equal(text(execution), `执行模型：${example.executionLabel}${example.executionReason}`, 'execution details show the saved execution readiness independently')
       }
+    } finally { app.close() }
+  })
+})
+
+test('webhook secret saves preserve failures and newer drafts on web and mobile', async (t) => {
+  const settings = workspaceModel.parseTriageSettings({
+    default_outlet: 'record', projects: [], webhook_url: '', webhook_secret_set: false,
+    scan_codex_sessions: false, codex_sessions: null, decision_url: '', device_id: 'node', decision_tokens: [],
+    outbox: { pending: 0, delivered: 0, dead: 0 },
+    status: { budget: { day: '2026-11-11', used: 0, limit: 10, retry_at_ms: 0, paused_reason: null }, pending_events: 0, inflight_events: 0, unknown_events: 0 },
+  })
+  for (const platform of ['web', 'mobile']) for (const outcome of ['failed', 'saved', 'edited']) await t.test(`${platform} ${outcome}`, async () => {
+    const held = pendingResult(), writes: unknown[] = []
+    const save = (params: unknown) => { writes.push(params); return held.promise }
+    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => method === 'triage_settings' ? settings : save(params) }
+    const name = platform === 'mobile' ? 'Triage' : 'TriageSettings'
+    const app = componentHarness(platform === 'mobile' ? '../../../../../apps/mobile/app/external-chat.tsx' : '../devices/triage-settings.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/identity/copy.ts': { waitingCopy },
+      '@vibeface/client/workspace/model.ts': workspaceModel,
+      '@/lib/glossary': { terms: { externalChat: { label: '外部聊天', icon: 'Send' } } },
+      '@/features/devices/remote-settings': { useCall: () => ({ value: settings, busy: '', error: null, call: (_key: string, _method: string, params: unknown) => save(params) }) },
+    }, {}, platform === 'mobile' ? 'Triage' : '')
+    const render = () => app.render(name)
+    const field = () => {
+      const input = render().find(({ props }) => platform === 'mobile' ? props.accessibilityLabel === '外部聊天密钥' : props.id === 'webhook-secret')
+      assert.ok(input)
+      return input.props
+    }
+    const edit = (value: string) => {
+      const input = field()
+      if (platform === 'mobile') { assert.ok(typeof input.onChangeText === 'function'); input.onChangeText(value) }
+      else { assert.ok(typeof input.onChange === 'function'); input.onChange({ target: { value } }) }
+    }
+    try {
+      render(); await settleComponent()
+      if (platform === 'web') {
+        const expand = render().find(({ type }) => type === 'SettingsRow')?.props.onClick
+        assert.ok(typeof expand === 'function'); expand()
+      }
+      edit('first-secret-draft')
+      if (platform === 'mobile') {
+        const press = render().find(({ type, props }) => type === 'Button' && elementText(props.children) === '保存')?.props.onPress
+        assert.ok(typeof press === 'function'); press()
+      } else {
+        const submit = render().find(({ type }) => type === 'form')?.props.onSubmit
+        assert.ok(typeof submit === 'function'); submit({ preventDefault() {} })
+      }
+      assert.equal(writes.length, 1)
+      assert.equal(JSON.parse(JSON.stringify(writes[0])).webhook_secret, 'first-secret-draft')
+      if (outcome === 'edited') edit('newer-secret-draft')
+      if (outcome === 'failed' && platform === 'web') held.reject(new Error('device offline'))
+      else held.resolve(outcome === 'failed' ? null : settings)
+      await settleComponent()
+      assert.equal(field().value, outcome === 'saved' ? '' : outcome === 'edited' ? 'newer-secret-draft' : 'first-secret-draft')
     } finally { app.close() }
   })
 })

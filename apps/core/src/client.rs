@@ -2071,28 +2071,35 @@ pub(crate) async fn start_node_join(
     let link = parse_join_link(link)?.encode()?;
     let name = name.to_owned();
     ensure!(name.chars().count() <= 128, "device name is too long");
+    let existing_status = |slot: &mut Option<NodeJoinTask>| -> Result<Option<NodeJoin>> {
+        let Some(current) = slot.as_ref() else {
+            return Ok(None);
+        };
+        let ended = matches!(
+            current.status,
+            NodeJoin::Failed { .. } | NodeJoin::Cancelled
+        );
+        // An end without joining is reported once; asking again after that starts over.
+        if current.link == link && current.owner == owner {
+            let status = current.status.clone();
+            if ended {
+                *slot = None;
+            }
+            return Ok(Some(status));
+        }
+        ensure!(
+            ended || current.owner == owner,
+            "another join is already running on this computer"
+        );
+        Ok(None)
+    };
     {
         let mut slot = node
             .node_join
             .lock()
             .map_err(|_| anyhow!("join state unavailable"))?;
-        if let Some(current) = slot.as_ref() {
-            let ended = matches!(
-                current.status,
-                NodeJoin::Failed { .. } | NodeJoin::Cancelled
-            );
-            // An end without joining is reported once; asking again after that starts over.
-            if current.link == link && current.owner == owner {
-                let status = current.status.clone();
-                if ended {
-                    *slot = None;
-                }
-                return Ok(status);
-            }
-            ensure!(
-                ended || current.owner == owner,
-                "another join is already running on this computer"
-            );
+        if let Some(status) = existing_status(&mut slot)? {
+            return Ok(status);
         }
     }
     ensure!(
@@ -2113,6 +2120,9 @@ pub(crate) async fn start_node_join(
         .node_join
         .lock()
         .map_err(|_| anyhow!("join state unavailable"))?;
+    if let Some(status) = existing_status(&mut slot)? {
+        return Ok(status);
+    }
     if let Some(previous) = slot.take() {
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
@@ -4089,6 +4099,78 @@ mod tests {
                 "joined",
                 "an approved join is not reported as cancelled"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn concurrent_node_joins_preserve_the_first_owner_and_request() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-concurrent-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        initialize_node(
+            &dir,
+            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
+            &LocalIdentity::generate(),
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let link = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?
+                .encode()?;
+            for owner in [JoinOwner::Terminal, JoinOwner::Page(capability.capability)] {
+                let (entered, running) = tokio::sync::oneshot::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                let holding_node = node.clone();
+                let holder = tokio::spawn(async move {
+                    holding_node
+                        .store
+                        .call("hold_concurrent_node_join", move |_| {
+                            let _ = entered.send(());
+                            held.recv()?;
+                            Ok(())
+                        })
+                        .await
+                });
+                running.await?;
+                let mut first =
+                    std::pin::pin!(start_node_join(&node, &link, "first", JoinOwner::Terminal,));
+                let mut second =
+                    std::pin::pin!(start_node_join(&node, &link, "second", owner.clone(),));
+                assert!(futures_util::poll!(&mut first).is_pending());
+                assert!(futures_util::poll!(&mut second).is_pending());
+                release.send(())?;
+                assert_eq!(first.await?, NodeJoin::Waiting);
+                let task = node
+                    .node_join
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .context("join")?
+                    .task
+                    .clone();
+                let reply = second.await;
+                if owner == JoinOwner::Terminal {
+                    assert_eq!(reply?, NodeJoin::Waiting);
+                } else {
+                    assert!(reply.unwrap_err().to_string().contains("another join"));
+                }
+                assert!(
+                    !task.is_aborted(),
+                    "a concurrent request must preserve the first join"
+                );
+                let current = node.node_join.lock().unwrap().take().context("join")?;
+                assert!(current.owner == JoinOwner::Terminal);
+                current.task.abort();
+                holder.await??;
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
