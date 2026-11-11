@@ -704,6 +704,17 @@ impl Runtime {
         }
     }
 
+    async fn sync_membership(&self, network: &str, recipient: &str) -> Result<NetworkState> {
+        let state = self.membership_state().await?;
+        ensure!(
+            state.genesis.network_id == network,
+            "wrong personal network"
+        );
+        // A request may have started before revocation; check the snapshot being sent.
+        state.project()?.node(recipient)?;
+        Ok(state)
+    }
+
     async fn hello(&self, network: &str) -> Result<Value> {
         let state = self.membership_state().await?;
         let (heads, forks) = {
@@ -778,7 +789,7 @@ impl Runtime {
                     "wrong membership network"
                 );
                 self.install_membership(incoming).await?;
-                Ok(json!({"state":self.membership_state().await?}))
+                Ok(json!({"state":self.sync_membership(network, origin).await?}))
             }
             "forks" => {
                 let after: Option<(String, u64, String)> =
@@ -977,7 +988,7 @@ impl Runtime {
                 {
                     // A private removal proof may be unavailable. A currently authorized peer
                     // can still receive our signed history and learn a late veto.
-                    let state = self.membership_state().await?;
+                    let state = self.sync_membership(network, peer).await?;
                     let reply = net
                         .request(
                             peer,
@@ -1005,7 +1016,7 @@ impl Runtime {
             if removed.is_err() {
                 // Still a member here: a late veto may have put back a directory the peer has
                 // not seen, so it gets this history to roll back too.
-                let state = self.membership_state().await?;
+                let state = self.sync_membership(network, peer).await?;
                 net.request(
                     peer,
                     net::SYNC,
@@ -1024,7 +1035,7 @@ impl Runtime {
             "peer answered for another personal network"
         );
         if theirs["membership"] != ours["membership"] {
-            let state = self.membership_state().await?;
+            let state = self.sync_membership(network, peer).await?;
             let reply = net
                 .request(
                     peer,
@@ -2649,6 +2660,169 @@ mod tests {
         let _ = router.shutdown().await;
         probe.close().await;
         finish_nodes(result, vec![(node, dir)]).await
+    }
+
+    #[tokio::test]
+    async fn a_full_membership_reply_checks_the_recipient_in_its_snapshot() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Member, Revocation};
+        let (ia, ib, later) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            assert_eq!(a.member_node(&ib.device_id()?).await?, network);
+            state.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Revocation::new(&ib.device_id()?, None)?,
+            )?)?;
+            state.append(GovernanceEvent::grant(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Member::node(&later, "after-removal-private")?,
+            )?)?;
+            let request = json!({"type":"membership","state":state});
+            assert!(
+                a.handle_sync(&network, &ib.device_id()?, &request)
+                    .await
+                    .is_err(),
+                "a request admitted earlier must not receive private post-removal membership"
+            );
+            let reply = a
+                .handle_sync(&network, &later.device_id()?, &request)
+                .await?;
+            let returned: NetworkState = serde_json::from_value(reply["state"].clone())?;
+            assert_eq!(
+                returned.project()?.node(&later.device_id()?)?.name,
+                "after-removal-private"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        finish_nodes(result, vec![(a, dir)]).await
+    }
+
+    #[tokio::test]
+    async fn a_full_membership_exchange_checks_the_recipient_in_its_snapshot() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Member, Revocation};
+
+        #[derive(Clone, Debug)]
+        struct SnapshotProbe {
+            node: Weak<Runtime>,
+            snapshot: NetworkState,
+            peer: String,
+            network: String,
+            address: iroh::EndpointAddr,
+            seen: Arc<std::sync::Mutex<Vec<Value>>>,
+        }
+        impl ProtocolHandler for SnapshotProbe {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let probe = self.clone();
+                net::serve_streams(connection, move |request: Value| {
+                    let probe = probe.clone();
+                    async move {
+                        probe.seen.lock().unwrap().push(request.clone());
+                        if request["type"] == "hello" {
+                            let node = probe.node.upgrade().context("fixture Node stopped")?;
+                            node.net()?.forget_sync_connection(&probe.peer);
+                            node.install_membership(probe.snapshot.clone()).await?;
+                            // A discovery address does not grant membership.
+                            node.net()?.learn(&probe.address).await;
+                            Ok(json!({"network_id":probe.network,"membership":"0".repeat(64)}))
+                        } else {
+                            Ok(json!({"error":"fixture recorded the membership request"}))
+                        }
+                    }
+                })
+                .await;
+                Ok(())
+            }
+        }
+
+        for revoke in [false, true] {
+            let (ia, ib, later) = (
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+            );
+            let mut snapshot =
+                ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+            let network = ia.fixture_network_id()?;
+            let (a, dir) = node(&ia).await?;
+            a.install_membership(snapshot.clone()).await?;
+            if revoke {
+                snapshot.append(GovernanceEvent::revoke(
+                    &ia.fixture_admin(),
+                    &snapshot.project()?,
+                    Revocation::new(&ib.device_id()?, None)?,
+                )?)?;
+            }
+            snapshot.append(GovernanceEvent::grant(
+                &ia.fixture_admin(),
+                &snapshot.project()?,
+                Member::node(&later, "after-removal-private")?,
+            )?)?;
+            let probe = Net::bind(
+                &ib.secret_key_hex,
+                &net::NetworkConfig {
+                    bind: Some("127.0.0.1:0".parse()?),
+                    ..Default::default()
+                },
+                0,
+                vec![],
+            )
+            .await?;
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let router = Router::builder(probe.endpoint.clone())
+                .accept(
+                    net::SYNC,
+                    SnapshotProbe {
+                        node: Arc::downgrade(&a),
+                        snapshot,
+                        peer: ib.device_id()?,
+                        network: network.clone(),
+                        address: probe.addr(),
+                        seen: seen.clone(),
+                    },
+                )
+                .spawn();
+            let result = async {
+                a.sync_peers
+                    .lock()
+                    .unwrap()
+                    .entry(ib.device_id()?)
+                    .or_default()
+                    .running = true;
+                a.start_network().await?;
+                a.net()?.learn(&probe.addr()).await;
+                assert!(a.sync_peer(&network, &ib.device_id()?).await.is_err());
+                let seen = seen.lock().unwrap();
+                assert!(seen.iter().any(|request| request["type"] == "hello"));
+                let full: Vec<_> = seen
+                    .iter()
+                    .filter(|request| request["type"] == "membership")
+                    .collect();
+                for request in &full {
+                    let state: NetworkState = serde_json::from_value(request["state"].clone())?;
+                    assert_eq!(
+                        state.project()?.node(&later.device_id()?)?.name,
+                        "after-removal-private"
+                    );
+                }
+                assert_eq!(full.len(), usize::from(!revoke));
+                anyhow::Ok(())
+            }
+            .await;
+            let _ = router.shutdown().await;
+            probe.close().await;
+            finish_nodes(result, vec![(a, dir)]).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
