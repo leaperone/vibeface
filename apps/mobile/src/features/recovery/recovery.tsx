@@ -306,7 +306,7 @@ export function RecoveredStep() {
     <SaveRecoveryFile code={file?.code ?? code ?? ''} saved={saved} onSaved={(value) => { try { if (value) forgetUnsavedRecovery(); setSaved(value) } catch (cause) { setClearError(messageOf(cause)) } }} save={save} />
     {!file && !saved ? <ReplaceRecovery /> : null}
     <ErrorText error={error || clearError} />
-    <Button className="self-end" disabled={!saved} onPress={() => { forgetUnsavedRecovery(); finishRecovered() }}><Text>完成</Text></Button>
+    <Button className="self-end" disabled={!saved} onPress={finishRecovered}><Text>完成</Text></Button>
   </Panel>
 }
 

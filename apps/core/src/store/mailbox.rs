@@ -72,8 +72,9 @@ fn save(connection: &Connection, record: &MailboxRecord) -> Result<()> {
 }
 
 fn records(connection: &Connection) -> Result<Vec<MailboxRecord>> {
-    let mut statement = connection
-        .prepare("SELECT value FROM identity_meta WHERE key LIKE 'mailbox:%' ORDER BY key")?;
+    let mut statement = connection.prepare(
+        "SELECT value FROM identity_meta WHERE key>='mailbox:' AND key<'mailbox;' ORDER BY key",
+    )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
@@ -147,7 +148,6 @@ pub(crate) fn queue(
         params![conversation, trigger],
     )?;
     save(connection, &candidate)?;
-    reconcile(connection, network, now_ms)?;
     Ok(load_key(connection, &key(network, conversation, trigger))?.unwrap_or(candidate))
 }
 

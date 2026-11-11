@@ -438,6 +438,7 @@ impl Store {
 
     /// Posts the standing answer. Ordinary questions schedule a turn; held requests return to
     /// the Node that holds their original transport.
+    #[cfg(test)]
     pub fn accept_answer(
         &mut self,
         identity: &LocalIdentity,

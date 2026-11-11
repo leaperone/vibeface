@@ -2,8 +2,8 @@ import { existsSync } from 'node:fs'
 import { lstat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { runControl, type CoreProgram } from './control-client.js'
-import { parseAccess, parseInspect, type Inspect } from './control-types.js'
-import { businessNavigation, parsePrivateOrigin, type BusinessNavigation, type JoinRequest } from './business-url.js'
+import { parseInspect, type Inspect } from './control-types.js'
+import { parsePrivateOrigin } from './business-url.js'
 import { CoreLifecycle } from './lifecycle.js'
 import { defaultSettings, loadSettings, saveSettings, type Settings } from './settings.js'
 import type { CoreState, PreferenceKey, RuntimeState } from '../shared/contract.js'
@@ -89,16 +89,6 @@ export class CoreSession {
     this.options.onChange()
   }
 
-  async forgetDataDir(): Promise<void> {
-    if (this.lifecycle.state().kind === 'owned') {
-      throw new Error('先停止这台电脑上由 Vibeface 启动的 Core，再切换数据目录。')
-    }
-    this.lifecycle.detach()
-    this.settings = { ...this.settings, lastDataDir: null }
-    await saveSettings(this.options.profileDir, this.settings)
-    this.core = { kind: 'none' }
-    this.options.onChange()
-  }
 
   async useDataDir(dataDir: string): Promise<void> {
     if (!isAbsolute(dataDir)) throw new Error('请选择一个绝对路径的数据目录。')
@@ -246,28 +236,12 @@ export class CoreSession {
     })
   }
 
-  /** Resolve the Core-served URL for the business window, canonicalized to Core's private origin. */
-  async businessTarget(invite?: JoinRequest): Promise<BusinessNavigation> {
-    const dataDir = this.requireDataDir()
-    const inspect = await this.inspect(dataDir)
-    if (inspect.status !== 'running') throw new Error('Core 还没有运行，无法打开 Vibeface 窗口。')
-    if (!inspect.webEnabled) throw new Error('这个 Core 关闭了网页访问，请在配置中重新开启。')
-    const access = parseAccess(
-      await runControl(this.programs.control(), { command: 'access', data_dir: dataDir, json: true })
-    )
-    this.core = this.stateFromInspect(inspect)
-    this.options.onChange()
-    return businessNavigation(access, inspect, invite)
-  }
 
   /** Quit closes only a Core this app started; an attached service is left alone. */
   async shutdown(): Promise<void> {
     await this.lifecycle.stopOwned('quit')
   }
 
-  ownsCore(): boolean {
-    return this.lifecycle.state().kind === 'owned'
-  }
 
   private requireDataDir(): string {
     const dataDir = this.dataDir()

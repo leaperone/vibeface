@@ -135,7 +135,7 @@ impl Runtime {
             .store
             .lock()
             .await
-            .work_records()
+            .open_work_records()
             .unwrap_or_default()
             .into_iter()
             .filter(|record| live(record) && on_app_server(record))
@@ -827,7 +827,7 @@ impl Runtime {
                 .live_probe_at
                 .compare_exchange(last, at, Relaxed, Relaxed)
                 .is_ok();
-        let records = self.store.lock().await.work_records()?;
+        let records = self.store.lock().await.open_work_records()?;
         for record in records {
             if record.kind == WorkKind::Task {
                 continue;
@@ -1182,11 +1182,8 @@ impl Runtime {
 
     /// Retries waiting dispatches and the stops held for other devices' works.
     pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
-        let dispatches = self.store.lock().await.dispatches()?;
-        for dispatch in dispatches
-            .into_iter()
-            .filter(|dispatch| dispatch.state == DispatchState::Pending)
-        {
+        let dispatches = self.store.lock().await.pending_dispatches()?;
+        for dispatch in dispatches {
             let lane = format!("dispatch_worker:{network}:{}", dispatch.spec.work_id);
             let Some(guard) = self.peer_delivery_locks.try_lock(&lane) else {
                 continue;
@@ -1278,7 +1275,7 @@ impl Runtime {
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
-        let records = self.store.lock().await.work_records()?;
+        let records = self.store.lock().await.open_work_records()?;
         for record in records
             .into_iter()
             .filter(|record| live(record) && on_app_server(record))

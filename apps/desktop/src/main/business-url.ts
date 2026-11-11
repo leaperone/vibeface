@@ -10,9 +10,6 @@
 
 import type { Access, Inspect } from './control-types.js'
 
-export type BusinessNavigation = { kind: 'business'; url: string }
-
-export type JoinRequest = { ticket: string }
 
 export type PrivateOrigin = { host: string; port: number; origin: string }
 
@@ -74,15 +71,3 @@ export function businessUrl(access: Access, inspect: Inspect): string {
   return target.toString()
 }
 
-/** The selected Core's page, at its join form when an invite is being opened. */
-export function businessNavigation(
-  access: Access,
-  inspect: Inspect,
-  invite?: JoinRequest
-): BusinessNavigation {
-  const target = businessUrl(access, inspect)
-  if (!invite) return { kind: 'business', url: target }
-  const join = new URL('/join', target)
-  join.hash = invite.ticket
-  return { kind: 'business', url: join.toString() }
-}

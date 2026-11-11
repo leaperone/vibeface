@@ -28,7 +28,7 @@ export type Row = { key: string; node: ReactNode }
 const cause = (kind: FailureKind | undefined, raw: string | null | undefined) => failureText(kind) || (raw ? taskError(raw).split('\n').at(-1) ?? '' : '')
 
 /** Plain-language reason a work needs the person; the device's own words stay out of the card. */
-export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
+function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
   if (check.reason === 'offline') return `${device} 离线了，报不回这个任务的结果。`
   if (check.reason === 'disconnected') return `${device} 上的 Codex 断开了，报不回这个任务的结果。`
   if (check.detail.startsWith('设备已移除')) return `${device} 已移除，报不回这个任务的结果。`

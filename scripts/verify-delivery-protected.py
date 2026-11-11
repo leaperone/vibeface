@@ -768,7 +768,7 @@ def process_fact(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         return {"pid": pid, "birth": fields[19], "group": int(fields[2]), "state": fields[0]}
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -791,7 +791,7 @@ class OwnedProcesses:
             for task in Path(f"/proc/{pid}/task").glob("*"):
                 try:
                     pending.extend(map(int, (task / "children").read_text().split()))
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     pass
 
     def alive(self):
@@ -1798,12 +1798,13 @@ def self_test_proof_diagnostics():
              and all(job["resources"]["cgroup"] == synthetic_target for job in collected["jobs"]), "four_synthetic_streams_bound_to_the_pinned_directory_fixture")
         for node in experiment.nodes: need(experiment.proof_channels[node.name] is None, "collector_closes_pinned_descriptors")
         need(experiment.collect_proof_diagnostics() == collected, "collector_never_upgrades_first_attempt")
-    for kind in ("missing", "fifo", "directory", "symlink", "hardlink", "mode", "owner", "changed", "replaced-directory", "overflow", "half-line", "extra"):
+    for kind in ("valid", "missing", "fifo", "directory", "symlink", "hardlink", "mode", "owner", "changed", "replaced-directory", "overflow", "half-line", "extra"):
         with tempfile.TemporaryDirectory(prefix="proof-collector-negative-", dir=ARTIFACTS) as temporary:
             run = Path(temporary); node = SimpleNamespace(name="S", device_id=principals["S"]["peer"], directory=run / "S"); node.directory.mkdir(mode=0o700)
-            experiment = object.__new__(Experiment); experiment.nodes = [node]; experiment.proof_channels = {}; experiment.proof_diagnostic_result = None
+            experiment = object.__new__(Experiment); experiment.nodes = [node, SimpleNamespace(name="R", device_id=principals["R"]["peer"])]; experiment.proof_channels = {}; experiment.proof_diagnostic_result = None
             experiment.config = {"source_commit": source, "sha256": artifacts}; experiment.profile_id = profile
-            experiment.orders = {orders[0]["order_id"]: orders[0]}; experiment.summary = {"genuine_receipts": []}; experiment.rows = Mock(return_value=[])
+            experiment.orders = {orders[0]["order_id"]: orders[0]}; experiment.summary = {"genuine_receipts": []}
+            experiment.rows = Mock(return_value=[(records[0]["job"], str(node.directory / "delivery/private" / ("proof-" + records[0]["job"] + ".receipt")))])
             experiment.prepare_proof_diagnostics(node); channel = experiment.proof_channels["S"]; path = channel["path"] / (records[0]["job"] + ".jsonl")
             if kind == "fifo": os.mkfifo(path, 0o600)
             elif kind == "directory": path.mkdir(mode=0o700)
@@ -1831,6 +1832,9 @@ def self_test_proof_diagnostics():
                 return info
             with patch.dict(globals(), resources=lambda: (_ for _ in ()).throw(OSError())), patch.object(os, "fstat", side_effect=checked_fstat):
                 unavailable = experiment.collect_proof_diagnostics()
+            if kind == "valid":
+                need(unavailable["availability"] != "unavailable", "safe_stream_with_reservation_is_collected")
+                continue
             need(unavailable["availability"] == "unavailable" and all(job == unavailable_proof_job(job["node"], job["order_index"]) for job in unavailable["jobs"]), "unsafe_stream_is_nonblocking_unavailable")
     maximum, maximum_group = 2**63-1, [2**64-1] * 2
     conservative_records = copy.deepcopy(records)

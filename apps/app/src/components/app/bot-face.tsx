@@ -60,7 +60,7 @@ function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body
 const transformOf = (frame: Frame) => `translate(${50 + frame.dx} ${50 + frame.dy}) rotate(${frame.rotate}) scale(${frame.scale}) translate(-50 -50)`
 
 /** Who a face belongs to: its id gives what `avatar` leaves out. */
-export type FaceBot = Pick<BotRecord, "bot_id" | "avatar">
+type FaceBot = Pick<BotRecord, "bot_id" | "avatar">
 
 /** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. `still` draws one frame and leaves the clock, for previews. */
 export function BotFace({ bot, mood, size, halo, still, className }: { bot: FaceBot; mood: Mood; size: number; halo?: string; still?: boolean; className?: string }) {

@@ -274,8 +274,6 @@ impl Host {
         versions.into_iter().map(|(_, path)| path).collect()
     }
 
-    /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
-    /// only its last two parts, so the full path stays on this computer.
     /// The usual project folders in the home folder that exist, for a first folder to offer.
     pub fn project_folders(&self) -> Vec<PathBuf> {
         let Some(home) = &self.home else {
@@ -299,6 +297,8 @@ impl Host {
         found
     }
 
+    /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
+    /// only its last two parts, so the full path stays on this computer.
     pub fn display(&self, path: &Path) -> String {
         self.tilde(path).unwrap_or_else(|| {
             let parts: Vec<_> = path.components().rev().take(2).collect();

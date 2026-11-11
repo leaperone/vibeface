@@ -369,10 +369,10 @@ function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void })
 }
 
 /** Only the computer's name asks for a thought; the browser takes its suggested name unless someone opens it. */
-function NamesStep({ computer, initial, onNext, onBack }: { computer?: string; initial: Names | null; onNext(names: Names): void; onBack(): void }) {
+function NamesStep({ initial, onNext, onBack }: { initial: Names | null; onNext(names: Names): void; onBack(): void }) {
   return <Panel icon={Laptop} title="给这个节点起名">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() || defaultBrowserName() }) }}>
-      <Input key={computer} name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
+      <Input name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || defaultComputerName()} />
       <Details label="这个浏览器的名字">
         <Input name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" className="text-foreground" defaultValue={initial?.browser ?? defaultBrowserName()} />
       </Details>

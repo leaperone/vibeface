@@ -168,7 +168,7 @@ async function invoke(program: ManagedNodeProgram, args: readonly string[], time
       child.kill('SIGKILL')
       reject(new Error('desktop Node command timed out'))
     }, timeoutMs)
-    void closePromise.finally(() => clearTimeout(timer))
+    void closePromise.then(() => clearTimeout(timer), () => clearTimeout(timer))
   })
   try {
     const [text, close] = await Promise.race([Promise.all([outputPromise, closePromise]), timeout])

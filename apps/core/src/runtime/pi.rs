@@ -926,7 +926,10 @@ impl Pi {
             if state["sessionId"] != session {
                 return Err(own(format!("pi opened session {}", state["sessionId"])));
             }
-            let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
+            let Some(file) = state["sessionFile"].as_str().filter(|f| !f.is_empty()) else {
+                return Err(own("pi reported no session file".into()));
+            };
+            let file = PathBuf::from(file);
             self.keep(session, &file, &launch.cwd, process.tree.token())
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         };
@@ -1845,7 +1848,6 @@ mod tests {
 
     fn gated_bot(dir: &Path, pi: &Arc<Pi>, mode: &str, client: &str) -> ManagerConfig {
         let mut config = bot(dir, pi, mode, None);
-        config.timeout_secs = 30;
         config.provider_env = gated_env(dir, mode);
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
@@ -1981,12 +1983,16 @@ mod tests {
 
     /// The turn the bot recorded once pi took its prompt.
     async fn started(turns: &Turns) -> (String, String) {
-        loop {
-            if let Some((session, Some(turn))) = turns.lock().unwrap().last().cloned() {
-                return (session, turn);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((session, Some(turn))) = turns.lock().unwrap().last().cloned() {
+                    return (session, turn);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("the turn was recorded")
     }
 
     fn launch(dir: &Path, mode: &str, session: &str) -> Launch {
@@ -2575,7 +2581,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_normal_end_preserves_eof_and_grace_for_a_cooperative_child() -> Result<()> {
         let dir = scratch("normal-cooperative-end");

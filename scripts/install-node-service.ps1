@@ -17,7 +17,7 @@ Usage: install-node-service.ps1 install --binary C:\absolute\vibeface.exe --data
        install-node-service.ps1 install-updater --binary C:\install-root\current\vibeface.exe --data-dir C:\absolute\data
        install-node-service.ps1 start|stop|restart [--data-dir C:\absolute\data]
        install-node-service.ps1 status
-       install-node-service.ps1 uninstall-updater|uninstall --data-dir C:\absolute\data
+       install-node-service.ps1 uninstall-updater|uninstall-node|uninstall --data-dir C:\absolute\data
 
 Installs scheduled tasks for the account that runs this script. Initialize the node first.
 '@

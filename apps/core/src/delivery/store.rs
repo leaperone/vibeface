@@ -116,7 +116,8 @@ impl ServiceStore {
             admissions: (std::time::Instant::now(), 0),
         })
     }
-    pub fn root(&self) -> &Path {
+    #[cfg(test)]
+    pub(super) fn root(&self) -> &Path {
         &self.root
     }
     pub fn check_limits(&self, capacity: u64, max_orders: u32) -> Result<()> {
@@ -1177,7 +1178,8 @@ impl ServiceStore {
         )?;
         Ok(last.is_none_or(|last| last < nonce))
     }
-    pub fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
+    #[cfg(test)]
+    pub(super) fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
         let mut query = self
             .db
             .prepare("SELECT id FROM transactions ORDER BY rowid DESC LIMIT 128")?;
@@ -1317,16 +1319,16 @@ fn capacity_usage(db: &Connection) -> Result<[(u32, u64); 3]> {
         let (id, bytes) = row?;
         usage[*owners.get(&id).unwrap_or(&0)].1 += bytes + 256;
     }
-    let mut query = db.prepare("SELECT id,body,length(id)+length(body)+128 FROM private_values")?;
+    let mut query = db.prepare("SELECT id,CASE WHEN substr(id,1,16)='protected-claim:' THEN body END,length(id)+length(body)+128 FROM private_values")?;
     for row in query.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
             row.get::<_, u64>(2)?,
         ))
     })? {
         let (id, body, bytes) = row?;
-        usage[private_class(db, &id, &body)?].1 += bytes;
+        usage[private_class(db, &id, body.as_deref().unwrap_or_default())?].1 += bytes;
     }
     let proofs: u64 = db.query_row(
         "SELECT coalesce(sum(length(digest)+length(path)+size+128),0) FROM proof_jobs",

@@ -249,6 +249,8 @@ async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
     let root = spawned.root();
     assert!(spawned.is_running());
     assert!(tree::root_is_running(root));
+    #[cfg(unix)]
+    assert!(!tree::root_is_running(0) && !tree::root_is_running(1));
     assert!(tree::token_is_running(spawned.token()));
 
     let left = tree::stop_recorded(spawned.token(), |_| false)?;

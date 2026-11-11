@@ -177,7 +177,7 @@ impl Runtime {
             store.authorize_node(network, &local)?;
             store.version_vector(network)?
         };
-        let jobs = self.store.lock().await.scheduler_jobs_all()?;
+        let jobs = self.store.lock().await.workspace_scheduler_jobs()?;
         for job in jobs {
             if let Err(error) = self.reconcile_workspace_job(network, &job).await {
                 scheduler_item_pending(error.context(format!("workspace job {}", job.trigger)))?;

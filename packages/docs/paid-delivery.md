@@ -8,7 +8,7 @@
 
 预算固定 payer、payee、Provider PeerID、asset 和一次存款金额。多 Provider 使用不同预算。Node 固定当前构建的 DeliveryEscrow、官方 adapter/verifier、产品 profile 和 TestToken runtime，不接受自定义 verifier、公开 RPC、主网或真实资产。
 
-在 S、P 的本机维护命令中创建并解锁独立钱包，备份保管方式沿用钱包命令。密码只通过受保护 FD 传递。R 先用现有 `register-key` 操作完成真实接收密钥注册，再准备订单；历史接收密钥仍保留给已分配订单。
+在 S、R、P 的本机维护命令中创建并解锁独立钱包，备份保管方式沿用钱包命令。口令通过关闭回显的终端或受保护 FD 输入。R 先用现有 `register-key` 操作完成真实接收密钥注册，再准备订单；历史接收密钥仍保留给已分配订单。
 
 S 和 R 各自管理个人网络，可以属于不同网络。P 是普通公共 Node，可以不加入二者的个人网络。服务通道认证 PeerID，个人网络通道另外验证成员资格；服务 PeerID 不授予个人网络成员权限。付款、报价或发现记录不能访问私人事件、附件、Agent 或模型密钥。
 

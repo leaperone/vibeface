@@ -328,7 +328,7 @@ where
             "manager workspace must be an existing absolute directory"
         );
         ensure!(
-            !prompt.trim().is_empty() && prompt.len() <= 65_536,
+            !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT,
             "management prompt must be nonempty and at most 65536 bytes"
         );
         if let Some(id) = previous_session_id {
@@ -1010,13 +1010,7 @@ pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
         .collect();
     values.extend(
         std::env::vars()
-            .filter(|(key, value)| {
-                value.len() >= 8
-                    && (key.ends_with("_KEY")
-                        || key.ends_with("_TOKEN")
-                        || key.ends_with("_SECRET")
-                        || key.ends_with("_PASSWORD"))
-            })
+            .filter(|(key, value)| value.len() >= 8 && crate::logging::credential_name(key))
             .map(|(_, value)| value),
     );
     if let Ok(keys) = config.sdk.provider().key_variables(&config.provider_env) {
@@ -1722,8 +1716,8 @@ mod tests {
         }
     }
 
-    fn workspace() -> PathBuf {
-        let directory = std::env::temp_dir().join(format!("vf-manager-{}", uuid::Uuid::new_v4()));
+    fn workspace(parent: &Path) -> PathBuf {
+        let directory = parent.join(format!("vf-manager-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         directory
     }
@@ -1771,7 +1765,7 @@ mod tests {
         }
         let error = provider_keys_from_config("model='SYNTHETIC_INLINE_SECRET").unwrap_err();
         assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
-        let dir = workspace();
+        let dir = workspace(&std::env::temp_dir());
         assert!(read_codex_config(&dir)?.is_none());
         std::fs::write(dir.join("config.toml"), vec![b'x'; 1_048_577])?;
         assert!(read_codex_config(&dir).is_err());
@@ -1781,7 +1775,8 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_cursor_effort_is_rejected_before_launch() {
-        let mut config = codex(workspace(), PathBuf::from("/unused.sock"));
+        let dir = workspace(&std::env::temp_dir());
+        let mut config = codex(dir.clone(), PathBuf::from("/unused.sock"));
         config.sdk = Sdk::Cursor {
             bridge: None,
             sdk_bin: "/unused-cursor".into(),
@@ -1804,6 +1799,7 @@ mod tests {
         assert_eq!(error.stage, ProviderStage::Validate);
         assert_eq!(error.start, StartEvidence::NotStarted);
         assert!(error.failure.detail.contains("effort"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1836,7 +1832,7 @@ mod tests {
                 }),
                 fresh_prompt: None,
             }),
-            ..codex(workspace(), fake.socket.clone())
+            ..codex(workspace(&fake.directory), fake.socket.clone())
         };
         let shown = Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress = shown.clone();
@@ -1896,10 +1892,19 @@ mod tests {
             (false, ManagerFailure::Unknown),
         ] {
             let fake = fake_app_server(Turn::Runs { confirm }).await;
-            let config = codex(workspace(), fake.socket.clone());
+            let config = codex(workspace(&fake.directory), fake.socket.clone());
             let (stop, cancel) = watch::channel(false);
+            let requests = fake.requests.clone();
             let stopper = tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !(requests.lock().unwrap().iter())
+                        .any(|request| request["method"] == "turn/start")
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the turn started");
                 stop.send(true).unwrap();
                 stop
             });
@@ -1933,7 +1938,7 @@ mod tests {
             ("failed", ManagerFailure::Failed),
         ] {
             let fake = fake_app_server(Turn::Ends(status)).await;
-            let config = codex(workspace(), fake.socket.clone());
+            let config = codex(workspace(&fake.directory), fake.socket.clone());
             let error = run_manager(
                 &config,
                 "fixture",
@@ -1967,7 +1972,7 @@ mod tests {
                 record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
                 fresh_prompt: Some("full context".into()),
             }),
-            ..codex(workspace(), fake.socket.clone())
+            ..codex(workspace(&fake.directory), fake.socket.clone())
         };
         let result = run_manager(
             &config,
@@ -1990,7 +1995,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_turn_start_is_not_sent_again() {
         let fake = fake_app_server(Turn::Drops).await;
-        let config = codex(workspace(), fake.socket.clone());
+        let config = codex(workspace(&fake.directory), fake.socket.clone());
         let error = run_manager(
             &config,
             "fixture",
@@ -2015,7 +2020,7 @@ mod tests {
     }
 
     fn concurrent_codex(fake: &ConcurrentFake, client: &str) -> ManagerConfig {
-        let mut config = codex(workspace(), fake.socket.clone());
+        let mut config = codex(workspace(&fake.directory), fake.socket.clone());
         config.timeout_secs = 30;
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),

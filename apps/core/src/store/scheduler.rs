@@ -4126,6 +4126,14 @@ impl Store {
         query_jobs(&self.connection, "1", [])
     }
 
+    pub fn workspace_scheduler_jobs(&self) -> Result<Vec<SchedulerJob>> {
+        query_jobs(
+            &self.connection,
+            "scope>='workspace_task:' AND scope<'workspace_task;'",
+            [],
+        )
+    }
+
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
     /// An agent task runs in its bot's conversation but is that work, not a reply in the chat.
     pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
@@ -5686,10 +5694,13 @@ impl Store {
             self.pending_checks()?.is_empty(),
             crate::maintenance::Busy("an interrupted invocation awaits reconciliation".into())
         );
+        let open_work: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE state<>'finished')",
+            [],
+            |row| row.get(0),
+        )?;
         ensure!(
-            self.work_records()?
-                .iter()
-                .all(|work| work.state.finished()),
+            !open_work,
             crate::maintenance::Busy("a dispatched work has not finished".into())
         );
         Ok(())

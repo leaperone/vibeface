@@ -547,12 +547,6 @@ mod tests {
                 .contains("version and avatar are required"),
             "{missing}"
         );
-        let mut forged = pick.clone();
-        forged["version"] = json!("0123456789abcdef");
-        assert!(
-            node.rpc(client(None), forged).await.is_err(),
-            "the signature covers the version"
-        );
         let in_bots = node
             .rpc(client(None), request("bots", None, Some(cloud))?)
             .await;
@@ -575,6 +569,14 @@ mod tests {
         );
 
         let count = events(&node).await?;
+        let mut forged = request("c", None, Some(bean))?;
+        forged["version"] = json!(picked);
+        let forged = node.rpc(client(None), forged).await.unwrap_err();
+        assert!(
+            format!("{forged:#}").contains("device signature does not match"),
+            "the signature covers the version: {forged:#}"
+        );
+        assert_eq!(events(&node).await?, count);
         let again = node.rpc(client(None), pick.clone()).await?;
         assert_eq!(again["bot"]["avatar_version"], json!(picked));
         assert_eq!(

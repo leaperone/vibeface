@@ -1,13 +1,12 @@
 # vibeface-desktop
 
-Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core 自己提供界面的业务窗口。
+Electron 宿主：一个单窗口客户端，加载运行时内置的业务界面，并可管理本机 Core。
 
-## 两个窗口
+## 窗口
 
 - **单窗口客户端**（`vibeface-app://app/`）：内置 React 业务界面；本机节点管理在 App 设置 `/settings/desktop-node`，经受限 client preload 调用主进程。
-  负责选择数据目录、初始化、启动与停止本机 Core、仅连接已有服务、打开业务窗口和桌面设置。
-- **业务窗口**：`sandbox`、`contextIsolation` 为真，`nodeIntegration` 为假，**没有 preload，也没有任何原生桥**。
-  它加载 Core 在 `local_listen`（默认 `http://127.0.0.1:4791`）提供的真实界面。
+  负责选择数据目录、初始化、启动与停止本机 Core、仅连接已有服务和桌面设置。
+  `sandbox`、`contextIsolation` 为真，`nodeIntegration` 为假，preload 只给这个固定来源。
   通知、文件选择和下载走 W3C API，由主进程的权限与下载钩子接住。
 
 ## 业务地址如何确定
@@ -17,6 +16,7 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 `src/main/business-url.ts` 因此把 `access` 的路径与一次性 `#local=` / `#bootstrap=` 片段原样搬到
 `inspect.local_listen` 报告的私有 origin 上，并校验回环地址与 `node=` 对应的设备。
 片段不写入设置、不打日志。
+窗口不加载这个地址：`src/main/client-host.ts` 只用它核对所选节点的私有 origin，access URL 和片段不经过 IPC。
 
 ## 生命周期
 
@@ -30,7 +30,7 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 ## 邀请激活时序
 
 `open-url`、`second-instance` 和初始 `argv` 只接受解析后的 `join` 邀请，先在内存队列里去重并限长缓存。
-队列在 `app.whenReady()` 与 `coreSession.restore()` 完成后统一消费；若当时还没连上本机 Core，邀请会保留并在会话变化后重试，不写入设置文件。
+队列在 `app.whenReady()` 与 `coreSession.restore()` 完成后统一消费，不写入设置文件。
 
 ## 命令
 
@@ -44,7 +44,7 @@ node apps/desktop/scripts/make-icons.mjs   # 仅 macOS：从品牌矢量重新�
 
 ## 运行时与开关
 
-打包后运行时固定为 `process.resourcesPath/runtime`，其中的 `vibeface-core[.exe]` 是唯一可执行的程序。
+打包后运行时固定为 `process.resourcesPath/runtime`，其中的 `vibeface-core[.exe]` 和 `vibeface[.exe]` 是仅有的可执行程序。
 下列变量**只在未打包时**生效，打包产物不会读取它们：
 
 | 变量 | 作用 |

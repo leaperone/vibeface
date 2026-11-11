@@ -439,9 +439,10 @@ impl TriageConfig {
                 "the webhook must use HTTPS"
             );
             ensure!(
-                parsed.username().is_empty() && parsed.password().is_none() && url.len() <= 2048,
+                parsed.username().is_empty() && parsed.password().is_none(),
                 "the webhook URL must not carry credentials"
             );
+            ensure!(url.len() <= 2048, "the webhook URL is too long");
         }
         Ok(())
     }

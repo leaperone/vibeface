@@ -384,7 +384,6 @@ export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "rev
 export type OverviewConsistency = "local_snapshot" | "mixed_remote" | "partial"
 export type OverviewTaskState = WorkState | DispatchState | StopState | "accepted_waiting_sync" | "unknown"
 export type OverviewDeliveryState = DispatchState | "dispatch_accepted" | StopState
-export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
 type OverviewTaskCommon = {

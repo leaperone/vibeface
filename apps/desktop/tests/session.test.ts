@@ -61,12 +61,7 @@ describe('CoreSession against protocol fixtures', () => {
   it('initializes, starts and then serves the Core private origin', async () => {
     await session.useDataDir(dataDir)
     await session.startOwned()
-    expect(session.state().kind).toBe('owned')
-    expect(session.ownsCore()).toBe(true)
-    const target = await session.businessTarget()
-    expect(target.kind).toBe('business')
-    expect(target.url.startsWith('http://127.0.0.1:4791/')).toBe(true)
-    expect(target.url).toContain('#local=')
+    expect(session.state()).toMatchObject({ kind: 'owned', origin: 'http://127.0.0.1:4791' })
   })
 
   it('stopping an owned Core leaves the directory offline, and it can start again', async () => {
@@ -74,7 +69,6 @@ describe('CoreSession against protocol fixtures', () => {
     await session.startOwned()
     await session.stopOwned()
     expect(session.state().kind).toBe('offline')
-    expect(session.ownsCore()).toBe(false)
     await session.startOwned()
     expect(session.state().kind).toBe('owned')
   })
@@ -89,7 +83,7 @@ describe('CoreSession against protocol fixtures', () => {
     const before = await readFile(join(dataDir, 'identity.json'), 'utf8')
     await expect(session.startOwned()).rejects.toThrow(/更新尚未完成/)
     await expect(session.startDiscoveredNode(dataDir, 'a'.repeat(64))).rejects.toThrow(/更新尚未完成/)
-    expect(session.ownsCore()).toBe(false)
+    expect(session.state().kind).toBe('failed')
     expect(await readFile(pending, 'utf8')).toBe(journal)
     expect(await readFile(join(dataDir, 'identity.json'), 'utf8')).toBe(before)
   })
@@ -155,7 +149,6 @@ describe('CoreSession against protocol fixtures', () => {
     const next = open()
     await next.restore()
     expect(next.state()).toMatchObject({ kind: 'offline', dataDir })
-    expect(next.ownsCore()).toBe(false)
   })
 
   it('refuses a relative data directory', async () => {
@@ -165,7 +158,6 @@ describe('CoreSession against protocol fixtures', () => {
   it('never writes a token or an access URL into its settings file', async () => {
     await session.useDataDir(dataDir)
     await session.startOwned()
-    await session.businessTarget()
     const settings: unknown = JSON.parse(await readFile(join(profileDir, 'desktop-settings.json'), 'utf8'))
     expect(settings).toEqual({ lastDataDir: dataDir, preferences: { openBusinessOnConnect: true } })
   })

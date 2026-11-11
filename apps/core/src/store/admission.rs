@@ -1024,9 +1024,8 @@ impl Store {
                     return Ok(None);
                 }
                 let work = self
-                    .works(network, conversation_id)?
-                    .into_iter()
-                    .find(|work| work.work_id == *work_id)
+                    .work(network, work_id)?
+                    .filter(|work| work.conversation_id == *conversation_id)
                     .context("stopped work source not found")?;
                 ensure!(
                     work.target_node == local,

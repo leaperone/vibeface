@@ -2593,7 +2593,10 @@ mod tests {
             },
         )?;
         forged.issuer = id(&ordinary);
-        assert!(state.append(forged.sign(&ordinary)?).is_err());
+        refused(
+            state.append(forged.sign(&ordinary)?),
+            "management permission required",
+        );
         state.append(GovernanceEvent::grant(
             &a,
             &state.project()?,
@@ -2634,7 +2637,11 @@ mod tests {
         refused(GovernanceEvent::revoke(&a, &view, cut(&a, 0)), LAST_MANAGER);
         let mut forged = GovernanceEvent::revoke(&a, &view, cut(&other, 0))?;
         forged.issuer = id(&ordinary);
-        assert!(state.append(forged.sign(&ordinary)?).is_err());
+        let error = state.append(forged.sign(&ordinary)?).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("management permission required"),
+            "{error:#}"
+        );
 
         state.append(GovernanceEvent::revoke(
             &ordinary,
@@ -2712,19 +2719,16 @@ mod tests {
             &granted.project()?,
             Member::client(&b, "b", true)?,
         )?)?;
-        let early = GovernanceEvent {
-            version: 1,
-            network_id: base.genesis.network_id.clone(),
-            epoch: 1,
-            parents: vec![],
-            issuer: id(&b),
-            action: GovernanceAction::Grant {
+        let early = signed_at(
+            &base,
+            &b,
+            1,
+            vec![],
+            GovernanceAction::Grant {
                 member: Member::client(&c, "c", false)?,
             },
-            signature: String::new(),
-        }
-        .sign(&b)?;
-        assert!(granted.append(early).is_err());
+        )?;
+        refused(granted.append(early), "management permission required");
         Ok(())
     }
 

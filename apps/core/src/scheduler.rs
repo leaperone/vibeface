@@ -749,9 +749,10 @@ async fn turn(
                     }
                     *sessions=filtered;
                 }
-                if job.scope!=SessionScope::Main { bot["sent"]=json!([]); }
+                if job.scope!=SessionScope::Main { bot["sent"]=json!([]); bot["sent_omitted"]=json!(0); }
                 bot["configured_bot"] = stable.bot.clone();
                 bot["skills"] = json!(stable.skills);
+                bot["skills_omitted"] = json!(0);
                 fit_bot(&mut bot, INDEX_BUDGET);
                 let memories: Vec<_> = store.memory_records(&network, &conversation)?
                     .into_iter().filter(|record| record.essential)
@@ -1330,7 +1331,7 @@ pub(crate) fn turn_recorder(
                         TurnExecution::Started,
                     )?;
                     store.record_context_started(&attempt)?;
-                    store.started_workspace_assignment(
+                    store.settle_workspace_assignment(
                         &node.identity,
                         &network,
                         &started,

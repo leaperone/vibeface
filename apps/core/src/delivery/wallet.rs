@@ -304,7 +304,12 @@ fn read_keystore(path: &Path) -> Result<Keystore> {
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = privatefs::create_durable(path, bytes);
-    if result.is_err() {
+    // A file that was already there is not this call's to remove.
+    if let Err(error) = &result
+        && !error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+    {
         let _ = std::fs::remove_file(path);
     }
     result
@@ -378,6 +383,7 @@ mod tests {
         backup(&dir, &output)?;
         assert_eq!(std::fs::read(&output)?, encrypted);
         assert!(backup(&dir, &output).is_err());
+        assert_eq!(std::fs::read(&output)?, encrypted);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

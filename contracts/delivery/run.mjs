@@ -185,7 +185,8 @@ try {
     await reject(() => reserve(b, [c]));
     const other = await budget(); await reject(() => reserve(other, [a]));
     await reject(() => escrow.reserveBatch(b.id, [{ ...reservation(a), walletSignature: `0x${'00'.repeat(65)}` }]));
-    await reject(() => escrow.reserveBatch(b.id, [reservation(c), reservation(c), reservation(c)]));
+    await reject(() => escrow.reserveBatch(other.id, [reservation(c), reservation(c), reservation(c)]));
+    await tx(escrow.reserveBatch(other.id, [reservation(c), reservation(c)]));
   });
   await check('source proof, wallet quote, payer, payee, provider and deployment domains are bound before service', async () => {
     const b = await budget(); const good = await make();

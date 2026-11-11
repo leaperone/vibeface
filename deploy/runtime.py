@@ -146,7 +146,7 @@ def guard(info):
     return result
 
 
-def maintenance(command):
+def maintenance():
     endpoint = Path('/tmp') / ('vibeface-' + os.environ['VIBEFACE_EXPECTED_DEVICE'][:32]) / 'maintenance.sock'
     metadata = endpoint.lstat()
     parent = endpoint.parent.lstat()
@@ -157,7 +157,7 @@ def maintenance(command):
     stream = socket.socket(socket.AF_UNIX)
     stream.settimeout(15)
     stream.connect(str(endpoint))
-    stream.sendall((json.dumps({'protocol': 1, 'command': command}) + '\n').encode())
+    stream.sendall((json.dumps({'protocol': 1, 'command': 'acquire'}) + '\n').encode())
     response = bytearray()
     while not response.endswith(b'\n') and len(response) <= 4096:
         part = stream.recv(4096)
@@ -165,7 +165,7 @@ def maintenance(command):
         response.extend(part)
     value = json.loads(response)
     require(len(response) <= 4096 and value.get('protocol') == 1
-            and value.get('status') == ('ready' if command == 'acquire' else 'healthy')
+            and value.get('status') == 'ready'
             and value['health']['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE'],
             'maintenance lease refused or identity differs')
     return stream
@@ -297,7 +297,7 @@ def main():
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
             os.execv(args[0], args)
     else:
-        with maintenance('acquire'):
+        with maintenance():
             print(json.dumps({'status': 'ready'}), flush=True)
             sys.stdin.buffer.read(1)
 

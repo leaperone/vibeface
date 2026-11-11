@@ -171,7 +171,6 @@ fn valid_date(date: &str) -> bool {
 fn host_target() -> Result<&'static str> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => Ok("aarch64-apple-darwin"),
-        ("x86_64", "macos") => Ok("x86_64-apple-darwin"),
         ("aarch64", "linux") => Ok("aarch64-unknown-linux-gnu"),
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
         ("x86_64", "windows") => Ok("x86_64-pc-windows-msvc"),

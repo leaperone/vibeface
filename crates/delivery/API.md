@@ -1,6 +1,6 @@
 # Delivery domain API
 
-Draft implementation in `work/vdp-domain`. Product integration, proof resource acceptance, chain settlement and final review remain separate gates.
+Domain crate used by `apps/core` and the `proof/` guest.
 
 ## Shared ABI
 
@@ -97,8 +97,8 @@ Charity uses the same C and E byte layouts and zeroized random material as paid 
 Native checks from the task worktree.
 
 ```sh
-cargo test --manifest-path crates/delivery/Cargo.toml --target-dir .artifacts/vdp-domain/target --locked
-cargo run --manifest-path crates/delivery/Cargo.toml --target-dir .artifacts/vdp-domain/target --locked --example fixture -- public 35 2 > .artifacts/vdp-domain/public-vectors.json
+cargo test --manifest-path crates/delivery/Cargo.toml --target-dir .artifacts/vdp/domain/target --locked
+cargo run --manifest-path crates/delivery/Cargo.toml --target-dir .artifacts/vdp/domain/target --locked --example fixture -- public 35 2 > .artifacts/vdp/domain/public-vectors.json
 ```
 
 The public vector generator reports profile ABI, all journals, transcript payloads, signatures, leaves, C and E. Its synthetic fixture keys are confined to example and unit-test support. These vectors check serialization and native crypto, not guest proofs.

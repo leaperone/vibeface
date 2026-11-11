@@ -219,7 +219,10 @@ pub struct Sink {
 
 impl Sink {
     pub fn open(dir: &Path, max_bytes: u64, keep: usize) -> Result<Self> {
-        ensure!(keep >= 1, "keep at least the current log file");
+        ensure!(
+            keep >= 2,
+            "keep the current log file and at least one rotation"
+        );
         let current = path(dir, 0);
         let file = open(&current)?;
         let len = file.metadata()?.len();

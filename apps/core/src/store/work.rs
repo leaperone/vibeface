@@ -517,6 +517,9 @@ impl Store {
     pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "1", [])
     }
+    pub fn open_work_records(&self) -> Result<Vec<WorkRecord>> {
+        query_runs(&self.connection, "state<>'finished'", [])
+    }
     /// The runs on one App Server thread, by index: a streamed event reads only these.
     pub fn work_records_on_thread(&self, thread: &str) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "thread_id=?", [thread])
@@ -699,6 +702,9 @@ impl Store {
     pub fn dispatches(&self) -> Result<Vec<Dispatch>> {
         query_dispatches(&self.connection, "1", [])
     }
+    pub fn pending_dispatches(&self) -> Result<Vec<Dispatch>> {
+        query_dispatches(&self.connection, "state='pending'", [])
+    }
 
     /// Whether the user closed this failed work or refused dispatch in 待处理.
     pub fn closed_in_inbox(&self, network: &str, work_id: &str) -> Result<bool> {
@@ -767,16 +773,18 @@ impl Store {
     /// refused, unknown, or accepted but not synced back.
     pub fn undelivered_dispatches(&self, network: &str, scope: &str) -> Result<Vec<Dispatch>> {
         let works = reduce::works_from(&self.connection, network, scope)?;
-        Ok(self
-            .dispatches()?
-            .into_iter()
-            .filter(|dispatch| {
-                dispatch.spec.conversation == scope
-                    && !works
-                        .iter()
-                        .any(|work| work.work_id == dispatch.spec.work_id)
-            })
-            .collect())
+        Ok(query_dispatches(
+            &self.connection,
+            "json_extract(spec,'$.conversation')=?1",
+            [scope],
+        )?
+        .into_iter()
+        .filter(|dispatch| {
+            !works
+                .iter()
+                .any(|work| work.work_id == dispatch.spec.work_id)
+        })
+        .collect())
     }
 
     pub fn save_stop_request(&mut self, request: &StopRequest) -> Result<()> {

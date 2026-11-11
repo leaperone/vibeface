@@ -179,7 +179,7 @@ test("work approval belongs to an unfinished work in the same Bot, target device
   assert.equal(workApproval({ ...input, conversationId: "other-bot" }), undefined)
   assert.equal(workApproval({ ...input, work: { ...work, target_node: "other-device" } }), undefined)
   assert.equal(workApproval({ ...input, work: { ...work, thread_id: "other-session" } }), undefined)
-  assert.equal(workApproval({ ...input, questions: [{ ...approval, about: { ...about, agent: "codex" } }] }), undefined)
+  assert.equal(workApproval({ ...input, questions: parseQuestions({ questions: [row("approval", 2)] }) }), undefined, "a question without a held request is not an approval")
   assert.equal(workApproval({ ...input, questions: [{ ...approval, closed: "request_lost" }] }), undefined)
   assert.equal(workApproval({ ...input, questions: [{ ...approval, answer: { message_id: "a", text: "继续", author: "me", created_at_ms: 3 } }] }), undefined)
 })
