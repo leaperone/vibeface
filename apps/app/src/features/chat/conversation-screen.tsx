@@ -444,7 +444,7 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
 }
 
 const intents = [
-  { value: 'continue', label: '发送', icon: Send },
+  { value: 'continue', label: '普通消息', icon: Send },
   { value: 'new_task', label: '新任务', icon: ListPlus },
   { value: 'defer', label: '稍后处理', icon: Clock },
 ] as const
