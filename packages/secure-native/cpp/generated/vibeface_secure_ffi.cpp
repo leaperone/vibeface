@@ -823,9 +823,8 @@ template <> struct Bridging<RustCallStatus> {
       // immediately. The errorBuf is small (a serialized error variant) and
       // only allocated on the cold error path, so the boundary copy is cheap.
       auto len = static_cast<size_t>(status.error_buf.len);
-      uint8_t *bytes = new uint8_t[len];
-      std::memcpy(bytes, status.error_buf.data, len);
-      auto payload = std::make_shared<uniffi_jsi::CMutableBuffer>(bytes, len);
+      auto payload = std::make_shared<uniffi_jsi::OwnedMutableBuffer>(len);
+      std::memcpy(payload->data(), status.error_buf.data, len);
       auto view = uniffi_jsi::arraybufferToUint8Array(
           rt, jsi::ArrayBuffer(rt, payload));
       statusObject.setProperty(rt, "errorBuf", view);
