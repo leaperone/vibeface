@@ -889,7 +889,7 @@ struct CommittedRelease {
     package_digest: String,
 }
 
-/// Only a confirmed activation grants permission to remove an unchanged package later.
+/// Only a confirmed, sealed candidate grants permission to remove an unchanged package later.
 pub(super) fn retain_committed(
     root: &Path,
     data: &Path,
@@ -931,6 +931,7 @@ pub(super) fn retain_committed(
     };
     let package_digest = |package: &Path| -> Result<String> {
         super::owned_directory(package)?;
+        verify_sealed_contents(package, host_target()?)?;
         let contents = tree(package)?;
         ensure!(
             package.file_name().and_then(|name| name.to_str())
@@ -939,30 +940,28 @@ pub(super) fn retain_committed(
         );
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&contents)?)))
     };
-    for package in [previous, candidate] {
-        let path = receipt(package)?;
-        let record = CommittedRelease {
-            data_dir: data.to_path_buf(),
-            device_id: device_id.to_owned(),
-            package_digest: package_digest(package)?,
-        };
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let saved: CommittedRelease = serde_json::from_slice(
-                    &privatefs::read_private_bounded(&path, 4096, "committed release receipt")?,
-                )?;
-                ensure!(
-                    saved.data_dir == record.data_dir
-                        && saved.device_id == record.device_id
-                        && saved.package_digest == record.package_digest,
-                    "committed release receipt belongs to another package or Node"
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                privatefs::create_durable(&path, &serde_json::to_vec(&record)?)?;
-            }
-            Err(error) => return Err(error.into()),
+    let path = receipt(candidate)?;
+    let record = CommittedRelease {
+        data_dir: data.to_path_buf(),
+        device_id: device_id.to_owned(),
+        package_digest: package_digest(candidate)?,
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let saved: CommittedRelease = serde_json::from_slice(
+                &privatefs::read_private_bounded(&path, 4096, "committed release receipt")?,
+            )?;
+            ensure!(
+                saved.data_dir == record.data_dir
+                    && saved.device_id == record.device_id
+                    && saved.package_digest == record.package_digest,
+                "committed release receipt belongs to another package or Node"
+            );
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            privatefs::create_durable(&path, &serde_json::to_vec(&record)?)?;
+        }
+        Err(error) => return Err(error.into()),
     }
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     for entry in fs::read_dir(&releases)? {

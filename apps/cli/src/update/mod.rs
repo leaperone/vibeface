@@ -1737,6 +1737,7 @@ async fn checked(command: &mut Command, action: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::mark_runnable;
+    use sha2::{Digest, Sha256};
 
     /// Writes a fixture service script that records the arguments it was handed.
     fn recording_service_script(package: &Path) -> PathBuf {
@@ -1950,9 +1951,34 @@ mod tests {
         directory
     }
 
+    fn sealed_package(root: &Path, version: &str) -> PathBuf {
+        let directory = package(root, version);
+        let checksums = [
+            PROGRAMS[0],
+            PROGRAMS[1],
+            SERVICE_SCRIPT,
+            "web/index.html",
+            "BUILD-INFO.json",
+        ]
+        .into_iter()
+        .map(|name| {
+            let hash = Sha256::digest(fs::read(directory.join(name)).unwrap());
+            format!("{}  {name}\n", hex::encode(hash))
+        })
+        .collect::<String>();
+        fs::write(directory.join("FILES.sha256"), checksums).unwrap();
+        directory
+    }
+
     fn build_info(version: &str) -> serde_json::Value {
+        let suffix = match std::env::consts::OS {
+            "macos" => "apple-darwin",
+            "linux" => "unknown-linux-gnu",
+            "windows" => "pc-windows-msvc",
+            other => panic!("unsupported test platform: {other}"),
+        };
         serde_json::json!({
-            "version": version, "target": if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "aarch64-apple-darwin" }, "source_commit": "a".repeat(40),
+            "version": version, "target": format!("{}-{suffix}", std::env::consts::ARCH), "source_commit": "a".repeat(40),
             "core_version": version, "core_source_commit": "a".repeat(40),
             "app_version": version, "app_source_commit": "a".repeat(40),
             "update_protocol": vibeface_control::UPDATE_PROTOCOL,
@@ -2653,15 +2679,20 @@ mod tests {
         let root = sandbox();
         let data = root.join("data");
         private_dir(&data)?;
-        let first = package(&root, "1.0.0");
-        let second = package(&root, "1.1.0");
-        privatefs::link_dir(&second, &root.join("current"))?;
+        let legacy = sealed_package(&root, "0.8.0");
+        let first = sealed_package(&root, "1.0.0");
+        privatefs::link_dir(&first, &root.join("current"))?;
+        release::retain_committed(&root, &data, "device", &legacy, &first)?;
+        assert!(root.join("releases/.updater-1.0.0.json").is_file());
+        assert!(!root.join("releases/.updater-0.8.0.json").exists());
+        let second = sealed_package(&root, "1.1.0");
+        switch(&root, &second)?;
         release::retain_committed(&root, &data, "device", &first, &second)?;
-        let unknown = package(&root, "0.9.0");
+        let unknown = sealed_package(&root, "0.9.0");
         let staging = root.join("releases/.staging-unclaimed");
         fs::create_dir(&staging)?;
         fs::write(staging.join("keep"), b"unclaimed partial download")?;
-        let third = package(&root, "1.2.0");
+        let third = sealed_package(&root, "1.2.0");
         switch(&root, &third)?;
         fs::write(
             data.join("update-pending.json"),
@@ -2679,7 +2710,8 @@ mod tests {
         release::retain_committed(&root, &data, "device", &second, &third)?;
         assert!(!first.exists());
         assert!(!root.join("releases/.updater-1.0.0.json").exists());
-        assert!(second.is_dir() && third.is_dir() && unknown.is_dir() && staging.is_dir());
+        assert!(legacy.is_dir() && second.is_dir() && third.is_dir());
+        assert!(unknown.is_dir() && staging.is_dir());
         fs::write(
             second.join("user-file"),
             b"not part of the committed package",
@@ -2692,11 +2724,15 @@ mod tests {
             root.join("releases/.updater-1.2.0.json"),
             root.join("releases/.updater-1.0.0.json"),
         )?;
-        let fourth = package(&root, "1.3.0");
+        let fourth = sealed_package(&root, "1.3.0");
         switch(&root, &fourth)?;
         release::retain_committed(&root, &data, "device", &third, &fourth)?;
         assert_eq!(installed(&root)?, fourth);
-        assert!(second.join("user-file").is_file() && third.is_dir());
+        assert_eq!(
+            fs::read(second.join("user-file"))?,
+            b"not part of the committed package"
+        );
+        assert!(legacy.is_dir() && third.is_dir());
         assert!(unknown.is_dir() && staging.join("keep").is_file());
         assert!(privatefs::is_dir_link(&first)?);
         assert_eq!(fs::read(outside.join("keep"))?, b"link target");
@@ -2713,6 +2749,90 @@ mod tests {
         privatefs::remove_dir_link(&releases)?;
         fs::rename(&moved, &releases)?;
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn committed_release_retention_never_adopts_preexisting_user_files() -> Result<()> {
+        for contaminated in ["previous", "candidate"] {
+            let root = sandbox();
+            let data = root.join("data");
+            private_dir(&data)?;
+            let first = sealed_package(&root, "1.0.0");
+            let second = sealed_package(&root, "1.1.0");
+            let user_package = if contaminated == "previous" {
+                &first
+            } else {
+                &second
+            };
+            fs::write(
+                user_package.join("user-file"),
+                b"predates the first receipt",
+            )?;
+            privatefs::link_dir(&second, &root.join("current"))?;
+            let retained = release::retain_committed(&root, &data, "device", &first, &second);
+            assert_eq!(retained.is_ok(), contaminated == "previous");
+            assert!(!root.join("releases/.updater-1.0.0.json").exists());
+            assert_eq!(
+                root.join("releases/.updater-1.1.0.json").is_file(),
+                contaminated == "previous"
+            );
+            let third = sealed_package(&root, "1.2.0");
+            let fourth = sealed_package(&root, "1.3.0");
+            let fifth = sealed_package(&root, "1.4.0");
+            for (previous, candidate) in [(&second, &third), (&third, &fourth), (&fourth, &fifth)] {
+                switch(&root, candidate)?;
+                release::retain_committed(&root, &data, "device", previous, candidate)?;
+                assert_eq!(
+                    fs::read(user_package.join("user-file"))?,
+                    b"predates the first receipt"
+                );
+            }
+            assert!(!third.exists());
+            assert!(!root.join("releases/.updater-1.2.0.json").exists());
+            assert!(first.is_dir() && fourth.is_dir() && fifth.is_dir());
+            assert_eq!(second.is_dir(), contaminated == "candidate");
+            assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn committed_release_retention_never_records_an_unsealed_candidate() -> Result<()> {
+        for mutation in ["changed payload", "missing seal"] {
+            let root = sandbox();
+            let data = root.join("data");
+            private_dir(&data)?;
+            let first = sealed_package(&root, "1.0.0");
+            let second = sealed_package(&root, "1.1.0");
+            if mutation == "changed payload" {
+                fs::write(second.join("web/index.html"), b"user payload")?;
+            } else {
+                fs::remove_file(second.join("FILES.sha256"))?;
+            }
+            privatefs::link_dir(&second, &root.join("current"))?;
+            assert!(release::retain_committed(&root, &data, "device", &first, &second).is_err());
+            assert!(!root.join("releases/.updater-1.0.0.json").exists());
+            assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            let third = sealed_package(&root, "1.2.0");
+            let fourth = sealed_package(&root, "1.3.0");
+            let fifth = sealed_package(&root, "1.4.0");
+            for (previous, candidate) in [(&second, &third), (&third, &fourth), (&fourth, &fifth)] {
+                switch(&root, candidate)?;
+                release::retain_committed(&root, &data, "device", previous, candidate)?;
+                assert!(second.is_dir());
+                assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            }
+            if mutation == "changed payload" {
+                assert_eq!(fs::read(second.join("web/index.html"))?, b"user payload");
+            } else {
+                assert!(!second.join("FILES.sha256").exists());
+            }
+            assert!(!third.exists());
+            assert!(fourth.is_dir() && fifth.is_dir());
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
 
