@@ -1467,10 +1467,21 @@ pub(super) mod tests {
     pub struct RpcFixture {
         pub chain: Chain,
         pub requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
-        task: tokio::task::JoinHandle<()>,
+        stop: std::sync::Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+    impl RpcFixture {
+        pub async fn shutdown(mut self) -> Result<()> {
+            self.stop.notify_one();
+            (&mut self.task)
+                .await
+                .context("join controlled delivery RPC server")?
+                .context("stop controlled delivery RPC server")
+        }
     }
     impl Drop for RpcFixture {
         fn drop(&mut self) {
+            self.stop.notify_one();
             self.task.abort();
         }
     }
@@ -1496,8 +1507,12 @@ pub(super) mod tests {
                 }
             }),
         );
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stopped = stop.clone();
         let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { stopped.notified().await })
+                .await
         });
         Ok(RpcFixture {
             chain: Chain {
@@ -1506,6 +1521,7 @@ pub(super) mod tests {
                 request_id: AtomicU64::new(1),
             },
             requests,
+            stop,
             task,
         })
     }
@@ -1782,7 +1798,11 @@ pub(super) mod tests {
                 .any(|request| request["method"] == "eth_sendRawTransaction"),
             "configuration changes during awaits cannot reach broadcast"
         );
-        std::fs::remove_dir_all(dir)?;
+        rpc.shutdown().await?;
+        delivery.shutdown().await;
+        drop(delivery);
+        std::fs::remove_dir_all(dir)
+            .context("remove chain configuration test directory after RPC and delivery shutdown")?;
         Ok(())
     }
 

@@ -416,8 +416,10 @@ async fn native_host_parent_fixture() -> Result<()> {
 
 #[tokio::test]
 async fn killing_the_synthetic_gui_parent_delivers_eof_to_only_its_owned_child() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.initialize()?;
+    let fixture = Fixture::new().context("create parent-death runtime fixture")?;
+    fixture
+        .initialize()
+        .context("provision private parent-death Node fixture")?;
     let mut parent = tokio::process::Command::new(std::env::current_exe()?)
         .args(["--exact", "native_host_parent_fixture", "--nocapture"])
         .env("VF_NATIVE_HOST_SYNTHETIC_PARENT", &fixture.root)
@@ -425,13 +427,29 @@ async fn killing_the_synthetic_gui_parent_delivers_eof_to_only_its_owned_child()
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
-    wait_parent_ready(&mut parent, &fixture.root.join("parent.ready")).await?;
-    parent.start_kill()?;
-    tokio::time::timeout(Duration::from_secs(3), parent.wait()).await??;
-    wait_file(&fixture.node().join("running"), false).await?;
+        .spawn()
+        .context("spawn the synthetic GUI parent test executable")?;
+    wait_parent_ready(&mut parent, &fixture.root.join("parent.ready"))
+        .await
+        .context("synthetic GUI parent must start its owned Core before parent death")?;
+    parent
+        .start_kill()
+        .context("kill only the held synthetic GUI parent")?;
+    tokio::time::timeout(Duration::from_secs(3), parent.wait())
+        .await
+        .context("synthetic GUI parent did not exit after its held handle was killed")?
+        .context("wait for the killed synthetic GUI parent")?;
+    wait_file(&fixture.node().join("running"), false)
+        .await
+        .context("owned synthetic Core must publish EOF evidence before clearing running")?;
+    let evidence = fixture.node().join("fixture.exited");
     assert_eq!(
-        std::fs::read(fixture.node().join("fixture.exited"))?,
+        std::fs::read(&evidence).with_context(|| {
+            format!(
+                "read committed synthetic EOF evidence {}",
+                evidence.display()
+            )
+        })?,
         b"eof"
     );
     assert!(fixture.node().join("identity.json").exists());

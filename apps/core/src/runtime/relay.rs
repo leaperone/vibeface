@@ -621,25 +621,32 @@ mod tests {
             assert!(b.grant_admits(&grant(Some(1))?, &device));
             assert!(!b.grant_admits(&grant(Some(0))?, &device), "used up");
 
-            let closed = b.configure_relay(json!({"volunteer":false})).await?;
+            let closed = b
+                .configure_relay(json!({"volunteer":false}))
+                .await
+                .context("disable B's announced volunteer relay")?;
             assert_eq!(closed, off);
             assert!(
                 b.mesh_roles()
                     .iter()
                     .all(|role| !matches!(role, Role::Relay { .. }))
             );
-            assert!(
-                tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_err(),
-                "the relay stopped"
+            ensure!(
+                b.relay.lock().await.is_none(),
+                "disabling B left a relay server handle installed"
+            );
+            let connection = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+            ensure!(
+                connection.is_err(),
+                "B's relay listener still accepts connections after disable returned: \
+                 endpoint={listen}, settings={closed}, connection={connection:?}"
             );
             let saved = crate::config::Config::load(&b.data_dir)?.network;
             assert!(!saved.relay_open && saved.relay_listen.is_none());
 
             // A port in use leaves the relay closed and says why.
-            let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let taken = taken.local_addr()?.to_string();
+            let occupied_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let taken = occupied_listener.local_addr()?.to_string();
             let refused = b
                 .configure_relay(json!({"volunteer":true,"listen":taken,
                     "url":format!("http://{taken}")}))
@@ -652,6 +659,7 @@ mod tests {
                     .is_some_and(|error| error.contains("relay failed to start")),
                 "{refused}"
             );
+            drop(occupied_listener);
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -659,11 +667,31 @@ mod tests {
             node.stop_network().await;
             node.shutdown().await;
         }
+        let runtimes = [Arc::downgrade(&a), Arc::downgrade(&b)];
         drop((a, b));
-        for dir in [dir_a, dir_b] {
-            let _ = std::fs::remove_dir_all(dir);
+        let mut cleanup_errors = Vec::new();
+        for (runtime, dir) in runtimes.into_iter().zip([dir_a, dir_b]) {
+            if runtime.upgrade().is_some() {
+                cleanup_errors.push(format!(
+                    "relay fixture Runtime still owned: {}",
+                    dir.display()
+                ));
+            } else if let Err(error) = std::fs::remove_dir_all(&dir) {
+                cleanup_errors.push(format!("remove relay fixture {}: {error:#}", dir.display()));
+            }
         }
-        result
+        if cleanup_errors.is_empty() {
+            result
+        } else {
+            let cleanup = format!(
+                "relay fixture cleanup failed: {}",
+                cleanup_errors.join("; ")
+            );
+            match result {
+                Err(error) => Err(error.context(cleanup)),
+                Ok(()) => bail!(cleanup),
+            }
+        }
     }
 
     /// Turning volunteering off removes what it set and leaves the operator's settings alone.
