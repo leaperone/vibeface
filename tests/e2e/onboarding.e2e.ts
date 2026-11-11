@@ -173,6 +173,50 @@ test('creates a persistent Bot without a model and shows triage budget state', a
   await expect(triage).toContainText('待审阅 0 · 审阅中 0 · 待确认 0');
   await expect(triage).not.toContainText('分诊暂停');
 
+  const webhookSecret = screen.getByLabel(/^密钥/);
+  const saveWebhook = screen.getByRole('button', '保存', { exact: true });
+  const secretDigest = () => browser.evaluate(async () => {
+    const input = document.getElementById('webhook-secret');
+    if (!(input instanceof HTMLInputElement)) throw new Error('Webhook secret editor is missing');
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input.value));
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  });
+  await webhookSecret.fill(secrets.get('webhookSecret'));
+  const firstSecretDigest = await secretDigest();
+  await browser.evaluate(() => {
+    const send = WebSocket.prototype.send;
+    const pending: { socket: WebSocket; data: Parameters<WebSocket['send']>[0] }[] = [];
+    window.addEventListener('release-webhook-save', () => {
+      WebSocket.prototype.send = send;
+      for (const { socket, data } of pending) send.call(socket, data);
+      document.documentElement.removeAttribute('data-webhook-save-held');
+    }, { once: true });
+    WebSocket.prototype.send = function (this: WebSocket, data) {
+      const copy = typeof data === 'string' || data instanceof Blob ? data
+        : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice() : new Uint8Array(data).slice();
+      pending.push({ socket: this, data: copy });
+      document.documentElement.setAttribute('data-webhook-save-held', 'true');
+    };
+    return true;
+  });
+  try {
+    await saveWebhook.click();
+    await expect(saveWebhook).toBeDisabled();
+    await expect(browser.locator('html')).toHaveAttribute('data-webhook-save-held', 'true');
+    await webhookSecret.fill(secrets.get('nextWebhookSecret'));
+    const newerSecretDigest = await secretDigest();
+    expect(newerSecretDigest).not.toBe(firstSecretDigest);
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+    await expect(webhookSecret).toHaveAttribute('placeholder', '已设置');
+    await expect(saveWebhook).toBeEnabled();
+    expect(await secretDigest()).toBe(newerSecretDigest);
+    await app.screenshot('webhook-newer-draft-preserved');
+    await saveWebhook.click();
+    await expect(webhookSecret).toHaveValue('');
+  } finally {
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+  }
+
   const database = new DatabaseSync(join(node.directory, 'node.sqlite3'));
   try {
     const network = database.prepare('SELECT network_id FROM networks').get();
