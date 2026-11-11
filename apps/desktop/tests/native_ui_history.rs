@@ -133,7 +133,7 @@ fn authority_changes_clear_invalid_rows_and_reject_late_scope_results() -> Resul
         )?,
         ApplyResult::Stale
     );
-    assert_eq!(state.authority(), Some("b"));
+    assert_eq!(state.materialize()["history_authority"], json!("b"));
     let foreign = HistoryState::new(HistoryScope {
         generation: 4,
         ..state.scope().clone()
@@ -144,7 +144,7 @@ fn authority_changes_clear_invalid_rows_and_reject_late_scope_results() -> Resul
         ApplyResult::Stale
     );
     state.invalidate();
-    assert!(state.authority().is_none());
+    assert!(state.materialize()["history_authority"].is_null());
     assert_eq!(rows(&state, S::Messages), json!([]));
     Ok(())
 }

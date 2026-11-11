@@ -1,5 +1,4 @@
-#[path = "fixtures/rustc.rs"]
-mod fixture_rustc;
+use host::fixture_rustc;
 
 #[allow(dead_code, unused_imports)]
 #[path = "../src/host/mod.rs"]
@@ -449,7 +448,7 @@ async fn unresponsive_owned_child_escalates_through_the_saved_handle() -> Result
     } else {
         "vibeface-core"
     });
-    let mut owned = host::TestOwnedChild::start(&core, fixture.identity())?;
+    let mut owned = host::lifecycle::OwnedChild::start(&core, fixture.identity())?;
     wait_file(&fixture.node().join("running"), true).await?;
     owned.stop(Duration::from_millis(50)).await?;
     assert!(owned.poll()?.is_some());

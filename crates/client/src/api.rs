@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, watch};
 
 #[derive(Clone, Debug)]
 pub enum ReadRequest {
@@ -416,6 +416,59 @@ struct AuthenticatedSession {
     authority: ClientAuthority,
     proof: crate::profile::CachedProfile,
 }
+struct ReadStorageJob {
+    outbox: Option<Arc<Mutex<Outbox>>>,
+    pending: watch::Sender<usize>,
+}
+
+impl ReadStorageJob {
+    fn register(pending: watch::Sender<usize>, outbox: Arc<Mutex<Outbox>>) -> Self {
+        pending.send_modify(|count| *count += 1);
+        Self {
+            outbox: Some(outbox),
+            pending,
+        }
+    }
+
+    fn invalidate_profile(&self, target: &str) -> Result<()> {
+        let store = self
+            .outbox
+            .as_ref()
+            .expect("read storage job owns its outbox until drop")
+            .lock()
+            .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
+        store.invalidate_profile(target)
+    }
+
+    fn cache_profile(&self, proof: &crate::profile::CachedProfile) -> Result<()> {
+        let store = self
+            .outbox
+            .as_ref()
+            .expect("read storage job owns its outbox until drop")
+            .lock()
+            .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
+        store.cache_profile(proof)
+    }
+
+    fn cache_write_gate(&self, target: &str, gate: u8) -> Result<()> {
+        let store = self
+            .outbox
+            .as_ref()
+            .expect("read storage job owns its outbox until drop")
+            .lock()
+            .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
+        store.cache_write_gate(target, gate)
+    }
+}
+
+impl Drop for ReadStorageJob {
+    fn drop(&mut self) {
+        // The storage method has released its mutex guard before this job can drop.
+        drop(self.outbox.take());
+        self.pending.send_modify(|count| *count -= 1);
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     key: Arc<ClientKey>,
@@ -425,6 +478,7 @@ pub struct Client {
     authority: ClientAuthority,
     endpoint: Endpoint,
     outbox: Arc<Mutex<Outbox>>,
+    read_storage: watch::Sender<usize>,
     events: broadcast::Sender<ClientEvent>,
     generation: String,
     writes: Arc<Semaphore>,
@@ -462,6 +516,7 @@ impl Client {
             Arc::new(Mutex::new(outbox)),
             Arc::new(Semaphore::new(8)),
             Arc::new(Mutex::new(BTreeMap::new())),
+            watch::channel(0).0,
         )
         .await
     }
@@ -525,6 +580,7 @@ impl Client {
             Arc::new(Mutex::new(outbox)),
             Arc::new(Semaphore::new(8)),
             Arc::new(Mutex::new(BTreeMap::new())),
+            watch::channel(0).0,
         )
     }
     fn offline_generation(
@@ -534,6 +590,7 @@ impl Client {
         outbox: Arc<Mutex<Outbox>>,
         writes: Arc<Semaphore>,
         decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
+        read_storage: watch::Sender<usize>,
     ) -> Result<Self> {
         let target = endpoint.node_id().to_owned();
         if let Endpoint::Local(grant) = &endpoint {
@@ -553,6 +610,7 @@ impl Client {
             authority,
             endpoint,
             outbox,
+            read_storage,
             events,
             generation: uuid::Uuid::new_v4().to_string(),
             writes,
@@ -572,6 +630,7 @@ impl Client {
             self.outbox.clone(),
             self.writes.clone(),
             self.decision_tokens.clone(),
+            self.read_storage.clone(),
         )?;
         self.close();
         Ok(next)
@@ -690,6 +749,7 @@ impl Client {
         outbox: Arc<Mutex<Outbox>>,
         writes: Arc<Semaphore>,
         decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
+        read_storage: watch::Sender<usize>,
     ) -> Result<Self> {
         let AuthenticatedSession {
             connection,
@@ -734,14 +794,8 @@ impl Client {
         let write_state = connection.call("write_state", json!({})).await?;
         let gate = write_gate_value(&write_state)?;
         proof.write_gate = gate;
-        let cache = outbox.clone();
-        tokio::task::spawn_blocking(move || {
-            cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?
-                .cache_profile(&proof)
-        })
-        .await??;
+        let job = ReadStorageJob::register(read_storage.clone(), outbox.clone());
+        tokio::task::spawn_blocking(move || job.cache_profile(&proof)).await??;
         Ok(Self {
             key,
             connection,
@@ -750,6 +804,7 @@ impl Client {
             authority,
             endpoint,
             outbox,
+            read_storage,
             events,
             generation,
             writes,
@@ -770,8 +825,9 @@ impl Client {
                         self.revoked.store(true, Ordering::Release);
                         self.connection.close();
                     }
-                    self.stored(move |db| db.invalidate_profile(&target))
-                        .await?;
+                    let job =
+                        ReadStorageJob::register(self.read_storage.clone(), self.outbox.clone());
+                    tokio::task::spawn_blocking(move || job.invalidate_profile(&target)).await??;
                 }
                 return Err(error);
             }
@@ -787,6 +843,7 @@ impl Client {
             self.outbox.clone(),
             self.writes.clone(),
             self.decision_tokens.clone(),
+            self.read_storage.clone(),
         )
         .await?;
         self.close();
@@ -986,6 +1043,23 @@ impl Client {
         })
         .await
     }
+    /// After aborting and joining reads/reconnects, wait for their cache jobs to release
+    /// this outbox. Generations sharing the outbox share this tracker. This does not wait
+    /// for network requests or mutation jobs.
+    pub async fn wait_for_read_storage(&self) {
+        let mut pending = self.read_storage.subscribe();
+        loop {
+            let count = *pending.borrow_and_update();
+            if count == 0 {
+                return;
+            }
+            pending
+                .changed()
+                .await
+                .expect("waiting Client retains the read storage tracker");
+        }
+    }
+
     pub async fn read(&self, request: ReadRequest) -> Result<Value> {
         self.require_active()?;
         let update_gate = matches!(&request, ReadRequest::WriteState);
@@ -1006,8 +1080,8 @@ impl Client {
             }
             self.write_gate.store(gate, Ordering::Release);
             let target = self.target.clone();
-            self.stored(move |db| db.cache_write_gate(&target, gate))
-                .await?;
+            let job = ReadStorageJob::register(self.read_storage.clone(), self.outbox.clone());
+            tokio::task::spawn_blocking(move || job.cache_write_gate(&target, gate)).await??;
         }
         Ok(value)
     }
@@ -2492,10 +2566,172 @@ mod offline_tests {
         membership::{Genesis, Member, NetworkState},
     };
 
+    #[tokio::test]
+    async fn cancelled_read_storage_and_reconnect_release_the_lease_only_after_the_job_finishes()
+    -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum CacheRead {
+            WriteState,
+            Reconnect,
+            Revoked,
+        }
+        for read in [
+            CacheRead::WriteState,
+            CacheRead::Reconnect,
+            CacheRead::Revoked,
+        ] {
+            for poison in [false, true] {
+                let dir = std::env::temp_dir()
+                    .join(format!("native-read-storage-{}", uuid::Uuid::new_v4()));
+                let mut key = ClientKey::create(&dir.join("key"), "fixture password")?;
+                let node = Identity::generate()?;
+                let state = NetworkState::new(Genesis::create(
+                    &Identity::generate()?,
+                    Member::client(&key.identity, "client", true)?,
+                    Member::node(&node, "node")?,
+                )?)?;
+                let evidence = Arc::new(Mutex::new(Evidence {
+                    counts: BTreeMap::new(),
+                    inputs: BTreeMap::new(),
+                    write_state: "writable".into(),
+                    revoked: false,
+                    controls: vec![],
+                    settings: json!({"roots":[],"manager":null}),
+                }));
+                let (endpoint, server) = fixture(
+                    &node.secret_hex(),
+                    state.clone(),
+                    key.device_id().into(),
+                    evidence.clone(),
+                    None,
+                )
+                .await?;
+                let Endpoint::Gateway(entry) = &endpoint else {
+                    unreachable!()
+                };
+                key.remember(&state.genesis.network_id, entry.clone())?;
+                let client = Client::open(Arc::new(key), endpoint, dir.join("outbox")).await?;
+                let network = client.network_id().to_owned();
+                let client_id = client.client_id().to_owned();
+                let target = client.target_node().to_owned();
+                {
+                    let mut observed = evidence.lock().expect("fixture");
+                    observed.write_state = "read_only".into();
+                    observed.revoked = matches!(read, CacheRead::Revoked);
+                }
+                let replacement = if !matches!(read, CacheRead::WriteState) {
+                    Some(
+                        fixture(&node.secret_hex(), state, client_id.clone(), evidence, None)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+
+                let outbox = client.outbox.clone();
+                let weak_outbox = Arc::downgrade(&outbox);
+                let (locked, lock_acquired) = tokio::sync::oneshot::channel();
+                let (release, gate) = std::sync::mpsc::channel();
+                let holder = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let store = outbox.lock().expect("fixture storage gate");
+                    locked
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("fixture observer left"))?;
+                    gate.recv().context("fixture storage gate closed")?;
+                    assert!(!poison, "controlled outbox mutex poisoning");
+                    drop(store);
+                    drop(outbox);
+                    Ok(())
+                });
+                lock_acquired.await?;
+                let mut registered = client.read_storage.subscribe();
+                let reader = client.clone();
+                let (read_task, replacement_server) = match replacement {
+                    Some((endpoint, server)) => (
+                        tokio::spawn(async move {
+                            let connected = reader.reconnect(endpoint).await?;
+                            connected.close();
+                            Ok::<(), anyhow::Error>(())
+                        }),
+                        Some(server),
+                    ),
+                    None => (
+                        tokio::spawn(async move {
+                            reader.read(ReadRequest::WriteState).await.map(|_| ())
+                        }),
+                        None,
+                    ),
+                };
+                loop {
+                    let count = *registered.borrow_and_update();
+                    if count != 0 {
+                        assert_eq!(count, 1);
+                        break;
+                    }
+                    registered.changed().await?;
+                }
+                read_task.abort();
+                assert!(
+                    read_task
+                        .await
+                        .expect_err("gated read was cancelled")
+                        .is_cancelled()
+                );
+                let mut drained = Box::pin(client.wait_for_read_storage());
+                assert!(
+                    futures_util::poll!(drained.as_mut()).is_pending(),
+                    "cancelling the read does not finish its blocking cache job"
+                );
+                release
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("fixture storage holder left"))?;
+                if poison {
+                    assert!(
+                        holder
+                            .await
+                            .expect_err("fixture poisoned the mutex")
+                            .is_panic()
+                    );
+                } else {
+                    holder.await??;
+                }
+                drained.as_mut().await;
+                drop(drained);
+                assert_eq!(*registered.borrow(), 0);
+                client.close();
+                drop(client);
+                // No scheduling delay between drain and these actual ownership/OS-lease checks.
+                assert!(
+                    weak_outbox.upgrade().is_none(),
+                    "read job retained the retired outbox after drain"
+                );
+                let reopened = Outbox::open(&dir.join("outbox"), &network, &client_id)?;
+                let proof = reopened.cached_profile(&target)?;
+                assert_eq!(
+                    proof.write_gate,
+                    if poison || matches!(read, CacheRead::Revoked) {
+                        1
+                    } else {
+                        3
+                    }
+                );
+                assert_eq!(proof.revoked, !poison && matches!(read, CacheRead::Revoked));
+                drop(reopened);
+                if let Some(server) = replacement_server {
+                    server.await??;
+                }
+                server.await??;
+                std::fs::remove_dir_all(dir)?;
+            }
+        }
+        Ok(())
+    }
+
     struct Evidence {
         counts: BTreeMap<String, u32>,
         inputs: BTreeMap<String, Value>,
         write_state: String,
+        revoked: bool,
         controls: Vec<Value>,
         settings: Value,
     }
@@ -2521,7 +2757,11 @@ mod offline_tests {
                 };
                 let result = match request["method"].as_str() {
                     Some("authenticate") => {
-                        json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}})
+                        if evidence.lock().expect("fixture evidence").revoked {
+                            json!({"initialized":true,"principal":null,"revoked":true})
+                        } else {
+                            json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}})
+                        }
                     }
                     Some("directory") => {
                         json!({"state":state,"now_ms":vibeface_protocol::now_ms()})
@@ -2703,6 +2943,7 @@ mod offline_tests {
             counts: BTreeMap::new(),
             inputs: BTreeMap::new(),
             write_state: "writable".into(),
+            revoked: false,
             controls: vec![],
             settings: json!({"roots":[],"manager":null}),
         }));
@@ -2888,6 +3129,7 @@ mod offline_tests {
             counts: BTreeMap::new(),
             inputs: BTreeMap::new(),
             write_state: "read_only".into(),
+            revoked: false,
             controls: vec![],
             settings: json!({"roots":[],"manager":null}),
         }));
@@ -2986,6 +3228,7 @@ mod offline_tests {
             counts: BTreeMap::new(),
             inputs: BTreeMap::new(),
             write_state: "writable".into(),
+            revoked: false,
             controls: vec![],
             settings: json!({"roots":[],"manager":null}),
         }));

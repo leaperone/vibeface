@@ -1,6 +1,5 @@
 //! Actual local grants, Noise clients, profile storage, and exclusive SQLite leases.
-#[path = "fixtures/rustc.rs"]
-mod fixture_rustc;
+use host::fixture_rustc;
 
 #[path = "../src/app.rs"]
 #[allow(dead_code, unused_imports)]
@@ -486,6 +485,7 @@ async fn local_profile_round_trip_reuses_its_lease_and_cancels_old_reconnect_wit
     .await?;
     readonly(&retried, &fixture.a);
     tx.send(Command::Input {
+        owner: None,
         conversation_id: "local-chat".into(),
         draft: ui::ComposerDraft {
             target: vibeface_protocol::workspace::InputTarget::BotMain {

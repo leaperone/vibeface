@@ -1,16 +1,44 @@
 use super::*;
 
 impl Backend {
-    pub(super) async fn cancel_reconnect(&mut self) {
-        if let Some(task) = self.reconnect_task.take() {
-            task.abort();
-            let _ = task.await;
+    pub(super) async fn cancel_reconnect(&mut self) -> Result<()> {
+        if let Some(task) = self.reconnect_task.as_mut() {
+            if !self.reconnect_joined {
+                task.abort();
+                let _ = tokio::time::timeout(super::reads::READ_DRAIN_TIMEOUT, task)
+                    .await
+                    .context("重新连接任务尚未退出，原存储租约保持占用。")?;
+                self.reconnect_joined = true;
+            }
         }
+        if let Some(client) = &self.reconnect_lease {
+            tokio::time::timeout(
+                super::reads::READ_DRAIN_TIMEOUT,
+                client.wait_for_read_storage(),
+            )
+            .await
+            .context("重新连接的本机缓存尚未写完，不能交接原身份存储。")?;
+        }
+        self.reconnect_task = None;
+        self.reconnect_lease = None;
+        self.reconnect_joined = false;
         while let Ok(recovered) = self.recovery.try_recv() {
             if let Ok(client) = recovered.result {
                 client.close();
+                self.reconnect_lease = Some(client);
+                tokio::time::timeout(
+                    super::reads::READ_DRAIN_TIMEOUT,
+                    self.reconnect_lease
+                        .as_ref()
+                        .unwrap()
+                        .wait_for_read_storage(),
+                )
+                .await
+                .context("已返回连接的本机缓存尚未写完，不能交接原身份存储。")?;
+                self.reconnect_lease = None;
             }
         }
+        Ok(())
     }
     pub(super) async fn prepare_connection(
         &mut self,
@@ -22,7 +50,8 @@ impl Backend {
             key.network_id().is_none_or(|known| known == network),
             "目标设备属于另一个个人网络，原身份保持不变"
         );
-        self.cancel_reconnect().await;
+        self.cancel_reconnect().await?;
+        self.cancel_reads().await?;
         let previous = self.take_profile_client()?;
         let key_network = key.network_id().map(str::to_owned);
         let reusable = previous
@@ -142,10 +171,16 @@ impl Backend {
             }
             return Ok(());
         }
+        // First-window reads now run off actor. Do not reconnect the healthy connection
+        // while its current scoped refresh is still filling that window.
+        self.cancel_stale_reads().await?;
+        if self.refresh_in_flight() {
+            return Ok(());
+        }
         if self.state.private_block.is_some() {
             return Ok(());
         }
-        if self.reconnect_task.is_some() {
+        if self.reconnect_task.is_some() || self.reconnect_lease.is_some() {
             return Ok(());
         }
         if tokio::time::Instant::now() < self.retry_at {
@@ -158,6 +193,7 @@ impl Backend {
         self.retry_attempt = self.retry_attempt.saturating_add(1);
         self.retry_at = tokio::time::Instant::now()
             + Duration::from_secs((1u64 << self.retry_attempt.min(5)).min(30));
+        self.cancel_reads().await?;
         self.state.generation += 1;
         self.history_state = None;
         self.state.history_loading = None;
@@ -179,6 +215,8 @@ impl Backend {
         let attempt = self.state.generation;
         let profile_id = self.current_profile_id()?;
         let recovered = self.recovered.clone();
+        self.reconnect_lease = Some(previous.clone());
+        self.reconnect_joined = false;
         self.reconnect_task = Some(tokio::spawn(async move {
             let result = previous.reconnect(endpoint).await;
             let _ = recovered

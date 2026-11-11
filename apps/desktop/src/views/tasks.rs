@@ -41,13 +41,14 @@ impl Desktop {
             ("根任务", Some(&task.root_task_id)),
             ("父任务", task.parent_task_id.as_ref()),
         ] {
-            if let Some(id) = id {
-                if id != task_id && !id.is_empty() {
-                    if self.snapshot.tasks.iter().any(|other| &other.task_id == id) {
-                        page = page.child(self.task_link(label, id, cx));
-                    } else {
-                        page = page.child(self.row(label, format!("{id} · 尚未读取")));
-                    }
+            if let Some(id) = id
+                && id != task_id
+                && !id.is_empty()
+            {
+                if self.snapshot.tasks.iter().any(|other| &other.task_id == id) {
+                    page = page.child(self.task_link(label, id, cx));
+                } else {
+                    page = page.child(self.row(label, format!("{id} · 尚未读取")));
                 }
             }
         }
@@ -121,15 +122,14 @@ impl Desktop {
             if let Some(result) = &assignment.result {
                 row = row.child(result.clone());
             }
-            if let Some(work_id) = &assignment.work_id {
-                if let Some(bot) = self
+            if let Some(work_id) = &assignment.work_id
+                && let Some(bot) = self
                     .snapshot
                     .bots
                     .iter()
                     .find(|bot| bot.bot_id == assignment.bot_id)
-                {
-                    row = row.child(self.task_work_link(&bot.conversation_id, work_id, cx));
-                }
+            {
+                row = row.child(self.task_work_link(&bot.conversation_id, work_id, cx));
             }
             page = page.child(row);
         }

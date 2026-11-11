@@ -25,6 +25,10 @@ pub struct Desktop {
     pub timeline: Timeline,
     pub history_list: crate::views::history_view::HistoryList,
     pub composer: Entity<TextareaState>,
+    composer_revision: u64,
+    _composer_events: Subscription,
+    pending_input: Option<InputAck>,
+    pending_business_open: Option<(u64, Option<String>)>,
     pub history_query: Entity<InputState>,
     _history_query_events: Subscription,
     pub form: Option<Form>,
@@ -85,6 +89,12 @@ impl Desktop {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder("输入消息。Enter 换行，点击发送提交。")
         });
+        let composer_events = cx.subscribe(&composer, |this, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.composer_revision = this.composer_revision.wrapping_add(1);
+                cx.notify();
+            }
+        });
         let timeline = Timeline::new();
         timeline
             .list
@@ -117,6 +127,10 @@ impl Desktop {
             timeline,
             history_list: crate::views::history_view::HistoryList::new(),
             composer,
+            composer_revision: 0,
+            _composer_events: composer_events,
+            pending_input: None,
+            pending_business_open: None,
             history_query,
             _history_query_events: history_events,
             form: None,
@@ -174,6 +188,14 @@ impl Desktop {
                 }
                 let profile_switched = self.snapshot.profile_id.is_some()
                     && self.snapshot.profile_id != snapshot.profile_id;
+                if self.snapshot.generation != snapshot.generation
+                    || self.snapshot.profile_id != snapshot.profile_id
+                    || self.snapshot.network != snapshot.network
+                    || self.snapshot.client_id != snapshot.client_id
+                {
+                    self.pending_input = None;
+                    self.sending = false;
+                }
                 if let Some(scope) = &snapshot.credential_scope {
                     self.credential_scope = scope.clone();
                 }
@@ -217,12 +239,13 @@ impl Desktop {
                     }
                 }
                 self.prepare_record_cache(&snapshot, cx);
-                if self.selected.is_none() && snapshot.cached {
-                    if let Some(conversation) = &snapshot.conversation.conversation {
-                        self.selected = Some(conversation.conversation_id.clone());
-                        self.route = Route::Chat(conversation.conversation_id.clone());
-                        self.attachment_scope = Some(conversation.conversation_id.clone());
-                    }
+                if self.selected.is_none()
+                    && snapshot.cached
+                    && let Some(conversation) = &snapshot.conversation.conversation
+                {
+                    self.selected = Some(conversation.conversation_id.clone());
+                    self.route = Route::Chat(conversation.conversation_id.clone());
+                    self.attachment_scope = Some(conversation.conversation_id.clone());
                 }
                 let changed = !Arc::ptr_eq(&self.snapshot.conversation, &snapshot.conversation);
                 if changed {
@@ -269,6 +292,27 @@ impl Desktop {
                             .into(),
                     );
                 }
+                if self
+                    .pending_business_open
+                    .as_ref()
+                    .is_some_and(|(generation, profile)| {
+                        *generation != self.snapshot.generation
+                            || *profile != self.snapshot.profile_id
+                    })
+                {
+                    self.pending_business_open = None;
+                }
+                if self.snapshot.online
+                    && self.pending_business_open.take().is_some()
+                    && self
+                        .host
+                        .as_ref()
+                        .map(|host| host.preferences.open_business_on_connect)
+                        .unwrap_or(true)
+                    && self.form.is_none()
+                {
+                    self.navigate(Route::Home, cx);
+                }
             }
             Event::Host(host) => {
                 self.dark = match host.preferences.theme {
@@ -290,7 +334,6 @@ impl Desktop {
             Event::Error(error) => {
                 self.notice = Some(error);
                 self.notice_is_error = true;
-                self.sending = false;
                 self.form_pending = false;
             }
             Event::Attachments {
@@ -329,15 +372,24 @@ impl Desktop {
                             .unwrap_or(true)
                     {
                         self.navigate(Route::Home, cx);
+                    } else if connected && !self.snapshot.cached {
+                        self.pending_business_open =
+                            Some((self.snapshot.generation, self.snapshot.profile_id.clone()));
                     }
                 }
             }
-            Event::InputStored(text) => {
-                self.sending = false;
-                if self.composer.read(cx).value().as_str() == text {
-                    self.composer
-                        .update(cx, |state, cx| state.set_value("", window, cx));
-                    self.attachments.clear();
+            Event::InputStored(ack) => self.input_stored(ack, window, cx),
+            Event::InputFailed { owner, error } => {
+                if self
+                    .pending_input
+                    .as_ref()
+                    .and_then(|pending| pending.owner.as_ref())
+                    == Some(&owner)
+                {
+                    self.pending_input = None;
+                    self.sending = false;
+                    self.notice = Some(error);
+                    self.notice_is_error = true;
                 }
             }
             Event::ShutdownComplete => cx.quit(),
@@ -379,7 +431,14 @@ impl Desktop {
         serde_json::json!({"runtime_ui":"gpui","phase":"completed","window_opened":true,"pid":std::process::id(),"node_started":false,"controlled_fixture":true,"input_text":self.fixture_input.read(cx).value().to_string(),"submitted_text":self.fixture_submitted,"action_count":self.fixture_actions,"focused":self.fixture_input.read(cx).focus_handle(cx).is_focused(window),"ime_verified":false})
     }
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
+        self.enqueue(command, cx);
+    }
+    fn enqueue(&mut self, command: Command, cx: &mut Context<Self>) -> bool {
         self.confirmation = None;
+        let form_id = match &command {
+            Command::Save { values, .. } => values.get("_submission_id").cloned(),
+            _ => None,
+        };
         let command = if command.requires_session() {
             Command::Scoped {
                 generation: self.snapshot.generation,
@@ -390,10 +449,93 @@ impl Desktop {
         };
         if self.tx.try_send(command).is_err() {
             self.notice = Some("操作队列已满，请等待当前操作完成后重试。".into());
+            if self
+                .form
+                .as_ref()
+                .is_some_and(|form| Some(&form.submission_id) == form_id.as_ref())
+            {
+                self.form_pending = false;
+            }
+            cx.notify();
+            return false;
         }
         cx.notify();
+        true
+    }
+    pub(crate) fn send_composer_input(
+        &mut self,
+        conversation_id: String,
+        draft: ComposerDraft,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_input.is_some() {
+            return;
+        }
+        let owner = ComposerOwner {
+            token: uuid::Uuid::new_v4().to_string(),
+            generation: self.snapshot.generation,
+            profile_id: self.snapshot.profile_id.clone(),
+            network: self.snapshot.network.clone(),
+            client_id: self.snapshot.client_id.clone(),
+            route: self.route.clone(),
+            view_conversation: self.selected.clone(),
+            editor_revision: self.composer_revision,
+            target_kind: self.target_kind,
+            selected_target: self.selected_target.clone(),
+            target_revision: self.target_revision,
+            attachment_scope: self.attachment_scope.clone(),
+        };
+        let ack = InputAck {
+            owner: Some(owner.clone()),
+            conversation_id: conversation_id.clone(),
+            draft: draft.clone(),
+        };
+        if self.enqueue(
+            Command::Input {
+                conversation_id,
+                draft,
+                owner: Some(owner),
+            },
+            cx,
+        ) {
+            self.pending_input = Some(ack);
+            self.sending = true;
+            cx.notify();
+        }
+    }
+    fn input_stored(&mut self, ack: InputAck, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_input.as_ref() != Some(&ack) {
+            return;
+        }
+        let Some(owner) = ack.owner.as_ref() else {
+            return;
+        };
+        let unchanged = owner.generation == self.snapshot.generation
+            && owner.profile_id == self.snapshot.profile_id
+            && owner.network == self.snapshot.network
+            && owner.client_id == self.snapshot.client_id
+            && owner.route == self.route
+            && owner.view_conversation == self.selected
+            && owner.editor_revision == self.composer_revision
+            && owner.target_kind == self.target_kind
+            && owner.selected_target == self.selected_target
+            && owner.target_revision == self.target_revision
+            && owner.attachment_scope == self.attachment_scope
+            && ack.draft.intent == self.intent
+            && ack.draft.text == self.composer.read(cx).value().as_str()
+            && ack.draft.attachments == self.attachments;
+        self.pending_input = None;
+        self.sending = false;
+        if unchanged {
+            self.composer
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.attachments.clear();
+        } else {
+            self.notice = Some("原输入已存本机，编辑器中的修改已保留。".into());
+        }
     }
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.pending_business_open = None;
         self.form = None;
         self.form_pending = false;
         self.send(
@@ -417,7 +559,18 @@ impl Desktop {
         self.detail.clear();
         match &route {
             Route::Chat(id) => {
-                self.timeline.replace(vec![], cx);
+                let rows = if self
+                    .snapshot
+                    .conversation
+                    .conversation
+                    .as_ref()
+                    .is_some_and(|conversation| conversation.conversation_id == *id)
+                {
+                    self.snapshot.conversation.messages.clone()
+                } else {
+                    vec![]
+                };
+                self.timeline.replace(rows, cx);
                 self.selected = Some(id.clone());
                 self.attachment_scope = Some(id.clone());
                 self.attachments.clear();
@@ -646,6 +799,7 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_business_open = None;
         if let Editor::ChannelPost(channel_id) = &editor {
             let scope = format!("channel-post:{channel_id}");
             self.attachment_scope = Some(scope.clone());
@@ -799,11 +953,82 @@ impl Desktop {
     pub(crate) fn conversation_id(&self) -> Option<String> {
         self.selected.clone()
     }
+    fn enqueue_form(
+        &mut self,
+        editor: Editor,
+        values: BTreeMap<String, String>,
+        conversation_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let submission_id = values.get("_submission_id").cloned();
+        if !self.enqueue(
+            Command::Save {
+                editor,
+                values,
+                conversation_id,
+            },
+            cx,
+        ) {
+            return false;
+        }
+        if let Some(form) = self
+            .form
+            .as_ref()
+            .filter(|form| Some(&form.submission_id) == submission_id.as_ref())
+        {
+            for field in &form.fields {
+                if ["unlock_password", "password", "ticket", "token"].contains(&field.key) {
+                    field
+                        .state
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                }
+            }
+        }
+        true
+    }
+    pub(crate) fn finish_credential_save(
+        &mut self,
+        command: Command,
+        unlocked: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Command::Save {
+            editor,
+            mut values,
+            conversation_id,
+        } = command
+        else {
+            unreachable!("credential completion requires its original save command")
+        };
+        if !self
+            .form
+            .as_ref()
+            .is_some_and(|form| Some(&form.submission_id) == values.get("_submission_id"))
+        {
+            return false;
+        }
+        match unlocked {
+            Ok(passphrase) => {
+                values.insert("passphrase".into(), passphrase);
+                self.enqueue_form(editor, values, conversation_id, window, cx)
+            }
+            Err(error) => {
+                self.form_pending = false;
+                self.notice = Some(error);
+                cx.notify();
+                false
+            }
+        }
+    }
     fn submit_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.form_pending {
             return;
         }
-        let Some(form) = &self.form else { return };
+        let Some(form) = &self.form else {
+            return;
+        };
         if form.generation != self.snapshot.generation
             && !matches!(
                 &form.editor,
@@ -823,7 +1048,7 @@ impl Desktop {
         let editor = form.editor.clone();
         let conversation_id = self.conversation_id();
         self.form_pending = true;
-        if matches!(
+        if !matches!(
             &editor,
             Editor::Connect
                 | Editor::ConnectLocal
@@ -831,71 +1056,56 @@ impl Desktop {
                 | Editor::Join
                 | Editor::Recovery
         ) {
-            let unlock_mode = values.get("unlock_mode").cloned().unwrap_or_default();
-            if unlock_mode == "manual" {
-                let passphrase = values.remove("unlock_password").unwrap_or_default();
-                if passphrase.chars().count() < 8 {
-                    self.form_pending = false;
-                    self.notice = Some(
-                        "设备解锁口令至少需要8个字符，身份会封存加密，口令不会写入设置。".into(),
-                    );
-                    cx.notify();
-                    return;
-                }
-                values.insert("passphrase".into(), passphrase);
-                self.send(
-                    Command::Save {
-                        editor,
-                        values,
-                        conversation_id,
-                    },
-                    cx,
-                );
-                if let Some(form) = &self.form {
-                    for field in &form.fields {
-                        if ["unlock_password", "password", "ticket"].contains(&field.key) {
-                            field
-                                .state
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                        }
-                    }
-                }
-                return;
-            }
-            if !unlock_mode.is_empty() && unlock_mode != "vault" {
+            self.enqueue_form(editor, values, conversation_id, window, cx);
+            return;
+        }
+        let unlock_mode = values.get("unlock_mode").cloned().unwrap_or_default();
+        if unlock_mode == "manual" {
+            let passphrase = values.remove("unlock_password").unwrap_or_default();
+            if passphrase.chars().count() < 8 {
                 self.form_pending = false;
-                self.notice = Some("设备解锁方式须为 vault 或 manual。".into());
+                self.notice =
+                    Some("设备解锁口令至少需要8个字符，身份会封存加密，口令不会写入设置。".into());
                 cx.notify();
                 return;
             }
-            let scope = self.credential_scope.clone();
-            if scope.is_empty() {
-                self.form_pending = false;
-                self.notice = Some("个人网络档案尚未安全读取，未创建或解锁身份。".into());
-                cx.notify();
-                return;
-            }
-            let read = cx.read_credentials(&scope);
-            cx.spawn(async move|this,cx|{let passphrase=match read.await{Ok(Some((_,bytes)))=>match String::from_utf8(bytes){Ok(value)=>value,Err(_)=>{let _=this.update(cx,|this,cx|{this.form_pending=false;this.notice=Some("系统凭证记录无效，身份保持锁定。".into());cx.notify();});return}},Ok(None)=>{let value=format!("{}{}",uuid::Uuid::new_v4(),uuid::Uuid::new_v4());let task=cx.update(|cx|cx.write_credentials(&scope,"client-key",value.as_bytes()));if task.await.is_err(){let _=this.update(cx,|this,cx|{this.form_pending=false;this.notice=Some("系统安全存储不可用，未创建或解锁身份。可明确选择 manual 并提供设备解锁口令，密钥文件仍会封存加密。".into());cx.notify();});return}let verify=cx.update(|cx|cx.read_credentials(&scope));if !matches!(verify.await,Ok(Some((ref user,ref bytes)))if user=="client-key"&&bytes.as_slice()==value.as_bytes()){let _=this.update(cx,|this,cx|{this.form_pending=false;this.notice=Some("系统安全存储未能读回刚保存的凭证，未创建身份。可明确选择 manual 使用加密口令解锁。".into());cx.notify();});return}value},Err(_)=>{let _=this.update(cx,|this,cx|{this.form_pending=false;this.notice=Some("无法读取系统安全存储，身份保持锁定。".into());cx.notify();});return}};values.insert("passphrase".into(),passphrase);let _=this.update(cx,|this,cx|{if this.form.as_ref().is_some_and(|form|Some(&form.submission_id)==values.get("_submission_id")){this.send(Command::Save{editor,values,conversation_id},cx);}});}).detach();
-        } else {
-            self.send(
-                Command::Save {
-                    editor,
-                    values,
-                    conversation_id,
-                },
-                cx,
-            );
+            values.insert("passphrase".into(), passphrase);
+            self.enqueue_form(editor, values, conversation_id, window, cx);
+            return;
         }
-        if let Some(form) = &self.form {
-            for field in &form.fields {
-                if ["unlock_password", "password", "ticket", "token"].contains(&field.key) {
-                    field
-                        .state
-                        .update(cx, |state, cx| state.set_value("", window, cx));
+        if !unlock_mode.is_empty() && unlock_mode != "vault" {
+            self.form_pending = false;
+            self.notice = Some("设备解锁方式须为 vault 或 manual。".into());
+            cx.notify();
+            return;
+        }
+        let scope = self.credential_scope.clone();
+        if scope.is_empty() {
+            self.form_pending = false;
+            self.notice = Some("个人网络档案尚未安全读取，未创建或解锁身份。".into());
+            cx.notify();
+            return;
+        }
+        let read = cx.read_credentials(&scope);
+        cx.spawn_in(window,async move|this,cx| {
+            let unlocked:Result<String,String>=async {
+                let record=read.await.map_err(|_|"无法读取系统安全存储，身份保持锁定。".to_owned())?;
+                if let Some((_,bytes))=record {
+                    return String::from_utf8(bytes).map_err(|_|"系统凭证记录无效，身份保持锁定。".to_owned());
                 }
-            }
-        }
+                let value=format!("{}{}",uuid::Uuid::new_v4(),uuid::Uuid::new_v4());
+                let write=cx.update(|_,cx|cx.write_credentials(&scope,"client-key",value.as_bytes())).map_err(|_|"窗口已关闭，未创建身份。".to_owned())?;
+                write.await.map_err(|_|"系统安全存储不可用，未创建或解锁身份。可明确选择 manual 使用加密口令。".to_owned())?;
+                let verify=cx.update(|_,cx|cx.read_credentials(&scope)).map_err(|_|"窗口已关闭，未创建身份。".to_owned())?;
+                if !matches!(verify.await,Ok(Some((ref user,ref bytes)))if user=="client-key"&&bytes.as_slice()==value.as_bytes()) {
+                    return Err("系统安全存储未能读回刚保存的凭证，未创建身份。可明确选择 manual 使用加密口令解锁。".into());
+                }
+                Ok(value)
+            }.await;
+            let _=cx.update(|window,cx|this.update(cx,|this,cx| {
+                this.finish_credential_save(Command::Save { editor,values,conversation_id },unlocked,window,cx);
+            }));
+        }).detach();
     }
 
     pub(crate) fn send_message(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -931,14 +1141,7 @@ impl Desktop {
             self.notice = Some(error);
             return;
         }
-        self.sending = true;
-        self.send(
-            Command::Input {
-                conversation_id: id,
-                draft,
-            },
-            cx,
-        );
+        self.send_composer_input(id, draft, cx);
     }
     fn shell_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette();
@@ -1113,29 +1316,25 @@ impl Desktop {
         let form_id = self.form.as_ref().map(|form| form.submission_id.clone());
         let picker = crate::host::platform::choose_files(cx, false);
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Some(paths)) = picker.await {
-                if let Some(path) = paths.first() {
-                    let path = path.display().to_string();
-                    let _ = cx.update(|window, cx| {
-                        let _ = this.update(cx, |this, cx| {
-                            if this.same_view_scope(generation, &network)
-                                && this.form.as_ref().map(|form| &form.submission_id)
-                                    == form_id.as_ref()
-                            {
-                                if let Some(form) = &this.form {
-                                    if let Some(field) =
-                                        form.fields.iter().find(|f| f.key == "file")
-                                    {
-                                        field.state.update(cx, |state, cx| {
-                                            state.set_value(path, window, cx)
-                                        });
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        });
+            if let Ok(Some(paths)) = picker.await
+                && let Some(path) = paths.first()
+            {
+                let path = path.display().to_string();
+                let _ = cx.update(|window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.same_view_scope(generation, &network)
+                            && this.form.as_ref().map(|form| &form.submission_id)
+                                == form_id.as_ref()
+                            && let Some(form) = &this.form
+                            && let Some(field) = form.fields.iter().find(|f| f.key == "file")
+                        {
+                            field
+                                .state
+                                .update(cx, |state, cx| state.set_value(path, window, cx));
+                        }
+                        cx.notify();
                     });
-                }
+                });
             }
         })
         .detach();
@@ -1169,9 +1368,9 @@ impl Render for Desktop {
                 .into_any_element();
         }
         let p = self.palette();
-        let content = if self.form.is_some() {
+        let content = if let Some(form) = &self.form {
             self.page()
-                .child(self.form.as_ref().unwrap().render())
+                .child(form.render())
                 .children(
                     if self
                         .form

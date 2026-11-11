@@ -106,6 +106,11 @@ impl Timeline {
             .list
             .is_scrolled_to_end()
             .unwrap_or_else(|| self.list.logical_scroll_top().item_ix >= self.rows.len());
+        let anchor = self.list.logical_scroll_top();
+        let anchor_id = self
+            .rows
+            .get(anchor.item_ix)
+            .map(|row| row.message_id.clone());
         let live = progress
             .iter()
             .filter(|p| Some(p.conversation_id.as_str()) == conversation)
@@ -138,12 +143,44 @@ impl Timeline {
             || self.rows[self.base_count..]
                 .iter()
                 .zip(&live)
-                .any(|(a, b)| a.text != b.text || a.status != b.status);
+                .any(|(a, b)| {
+                    a.message_id != b.message_id || a.text != b.text || a.status != b.status
+                });
         if !changed {
             return;
         }
-        self.list
-            .splice(self.base_count..self.rows.len(), live.len());
+        let old_live = &self.rows[self.base_count..];
+        let prefix = old_live
+            .iter()
+            .zip(&live)
+            .take_while(|(a, b)| a.message_id == b.message_id)
+            .count();
+        let suffix = old_live[prefix..]
+            .iter()
+            .rev()
+            .zip(live[prefix..].iter().rev())
+            .take_while(|(a, b)| a.message_id == b.message_id)
+            .count();
+        if prefix + suffix != old || prefix + suffix != live.len() {
+            self.list.splice(
+                self.base_count + prefix..self.rows.len() - suffix,
+                live.len() - prefix - suffix,
+            );
+        }
+        for (old_index, row) in old_live.iter().enumerate() {
+            let new_index = if old_index < prefix {
+                Some(old_index)
+            } else if old_index >= old - suffix {
+                Some(live.len() - (old - old_index))
+            } else {
+                None
+            };
+            if let Some(index) = new_index {
+                if row.text != live[index].text || row.status != live[index].status {
+                    invalidate_row(&self.list, self.base_count + index);
+                }
+            }
+        }
         for row in &self.rows[self.base_count..] {
             self.indices.borrow_mut().remove(&row.message_id);
         }
@@ -157,10 +194,21 @@ impl Timeline {
         if follow {
             self.visible = self.rows.len().saturating_sub(32)..self.rows.len();
             self.list.scroll_to_end();
+        } else if let Some(index) = anchor_id.and_then(|id| self.indices.borrow().get(&id).copied())
+        {
+            self.list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: anchor.offset_in_item,
+            });
+            let shift = index as isize - anchor.item_ix as isize;
+            self.visible = self.visible.start.saturating_add_signed(shift)
+                ..self.visible.end.saturating_add_signed(shift);
         }
         self.prepare_visible(self.visible.clone(), cx);
     }
     pub fn prepare_visible(&mut self, visible: Range<usize>, cx: &mut App) {
+        let start = visible.start.min(self.rows.len());
+        let visible = start..visible.end.min(self.rows.len()).max(start);
         self.visible = visible.clone();
         let range = visible.start.saturating_sub(32)..(visible.end + 48).min(self.rows.len());
         let ids: HashSet<_> = self

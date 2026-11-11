@@ -23,13 +23,14 @@ struct TransferIntent {
 }
 impl Backend {
     pub(super) async fn refresh_delivery(&mut self) -> Result<()> {
-        let client = self.client()?;
-        let status = client
-            .read(ReadRequest::Delivery(DeliveryRead::Status))
-            .await?;
-        let list = client
-            .read(ReadRequest::Delivery(DeliveryRead::List))
-            .await?;
+        self.start_delivery_refresh().await
+    }
+    pub(super) async fn apply_delivery_refresh(
+        &mut self,
+        status: Value,
+        list: Value,
+        providers: Value,
+    ) -> Result<()> {
         let mut delivery: Delivery = serde_json::from_value(status)?;
         let target = self
             .active_entry
@@ -52,9 +53,6 @@ impl Backend {
             );
             self.validate_quote(order).await?;
         }
-        let providers = client
-            .read(ReadRequest::Delivery(DeliveryRead::Providers))
-            .await?;
         delivery.providers = decode_list(&providers, "providers")?;
         self.state.delivery = delivery;
         self.publish();

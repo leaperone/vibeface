@@ -269,6 +269,7 @@ async fn native_backend_cold_offline_stages_original_input_in_actual_outbox() ->
     );
     fixture_phase("stage-offline-input");
     tx.send(Command::Input {
+        owner: None,
         conversation_id: "fixture-chat".into(),
         draft: ui::ComposerDraft {
             target: InputTarget::BotMain {
@@ -290,8 +291,9 @@ async fn native_backend_cold_offline_stages_original_input_in_actual_outbox() ->
                 event
             };
             match event {
-                Event::InputStored(text) => {
-                    assert_eq!(text, "offline native input");
+                Event::InputStored(ack) => {
+                    assert_eq!(ack.draft.text, "offline native input");
+                    assert!(ack.owner.is_none());
                     return Ok::<_, anyhow::Error>(());
                 }
                 Event::Error(error) => anyhow::bail!("native staging failed: {error}"),
@@ -405,6 +407,7 @@ async fn native_backend_cold_offline_stages_original_input_in_actual_outbox() ->
         "fixture-chat"
     );
     tx.send(Command::Input {
+        owner: None,
         conversation_id: "fixture-chat".into(),
         draft: ui::ComposerDraft {
             target: InputTarget::BotMain {

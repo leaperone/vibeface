@@ -178,21 +178,20 @@ impl Desktop {
                 .bots
                 .iter()
                 .find(|bot| bot.bot_id == task.owner_bot)
+                && channel.members.contains(&bot.bot_id)
             {
-                if channel.members.contains(&bot.bot_id) {
-                    row = row.child(self.channel_target_button(
-                        format!("task-{}", task.task_id),
-                        format!("回复任务 · {}", bot.name),
-                        InputTarget::ChannelTask {
-                            channel_id: channel_id.clone(),
-                            task_id: task.task_id.clone(),
-                            bot_id: bot.bot_id.clone(),
-                        },
-                        bot.conversation_id.clone(),
-                        Some(task.revision),
-                        cx,
-                    ));
-                }
+                row = row.child(self.channel_target_button(
+                    format!("task-{}", task.task_id),
+                    format!("回复任务 · {}", bot.name),
+                    InputTarget::ChannelTask {
+                        channel_id: channel_id.clone(),
+                        task_id: task.task_id.clone(),
+                        bot_id: bot.bot_id.clone(),
+                    },
+                    bot.conversation_id.clone(),
+                    Some(task.revision),
+                    cx,
+                ));
             }
             for (label, action) in [
                 ("继续", TaskAction::Continue),
@@ -311,24 +310,21 @@ impl Desktop {
                         if let InputTarget::ChannelTask {
                             task_id, bot_id, ..
                         } = &input.target
-                        {
-                            if let Some(task) = tasks
+                            && let Some(task) = tasks
                                 .iter()
                                 .find(|task| task.task_id == *task_id && task.owner_bot == *bot_id)
-                            {
-                                if let Some(bot) = self.snapshot.bots.iter().find(|bot| {
-                                    bot.bot_id == *bot_id && bot.conversation_id == event.scope_id
-                                }) {
-                                    row = row.child(self.channel_target_button(
-                                        format!("reply-{}", event.event_hash),
-                                        "回复这个任务".into(),
-                                        input.target.clone(),
-                                        bot.conversation_id.clone(),
-                                        Some(task.revision),
-                                        cx,
-                                    ));
-                                }
-                            }
+                            && let Some(bot) = self.snapshot.bots.iter().find(|bot| {
+                                bot.bot_id == *bot_id && bot.conversation_id == event.scope_id
+                            })
+                        {
+                            row = row.child(self.channel_target_button(
+                                format!("reply-{}", event.event_hash),
+                                "回复这个任务".into(),
+                                input.target.clone(),
+                                bot.conversation_id.clone(),
+                                Some(task.revision),
+                                cx,
+                            ));
                         }
                     }
                     HistoryBody::MessagePosted {
@@ -1056,14 +1052,7 @@ impl Desktop {
                             cx.notify();
                             return;
                         }
-                        this.sending = true;
-                        this.send(
-                            Command::Input {
-                                conversation_id: conversation_id.clone(),
-                                draft,
-                            },
-                            cx,
-                        );
+                        this.send_composer_input(conversation_id.clone(), draft, cx);
                     })),
             );
         if !allow_continue && self.intent != InputIntent::NewTask {

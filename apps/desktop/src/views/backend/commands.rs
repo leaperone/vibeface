@@ -26,7 +26,7 @@ impl Backend {
                 conversation_id,
                 section,
             } => Box::pin(async move {
-                self.load_history(&conversation_id, section).await?;
+                self.start_history_page(&conversation_id, section).await?;
                 Ok(())
             }),
             Command::SendStaged(id) => Box::pin(async move {
@@ -122,21 +122,19 @@ impl Backend {
                 Ok(())
             }),
             Command::Refresh => Box::pin(async move {
-                {
-                    if self.client.is_some() {
-                        if self.state.online {
-                            self.refresh().await?
-                        } else {
-                            self.retry_at = tokio::time::Instant::now();
-                            self.maintain().await?;
-                        }
+                if self.client.is_some() {
+                    if self.state.online {
+                        self.refresh().await?
+                    } else {
+                        self.retry_at = tokio::time::Instant::now();
+                        self.maintain().await?;
                     }
-                };
+                }
                 Ok(())
             }),
             Command::Disconnect => Box::pin(async move {
                 {
-                    self.cancel_reconnect().await;
+                    self.cancel_reconnect().await?;
                     if let Some(client) = self.client.take() {
                         client.close();
                     }
@@ -216,10 +214,8 @@ impl Backend {
                     self.form_id = None;
                     self.form_owner = None;
                     result?;
-                    if immediate {
-                        if let Some(id) = id {
-                            let _ = self.emit(Event::FormSaved(id)).await;
-                        }
+                    if immediate && let Some(id) = id {
+                        let _ = self.emit(Event::FormSaved(id)).await;
                     }
                 };
                 Ok(())
@@ -227,11 +223,26 @@ impl Backend {
             Command::Input {
                 conversation_id,
                 draft,
+                owner,
             } => Box::pin(async move {
-                {
+                let result = async {
                     draft.validate().map_err(anyhow::Error::msg)?;
-                    self.send_draft(conversation_id, draft, None).await?;
-                };
+                    self.send_draft(conversation_id, draft, None, owner.clone())
+                        .await
+                }
+                .await;
+                if let Err(error) = result {
+                    if let Some(owner) = owner {
+                        let _ = self
+                            .emit(Event::InputFailed {
+                                owner,
+                                error: format!("输入保存或确认未完成，编辑器内容保留：{error}"),
+                            })
+                            .await;
+                    } else {
+                        return Err(error);
+                    }
+                }
                 Ok(())
             }),
             Command::RetryReply {
@@ -243,8 +254,12 @@ impl Backend {
                         self.conversation.as_ref() == Some(&conversation_id),
                         "请先打开原对话再重试"
                     );
-                    self.refresh().await?;
-                    let shown = self.state.conversation.clone();
+                    let Some(shown) = self
+                        .retry_reply_proof(&conversation_id, &message_id)
+                        .await?
+                    else {
+                        return Ok(());
+                    };
                     let asked = shown
                         .messages
                         .iter()
@@ -293,6 +308,7 @@ impl Backend {
                             expected_revision: None,
                         },
                         None,
+                        None,
                     )
                     .await?;
                 };
@@ -312,6 +328,7 @@ impl Backend {
                             expected_revision: saved.input.route.expected_revision,
                         },
                         Some(saved),
+                        None,
                     )
                     .await?;
                 };

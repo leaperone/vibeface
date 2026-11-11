@@ -87,7 +87,8 @@ impl Backend {
         if registry.selected_id() == &id {
             return Ok(());
         }
-        self.cancel_reconnect().await;
+        self.cancel_reconnect().await?;
+        self.cancel_reads().await?;
         if let Some(previous) = self.take_profile_client()? {
             self.retired_clients.insert(current, previous);
         }

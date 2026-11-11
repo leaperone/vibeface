@@ -1,7 +1,10 @@
 //! Native desktop ownership and OS integration. This module never links Core's Runtime.
 pub mod activation;
 mod bootstrap;
-mod lifecycle;
+#[cfg(test)]
+#[path = "../../tests/fixtures/rustc.rs"]
+pub(crate) mod fixture_rustc;
+pub(crate) mod lifecycle;
 mod model;
 mod operator;
 pub mod platform;
@@ -19,8 +22,6 @@ pub use settings::{NodeMode, Preferences, Settings, Theme};
 
 use anyhow::{Context, Result, bail, ensure};
 use lifecycle::OwnedChild;
-#[cfg(test)]
-pub(crate) use lifecycle::OwnedChild as TestOwnedChild;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
@@ -232,14 +233,14 @@ impl DesktopHost {
                 .nodes
                 .iter()
                 .filter(|node| node.status == NodeStatus::Running);
-            if let Some(candidate) = running.next() {
-                if running.next().is_none() {
-                    self.selected = self
-                        .verify(&candidate.identity(), Some(NodeStatus::Running))
-                        .await
-                        .ok()
-                        .map(|node| node.identity());
-                }
+            if let Some(candidate) = running.next()
+                && running.next().is_none()
+            {
+                self.selected = self
+                    .verify(&candidate.identity(), Some(NodeStatus::Running))
+                    .await
+                    .ok()
+                    .map(|node| node.identity());
             }
         }
         let mut settings = self.settings.clone();
@@ -292,12 +293,12 @@ impl DesktopHost {
         Ok(credential)
     }
     pub fn poll_owned(&mut self) -> Result<bool> {
-        if let Some(owned) = &mut self.owned {
-            if let Some(exit) = owned.poll()? {
-                self.last_owned_exit = exit.code();
-                self.owned = None;
-                return Ok(true);
-            }
+        if let Some(owned) = &mut self.owned
+            && let Some(exit) = owned.poll()?
+        {
+            self.last_owned_exit = exit.code();
+            self.owned = None;
+            return Ok(true);
         }
         Ok(false)
     }

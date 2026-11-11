@@ -7,6 +7,7 @@ mod history;
 mod inputs;
 mod operator;
 mod profiles;
+mod reads;
 mod records;
 mod session;
 mod settings;
@@ -106,6 +107,7 @@ pub enum Command {
     Input {
         conversation_id: String,
         draft: ComposerDraft,
+        owner: Option<ComposerOwner>,
     },
     Workspace(WorkspaceCommand),
     StopReply(String),
@@ -223,7 +225,11 @@ pub enum Event {
         conversation_id: String,
         attachments: Vec<vibeface_protocol::workspace::Attachment>,
     },
-    InputStored(String),
+    InputStored(InputAck),
+    InputFailed {
+        owner: ComposerOwner,
+        error: String,
+    },
     FormSaved(String),
     EditForm {
         editor: Editor,
@@ -248,7 +254,7 @@ struct Reconnected {
 }
 struct Completed {
     generation: String,
-    input: Option<String>,
+    input: Option<InputAck>,
     form_id: Option<String>,
     copy_token: bool,
     delivery: bool,
@@ -292,6 +298,8 @@ pub struct Backend {
     recovery: mpsc::Receiver<Reconnected>,
     recovered: mpsc::Sender<Reconnected>,
     reconnect_task: Option<tokio::task::JoinHandle<()>>,
+    reconnect_lease: Option<Client>,
+    reconnect_joined: bool,
     completion: mpsc::Sender<Completed>,
     pushes: Option<broadcast::Receiver<vibeface_client::ClientEvent>>,
     host: DesktopHost,
@@ -311,29 +319,35 @@ pub struct Backend {
     client: Option<Client>,
     state: Snapshot,
     history_state: Option<Box<crate::views::history::HistoryState>>,
+    reads: reads::ReadTasks,
+    read_completed: mpsc::Sender<reads::ReadCompleted>,
+    read_completions: mpsc::Receiver<reads::ReadCompleted>,
     conversation: Option<String>,
     out: mpsc::Sender<Event>,
     snapshots: watch::Sender<Arc<Snapshot>>,
     attachments: BTreeMap<String, Vec<vibeface_protocol::workspace::Attachment>>,
 }
+pub type BackendChannels = (
+    mpsc::Sender<Command>,
+    mpsc::Receiver<Event>,
+    watch::Receiver<Arc<Snapshot>>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+);
+
 impl Backend {
     pub fn spawn(
         host: DesktopHost,
         runtime: &tokio::runtime::Handle,
         credential_base: String,
-    ) -> (
-        mpsc::Sender<Command>,
-        mpsc::Receiver<Event>,
-        watch::Receiver<Arc<Snapshot>>,
-        watch::Sender<bool>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> BackendChannels {
         let (tx, mut rx) = mpsc::channel(64);
         let (out, events) = mpsc::channel(64);
         let (snapshots, snapshot_rx) = watch::channel(Arc::new(Snapshot::default()));
         let (stop, mut stopping) = watch::channel(false);
         let (completion, mut completed) = mpsc::channel(64);
         let (recovered, recovery) = mpsc::channel(8);
+        let (read_completed, read_completions) = mpsc::channel(8);
         #[cfg(test)]
         Self::test_phase("spawn-prepare");
         let actor = async move {
@@ -346,6 +360,8 @@ impl Backend {
                 recovery,
                 recovered,
                 reconnect_task: None,
+                reconnect_lease: None,
+                reconnect_joined: false,
                 completion,
                 pushes: None,
                 host,
@@ -365,6 +381,9 @@ impl Backend {
                 client: None,
                 state: Snapshot::default(),
                 history_state: None,
+                reads: reads::ReadTasks::default(),
+                read_completed,
+                read_completions,
                 conversation: None,
                 out,
                 snapshots,
@@ -383,14 +402,25 @@ impl Backend {
             Self::test_phase("actor-ready");
             let mut timer = tokio::time::interval(Duration::from_secs(2));
             'commands: loop {
+                if let Err(error) = backend.cancel_stale_reads().await {
+                    let _ = backend.emit(Event::Error(error.to_string())).await;
+                }
                 tokio::select! {biased;_=stopping.changed()=>break,
-                recovered=backend.recovery.recv()=>{if let Some(recovered)=recovered{if recovered.attempt==backend.state.generation&&backend.current_profile_id().ok().as_deref()==Some(recovered.profile_id.as_str()){backend.reconnect_task=None;match recovered.result{Ok(client)=>{backend.pushes=Some(client.subscribe());backend.client=Some(client);backend.retry_attempt=0;if let Err(error)=backend.refresh().await{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.status=format!("重新连接后读取尚未完成：{error}");backend.publish();}else{let _=backend.flush_prepared().await;}},Err(error)=>{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.can_save_locally=backend.client.as_ref().is_some_and(|client|client.can_save_locally())&&(backend.state.synced||backend.state.cached||backend.state.projection_valid);backend.state.status=format!("当前尚未重新验证连接：{error}");backend.publish();}}}else if let Ok(client)=recovered.result{client.close();}}},
-                result=completed.recv()=>{if let Some(completed)=result{if backend.client.as_ref().is_some_and(|client|client.generation()==completed.generation){match completed.result{Ok(operation)=>{if operation.state==vibeface_client::OperationState::Accepted{if let Err(error)=backend.finish_accepted_draft(&operation.id).await{let _=backend.emit(Event::Error(format!("原输入已接收，本机提醒尚未清理：{error}"))).await;}let _=backend.flush_prepared().await;}if let Some(id)=completed.form_id{let _=backend.emit(Event::FormSaved(id)).await;}if completed.copy_token{if let Some(client)=backend.client.as_ref(){if let Ok(Some(token))=client.take_decision_token(&operation.id){let _=backend.emit(Event::CopySecret(zeroize::Zeroizing::new(token.expose().to_owned()))).await;}}}if let Some(text)=completed.input{let _=backend.emit(Event::InputStored(text)).await;}let _=backend.emit(Event::Notice(format!("操作 {}：{}。",operation.id,operation_label(operation.state)))).await;if let Err(error)=backend.refresh().await{let _=backend.emit(Event::Error(format!("原操作已保存，工作区重新读取失败：{error}"))).await;}if completed.delivery||!backend.state.delivery.orders.is_empty()||backend.state.delivery.enabled{if let Err(error)=backend.refresh_delivery().await{let _=backend.emit(Event::Error(format!("原订单已保存，条款或进度尚未重新确认：{error}"))).await;}}},Err(error)=>{let _=backend.emit(Event::Error(format!("操作未完成：{error}"))).await;}}}}},
+                recovered=backend.recovery.recv()=>{if let Some(recovered)=recovered{if recovered.attempt==backend.state.generation&&backend.current_profile_id().ok().as_deref()==Some(recovered.profile_id.as_str()){backend.reconnect_task=None;backend.reconnect_lease=None;backend.reconnect_joined=false;match recovered.result{Ok(client)=>{if let Err(error)=backend.cancel_reads().await{client.close();let _=backend.emit(Event::Error(error.to_string())).await;continue}backend.pushes=Some(client.subscribe());backend.client=Some(client);backend.retry_attempt=0;if let Err(error)=backend.refresh().await{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.status=format!("重新连接后读取尚未完成：{error}");backend.publish();}else{let _=backend.flush_prepared().await;}},Err(error)=>{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.can_save_locally=backend.client.as_ref().is_some_and(|client|client.can_save_locally())&&(backend.state.synced||backend.state.cached||backend.state.projection_valid);backend.state.status=format!("当前尚未重新验证连接：{error}");backend.publish();}}}else if let Ok(client)=recovered.result{client.close();}}},
+                read=backend.read_completions.recv()=>{if let Some(read)=read{let result=tokio::select!{biased;_=stopping.changed()=>break 'commands,result=backend.finish_read(read)=>result};if let Err(error)=result{let _=backend.emit(Event::Error(format!("读取未完成：{error}"))).await;}}},
+                result = completed.recv() => { if let Some(completed) = result { backend.finish_operation(completed).await; } },
                 push=async{match backend.pushes.as_mut(){Some(pushes)=>pushes.recv().await,None=>std::future::pending().await}}=>{match push{Ok(event)if backend.client.as_ref().is_some_and(|client|client.generation()==event.generation&&client.network_id()==event.network_id)=>{if let Err(error)=backend.push(event.payload).await{backend.state.status=format!("实时记录需要重新读取：{error}");let _=backend.refresh().await;}},Err(broadcast::error::RecvError::Lagged(_))=>{backend.state.status="实时记录有缺口，正在重新读取。".into();let _=backend.refresh().await;},Err(broadcast::error::RecvError::Closed)=>{backend.pushes=None;backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.status="连接已断开，未确认的操作不会重发。".into();backend.publish();},_=>{}}},
-                command=rx.recv()=>{let Some(command)=command else{break};let command=match command{Command::Scoped{generation,command}=>{if generation!=backend.state.generation{let _=backend.emit(Event::Error("连接已经切换，旧页面操作未提交。".into())).await;continue}*command},command=>command};#[cfg(test)] Self::test_phase("dispatch-command");let result=tokio::select!{biased;_=stopping.changed()=>break 'commands,result=backend.run(command)=>result};if let Err(error)=result{let _=backend.emit(Event::Error(format!("操作未完成：{error}"))).await;}},
+                command=rx.recv()=>{let Some(command)=command else{break};let command=match command{Command::Scoped{generation,command}=>{if generation!=backend.state.generation{let _=backend.emit(Event::Error("连接已经切换，旧页面操作未提交。".into())).await;continue}*command},command=>command};if let Err(error)=backend.prepare_read_scope_command(&command).await{let _=backend.emit(Event::Error(error.to_string())).await;continue}#[cfg(test)] Self::test_phase("dispatch-command");let result=tokio::select!{biased;_=stopping.changed()=>break 'commands,result=backend.run(command)=>result};if let Err(error)=result{let _=backend.emit(Event::Error(format!("操作未完成：{error}"))).await;}},
                 _=timer.tick()=>{let result=tokio::select!{biased;_=stopping.changed()=>break 'commands,result=backend.maintain()=>result};if let Err(error)=result{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.can_save_locally=backend.client.as_ref().is_some_and(|client|client.can_save_locally())&&(backend.state.synced||backend.state.cached||backend.state.projection_valid);backend.state.status="连接中断，显示最近记录。结果未知的操作须先核对。".into();backend.state.error=Some(error.to_string());backend.publish();}}}
             }
-            backend.cancel_reconnect().await;
+            if let Err(error) = backend.cancel_reads().await {
+                let _ = backend.emit(Event::Error(error.to_string())).await;
+                return;
+            }
+            if let Err(error) = backend.cancel_reconnect().await {
+                let _ = backend.emit(Event::Error(error.to_string())).await;
+                return;
+            }
             if let Some(client) = &backend.client {
                 client.close();
             }
@@ -420,7 +450,77 @@ impl Backend {
         (tx, events, snapshot_rx, stop, task)
     }
 
-    async fn emit(&self, event: Event) -> std::result::Result<(), mpsc::error::SendError<Event>> {
+    async fn finish_operation(&mut self, completed: Completed) {
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.generation() == completed.generation)
+        {
+            return;
+        }
+        match completed.result {
+            Ok(operation) => {
+                if operation.state == vibeface_client::OperationState::Accepted {
+                    if let Err(error) = self.finish_accepted_draft(&operation.id).await {
+                        let _ = self
+                            .emit(Event::Error(format!(
+                                "原输入已接收，本机提醒尚未清理：{error}"
+                            )))
+                            .await;
+                    }
+                    let _ = self.flush_prepared().await;
+                }
+                if let Some(id) = completed.form_id {
+                    let _ = self.emit(Event::FormSaved(id)).await;
+                }
+                if completed.copy_token
+                    && let Some(client) = self.client.as_ref()
+                    && let Ok(Some(token)) = client.take_decision_token(&operation.id)
+                {
+                    let _ = self
+                        .emit(Event::CopySecret(zeroize::Zeroizing::new(
+                            token.expose().to_owned(),
+                        )))
+                        .await;
+                }
+                if let Some(ack) = completed.input {
+                    let _ = self.emit(Event::InputStored(ack)).await;
+                }
+                let _ = self
+                    .emit(Event::Notice(format!(
+                        "操作 {}：{}。",
+                        operation.id,
+                        operation_label(operation.state)
+                    )))
+                    .await;
+                if let Err(error) = self.refresh().await {
+                    let _ = self
+                        .emit(Event::Error(format!(
+                            "原操作已保存，工作区重新读取失败：{error}"
+                        )))
+                        .await;
+                }
+                if (completed.delivery
+                    || !self.state.delivery.orders.is_empty()
+                    || self.state.delivery.enabled)
+                    && let Err(error) = self.refresh_delivery().await
+                {
+                    let _ = self
+                        .emit(Event::Error(format!(
+                            "原订单已保存，条款或进度尚未重新确认：{error}"
+                        )))
+                        .await;
+                }
+            }
+            Err(error) => {
+                let _ = self
+                    .emit(Event::Error(format!("操作未完成：{error}")))
+                    .await;
+            }
+        }
+    }
+
+    async fn emit(&self, event: Event) -> Result<()> {
         self.out
             .send(Event::Scoped {
                 generation: self.state.generation,
@@ -428,10 +528,12 @@ impl Backend {
                 event: Box::new(event),
             })
             .await
+            .map_err(|_| anyhow::anyhow!("桌面事件接收端已关闭。"))
     }
     fn publish(&self) {
         let mut state = self.state.clone();
-        state.identity_busy = self.identity_busy || self.reconnect_task.is_some();
+        state.identity_busy =
+            self.identity_busy || self.reconnect_task.is_some() || self.reconnect_lease.is_some();
         if let Some(registry) = &self.client_profiles {
             state.profiles = registry.profiles().to_vec();
             state.profile_id = Some(registry.selected_id().as_str().into());
@@ -492,8 +594,22 @@ impl Backend {
         );
         let copy_token = matches!(&action, Action::CreateDecisionToken { .. });
         let delivery = matches!(&action, Action::Delivery(_));
-        let input = if let Action::Input { input, .. } = &action {
-            Some(input.text.clone())
+        let input = if let Action::Input {
+            conversation_id,
+            input,
+        } = &action
+        {
+            Some(InputAck {
+                owner: None,
+                conversation_id: conversation_id.clone(),
+                draft: ComposerDraft {
+                    target: input.route.target.clone(),
+                    intent: input.route.intent,
+                    text: input.text.clone(),
+                    attachments: input.attachments.clone(),
+                    expected_revision: input.route.expected_revision,
+                },
+            })
         } else {
             None
         };
@@ -558,99 +674,7 @@ impl Backend {
     }
 
     async fn refresh(&mut self) -> Result<()> {
-        #[cfg(test)]
-        Self::test_phase("refresh-enter");
-        let client = self.client()?.clone();
-        let home = client.read(ReadRequest::Home).await?;
-        let nodes = client.read(ReadRequest::Nodes).await?;
-        let workspace = client.read(ReadRequest::Workspace).await?;
-        let write_state = client.read(ReadRequest::WriteState).await?;
-        let mut next = self.state.clone();
-        next.local_session = matches!(
-            client.authority(),
-            vibeface_client::ClientAuthority::LocalSession
-        );
-        next.write_state = write_state["state"]
-            .as_str()
-            .context("写入状态缺失")?
-            .into();
-        next.writable = client.can_write() && next.write_state == "writable";
-        next.can_control = client.can_control();
-        next.can_save_locally = client.can_save_locally();
-        next.projection_valid = true;
-        next.can_manage = matches!(
-            client.authority(),
-            vibeface_client::ClientAuthority::Membership { can_manage: true }
-        );
-        next.can_configure = client.can_configure_node();
-        next.can_configure_owner = self.host.snapshot().selected.is_some();
-        next.bots = decode_list(&home, "bots")?;
-        next.nodes = decode_list(&nodes, "nodes")?;
-        next.tasks = decode_list(&workspace, "tasks")?;
-        next.assignments = decode_list(&workspace, "assignments")?;
-        next.channels = decode_list(&workspace, "channels")?;
-        next.inputs = decode_list(&workspace, "inputs")?;
-        next.questions = decode_list(&client.read(ReadRequest::Questions).await?, "questions")?;
-        next.notifications = decode_list(
-            &client.read(ReadRequest::Notifications).await?,
-            "notifications",
-        )?;
-        if let Some(id) = self.conversation.clone() {
-            let bot = next
-                .bots
-                .iter()
-                .find(|bot| bot.conversation_id == id)
-                .map(|bot| bot.bot_id.clone());
-            let (conversation, reset) = self.read_conversation(&id, bot.as_deref()).await?;
-            next.conversation = Arc::new(conversation);
-            if reset {
-                self.reset_history_authority().await?;
-                return Ok(());
-            }
-        }
-        next.drafts = load_draft_summaries(self.draft_dir()?).await?;
-        next.pending = client
-            .pending()
-            .await?
-            .into_iter()
-            .map(|p| Pending {
-                id: p.id,
-                state: operation_label(p.state).into(),
-                target_node: p.target_node,
-            })
-            .collect();
-        next.online = true;
-        next.private_block = None;
-        next.cached = false;
-        next.cached_at_ms = None;
-        next.cache_omitted = 0;
-        next.synced = next.write_state != "aligning";
-        next.status = if next.local_session {
-            "本机会话只读。加入个人网络后才能发送签名输入。".into()
-        } else if next.writable {
-            "已读取当前连接。未确认的操作保留在待处理列表。".into()
-        } else {
-            format!(
-                "当前写入状态 {}，先核对分叉或同步状态后恢复。",
-                next.write_state
-            )
-        };
-        next.error = None;
-        prune_terminal_progress(&mut next.live, &next.conversation);
-        let became_writable = !self.state.writable && next.writable;
-        self.state = next;
-        self.publish();
-        if let Err(error) = self.save_projection().await {
-            let _ = self
-                .emit(Event::Notice(format!(
-                    "当前记录已读取，离线缓存未更新：{error}"
-                )))
-                .await;
-        }
-        if became_writable {
-            self.flush_prepared().await?;
-        }
-        Ok(())
+        self.start_refresh().await
     }
 }
 fn memory_base(metadata: &MemoryMetadata) -> Result<MemoryBase> {
@@ -724,18 +748,15 @@ impl Command {
             | Self::Host(_)
             | Self::Disconnect
             | Self::Refresh => false,
-            Self::Save { editor, .. }
-                if matches!(
-                    editor,
+            Self::Save {
+                editor:
                     Editor::Connect
-                        | Editor::ConnectLocal
-                        | Editor::CreateNetwork
-                        | Editor::Join
-                        | Editor::Recovery
-                ) =>
-            {
-                false
-            }
+                    | Editor::ConnectLocal
+                    | Editor::CreateNetwork
+                    | Editor::Join
+                    | Editor::Recovery,
+                ..
+            } => false,
             _ => true,
         }
     }
@@ -958,29 +979,22 @@ fn operation_label(state: vibeface_client::OperationState) -> &'static str {
 #[cfg(test)]
 impl Backend {
     /// Infers generator sizes without constructing/polling them or opening any identity.
-    pub fn frame_sizes_for_tests() -> Vec<(&'static str, usize)> {
-        fn size<F, R>(_: F) -> usize
+    fn frame_sizes_for_tests() -> Vec<(&'static str, usize)> {
+        fn size<A, F, R>(_: F) -> usize
         where
-            F: FnOnce() -> R,
+            F: FnOnce(A) -> R,
         {
             std::mem::size_of::<R>()
         }
-        let absent: Option<&'static mut Backend> = None;
-        let run = size(move || absent.expect("type-only probe").run(Command::Refresh));
-        let absent: Option<&'static mut Backend> = None;
-        let save = size(move || {
-            absent
-                .expect("type-only probe")
-                .save(Editor::Connect, BTreeMap::new(), None)
+        let run = size(|backend: &'static mut Backend| backend.run(Command::Refresh));
+        let save = size(|backend: &'static mut Backend| {
+            backend.save(Editor::Connect, BTreeMap::new(), None)
         });
-        let absent: Option<&'static mut Backend> = None;
-        let refresh = size(move || absent.expect("type-only probe").refresh());
-        let absent: Option<&'static mut Backend> = None;
-        let maintain = size(move || absent.expect("type-only probe").maintain());
-        let absent: Option<Arc<ClientKey>> = None;
-        let client = size(move || {
+        let refresh = size(|backend: &'static mut Backend| backend.refresh());
+        let maintain = size(|backend: &'static mut Backend| backend.maintain());
+        let client = size(|key: Arc<ClientKey>| {
             Client::open(
-                absent.expect("type-only probe"),
+                key,
                 Endpoint::Gateway(Entry {
                     origin: String::new(),
                     node_id: String::new(),
@@ -995,6 +1009,23 @@ impl Backend {
             ("backend_maintain", maintain),
             ("client_open", client),
         ]
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::Backend;
+
+    #[test]
+    fn native_actor_generators_fit_the_debug_stack_budget() {
+        let frames = Backend::frame_sizes_for_tests();
+        for (name, size) in &frames {
+            eprintln!("native async frame {name}: {size} bytes");
+        }
+        assert!(
+            frames.iter().all(|(_, size)| *size <= 256 * 1024),
+            "native composed futures exceed the256KiB generator budget: {frames:?}"
+        );
     }
 }
 

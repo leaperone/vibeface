@@ -302,10 +302,6 @@ impl HistoryState {
     pub fn scope(&self) -> &HistoryScope {
         &self.scope
     }
-    #[cfg(test)]
-    pub fn authority(&self) -> Option<&str> {
-        self.authority.as_deref()
-    }
     pub fn section(&self, section: HistorySection) -> &SectionState {
         &self
             .sections
@@ -374,7 +370,7 @@ impl HistoryState {
             let raw = at_path(&value, section.snapshot_path()).filter(|raw| !raw.is_null());
             let raw_coverage = value
                 .get("history")
-                .and_then(|history| history.get(&section_name(section)));
+                .and_then(|history| history.get(section_name(section)));
             if raw.is_none() && raw_coverage.is_none() {
                 continue;
             }

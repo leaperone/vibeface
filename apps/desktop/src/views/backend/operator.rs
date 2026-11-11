@@ -77,10 +77,10 @@ impl Backend {
         Ok(identity)
     }
     pub(super) async fn read_node(&mut self, query: ReadRequest) -> Result<Value> {
-        if self.form_owner.is_none() {
-            if let Some(client) = self.client.as_ref() {
-                return client.read(query).await;
-            }
+        if self.form_owner.is_none()
+            && let Some(client) = self.client.as_ref()
+        {
+            return client.read(query).await;
         }
         let identity = self.operator_identity()?;
         let query = match query {

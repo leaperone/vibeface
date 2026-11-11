@@ -58,18 +58,19 @@ impl ManagedNodeStatus {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.ok, "后台节点操作失败。");
         let update = &self.runtime_update;
-        for version in std::iter::once(Some(&update.bundled_version)).chain([
-            update.installed_version.as_ref(),
-            update.running_version.as_ref(),
-        ]) {
-            if let Some(version) = version {
-                ensure!(
-                    !version.is_empty()
-                        && version.len() <= 160
-                        && !version.chars().any(char::is_control),
-                    "后台节点版本无效。"
-                );
-            }
+        for version in std::iter::once(Some(&update.bundled_version))
+            .chain([
+                update.installed_version.as_ref(),
+                update.running_version.as_ref(),
+            ])
+            .flatten()
+        {
+            ensure!(
+                !version.is_empty()
+                    && version.len() <= 160
+                    && !version.chars().any(char::is_control),
+                "后台节点版本无效。"
+            );
         }
         if self.state == ServiceState::NotInstalled {
             ensure!(

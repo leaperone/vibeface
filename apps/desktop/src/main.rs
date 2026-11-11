@@ -139,10 +139,10 @@ fn run() -> Result<()> {
     let urls_overflow = activation_overflow.clone();
     application.on_open_urls(move |urls| {
         for url in urls {
-            if let Some(activation) = Activation::parse(&url) {
-                if urls_tx.try_send(activation).is_err() {
-                    urls_overflow.store(true, Ordering::Relaxed);
-                }
+            if let Some(activation) = Activation::parse(&url)
+                && urls_tx.try_send(activation).is_err()
+            {
+                urls_overflow.store(true, Ordering::Relaxed);
             }
         }
     });
@@ -206,7 +206,7 @@ fn run() -> Result<()> {
                     }
                 }
                 if activation_overflow.swap(false, Ordering::Relaxed) {
-                    let _ = view.update(cx, |app, cx| {
+                    view.update(cx, |app, cx| {
                         app.notice = Some("待处理的系统打开请求过多。请完成当前操作后重新打开邀请链接。".into());
                         app.notice_is_error = true;
                         cx.notify();

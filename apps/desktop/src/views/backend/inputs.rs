@@ -10,7 +10,13 @@ impl Backend {
         conversation_id: String,
         draft: ComposerDraft,
         saved: Option<DurableInputDraft>,
+        owner: Option<ComposerOwner>,
     ) -> Result<()> {
+        let ack = InputAck {
+            owner,
+            conversation_id: conversation_id.clone(),
+            draft: draft.clone(),
+        };
         ensure!(
             self.state.can_stage_input(),
             "此身份尚未完成可写工作区验证，输入保留在编辑器"
@@ -193,9 +199,7 @@ impl Backend {
             })
             .collect();
         self.publish();
-        let _ = self
-            .emit(Event::InputStored(saved.input.text.clone()))
-            .await;
+        let _ = self.emit(Event::InputStored(ack)).await;
         if let Some(id) = &self.form_id {
             let _ = self.emit(Event::FormSaved(id.clone())).await;
         }
@@ -351,6 +355,7 @@ impl Backend {
                 attachments: vec![],
                 expected_revision: None,
             },
+            None,
             None,
         )
         .await

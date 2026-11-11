@@ -467,13 +467,34 @@ pub struct Pending {
     pub state: String,
     pub target_node: String,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ComposerDraft {
     pub target: InputTarget,
     pub intent: InputIntent,
     pub text: String,
     pub attachments: Vec<Attachment>,
     pub expected_revision: Option<u64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerOwner {
+    pub token: String,
+    pub generation: u64,
+    pub profile_id: Option<String>,
+    pub network: Option<String>,
+    pub client_id: Option<String>,
+    pub route: Route,
+    pub view_conversation: Option<String>,
+    pub editor_revision: u64,
+    pub target_kind: usize,
+    pub selected_target: Option<InputTarget>,
+    pub target_revision: Option<u64>,
+    pub attachment_scope: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputAck {
+    pub owner: Option<ComposerOwner>,
+    pub conversation_id: String,
+    pub draft: ComposerDraft,
 }
 impl ComposerDraft {
     pub fn validate(&self) -> Result<(), String> {
@@ -913,15 +934,14 @@ pub struct IdentityPlanView {
 
 pub fn prune_terminal_progress(streams: &mut Vec<LiveProgress>, conversation: &Conversation) {
     streams.retain(|progress| {
-        if let Some(work_id) = &progress.work_id {
-            if let Some(work) = conversation
+        if let Some(work_id) = &progress.work_id
+            && let Some(work) = conversation
                 .works
                 .iter()
                 .find(|work| &work.work_id == work_id)
-            {
-                return !["finished", "completed", "failed", "interrupted", "rejected"]
-                    .contains(&work.state.as_str());
-            }
+        {
+            return !["finished", "completed", "failed", "interrupted", "rejected"]
+                .contains(&work.state.as_str());
         }
         if let Some(trigger) = &progress.trigger {
             if conversation.messages.iter().any(|message| {
@@ -1274,11 +1294,10 @@ pub fn connection_endpoint(
         && origin.trim().is_empty()
         && node_id.trim().is_empty()
         && addresses.trim().is_empty()
+        && let Some(endpoint) = remembered
     {
-        if let Some(endpoint) = remembered {
-            endpoint.validate()?;
-            return Ok(endpoint.clone());
-        }
+        endpoint.validate()?;
+        return Ok(endpoint.clone());
     }
     let remembered_entry = remembered.map(|endpoint| match endpoint {
         Endpoint::Gateway(entry) | Endpoint::Preferred { gateway: entry, .. } => entry.clone(),

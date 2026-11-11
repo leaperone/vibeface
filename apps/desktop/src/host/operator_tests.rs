@@ -1,5 +1,4 @@
-#[path = "../../tests/fixtures/rustc.rs"]
-mod fixture_rustc;
+use crate::host::fixture_rustc;
 
 use super::*;
 use std::{

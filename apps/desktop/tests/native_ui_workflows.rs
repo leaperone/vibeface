@@ -148,7 +148,9 @@ fn explicit_task_selection_routes_to_its_owner_not_the_open_bot(cx: &mut TestApp
         Command::Input {
             conversation_id,
             draft,
+            owner,
         } => {
+            assert!(owner.is_some(), "a composer must carry its UI owner");
             assert_eq!(conversation_id, "chat-b");
             assert_eq!(
                 draft.target,
@@ -197,26 +199,28 @@ fn offline_members_can_save_but_editor_clears_only_after_durable_ack(cx: &mut Te
     enter_message(&h, cx, "离线待发内容");
     click(&h, cx, "send");
     let (_, command) = scoped(h.commands.try_recv().expect("offline staging command"));
-    match command {
+    let ack = match command {
         Command::Input {
             conversation_id,
             draft,
+            owner,
         } => {
             assert_eq!(conversation_id, "chat-a");
             assert_eq!(draft.text, "离线待发内容");
+            ui::InputAck {
+                owner,
+                conversation_id,
+                draft,
+            }
         }
         _ => panic!("wrong offline native action"),
-    }
+    };
     assert_eq!(
         h.view
             .read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
         "离线待发内容"
     );
-    assert!(
-        h.events
-            .try_send(Event::InputStored("离线待发内容".into()))
-            .is_ok()
-    );
+    assert!(h.events.try_send(Event::InputStored(ack)).is_ok());
     cx.run_until_parked();
     assert_eq!(
         h.view
@@ -417,7 +421,19 @@ fn stale_critical_events_cannot_clear_a_newer_draft_or_copy_an_old_profile_secre
             .try_send(Event::Scoped {
                 generation: 6,
                 profile_id: None,
-                event: Box::new(Event::InputStored("当前档案尚未保存的文字".into()))
+                event: Box::new(Event::InputStored(ui::InputAck {
+                    owner: None,
+                    conversation_id: "chat-a".into(),
+                    draft: ui::ComposerDraft {
+                        target: InputTarget::BotMain {
+                            bot_id: "bot-a".into()
+                        },
+                        intent: InputIntent::Continue,
+                        text: "当前档案尚未保存的文字".into(),
+                        attachments: vec![],
+                        expected_revision: None
+                    }
+                }))
             })
             .is_ok()
     );
@@ -708,4 +724,474 @@ fn join_activation_waits_for_active_network_operations_and_user_confirmation(
             })
         })
         .unwrap();
+}
+
+fn edit_message(h: &Harness, cx: &mut TestAppContext, text: &str) {
+    h.window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                view.composer.update(cx, |input, cx| {
+                    input.replace_all(text.to_owned(), window, cx)
+                })
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+fn next_composer_ack(h: &mut Harness) -> ui::InputAck {
+    loop {
+        let (_, command) = scoped(h.commands.try_recv().expect("composer command"));
+        if let Command::Input {
+            conversation_id,
+            draft,
+            owner,
+        } = command
+        {
+            assert!(
+                owner.is_some(),
+                "actual composer producers must carry ownership"
+            );
+            return ui::InputAck {
+                owner,
+                conversation_id,
+                draft,
+            };
+        }
+    }
+}
+fn acknowledge(h: &Harness, cx: &mut TestAppContext, ack: ui::InputAck) {
+    let owner = ack.owner.as_ref().expect("composer ack owner");
+    h.events
+        .try_send(Event::Scoped {
+            generation: owner.generation,
+            profile_id: owner.profile_id.clone(),
+            event: Box::new(Event::InputStored(ack)),
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+fn fill_commands(h: &Harness, cx: &mut TestAppContext) {
+    h.view.update(cx, |view, cx| {
+        for _ in 0..32 {
+            view.send(Command::WatchRecord(views::backend::ActiveRecord::None), cx);
+        }
+    });
+}
+fn assert_text(h: &Harness, cx: &TestAppContext, expected: &str) {
+    assert_eq!(
+        h.view
+            .read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        expected
+    );
+}
+
+#[gpui_kit::test]
+fn stored_input_keeps_text_when_target_changes_or_text_changes_back(cx: &mut TestAppContext) {
+    let mut snapshot = fixture();
+    snapshot.tasks = vec![ui::Task {
+        task_id: "task-b".into(),
+        owner_bot: "bot-b".into(),
+        title: "Beta task".into(),
+        revision: 9,
+        ..Default::default()
+    }];
+    let mut h = open(cx, Route::Chat("chat-a".into()), snapshot);
+    enter_message(&h, cx, "original text");
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    click(&h, cx, "target-1");
+    click(&h, cx, "target-choice-0");
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "original text");
+    assert!(!h.view.read_with(cx, |view, _| view.sending));
+    enter_message(&h, cx, "same text");
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    assert_eq!(ack.conversation_id, "chat-b");
+    edit_message(&h, cx, "edited text");
+    edit_message(&h, cx, "same text");
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "same text");
+}
+
+#[gpui_kit::test]
+fn stored_input_keeps_new_attachments_and_another_conversation_draft(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Chat("chat-a".into()), fixture());
+    enter_message(&h, cx, "retained text");
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    let attachment = vibeface_protocol::workspace::Attachment {
+        hash: "a".repeat(64),
+        size: 4,
+        name: "new-file.txt".into(),
+    };
+    h.events
+        .try_send(Event::Attachments {
+            conversation_id: "chat-a".into(),
+            attachments: vec![attachment.clone()],
+        })
+        .unwrap();
+    cx.run_until_parked();
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "retained text");
+    assert_eq!(
+        h.view.read_with(cx, |view, _| view.attachments.clone()),
+        vec![attachment]
+    );
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    h.view.update(cx, |view, cx| {
+        view.navigate(Route::Chat("chat-b".into()), cx)
+    });
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "retained text");
+}
+
+#[gpui_kit::test]
+fn new_generation_releases_old_busy_without_clearing_new_editor(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Chat("chat-a".into()), fixture());
+    enter_message(&h, cx, "keep across scope");
+    click(&h, cx, "send");
+    let old = next_composer_ack(&mut h);
+    let mut snapshot = fixture();
+    snapshot.generation = 8;
+    snapshot.profile_id = Some("profile-b".into());
+    snapshot.network = Some("network-b".into());
+    snapshot.client_id = Some("client-b".into());
+    h._snapshots.send_replace(Arc::new(snapshot));
+    cx.run_until_parked();
+    assert!(!h.view.read_with(cx, |view, _| view.sending));
+    assert_text(&h, cx, "keep across scope");
+    h.view.update(cx, |view, cx| {
+        view.navigate(Route::Chat("chat-a".into()), cx)
+    });
+    let attachment = vibeface_protocol::workspace::Attachment {
+        hash: "b".repeat(64),
+        size: 2,
+        name: "new-scope.txt".into(),
+    };
+    h.view.update(cx, |view, cx| {
+        view.attachments = vec![attachment.clone()];
+        cx.notify();
+    });
+    click(&h, cx, "send");
+    let new = next_composer_ack(&mut h);
+    assert_ne!(
+        old.owner.as_ref().unwrap().token,
+        new.owner.as_ref().unwrap().token
+    );
+    acknowledge(&h, cx, old);
+    assert_text(&h, cx, "keep across scope");
+    assert!(h.view.read_with(cx, |view, _| view.sending));
+    assert_eq!(
+        h.view.read_with(cx, |view, _| view.attachments.clone()),
+        vec![attachment]
+    );
+    acknowledge(&h, cx, new);
+    assert_text(&h, cx, "");
+    assert!(!h.view.read_with(cx, |view, _| view.sending));
+}
+
+#[gpui_kit::test]
+fn read_errors_and_unowned_inputs_do_not_release_an_owned_submission(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Chat("chat-a".into()), fixture());
+    enter_message(&h, cx, "owned text");
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    h.events
+        .try_send(Event::Error("controlled history read error".into()))
+        .unwrap();
+    let mut unowned = ack.clone();
+    unowned.owner = None;
+    h.events.try_send(Event::InputStored(unowned)).unwrap();
+    cx.run_until_parked();
+    assert!(h.view.read_with(cx, |view, _| view.sending));
+    assert_text(&h, cx, "owned text");
+    let mut wrong = ack.owner.clone().unwrap();
+    wrong.token = "other-submission".into();
+    h.events
+        .try_send(Event::InputFailed {
+            owner: wrong,
+            error: "old failure".into(),
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(h.view.read_with(cx, |view, _| view.sending));
+    h.events
+        .try_send(Event::InputFailed {
+            owner: ack.owner.unwrap(),
+            error: "controlled local save failure".into(),
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!h.view.read_with(cx, |view, _| view.sending));
+    assert_text(&h, cx, "owned text");
+}
+
+#[gpui_kit::test]
+fn record_composer_returns_owner_and_clears_only_its_unchanged_draft(cx: &mut TestAppContext) {
+    let mut snapshot = fixture();
+    snapshot.tasks = vec![ui::Task {
+        task_id: "task-b".into(),
+        owner_bot: "bot-b".into(),
+        title: "Beta task".into(),
+        revision: 9,
+        ..Default::default()
+    }];
+    let mut h = open(cx, Route::Task("task-b".into()), snapshot);
+    cx.simulate_window_resize(
+        h.window,
+        gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(1800.)),
+    );
+    enter_message(&h, cx, "record task input");
+    click(&h, cx, "record-send");
+    let ack = next_composer_ack(&mut h);
+    assert_eq!(ack.conversation_id, "chat-b");
+    assert_eq!(
+        ack.draft.target,
+        InputTarget::Task {
+            task_id: "task-b".into()
+        }
+    );
+    assert_eq!(ack.draft.expected_revision, Some(9));
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "");
+}
+
+#[gpui_kit::test]
+fn full_command_queue_keeps_composer_retryable(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Chat("chat-a".into()), fixture());
+    enter_message(&h, cx, "queue must preserve me");
+    fill_commands(&h, cx);
+    click(&h, cx, "send");
+    assert!(!h.view.read_with(cx, |view, _| view.sending));
+    assert_text(&h, cx, "queue must preserve me");
+    let mut count = 0;
+    while let Ok(command) = h.commands.try_recv() {
+        let (_, command) = scoped(command);
+        assert!(matches!(command, Command::WatchRecord(_)));
+        count += 1;
+    }
+    assert_eq!(count, 32);
+    click(&h, cx, "send");
+    let ack = next_composer_ack(&mut h);
+    acknowledge(&h, cx, ack);
+    assert_text(&h, cx, "");
+}
+
+#[gpui_kit::test]
+fn full_queue_preserves_manual_identity_and_ordinary_form_fields(cx: &mut TestAppContext) {
+    let h = open(cx, Route::Join, fixture());
+    fill_commands(&h, cx);
+    h.window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                view.edit(
+                    views::forms::Editor::Join,
+                    std::collections::BTreeMap::from([
+                        ("unlock_mode", "manual".into()),
+                        ("unlock_password", "controlled password".into()),
+                        ("ticket", "controlled invitation".into()),
+                    ]),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    click(&h, cx, "save-form");
+    assert!(!h.view.read_with(cx, |view, _| view.form_pending));
+    let values = h
+        .view
+        .read_with(cx, |view, cx| view.form.as_ref().unwrap().values(cx));
+    assert_eq!(values["unlock_password"], "controlled password");
+    assert_eq!(values["ticket"], "controlled invitation");
+    h.window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                view.edit(
+                    views::forms::Editor::Answer("question-a".into(), "chat-a".into()),
+                    std::collections::BTreeMap::from([("text", "ordinary answer".into())]),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    click(&h, cx, "save-form");
+    assert!(!h.view.read_with(cx, |view, _| view.form_pending));
+    assert_eq!(
+        h.view
+            .read_with(cx, |view, cx| view.form.as_ref().unwrap().values(cx))["text"],
+        "ordinary answer"
+    );
+}
+
+#[gpui_kit::test]
+fn full_queue_preserves_form_when_vault_completion_arrives(cx: &mut TestAppContext) {
+    let h = open(cx, Route::Join, fixture());
+    fill_commands(&h, cx);
+    h.window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                view.edit(
+                    views::forms::Editor::Recovery,
+                    std::collections::BTreeMap::from([
+                        ("unlock_mode", "vault".into()),
+                        ("ticket", "vault invitation".into()),
+                        ("password", "recovery password".into()),
+                    ]),
+                    window,
+                    cx,
+                );
+                view.form_pending = true;
+                let values = view.form.as_ref().unwrap().values(cx);
+                assert!(!view.finish_credential_save(
+                    Command::Save {
+                        editor: views::forms::Editor::Recovery,
+                        values,
+                        conversation_id: None
+                    },
+                    Ok("controlled vault credential".into()),
+                    window,
+                    cx
+                ));
+            })
+        })
+        .unwrap();
+    assert!(!h.view.read_with(cx, |view, _| view.form_pending));
+    assert_eq!(
+        h.view
+            .read_with(cx, |view, cx| view.form.as_ref().unwrap().values(cx))["password"],
+        "recovery password"
+    );
+}
+
+#[gpui_kit::test]
+fn same_arc_cached_chat_survives_navigation_away_and_back(cx: &mut TestAppContext) {
+    let mut snapshot = fixture();
+    snapshot.online = false;
+    snapshot.cached = true;
+    snapshot.conversation = Arc::new(Conversation {
+        messages: vec![ui::Message {
+            message_id: "cached-message".into(),
+            role: "assistant".into(),
+            text: "retained offline history".into(),
+            ..Default::default()
+        }],
+        ..(*snapshot.conversation).clone()
+    });
+    let original = snapshot.conversation.clone();
+    let h = open(cx, Route::Chat("chat-a".into()), snapshot);
+    h.view.update(cx, |view, cx| {
+        view.timeline
+            .replace(view.snapshot.conversation.messages.clone(), cx);
+        view.navigate(Route::Home, cx);
+        view.navigate(Route::Chat("chat-a".into()), cx);
+        assert!(Arc::ptr_eq(&view.snapshot.conversation, &original));
+        assert_eq!(
+            view.timeline.message(0).unwrap().text,
+            "retained offline history"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn long_live_row_keeps_its_identity_and_intra_row_offset(cx: &mut TestAppContext) {
+    let h = open(cx, Route::Chat("chat-a".into()), fixture());
+    h.view.update(cx, |view, cx| {
+        let mut live = ui::LiveProgress {
+            key: "manager:chat-a:node:trigger".into(),
+            conversation_id: "chat-a".into(),
+            text: "long live line\n".repeat(200),
+            status: "running".into(),
+            tools: vec![ui::ToolProgress {
+                item_id: "tool-a".into(),
+                name: "tool".into(),
+                status: "running".into(),
+                text: "first tool".into(),
+                sequence: 1,
+            }],
+            ..Default::default()
+        };
+        view.timeline.replace(
+            vec![ui::Message {
+                message_id: "base".into(),
+                role: "user".into(),
+                text: "base message".into(),
+                ..Default::default()
+            }],
+            cx,
+        );
+        view.timeline
+            .update_live(&[live.clone()], Some("chat-a"), cx);
+        let stable = view.timeline.message(2).unwrap().message_id.clone();
+        view.timeline.list.scroll_to(gpui_kit::ListOffset {
+            item_ix: 2,
+            offset_in_item: gpui_kit::px(117.),
+        });
+        live.text.push_str("new delta");
+        view.timeline
+            .update_live(&[live.clone()], Some("chat-a"), cx);
+        assert_eq!(
+            view.timeline.list.logical_scroll_top(),
+            gpui_kit::ListOffset {
+                item_ix: 2,
+                offset_in_item: gpui_kit::px(117.)
+            }
+        );
+        assert_eq!(view.timeline.message(2).unwrap().message_id, stable);
+        live.tools.push(ui::ToolProgress {
+            item_id: "tool-b".into(),
+            name: "tool".into(),
+            status: "running".into(),
+            text: "second tool".into(),
+            sequence: 2,
+        });
+        view.timeline.update_live(&[live], Some("chat-a"), cx);
+        assert_eq!(
+            view.timeline.list.logical_scroll_top(),
+            gpui_kit::ListOffset {
+                item_ix: 3,
+                offset_in_item: gpui_kit::px(117.)
+            }
+        );
+        assert_eq!(view.timeline.message(3).unwrap().message_id, stable);
+    });
+}
+
+#[gpui_kit::test]
+fn connected_form_waits_for_actual_workspace_before_opening_business(cx: &mut TestAppContext) {
+    let mut snapshot = fixture();
+    snapshot.online = false;
+    snapshot.synced = false;
+    let h = open(cx, Route::Connect, snapshot.clone());
+    let id = h
+        .window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                view.edit(
+                    views::forms::Editor::Connect,
+                    std::collections::BTreeMap::new(),
+                    window,
+                    cx,
+                );
+                view.form.as_ref().unwrap().submission_id.clone()
+            })
+        })
+        .unwrap();
+    h.events.try_send(Event::FormSaved(id)).unwrap();
+    cx.run_until_parked();
+    assert!(matches!(
+        h.view.read_with(cx, |view, _| view.route.clone()),
+        Route::Connect
+    ));
+    snapshot.online = true;
+    snapshot.synced = true;
+    h._snapshots.send_replace(Arc::new(snapshot));
+    cx.run_until_parked();
+    assert!(matches!(
+        h.view.read_with(cx, |view, _| view.route.clone()),
+        Route::Home
+    ));
 }

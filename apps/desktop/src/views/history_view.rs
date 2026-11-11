@@ -407,25 +407,25 @@ impl Desktop {
                     "尚有更早记录"
                 }
             ));
-            if !coverage.complete {
-                if let Some(conversation_id) = self.conversation_id() {
-                    row = row.child(
-                        self.button(
-                            SharedString::from(format!("load-history-{key}")),
-                            if self.snapshot.history_loading == Some(section) {
-                                "正在读取…"
-                            } else {
-                                "读取更早记录"
-                            },
-                            Command::LoadHistory {
-                                conversation_id,
-                                section,
-                            },
-                            cx,
-                        )
-                        .disabled(!self.snapshot.online || self.snapshot.history_loading.is_some()),
-                    );
-                }
+            if !coverage.complete
+                && let Some(conversation_id) = self.conversation_id()
+            {
+                row = row.child(
+                    self.button(
+                        SharedString::from(format!("load-history-{key}")),
+                        if self.snapshot.history_loading == Some(section) {
+                            "正在读取…"
+                        } else {
+                            "读取更早记录"
+                        },
+                        Command::LoadHistory {
+                            conversation_id,
+                            section,
+                        },
+                        cx,
+                    )
+                    .disabled(!self.snapshot.online || self.snapshot.history_loading.is_some()),
+                );
             }
         } else {
             row = row.child(format!(
@@ -635,13 +635,12 @@ impl Desktop {
                             std::collections::BTreeMap::new(),
                             cx,
                         ));
-                    } else if let Some(answer) = &question.answer {
-                        if let Some(text) = answer
+                    } else if let Some(answer) = &question.answer
+                        && let Some(text) = answer
                             .as_str()
                             .or_else(|| answer.get("text").and_then(serde_json::Value::as_str))
-                        {
-                            row = row.child(text.to_owned());
-                        }
+                    {
+                        row = row.child(text.to_owned());
                     }
                     page = page.child(row);
                 }

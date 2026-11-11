@@ -78,10 +78,11 @@ fn literal(text: &str) -> String {
 }
 
 pub fn open_external(url: &str, cx: &App) {
-    if let Ok(url) = reqwest::Url::parse(url) {
-        if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
-            cx.open_url(url.as_str());
-        }
+    if let Ok(url) = reqwest::Url::parse(url)
+        && matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+    {
+        cx.open_url(url.as_str());
     }
 }
 fn no_document_image() -> ImageSource {
@@ -106,12 +107,13 @@ pub fn view(state: &Entity<TextViewState>) -> TextView {
                 })
         })
 }
+type DocumentChanged = Rc<dyn Fn(&mut App)>;
 struct Document {
     state: Entity<TextViewState>,
     safe: String,
     revision: u64,
     task: Option<gpui_kit::Task<()>>,
-    changed: Option<Rc<dyn Fn(&mut App)>>,
+    changed: Option<DocumentChanged>,
     _observer: Subscription,
 }
 impl Document {

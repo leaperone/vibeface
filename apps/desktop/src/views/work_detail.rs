@@ -359,24 +359,21 @@ impl Desktop {
             },
             cx,
         ));
-        if let Some(target) = &work.target {
-            if let InputTarget::ChannelTask {
-                channel_id,
-                task_id,
-                ..
-            } = target
-            {
-                if self.snapshot.tasks.iter().any(|task| {
-                    task.task_id == *task_id && task.channel_id.as_ref() == Some(channel_id)
-                }) {
-                    page = page.child(self.nav(
-                        "work-channel",
-                        "打开来源频道",
-                        Route::Channel(channel_id.clone()),
-                        cx,
-                    ));
-                }
-            }
+        if let Some(InputTarget::ChannelTask {
+            channel_id,
+            task_id,
+            ..
+        }) = &work.target
+            && self.snapshot.tasks.iter().any(|task| {
+                task.task_id == *task_id && task.channel_id.as_ref() == Some(channel_id)
+            })
+        {
+            page = page.child(self.nav(
+                "work-channel",
+                "打开来源频道",
+                Route::Channel(channel_id.clone()),
+                cx,
+            ));
         }
         for queued in self.snapshot.inputs.iter().filter(|input| !input.cancelled && input.conversation_id == *conversation_id && matches!(&input.input.route.target,InputTarget::Work{work_id:id} if id == work_id)) {
             let mut row = self.row(if queued.deferred {"已延后补充"} else {"等待执行的补充"}, queued.input.text.clone());
@@ -397,32 +394,31 @@ impl Desktop {
             .filter(|h| h.network_id == detail.network_id)
         {
             for event in &history.events {
-                if let HistoryBody::InputPosted { input } = &event.body {
-                    if event.scope_id == *conversation_id
-                        && work.target.as_ref() == Some(&input.target)
-                    {
-                        if !input.attachments.is_empty() {
-                            page = page.child(self.row(
-                                "来源任务中的附件",
-                                format!(
-                                    "输入 {} · {}",
-                                    input.message_id,
-                                    if history.coverage.truncated {
-                                        "任务历史已截断"
-                                    } else {
-                                        "已读取当前任务范围"
-                                    }
-                                ),
-                            ));
-                        }
-                        for file in &input.attachments {
-                            page = page.child(self.record_attachment(
-                                &event.event_hash,
-                                conversation_id,
-                                file,
-                                cx,
-                            ));
-                        }
+                if let HistoryBody::InputPosted { input } = &event.body
+                    && event.scope_id == *conversation_id
+                    && work.target.as_ref() == Some(&input.target)
+                {
+                    if !input.attachments.is_empty() {
+                        page = page.child(self.row(
+                            "来源任务中的附件",
+                            format!(
+                                "输入 {} · {}",
+                                input.message_id,
+                                if history.coverage.truncated {
+                                    "任务历史已截断"
+                                } else {
+                                    "已读取当前任务范围"
+                                }
+                            ),
+                        ));
+                    }
+                    for file in &input.attachments {
+                        page = page.child(self.record_attachment(
+                            &event.event_hash,
+                            conversation_id,
+                            file,
+                            cx,
+                        ));
                     }
                 }
             }

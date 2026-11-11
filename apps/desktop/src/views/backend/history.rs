@@ -1,6 +1,5 @@
 use super::*;
 use crate::views::history::{ApplyResult, HistoryScope, HistoryState};
-use vibeface_protocol::history::HistorySection;
 impl Backend {
     fn history_scope(&self, id: &str) -> Result<HistoryScope> {
         let client = self.client()?;
@@ -11,7 +10,7 @@ impl Backend {
             generation: self.state.generation,
         })
     }
-    fn prepare_history(&mut self, id: &str) -> Result<()> {
+    pub(super) fn prepare_history(&mut self, id: &str) -> Result<()> {
         let scope = self.history_scope(id)?;
         if let Some(history) = &mut self.history_state {
             let old = history.scope();
@@ -21,28 +20,6 @@ impl Backend {
         }
         self.history_state = Some(Box::new(HistoryState::new(scope)));
         Ok(())
-    }
-    pub(super) async fn read_conversation(
-        &mut self,
-        id: &str,
-        bot: Option<&str>,
-    ) -> Result<(Conversation, bool)> {
-        self.prepare_history(id)?;
-        let ticket = self
-            .history_state
-            .as_ref()
-            .context("对话历史尚未初始化")?
-            .begin_snapshot();
-        let value = self
-            .client()?
-            .read(ReadRequest::Conversation {
-                conversation_id: id.into(),
-            })
-            .await?;
-        let history = self.history_state.as_mut().context("对话历史已切换")?;
-        let result = history.apply_snapshot(&ticket, value)?;
-        let conversation = parse_conversation(history.materialize(), id, bot)?;
-        Ok((conversation, result == ApplyResult::AuthorityReset))
     }
     pub(super) async fn merge_history_push(&mut self, value: Value) -> Result<()> {
         let id = self.conversation.clone().context("尚未选择对话")?;
@@ -74,29 +51,16 @@ impl Backend {
         }
         Ok(())
     }
-    pub(super) async fn load_history(&mut self, id: &str, section: HistorySection) -> Result<()> {
-        ensure!(
-            self.state.online && self.conversation.as_deref() == Some(id),
-            "请先连接并打开原对话再读取历史"
-        );
-        self.prepare_history(id)?;
-        let ticket = self
-            .history_state
-            .as_ref()
-            .context("历史尚未首读")?
-            .begin_page(section)?;
-        self.state.history_loading = Some(section);
-        self.state.history_error = None;
-        self.publish();
-        let response = self
-            .client()?
-            .read(ReadRequest::ConversationHistory(ticket.request()))
-            .await;
-        self.state.history_loading = None;
+    pub(super) async fn finish_history_page(
+        &mut self,
+        id: &str,
+        ticket: &crate::views::history::PageTicket,
+        response: Result<Value>,
+    ) -> Result<()> {
         match response {
             Ok(value) => {
                 let history = self.history_state.as_mut().context("对话历史已切换")?;
-                match history.apply_page(&ticket, value)? {
+                match history.apply_page(ticket, value)? {
                     ApplyResult::Stale => {
                         self.state.history_error =
                             Some("历史请求已过期，当前视图保持原样。".into());
@@ -185,6 +149,7 @@ impl Backend {
         Ok(())
     }
     pub(super) async fn reset_history_authority(&mut self) -> Result<()> {
+        self.cancel_reads().await?;
         if let Some(history) = &mut self.history_state {
             history.invalidate();
         }

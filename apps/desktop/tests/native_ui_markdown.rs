@@ -77,8 +77,24 @@ fn hostile_markdown_has_no_network_or_document_image_loads(cx: &mut TestAppConte
 <img src="https://code.invalid/literal.png">
 ```
 "#;
-    let (window, view) = open(cx, source);
+    let (window, view) = open(cx, "Before");
     draw(cx, window);
+    let changes = Arc::new(AtomicUsize::new(0));
+    view.update(cx, |view, cx| {
+        let changes = changes.clone();
+        view.document.on_changed(
+            move |_| {
+                changes.fetch_add(1, Ordering::SeqCst);
+            },
+            cx,
+        );
+        view.document.replace(source, cx);
+    });
+    draw(cx, window);
+    assert!(
+        changes.load(Ordering::SeqCst) > 0,
+        "streamed text updates notify the owning row"
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         0,

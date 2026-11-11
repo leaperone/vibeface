@@ -11,7 +11,7 @@ pub mod offline;
 #[path = "../src/views/records.rs"]
 pub mod records;
 mod views {
-    pub use crate::{history, offline, records};
+    pub use crate::{history, records};
 }
 #[path = "../src/ui.rs"]
 #[allow(dead_code)]
