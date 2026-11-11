@@ -21,7 +21,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 示例：`release product stable 0.0.1`、`release product nightly`、`release www stable patch`。这些是 skill 参数，不是 shell 命令。
 
-先读 [发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py) 和目标应用的版本文件。版本准备遵守 [AGENTS.md](../../../AGENTS.md) 的独立 worktree、单 PR 与合并规则。
+先读 [发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py) 和目标应用的版本文件。人工版本准备遵守 [AGENTS.md](../../../AGENTS.md) 的独立 worktree、单 PR 与合并规则。
 
 | 发布组 | Tag | 版本来源 | 交付结果 |
 | --- | --- | --- | --- |
@@ -34,7 +34,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 `nightly.yml`（Release / Nightly）保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每槽运行。先调用一次完整标准 Core，再由根级 `ci-gate` 验证结果。仅 main schedule 的 gate 成功后运行 `scripts/daily-nightly.py`；手动 Core、手动 Nightly 和普通 main push 不自动发布 Nightly。
 
-协调器只用 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，不合入 main。以原 schedule run 的精确 main SHA 作唯一 parent，生成普通机械版本提交，只改七个版本文件中的发行版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号，保留 marketing version、依赖和其他内容。共享验证器对比完整 tree，并运行 `cargo metadata --locked --no-deps` 核对两个本仓包的清单版本（这条命令带 `--no-deps` 时不校验锁文件），不以路径白名单放行。
+协调器只用 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，不合入 main。以原 schedule run 的精确 main SHA 作唯一 parent，生成普通机械版本提交，只改七个版本文件中的发行版本、Cargo.lock 三个本仓包版本及 Android、iOS 构建号，保留 marketing version、依赖和其他内容。共享验证器对比完整 tree，并运行 `cargo metadata --locked --no-deps` 核对 Core、CLI、Desktop 三个本仓包的清单版本（这条命令带 `--no-deps` 时不校验锁文件），不以路径白名单放行。
 
 原 run 的 UTC `created_at` 向下取整到四小时批次，版本日期仍取该 run 的 `YYYYMMDD`。提交记录原 schedule run ID、批次和上一可信产品 Nightly 来源。移动构建号从 main 与上一可信 Nightly 取数值上界后加一；iOS 按数字分段比较，末段溢出时停止，不回绕。协调器全局串行。同批次、延迟或跨日恢复保持原版本、构建号、提交与 artifact；上一来源完整发布且 npm 成功、main 无新提交时跳过。部分 Tag、Release 或 npm 必须先恢复原来源，或经 main 明确审查弃用后由下一批分配新版本，不覆盖原来源。
 

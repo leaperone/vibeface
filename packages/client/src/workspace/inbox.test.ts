@@ -27,7 +27,7 @@ const source = (manage: boolean, answered: Record<string, string> = {}): InboxSo
 
 test('unknown inputs keep separate Inbox IDs and their original Task and Channel targets', () => {
   const state = source(false)
-  const pending = (message_id: string, target: PendingMessage['target'], delivery: PendingMessage['delivery']): PendingMessage => ({ message_id, conversation_id: 'c', target, delivery, text: message_id, intent: 'continue', sequence: 1, created_at_ms: 1 })
+  const pending = (message_id: string, target: PendingMessage['target'], delivery: PendingMessage['delivery']): PendingMessage => ({ message_id, conversation_id: 'c', target, delivery, text: message_id, report_results: true, intent: 'continue', sequence: 1, created_at_ms: 1 })
   state.workspace.pendingMessages = [pending('task-input', { kind: 'task', task_id: 'task' }, 'unknown'), pending('saved-main', { kind: 'bot_main', bot_id: 'b' }, 'saved'), pending('channel-input', { kind: 'channel_task', channel_id: 'channel', task_id: 'other', bot_id: 'b' }, 'unknown')]
   const items = inboxItems(state).flatMap((item) => item.kind === 'undelivered' ? [item] : [])
   assert.deepEqual(items.map((item) => item.key), ['undelivered:task-input', 'undelivered:channel-input'])

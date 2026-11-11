@@ -1602,8 +1602,11 @@ mod tests {
             1
         );
         drop(database);
+        rpc.shutdown().await?;
+        delivery.shutdown().await;
         drop(delivery);
-        std::fs::remove_dir_all(dir)?;
+        std::fs::remove_dir_all(dir)
+            .context("remove allocation recovery test directory after RPC and delivery shutdown")?;
         Ok(())
     }
 }

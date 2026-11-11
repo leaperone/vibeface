@@ -199,10 +199,10 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
     return () => clearInterval(timer)
   }, [client, polling])
   async function run(key: string, action: () => Promise<void>) {
-    if (running.current !== null || !current()) return
+    if (running.current !== null || !current()) return false
     running.current = key; setBusy(key); setError(''); setNotice('')
-    try { await action() }
-    catch (cause) { if (current()) setError(messageOf(cause)) }
+    try { await action(); return true }
+    catch (cause) { if (current()) setError(messageOf(cause)); return false }
     finally { if (current()) { running.current = null; setBusy(null) } }
   }
   const selected = orders.find(order => order.order_id === selectedId) ?? null

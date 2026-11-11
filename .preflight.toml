@@ -8,8 +8,8 @@ build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text())
 
 [[domain_check]]
 name = "Rust workspace"
-trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi && cargo clippy --workspace --all-targets --locked -- -D warnings"
+trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+command = "cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi && cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [[domain_check]]
 name = "Delivery proof and settlement"
@@ -23,7 +23,7 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 
 [[domain_check]]
 name = "Web build and packaged resources"
-trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "apps/desktop/src/shared/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
+trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
 
 [[domain_check]]
@@ -33,13 +33,13 @@ command = "pnpm --filter @vibeface/client run typecheck && pnpm --filter @vibefa
 
 [[domain_check]]
 name = "Desktop source"
-trigger_paths = ["apps/desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "pnpm --dir apps/desktop typecheck && pnpm --dir apps/desktop test && pnpm --dir apps/desktop build"
+trigger_paths = ["apps/desktop/**", "tests/e2e/e2e.native-desktop.config.ts", "tests/e2e/native-desktop*.ts", "scripts/e2e-desktop.mjs", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+command = "cargo test -p vibeface-desktop --locked && cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings && node scripts/build-desktop.mjs --self-test && node scripts/verify-desktop.mjs --self-test && python3 -B scripts/offline-docs.py --self-test && pnpm exec e2e list --config tests/e2e/e2e.native-desktop.config.ts"
 
 [[domain_check]]
 name = "Static www portal"
 trigger_paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
+command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run test && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
 
 [[domain_check]]
 name = "JavaScript syntax"

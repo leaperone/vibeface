@@ -71,7 +71,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const recovering = Boolean(device.pendingRecovery)
   // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
   const lasting = device.ready?.info.connection_entry
-  const home = typeof window !== 'undefined' && window.vibefaceClient ? undefined : lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
+  const home = lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
   const { setOpenMobile, isMobile } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")

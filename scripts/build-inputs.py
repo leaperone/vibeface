@@ -19,7 +19,7 @@ OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("apps/app/", "apps/desktop/src/shared/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
+    "web": ("apps/app/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 CACHE_POLICIES = (
@@ -196,14 +196,9 @@ def self_test():
         defaults = repo / "config/public-bootstrap.json"
         defaults.parent.mkdir()
         defaults.write_text('{"issuer":"fixture-one"}')
-        shared = repo / "apps/desktop/src/shared"
-        shared.mkdir(parents=True)
-        shared_sources = [shared / name for name in ("node-view.ts", "contract.ts", "client-contract.ts")]
-        for path in shared_sources:
-            path.write_text("export const fixture = 'original'\n")
-        desktop_main = repo / "apps/desktop/src/main/index.ts"
+        desktop_main = repo / "apps/desktop/src/main.rs"
         desktop_main.parent.mkdir(parents=True)
-        desktop_main.write_text("desktop main original\n")
+        desktop_main.write_text("fn main() {}\n")
         subprocess.run(["git", "add", "apps/desktop/src"], cwd=repo, check=True)
         for component in OUTPUTS:
             prepare(repo, component)
@@ -259,18 +254,6 @@ def self_test():
             check(repo, "web")
         defaults.write_text('{"issuer":"fixture-one"}')
         check(repo, "web")
-        for path in shared_sources:
-            original = path.read_text()
-            path.write_text("export const fixture = 'changed'\n")
-            check(repo, "crypto")
-            try:
-                check(repo, "web")
-            except ValueError as error:
-                assert str(error) == "web source inputs changed; run its build script"
-            else:
-                raise AssertionError(f"changed {path.relative_to(repo)} reused stale web output")
-            path.write_text(original)
-            check(repo, "web")
         desktop_main.write_text("desktop main changed\n")
         check(repo, "crypto")
         check(repo, "web")

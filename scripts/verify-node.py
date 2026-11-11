@@ -270,6 +270,13 @@ async function connect(input) {
         send(id, method, params);
       });
     },
+    // The server completed the request, but Python never receives its successful body.
+    async dropResponse(method, params) {
+      const response = await this.request(method, params);
+      if (Object.hasOwn(response, 'error')) throw new Error(`request rejected before reply discard: ${response.error}`);
+      close(new Error('application reply discarded'));
+      return { sent: true, application_reply_discarded: true };
+    },
     // The request leaves, then the connection drops before any answer: an unknown write.
     drop(method, params) { send(String(++sequence), method, params); close(new Error('dropped after send')); return { sent: true }; },
   };
@@ -379,6 +386,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const connection = connections.get(input.connection || 'main');
         if (!connection) throw new Error('no connection');
         if (input.op === 'request') result = await connection.request(input.method, input.params || {});
+        else if (input.op === 'drop_response') result = await connection.dropResponse(input.method, input.params || {});
         else if (input.op === 'drop') result = connection.drop(input.method, input.params || {});
         else if (input.op === 'events') result = connection.events;
         else throw new Error('unknown client command');
@@ -390,6 +398,65 @@ for await (const line of createInterface({ input: process.stdin })) {
 for (const connection of connections.values()) connection.close();
 for (const key of roots.values()) key.free();
 """
+
+
+def client_response_drop_selfcheck():
+    start = CLIENT_SOURCE.index("  const send =")
+    end = CLIENT_SOURCE.index("\n}\nfor await", start)
+    factory = "const factory = new Function('pending', 'events', 'close', 'queued', 'channel', 'socket', 'encoder', " \
+              + json.dumps("let sequence = 0; let closed = false; let failure;\n" + CLIENT_SOURCE[start:end]) + ");\n"
+    check = r"""
+import assert from 'node:assert/strict';
+function fixture() {
+  const pending = new Map();
+  let sent;
+  let closes = 0;
+  const channel = { sealMessage: bytes => [bytes] };
+  const socket = { send: bytes => { sent = JSON.parse(new TextDecoder().decode(bytes)); } };
+  const connection = factory(pending, [], () => { closes++; }, [], channel, socket, new TextEncoder());
+  return { connection, pending, sent: () => sent, closes: () => closes,
+    deliver(response) {
+      const request = pending.get(response.id);
+      if (!request) return false;
+      pending.delete(response.id); clearTimeout(request.timer); request.resolve(response); return true;
+    },
+  };
+}
+const params = { method: 'create_bot', bot_id: 'fixed-bot', attestation: { signature: 'fixed-signed-fixture' } };
+const success = fixture();
+const outstanding = success.connection.dropResponse('rpc', params);
+let exposed = false;
+outstanding.then(() => { exposed = true; });
+await Promise.resolve();
+assert.equal(exposed, false); assert.equal(success.closes(), 0);
+assert.deepEqual(success.sent().params, params);
+assert.equal(success.deliver({ id: 'wrong-id', result: {} }), false);
+assert.equal(success.closes(), 0);
+assert.equal(success.deliver({ id: success.sent().id, result: { private: 'MUST-NOT-REACH-PYTHON' } }), true);
+const marker = await outstanding;
+assert.deepEqual(marker, { sent: true, application_reply_discarded: true });
+assert.equal(JSON.stringify(marker).includes('MUST-NOT-REACH-PYTHON'), false);
+assert.equal(success.closes(), 1); assert.equal(success.pending.size, 0);
+for (const error of ['authoritative fixture refusal', '', null]) {
+  const rejected = fixture();
+  const response = rejected.connection.dropResponse('rpc', params);
+  rejected.deliver({ id: rejected.sent().id, error, result: { private: 'MUST-NOT-REACH-PYTHON' } });
+  await assert.rejects(response, /request rejected before reply discard/);
+  assert.equal(rejected.closes(), 0); assert.equal(rejected.pending.size, 0);
+}
+const immediate = fixture();
+assert.deepEqual(immediate.connection.drop('rpc', params), { sent: true });
+assert.deepEqual(immediate.sent().params, params);
+assert.equal(immediate.closes(), 1); assert.equal(immediate.pending.size, 0);
+console.log(JSON.stringify({ status: 'PASS', matching_response_required: true, success_body_exposed: false,
+  rejected_responses: 3, immediate_drop_preserved: true, network_sockets: 0 }));
+"""
+    result = subprocess.run(["node", "--input-type=module"], input=factory + check, text=True, capture_output=True)
+    require(result.returncode == 0, "the response-drop helper selfcheck passes without a Node service or network")
+    value = json.loads(result.stdout)
+    require(value["status"] == "PASS" and value["success_body_exposed"] is False,
+            "successful replies stay private to the discard boundary")
+    print(result.stdout.strip())
 
 
 class Client:
@@ -2258,6 +2325,74 @@ def verify_recovery_approval(node, other, network):
     return checkpoint
 
 
+CONVERSATION_HISTORY_PATHS = {
+    "messages": ("messages",), "works": ("works",), "changes": ("changes",),
+    "questions": ("questions",), "sessions": ("sessions",), "checks": ("checks",),
+    "deliveries": ("deliveries",), "overwritten": ("overwritten",),
+    "jobs": ("scheduler", "jobs"), "scope_jobs": ("scheduler", "scope_jobs"),
+    "unanswered": ("scheduler", "unanswered"),
+    "owner_jobs": ("scheduler", "remote", "jobs"),
+    "owner_scope_jobs": ("scheduler", "remote", "scope_jobs"),
+    "owner_memory_conflicts": ("scheduler", "remote", "memory_conflicts"),
+    "skills": ("bot_settings", "skills"), "schedules": ("bot_settings", "schedules"),
+    "memory": ("bot_settings", "memory"), "memory_conflicts": ("bot_settings", "memory_conflicts"),
+    "memory_sync_conflicts": ("bot_settings", "memory_sync_conflicts", "items"),
+}
+
+
+def conversation_snapshot(client, conversation_id, *, sections=("messages", "works", "jobs")):
+    """Read a bounded snapshot and complete only the sections this oracle needs."""
+    def bounded(value):
+        require(len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()) < 3 * 1024 * 1024,
+                "each conversation/history response stays below 3 MiB")
+        return value
+
+    def continuation(coverage):
+        require(isinstance(coverage, dict) and type(coverage.get("complete")) is bool,
+                "history coverage explicitly declares completeness")
+        cursor = coverage["next_cursor"]
+        require(cursor is None or isinstance(cursor, str) and 0 < len(cursor) <= 8192,
+                "history continuation is one bounded opaque cursor")
+        require(coverage["complete"] == (cursor is None), "history cursor and completeness agree")
+        return cursor
+
+    snapshot = bounded(client.rpc("conversation", conversation_id=conversation_id))
+    require(snapshot["conversation"]["conversation_id"] == conversation_id,
+            "conversation snapshot retains its requested scope")
+    authority = snapshot["history_authority"]
+    require(isinstance(authority, str) and authority, "conversation snapshot has a projection authority")
+    for section in sections:
+        require(section in CONVERSATION_HISTORY_PATHS, "oracle requests one current typed history section")
+        if section in ("owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"):
+            require(snapshot["scheduler"]["remote"]["reachable"] is True,
+                    "offline owner history remains unknown until the owner is reachable")
+        path = CONVERSATION_HISTORY_PATHS[section]
+        parent = snapshot
+        for key in path[:-1]:
+            parent = parent[key]
+        items = parent[path[-1]]
+        require(isinstance(items, list), "history section retains its typed item array")
+        cursor = continuation(snapshot["history"][section])
+        seen = set()
+        while cursor is not None:
+            require(cursor not in seen, "history traversal advances without a cursor loop")
+            seen.add(cursor)
+            page = bounded(client.rpc("conversation_history", conversation_id=conversation_id,
+                                      section=section, cursor=cursor, limit=100))
+            require(page["conversation_id"] == conversation_id and page["section"] == section,
+                    "history page retains its requested conversation and section")
+            require(page["history_authority"] == authority,
+                    "one complete oracle read retains its original projection authority")
+            require(isinstance(page["items"], list) and len(page["items"]) <= 100,
+                    "history response contains at most the requested typed item count")
+            items[0:0] = page["items"]
+            cursor = continuation(page)
+        snapshot["history"][section] = {"next_cursor": None, "complete": True}
+        if section == "memory_sync_conflicts":
+            snapshot["bot_settings"]["memory_sync_conflicts"]["has_more"] = False
+    return snapshot
+
+
 def scheduler_records(node, network):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
         connection.row_factory = sqlite3.Row
@@ -2320,7 +2455,7 @@ def bot_checks(run, workspace, a, network, passed, outsider):
     for definition, invocation in zip(definitions, first):
         require(invocation["bot_prompt_markers"] == [definition["instructions"]],
                 "each management prompt receives only its own Bot instructions")
-        snapshot = a.client.rpc("conversation", conversation_id=definition["conversation_id"])
+        snapshot = conversation_snapshot(a.client, definition["conversation_id"])
         require(snapshot["bot"] == next(bot for bot in stored if bot["bot_id"] == definition["bot_id"])
                 and [message["message_id"] for message in snapshot["messages"] if message["role"] == "user"]
                     == ["bot-message-" + definition["bot_id"]], "two Bots retain separate definitions and message histories")
@@ -2389,7 +2524,7 @@ def work_checks(run, workspace, a, network, passed):
         return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method and not row["bot"]]
 
     def snapshot(name):
-        return a.client.rpc("conversation", conversation_id=name)
+        return conversation_snapshot(a.client, name)
 
     def work(name, work_id):
         return next((row for row in snapshot(name)["works"] if row["work_id"] == work_id), None)
@@ -2764,7 +2899,7 @@ def triage_checks(run, workspace, a, network, passed):
                 (row for row in fixture_records(run, "manager-native-work.jsonl")
                  if row["label"] == label and row["trigger"] == receipt["trigger"]), None))
             source = wait_for("the hook's source Work finishes with its real native turn", lambda: next(
-                (row for row in a.client.rpc("conversation", conversation_id=owner)["works"]
+                (row for row in conversation_snapshot(a.client, owner, sections=("works",))["works"]
                  if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
                  and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
             require(source["trigger"] == receipt["trigger"] and source["target_node"] == a.device_id
@@ -2836,7 +2971,7 @@ def triage_checks(run, workspace, a, network, passed):
                 and answer_detail["work_id"] == answer_work and answer_detail["trigger"] == acted[0]["trigger"]
                 and answer_detail["target"] == question["target"] and answer_detail["thread_id"] == thread_id
                 and not any(row["work_id"] == answer_work
-                            for row in a.client.rpc("conversation", conversation_id=owner)["works"]),
+                            for row in conversation_snapshot(a.client, owner, sections=("works",))["works"]),
                 "the Answer manager and its native work keep the original Work scope and stay outside Main")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
                         if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
@@ -3100,7 +3235,7 @@ def bot_settings_checks(run, a, network, passed):
         return receipt
 
     def snapshot(conversation=name):
-        return a.client.rpc("conversation", conversation_id=conversation)
+        return conversation_snapshot(a.client, conversation)
 
     def results(trigger, tool_name):
         return [row for row in fixture_records(run, "manager-tools.jsonl")
@@ -3278,7 +3413,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
         disabled = node.client.rpc("message", conversation_id=scope, message_id="runtime-default-off",
                                    text=json.dumps({"chat_agent": True, "tools": []}))
         failed = wait_for("disabled backup records the original refusal", lambda:
-            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+            next((job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                   if job["trigger"] == disabled["trigger"] and job["state"] == "failed"), None))
         require(failed["runtime"]["execution"] == "not_started" and failed["retryable"]
                 and failed["runtime"]["stage"] == "turn_start" and failed["runtime"]["switched_from"] is None,
@@ -3288,7 +3423,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
         sent = node.client.rpc("message", conversation_id=scope, message_id="runtime-explicit-backup",
                                text=json.dumps({"chat_agent": True, "tools": []}))
         completed = wait_for("explicit backup completes exactly one accepted turn", lambda:
-            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+            next((job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                   if job["trigger"] == sent["trigger"] and job["state"] == "completed"), None))
         runtime = completed["runtime"]
         attempts = [row["message"]["params"] for row in fixture_records(run, "codex-rpc.jsonl")
@@ -3304,7 +3439,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
                  if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS] == tools_before,
                 "neither the refused turn nor the backup repeats a tool effect")
         node.client.call("configure_node", original)
-        frozen = next(job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+        frozen = next(job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                       if job["trigger"] == sent["trigger"])
         require(frozen["runtime"] == runtime, "later settings never rewrite a historical turn runtime")
         passed("backup is off by default; an explicit unstarted quota fallback sends once with frozen model and effort",
@@ -3460,7 +3595,7 @@ def phase1_acceptance(options):
                 and (label is None or record["label"] == label)]
 
     def conversation(name):
-        return a.client.rpc("conversation", conversation_id=name)
+        return conversation_snapshot(a.client, name)
 
     def new_conversation(name):
         a.client.rpc("create_bot", bot_id="bot-" + name, conversation_id=name, name=name, instructions="",
@@ -3613,8 +3748,14 @@ def phase1_acceptance(options):
             [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "records"
              and event["payload"]["conversation_id"] == name
              and any(row["message_id"] == "queue-first" and row["rank"] for row in event["payload"]["messages"])])
-        require(all(isinstance(row["jobs"], list) and isinstance(row["works"], list) for row in pushed),
-                "pushed records carry the conversation's jobs and changed works")
+        refreshed = conversation(name)
+        require(all(isinstance(row["messages"], list) and isinstance(row["works"], list)
+                    and row["refresh_metadata"] is True
+                    and row["history_authority"] == refreshed["history_authority"] for row in pushed),
+                "exact pushed message/work records request metadata refresh under the same authority")
+        require({job["trigger"] for job in refreshed["scheduler"]["jobs"]}
+                == {first["trigger"], second["trigger"], cancelled_queued["trigger"]},
+                "the authenticated metadata refresh recovers every durable local job")
         active_before = state(first, "running")
         require(active_before, "original reply remains running before queued cancellation")
         cancelled_reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])
@@ -4046,7 +4187,7 @@ def phase1_acceptance(options):
         for task_id, history, assignment_id, bot_id, expected in (
                 (root_task, root_conversation, root_assignment, root_bot, "delegate-root:complete"),
                 (child_task, child_conversation, child_assignment, child_bot, "delegate-child:complete")):
-            messages = a.client.rpc("conversation", conversation_id=history)["messages"]
+            messages = conversation_snapshot(a.client, history, sections=("messages",))["messages"]
             task_history = a.client.rpc("workspace_history", task_id=task_id, limit=100)
             replies = [row for row in task_history["events"] if row["kind"] == "message_posted"
                        and row["body"]["role"] == "assistant"]
@@ -5194,7 +5335,7 @@ def acceptance(options):
             require(opened["ok"], f"{gateway.name} forwards the browser to {target.name}: {opened.get('error')}")
             client.authenticate()
             require(client.call("info")["device_id"] == target.device_id, "Noise ends at the target, not the Gateway")
-            history = client.rpc("conversation", conversation_id=conversation)
+            history = conversation_snapshot(client, conversation)
             require(any(row["message_id"] == "m1" for row in history["messages"]), "the target shows the synced history")
             reached[f"{gateway.name}->{target.name}"] = True
             client.close()
@@ -5255,7 +5396,7 @@ def acceptance(options):
         require(failover.call("rpc", late)["trigger"] == first["trigger"], "resending through the new entrance is idempotent")
         c.start()
         final = wait_for("all four Nodes converge after the entrance switch", lambda: converged(members, network), timeout=60)
-        shown = [row["message_id"] for row in failover.rpc("conversation", conversation_id=conversation)["messages"]
+        shown = [row["message_id"] for row in conversation_snapshot(failover, conversation, sections=("messages",))["messages"]
                  if row["role"] == "user"]
         require(sorted(shown) == ["m1", "m2-delivered", "m3", "m4"], "each message appears once after failover")
         passed("entrance-switch", heads=final, messages=shown)
@@ -5268,12 +5409,14 @@ def acceptance(options):
         held = at_c.call("rpc", signed_message(at_c, conversation, "m5-stop", directive))
 
         def owner_job(state):
-            view = at_c.rpc("conversation", conversation_id=conversation)
-            job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
+            view = conversation_snapshot(at_c, conversation,
+                sections=("jobs", "owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"))
             remote = view["scheduler"]["remote"]
-            scope_jobs = remote.get("scope_jobs")
+            job = next((row for row in remote["jobs"] if row["trigger"] == held["trigger"]), None)
+            scope_jobs = remote["scope_jobs"]
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and set(remote) == {"owner", "reachable", "context", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and set(remote) == {"owner", "reachable", "context", "jobs", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and not any(row.get("source_node") for row in view["scheduler"]["jobs"]) \
                 and isinstance(scope_jobs, list) \
                 and all(isinstance(row, dict) and row.get("conversation_id") == conversation
                         and row.get("source_node") == a.device_id and row.get("scope") == {"kind": "main"}
@@ -5288,9 +5431,10 @@ def acceptance(options):
                 and all(isinstance(conflict, dict) for conflict in remote["memory_conflicts"]),
                 "C receives the owner's typed context and Memory metadata")
         require(remote["context"] == view["scheduler"]["context"]
-                and remote["memory_staged_count"] == view["bot_settings"]["memory_staged_count"]
-                and remote["memory_conflicts"] == view["bot_settings"]["memory_conflicts"],
-                "C uses the owner's context and Memory from the same response")
+                and view["bot_settings"]["memory_staged_count"] == 0
+                and view["bot_settings"]["memory_conflicts"] == []
+                and scheduler_records(c, network) == [],
+                "C shows the owner's context while retaining its own empty local Memory and scheduler state")
         require(view["observation_targets"] == [a.device_id] and view["scheduler"]["capabilities"]["cancel"] is True,
                 "C follows A's progress and offers A's stop")
         wait_for("C receives the text A's reply streams", lambda: [
@@ -5300,7 +5444,7 @@ def acceptance(options):
         require(receipt.get("cancel_requested") is True and receipt.get("owner") == a.device_id, "C's stop is carried out by A")
         wait_for("A stops its reply", lambda: (scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled")
         stopped = wait_for("C shows the stopped reply", lambda: [
-            row for row in at_c.rpc("conversation", conversation_id=conversation)["messages"]
+            row for row in conversation_snapshot(at_c, conversation, sections=("messages",))["messages"]
             if row.get("in_reply_to") == "m5-stop" and row.get("status") == "stopped"])
         require(sum(row["label"] == "remote-stop" for row in fixture_records(run)) == 1 and scheduler_records(c, network) == [],
                 "the reply ran once on A and C stored none of its jobs")
@@ -5308,9 +5452,16 @@ def acceptance(options):
         unconfirmed = at_c.rpc("cancel_manager", conversation_id=conversation, trigger=held["trigger"])
         require(unconfirmed == {"cancel_requested": False, "unconfirmed": True, "owner": a.device_id},
                 "a stop A does not answer is unconfirmed")
-        away = at_c.rpc("conversation", conversation_id=conversation)["scheduler"]
-        require(away["remote"] == {"owner": a.device_id, "reachable": False}
-                and not any(row.get("source_node") for row in away["jobs"]), "C shows A's state as unknown, not stale")
+        away_view = conversation_snapshot(at_c, conversation)
+        away = away_view["scheduler"]
+        require(away["remote"] == {"owner": a.device_id, "reachable": False, "jobs": [], "scope_jobs": [],
+                                  "memory_conflicts": [], "memory_staged_count": None, "context": None, "manager": None}
+                and not any(row.get("source_node") for row in away["jobs"])
+                and all(away_view["history"][section]["complete"] is False
+                        and isinstance(away_view["history"][section]["next_cursor"], str)
+                        and away_view["history"][section]["next_cursor"]
+                        for section in ("owner_jobs", "owner_scope_jobs", "owner_memory_conflicts")),
+                "C keeps unavailable owner observations empty and incomplete without claiming local jobs as A's")
         a.start()
         a.client.connect()
         a.client.authenticate()
@@ -5394,7 +5545,7 @@ def phase4_acceptance(options):
         return next(row for row in records(node) if row["trigger"] == trigger)
 
     def works(client):
-        return {row["work_id"]: row for row in client.rpc("conversation", conversation_id=conversation)["works"]}
+        return {row["work_id"]: row for row in conversation_snapshot(client, conversation, sections=("works",))["works"]}
 
     def delivery(client, work_id):
         rows = client.rpc("conversation", conversation_id=conversation)["deliveries"]
@@ -5491,11 +5642,13 @@ def phase4_acceptance(options):
                    "owner_attestation": a.client.command("attest", network_id=network, scope_id=conversation, body={
                        "type": "conversation_owner", "scheduler_node": a.device_id, "epoch": 1}),
                    "attestation": a.client.attestation("create_bot", dict(definition))}
-        at_p.command("drop", method="rpc", params=request)
+        lost_reply = at_p.command("drop_response", method="rpc", params=request)
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "P's successful creation reply is discarded before the application receives its body")
         at_p.connect(p.device_id)
         at_p.authenticate()
         at_b = browser(b)
-        wait_for("P's creation, whose answer was lost, reaches B", lambda: any(
+        wait_for("P's committed creation, whose application reply was discarded, reaches B", lambda: any(
             bot["bot_id"] == "p4-bot" for bot in at_b.rpc("bots")["bots"]), timeout=60)
         retried = at_b.call("rpc", request)["bot"]
         original = next(bot for bot in definitions_of(at_p.rpc("bots")["bots"]) if bot["bot_id"] == "p4-bot")
@@ -5503,7 +5656,8 @@ def phase4_acceptance(options):
         wait_for("the conversation reaches A", lambda: converged(members, network), timeout=60)
         owners = {client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] for client in (a.client, at_b, at_p)}
         require(owners == {a.device_id}, "every entrance records the owner the browser signed")
-        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A")
+        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A",
+               reply_boundary="discarded_before_application")
 
         first_dir = folder("p4-first", released=True)
         side_effect = workspace / "p4-side-effect.txt"
@@ -5535,7 +5689,7 @@ def phase4_acceptance(options):
         wait_for("all entrances converge", lambda: converged(members, network), timeout=60)
 
         def same_views():
-            seen = [[(row["message_id"], row["text"]) for row in client.rpc("conversation", conversation_id=conversation)["messages"]]
+            seen = [[(row["message_id"], row["text"]) for row in conversation_snapshot(client, conversation, sections=("messages",))["messages"]]
                     for client in (a.client, at_b, at_p)]
             return seen[0] if seen[0] == seen[1] == seen[2] else None
         shown = wait_for("every entrance shows the same conversation", same_views, timeout=30)
@@ -5668,7 +5822,7 @@ def phase4_acceptance(options):
                 and refused.get("code") == "input_not_saved" and refused.get("message_id") == "p4-unsigned",
                 "an unsigned input returns a typed refusal before persistence")
         require_quiet("the unsigned input creates no shared message or provider call on any execution Node", lambda:
-            not any(row["message_id"] == "p4-unsigned" for row in a.client.rpc("conversation", conversation_id=conversation)["messages"])
+            not any(row["message_id"] == "p4-unsigned" for row in conversation_snapshot(a.client, conversation, sections=("messages",))["messages"])
             and all(len(records(node)) == unsigned_calls[node.name] for node in (a, b, c))
             and all(not any(row.get("message_id") == "p4-unsigned" for row in records(node, "codex-inputs.jsonl"))
                     for node in (a, b, c)))
@@ -5826,7 +5980,7 @@ def phase4_acceptance(options):
         require(file_sha256(stored) == digest and 0 < kept < size, "B resumes the download and verifies its hash")
         at_b.connect(b.device_id)
         wait_for("the browser reconnects to the restarted B", lambda: at_b.authenticate())
-        shown = next(row for row in at_b.rpc("conversation", conversation_id=conversation)["messages"] if row["message_id"] == "p4-attachment")
+        shown = next(row for row in conversation_snapshot(at_b, conversation, sections=("messages",))["messages"] if row["message_id"] == "p4-attachment")
         require(shown["attachments"] == [{"hash": digest, "size": size, "name": "p4 附件.bin"}],
                 "the message carries its named attachment on every entrance")
         download, offset, pages = hashlib.sha256(), 0, 0
@@ -5953,7 +6107,7 @@ def public_node_acceptance(options):
                   project={"target_node": m.device_id, "cwd": str(workspace)})
         phone.rpc("message", conversation_id=conversation, message_id="pe-1", text="你好")
         wait_for("M answers the phone", lambda: any(row["role"] == "assistant" for row in
-                 phone.rpc("conversation", conversation_id=conversation)["messages"]), timeout=60)
+                 conversation_snapshot(phone, conversation, sections=("messages",))["messages"]), timeout=60)
         passed("browser-chats-through-the-public-node")
 
         phone.close()
@@ -5963,7 +6117,7 @@ def public_node_acceptance(options):
         phone.authenticate(network)
         phone.rpc("message", conversation_id=conversation, message_id="pe-2", text="又来了")
         wait_for("M answers after the reconnect", lambda: sum(row["role"] == "assistant" for row in
-                 phone.rpc("conversation", conversation_id=conversation)["messages"]) >= 2, timeout=60)
+                 conversation_snapshot(phone, conversation, sections=("messages",))["messages"]) >= 2, timeout=60)
         passed("browser-reconnects-after-the-public-node-restarts")
 
         wait_for("M's Main scheduler settles before the hook producer", lambda:
@@ -5979,7 +6133,7 @@ def public_node_acceptance(options):
             (row for row in fixture_records(fixture, "manager-native-work.jsonl")
              if row["label"] == "pe-work" and row["trigger"] == "message:pe-3"), None), timeout=60)
         source = wait_for("M's exact Work records its Codex thread and turn", lambda: next(
-            (row for row in phone.rpc("conversation", conversation_id=conversation)["works"]
+            (row for row in conversation_snapshot(phone, conversation, sections=("works",))["works"]
              if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
              and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
         require(source["trigger"] == "message:pe-3" and source["target_node"] == m.device_id
@@ -6651,7 +6805,7 @@ def auto_route_acceptance(options):
                         and refused.get("code") == "input_not_saved" and refused.get("message_id") == unsigned["message_id"],
                         f"{kind} input returns a typed refusal before persistence")
         require_quiet("invalid signatures create no shared input or provider execution", lambda:
-            not any(row["message_id"] == unsigned["message_id"] for row in target.client.rpc("conversation", conversation_id=conversation)["messages"])
+            not any(row["message_id"] == unsigned["message_id"] for row in conversation_snapshot(target.client, conversation, sections=("messages",))["messages"])
             and not fixture_records(run)
             and not any(row.get("message_id") == unsigned["message_id"] for row in fixture_records(run, "codex-inputs.jsonl")))
         passed("attestation-required", refused=["unsigned", "other-device", "changed-text"])
@@ -6662,13 +6816,15 @@ def auto_route_acceptance(options):
                     "report_results": False}
         target.client.message_arguments(original)
         signed = {**original, "attestation": target.client.attestation("message", dict(original))}
-        target.client.command("drop", method="rpc", params={"method": "message", **signed})
+        lost_reply = target.client.command("drop_response", method="rpc", params={"method": "message", **signed})
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "the durable input reply is discarded before the application receives its body")
         marker = workspace / "auto-route-count.txt"
-        wait_for("exactly one Agent write starts after the dropped send", lambda:
+        wait_for("exactly one Agent write starts after the committed input's application reply is discarded", lambda:
                  marker.exists() and marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         target.client.connect()
         target.client.authenticate()
-        snapshot = target.client.rpc("conversation", conversation_id=conversation)
+        snapshot = conversation_snapshot(target.client, conversation)
         require(any(row["message_id"] == original["message_id"] for row in snapshot["messages"]),
                 "after reconnecting, the business ID shows the write was recorded")
         trigger = invocations(run, "auto-route")[0]["trigger"]
@@ -6676,7 +6832,8 @@ def auto_route_acceptance(options):
         require(duplicate["trigger"] == trigger, "resubmitting the unchanged signed request returns the original job")
         require_quiet("a same-ID resubmission never repeats the host write", lambda:
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
-        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
+        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1,
+               reply_boundary="discarded_before_application")
 
         joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
@@ -6695,7 +6852,7 @@ def auto_route_acceptance(options):
         wait_for("the second Gateway forwards to the target", lambda: through.authenticate())
         require(through.call("info")["device_id"] == target.device_id, "Noise ends at the target behind the other Gateway")
         require(any(row["message_id"] == original["message_id"]
-                    for row in through.rpc("conversation", conversation_id=conversation)["messages"]),
+                    for row in conversation_snapshot(through, conversation, sections=("messages",))["messages"]),
                 "the forwarded channel reads the target's conversation")
         stranger = fresh(joining.url)
         refused = stranger.connect(stranger.own_id(), check=False)
@@ -6802,6 +6959,32 @@ def delivery_free_state(nodes, spy):
     require(wallets == 0 and transactions == 0 and spy.calls == 0,
             "the free mesh and charity create no wallet, transactions or chain RPC calls")
     return {"wallet_files": wallets, "transaction_rows": transactions, "chain_rpc_calls": spy.calls}
+
+
+def require_disabled_delivery(node, state):
+    require(state["availability"] == {"state": "disabled"}
+            and state["enabled"] is False and state["paid_enabled"] is False,
+            "object delivery starts disabled with paid delivery inactive")
+    # Disabled delivery defers opening the independent keystore, so it cannot claim the
+    # loaded-wallet state `absent`. Other Unavailable reasons must still fail this check.
+    require(state["wallet"] == {
+        "state": "unavailable",
+        "reason": "delivery wallet is inactive until paid delivery is enabled",
+        "address": None,
+    } and state["receiver_key"] is None,
+            "disabled object delivery keeps its wallet and receiving key inactive")
+    require(not os.path.lexists(node.directory / "delivery-wallet.json")
+            and not os.path.lexists(node.directory / "delivery"),
+            "disabled object delivery creates no independent wallet or service store")
+
+
+def delivery_public_report(report):
+    public = {"status": report["status"], "mode": report["mode"],
+              "binary_sha256": report["binary_sha256"], "profile_sha256": report["profile_sha256"],
+              "passed_cases": sorted(report["cases"])}
+    if "failure" in report:
+        public["failure"] = {"type": report["failure"]["type"]}
+    return public
 
 
 def delivery_call(node, op, **params):
@@ -6921,13 +7104,17 @@ def delivery_charity_acceptance(options):
                            for node in (source, receiver)}
         for node in (source, receiver):
             state = call(node, "status")
-            require(state["enabled"] is False and state["wallet"]["state"] == "absent",
-                    "object delivery starts disabled with no independent wallet")
+            require_disabled_delivery(node, state)
         everyone = {node.device_id for node in nodes}
         wait_for("every Node learns every record through the free mesh", lambda: all(
             {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]} == everyone for node in nodes),
             timeout=90)
-        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone))
+        for node in (source, receiver):
+            require_disabled_delivery(node, call(node, "status"))
+        service_stores = sum(os.path.lexists(node.directory / "delivery") for node in nodes)
+        require(service_stores == 0, "the disabled mesh creates no delivery service stores on any Node")
+        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone),
+               service_store_directories=service_stores)
         for node in (source, receiver):
             state = call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
             require(state["enabled"] and not state["paid_enabled"], "manager explicitly enables charity")
@@ -7038,6 +7225,7 @@ def delivery_charity_acceptance(options):
             node.stop()
         spy.close()
         private_json(run / "summary.json", report)
+        private_json(run / "report.json", delivery_public_report(report))
         print("Delivery report: " + str(run / "summary.json"), flush=True)
     return report
 
@@ -7359,7 +7547,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                             "native running input preserves its accepted trigger")
                     wait_for("native running input reaches its actual job state", lambda:
                         any(job["trigger"] == running["trigger"] and job["state"] == "running"
-                            for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                            for job in conversation_snapshot(client, native_queue["conversation_id"], sections=("jobs",))["scheduler"]["jobs"]))
                     wait_for("the native queue has one positive controlled invocation", lambda:
                         len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
                              and row["trigger"] == native_queue["running_trigger"]]) == 1)
@@ -7378,7 +7566,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                     settings = client.call("node_settings")
                     provider = next(item for item in settings["providers"] if item["provider"] == "codex")
                     manager = settings["settings"]["manager"]
-                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    jobs = conversation_snapshot(client, native_queue["conversation_id"], sections=("jobs",))["scheduler"]["jobs"] if native_queue else []
                     inputs = client.rpc("workspace_state")["inputs"] if native_queue else []
                     deferred_input = next((row for row in inputs
                         if row["input"]["message_id"] == native_queue["deferred_message_id"]), None) if native_queue else None
@@ -7450,6 +7638,7 @@ if __name__ == "__main__":
         parser.add_argument("--npm-baseline", type=Path, help="the public baseline artifact pinned once for this candidate")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
+        modes.add_argument("--conversation-history", action="store_true", help="check bounded conversation history through a real isolated Core process")
         modes.add_argument("--npm-service", action="store_true", help="check real npm user services only on a fresh GitHub-hosted POSIX runner")
         modes.add_argument("--npm-baseline-pin", action="store_true", help="pin one public same-epoch npm baseline and its complete product provenance")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
@@ -7463,6 +7652,7 @@ if __name__ == "__main__":
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--client-response-drop-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check the free mesh, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="retired Strict full-delivery runner; fails explicitly without starting paid work")
         modes.add_argument("--delivery-protected", action="store_true", help="run fresh two-order protected budgets with five genuine receipts in the bounded Linux proof sandbox")
@@ -7482,7 +7672,8 @@ if __name__ == "__main__":
         try:
             needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
                                  or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin
-                                 or arguments.delivery or arguments.delivery_protected_selfcheck)
+                                 or arguments.delivery or arguments.delivery_protected_selfcheck
+                                 or arguments.client_response_drop_selfcheck)
             if needs_process:
                 require(arguments.binary is not None, "--binary is required for Node process acceptance")
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
@@ -7511,6 +7702,8 @@ if __name__ == "__main__":
                 native_provider_selfcheck(arguments)
             elif arguments.native_clipboard_selfcheck:
                 native_clipboard_selfcheck(arguments)
+            elif arguments.client_response_drop_selfcheck:
+                client_response_drop_selfcheck()
             elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.delivery_protected_selfcheck:
@@ -7534,6 +7727,9 @@ if __name__ == "__main__":
                 phase4_acceptance(arguments)
             elif arguments.auto_route:
                 auto_route_acceptance(arguments)
+            elif arguments.conversation_history:
+                from conversation_history_probe import conversation_history_acceptance
+                conversation_history_acceptance(arguments, sys.modules[__name__])
             elif arguments.npm_service:
                 npm_service_acceptance(arguments)
             elif arguments.web_only:

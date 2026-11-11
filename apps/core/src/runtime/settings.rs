@@ -839,29 +839,29 @@ impl Runtime {
         if !active.is_empty() || self.triage.turn.try_lock().is_err() {
             return Ok(false);
         }
-        let store = self.store.lock().await;
-        let busy_work = match store.work_records() {
-            Ok(works) => works.iter().any(|work| {
-                matches!(
-                    work.kind,
-                    crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
-                ) && !work.state.finished()
-            }),
+        let busy = self
+            .store
+            .call("settings.busy_provider_work", move |store| {
+                let busy_work = store.work_records()?.iter().any(|work| {
+                    matches!(
+                        work.kind,
+                        crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
+                    ) && !work.state.finished()
+                });
+                let busy_job = store.scheduler_jobs_all()?.iter().any(|job| {
+                    matches!(
+                        job.state.name(),
+                        "claimed" | "running" | "cancelling" | "reconciling" | "steering"
+                    )
+                });
+                Ok(busy_work || busy_job)
+            })
+            .await;
+        match busy {
+            Ok(false) => {}
+            Ok(true) => return Ok(false),
             Err(error) => return Err(error),
-        };
-        let busy_job = match store.scheduler_jobs_all() {
-            Ok(jobs) => jobs.iter().any(|job| {
-                matches!(
-                    job.state.name(),
-                    "claimed" | "running" | "cancelling" | "reconciling" | "steering"
-                )
-            }),
-            Err(error) => return Err(error),
-        };
-        if busy_work || busy_job {
-            return Ok(false);
         }
-        drop(store);
         if let Some(projected) = Config::load(&self.data_dir)?.codex_config
             && ProviderRoots::new(&self.data_dir).publish_codex_config(&projected)?
         {
@@ -1184,11 +1184,16 @@ impl Runtime {
         );
         let body = crate::model::EventBody::QuestionAsked {
             question_id: question_id.clone(),
-            target: self
-                .store
-                .lock()
-                .await
-                .trigger_input_target(network, scope, trigger)?,
+            target: {
+                let network = network.to_owned();
+                let scope = scope.to_owned();
+                let trigger = trigger.to_owned();
+                self.store
+                    .call("settings.trigger_input_target", move |store| {
+                        store.trigger_input_target(&network, &scope, &trigger)
+                    })
+                    .await
+            }?,
             attention: crate::model::AttentionRequest {
                 kind: crate::model::AttentionKind::Approval,
                 device_id: Some(device.clone()),
@@ -1211,11 +1216,16 @@ impl Runtime {
             },
         };
         let mut proposals = self.provider_proposals.lock().await;
-        let (_, written) =
+        let (_, written) = {
+            let identity = self.identity.to_owned();
+            let network = network.to_owned();
+            let scope = scope.to_owned();
             self.store
-                .lock()
+                .call("settings.ask", move |store| {
+                    store.ask(&identity, &network, &scope, body, super::now_ms())
+                })
                 .await
-                .ask(&self.identity, network, scope, body, super::now_ms())?;
+        }?;
         if let Some(event) = &written {
             tracing::info!(event = "question.asked", conversation_id = scope, question_id, filled = ?paths.names(), roots = roots.len(), "provider paths proposed");
             self.publish_changed(network, scope, super::Changed::Event(&event.hash));
@@ -1303,12 +1313,16 @@ impl Runtime {
         if let Some(outcome) = &proposal.outcome {
             return Ok(outcome.clone());
         }
-        let question = self
-            .store
-            .lock()
-            .await
-            .question(network, question_id)?
-            .context("the proposal's question is missing")?;
+        let question = {
+            let network = network.to_owned();
+            let question_id = question_id.to_owned();
+            self.store
+                .call("settings.question", move |store| {
+                    store.question(&network, &question_id)
+                })
+                .await
+        }?
+        .context("the proposal's question is missing")?;
         let answer = question["answer"]["text"]
             .as_str()
             .context("the user has not answered yet; apply it in the turn their answer starts")?

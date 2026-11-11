@@ -8,7 +8,7 @@ import {
 } from '@/components/ui/message-scroller'
 import { useMessageScroller } from '@shadcn/react/message-scroller'
 
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { cn } from '@/lib/utils'
 import { Message, type ChatMessage } from './message'
@@ -26,6 +26,34 @@ function ToUnread({ shown }: { shown: boolean }) {
 }
 
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {
+  const viewport = useRef<HTMLDivElement>(null)
+  const visibleAnchor = useRef<{ key: string; offset: number } | null>(null)
+  const [reading, setReading] = useState(false)
+  const captureAnchor = () => {
+    const view = viewport.current
+    if (!view) return
+    const away = view.scrollHeight - view.clientHeight - view.scrollTop > 96
+    setReading(away)
+    if (!away) { visibleAnchor.current = null; return }
+    const top = view.getBoundingClientRect().top
+    const row = [...view.querySelectorAll<HTMLElement>('[data-history-key]')].find((item) => item.dataset.historyKey !== 'history-controls' && item.getBoundingClientRect().bottom > top)
+    if (row?.dataset.historyKey) visibleAnchor.current = { key: row.dataset.historyKey, offset: row.getBoundingClientRect().top - top }
+  }
+  const restoreAnchor = () => {
+    const view = viewport.current, anchor = visibleAnchor.current
+    if (!view || !anchor) return
+    const row = [...view.querySelectorAll<HTMLElement>('[data-history-key]')].find((item) => item.dataset.historyKey === anchor.key)
+    if (row) view.scrollTop += row.getBoundingClientRect().top - view.getBoundingClientRect().top - anchor.offset
+  }
+  useLayoutEffect(() => { restoreAnchor() }, [entries])
+  useEffect(() => {
+    const view = viewport.current
+    if (!view) return
+    const content = view.querySelector('[data-slot="message-scroller-content"]')
+    const observer = new ResizeObserver(restoreAnchor)
+    if (content) observer.observe(content)
+    return () => observer.disconnect()
+  }, [entries.length === 0])
   // MessageScroller scrolls to the first anchored item it has not aligned yet. Only a user message sent after the
   // chat opened is an anchor, so opening a chat stays at its newest entry and a send still lands at the bottom.
   const newest = entries.map((entry) => entry.anchor === true).lastIndexOf(true)
@@ -58,13 +86,13 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
 
   return (
     // The button shows only once the last line has scrolled out of view, so it never covers it.
-    <MessageScrollerProvider autoScroll scrollEdgeThreshold={96}>
+    <MessageScrollerProvider autoScroll={!reading} scrollEdgeThreshold={96}>
       <MessageScroller className="h-auto min-h-24 flex-1">
-        <MessageScrollerViewport aria-label="聊天记录">
+        <MessageScrollerViewport ref={viewport} onScroll={captureAnchor} aria-label="聊天记录">
           {/* Room for a toast over the composer, so the last card can scroll clear of it. */}
           <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 pt-6 pb-[calc(1.5rem+var(--toast-cover,0px))] sm:px-6">
             {entries.map((entry, index) => (
-              <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && 'mt-6', entered.current.has(entry.key) && 'message-enter')}>
+              <MessageScrollerItem data-history-key={entry.key} key={entry.key} messageId={entry.key} scrollAnchor={!reading && index === anchor || undefined} className={cn(index > 0 && 'mt-6', entered.current.has(entry.key) && 'message-enter')}>
                 {'message' in entry ? <Message message={entry.message} conversationId={entry.conversationId} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} /> : entry.node}
               </MessageScrollerItem>
             ))}

@@ -1,0 +1,34 @@
+[package]
+name = "vibeface-desktop"
+version = "0.0.1-nightly.20261110.3"
+edition.workspace = true
+rust-version = "1.98.1"
+
+[features]
+native-ui-tests = ["gpui-kit/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+futures-util.workspace = true
+gpui-kit = "=0.9.1"
+markdown = "=1.0.0"
+png = "=0.18.1"
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
+uuid.workspace = true
+vibeface-bridge.workspace = true
+vibeface-client.workspace = true
+vibeface-control.workspace = true
+vibeface-protocol.workspace = true
+vibeface-secure = { path = "../../crates/secure" }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true

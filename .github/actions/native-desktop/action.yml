@@ -1,0 +1,38 @@
+name: Native GPUI desktop dependencies
+description: Set up native platform libraries and package tools on disposable hosted runners
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/ubuntu-apt
+      if: runner.os == 'Linux'
+      with:
+        apply: 'true'
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      with:
+        toolchain: '1.98.1'
+        components: rustfmt, clippy
+    - name: Install Linux native libraries and package tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libasound2-dev libudev-dev libvulkan-dev libclang-dev libssl-dev libzstd-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libx11-dev libxext-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-xinput-dev libxcb-cursor-dev libxcb-sync-dev libxcb-present-dev libxcb-dri3-dev xvfb xauth xdotool imagemagick fonts-noto-cjk mesa-vulkan-drivers patchelf squashfs-tools
+        architecture="$(uname -m)"
+        case "$architecture" in
+          x86_64) digest=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
+          aarch64) digest=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158 ;;
+          *) exit 1 ;;
+        esac
+        tool="$RUNNER_TEMP/appimagetool-$architecture.AppImage"
+        curl --fail --location --retry 3 "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$architecture.AppImage" --output "$tool"
+        printf '%s  %s\n' "$digest" "$tool" | sha256sum --check
+        chmod +x "$tool"
+        printf 'APPIMAGETOOL=%s\n' "$tool" >> "$GITHUB_ENV"
+    - name: Locate the Windows per-user installer compiler
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $compiler = 'C:\Program Files (x86)\NSIS\makensis.exe'
+        if (-not (Test-Path $compiler)) { choco install nsis --version=3.11 --yes --no-progress }
+        if (-not (Test-Path $compiler)) { throw 'The hosted runner has no NSIS compiler' }
+        "MAKENSIS=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

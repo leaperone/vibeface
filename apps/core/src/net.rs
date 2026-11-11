@@ -886,16 +886,32 @@ pub struct RelayServer {
     front: Front,
 }
 
-struct Front(tokio::task::JoinHandle<()>);
+struct Front(Option<tokio::task::JoinHandle<()>>);
+impl Front {
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.0.as_mut() {
+            // Keep ownership during the await so cancellation still reaches the Drop fallback.
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(event = "relay.front_shutdown_failed", %error);
+            }
+            drop(self.0.take());
+        }
+    }
+}
 impl Drop for Front {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
 impl RelayServer {
-    pub async fn shutdown(self) {
-        drop(self.front);
+    pub async fn shutdown(mut self) {
+        self.front.shutdown().await;
         let _ = self.server.shutdown().await;
     }
 }
@@ -930,7 +946,9 @@ pub async fn spawn_relay(
     Ok(RelayServer {
         server,
         addr: listener.local_addr()?,
-        front: Front(tokio::spawn(relay_front(listener, relay, per_ip, usage))),
+        front: Front(Some(tokio::spawn(relay_front(
+            listener, relay, per_ip, usage,
+        )))),
     })
 }
 

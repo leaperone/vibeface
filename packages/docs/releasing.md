@@ -22,13 +22,13 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。各组通过本地校验后，按自己独占的文件集合向同一个公开 Release 追加附件，供用户先手动下载。`collect` 同时在后台审计完整产品制品，最终任务核对全部公开字节并最后追加全局 `release.json`。文件集合包含所有平台安装包、校验和、来源收据及可选的签名 IPA。缺失、错源、损坏或失败目标会阻止整套完成标记、自动更新、npm 和部署，不把部分可下载当作整套完成。
 
-`COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
+`COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。Desktop 的原生来源收据 schema 为 2，要求 `ui=gpui`、固定 `gpui_kit` 与 `gpui` 版本。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
 ## 每 4 小时 Nightly 的发布约束
 
 协调入口是 `nightly.yml`（Release / Nightly）的 `daily-nightly`。配置保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每个槽位都发生。它先调用一次完整标准 Core，再由根级 `ci-gate` 验证结果。仅 main schedule 的 gate 成功后启动自动 Nightly。手动 Core、手动 Nightly 和普通 main push 不启动发布协调器，手动验证不能补发 Nightly。
 
-协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对两个本仓包的清单版本，带 `--no-deps` 时不校验锁文件，`Cargo.lock` 的内容由完整 tree 比对覆盖。仅路径白名单不能放行发布。
+协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 三个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对 Core、CLI、Desktop 三个本仓包的清单版本，带 `--no-deps` 时不校验锁文件，`Cargo.lock` 的内容由完整 tree 比对覆盖。仅路径白名单不能放行发布。
 
 原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，或经 main 明确审查弃用后由下一批分配新版本，不覆盖原来源。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
 
@@ -95,11 +95,13 @@ cd vibeface-<version>-<target>
 
 ## CI 验证范围
 
+CLI 与 Core 的最低 Rust 版本保持 `1.91`。GPUI Desktop 单独使用 Rust `1.98.1` 编译与验收，不改变无图形组件的最低版本要求。
+
 `crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA。Core 从 `VIBEFACE_APP_DIR` 或发行包同级 `web/` 读取完整静态目录，不在编译时内嵌网页或 WASM。Core 可独立构建和运行，未提供 App 时网页返回 404；App 构建和完整发行包缺少资源时失败。
 
 质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`packages/docs/` 触发门户构建；`main` 的纯 App 改动只构建 Linux x64 包并验收网页资源，不运行 Core 库业务测试。`main` 保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和四平台制品在扩展检查执行。`ci-gate` 要求本次计划中的任务全部成功。
 
-打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。安装包不含 Provider SDK，验收不安装或导入 Provider SDK，也不开启模型会话。
+打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。运行包不携带或安装 Provider SDK 桥接依赖。Provider CLI 由用户另行安装和配置；CI 使用受控协议夹具，不调用真实模型。
 
 源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
@@ -235,7 +237,7 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 
 ## 桌面与 Windows 签名
 
-每个平台的桌面任务只等待自身完整运行包。macOS 生成 DMG 和 ZIP，Windows 生成当前用户安装的 NSIS EXE 和 ZIP，Linux 生成 AppImage 和 ZIP。Linux 的完整性由 SHA256 与来源收据验证，不声明平台厂商签名。每组制品携带 SHA256 与来源收据，记录 Electron 版本、产品版本、源码和内置运行包摘要。打包后再次核对运行包的 `FILES.sha256`，禁止 Electron 重新签名或改写已经封存的 CLI 与 Core。
+每个平台的桌面任务只等待自身完整运行包。macOS 生成 DMG 和 ZIP，Windows 生成当前用户安装的 NSIS EXE 和 ZIP，Linux 生成 AppImage 和 ZIP。Linux 的完整性由 SHA256 与来源收据验证，不声明平台厂商签名。每组制品携带 SHA256 与来源收据，记录原生 GPUI/Kit 固定版本、产品版本、源码和内置运行包摘要。打包后再次核对运行包的 `FILES.sha256`，禁止桌面打包器重新签名或改写已经封存的 CLI 与 Core。
 
 Windows 原生 CLI 和 Core 使用静态 MSVC CRT，构建后检查 PE 导入表，拒绝对未随包提供的 `VCRUNTIME`、`MSVCP` 或 `CONCRT` DLL 的依赖。
 
@@ -253,3 +255,5 @@ iOS 与 Android、桌面和原生程序独立并行构建。`release-ios.yml` �
 配置 `IOS_CERTIFICATE_P12_BASE64`、`IOS_CERTIFICATE_PASSWORD` 和 `IOS_PROVISIONING_PROFILE_BASE64` 后，工作流可签名并导出 IPA。三项必须完整，证书须为匹配 App 与 team 的 Apple Distribution 身份。Stable 产品在缺少该配置时提前失败。macOS Developer ID 证书和公证 API key 不能替代 iOS 签名材料。
 
 默认导出 `app-store-connect` IPA，收据为 `testflight_eligible=true`、`installable=false`。这只记录导出方式与描述文件校验结果，不代表 Apple 已接收。内测安装仍需另行授权上传、等待 Apple 处理，并分配到 TestFlight 内部测试组。`ad-hoc` 仅适用于描述文件中已注册的设备，收据才标记 `installable=true`。本流程只构建和校验，不上传到 TestFlight 或 App Store。详见 [iOS 构建与分发](ios.md)。
+
+离线文档由 `scripts/offline-docs.json` 与 `scripts/offline-docs.py` 统一组装，三个运行包入口使用相同清单和链接改写；发布前执行 `python3 -B scripts/offline-docs.py --self-test` 检查组装后的本地链接。

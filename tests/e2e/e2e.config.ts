@@ -9,7 +9,7 @@ const { web } = await import('@e2e-dev/web');
 const browserEndpoint = process.env.VIBEFACE_E2E_BROWSER_ENDPOINT;
 
 export default {
-  tests: ['*.e2e.ts'],
+  tests: ['*.e2e.ts', '!native-desktop.e2e.ts'],
   targets: [{
     name: 'chromium',
     engine: web(browserEndpoint ? { connect: { cdpEndpoint: () => browserEndpoint } } : {}),

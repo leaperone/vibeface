@@ -84,4 +84,3 @@ jobs:
           if failed: raise SystemExit('Native mobile builds are incomplete: ' + json.dumps(failed))
           print('Selected native mobile application builds passed')
           PYTHON
-

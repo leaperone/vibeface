@@ -1,0 +1,713 @@
+use crate::{
+    app::Desktop,
+    ui::*,
+    views::{backend::Command, forms::Editor},
+};
+use gpui_kit::{component::button::Button, *};
+use std::collections::BTreeMap;
+use vibeface_protocol::workspace::{TaskAction, WorkspaceCommand};
+
+impl Desktop {
+    pub(crate) fn bot_context_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut header = div().flex().flex_wrap().gap_2().child(
+            self.selected_bot()
+                .map(|bot| format!("当前Bot：{}", bot.name))
+                .unwrap_or_else(|| "先选择要查看的Bot。".into()),
+        );
+        for bot in &self.snapshot.bots {
+            let conversation_id = bot.conversation_id.clone();
+            let generation = self.snapshot.generation;
+            let network = self.snapshot.network.clone();
+            header = header.child(
+                Button::new(SharedString::from(format!("select-context-{}", bot.bot_id)))
+                    .label(bot.name.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.same_view_scope(generation, &network) {
+                            this.selected = Some(conversation_id.clone());
+                            this.send(Command::Conversation(conversation_id.clone()), cx);
+                        }
+                    })),
+            );
+        }
+        header.into_any_element()
+    }
+    pub(crate) fn home(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = self.page().child(self.open_editor(
+            "create-bot",
+            "新建 Bot",
+            Editor::CreateBot,
+            BTreeMap::new(),
+            cx,
+        ));
+        for bot in &self.snapshot.bots {
+            page = page.child(
+                self.row(
+                    bot.name.clone(),
+                    bot.busy
+                        .clone()
+                        .map(|busy| {
+                            if busy == "thinking" {
+                                String::from("正在思考")
+                            } else {
+                                String::from("正在回复")
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            bot.last_message
+                                .as_ref()
+                                .map(|message| message.text.chars().take(100).collect::<String>())
+                                .unwrap_or_else(|| "可以开始对话".into())
+                        }),
+                )
+                .child(format!(
+                    "{} 条未读或待处理",
+                    self.snapshot
+                        .notifications
+                        .iter()
+                        .filter(|note| note.conversation_id == bot.conversation_id
+                            && ["manager_response", "manager_attention", "bot_message"]
+                                .contains(&note.kind.as_str()))
+                        .count()
+                        + self
+                            .snapshot
+                            .questions
+                            .iter()
+                            .filter(|q| q.conversation_id == bot.conversation_id
+                                && q.answer.is_none()
+                                && q.closed.is_none())
+                            .count()
+                ))
+                .child(crate::widgets::avatar::render(
+                    &bot.bot_id,
+                    bot.avatar.as_ref(),
+                ))
+                .child(self.nav_conversation(bot, cx)),
+            );
+        }
+        if self.snapshot.bots.is_empty() {
+            page = page.child(if self.snapshot.synced {
+                "当前网络没有 Bot。新建 Bot 开始。"
+            } else {
+                "尚未读取当前网络的 Bot，连接完成后再确认。"
+            });
+        }
+        page.into_any_element()
+    }
+    pub(crate) fn nav_conversation(&self, bot: &Bot, cx: &mut Context<Self>) -> Button {
+        let id = bot.conversation_id.clone();
+        Button::new(SharedString::from(format!("bot-{}", bot.bot_id)))
+            .label("打开对话")
+            .on_click(cx.listener(move |this, _, _, cx| this.navigate(Route::Chat(id.clone()), cx)))
+    }
+    pub(crate) fn tasks(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = self.page().child(
+            self.open_editor(
+                "create-task",
+                "新建任务",
+                Editor::CreateTask,
+                self.selected_bot()
+                    .map(|bot| BTreeMap::from([("owner_bot", bot.bot_id.clone())]))
+                    .unwrap_or_default(),
+                cx,
+            ),
+        );
+        for task in &self.snapshot.tasks {
+            let values = BTreeMap::from([
+                ("title", task.title.clone()),
+                ("owner_bot", task.owner_bot.clone()),
+                ("request", task.request.clone()),
+                ("expected_result", task.expected_result.clone()),
+                ("dependencies", task.dependencies.join(",")),
+            ]);
+            let mut row = self
+                .row(
+                    task.title.clone(),
+                    format!(
+                        "{} · 修订 {} · 依赖 {}",
+                        task.state,
+                        task.revision,
+                        task.dependencies.join(", ")
+                    ),
+                )
+                .child(task.request.clone())
+                .child(self.open_editor(
+                    SharedString::from(format!("revise-{}", task.task_id)),
+                    "修改任务",
+                    Editor::EditTask(task.task_id.clone(), task.revision),
+                    values,
+                    cx,
+                ));
+            let mut actions = div().flex().gap_2();
+            for (label, action) in [
+                ("继续", TaskAction::Continue),
+                ("停止", TaskAction::Stop),
+                ("延后", TaskAction::Defer),
+                ("取消", TaskAction::Cancel),
+            ] {
+                actions = actions.child(self.button(
+                    SharedString::from(format!("task-{}-{label}", task.task_id)),
+                    label,
+                    Command::Workspace(WorkspaceCommand::ControlTask {
+                        task_id: task.task_id.clone(),
+                        expected_revision: task.revision,
+                        action,
+                    }),
+                    cx,
+                ));
+            }
+            row = row
+                .child(actions)
+                .child(self.open_editor(
+                    SharedString::from(format!("assign-task-{}", task.task_id)),
+                    "分派执行",
+                    Editor::AssignTask(task.task_id.clone(), task.revision),
+                    BTreeMap::from([
+                        ("bot_id", task.owner_bot.clone()),
+                        ("automatic", "false".into()),
+                    ]),
+                    cx,
+                ))
+                .child(
+                    Button::new(SharedString::from(format!("task-history-{}", task.task_id)))
+                        .label("查看任务活动与依赖")
+                        .on_click({
+                            let id = task.task_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.navigate(Route::Task(id.clone()), cx)
+                            })
+                        }),
+                );
+            page = page.child(row);
+        }
+        page.into_any_element()
+    }
+    pub(crate) fn channels(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = self.page().child(self.open_editor(
+            "create-channel",
+            "新建频道",
+            Editor::CreateChannel,
+            BTreeMap::new(),
+            cx,
+        ));
+        for channel in &self.snapshot.channels {
+            let values = BTreeMap::from([
+                ("title", channel.title.clone()),
+                ("purpose", channel.purpose.clone()),
+                ("members", channel.members.join(",")),
+                ("coordinator_bot", channel.coordinator_bot.clone()),
+                ("coordinator_node", channel.coordinator_node.clone()),
+            ]);
+            page = page.child(
+                self.row(
+                    channel.title.clone(),
+                    format!(
+                        "{} · {} 位成员 · 修订 {}",
+                        channel.purpose,
+                        channel.members.len(),
+                        channel.revision
+                    ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "open-channel-{}",
+                        channel.channel_id
+                    )))
+                    .label("打开频道")
+                    .on_click({
+                        let id = channel.channel_id.clone();
+                        cx.listener(move |this, _, _, cx| {
+                            this.navigate(Route::Channel(id.clone()), cx)
+                        })
+                    }),
+                )
+                .child(self.open_editor(
+                    SharedString::from(format!("channel-{}", channel.channel_id)),
+                    "配置频道",
+                    Editor::EditChannel(
+                        channel.channel_id.clone(),
+                        channel.revision,
+                        channel.owner_epoch,
+                    ),
+                    values,
+                    cx,
+                ))
+                .child(self.open_editor(
+                    SharedString::from(format!("post-{}", channel.channel_id)),
+                    "发送频道消息",
+                    Editor::ChannelPost(channel.channel_id.clone()),
+                    BTreeMap::new(),
+                    cx,
+                ))
+                .child(self.button(
+                    SharedString::from(format!("channel-history-{}", channel.channel_id)),
+                    "读取频道历史",
+                    Command::History {
+                        channel_id: Some(channel.channel_id.clone()),
+                        task_id: None,
+                    },
+                    cx,
+                )),
+            );
+        }
+        page.into_any_element()
+    }
+    pub(crate) fn memory(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.selected_conversation_loaded() {
+            return self
+                .page()
+                .child(self.bot_context_header(cx))
+                .child("正在读取所选Bot的记忆，尚未提供可编辑版本。")
+                .into_any_element();
+        }
+        let mut page = self
+            .page()
+            .child(self.bot_context_header(cx))
+            .child(self.open_editor(
+                "memory-create",
+                "新增记忆",
+                Editor::Memory(None),
+                BTreeMap::new(),
+                cx,
+            ));
+        page = page
+            .child(self.history_coverage(vibeface_protocol::history::HistorySection::Memory, cx))
+            .child(self.history_coverage(
+                vibeface_protocol::history::HistorySection::MemoryConflicts,
+                cx,
+            ))
+            .child(self.history_coverage(
+                vibeface_protocol::history::HistorySection::MemorySyncConflicts,
+                cx,
+            ));
+        let settings = &self.snapshot.conversation.bot_settings;
+        page = page.child(format!(
+            "暂存 {} 条，修改记忆采用当前版本比较，不覆盖并发修改。",
+            settings
+                .memory_staged_count
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "数量未知".into())
+        ));
+        for conflict in &settings.memory_sync_conflicts.items {
+            page = page.child(
+                self.row(
+                    "记忆同步冲突",
+                    format!(
+                        "{} · {} · {} 与 {}",
+                        conflict.memory_id,
+                        conflict.reason,
+                        conflict.losing_revision,
+                        conflict.winning_revision
+                    ),
+                )
+                .child(self.button(
+                    SharedString::from(format!("memory-conflict-{}", conflict.memory_id)),
+                    "读取当前版本并比较",
+                    Command::ReadMemory {
+                        conversation_id: self.conversation_id().unwrap_or_default(),
+                        memory_id: conflict.memory_id.clone(),
+                    },
+                    cx,
+                )),
+            );
+        }
+        if settings.memory_sync_conflicts.has_more {
+            page = page.child("还有未读取的同步冲突，可继续读取更早记录。");
+        }
+        for conflict in settings.memory_conflicts.as_deref().unwrap_or(&[]) {
+            page = page.child(self.row(
+                "记忆提交冲突",
+                format!(
+                    "{} · 预期 {} · 当前 {} · {}",
+                    conflict.memory_id,
+                    conflict.expected_revision,
+                    conflict.actual_revision,
+                    conflict.reason
+                ),
+            ));
+        }
+        for memory in &self.snapshot.conversation.bot_settings.memory {
+            page = page.child(
+                self.row(
+                    memory.text.clone(),
+                    format!(
+                        "{} · 版本 {}",
+                        if memory.metadata.user_controlled {
+                            "用户保护"
+                        } else {
+                            "自动记忆"
+                        },
+                        memory.metadata.revision
+                    ),
+                )
+                .child(self.open_editor(
+                    SharedString::from(format!("memory-edit-{}", memory.memory_id)),
+                    "编辑并保护",
+                    Editor::Memory(Some(memory.clone())),
+                    BTreeMap::from([("text", memory.text.clone())]),
+                    cx,
+                ))
+                .child(self.ask(
+                    SharedString::from(format!("memory-delete-{}", memory.memory_id)),
+                    "删除记忆",
+                    Command::DeleteMemory {
+                        conversation_id: self.conversation_id().unwrap_or_default(),
+                        memory: memory.clone(),
+                    },
+                    cx,
+                )),
+            );
+        }
+        page.into_any_element()
+    }
+    pub(crate) fn schedules(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.selected_conversation_loaded() {
+            return self
+                .page()
+                .child(self.bot_context_header(cx))
+                .child("正在读取所选Bot的计划，尚未提供当前列表。")
+                .into_any_element();
+        }
+        let mut page = self
+            .page()
+            .child(self.bot_context_header(cx))
+            .child(self.open_editor(
+                "schedule-create",
+                "新增计划",
+                Editor::Schedule,
+                BTreeMap::new(),
+                cx,
+            ));
+        page = page.child(
+            self.history_coverage(vibeface_protocol::history::HistorySection::Schedules, cx),
+        );
+        for schedule in &self.snapshot.conversation.bot_settings.schedules {
+            page = page.child(
+                self.row(
+                    schedule.name.clone(),
+                    format!(
+                        "{} · 下次执行 {}",
+                        if schedule.enabled {
+                            "运行中"
+                        } else {
+                            "已暂停"
+                        },
+                        schedule
+                            .next_run_at_ms
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "未排定".into())
+                    ),
+                )
+                .child(schedule.prompt.clone())
+                .child(
+                    self.open_editor(
+                        SharedString::from(format!("schedule-edit-{}", schedule.schedule_id)),
+                        "修改计划",
+                        Editor::EditSchedule(schedule.clone()),
+                        BTreeMap::from([
+                            ("name", schedule.name.clone()),
+                            ("prompt", schedule.prompt.clone()),
+                            ("first_run_at_ms", schedule.first_run_at_ms.to_string()),
+                            (
+                                "every_minutes",
+                                schedule
+                                    .every_minutes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default(),
+                            ),
+                        ]),
+                        cx,
+                    ),
+                )
+                .child(self.button(
+                    SharedString::from(format!("schedule-{}", schedule.schedule_id)),
+                    if schedule.enabled { "暂停" } else { "恢复" },
+                    Command::Schedule {
+                        conversation_id: self.conversation_id().unwrap_or_default(),
+                        schedule_id: schedule.schedule_id.clone(),
+                        action: if schedule.enabled { "pause" } else { "resume" }.into(),
+                    },
+                    cx,
+                ))
+                .child(self.ask(
+                    SharedString::from(format!("schedule-delete-{}", schedule.schedule_id)),
+                    "删除计划",
+                    Command::Schedule {
+                        conversation_id: self.conversation_id().unwrap_or_default(),
+                        schedule_id: schedule.schedule_id.clone(),
+                        action: "delete".into(),
+                    },
+                    cx,
+                )),
+            );
+        }
+        page.into_any_element()
+    }
+    pub(crate) fn inbox(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = self.page();
+        for check in &self.snapshot.conversation.checks {
+            page = page.child(
+                self.row("进程状态待确认", check.detail.clone())
+                    .child(self.ask(
+                        SharedString::from(format!("resolve-{}", check.check_id)),
+                        "我已核实进程停止",
+                        Command::ResolveCheck(check.clone()),
+                        cx,
+                    )),
+            );
+        }
+        for note in &self.snapshot.notifications {
+            page = page.child(
+                self.row(note.text.clone(), note.kind.clone())
+                    .child(self.button(
+                        SharedString::from(format!("ack-{}", note.notification_id)),
+                        "标记已读",
+                        Command::Ack(note.clone()),
+                        cx,
+                    ))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "open-note-{}",
+                            note.notification_id
+                        )))
+                        .label("打开目标对话")
+                        .on_click({
+                            let id = note.conversation_id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.navigate(Route::Chat(id.clone()), cx)
+                            })
+                        }),
+                    ),
+            );
+        }
+        for question in self
+            .snapshot
+            .questions
+            .iter()
+            .filter(|q| q.answer.is_none() && q.closed.is_none())
+        {
+            let mut row = self.row(
+                question.text.clone(),
+                "等待你的回复。重复确认使用同一问题标识。",
+            );
+            for choice in &question.choices {
+                row = row.child(self.button(
+                    SharedString::from(format!("q-{}-{}", question.question_id, choice.label)),
+                    choice.label.clone(),
+                    Command::Answer {
+                        conversation_id: question.conversation_id.clone(),
+                        question_id: question.question_id.clone(),
+                        text: choice.label.clone(),
+                    },
+                    cx,
+                ));
+            }
+            page = page.child(row.child(self.open_editor(
+                SharedString::from(format!("answer-{}", question.question_id)),
+                "输入回复",
+                Editor::Answer(
+                    question.question_id.clone(),
+                    question.conversation_id.clone(),
+                ),
+                BTreeMap::new(),
+                cx,
+            )));
+        }
+        for draft in &self.snapshot.drafts {
+            page = page.child(
+                self.row(
+                    "已存本机的输入",
+                    format!("原对话 {}\n{}", draft.conversation_id, draft.text),
+                )
+                .child(self.button(
+                    SharedString::from(format!("resume-{}", draft.fingerprint)),
+                    "继续原输入，保留原任务与标识",
+                    Command::ResumeDraft(draft.fingerprint.clone()),
+                    cx,
+                )),
+            );
+        }
+        for pending in &self.snapshot.pending {
+            let mut row = self.row(
+                "本机操作记录",
+                format!(
+                    "{} · {} · 原目标Node {}",
+                    pending.id, pending.state, pending.target_node
+                ),
+            );
+            if pending.state.contains("结果未知") {
+                row = row
+                    .child(self.button(
+                        SharedString::from(format!("reconcile-{}", pending.id)),
+                        "查询原回执",
+                        Command::Reconcile(pending.id.clone()),
+                        cx,
+                    ))
+                    .child(self.button(
+                        SharedString::from(format!("review-settings-{}", pending.id)),
+                        "核对未知设置操作",
+                        Command::ReviewSettings(pending.id.clone()),
+                        cx,
+                    ));
+            } else if pending.state.contains("等待发送") {
+                row = row.child(self.button(
+                    SharedString::from(format!("send-staged-{}", pending.id)),
+                    "发送这条已存操作",
+                    Command::SendStaged(pending.id.clone()),
+                    cx,
+                ));
+            }
+            page = page.child(row);
+        }
+        page = page.child(self.unknown_settings_review(cx));
+        page.into_any_element()
+    }
+    pub(crate) fn bot_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(bot) = self.selected_bot() else {
+            return self
+                .page()
+                .child("先打开一个 Bot 的对话。 ")
+                .into_any_element();
+        };
+        let mut page = self
+            .page()
+            .child(self.nav(
+                "bot-history",
+                "历史与变更",
+                Route::History(vibeface_protocol::history::HistorySection::Changes),
+                cx,
+            ))
+            .child(self.history_coverage(vibeface_protocol::history::HistorySection::Skills, cx))
+            .child(self.row(bot.name.clone(), bot.instructions.clone()))
+            .child(
+                self.open_editor(
+                    "edit-bot",
+                    "编辑 Bot",
+                    Editor::EditBot,
+                    BTreeMap::from([
+                        ("name", bot.name.clone()),
+                        ("instructions", bot.instructions.clone()),
+                        (
+                            "target_node",
+                            bot.project
+                                .as_ref()
+                                .map(|p| p.target_node.clone())
+                                .unwrap_or_default(),
+                        ),
+                        (
+                            "cwd",
+                            bot.project
+                                .as_ref()
+                                .map(|p| p.cwd.clone())
+                                .unwrap_or_default(),
+                        ),
+                    ]),
+                    cx,
+                ),
+            )
+            .child(
+                self.open_editor(
+                    "edit-avatar",
+                    "编辑头像",
+                    Editor::Avatar,
+                    BTreeMap::from([
+                        (
+                            "outline",
+                            serde_json::to_value(
+                                crate::widgets::avatar::face(&bot.bot_id, bot.avatar.as_ref())
+                                    .outline,
+                            )
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "round".into()),
+                        ),
+                        (
+                            "eyes",
+                            serde_json::to_value(
+                                crate::widgets::avatar::face(&bot.bot_id, bot.avatar.as_ref()).eyes,
+                            )
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "dot".into()),
+                        ),
+                        (
+                            "hue",
+                            crate::widgets::avatar::face(&bot.bot_id, bot.avatar.as_ref())
+                                .hue
+                                .to_string(),
+                        ),
+                    ]),
+                    cx,
+                ),
+            )
+            .child(self.button(
+                "primary-bot",
+                "设为主 Bot",
+                Command::PrimaryBot(bot.conversation_id.clone()),
+                cx,
+            ))
+            .child(self.ask(
+                "delete-bot",
+                "删除 Bot",
+                Command::DeleteBot(bot.conversation_id.clone()),
+                cx,
+            ));
+        for (provider, name) in [
+            (vibeface_client::Provider::Codex, "codex"),
+            (vibeface_client::Provider::Cursor, "cursor"),
+            (vibeface_client::Provider::Claude, "claude"),
+            (vibeface_client::Provider::Pi, "pi"),
+            (vibeface_client::Provider::Opencode, "opencode"),
+        ] {
+            page = page.child(
+                self.row(
+                    format!("{name} 模型与推理强度"),
+                    format!(
+                        "{} · {}",
+                        bot.models
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("设备默认模型"),
+                        bot.reasoning_efforts
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("由Provider控制")
+                    ),
+                )
+                .child(self.open_editor(
+                    SharedString::from(format!("bot-model-{name}")),
+                    "修改此Provider偏好",
+                    Editor::BotModel(provider),
+                    BTreeMap::from([
+                        ("model", bot.models.get(name).cloned().unwrap_or_default()),
+                        (
+                            "effort",
+                            bot.reasoning_efforts.get(name).cloned().unwrap_or_default(),
+                        ),
+                    ]),
+                    cx,
+                )),
+            );
+        }
+        page = page.child(self.row(
+            "技能",
+            if bot.skills.is_none() {
+                "当前Bot可使用全部共享技能".into()
+            } else {
+                format!(
+                    "当前Bot已选择 {} 项技能",
+                    bot.skills.as_ref().map(Vec::len).unwrap_or(0)
+                )
+            },
+        ));
+        page = page.child(self.nav(
+            "skill-history-details",
+            "查看技能正文",
+            Route::History(vibeface_protocol::history::HistorySection::Skills),
+            cx,
+        ));
+        for skill in &self.snapshot.conversation.bot_settings.skills {
+            page = page.child(self.row(skill.name.clone(), skill.description.clone()));
+        }
+        page.into_any_element()
+    }
+}

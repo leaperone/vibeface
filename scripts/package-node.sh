@@ -102,24 +102,7 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
 fi
 cp -a "$web/." "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
-cp "$repo/README.md" "$package/"
-python3 - "$repo" "$package" <<'PY'
-from pathlib import Path
-import shutil
-import subprocess
-import sys
-
-repo, package = map(Path, sys.argv[1:])
-for name in subprocess.check_output(["git", "ls-files", "-z", "--", "packages/docs"], cwd=repo).decode().split("\0"):
-    if not name:
-        continue
-    source = repo / name
-    if source.is_symlink() or any((repo / part).is_symlink() for part in Path(name).parents) or not source.is_file():
-        raise SystemExit("Package documentation must be a regular tracked file")
-    destination = package / "docs" / Path(name).relative_to("packages/docs")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
-PY
+python3 "$repo/scripts/offline-docs.py" "$package"
 if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
 cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 # Runtime requirements

@@ -95,6 +95,51 @@ export type DeliveryDraft = {
   max_gas_amount: string
   budget_id: string | null
 }
-export type TransferFile = { name: string; size: number; arrayBuffer(): Promise<ArrayBuffer> }
+export type TransferFile = {
+  name: string
+  size: number
+  arrayBuffer(): Promise<ArrayBuffer>
+  /** Releases only an app-owned selection copy, never the person's original file. */
+  dispose?(): void
+}
 export type ReceivedFile = { name: string; content_base64: string; sha256: string; bytes: number }
 export type PendingIntent = { intent_id: string; fingerprint: string }
+
+/** A selection owns its private copy; an operation holds it until its promise settles. */
+export function transferSelection() {
+  let selected: TransferFile | null = null
+  let closed = false
+  const uses = new Map<TransferFile, number>()
+  const retired = new Set<TransferFile>()
+  const release = (file: TransferFile) => {
+    if ((uses.get(file) ?? 0) > 0) { retired.add(file); return }
+    retired.delete(file)
+    file.dispose?.()
+  }
+  return {
+    replace(file: TransferFile | null) {
+      if (closed) { file?.dispose?.(); return false }
+      const previous = selected
+      selected = file
+      if (previous && previous !== file) release(previous)
+      return true
+    },
+    async use<T>(operation: (file: TransferFile) => Promise<T>): Promise<T> {
+      const file = selected
+      if (closed || !file) throw new Error('请先选择文件。')
+      uses.set(file, (uses.get(file) ?? 0) + 1)
+      try { return await operation(file) }
+      finally {
+        const count = (uses.get(file) ?? 1) - 1
+        if (count) uses.set(file, count)
+        else { uses.delete(file); if (retired.has(file)) release(file) }
+      }
+    },
+    close() {
+      closed = true
+      const previous = selected
+      selected = null
+      if (previous) release(previous)
+    },
+  }
+}

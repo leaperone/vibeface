@@ -1,3 +1,5 @@
+import { historySections } from '@vibeface/client/workspace/model.ts'
+import { HistoryControls } from './history-controls'
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { ArrowDown, ArrowRightLeft, Bot, Check, ChevronRight, CircleCheck, Clock, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, ListPlus, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, SlidersHorizontal, Unplug, WifiOff } from 'lucide-react'
@@ -241,6 +243,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
+  useEffect(() => () => { for (const section of historySections) latest.current.cancelHistory(section) }, [conversationId, workspace.generation, active])
   const awaiting = Boolean(bot) && awaitsDevice(reach), starting = reach === 'starting'
   useEffect(() => {
     if (!awaiting) return
@@ -266,6 +269,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} name={bot.name} /> : null
   if (bot && !data) return <section className="conversation-screen" aria-label="对话">{history}<ChatSkeleton /></section>
 
+  if (data && historySections.some((section) => !data.history[section].complete)) entries.unshift({ key: 'history-controls', node: <HistoryControls key={`${workspace.generation}:${conversationId}`} workspace={workspace} /> })
   return (
     <section className="conversation-screen" aria-label="对话">
       {history}

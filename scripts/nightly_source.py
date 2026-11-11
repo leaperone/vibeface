@@ -13,8 +13,9 @@ from urllib.parse import quote
 import release
 
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/package.json')
+         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/Cargo.toml')
 PRODUCT_APPS = release.PRODUCT_APPS
+RUST_PACKAGES = {'core': 'vibeface-core', 'cli': 'vibeface', 'desktop': 'vibeface-desktop'}
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 ABANDONED = 'scripts/nightly-abandoned.json'
 MAX_HISTORY = 16
@@ -56,6 +57,23 @@ def blob(commit, path):
     return subprocess.check_output(['git', 'show', f'{commit}:{path}'], cwd=release.ROOT)
 
 
+def rust_packages_at(commit):
+    """Read the Desktop manifest kind from this immutable source tree."""
+    cargo = 'apps/desktop/Cargo.toml'
+    package = 'apps/desktop/package.json'
+    entries = git('ls-tree', commit, '--', cargo, package).splitlines()
+    require(len(entries) == 1, 'source must have exactly one Desktop version manifest')
+    mode, kind, _, path = entries[0].split()
+    require((mode, kind) == ('100644', 'blob'), 'Desktop version source must be an ordinary tracked file')
+    return {app: name for app, name in RUST_PACKAGES.items() if app != 'desktop' or path == cargo}
+
+
+def version_paths_at(commit):
+    rust_packages = rust_packages_at(commit)
+    return tuple(path if path != 'apps/desktop/Cargo.toml' or 'desktop' in rust_packages
+                 else 'apps/desktop/package.json' for path in PATHS)
+
+
 def json_value(text, path, value):
     data = json.loads(text)
     require(json.dumps(data, indent=2, ensure_ascii=False) + '\n' == text, 'version JSON formatting changed; refuse unrelated formatting edits')
@@ -75,12 +93,21 @@ def package_version(text, value):
     return text[:match.start(1)] + section + text[match.end(1):]
 
 
+def locked_package_version(block, previous, value):
+    """Change only the single version line of a local Cargo.lock package."""
+    versions = re.findall(r'(?m)^version = "([^"]+)"$', block)
+    require(versions == [previous], 'Cargo.lock local package mismatch or ambiguous version')
+    require(not re.search(r'(?m)^(source|checksum)\s*=', block), 'Cargo.lock local package must not name a registry source')
+    return re.sub(r'(?m)^version = "[^"]+"$', lambda _: 'version = ' + json.dumps(value), block)
+
+
 def versions_at(commit):
     values = {}
+    rust_packages = rust_packages_at(commit)
     for app in release.APPS:
-        path = f'apps/{app}/' + ('Cargo.toml' if app in ('core', 'cli') else 'app.json' if app == 'mobile' else 'package.json')
+        path = f'apps/{app}/' + ('Cargo.toml' if app in rust_packages else 'app.json' if app == 'mobile' else 'package.json')
         text = blob(commit, path).decode()
-        if app in ('core', 'cli'):
+        if app in rust_packages:
             match = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
             require(match, 'missing Cargo package')
             values[app] = re.search(r'(?m)^version\s*=\s*"([^"]+)"', match[1])[1]
@@ -104,6 +131,7 @@ def next_ios_build_number(value):
 
 def generated(plan):
     old = versions_at(plan.base)
+    rust_packages = rust_packages_at(plan.base)
     require(set(plan.versions) == set(release.APPS), 'daily plan must contain all release applications')
     product_ver = plan.versions['cli']
     for app in PRODUCT_APPS:
@@ -114,24 +142,25 @@ def generated(plan):
         require(value.startswith(prefix), 'daily version changed baseline or date')
         if release.version(old[app]) == 'nightly':
             require(nightly_order(value) > nightly_order(old[app]), 'daily version did not advance')
-    result = {path: blob(plan.base, path).decode() for path in PATHS}
-    for app in ('www', 'app', 'desktop'):
+    result = {path: blob(plan.base, path).decode() for path in version_paths_at(plan.base)}
+    json_apps = ('www', 'app') if 'desktop' in rust_packages else ('www', 'app', 'desktop')
+    for app in json_apps:
         path = f'apps/{app}/package.json'
         result[path] = json_value(result[path], ('version',), plan.versions[app])
-    for app in ('core', 'cli'):
+    for app in rust_packages:
         path = f'apps/{app}/Cargo.toml'
         result[path] = package_version(result[path], plan.versions[app])
     blocks = result['Cargo.lock'].split('[[package]]')
+    package_apps = {package: app for app, package in rust_packages.items()}
     found = set()
     for index, block in enumerate(blocks):
-        match = re.search(r'(?m)^name = "(vibeface|vibeface-core)"$', block)
-        if match:
-            app = 'cli' if match[1] == 'vibeface' else 'core'
-            require(app not in found and f'version = "{old[app]}"' in block, 'Cargo.lock local package mismatch')
-            blocks[index], count = re.subn(r'(?m)^version = "[^"]+"$', 'version = "' + plan.versions[app] + '"', block)
-            require(count == 1, 'ambiguous local lock version')
+        match = re.search(r'(?m)^name = "([^"]+)"$', block)
+        if match and match[1] in package_apps:
+            app = package_apps[match[1]]
+            require(app not in found, 'Cargo.lock local package mismatch')
+            blocks[index] = locked_package_version(block, old[app], plan.versions[app])
             found.add(app)
-    require(found == {'core', 'cli'}, 'Cargo.lock is missing local packages')
+    require(found == set(rust_packages), 'Cargo.lock is missing local packages')
     result['Cargo.lock'] = '[[package]]'.join(blocks)
     mobile_path = 'apps/mobile/app.json'
     expo = json.loads(result[mobile_path])['expo']
@@ -197,7 +226,7 @@ def metadata(source, plan):
     before = (source / 'Cargo.lock').read_bytes()
     result = subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], cwd=source)
     packages = {package['name']: package['version'] for package in json.loads(result)['packages']}
-    require(packages['vibeface'] == plan.versions['cli'] and packages['vibeface-core'] == plan.versions['core'],
+    require(all(packages.get(package) == plan.versions[app] for app, package in rust_packages_at(plan.base).items()),
             'Cargo metadata does not match daily versions')
     require((source / 'Cargo.lock').read_bytes() == before, 'cargo metadata changed dependency resolution')
 

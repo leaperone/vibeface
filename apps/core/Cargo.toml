@@ -57,3 +57,4 @@ security-framework = "3.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+vibeface-client.workspace = true

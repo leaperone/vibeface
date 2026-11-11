@@ -1,11 +1,10 @@
-import { HeadContent, Outlet, Scripts, createRootRoute, useRouter } from '@tanstack/react-router'
+import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { Toaster } from '@/components/app/kit'
 import { DeviceProvider } from '@vibeface/client/identity/context.tsx'
 import { ViewportHeight } from '@/components/viewport-height'
 import { registerShell } from '@/lib/offline'
 import { installErrorReporting } from '@/lib/error-reporting'
-import { installDesktopNavigation } from '@/lib/desktop-nav'
 import { webPlatform } from '@/lib/platform'
 import { installValidityMessages } from '@/lib/validity'
 import { themeScript } from '@/lib/theme'
@@ -46,11 +45,9 @@ function RootLayout() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
-  const router = useRouter()
   useEffect(registerShell, [])
   useEffect(installErrorReporting, [])
   useEffect(installValidityMessages, [])
-  useEffect(() => installDesktopNavigation(router), [router])
   return (
     <html lang="zh-CN">
       <head>

@@ -13,25 +13,32 @@ impl Runtime {
         );
         let command: WorkspaceCommand = serde_json::from_value(input["command"].clone())
             .context("invalid workspace command")?;
-        if self
-            .store
-            .lock()
-            .await
-            .workspace_command_recorded(&access.network_id, &id(input, "command_id")?)?
-        {
+        if {
+            let network_id = access.network_id.to_owned();
+            let command_id = id(input, "command_id")?;
+            self.store
+                .call("workspace.workspace_command_recorded", move |store| {
+                    store.workspace_command_recorded(&network_id, &command_id)
+                })
+                .await
+        }? {
             return self
                 .accept_workspace_command(&access.network_id, input)
                 .await;
         }
         if let WorkspaceCommand::ControlInput { message_id, .. } = &command {
             let owner = {
-                let store = self.store.lock().await;
-                let input = store
-                    .workspace_input(&access.network_id, message_id)?
-                    .context("input not found")?;
-                store
-                    .resolve_input_target(&access.network_id, &input.input.route.target)?
-                    .owner_node
+                let (network, message_id) = (access.network_id.clone(), message_id.clone());
+                self.store
+                    .call("workspace.input_owner", move |store| {
+                        let input = store
+                            .workspace_input(&network, &message_id)?
+                            .context("input not found")?;
+                        Ok(store
+                            .resolve_input_target(&network, &input.input.route.target)?
+                            .owner_node)
+                    })
+                    .await?
             };
             if owner != self.identity.device_id()? {
                 return self.peer_request(&access.network_id, &owner, json!({"type":"workspace_command","command_id":id(input,"command_id")?,"command":command,"attestation":attestation(input)?})).await;
@@ -52,16 +59,26 @@ impl Runtime {
         let command: WorkspaceCommand = serde_json::from_value(input["command"].clone())
             .context("invalid workspace command")?;
         let command_id = id(input, "command_id")?;
-        let result = self.store.lock().await.apply_workspace_command(
-            &self.identity,
-            network,
-            &command_id,
-            command,
-            Some(attestation(input)?),
-            None,
-            None,
-            now_ms(),
-        );
+        let result = {
+            let identity = self.identity.to_owned();
+            let network = network.to_owned();
+            let command_id = command_id.to_owned();
+            let signature = Some(attestation(input)?);
+            self.store
+                .call("workspace.apply_workspace_command", move |store| {
+                    store.apply_workspace_command(
+                        &identity,
+                        &network,
+                        &command_id,
+                        command,
+                        signature,
+                        None,
+                        None,
+                        now_ms(),
+                    )
+                })
+                .await
+        };
         let receipt = match result {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -100,14 +117,15 @@ impl Runtime {
             .map(|_| id(input, "task_id"))
             .transpose()?;
         let limit = domain_limit(input)?;
-        Ok(serde_json::to_value(
-            self.store.lock().await.workspace_state(
-                &access.network_id,
-                channel.as_deref(),
-                task.as_deref(),
-                limit,
-            )?,
-        )?)
+        Ok(serde_json::to_value({
+            let network_id = access.network_id.to_owned();
+            let channel = channel.clone();
+            let task = task.clone();
+            self.read_display(access, input, "workspace.workspace_state", move |store| {
+                store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)
+            })
+            .await
+        }?)?)
     }
     pub(super) async fn workspace_history(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
@@ -123,12 +141,15 @@ impl Runtime {
             .map(|_| id(input, "task_id"))
             .transpose()?;
         let limit = domain_limit(input)?;
-        let (events, truncated) = self.store.lock().await.workspace_history(
-            &access.network_id,
-            channel.as_deref(),
-            task.as_deref(),
-            limit,
-        )?;
+        let (events, truncated) = {
+            let network_id = access.network_id.to_owned();
+            let channel = channel.clone();
+            let task = task.clone();
+            self.read_display(access, input, "workspace.workspace_history", move |store| {
+                store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)
+            })
+            .await
+        }?;
         Ok(
             json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task.is_some(){"task"}else if channel.is_some(){"channel"}else{"workspace"}}}),
         )
@@ -159,15 +180,18 @@ mod tests {
         let (node, admin, directory) = node().await?;
         let result = async {
             bot(&node, &admin, "c", "Workspace", &[]).await?;
-            let network = node.store.lock().await.network()?.context("network")?;
-            let bot = node.store.lock().await.bot_for_conversation(&network, "c")?.context("bot")?;
+            let network = node.store.call("workspace.network", move |store| store.network()).await?.context("network")?;
+            let bot = {
+                let network = network.to_owned();
+                node.store.call("workspace.bot_for_conversation", move |store| store.bot_for_conversation(&network, "c")).await
+            }?.context("bot")?;
             let request = InputRequest {
                 message_id: "deferred".into(),
                 route: InputRoute {
                     target: InputTarget::BotMain { bot_id: bot.bot_id },
                     intent: InputIntent::Defer, sequence: 1, expected_revision: None,
                 },
-                text: "saved input".into(), attachments: vec![], report_results: Some(true),
+                text: "saved input".into(), attachments: vec![], report_results: true,
             };
             let signed = admin.attest(&network, "c", EventBody::InputPosted {
                 message_id: request.message_id.clone(), target: request.route.target.clone(),
@@ -175,9 +199,12 @@ mod tests {
                 expected_revision: None, text: request.text.clone(), attachments: vec![],
                 report_results: Some(true), attestation: None,
             })?;
-            let original = node.store.lock().await.post_workspace_input(
-                &node.identity, &network, request, signed.attestation().cloned().context("signature")?, now_ms(),
-            )?;
+            let original = {
+                let identity = node.identity.to_owned();
+                let network = network.to_owned();
+                let signature = signed.attestation().cloned().context("signature")?;
+                node.store.call("workspace.post_workspace_input", move |store| store.post_workspace_input(&identity, &network, request, signature, now_ms())).await
+            }?;
             let control = |command_id: &str, expected_event: &str| -> Result<Value> {
                 let command = WorkspaceCommand::ControlInput {
                     message_id: "deferred".into(), expected_event: expected_event.into(), action: InputControl::Release,
@@ -189,33 +216,51 @@ mod tests {
                 Ok(json!({"command_id":command_id,"command":command,"attestation":signed.attestation().context("control signature")?}))
             };
             let access = test_access(network.clone(), true, None);
-            let before = node.store.lock().await.version_vector(&network)?;
+            let before = {
+                let network = network.to_owned();
+                node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await
+            }?;
             let stale = control("stale-release", &crate::crypto::digest(b"other control"))?;
             let rejected = node.workspace_command(&access, &stale).await?;
             assert_eq!(rejected, json!({"accepted":false,"stored":false,"code":"workspace_command_not_saved",
                 "command_id":"stale-release","reason":"input control version changed"}));
             {
-                let store = node.store.lock().await;
-                assert!(!store.workspace_command_recorded(&network, "stale-release")?);
-                assert_eq!(store.version_vector(&network)?, before);
-                assert_eq!(store.queued_workspace_input(&network, "deferred")?.context("input")?.control_event, original.source_event);
+                let (network, before, source_event) = (network.clone(), before.clone(), original.source_event.clone());
+                node.store.call("workspace.assert_rejected", move |store| {
+                    assert!(!store.workspace_command_recorded(&network, "stale-release")?);
+                    assert_eq!(store.version_vector(&network)?, before);
+                    assert_eq!(store.queued_workspace_input(&network, "deferred")?.context("input")?.control_event, source_event);
+                    Ok(())
+                }).await?;
             }
             let valid = control("valid-release", &original.source_event)?;
-            node.store.lock().await.connection.pragma_update(None, "query_only", true)?;
+            node.store.call("workspace.connection.pragma_update", move |store| Ok(store.connection.pragma_update(None, "query_only", true)?)).await?;
             let io_error = node.workspace_command(&access, &valid).await.expect_err("database write failure remains an RPC error");
-            node.store.lock().await.connection.pragma_update(None, "query_only", false)?;
+            node.store.call("workspace.connection.pragma_update", move |store| Ok(store.connection.pragma_update(None, "query_only", false)?)).await?;
             assert!(io_error.downcast_ref::<WorkspaceCommandNotSaved>().is_none());
-            assert!(!node.store.lock().await.workspace_command_recorded(&network, "valid-release")?);
-            assert_eq!(node.store.lock().await.version_vector(&network)?, before);
+            assert!(!{
+                let network = network.to_owned();
+                node.store.call("workspace.workspace_command_recorded", move |store| store.workspace_command_recorded(&network, "valid-release")).await
+            }?);
+            assert_eq!({
+                let network = network.to_owned();
+                node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await
+            }?, before);
             let applied = node.workspace_command(&access, &valid).await?;
             assert_eq!(applied["command_id"], "valid-release");
             assert_eq!(applied["duplicate"], false);
             assert!(applied["event_hash"].as_str().is_some_and(|hash| !hash.is_empty()));
-            let committed = node.store.lock().await.version_vector(&network)?;
+            let committed = {
+                let network = network.to_owned();
+                node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await
+            }?;
             let duplicate = node.workspace_command(&access, &valid).await?;
             assert_eq!(duplicate["duplicate"], true);
             assert_eq!(duplicate["event_hash"], applied["event_hash"]);
-            assert_eq!(node.store.lock().await.version_vector(&network)?, committed);
+            assert_eq!({
+                let network = network.to_owned();
+                node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await
+            }?, committed);
             Ok::<_, anyhow::Error>(())
         }.await;
         let socket = node

@@ -14,10 +14,10 @@ from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 import release
-from nightly_source import (DailyPlan, BOT, PATHS, blob, checkout, generated, git, metadata,
+from nightly_source import (DailyPlan, BOT, PATHS, blob, checkout, generated, git, locked_package_version, metadata,
                             abandoned_source,
                             next_build_numbers, next_ios_build_number, nightly_order, recovered_plan,
-                            scratch, verify_tree, versions_at)
+                            scratch, verify_tree, version_paths_at, versions_at)
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = 'leaperone/vibeface'
@@ -310,8 +310,9 @@ def trusted_nightlies(tags, batch):
         subject = git('show', '-s', '--format=%s', source)
         original_batch = subject == 'chore(release): nightly ' + batch
         try:
-            require(set(git('ls-tree', '-r', '--name-only', source, '--', *PATHS).splitlines()) == set(PATHS),
-                    'Nightly candidate predates the current release layout')
+            paths = version_paths_at(source)
+            require(set(git('ls-tree', '-r', '--name-only', source, '--', *paths).splitlines()) == set(paths),
+                    'Nightly candidate is missing immutable version sources')
             if source not in values_by_source:
                 values_by_source[source] = versions_at(source)
             values = values_by_source[source]
@@ -453,10 +454,182 @@ def run_daily(run_id):
                           schedule_ci=ci['html_url'], releases=releases), indent=2))
 
 
+def self_test_source_layouts():
+    """Historical and native source trees use their own exact version manifests."""
+    from unittest.mock import patch
+
+    old = '0.0.1-nightly.20261105.2'
+    new = '0.0.1-nightly.20261106.1'
+    for native in (False, True):
+        with tempfile.TemporaryDirectory(dir=scratch(), prefix='source-layout-') as temporary:
+            root = Path(temporary)
+            rust = {'core': 'vibeface-core', 'cli': 'vibeface'}
+            if native:
+                rust['desktop'] = 'vibeface-desktop'
+            initial = {}
+            for app in release.APPS:
+                directory = root / 'apps' / app
+                directory.mkdir(parents=True)
+                if app in rust:
+                    path = f'apps/{app}/Cargo.toml'
+                    text = f'[package]\nname = "{rust[app]}"\nversion = "{old}"\nedition = "2021"\n'
+                    (directory / 'src').mkdir()
+                    (directory / 'src/main.rs').write_text('fn main() {}\n')
+                else:
+                    path = f'apps/{app}/package.json'
+                    value = {'version': old, 'private': True}
+                    if app == 'mobile':
+                        path = 'apps/mobile/app.json'
+                        value = {'expo': {'version': '0.0.1', 'extra': {'releaseVersion': old},
+                                          'android': {'versionCode': 1}, 'ios': {'buildNumber': '1'}}}
+                    text = json.dumps(value, indent=2) + '\n'
+                initial[path] = text.encode()
+            initial['Cargo.lock'] = ('version = 3\n' + ''.join(
+                f'\n[[package]]\nname = "{name}"\nversion = "{old}"\n' for name in sorted(rust.values()))).encode()
+            for path, content in initial.items():
+                (root / path).write_bytes(content)
+            members = ', '.join(json.dumps(f'apps/{app}') for app in rust)
+            (root / 'Cargo.toml').write_text(f'[workspace]\nmembers = [{members}]\nresolver = "2"\n')
+            (root / 'business.txt').write_text('unchanged business source\n')
+            git('init', '--initial-branch=main', root=root)
+            git('add', '.', root=root)
+            git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                'commit', '-qm', 'immutable source layout', root=root)
+            with patch('release.ROOT', root):
+                base = git('rev-parse', 'HEAD')
+                git('update-ref', 'refs/remotes/origin/main', base)
+                plan = DailyPlan('2026110600', base, dict.fromkeys(release.APPS, new), 2, '2', '42')
+                # Independent expected bytes, including unchanged manifest bodies and lock entries.
+                expected = {path: content.replace(old.encode(), new.encode()) for path, content in initial.items()}
+                expected['apps/mobile/app.json'] = expected['apps/mobile/app.json'].replace(
+                    b'"versionCode": 1', b'"versionCode": 2').replace(b'"buildNumber": "1"', b'"buildNumber": "2"')
+                assert generated(plan) == expected
+                desktop_path = 'apps/desktop/' + ('Cargo.toml' if native else 'package.json')
+                assert len(expected['Cargo.lock'].split(b'[[package]]')) - 1 == len(rust)
+                if native:
+                    assert set(expected) == set(PATHS) and len(rust) == 3
+                else:
+                    assert 'apps/desktop/Cargo.toml' not in expected and len(rust) == 2
+
+                def commit_candidate(changes):
+                    git('checkout', '--detach', '-q', base)
+                    for path, content in (expected | changes).items():
+                        (root / path).write_bytes(content)
+                    git('add', '--all')
+                    git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                        'commit', '-qm', plan.message)
+                    return git('rev-parse', 'HEAD')
+
+                head = commit_candidate({})
+                assert versions_at(head) == plan.versions
+                assert recovered_plan(head) == plan
+                verify_tree(plan, head)
+                metadata(root, plan)
+                assert release.validate_source(head, 'product') == dict(
+                    ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
+                tampered_manifest = (expected[desktop_path] + b'\n[dependencies]\nserde = "1"\n'
+                                     if native else expected[desktop_path].replace(b'"private": true', b'"private": false'))
+                for path, content in (
+                    (desktop_path, tampered_manifest),
+                    (desktop_path, expected[desktop_path].replace(new.encode(), b'0.0.1-nightly.20261106.2')),
+                    ('Cargo.lock', expected['Cargo.lock'].replace(new.encode(), b'0.0.1-nightly.20261106.2', 1)),
+                    ('Cargo.lock', expected['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
+                    ('business.txt', b'modified non-version source\n'),
+                ):
+                    bad = commit_candidate({path: content})
+                    for check in (lambda: verify_tree(plan, bad), lambda: release.validate_source(bad, 'product')):
+                        try:
+                            check()
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError(f'tampered source accepted: {path}')
+                if not native:
+                    self_test_trusted_source_layouts(root, base, head, plan)
+
+
+def self_test_trusted_source_layouts(root, historical_base, historical_head, historical_plan):
+    """Discover mixed immutable layouts without accepting forged historical sources."""
+    historical_tag = 'v' + historical_plan.versions['cli']
+    git('tag', historical_tag, historical_head)
+    git('checkout', '--detach', '-q', historical_base)
+    desktop = root / 'apps/desktop'
+    (desktop / 'package.json').unlink()
+    (desktop / 'Cargo.toml').write_bytes(blob(historical_base, 'apps/core/Cargo.toml').replace(
+        b'vibeface-core', b'vibeface-desktop'))
+    (desktop / 'src').mkdir()
+    (desktop / 'src/main.rs').write_text('fn main() {}\n')
+    workspace = root / 'Cargo.toml'
+    workspace.write_text(workspace.read_text().replace('members = [', 'members = ["apps/desktop", '))
+    lock = root / 'Cargo.lock'
+    lock.write_text(lock.read_text() + '\n[[package]]\nname = "vibeface-desktop"\n'
+                    'version = "0.0.1-nightly.20261105.2"\n')
+    git('add', '--all')
+    git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+        'commit', '-qm', 'replace Desktop with the Native application')
+    native_base = git('rev-parse', 'HEAD')
+    git('update-ref', 'refs/remotes/origin/main', native_base)
+    native_plan = DailyPlan('2026110604', native_base,
+                           dict.fromkeys(release.APPS, '0.0.1-nightly.20261106.2'), 2, '2', '43')
+    native_contents = generated(native_plan)
+    assert set(native_contents) == set(PATHS) and native_contents['Cargo.lock'].count(b'[[package]]') == 3
+    for path, content in native_contents.items():
+        (root / path).write_bytes(content)
+    git('add', '--all')
+    git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+        'commit', '-qm', native_plan.message)
+    native_head = git('rev-parse', 'HEAD')
+    native_tag = 'v' + native_plan.versions['cli']
+    git('tag', native_tag, native_head)
+    for tags in ([historical_tag, native_tag], [native_tag, historical_tag]):
+        # The original historical batch forces both candidates through real source validation.
+        trusted = trusted_nightlies(tags, historical_plan.batch)
+        assert [source for _, source, _ in trusted] == [native_head, historical_head]
+        assert trusted[1][2] == dict(ci_source_commit=historical_base, ci_run_id='42',
+                                    nightly_batch=historical_plan.batch)
+        assert [source for _, source, _ in trusted_nightlies(tags, '2026110608')] == [native_head]
+
+    historical_contents = generated(historical_plan)
+    historical_manifest = 'apps/desktop/package.json'
+    forged = historical_contents[historical_manifest].replace(b'"private": true', b'"private": false')
+    for invalid in ('missing', 'dual', 'symlink', 'forged'):
+        git('checkout', '--detach', '-q', historical_head)
+        manifest = root / historical_manifest
+        if invalid == 'missing':
+            manifest.unlink()
+        elif invalid == 'dual':
+            (desktop / 'Cargo.toml').write_bytes(blob(native_base, 'apps/desktop/Cargo.toml'))
+        elif invalid == 'symlink':
+            manifest.unlink()
+            manifest.symlink_to('../app/package.json')
+        else:
+            manifest.write_bytes(forged)
+        git('add', '--all')
+        tree = git('write-tree')
+        bad = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                  'commit-tree', tree, '-p', historical_base, '-m', historical_plan.message)
+        git('tag', '-f', historical_tag, bad)
+        for tags, batch, message in (
+            ([historical_tag, native_tag], historical_plan.batch, 'invalid immutable source'),
+            ([native_tag, historical_tag], historical_plan.batch, 'invalid immutable source'),
+            ([historical_tag], '2026110608', 'invalid or unresolved'),
+        ):
+            try:
+                trusted_nightlies(tags, batch)
+            except ValueError as error:
+                assert message in str(error), str(error)
+            else:
+                raise AssertionError(f'invalid historical mechanical source accepted: {invalid}')
+        # Restore the ordinary tracked manifest before checking out another fixture.
+        git('reset', '--hard', '-q', historical_head)
+
+
 def self_test():
     from unittest.mock import patch
     import nightly_source
     real_anchor = nightly_source.complete_release_anchor
+
+    self_test_source_layouts()
 
     with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token'}):
         with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as transport:
@@ -471,6 +644,16 @@ def self_test():
         else:
             raise AssertionError('unsafe operation was accepted')
 
+    for package in ('vibeface', 'vibeface-core', 'vibeface-desktop'):
+        lock_block = f'\nname = "{package}"\nversion = "0.0.1"\ndependencies = [\n "vibeface-protocol",\n]\n'
+        updated = locked_package_version(lock_block, '0.0.1', '0.0.1-nightly.20261106.1')
+        assert updated == lock_block.replace('version = "0.0.1"', 'version = "0.0.1-nightly.20261106.1"')
+        for invalid in (lock_block.replace('version = "0.0.1"', '# version = "0.0.1"\nversion = "0.0.2"'),
+                        lock_block + 'version = "0.0.1"\n',
+                        lock_block + 'source = "registry+https://example.invalid/index"\n',
+                        lock_block + 'checksum = "unchanged-dependency-digest"\n'):
+            rejected(lambda invalid=invalid: locked_package_version(invalid, '0.0.1', '0.0.1-nightly.20261106.1'), 'Cargo.lock local package')
+
     for hour in range(24):
         assert schedule_batch(f'2026-11-06T{hour:02}:23:00Z') == f'20261106{hour // 4 * 4:02}'
         assert schedule_batch(f'2026-11-06T{hour:02}:59:59Z') == f'20261106{hour // 4 * 4:02}'
@@ -483,9 +666,9 @@ def self_test():
         root = Path(temporary) / 'repo'; root.mkdir()
         for app in release.APPS:
             directory = root / 'apps' / app; directory.mkdir(parents=True)
-            if app in ('core', 'cli'):
+            if app in ('core', 'cli', 'desktop'):
                 (directory / 'src').mkdir(); (directory / 'src/main.rs').write_text('fn main() {}\n')
-                (directory / 'Cargo.toml').write_text('[package]\nname = "' + ('vibeface' if app == 'cli' else 'vibeface-core')
+                (directory / 'Cargo.toml').write_text('[package]\nname = "' + {'cli': 'vibeface', 'core': 'vibeface-core', 'desktop': 'vibeface-desktop'}[app]
                                                      + '"\nversion = "0.0.1-nightly.20261105.2"\nedition = "2021"\n')
             else:
                 value = {'version': '0.0.1'} if app == 'www' else {'version': '0.0.1-nightly.20261105.2', 'private': True}
@@ -494,8 +677,8 @@ def self_test():
                         'android': {'package': 'one.leaper.vibeface', 'versionCode': 250001},
                         'extra': {'releaseVersion': '0.0.1-nightly.20261105.2'}}}
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
-        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
-        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
+        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli", "apps/desktop"]\nresolver = "2"\n')
+        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-desktop"\nversion = "0.0.1-nightly.20261105.2"\n')
         (root / 'scripts').mkdir()
         (root / nightly_source.ABANDONED).write_text('[]\n')
         git('init', '--initial-branch=main', root=root)
@@ -509,12 +692,20 @@ def self_test():
         git('tag', 'v0.0.1-nightly.20261016.1', legacy, root=root)
         git('tag', 'v0.0.1-nightly.20261016.2', legacy_batch, root=root)
         (root / '.github/workflows').mkdir(parents=True)
-        for path in (CI, RELEASE):
-            (root / path).write_bytes(subprocess.check_output(['git', 'show', 'HEAD:' + path], cwd=ROOT))
+        # Commit the historical contracts themselves; HEAD may already use the split entries.
+        (root / CI).write_text("name: CI\non:\n  schedule:\n    - cron: '23 */4 * * *'\n"
+                              "jobs:\n  ci-gate:\n    runs-on: ubuntu-24.04\n"
+                              "    steps:\n      - run: 'true'\n")
+        (root / RELEASE).write_text("name: Release\non:\n  workflow_dispatch:\n    inputs:\n"
+                                   "      app:\n        type: choice\n        options: [product, www]\n"
+                                   "      tag:\n        type: string\n"
+                                   "      publish:\n        type: boolean\n        default: false\n"
+                                   "jobs:\n  identity:\n    runs-on: ubuntu-24.04\n"
+                                   "    steps:\n      - run: 'true'\n")
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'historical workflow fixture', root=root)
         old_base = git('rev-parse', 'HEAD', root=root)
-        for path in (NIGHTLY, '.github/workflows/release-www.yml'):
+        for path in (CI, RELEASE, NIGHTLY, '.github/workflows/release-www.yml'):
             (root / path).write_bytes((ROOT / path).read_bytes())
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
@@ -550,8 +741,14 @@ def self_test():
             for invalid in ('', '0', '10000', '9999', '3.99', '3.1.99', '3.100', '3.1.100', '3.1.2.3'):
                 rejected(lambda invalid=invalid: next_ios_build_number(invalid))
             contents = generated(plan)
-            assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['supportsTablet'] is True
-            assert contents['Cargo.lock'].count(b'[[package]]') == 2
+            mobile_generated = json.loads(contents['apps/mobile/app.json'])['expo']
+            assert mobile_generated['ios']['buildNumber'] == '4'
+            assert mobile_generated['ios']['supportsTablet'] is True
+            assert re.search(rb'version = "([^"]+)"', contents['apps/desktop/Cargo.toml'])[1].decode() == plan.versions['cli']
+            assert contents['Cargo.lock'].count(b'[[package]]') == 3
+            assert 'apps/desktop/Cargo.toml' in PATHS and 'apps/desktop/package.json' not in PATHS
+            for package in ('vibeface', 'vibeface-core', 'vibeface-desktop'):
+                assert f'name = "{package}"\nversion = "{plan.versions["cli"]}"'.encode() in contents['Cargo.lock']
 
             def commit_files(changes, candidate=plan):
                 git('checkout', '--detach', '-q', candidate.base)
@@ -571,7 +768,10 @@ def self_test():
             assert release.validate_source(head, 'www')['ci_source_commit'] == base
             for path, content in (
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
-                ('apps/desktop/package.json', contents['apps/desktop/package.json'].replace(b'"private": true', b'"private": false')),
+                ('apps/desktop/Cargo.toml', contents['apps/desktop/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
+                ('Cargo.lock', contents['Cargo.lock'].replace(
+                    f'name = "vibeface-desktop"\nversion = "{plan.versions["desktop"]}"'.encode(),
+                    b'name = "vibeface-desktop"\nversion = "0.0.1-nightly.20261106.9"')),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'20261106.8', b'20261106.9')),

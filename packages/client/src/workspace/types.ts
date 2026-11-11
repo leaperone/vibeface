@@ -64,7 +64,7 @@ export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { 
 export type WorkspaceCommandNotSaved = { accepted: false; code: 'workspace_command_not_saved'; stored: false; command_id: string; reason: string }
 export type WorkspaceInputBody = {
   type: 'input_posted'; message_id: string; target: InputTarget; intent: InputIntent; sequence: number; expected_revision?: number
-  text: string; attachments?: Attachment[]; report_results?: boolean
+  text: string; attachments?: Attachment[]; report_results: boolean
 }
 export type WorkspaceHistoryBody =
   | WorkspaceInputBody
@@ -217,9 +217,11 @@ export type MemoryConflict = {
   call_ref: string; memory_id: string; expected_epoch: number; actual_epoch: number
   expected_revision: string; actual_revision: string; reason: string
 }
+export type ConversationMemoryConflict = MemoryConflict & { history_id: string }
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  local_jobs: ManagerJob[]
   scope_jobs: ScopeJob[]
   context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
@@ -228,7 +230,7 @@ export type SchedulerSnapshot = {
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
   /** Set when another device schedules this conversation; unreachable leaves its replies' state unknown. */
-  remote?: { owner: string; reachable: boolean }
+  remote?: { owner: string; reachable: boolean; jobs: ManagerJob[]; scope_jobs: ScopeJob[]; memory_conflicts: ConversationMemoryConflict[] | null }
 }
 /** A coordination process still alive after its turn ended; the Node closes it once the process exits. */
 export type CoordinationCheck = {
@@ -249,27 +251,10 @@ export type WorkDetail = { work: WorkDetailWork; coverage: { source: 'shared_his
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
-  context?: ContextProjection | null
-  memory?: MemoryEntry[]
-  memory_staged_count?: number | null
-  memory_conflicts?: MemoryConflict[] | null
-  memory_sync_conflicts?: MemorySyncConflicts
+  history_authority: string
+  refresh_metadata: boolean
   messages: TranscriptMessage[]
   works: WorkRecord[]
-  last_message: LastMessage | null
-  busy: Busy
-  questions: Question[]
-  notifications: NotificationRecord[]
-  /** This device's dispatch and stop requests, as `conversation` returns them. */
-  deliveries: unknown[]
-  checks: CoordinationCheck[]
-  jobs: ManagerJob[]
-  scope_jobs: ScopeJob[]
-  unanswered: string[]
-  sent: SentBotMessage[]
-  sent_coverage: SentCoverage
-  /** The conversation's works that want the person, as the Node lists them now; replaces its share of `open_works`. */
-  open_works: OpenWork[]
 }
 /**
  * What only the person can settle; nothing is resent.
@@ -334,12 +319,15 @@ export type Overwritten = { change_id: string; by: string } & (
   | { field: "reasoning_effort"; provider: ProviderId; value: string | null }
   | { field: "skills"; value: SkillSet }
   | { field: "avatar"; value: Avatar | null })
-type SkillSummary = { skill_id: string; name: string; description: string }
+export type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: ConversationMemoryConflict[] | null }
 export type ConversationPayload = {
+  history_authority: string
+  history: ConversationHistory
+  deliveries: DeliveryRecord[]
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
   works: WorkRecord[]
@@ -565,7 +553,7 @@ export type AnswerResult = { status: "answered" | "already_answered"; text: stri
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
 /** A session no bot started that this bot looks after; `muted`: the person stopped following it here. */
-export type SessionHandoff = { node: string; agent: ProviderId; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
+export type SessionHandoff = { rank?: string; node: string; agent: ProviderId; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"
 export type TriageSettings = {
@@ -586,3 +574,17 @@ export type TriageSettings = {
     unknown_events: number
   }
 }
+
+export type DeliveryRecord = { work_id: string; target_node: string } & (
+  | { state: DispatchState; cwd: string; trigger?: string; title?: string; prompt?: string; reason?: string | null; failure?: FailureKind }
+  | { state: StopState }
+)
+export type HistoryItems = {
+  messages: TranscriptMessage; works: WorkRecord; changes: BotChangeRecord; questions: Question; sessions: SessionHandoff
+  jobs: ManagerJob; scope_jobs: ScopeJob; owner_jobs: ManagerJob; owner_scope_jobs: ScopeJob; owner_memory_conflicts: ConversationMemoryConflict; checks: CoordinationCheck; deliveries: DeliveryRecord; unanswered: string
+  skills: SkillSummary; schedules: ScheduleView; memory: MemoryEntry; memory_conflicts: ConversationMemoryConflict; memory_sync_conflicts: MemorySyncConflict; overwritten: Overwritten
+}
+export type HistorySection = keyof HistoryItems
+export type HistoryCoverage = { next_cursor: string | null; complete: boolean }
+export type ConversationHistory = { [S in HistorySection]: HistoryCoverage }
+export type HistoryPage = { [S in HistorySection]: { conversation_id: string; history_authority: string; section: S; items: HistoryItems[S][] } & HistoryCoverage }[HistorySection]

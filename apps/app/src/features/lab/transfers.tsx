@@ -3,7 +3,7 @@ import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleChe
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
 import { canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
-import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
+import { transferSelection, type DeliveryDraft, type DeliveryOrder, type DeliverySettings, type TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -25,6 +25,12 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const { directory } = useDevice()
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null })
   const [file, setFile] = useState<TransferFile | null>(null)
+  const selection = useRef(transferSelection())
+  useEffect(() => {
+    const owner = transferSelection()
+    selection.current = owner
+    return () => owner.close()
+  }, [])
   // Feedback shows next to the control that caused it, not at the top of a long page.
   const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
   const picker = useAction()
@@ -47,6 +53,12 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const receiverId = <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={picked ? '' : draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required={!picked} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
   const providers = providerChoices(delivery.providers, draft.mode)
   const unusable = working || !status?.enabled || !file || !draft.receiver_peer || status.max_file_bytes === 0 || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled
+  const prepare = (restart?: string) => {
+    if (!file || unusable) return
+    setOrigin('form')
+    const owner = selection.current
+    void owner.use(selected => delivery.prepare(draft, selected, restart)).then(success => { if (success && owner.replace(null)) setFile(null) })
+  }
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
     {!status ? <p role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</p> : <>
@@ -69,7 +81,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <p>{transferCopy.walletDetails}</p>
         </Details>
       </section>
-      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file && !unusable) { setOrigin('form'); void delivery.prepare(draft, file) } }}>
+      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); prepare() }}>
         <h2 className="text-heading font-semibold">发送文件</h2>
         {mine.length ? <>
           <Field><FieldLabel htmlFor="transfer-to">{transferCopy.sendTo}</FieldLabel>
@@ -105,7 +117,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Field><FieldLabel htmlFor="transfer-gas-cap">{transferCopy.gasCap}</FieldLabel><Input id="transfer-gas-cap" value={draft.max_gas_amount} readOnly /></Field>
         </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />{transferCopy.free}</p>}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const picked = await webPlatform.files?.pick(); if (picked) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
+          <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const owner = selection.current; const picked = await webPlatform.files?.pick(); if (picked && owner.replace(picked)) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
           <span className="min-w-0 break-all text-meta text-muted-foreground">{file ? <><span className="text-foreground">{file.name}</span> · {sizeLabel(file.size)}</> : transferCopy.maxSize(status.max_file_bytes)}</span>
         </div>
         {picker.error ? <p role="alert" className="text-meta text-danger">{messageOf(picker.error)}</p> : null}
@@ -113,7 +125,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         {feedback('form')}
         <div className="flex flex-wrap gap-2">
           <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(draft.mode)}</Button>
-          {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file && !unusable) { setOrigin('form'); void delivery.prepare(draft, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
+          {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { prepare(selected.intent_id) }}>作为新订单再次发送</Button> : null}
         </div>
         <Details><p>{transferCopy.prepareDetails}</p>{draft.mode === 'paid' ? <p>{transferCopy.units}</p> : null}</Details>
       </form> : null}

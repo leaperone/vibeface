@@ -16,10 +16,11 @@ use std::sync::{
     PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::platform::tree;
+use vibeface_bridge::transport;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -977,7 +978,7 @@ struct Process {
     tree: tree::Tree,
     reaped: bool,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: transport::Lines<BufReader<ChildStdout>>,
     /// The end of what it wrote to stderr, once it closed it.
     stderr: Option<tokio::task::JoinHandle<String>>,
     _guide: Option<Arc<Guide>>,
@@ -1059,32 +1060,24 @@ impl Launch<'_> {
             ));
         };
         let stderr = tokio::spawn(async move {
-            let mut tail = String::new();
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tail.push_str(&line);
-                tail.push('\n');
-                keep_end(&mut tail);
+            let mut stderr = stderr;
+            let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
+            while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
+                tail.extend_from_slice(&buffer[..read]);
+                let over = tail.len().saturating_sub(2000);
+                tail.drain(..over);
             }
-            tail.trim().to_owned()
+            String::from_utf8_lossy(&tail).trim().to_owned()
         });
         Ok(Process {
             child,
             tree,
             reaped: false,
             stdin: Arc::new(Mutex::new(Some(stdin))),
-            lines: BufReader::new(stdout).lines(),
+            lines: transport::Lines::new(BufReader::new(stdout), transport::FRAME_BYTES),
             stderr: Some(stderr),
             _guide: self.guide.clone(),
         })
-    }
-}
-
-/// Keeps the last 2000 characters of `tail` once it grows past 4000.
-fn keep_end(tail: &mut String) {
-    let count = tail.chars().count();
-    if count > 4000 {
-        *tail = tail.chars().skip(count - 2000).collect();
     }
 }
 
@@ -1093,7 +1086,9 @@ async fn send(stdin: &Mutex<Option<ChildStdin>>, frame: &Value) -> Result<()> {
     let pipe = stdin
         .as_mut()
         .context("Claude Code no longer takes input")?;
-    pipe.write_all(format!("{frame}\n").as_bytes()).await?;
+    let mut bytes = transport::json(frame, transport::FRAME_BYTES)?;
+    bytes.push(b'\n');
+    pipe.write_all(&bytes).await?;
     pipe.flush().await?;
     Ok(())
 }
@@ -1325,6 +1320,13 @@ where
             }
             line = process.lines.next_line() => line,
         };
+        if let Err(failure) = &line {
+            break Err(error(
+                ManagerFailure::Unknown,
+                native,
+                own(&format!("Claude Code output transport: {failure}")),
+            ));
+        }
         let Ok(Some(line)) = line else {
             if let Some(ending) = ending.take() {
                 break if processes.drained(process.tree.token(), results) {
@@ -1388,7 +1390,12 @@ where
                 reported_start = true;
             }
             if let Some(update) = turn.apply(frame)
-                && let Err(e) = progress(manager::redact(update, &secrets)).await
+                && let Err(e) = transport::deliver(
+                    progress(manager::redact(update, &secrets)),
+                    &mut cancel,
+                    deadline,
+                )
+                .await
             {
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
@@ -1615,8 +1622,12 @@ async fn follow(
             return;
         };
         let Ok(Some(line)) = line else {
-            missing_input_results =
-                ending.is_some() && !node.claude.processes.drained(process.tree.token(), results);
+            missing_input_results = line.is_err()
+                || (ending.is_some()
+                    && !node.claude.processes.drained(process.tree.token(), results));
+            if let Err(error) = &line {
+                tracing::warn!(%error, "Claude Code output transport stopped; reconcile native session");
+            }
             break;
         };
         for frame in frames(&line) {
@@ -1927,7 +1938,12 @@ impl Executor for Claude {
                 Err(error) => return SteerAck::Refused(error.to_string()),
             };
             let frame = steer_frame(input, message_id, &into.thread_id);
-            let input_hash = crate::crypto::digest(frame.to_string().as_bytes());
+            let mut bytes = match transport::json(&frame, transport::FRAME_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => return SteerAck::Refused(error.to_string()),
+            };
+            let input_hash = crate::crypto::digest(&bytes);
+            bytes.push(b'\n');
             let existing = match std::fs::read(&path) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2011,7 +2027,7 @@ impl Executor for Claude {
                 ));
             }
             let result = async {
-                pipe.write_all(format!("{frame}\n").as_bytes()).await?;
+                pipe.write_all(&bytes).await?;
                 pipe.flush().await
             }
             .await;
@@ -2073,17 +2089,6 @@ pub(super) mod tests {
         } else {
             "tests/fixtures/fake-claude"
         })
-    }
-
-    #[test]
-    fn a_stderr_tail_of_wide_characters_keeps_its_end() {
-        let mut tail = "错".repeat(1399) + "尾";
-        keep_end(&mut tail);
-        assert_eq!(tail.chars().count(), 1400);
-        let mut tail = "错".repeat(4000) + "尾";
-        keep_end(&mut tail);
-        assert_eq!(tail.chars().count(), 2000);
-        assert!(tail.ends_with('尾'));
     }
 
     /// A private directory with Claude Code's home and the fixture's log inside it.
@@ -3337,41 +3342,44 @@ time.sleep(0.05)
                 cause: None,
             },
         )?;
-        let mut store = node.store.lock().await;
-        store.create_conversation(
-            &node.identity,
-            network,
-            conversation_id,
-            "bot",
-            owner,
-            now_ms(),
-        )?;
-        store.append_event(
-            &node.identity,
-            network,
-            conversation_id,
-            bot,
-            vec![],
-            now_ms(),
-        )?;
-        let input = crate::runtime::test_support::signed_main_input(
-            admin,
-            network,
-            conversation_id,
-            message_id,
-            "Run the provider fixture work",
-            vec![],
-            1,
-        )?;
-        store.append_event(
-            &node.identity,
-            network,
-            conversation_id,
-            input,
-            vec![],
-            now_ms(),
-        )?;
-        Ok(())
+        let (identity, admin, network, conversation_id, message_id) = (
+            node.identity.clone(),
+            admin.clone(),
+            network.to_owned(),
+            conversation_id.to_owned(),
+            message_id.to_owned(),
+        );
+        node.store
+            .call("claude.conversation_fixture", move |store| {
+                store.create_conversation(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    "bot",
+                    owner,
+                    now_ms(),
+                )?;
+                store.append_event(&identity, &network, &conversation_id, bot, vec![], now_ms())?;
+                let input = crate::runtime::test_support::signed_main_input(
+                    &admin,
+                    &network,
+                    &conversation_id,
+                    &message_id,
+                    "Run the provider fixture work",
+                    vec![],
+                    1,
+                )?;
+                store.append_event(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    input,
+                    vec![],
+                    now_ms(),
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     fn spec(node: &Runtime, place: &Place, call_ref: &str, prompt: &str) -> Result<WorkSpec> {
@@ -3386,23 +3394,31 @@ time.sleep(0.05)
 
     /// Registers the work and has Claude Code start it, as `track_work` does.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<bool> {
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let claude = node.executor(Provider::Claude)?;
         node.start_work(claude, network, spec, None, &json!({}))
             .await
     }
 
     async fn record(node: &Runtime, work_id: &str) -> Result<WorkRecord> {
-        node.store
-            .lock()
-            .await
-            .work_record(work_id)?
-            .context("the work is recorded")
+        {
+            let work_id = work_id.to_owned();
+            node.store
+                .call("claude.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
+        }?
+        .context("the work is recorded")
     }
 
     async fn until(
@@ -3477,7 +3493,24 @@ time.sleep(0.05)
             text: "the work's late constraint".into(),
             files: vec![],
         };
-        let store = node.store.lock().await;
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (held_node, held_work) = (node.clone(), work.work_id.clone());
+        let gate = tokio::spawn(async move {
+            held_node
+                .store
+                .call("claude.hold_fixture_completion", move |store| {
+                    let _ = entered.send(());
+                    held.recv().context("release fixture completion")?;
+                    Ok(!store
+                        .work_record(&held_work)?
+                        .context("work")?
+                        .state
+                        .finished())
+                })
+                .await
+        });
+        waiting.await?;
         assert!(!matches!(
             node.claude.send_turn(&target, "work-input", &input).await,
             SteerAck::Refused(_)
@@ -3491,14 +3524,8 @@ time.sleep(0.05)
             }
         })
         .await?;
-        assert!(
-            !store
-                .work_record(&work.work_id)?
-                .context("work")?
-                .state
-                .finished()
-        );
-        drop(store);
+        release.send(())?;
+        assert!(gate.await??);
         let finished = until(&node, &work.work_id, WorkState::finished).await?;
         assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(
@@ -3600,12 +3627,16 @@ time.sleep(0.05)
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never sent")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let session = derived(SESSION_SEED, &spec.work_id);
         let journaled = node
             .signal_work(&network, &spec.work_id, Signal::ThreadCreated(session))
@@ -3646,12 +3677,16 @@ time.sleep(0.05)
                 thread: Some(session.clone()),
                 ..spec(&node, &place, call_ref, "hang around")?
             };
-            node.store.lock().await.accept_work_fixture(
-                &node.identity,
-                &network,
-                spec.clone(),
-                now_ms(),
-            )?;
+            {
+                let identity = node.identity.to_owned();
+                let network = network.to_owned();
+                let spec = spec.clone();
+                node.store
+                    .call("claude.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
+            }?;
             specs.push(spec);
         }
         let (claude, args) = (node.executor(Provider::Claude)?, json!({}));
@@ -3745,12 +3780,16 @@ time.sleep(0.05)
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never run")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let error = node
             .start_work(&Unstartable, &network, &spec, None, &json!({}))
             .await

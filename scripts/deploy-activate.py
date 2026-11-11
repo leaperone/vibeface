@@ -807,8 +807,8 @@ server {
             with TestCase().assertRaises(ValueError, msg='TLS files the Node could change or not read accepted'):
                 tls_directory(owned, owner=os.geteuid())
             tls.chmod(0o750); (tls / 'tls-key.pem').chmod(0o640); owned['gid'] = os.getegid()
-        with TestCase().assertRaises(ValueError, msg='TLS files not owned by root accepted'):
-            tls_directory(owned)
+        with TestCase().assertRaises(ValueError, msg='TLS files owned by a different account accepted'):
+            tls_directory(owned, owner=0 if os.geteuid() != 0 else 1)
         units = directory / 'units'; (units / 'old.service.d').mkdir(parents=True)
         (units / 'other.service').write_text('[Service]\nExecStart=/usr/bin/node --data-dir /var/lib/official-node2\n')
         assert units_using('/var/lib/official-node', [str(units)]) == []

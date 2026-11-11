@@ -49,6 +49,20 @@ pnpm exec e2e run --config tests/e2e/e2e.config.ts --headed
 
 排查失败时，读取终端指向的 `trace.md`。不要上传 Node 数据目录或恢复文件。
 
+## 验证会话历史分页
+
+使用同一源码构建的 CLI、Core 和 Web 加密模块运行隔离进程验收：
+
+```sh
+python3 scripts/verify-node.py --conversation-history \
+  --binary /absolute/path/to/vibeface \
+  --core-binary /absolute/path/to/vibeface-core \
+  --crypto-module /absolute/path/to/apps/app/dist/client/vibeface_secure.js \
+  --artifacts .artifacts/conversation-history
+```
+
+该模式通过真实加密连接写入 1024 条延后处理的签名消息，核对默认窗口、完整旧历史、3 MiB 响应预算、错误作用域拒绝、进程重启和新消息合并。Provider 执行与会话扫描关闭；若任何 Provider 程序被调用，验收失败。每次运行仅停止自己的 Node 和客户端进程，私有目录中的 `summary.json` 保存内容摘要、字节计量和清理结果，不输出凭证。此验收不证明网页或原生窗口的滚动表现。
+
 ## 验证公益传输进程和网络边界
 
 先构建仅用于受控 loopback 验收的 QUIC/Noise probe。构建产物必须留在任务 worktree 的 `.artifacts/`。
@@ -260,3 +274,16 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../../.agents/skills/e2e/SKILL.md)。
 
 当前未选择 AI 模型。需要 `agent.act` 时，先选择订阅、API 或本地模型，再按 `pnpm exec e2e guide setup` 配置 provider。ChatGPT 订阅的登录命令为 `pnpm exec e2e login openai`，完成登录后再运行模型测试。不要把凭证写入仓库；CI 保持不调用真实模型。
+
+## 验证原生桌面窗口
+
+Desktop 使用 GPUI。浏览器和手机 e2e 保留各自的配置，不把网页通过当作 Desktop 验收。
+
+```sh
+cargo test -p vibeface-desktop --locked
+VIBEFACE_E2E_DESKTOP_APP=<absolute-packaged-executable-or-mac-app> \
+VIBEFACE_E2E_DESKTOP_RUNTIME=<absolute-sealed-runtime-directory> \
+pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
+```
+
+Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。该配置使用现有 e2e runner 的 tools-only 原生目标，不设置浏览器引擎或 AI 模型；workers 为 1，retries 为 0。测试调用确定性的 OS 窗口驱动，只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。

@@ -69,6 +69,7 @@ export function prepareSend(input: {
   pending?: PendingMessage | null
   intent?: InputIntent
   expected_revision?: number
+  /** Defaults to true for a new draft, before its event is signed. */
   reportResults?: boolean
   /** It carries files, which are a message on their own. */
   files?: boolean
@@ -92,7 +93,7 @@ export function prepareSend(input: {
     intent: pending.intent, sequence: pending.sequence,
     ...(pending.expected_revision === undefined ? {} : { expected_revision: pending.expected_revision }),
     text: pending.text, ...(pending.attachments?.length ? { attachments: pending.attachments } : {}),
-    report_results: pending.report_results ?? true,
+    report_results: pending.report_results,
   } }
 }
 export function inputTargetKey(target: InputTarget): string {
@@ -109,7 +110,7 @@ export function inputEventBody(body: MessageRequest): WorkspaceInputBody {
   return { type: 'input_posted', message_id: body.message_id, target: body.target, intent: body.intent, sequence: body.sequence,
     ...(body.expected_revision === undefined ? {} : { expected_revision: body.expected_revision }), text: body.text,
     ...(body.attachments?.length ? { attachments: body.attachments } : {}),
-    ...(body.report_results === undefined ? {} : { report_results: body.report_results }),
+    report_results: body.report_results,
   }
 }
 /** The Node admitted this exact message; a retry of the same message_id returns the same receipt. */

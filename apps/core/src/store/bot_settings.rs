@@ -449,6 +449,7 @@ pub(crate) struct MemoryRecord {
     pub source_event_hash: String,
 }
 
+#[cfg(test)]
 impl MemoryRecord {
     pub fn metadata(&self) -> MemoryMetadata {
         MemoryMetadata {

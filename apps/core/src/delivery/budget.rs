@@ -2256,6 +2256,13 @@ mod tests {
                 .join(uuid::Uuid::new_v4().to_string());
             crate::config::private_dir(&dir)?;
             let delivery = Delivery::open(&dir, crate::crypto::LocalIdentity::generate())?;
+            let config = chain::tests::config();
+            delivery.configure_local(super::super::DeliveryConfig {
+                enabled: true,
+                paid_enabled: true,
+                chain: Some(config.clone()),
+                ..Default::default()
+            })?;
             let wallet = {
                 let mut wallet = delivery.wallet.lock().unwrap();
                 let password = vibeface_control::maintenance::SecretString::new(
@@ -2265,7 +2272,6 @@ mod tests {
                 wallet.unlock(&password)?;
                 wallet.address()?
             };
-            let config = chain::tests::config();
             let escrow = chain::address(&config.escrow)?;
             let observation = Arc::new(Mutex::new(NonceObservation {
                 receipts: Default::default(),
@@ -2527,19 +2533,23 @@ mod tests {
                 .contains("authorization")
         );
         fixture.delivery.configure_local(settings)?;
+        assert!(matches!(
+            fixture.delivery.wallet.lock().unwrap().status(),
+            WalletStatus::Locked { .. }
+        ));
+        assert!(matches!(
+            fixture.delivery.wallet.lock().unwrap().unlock(
+                &vibeface_control::maintenance::SecretString::new("nonce cleanup test password".into()),
+            )?,
+            WalletStatus::Unlocked { address } if address == fixture.claim.terms.payee
+        ));
         {
             let mut state = fixture.observation.lock().unwrap();
             state.latest = 8;
             state.pending = 8;
         }
-        assert!(
-            fixture
-                .step(true)
-                .await?
-                .1
-                .unwrap()
-                .contains("canonical nonce")
-        );
+        let nonce_risk = fixture.step(true).await?.1.unwrap();
+        assert!(nonce_risk.contains("canonical nonce"), "{nonce_risk}");
         {
             let mut state = fixture.observation.lock().unwrap();
             state.latest = 7;

@@ -31,7 +31,7 @@
 ## What you can do
 
 - **Ask in chat.** Give a bot a name and a job, then use its conversation to ask for work and review results.
-- **Choose a computer.** Run tasks on your own Mac or Linux computer using Codex, Claude Code, pi, opencode, or Cursor.
+- **Choose a computer.** Run tasks on your own Mac, Windows, or Linux computer using Codex, Claude Code, pi, opencode, or Cursor.
 - **Continue elsewhere.** Approved computers share conversations, task updates, and saved results. Open a synced conversation on another computer and choose to continue there.
 - **Check from your phone.** Connect through a browser or the native iOS and Android apps.
 
@@ -39,7 +39,7 @@ Vibeface coordinates the work. You provide the Agent, its login and model access
 
 ## Get started
 
-You need an Apple Silicon Mac, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
+You need an Apple Silicon Mac, Windows x64, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
 
 1. Install Nightly. The installer selects and verifies the complete package for your platform:
 
@@ -117,7 +117,7 @@ Detailed guides are currently in Chinese.
 
 ## Build from source
 
-You need Rust 1.91+, Node.js 22.12+, pnpm 11.9.0, and `wasm-bindgen-cli` 0.2.129.
+Core/CLI builds need Python 3.12+, Rust 1.91+, Node.js 24, pnpm 11.9.0, and `wasm-bindgen-cli` 0.2.129.
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -125,6 +125,8 @@ bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 bash scripts/package-node.sh
 ```
+
+The native GPUI Desktop uses the separate pinned toolchain and platform libraries in `.github/actions/native-desktop/action.yml`. The repository contains six apps: Web, CLI, Core, Desktop, Mobile, and the independent website.
 
 The platform package is written to `.artifacts/packages/`. See [source setup](packages/docs/quick-start.md#从源码准备当前版本) for running it and [release instructions](packages/docs/releasing.md) for packaging details.
 
@@ -136,7 +138,7 @@ The platform package is written to `.artifacts/packages/`. See [source setup](pa
 │   ├── app/         # Web app
 │   ├── cli/         # Command line
 │   ├── core/        # Node service
-│   ├── desktop/     # Desktop app
+│   ├── desktop/     # Native GPUI desktop app
 │   ├── mobile/      # iOS and Android apps
 │   └── www/         # Public website
 ├── crates/          # Shared Rust libraries

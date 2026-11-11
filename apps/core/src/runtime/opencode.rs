@@ -11,8 +11,8 @@ use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
 use futures_util::future::BoxFuture;
 use reqwest::Method;
-use tokio::io::AsyncBufReadExt as _;
 use vibeface_bridge::failure::ProviderStage;
+use vibeface_bridge::transport;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -57,8 +57,6 @@ pub struct Opencode {
     unresolved_uses: std::sync::Mutex<HashMap<String, Use>>,
     /// Sessions a work is being sent into now.
     starting: std::sync::Mutex<BTreeSet<String>>,
-    /// Works whose start runs in this process and has yet to claim its session.
-    sending: std::sync::Mutex<BTreeSet<String>>,
     cancelled_inputs: std::sync::Mutex<BTreeSet<String>>,
 }
 
@@ -280,7 +278,6 @@ impl Opencode {
             users: Default::default(),
             unresolved_uses: Default::default(),
             starting: Default::default(),
-            sending: Default::default(),
             cancelled_inputs: Default::default(),
         })
     }
@@ -498,8 +495,10 @@ impl Opencode {
                 },
             ));
         }
-        let mut lines =
-            tokio::io::BufReader::new(stdout.context("the opencode serve has no output")?).lines();
+        let mut lines = transport::Lines::new(
+            tokio::io::BufReader::new(stdout.context("the opencode serve has no output")?),
+            transport::FRAME_BYTES,
+        );
         let listening = async {
             while let Some(line) = lines.next_line().await? {
                 if let Some(base) = line.split("listening on ").nth(1) {
@@ -552,11 +551,13 @@ impl Opencode {
             .query(query)
             .timeout(REQUEST_WAIT);
         if let Some(body) = body {
-            request = request.json(body);
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(transport::json(body, transport::BODY_BYTES)?);
         }
         let response = request.send().await?;
         let status = response.status().as_u16();
-        let bytes = response.bytes().await?;
+        let bytes = transport::body(response, transport::BODY_BYTES).await?;
         let body = match serde_json::from_slice(&bytes) {
             Ok(body) => body,
             Err(_) if bytes.is_empty() => Value::Null,
@@ -1138,7 +1139,8 @@ impl Opencode {
         self.environment(&conn, &session, &env)
             .await
             .map_err(|e| failed(native, own(&format!("set the tool environment: {e}"))))?;
-        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (events_tx, mut events) =
+            transport::json_channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES);
         let (up, ready) = tokio::sync::oneshot::channel();
         let follow = follow_events(
             self.http.clone(),
@@ -1249,7 +1251,7 @@ impl Opencode {
                         native_start_event = event["type"] == "session.step.started"
                             && event["data"]["assistantMessageID"].is_string();
                         if let Some(update) = seen.apply(&event)
-                            && let Err(e) = progress(update).await
+                            && let Err(e) = transport::deliver(progress(update), &mut cancel, deadline).await
                         {
                             // Not knowing what was shown, the run must not go on unseen.
                             let last = self.close(&session);
@@ -1268,8 +1270,12 @@ impl Opencode {
                         terminal_event
                     }
                     None => {
+                        if let Some(error) = events.failure() {
+                            tracing::warn!(%error, "opencode progress unavailable; reconciling native run");
+                        }
                         streaming = false;
-                        false
+                        // Reconcile immediately through the independent HTTP path.
+                        true
                     }
                 },
                 _ = ticks.tick() => true,
@@ -1395,57 +1401,43 @@ async fn follow_events(
     http: reqwest::Client,
     conn: Conn,
     session: String,
-    events: mpsc::UnboundedSender<Value>,
+    events: transport::JsonSender,
     up: tokio::sync::oneshot::Sender<()>,
 ) {
-    let response = http
-        .get(format!("{}/api/event", conn.base))
-        .basic_auth("opencode", Some(&conn.password))
-        .send()
-        .await;
-    let Ok(mut response) = response else {
-        return;
-    };
-    if !response.status().is_success() {
-        return;
-    }
-    let mut up = Some(up);
-    let mut buffer = Vec::new();
-    let mut data = Vec::new();
-    let mut dispatch = |bytes: &[u8]| {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(event) = serde_json::from_slice::<Value>(bytes) else {
-            return;
-        };
-        if let Some(up) = up.take() {
-            let _ = up.send(());
-        }
-        if session_of(&event) == Some(session.as_str()) {
-            let _ = events.send(event);
-        }
-    };
-    while let Ok(Some(chunk)) = response.chunk().await {
-        buffer.extend_from_slice(&chunk);
-        while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=end).collect();
-            let line = line.strip_suffix(b"\n").unwrap_or(&line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                dispatch(&data);
-                data.clear();
-            } else if let Some(value) = line.strip_prefix(b"data:") {
-                let value = value.strip_prefix(b" ").unwrap_or(value);
-                data.extend_from_slice(value);
+    let result = async {
+        let mut response = http
+            .get(format!("{}/api/event", conn.base))
+            .basic_auth("opencode", Some(&conn.password))
+            .send()
+            .await?;
+        ensure!(
+            response.status().is_success(),
+            "opencode event stream refused"
+        );
+        let mut up = Some(up);
+        let mut sse = transport::Sse::new(transport::FRAME_BYTES);
+        while let Some(chunk) = response.chunk().await? {
+            let mut input = chunk.as_ref();
+            while let Some(bytes) = sse.next(&mut input)? {
+                let event: Value = serde_json::from_slice(&bytes)?;
+                if let Some(up) = up.take() {
+                    let _ = up.send(());
+                }
+                if session_of(&event) == Some(session.as_str()) {
+                    // HTTP requests use a different connection. The turn guard aborts this
+                    // task on cancellation, including while a slow consumer holds the queue.
+                    events.send(event).await?;
+                }
             }
         }
-        // ponytail: a line this long is no event the turn needs.
-        if buffer.len() > 1 << 24 {
-            return;
-        }
+        sse.finish()?;
+        anyhow::Ok(())
     }
-    dispatch(&data);
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "opencode event stream stopped; reconcile through HTTP");
+        events.fail(error);
+    }
 }
 
 fn session_of(event: &Value) -> Option<&str> {
@@ -1758,7 +1750,14 @@ async fn follow(node: std::sync::Weak<Runtime>, network: String, work_id: String
         let Some(node) = node.upgrade() else {
             return;
         };
-        let Ok(Some(record)) = node.store.lock().await.work_record(&work_id) else {
+        let Ok(Some(record)) = ({
+            let work_id = work_id.to_owned();
+            node.store
+                .call("opencode.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
+        }) else {
             return;
         };
         let starting = matches!(record.state, WorkState::Starting { .. });
@@ -1796,7 +1795,6 @@ impl Executor for Opencode {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let id = work.work_id.as_str();
-            let sending = Claim::take(&self.sending, id);
             let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let mut files = Vec::new();
             for image in args["images"].as_array().into_iter().flatten() {
@@ -1847,21 +1845,31 @@ impl Executor for Opencode {
                     }
                 }
             };
-            // Two runs in one session would end each other's turns. A work not known to be sent
-            // holds the session too, unless its own start has yet to try for the session here.
+            // A pinned session is already Starting at admission. Only a durable native
+            // reservation makes that unfinished start a possible session writer.
             let _claim = match thread {
                 Some(_) => {
                     let claim = Claim::take(&self.starting, &session);
-                    drop(sending);
-                    let runs = node.store.lock().await.work_records_on_thread(&session)?;
-                    let holder = runs.into_iter().find(|run| {
-                        run.work_id != id
-                            && !run.state.finished()
-                            && !(matches!(run.state, WorkState::Starting { .. })
-                                && (self.sending.lock())
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .contains(&run.work_id))
-                    });
+                    let holder = {
+                        let session = session.to_owned();
+                        let work_id = id.to_owned();
+                        node.store
+                            .call("opencode.work_records_on_thread", move |store| {
+                                for run in store.work_records_on_thread(&session)? {
+                                    if run.work_id == work_id || run.state.finished() {
+                                        continue;
+                                    }
+                                    if matches!(run.state, WorkState::Starting { .. })
+                                        && !store.work_native_submission_reserved(&run.work_id)?
+                                    {
+                                        continue;
+                                    }
+                                    return Ok(Some(run));
+                                }
+                                Ok(None)
+                            })
+                            .await
+                    }?;
                     let busy = match (&claim, &holder) {
                         (None, _) => {
                             Some("opencode is starting another work in this session".to_owned())
@@ -1884,10 +1892,7 @@ impl Executor for Opencode {
                     }
                     claim
                 }
-                None => {
-                    drop(sending);
-                    None
-                }
+                None => None,
             };
             // Journaled before the send: a restart reads the run back by the work's message.
             let signal = Signal::ThreadCreated(session.clone());
@@ -1944,12 +1949,17 @@ impl Executor for Opencode {
                 let Some(node) = runtime.upgrade() else {
                     return;
                 };
-                let store = node.store.lock().await;
-                let finished = store
-                    .work_record(&held_work)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.state.finished());
+                let finished = {
+                    let held_work = held_work.clone();
+                    node.store
+                        .call("opencode.held_work_finished", move |store| {
+                            store.work_record(&held_work)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record.state.finished())
+                };
                 if !finished {
                     owner
                         .unresolved_uses
@@ -2764,16 +2774,30 @@ mod tests {
     /// Registers the work `w-1` and has the Node start it on opencode.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<()> {
         let at = now_ms();
-        (node.store.lock().await).accept_work_fixture(&node.identity, network, spec.clone(), at)?;
-        assert_eq!(
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
             node.store
-                .lock()
+                .call("opencode.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, at)
+                })
                 .await
-                .works(network, &spec.conversation)?
-                .into_iter()
-                .find(|work| work.work_id == spec.work_id)
-                .context("accepted work")?
-                .cwd,
+        }?;
+        assert_eq!(
+            {
+                let network = network.to_owned();
+                let conversation = spec.conversation.to_owned();
+                node.store
+                    .call("opencode.works", move |store| {
+                        store.works(&network, &conversation)
+                    })
+                    .await
+            }?
+            .into_iter()
+            .find(|work| work.work_id == spec.work_id)
+            .context("accepted work")?
+            .cwd,
             spec.cwd,
             "the admitted work retains its exact requested directory"
         );
@@ -2787,7 +2811,12 @@ mod tests {
     async fn until(node: &Runtime, done: impl Fn(&WorkState) -> bool) -> Result<WorkRecord> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let record = node.store.lock().await.work_record("w-1")?;
+            let record = node
+                .store
+                .call("opencode.work_record", move |store| {
+                    store.work_record("w-1")
+                })
+                .await?;
             let record = record.context("the work is recorded")?;
             if done(&record.state) {
                 return Ok(record);
@@ -3551,9 +3580,7 @@ mod tests {
             .get_mut(&session)
             .unwrap()
             .busy = false;
-        node.store.lock().await.connection.execute_batch(
-            "CREATE TEMP TRIGGER refuse_terminal_work BEFORE INSERT ON work_runs WHEN NEW.state='finished' BEGIN SELECT RAISE(FAIL,'fixture terminal write failure'); END;"
-        )?;
+        node.store.call("opencode.connection.execute_batch", move |store| Ok(store.connection.execute_batch("CREATE TEMP TRIGGER refuse_terminal_work BEFORE INSERT ON work_runs WHEN NEW.state='finished' BEGIN SELECT RAISE(FAIL,'fixture terminal write failure'); END;")?)).await?;
         node.interrupt_work(&network, &work.work_id).await?;
         let interrupted = Probe::Terminal {
             turn_id: work_message(&work.work_id),
@@ -3570,10 +3597,12 @@ mod tests {
         );
         assert_eq!(node.opencode.probe(&running).await?, interrupted);
         node.store
-            .lock()
-            .await
-            .connection
-            .execute_batch("DROP TRIGGER refuse_terminal_work;")?;
+            .call("opencode.connection.execute_batch", move |store| {
+                Ok(store
+                    .connection
+                    .execute_batch("DROP TRIGGER refuse_terminal_work;")?)
+            })
+            .await?;
         node.signal_work(&network, &work.work_id, Signal::Probed(interrupted))
             .await?;
         let stopped = until(&node, WorkState::finished).await?;
@@ -3755,12 +3784,16 @@ mod tests {
             thread: Some(session.clone()),
             ..first
         };
-        (node.store.lock().await).accept_work_fixture(
-            &node.identity,
-            &network,
-            second.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let second = second.clone();
+            node.store
+                .call("opencode.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, second, now_ms())
+                })
+                .await
+        }?;
         let args = json!({"model":"fake/other"});
         let opencode = node.opencode.clone();
         let busy = node
@@ -3781,7 +3814,13 @@ mod tests {
             json!({"providerID":"fake","id":"m"}),
             "a refused work must not change the running session's model"
         );
-        let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
+        let refused = (node
+            .store
+            .call("opencode.work_record", move |store| {
+                store.work_record("w-2")
+            })
+            .await?)
+            .context("recorded")?;
         assert_eq!(
             refused.state,
             WorkState::Finished {
@@ -3813,12 +3852,16 @@ mod tests {
             call_ref: "w-2".into(),
             ..unsure.clone()
         };
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            unsure.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let unsure = unsure.clone();
+            node.store
+                .call("opencode.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, unsure, now_ms())
+                })
+                .await
+        }?;
         let input = node
             .work_start_lease(&network, &unsure, Some(&session))
             .await?;
@@ -3833,18 +3876,24 @@ mod tests {
             .signal_work(&network, &unsure.work_id, Signal::Probed(Probe::Missing))
             .await?;
         assert!(matches!(unknown.state, WorkState::Unverified { .. }));
-        assert!(
+        assert!({
+            let work_id = unsure.work_id.to_owned();
             node.store
-                .lock()
+                .call("opencode.work_native_submission_reserved", move |store| {
+                    store.work_native_submission_reserved(&work_id)
+                })
                 .await
-                .work_native_submission_reserved(&unsure.work_id)?
-        );
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            second.clone(),
-            now_ms(),
-        )?;
+        }?);
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let second = second.clone();
+            node.store
+                .call("opencode.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, second, now_ms())
+                })
+                .await
+        }?;
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let busy = node
@@ -3860,7 +3909,13 @@ mod tests {
                 .map(|failure| failure.kind),
             Some(FailureKind::WriterBusy)
         );
-        let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
+        let refused = (node
+            .store
+            .call("opencode.work_record", move |store| {
+                store.work_record("w-2")
+            })
+            .await?)
+            .context("recorded")?;
         assert_eq!(
             refused.state,
             WorkState::Finished {
@@ -3869,20 +3924,26 @@ mod tests {
         );
         assert!(place.prompts().is_empty(), "nothing went into the session");
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .work_record(&unsure.work_id)?
-                .context("unknown work")?
-                .state,
+            {
+                let work_id = unsure.work_id.to_owned();
+                node.store
+                    .call("opencode.work_record", move |store| {
+                        store.work_record(&work_id)
+                    })
+                    .await
+            }?
+            .context("unknown work")?
+            .state,
             unknown.state
         );
-        assert!(
+        assert!({
+            let work_id = unsure.work_id.to_owned();
             node.store
-                .lock()
+                .call("opencode.work_native_submission_reserved", move |store| {
+                    store.work_native_submission_reserved(&work_id)
+                })
                 .await
-                .work_native_submission_reserved(&unsure.work_id)?
-        );
+        }?);
         Ok(())
     }
 
@@ -3903,9 +3964,18 @@ mod tests {
             call_ref: "w-2".into(),
             ..first.clone()
         };
-        for work in [&first, &second] {
-            let mut store = node.store.lock().await;
-            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
+        let waiting = WorkSpec {
+            work_id: "w-waiting".into(),
+            call_ref: "w-waiting".into(),
+            ..first.clone()
+        };
+        for work in [&first, &second, &waiting] {
+            let (identity, network, work) = (node.identity.clone(), network.clone(), work.clone());
+            node.store
+                .call("opencode.accept_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, work, now_ms())
+                })
+                .await?;
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
@@ -3913,10 +3983,11 @@ mod tests {
             node.start_work(opencode.as_ref(), &network, &first, Some(&session), &args),
             node.start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
         );
+        let starts = [one, two];
         assert_eq!(
-            [one, two].iter().filter(|start| start.is_err()).count(),
+            starts.iter().filter(|start| start.is_err()).count(),
             1,
-            "the refused start says so"
+            "the refused start says so: {starts:?}"
         );
         assert_eq!(
             place.prompts().len(),
@@ -3925,7 +3996,13 @@ mod tests {
         );
         let mut rejected = 0;
         for id in ["w-1", "w-2"] {
-            let run = (node.store.lock().await.work_record(id)?).context("recorded")?;
+            let run = ({
+                let id = id.to_owned();
+                node.store
+                    .call("opencode.work_record", move |store| store.work_record(&id))
+                    .await
+            }?)
+            .context("recorded")?;
             rejected += usize::from(
                 run.state
                     == WorkState::Finished {
@@ -3934,6 +4011,23 @@ mod tests {
             );
         }
         assert_eq!(rejected, 1, "the other was refused");
+        let (waiting, reserved) = node
+            .store
+            .call("opencode.waiting_work", move |store| {
+                Ok((
+                    store.work_record("w-waiting")?.context("waiting work")?,
+                    store.work_native_submission_reserved("w-waiting")?,
+                ))
+            })
+            .await?;
+        assert_eq!(
+            waiting.state,
+            WorkState::Starting {
+                thread: Some(session),
+            },
+            "the admitted peer still awaits its first native submission"
+        );
+        assert!(!reserved, "an admitted peer does not reserve the session");
         Ok(())
     }
 
@@ -4020,7 +4114,14 @@ mod tests {
                 .unwrap()
                 .busy = false;
             assert!(node.resolve_check(&access, &input).await.is_err());
-            assert_eq!(node.store.lock().await.pending_checks()?.len(), 1);
+            assert_eq!(
+                node.store
+                    .call("opencode.pending_checks", move |store| store
+                        .pending_checks())
+                    .await?
+                    .len(),
+                1
+            );
             assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert!(server.configuration_pending(&expected.bin, &expected.env));
             {
@@ -4029,7 +4130,13 @@ mod tests {
                 fake.unavailable = !observable;
             }
             assert_eq!(node.resolve_check(&access, &input).await?["resolved"], true);
-            assert!(node.store.lock().await.pending_checks()?.is_empty());
+            assert!(
+                node.store
+                    .call("opencode.pending_checks", move |store| store
+                        .pending_checks())
+                    .await?
+                    .is_empty()
+            );
             assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert!(!server.configuration_pending(&expected.bin, &expected.env));
             server.release_manager(&session);

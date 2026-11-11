@@ -13,13 +13,14 @@ use base64::Engine as _;
 use futures_util::future::BoxFuture;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{oneshot, watch};
 use vibeface_bridge::agent::{self, AgentResult};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 use vibeface_bridge::platform::tree;
+use vibeface_bridge::transport;
 use vibeface_bridge::turn::TurnStatus;
 
 /// Process groups of the running pi processes, with the program each one runs.
@@ -132,12 +133,29 @@ struct ReplyPointer {
     prompt_hash: String,
 }
 
+type PendingResponses =
+    std::sync::Mutex<Option<HashMap<String, oneshot::Sender<transport::HeldJson>>>>;
+
 /// One pi process's commands: each goes out with an ID and its response comes back by it.
 struct Rpc {
     stdin: Mutex<Option<ChildStdin>>,
     /// `None` once pi closed its output.
-    waiting: std::sync::Mutex<Option<HashMap<String, oneshot::Sender<Value>>>>,
+    waiting: PendingResponses,
+    responses: transport::JsonBudget,
+    commands: transport::JsonBudget,
     next: AtomicU64,
+}
+
+struct PendingReply<'a> {
+    rpc: &'a Rpc,
+    id: String,
+}
+impl Drop for PendingReply<'_> {
+    fn drop(&mut self) {
+        if let Some(waiting) = lock(&self.rpc.waiting).as_mut() {
+            waiting.remove(&self.id);
+        }
+    }
 }
 
 enum Reply {
@@ -166,7 +184,8 @@ struct Process {
     processes: Arc<Processes>,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
-    events: mpsc::UnboundedReceiver<Value>,
+    events: transport::JsonReceiver,
+    output: tokio::task::JoinHandle<()>,
     /// The end of what pi wrote to stderr, once it closed it.
     stderr: Option<tokio::task::JoinHandle<String>>,
     _guide: Option<Arc<Guide>>,
@@ -174,6 +193,7 @@ struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        self.output.abort();
         if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
             self.tree.kill();
         }
@@ -200,6 +220,32 @@ enum Report {
     Progress(Value),
     /// The run ended without seeing the turn end; the session file tells.
     Probe,
+}
+
+// Only these signals are produced by run_work. New report variants must supply a byte
+// estimate before entering this queue; an unknown variant forces reconciliation.
+fn report_bytes(report: &Report) -> usize {
+    let payload = match report {
+        Report::Probe => 0,
+        Report::Progress(value) => transport::value_bytes(value),
+        Report::Signal(signal) => match signal {
+            Signal::TurnStarted { turn_id, .. } => turn_id.capacity(),
+            Signal::StartRejected(error) => error.detail.capacity(),
+            Signal::Progress { summary, .. } => summary.capacity(),
+            Signal::Text(text) => text.capacity(),
+            Signal::TurnCompleted {
+                turn_id,
+                text,
+                error,
+                ..
+            } => turn_id
+                .capacity()
+                .saturating_add(text.capacity())
+                .saturating_add(error.as_ref().map_or(0, |error| error.detail.capacity())),
+            _ => usize::MAX,
+        },
+    };
+    std::mem::size_of::<Report>().saturating_add(payload)
 }
 
 /// What the events of one turn showed.
@@ -388,6 +434,71 @@ impl Seen {
     }
 }
 
+/// A frame owns stdin until all its bytes and flush complete. Cancelling `write_all` may
+/// leave a prefix on the pipe, so an interrupted writer must never return to the input slot.
+struct InFlightFrame<'a, W> {
+    pipe: Option<W>,
+    slot: &'a mut Option<W>,
+    waiting: &'a PendingResponses,
+}
+
+impl<W> InFlightFrame<'_, W> {
+    fn complete(mut self) {
+        *self.slot = self.pipe.take();
+    }
+}
+
+impl<W> Drop for InFlightFrame<'_, W> {
+    fn drop(&mut self) {
+        if self.pipe.is_some() {
+            *lock(self.waiting) = None;
+            tracing::warn!(
+                "pi input frame interrupted; closing stdin and reconciling native session"
+            );
+        }
+        // An incomplete frame's pipe closes here. Its native process is left for readback.
+    }
+}
+
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    stdin: &mut Option<W>,
+    waiting: &PendingResponses,
+    bytes: &[u8],
+    started: &AtomicBool,
+    prompt_started: Option<&AtomicBool>,
+) -> Result<(), Reply> {
+    let Some(pipe) = stdin.take() else {
+        return Err(Reply::Unsent);
+    };
+    let mut frame = InFlightFrame {
+        pipe: Some(pipe),
+        slot: stdin,
+        waiting,
+    };
+    started.store(true, Relaxed);
+    if let Some(prompt_started) = prompt_started {
+        prompt_started.store(true, Relaxed);
+    }
+    let pipe = frame.pipe.as_mut().expect("in-flight frame owns stdin");
+    pipe.write_all(bytes).await.map_err(|_| Reply::Lost)?;
+    pipe.flush().await.map_err(|_| Reply::Lost)?;
+    frame.complete();
+    Ok(())
+}
+
+async fn write_command<W: tokio::io::AsyncWrite + Unpin>(
+    stdin: &Mutex<Option<W>>,
+    waiting: &PendingResponses,
+    line: &Value,
+    started: &AtomicBool,
+) -> Result<(), Reply> {
+    let mut stdin = stdin.lock().await;
+    let mut bytes = transport::json(line, transport::FRAME_BYTES)
+        .map_err(|error| Reply::Refused(error.to_string()))?;
+    bytes.push(b'\n');
+    write_frame(&mut stdin, waiting, &bytes, started, None).await
+}
+
 impl Rpc {
     async fn call(&self, command: Value, within: Duration) -> Reply {
         self.call_with_prompt(command, within, None).await
@@ -401,32 +512,49 @@ impl Rpc {
     ) -> Reply {
         let id = format!("vf-{}", self.next.fetch_add(1, Relaxed));
         command["id"] = json!(id);
+        let command = match self.commands.try_hold(command) {
+            Ok(command) => command,
+            Err(error) => return Reply::Refused(error.to_string()),
+        };
         let (sender, answer) = oneshot::channel();
         match lock(&self.waiting).as_mut() {
-            Some(waiting) => waiting.insert(id.clone(), sender),
+            Some(waiting) if waiting.len() < transport::QUEUE_ITEMS => {
+                waiting.insert(id.clone(), sender)
+            }
+            Some(_) => return Reply::Refused("pi has too many pending commands".into()),
             None => return Reply::Unsent,
         };
-        let written = match prompt {
-            Some(prompt) => self.write_prompt(&command, prompt).await,
-            None if self.write(&command).await => Ok(()),
-            None => Err(Reply::Unsent),
-        };
-        if let Err(reply) = written {
-            if let Some(waiting) = lock(&self.waiting).as_mut() {
-                waiting.remove(&id);
+        let _pending = PendingReply { rpc: self, id };
+        let write_started = AtomicBool::new(false);
+        let written = tokio::time::timeout(within, async {
+            match prompt {
+                Some(prompt) => {
+                    self.write_prompt(&command.value, prompt, &write_started)
+                        .await
+                }
+                None => {
+                    write_command(&self.stdin, &self.waiting, &command.value, &write_started).await
+                }
             }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(if write_started.load(Relaxed) {
+                Reply::Lost
+            } else {
+                Reply::Unsent
+            })
+        });
+        if let Err(reply) = written {
             return reply;
         }
         let answer = tokio::time::timeout(within, answer).await;
-        if let Some(waiting) = lock(&self.waiting).as_mut() {
-            waiting.remove(&id);
-        }
         match answer {
-            Ok(Ok(response)) if response["success"] == true => {
-                Reply::Done(response["data"].clone())
+            Ok(Ok(response)) if response.value["success"] == true => {
+                Reply::Done(response.value["data"].clone())
             }
             Ok(Ok(response)) => Reply::Refused(
-                response["error"]
+                response.value["error"]
                     .as_str()
                     .unwrap_or("pi refused the command")
                     .into(),
@@ -435,16 +563,22 @@ impl Rpc {
         }
     }
 
-    async fn write_prompt(&self, line: &Value, prompt: PromptWrite<'_>) -> Result<(), Reply> {
-        let mut bytes = line.to_string().into_bytes();
-        bytes.push(b'\n');
+    async fn write_prompt(
+        &self,
+        line: &Value,
+        prompt: PromptWrite<'_>,
+        started: &AtomicBool,
+    ) -> Result<(), Reply> {
         let mut stdin = self.stdin.lock().await;
+        let mut bytes = transport::json(line, transport::FRAME_BYTES)
+            .map_err(|error| Reply::Refused(error.to_string()))?;
+        bytes.push(b'\n');
         if *prompt.cancel.borrow() {
             return Err(Reply::Refused("stopped before pi took the prompt".into()));
         }
-        let Some(pipe) = stdin.as_mut() else {
+        if stdin.is_none() {
             return Err(Reply::Unsent);
-        };
+        }
         let _lease = match prompt.work {
             Some(work) => Some(
                 work.node
@@ -457,40 +591,58 @@ impl Rpc {
         if *prompt.cancel.borrow() {
             return Err(Reply::Refused("stopped before pi took the prompt".into()));
         }
-        prompt.writing.store(true, Relaxed);
-        pipe.write_all(&bytes).await.map_err(|_| Reply::Lost)?;
-        pipe.flush().await.map_err(|_| Reply::Lost)
+        write_frame(
+            &mut stdin,
+            &self.waiting,
+            &bytes,
+            started,
+            Some(prompt.writing),
+        )
+        .await
     }
 
     /// One JSON line on pi's input; false when pi no longer reads it.
     async fn write(&self, line: &Value) -> bool {
-        let mut bytes = line.to_string().into_bytes();
-        bytes.push(b'\n');
-        match self.stdin.lock().await.as_mut() {
-            Some(pipe) => pipe.write_all(&bytes).await.is_ok() && pipe.flush().await.is_ok(),
-            None => false,
-        }
+        let started = AtomicBool::new(false);
+        write_command(&self.stdin, &self.waiting, line, &started)
+            .await
+            .is_ok()
     }
 }
 
 /// Routes pi's output: responses to their callers, the rest as events. With no extensions
 /// loaded, nothing in it waits for an answer.
-async fn read_output(stdout: ChildStdout, rpc: Arc<Rpc>, events: mpsc::UnboundedSender<Value>) {
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if message["type"] != "response" {
-            let _ = events.send(message);
-            continue;
+async fn read_output(
+    stdout: impl tokio::io::AsyncRead + Unpin,
+    rpc: Arc<Rpc>,
+    events: transport::JsonSender,
+) {
+    let mut lines =
+        transport::Lines::new(tokio::io::BufReader::new(stdout), transport::FRAME_BYTES);
+    let result = async {
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if message["type"] != "response" {
+                // Waiting here can strand the response to the prompt/get_entries/abort RPC
+                // behind progress on the same pipe. Pressure makes the outcome unknown.
+                events.try_send(message)?;
+                continue;
+            }
+            let waiting = message["id"]
+                .as_str()
+                .and_then(|id| lock(&rpc.waiting).as_mut()?.remove(id));
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(rpc.responses.try_hold(message)?);
+            }
         }
-        let waiting = message["id"]
-            .as_str()
-            .and_then(|id| lock(&rpc.waiting).as_mut()?.remove(id));
-        if let Some(waiting) = waiting {
-            let _ = waiting.send(message);
-        }
+        std::io::Result::Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "pi output transport stopped; reconcile native session");
+        events.fail(error);
     }
     *lock(&rpc.waiting) = None;
 }
@@ -548,10 +700,13 @@ impl Process {
         let rpc = Arc::new(Rpc {
             stdin: Mutex::new(Some(stdin)),
             waiting: std::sync::Mutex::new(Some(HashMap::new())),
+            responses: transport::JsonBudget::new(transport::QUEUE_BYTES),
+            commands: transport::JsonBudget::new(transport::QUEUE_BYTES),
             next: AtomicU64::new(1),
         });
-        let (sender, events) = mpsc::unbounded_channel();
-        tokio::spawn(read_output(stdout, rpc.clone(), sender));
+        let (sender, events) =
+            transport::json_channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES);
+        let output = tokio::spawn(read_output(stdout, rpc.clone(), sender));
         let stderr = tokio::spawn(async move {
             let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
             while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
@@ -568,6 +723,7 @@ impl Process {
             processes: processes.clone(),
             rpc,
             events,
+            output,
             stderr: Some(stderr),
             _guide: launch.guide.clone(),
         })
@@ -601,7 +757,7 @@ impl Process {
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
             seen.apply(&event);
             if event["type"] == "agent_settled" {
-                return true;
+                return self.events.failure().is_none();
             }
         }
         false
@@ -701,7 +857,9 @@ impl Process {
                 Ok(None) | Err(_) => {
                     return Begin::Unknown(ExecFailure::new(
                         FailureKind::Lost,
-                        "pi stopped before the turn started",
+                        self.events
+                            .failure()
+                            .unwrap_or_else(|| "pi stopped before the turn started".into()),
                     ));
                 }
             }
@@ -1202,12 +1360,23 @@ impl Pi {
                         break Err(error(
                             ManagerFailure::Unknown,
                             native,
-                            ExecFailure::new(FailureKind::Lost, "pi exited during the turn"),
+                            ExecFailure::new(
+                                FailureKind::Lost,
+                                process
+                                    .events
+                                    .failure()
+                                    .unwrap_or_else(|| "pi exited during the turn".into()),
+                            ),
                         ));
                     };
                     let mut shown = Ok(());
                     for update in seen.apply(&event) {
-                        shown = progress(crate::manager::redact(update, &secrets)).await;
+                        shown = transport::deliver(
+                            progress(crate::manager::redact(update, &secrets)),
+                            &mut cancel,
+                            deadline,
+                        )
+                        .await;
                         if shown.is_err() {
                             break;
                         }
@@ -1216,6 +1385,9 @@ impl Pi {
                         break Err(error(ManagerFailure::Unknown, native, own(e.to_string())));
                     }
                     if event["type"] == "agent_settled" {
+                        if let Some(failure) = process.events.failure() {
+                            break Err(error(ManagerFailure::Unknown, native, own(failure)));
+                        }
                         break match seen.ending(false) {
                             (TurnStatus::Completed, _) => Ok(seen.text()),
                             (TurnStatus::Interrupted, _) => {
@@ -1248,16 +1420,21 @@ impl Pi {
         launch: Launch,
         first_input: WorkFirstInput,
         prompt: Value,
-        report: mpsc::UnboundedSender<Report>,
+        report: transport::Sender<Report>,
         mut cancel: watch::Receiver<bool>,
     ) {
         let session = first_input.session.clone();
-        let send = |item| {
-            let _ = report.send(item);
+        let send = async |item| {
+            if let Err(error) = report.send(item).await {
+                tracing::warn!(%error, "pi work report unavailable; reconcile native session");
+                // Probe is tiny and reliable even when the original terminal report exceeded
+                // the byte budget. A closed consumer cannot accept either message.
+                let _ = report.send(Report::Probe).await;
+            }
         };
         let (mut process, after) = match self.open(&launch, &session, &mut cancel).await {
             Ok(opened) => opened,
-            Err(error) => return send(Report::Signal(Signal::StartRejected(error.failure))),
+            Err(error) => return send(Report::Signal(Signal::StartRejected(error.failure))).await,
         };
         let turn = match process
             .begin(
@@ -1274,11 +1451,12 @@ impl Pi {
                 let tail = process.end().await;
                 return send(Report::Signal(Signal::StartRejected(with_tail(
                     failure, &tail,
-                ))));
+                ))))
+                .await;
             }
             Begin::Unknown(_) => {
                 process.end().await;
-                return send(Report::Probe);
+                return send(Report::Probe).await;
             }
         };
         // Keep the turn interruptible before reporting its native handle.
@@ -1299,9 +1477,10 @@ impl Pi {
         send(Report::Signal(Signal::TurnStarted {
             turn_id: turn.clone(),
             epoch: 0,
-        }));
+        }))
+        .await;
         let mut seen = Seen::default();
-        let settled = loop {
+        let settled = 'events: loop {
             let event = tokio::select! {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel), if !stopping.load(Relaxed) => {
@@ -1313,34 +1492,55 @@ impl Pi {
                 }
                 event = process.events.recv() => match event {
                     Some(event) => event,
-                    None => break false,
+                    None => {
+                        if let Some(error) = process.events.failure() {
+                            tracing::warn!(%error, "pi work output unavailable; reconcile native session");
+                        }
+                        break false;
+                    },
                 },
             };
             for update in seen.apply(&event) {
-                send(Report::Progress(update));
+                let delivered = tokio::select! {
+                    biased;
+                    _ = agent::wait_for_cancel(&mut cancel) => false,
+                    result = report.send(Report::Progress(update)) => result.is_ok(),
+                };
+                if !delivered {
+                    stopping.store(*cancel.borrow(), Relaxed);
+                    break 'events false;
+                }
             }
             let message = &event["message"];
             if event["type"] == "message_end" && message["role"] == "assistant" {
                 let text = text(message);
                 if !text.is_empty() {
-                    send(Report::Signal(match message["stopReason"].as_str() {
+                    let signal = Report::Signal(match message["stopReason"].as_str() {
                         // Text before tool calls is the turn's commentary.
                         Some("toolUse") => Signal::Progress {
                             summary: text,
                             at_ms: now_ms(),
                         },
                         _ => Signal::Text(text),
-                    }));
+                    });
+                    let delivered = tokio::select! {
+                        biased;
+                        _ = agent::wait_for_cancel(&mut cancel) => false,
+                        result = report.send(signal) => result.is_ok(),
+                    };
+                    if !delivered {
+                        break 'events false;
+                    }
                 }
             }
             if event["type"] == "agent_settled" {
-                break true;
+                break process.events.failure().is_none();
             }
         };
         drop(live);
         process.end().await;
         if !settled {
-            return send(Report::Probe);
+            return send(Report::Probe).await;
         }
         let (status, error) = seen.ending(stopping.load(Relaxed));
         send(Report::Signal(Signal::TurnCompleted {
@@ -1348,7 +1548,8 @@ impl Pi {
             status,
             text: seen.text(),
             error,
-        }));
+        }))
+        .await;
     }
 }
 
@@ -1526,7 +1727,8 @@ impl Executor for Pi {
                 args: launch_args,
                 guide: None,
             };
-            let (sender, mut reports) = mpsc::unbounded_channel();
+            let (sender, mut reports) =
+                transport::channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES, report_bytes);
             let (stop, cancel) = watch::channel(false);
             {
                 let mut preparing = lock(&self.preparing);
@@ -1752,6 +1954,283 @@ impl Executor for Pi {
     }
 }
 
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn rpc() -> Arc<Rpc> {
+        Arc::new(Rpc {
+            stdin: Mutex::new(None),
+            waiting: std::sync::Mutex::new(Some(HashMap::new())),
+            responses: transport::JsonBudget::new(4096),
+            commands: transport::JsonBudget::new(4096),
+            next: AtomicU64::new(1),
+        })
+    }
+
+    fn pending_response() -> (PendingResponses, oneshot::Receiver<transport::HeldJson>) {
+        let (reply, answer) = oneshot::channel();
+        (
+            std::sync::Mutex::new(Some(HashMap::from([("pending".into(), reply)]))),
+            answer,
+        )
+    }
+
+    #[tokio::test]
+    async fn timed_out_partial_frame_closes_stdin_and_never_appends_another_command() {
+        let (pipe, mut reader) = tokio::io::duplex(8);
+        let stdin = Mutex::new(Some(pipe));
+        let (waiting, answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"steer", "text":"a prompt longer than the pipe"});
+        let result = tokio::time::timeout(
+            Duration::from_millis(5),
+            write_command(&stdin, &waiting, &command, &started),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.load(Relaxed));
+        assert!(stdin.lock().await.is_none());
+        assert!(lock(&waiting).is_none());
+        assert!(answer.await.is_err());
+        let next = AtomicBool::new(false);
+        assert!(matches!(
+            write_command(&stdin, &waiting, &json!({"type":"abort"}), &next).await,
+            Err(Reply::Unsent)
+        ));
+        assert!(!next.load(Relaxed));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(
+            received,
+            transport::json(&command, transport::FRAME_BYTES).unwrap()[..8]
+        );
+        assert!(
+            !received.contains(&b'\n'),
+            "the partial frame never gained a second command"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_partial_prompt_closes_stdin_and_releases_other_rpc_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(8);
+        let mut stdin = Some(pipe);
+        let (waiting, answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let prompt_started = AtomicBool::new(false);
+        let (stop, mut cancel) = watch::channel(false);
+        let bytes = b"{\"type\":\"prompt\",\"text\":\"long partial prompt\"}\n";
+        {
+            let writing = write_frame(&mut stdin, &waiting, bytes, &started, Some(&prompt_started));
+            tokio::pin!(writing);
+            assert!(futures_util::poll!(writing.as_mut()).is_pending());
+            stop.send(true).unwrap();
+            tokio::select! {
+                biased;
+                _ = agent::wait_for_cancel(&mut cancel) => {},
+                _ = &mut writing => panic!("the undrained pipe cannot finish this frame"),
+            }
+            // Dropping the selected-away write future is the same cancellation used by begin.
+        }
+        assert!(started.load(Relaxed) && prompt_started.load(Relaxed));
+        assert!(stdin.is_none());
+        assert!(lock(&waiting).is_none());
+        assert!(answer.await.is_err());
+        let next = AtomicBool::new(false);
+        assert!(matches!(
+            write_frame(&mut stdin, &waiting, b"next\n", &next, None).await,
+            Err(Reply::Unsent)
+        ));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, bytes[..8]);
+        assert!(!next.load(Relaxed));
+    }
+
+    #[tokio::test]
+    async fn timeout_before_writing_keeps_stdin_and_does_not_poison_other_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let held = stdin.lock().await;
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                write_command(&stdin, &waiting, &json!({"type":"abort"}), &started)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!started.load(Relaxed));
+        assert!(held.is_some());
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        drop(held);
+        let command = json!({"type":"get_state"});
+        assert!(
+            write_command(&stdin, &waiting, &command, &started)
+                .await
+                .is_ok()
+        );
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        let mut expected = transport::json(&command, transport::FRAME_BYTES).unwrap();
+        expected.push(b'\n');
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_writing_keeps_stdin_and_pending_waiters() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let held = stdin.lock().await;
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"abort"});
+        {
+            let writing = write_command(&stdin, &waiting, &command, &started);
+            tokio::pin!(writing);
+            assert!(futures_util::poll!(writing.as_mut()).is_pending());
+        }
+        assert!(!started.load(Relaxed));
+        assert!(held.is_some());
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        drop(held);
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_complete_frame_keeps_stdin_for_readback_commands() {
+        let (pipe, mut reader) = tokio::io::duplex(128);
+        let stdin = Mutex::new(Some(pipe));
+        let (waiting, _answer) = pending_response();
+        let started = AtomicBool::new(false);
+        let command = json!({"type":"get_state"});
+        {
+            let call = async {
+                assert!(
+                    write_command(&stdin, &waiting, &command, &started)
+                        .await
+                        .is_ok()
+                );
+                std::future::pending::<()>().await;
+            };
+            tokio::pin!(call);
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+        }
+        assert!(started.load(Relaxed));
+        assert!(lock(&waiting).as_ref().unwrap().contains_key("pending"));
+        assert!(stdin.lock().await.take().is_some());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        let mut expected = transport::json(&command, transport::FRAME_BYTES).unwrap();
+        expected.push(b'\n');
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn response_bypasses_progress_and_terminal_remains_ordered() {
+        let rpc = rpc();
+        let (reply, answer) = oneshot::channel();
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("vf-1".into(), reply);
+        let (sender, mut events) = transport::json_channel(2, 4096);
+        let input = concat!(
+            "{\"type\":\"message_update\"}\n",
+            "{\"type\":\"response\",\"id\":\"vf-1\",\"success\":true,\"data\":{\"ok\":true}}\n",
+            "{\"type\":\"agent_settled\"}\n",
+        );
+        read_output(input.as_bytes(), rpc.clone(), sender).await;
+        assert_eq!(answer.await.unwrap().value["data"], json!({"ok":true}));
+        assert_eq!(events.recv().await.unwrap()["type"], "message_update");
+        assert_eq!(events.recv().await.unwrap()["type"], "agent_settled");
+        assert!(events.recv().await.is_none());
+        assert!(events.failure().is_none());
+        assert!(lock(&rpc.waiting).is_none());
+    }
+
+    #[tokio::test]
+    async fn progress_pressure_closes_intake_and_releases_response_waiter() {
+        let rpc = rpc();
+        let (reply, answer) = oneshot::channel();
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("vf-1".into(), reply);
+        let (sender, mut events) = transport::json_channel(1, 4096);
+        let input = concat!(
+            "{\"type\":\"message_update\"}\n",
+            "{\"type\":\"message_update\"}\n",
+            "{\"type\":\"response\",\"id\":\"vf-1\",\"success\":true}\n",
+            "{\"type\":\"agent_settled\"}\n",
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            read_output(input.as_bytes(), rpc.clone(), sender),
+        )
+        .await
+        .unwrap();
+        assert!(
+            answer.await.is_err(),
+            "RPC must become unknown, never hang behind progress"
+        );
+        assert_eq!(events.recv().await.unwrap()["type"], "message_update");
+        assert!(events.recv().await.is_none());
+        assert!(events.failure().unwrap().contains("queue"));
+        assert!(lock(&rpc.waiting).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_rpc_releases_its_waiter_entry() {
+        let rpc = rpc();
+        let (reply, answer) = oneshot::channel();
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("cancelled".into(), reply);
+        let pending = PendingReply {
+            rpc: &rpc,
+            id: "cancelled".into(),
+        };
+        drop(pending);
+        assert!(answer.await.is_err());
+        assert!(lock(&rpc.waiting).as_ref().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_queue_pressure_keeps_the_terminal_signal() {
+        let (sender, mut reports) = transport::channel(1, 4096, report_bytes);
+        sender
+            .try_send(Report::Progress(
+                json!({"type":"text_delta", "text":"hello"}),
+            ))
+            .unwrap();
+        let terminal = sender.send(Report::Signal(Signal::TurnCompleted {
+            turn_id: "turn".into(),
+            status: TurnStatus::Completed,
+            text: "done".into(),
+            error: None,
+        }));
+        tokio::pin!(terminal);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut terminal)
+                .await
+                .is_err()
+        );
+        assert!(matches!(reports.recv().await, Some(Report::Progress(_))));
+        terminal.await.unwrap();
+        assert!(
+            matches!(reports.recv().await, Some(Report::Signal(Signal::TurnCompleted { text, .. })) if text == "done")
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1780,7 +2259,10 @@ mod tests {
                 "PI_CODING_AGENT_SESSION_DIR".into(),
                 dir.join("sessions").display().to_string(),
             ),
-            ("FAKE_PI_LOG".into(), dir.join("log").display().to_string()),
+            (
+                "FAKE_PI_RECORDS_DIR".into(),
+                dir.join("pi-log-records").display().to_string(),
+            ),
             ("FAKE_PI_MODE".into(), mode.into()),
         ])
     }
@@ -1799,11 +2281,7 @@ mod tests {
     }
 
     fn log(dir: &Path) -> Vec<Value> {
-        std::fs::read_to_string(dir.join("log"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        super::super::triage::tests::pi_fixture_log(dir).unwrap_or_else(|error| panic!("{error:#}"))
     }
 
     fn prompts(dir: &Path) -> Vec<Value> {
@@ -1878,19 +2356,17 @@ mod tests {
     async fn wait_for_abort(dir: &Path) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let aborted = std::fs::read_to_string(dir.join("log"))
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                let aborted = super::super::triage::tests::pi_fixture_log(dir)?
+                    .iter()
                     .any(|entry| entry["abort"] == true);
                 if aborted {
-                    return;
+                    return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .context("the cancelled pi turn received an abort")
+        .context("the cancelled pi turn received an abort")?
     }
 
     fn release(dir: &Path) {
@@ -2032,12 +2508,16 @@ mod tests {
     /// Dispatches the pi work `w-1` on `node`; the Node sends it itself.
     async fn dispatch(node: &Arc<Runtime>, network: &str, dir: &Path) -> Result<()> {
         let spec = spec("w-1", &node.identity.device_id()?, dir);
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let pi = node.pi.clone();
         let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
         ensure!(!sends, "the Node sends a pi work itself");
@@ -2075,7 +2555,10 @@ mod tests {
     async fn work(node: &Runtime, done: impl Fn(&WorkState) -> bool) -> Result<WorkRecord> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let record = node.store.lock().await.work_record("w-1")?;
+            let record = node
+                .store
+                .call("pi.work_record", move |store| store.work_record("w-1"))
+                .await?;
             let record = record.context("work")?;
             if done(&record.state) || Instant::now() > deadline {
                 return Ok(record);
@@ -2555,9 +3038,8 @@ mod tests {
         let pid = state_waiting(&dir).await?;
         let preparing = node
             .store
-            .lock()
-            .await
-            .work_record("w-1")?
+            .call("pi.work_record", move |store| store.work_record("w-1"))
+            .await?
             .context("work")?;
         assert!(preparing.state.handle().is_none());
         tokio::time::timeout(Duration::from_secs(2), node.stop_work(&network, "c", "w-1"))
@@ -2576,7 +3058,12 @@ mod tests {
         std::fs::write(dir.join("state-release"), "")?;
         assert!(prompts(&dir).is_empty());
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
-        assert!(node.store.lock().await.stop_requests()?.is_empty());
+        assert!(
+            node.store
+                .call("pi.stop_requests", move |store| store.stop_requests())
+                .await?
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2704,10 +3191,15 @@ mod tests {
         let (node, network) = node(&dir, "reply").await?;
         dispatch(&node, &network, &dir).await?;
         work(&node, WorkState::finished).await?;
-        let session = (node.store.lock().await.works(&network, "c")?)
-            .into_iter()
-            .find_map(|work| work.thread_id)
-            .context("a session")?;
+        let session = ({
+            let network = network.to_owned();
+            node.store
+                .call("pi.works", move |store| store.works(&network, "c"))
+                .await
+        }?)
+        .into_iter()
+        .find_map(|work| work.thread_id)
+        .context("a session")?;
         assert_eq!(node.pi.native_directory(&session).await?, dir);
         assert!(node.pi.native_directory("missing-session").await.is_err());
         let file = node.pi.pointer(&session)?.context("pointer")?.file;
@@ -2718,12 +3210,16 @@ mod tests {
             thread: Some(session.clone()),
             ..spec("w-3", &node.identity.device_id()?, &elsewhere)
         };
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            moved.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let moved = moved.clone();
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, moved, now_ms())
+                })
+                .await
+        }?;
         let refused = node.start_work(pi.as_ref(), &network, &moved, Some(&session), &Value::Null);
         let refused = refused
             .await
@@ -2740,16 +3236,24 @@ mod tests {
             thread: Some(session.clone()),
             ..spec("w-2", &node.identity.device_id()?, &dir)
         };
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {
-            let record = node.store.lock().await.work_record("w-2")?.context("w-2")?;
+            let record = node
+                .store
+                .call("pi.work_record", move |store| store.work_record("w-2"))
+                .await?
+                .context("w-2")?;
             if record.state.finished() || Instant::now() > deadline {
                 break record;
             }
@@ -2815,9 +3319,8 @@ mod tests {
         assert_eq!(aborts(), 1, "the first native abort reached pi");
         let first = node
             .store
-            .lock()
-            .await
-            .work_record("w-1")?
+            .call("pi.work_record", move |store| store.work_record("w-1"))
+            .await?
             .context("work")?;
         assert!(matches!(first.state, WorkState::Interrupting { .. }));
         assert_eq!(
@@ -2829,14 +3332,21 @@ mod tests {
         );
         let mut held = node
             .store
-            .lock()
-            .await
-            .stop_requests()?
+            .call("pi.stop_requests", move |store| store.stop_requests())
+            .await?
             .into_iter()
             .find(|request| request.work_id == "w-1")
             .context("the unsettled turn keeps its stop request")?;
         held.deadline_ms = now_ms() - 1;
-        node.store.lock().await.save_stop_request(&held)?;
+        {
+            let held = held.to_owned();
+            node.store
+                .call("pi.save_stop_request", move |store| {
+                    store.save_stop_request(&held)
+                })
+                .await
+        }?;
+        let mut changes = node.events.subscribe();
         node.reconcile_works(&network).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while aborts() < 2 {
@@ -2845,7 +3355,33 @@ mod tests {
         })
         .await
         .context("the stop retry sent another native abort")?;
-        let finished = work(&node, WorkState::finished).await?;
+        // The terminal work row commits before signal_work clears its stop request.
+        // Its published work change follows both commits; observe the complete settlement.
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let change = changes.recv().await.context("receive pi work settlement")?;
+                if change.network_id != network
+                    || change.payload["conversation_id"] != "c"
+                    || change.payload["work_id"] != "w-1"
+                {
+                    continue;
+                }
+                let (record, stop) = node
+                    .store
+                    .call("pi.settled_stop", |store| {
+                        Ok((
+                            store.work_record("w-1")?.context("work")?,
+                            store.stop_request("w-1")?,
+                        ))
+                    })
+                    .await?;
+                if record.state.finished() && stop.is_none() {
+                    break Ok::<_, anyhow::Error>(record);
+                }
+            }
+        })
+        .await
+        .context("pi terminal work and stop-request cleanup were not both published")??;
         assert_work_outcome(&finished, WorkOutcome::Interrupted);
         assert_eq!(
             node.pi.probe(&running).await?,
@@ -2857,7 +3393,12 @@ mod tests {
             }
         );
         assert!(ended(&group).await, "settled pi ended its process");
-        assert!(node.store.lock().await.stop_requests()?.is_empty());
+        assert!(
+            node.store
+                .call("pi.stop_requests", move |store| store.stop_requests())
+                .await?
+                .is_empty()
+        );
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
         assert!(
             node.pi
@@ -3122,12 +3663,14 @@ mod tests {
             }
         );
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .work(&network, "w-1")?
-                .context("work")?
-                .failure,
+            {
+                let network = network.to_owned();
+                node.store
+                    .call("pi.work", move |store| store.work(&network, "w-1"))
+                    .await
+            }?
+            .context("work")?
+            .failure,
             Some(FailureKind::MissingKey)
         );
         std::fs::remove_dir_all(&dir)?;

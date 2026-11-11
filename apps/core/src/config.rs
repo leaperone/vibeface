@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "b9abd158c979780e14cb837bad95a668aa58e643760fb8ebf564094d28b7afa3";
+    "6060f835c4ad94fa814daca98cbebd9a82b29fac24235ef479dfbc4003f04939";
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }

@@ -1,3 +1,5 @@
+import { historySections } from '@vibeface/client/workspace/model.ts'
+import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
@@ -146,6 +148,7 @@ export default function ChatScreen() {
   // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s, or every 2s while it starts.
   const latestLive = useRef(live)
   latestLive.current = live
+  useFocusEffect(useCallback(() => () => { for (const section of historySections) latestLive.current?.cancelHistory(section) }, [id, live?.generation]))
   const awaiting = live ? awaitsDevice(reach) : false, starting = reach === 'starting'
   useFocusEffect(useCallback(() => {
     if (!awaiting) return
@@ -207,6 +210,8 @@ export default function ChatScreen() {
       if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  const history = live?.conversationId === id ? live.data?.history : undefined
+  if (history && live && historySections.some((section) => !history[section].complete)) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} /> })
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
@@ -246,7 +251,7 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
-      maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
+      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return

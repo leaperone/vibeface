@@ -28,7 +28,7 @@ export type PendingMessage = {
   message_id: string
   conversation_id: string
   text: string
-  report_results?: boolean
+  report_results: boolean
   target: InputTarget
   intent: InputIntent
   sequence: number

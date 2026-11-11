@@ -51,7 +51,7 @@ def stage_desktop(api, destination, target, product, runtime_archive, *, content
         payload.write_bytes(f'{name} {content}'.encode())
         payload.with_name(name + '.sha256').write_text(f'{api.digest(payload)}  {name}\n', encoding='utf-8')
         artifacts[name] = api.digest(payload)
-    receipt = dict(product, schema=api.SCHEMA_VERSION, app='desktop', target=target, electron=api.ELECTRON_VERSION,
+    receipt = dict(product, schema=api.DESKTOP_SCHEMA, app='desktop', target=target, **api.NATIVE_UI,
         signed=target == 'aarch64-apple-darwin',
         signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
         else 'platform-checksums' if target.endswith('-unknown-linux-gnu') else 'unsigned-development-preview',

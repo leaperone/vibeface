@@ -11,5 +11,6 @@
       "@vibeface/client/*": ["../../packages/client/src/*"]
     }
   },
-  "include": ["**/*.ts", "**/*.tsx", "expo-env.d.ts"]
+  "include": ["**/*.ts", "**/*.tsx", "expo-env.d.ts"],
+  "exclude": ["node_modules", "src/**/*.test.ts"]
 }

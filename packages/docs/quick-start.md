@@ -36,7 +36,7 @@ vibeface --version
 
 ### 从源码准备当前版本
 
-匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3、Rust 1.91+、Node.js 22.12+ 和 pnpm 11.9.0，再执行：
+匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3.12+、Core/CLI 对应的 Rust 工具链、Node.js 24 和 pnpm 11.9.0，再执行：
 
 ```sh
 git clone https://github.com/leaperone/vibeface.git
@@ -104,3 +104,5 @@ vibeface
 - [日常使用指南](user-guide.md)：管理 Bot、查看工作状态、取消任务和换设备继续。
 - [安装与管理节点](install.md#用-cli-管理后台服务)：把前台进程改成后台服务。
 - [排障](troubleshooting.md)：页面打不开、Agent 无法使用或任务结果待确认。
+
+Desktop 另外需要 GPUI 图形工具链与平台开发库，版本及 hosted runner 配置见 [原生 Desktop action](../../.github/actions/native-desktop/action.yml)。Core/CLI 的最低 Rust 版本不能作为 GPUI 已通过编译的证明。Windows 原生组包使用 `python3 -B scripts/package-node-windows.py`，不执行 POSIX shell 组包脚本。

@@ -1529,10 +1529,21 @@ pub(super) mod tests {
     pub struct RpcFixture {
         pub chain: Chain,
         pub requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
-        task: tokio::task::JoinHandle<()>,
+        stop: std::sync::Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+    impl RpcFixture {
+        pub async fn shutdown(mut self) -> Result<()> {
+            self.stop.notify_one();
+            (&mut self.task)
+                .await
+                .context("join controlled delivery RPC server")?
+                .context("stop controlled delivery RPC server")
+        }
     }
     impl Drop for RpcFixture {
         fn drop(&mut self) {
+            self.stop.notify_one();
             self.task.abort();
         }
     }
@@ -1558,8 +1569,12 @@ pub(super) mod tests {
                 }
             }),
         );
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stopped = stop.clone();
         let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { stopped.notified().await })
+                .await
         });
         Ok(RpcFixture {
             chain: Chain {
@@ -1568,6 +1583,7 @@ pub(super) mod tests {
                 request_id: AtomicU64::new(1),
             },
             requests,
+            stop,
             task,
         })
     }
@@ -1712,13 +1728,7 @@ pub(super) mod tests {
             &dir,
             crate::crypto::LocalIdentity::generate(),
         )?);
-        let password = SecretString::new("synthetic configuration regression wallet".into());
-        let wallet = {
-            let mut wallet = delivery.wallet.lock().unwrap();
-            wallet.create(&password)?;
-            wallet.unlock(&password)?;
-            wallet.address()?
-        };
+        assert!(delivery.wallet.lock().unwrap().is_deferred());
         let on_nonce = Arc::new(AtomicBool::new(true));
         let on_receipt = Arc::new(AtomicBool::new(false));
         let captured_delivery = delivery.clone();
@@ -1748,7 +1758,21 @@ pub(super) mod tests {
             chain: Some(rpc.chain.config.clone()),
             ..Default::default()
         };
-        delivery.configure_local(settings.clone())?;
+        delivery
+            .configure_local(settings.clone())
+            .context("enable controlled paid delivery before creating its test wallet")?;
+        let password = SecretString::new("synthetic configuration regression wallet".into());
+        let wallet = {
+            let mut wallet = delivery.wallet.lock().unwrap();
+            assert!(!wallet.is_deferred());
+            wallet
+                .create(&password)
+                .context("create controlled paid wallet")?;
+            wallet
+                .unlock(&password)
+                .context("unlock controlled paid wallet")?;
+            wallet.address()?
+        };
         let budget_id = "44".repeat(32);
         let cap = "100000000000000";
         delivery.register_budget(
@@ -1836,10 +1860,11 @@ pub(super) mod tests {
                 .any(|request| request["method"] == "eth_sendRawTransaction"),
             "configuration changes during awaits cannot reach broadcast"
         );
-        // The RPC fixture's tasks still hold a clone of `delivery`, so dropping
-        // ours would leave the SQLite file open and Windows could not delete it.
-        delivery.store.lock().expect("delivery store").take();
-        std::fs::remove_dir_all(dir)?;
+        rpc.shutdown().await?;
+        delivery.shutdown().await;
+        drop(delivery);
+        std::fs::remove_dir_all(dir)
+            .context("remove chain configuration test directory after RPC and delivery shutdown")?;
         Ok(())
     }
 

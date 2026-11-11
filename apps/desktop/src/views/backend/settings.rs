@@ -1,0 +1,328 @@
+use super::*;
+
+impl Backend {
+    pub(super) async fn edit_settings(&mut self, kind: SettingsKind, owner: bool) -> Result<()> {
+        let query = match &kind {
+            SettingsKind::Node | SettingsKind::Provider(_) => ReadRequest::NodeSettings,
+            SettingsKind::Triage => ReadRequest::TriageSettings,
+            SettingsKind::Relay => ReadRequest::RelaySettings,
+        };
+        let value = if owner {
+            self.read_owner_node(query).await?
+        } else {
+            self.read_node(query).await?
+        };
+        let field = |value: &Value, key: &str| value[key].as_str().unwrap_or("").to_owned();
+        let mut values = BTreeMap::new();
+        if owner || self.client.is_none() {
+            values.insert(
+                "_owner_node_id",
+                self.host
+                    .snapshot()
+                    .selected
+                    .context("请先选择本机Node")?
+                    .device_id,
+            );
+        }
+        let editor = match kind {
+            SettingsKind::Node => {
+                let settings = &value["settings"];
+                let roots: Vec<String> = serde_json::from_value(settings["roots"].clone())?;
+                values.insert("roots", roots.join("\n"));
+                let manager = &settings["manager"];
+                for key in ["provider", "workspace", "model", "reasoning_effort"] {
+                    values.insert(key, field(manager, key));
+                }
+                values.insert(
+                    "backup_automatic",
+                    manager["backup"]["automatic"]
+                        .as_bool()
+                        .unwrap_or(false)
+                        .to_string(),
+                );
+                values.insert(
+                    "backup_candidates",
+                    manager["backup"]["candidates"]
+                        .as_array()
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|row| {
+                                    format!(
+                                        "{}|{}|{}",
+                                        field(row, "provider"),
+                                        field(row, "model"),
+                                        field(row, "reasoning_effort")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default(),
+                );
+                Editor::NodeSettings
+            }
+            SettingsKind::Provider(provider) => {
+                let provider_name = serde_json::to_value(&provider)?
+                    .as_str()
+                    .context("Provider名称无效")?
+                    .to_owned();
+                let row = value["providers"]
+                    .as_array()
+                    .context("缺少Provider状态")?
+                    .iter()
+                    .find(|p| p["provider"] == provider_name)
+                    .context("当前设备没有该Provider配置")?;
+                values.insert("provider", provider_name);
+                values.insert(
+                    "device_id",
+                    if owner || self.client.is_none() {
+                        self.host
+                            .snapshot()
+                            .selected
+                            .map(|node| node.device_id)
+                            .unwrap_or_default()
+                    } else {
+                        self.active_entry
+                            .as_ref()
+                            .map(|e| e.node_id.clone())
+                            .unwrap_or_default()
+                    },
+                );
+                values.insert("bin", field(row, "bin"));
+                values.insert("model", field(row, "execution_model"));
+                let roles = row["roles"].as_array().cloned().unwrap_or_default();
+                values.insert("bot", roles.iter().any(|role| role == "agent").to_string());
+                values.insert(
+                    "execution",
+                    roles.iter().any(|role| role == "execution").to_string(),
+                );
+                values.insert("connect_local", (!row["app_server"].is_null()).to_string());
+                values.insert("app_server_mode", field(&row["app_server"], "mode"));
+                values.insert("socket", field(&row["app_server"], "socket"));
+                Editor::Provider
+            }
+            SettingsKind::Triage => {
+                self.state.decision_tokens = decode_list(&value, "decision_tokens")?;
+                self.publish();
+                for key in ["default_outlet", "webhook_url", "codex_sessions"] {
+                    values.insert(key, field(&value, key));
+                }
+                values.insert(
+                    "scan_codex_sessions",
+                    value["scan_codex_sessions"]
+                        .as_bool()
+                        .unwrap_or(false)
+                        .to_string(),
+                );
+                values.insert(
+                    "projects",
+                    value["projects"]
+                        .as_array()
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|row| {
+                                    format!("{}={}", field(row, "prefix"), field(row, "outlet"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default(),
+                );
+                Editor::Triage
+            }
+            SettingsKind::Relay => {
+                for key in ["listen", "url"] {
+                    values.insert(key, field(&value, key));
+                }
+                values.insert(
+                    "volunteer",
+                    value["volunteer"].as_bool().unwrap_or(false).to_string(),
+                );
+                for key in ["rate", "max_clients", "max_clients_per_ip"] {
+                    values.insert(
+                        key,
+                        value[key]
+                            .as_u64()
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+                Editor::Relay
+            }
+        };
+        let _ = self.emit(Event::EditForm { editor, values }).await;
+        Ok(())
+    }
+    pub(super) fn history_bindings(&self) -> crate::views::records::HistoryBindings {
+        crate::views::records::HistoryBindings {
+            bot_conversations: self
+                .state
+                .bots
+                .iter()
+                .map(|bot| (bot.bot_id.clone(), bot.conversation_id.clone()))
+                .collect(),
+            task_channels: self
+                .state
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.clone(), task.channel_id.clone()))
+                .collect(),
+            task_owners: self
+                .state
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.clone(), task.owner_bot.clone()))
+                .collect(),
+            work_conversations: self
+                .state
+                .conversation
+                .works
+                .iter()
+                .filter_map(|work| {
+                    self.conversation
+                        .as_ref()
+                        .map(|id| (work.work_id.clone(), id.clone()))
+                })
+                .collect(),
+            channel_coordinators: self
+                .state
+                .channels
+                .iter()
+                .map(|channel| (channel.channel_id.clone(), channel.coordinator_bot.clone()))
+                .collect(),
+        }
+    }
+}
+impl Backend {
+    pub(super) async fn review_settings(&mut self, id: &str) -> Result<()> {
+        let client = self.client()?.clone();
+        let review = client.review_settings(id).await?;
+        let query = match review.kind {
+            vibeface_client::SettingsKind::Node | vibeface_client::SettingsKind::Provider => {
+                ReadRequest::NodeSettings
+            }
+            vibeface_client::SettingsKind::Triage => ReadRequest::TriageSettings,
+            vibeface_client::SettingsKind::Relay => ReadRequest::RelaySettings,
+        };
+        let current = self.read_node(query).await;
+        let (mut fields, mut read_error) = (vec![], None);
+        match current {
+            Ok(value) => {
+                let actual = match review.kind {
+                    vibeface_client::SettingsKind::Node => &value["settings"],
+                    _ => &value,
+                };
+                for field in &review.fields {
+                    if field.secret {
+                        fields.push(vibeface_client::SettingsField {
+                            name: field.name.clone(),
+                            value: "值不可读回".into(),
+                            secret: true,
+                        });
+                    } else if let Some(value) = actual.get(&field.name) {
+                        fields.push(vibeface_client::SettingsField {
+                            name: field.name.clone(),
+                            value: value.to_string(),
+                            secret: false,
+                        });
+                    }
+                }
+            }
+            Err(error) => read_error = Some(error.to_string()),
+        }
+        self.state.settings_review = Some(SettingsReviewView {
+            original_rows: review_rows(&review.fields),
+            review,
+            current: public_current_values(&fields),
+            read_error,
+        });
+        self.publish();
+        Ok(())
+    }
+}
+
+fn review_rows(fields: &[vibeface_client::SettingsField]) -> Vec<(String, String)> {
+    fn flatten(path: String, value: &Value, rows: &mut Vec<(String, String)>) {
+        match value {
+            Value::Object(values) => {
+                for (key, value) in values {
+                    flatten(format!("{path}.{key}"), value, rows)
+                }
+            }
+            Value::Array(values) => {
+                if values.is_empty() {
+                    rows.push((path, "空列表".into()))
+                } else {
+                    for (index, value) in values.iter().enumerate() {
+                        flatten(format!("{path}[{}]", index + 1), value, rows)
+                    }
+                }
+            }
+            Value::String(value) => rows.push((path, value.clone())),
+            Value::Bool(value) => rows.push((path, if *value { "开启" } else { "关闭" }.into())),
+            Value::Null => rows.push((path, "未设置".into())),
+            Value::Number(value) => rows.push((path, value.to_string())),
+        }
+    }
+    let mut rows = vec![];
+    for field in fields {
+        if field.secret {
+            rows.push((
+                field.name.clone(),
+                "密钥修改，值不显示且不能读回验证".into(),
+            ));
+        } else if let Ok(value) = serde_json::from_str(&field.value) {
+            flatten(field.name.clone(), &value, &mut rows);
+        } else {
+            rows.push((field.name.clone(), field.value.clone()));
+        }
+    }
+    rows
+}
+
+fn public_current_values(
+    fields: &[vibeface_client::SettingsField],
+) -> Vec<vibeface_client::SettingsField> {
+    fields
+        .iter()
+        .filter(|field| !field.secret)
+        .flat_map(|field| review_rows(std::slice::from_ref(field)))
+        .map(|(name, value)| vibeface_client::SettingsField {
+            name,
+            value,
+            secret: false,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn current_settings_show_named_public_values_and_omit_secrets() {
+        let fields = vec![
+            vibeface_client::SettingsField {
+                name: "manager".into(),
+                value: r#"{"model":"verified-model","enabled":true}"#.into(),
+                secret: false,
+            },
+            vibeface_client::SettingsField {
+                name: "env.PRIVATE".into(),
+                value: "never show this".into(),
+                secret: true,
+            },
+        ];
+        let mut shown = public_current_values(&fields);
+        shown.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            shown
+                .iter()
+                .map(|field| (field.name.as_str(), field.value.as_str(), field.secret))
+                .collect::<Vec<_>>(),
+            vec![
+                ("manager.enabled", "开启", false),
+                ("manager.model", "verified-model", false)
+            ]
+        );
+    }
+}

@@ -213,17 +213,18 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `set_primary_bot` | `conversation_id`、`attestation` | 本人选定主 Bot，写入 `bots` scope |
 | `set_bot_project` | `conversation_id`、`project`（`{ target_node, cwd }` 或 `null`）、`attestation` | 本人换掉或清空机器人的项目文件夹，在它的会话写 `BotProjectSet`（签名事件体 `{"type":"bot_project_set", project}`），投影进 `bot_profiles` 的 `project` 字段，不建表、不改数据纪元；与当前相同时不写 |
 | `set_bot_avatar` | `conversation_id`、`version`（字符串或 `null`）、`avatar`（`{ outline, eyes, hue }` 或 `null`），两项必填；`attestation` | 本人给机器人挑长相或恢复默认，`version` 是本人看到的 `avatar_version`（`bots` 里的值）。当前已是 `avatar` 时不写并返回当前 bot；否则当前版本不等于 `version` 时拒绝（`the bot's face changed since you saw it; nothing was written`），客户端删掉这条待写、刷新、不重发；相等时在它的会话写 `BotAvatarSet`（签名事件体 `{"type":"bot_avatar_set", version, avatar}`），投影进 `bot_profiles` 的 `avatar` 字段，与聊天修改按 rank 后写者胜。任何修改都换新版本，改回原长相也一样，所以重放不会盖掉之后的修改。比较只在接收写入的 Node 上做，读取与追加在同一把存储锁内。返回 `{ bot }`，含新的 `avatar_version` |
-| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重；与现有 Bot 重名（忽略大小写和首尾空格）时拒绝 |
+| `create_bot` | 必需 `bot_id`、`conversation_id`、`name`、`scheduler_node`、`attestation`、`owner_attestation`；可选 `instructions`（默认空字符串）、`project` | 创建机器人和它的会话，完整请求精确去重；与现有 Bot 重名（忽略大小写和首尾空格）时拒绝 |
 | `delete_bot` | `conversation_id`、`attestation` | 本人删除机器人，在它的会话写 `BotDeleted`；已删除时不写。本机停下它正在跑和排队的回合，并中断它派到本机的工作，其他设备收到删除后各自停下自己的。返回 `{ written, primary }`，`primary` 为删除后的主 Bot 会话 ID |
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
 | `control_memory` | `conversation_id`、`memory_id`、`base`、`after`、`attestation`、`operation_id` | 本人新增、接管编辑或删除记忆。签名体为 `{type:"memory_controlled", memory_id, base, after}`。返回 `{state, operation_id, current}`，state 为 applied、already_recorded、superseded 或 conflict。先核验签名和操作身份，再查 receipt，未见才在同一事务比较本机 base 并追加；conflict 不写入 |
 | `memory_state` | `conversation_id`、`memory_id`、可选 `operation_id` | 返回 `{current, receipt}`。current 为含墓碑的 `{memory_id, text, metadata}` 或 null。未指定操作时 receipt=null，否则为 recorded、superseded 或 not_seen_here。not_seen_here 只表示入口未见，不是全网未执行 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 `scheduler_node` 及其签名 `owner_attestation` | 以稳定 ID 创建会话 |
-| `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（归给本 Bot 的外来会话，含 `muted`）、`local_node`、调度队列和 `observation_targets`（本次观察进度的设备）。负责人是其他设备时，入口限时向它读取 `scheduler_jobs`，带 `source_node` 合并进调度队列，只用于显示、不写本地；`scheduler.remote` 为 `{owner, reachable}`，联系不上时 `reachable: false` |
+| `conversation` | `conversation_id` | 会话元数据和各历史分区的有界首页，含 `history_authority`、`history`、负责人及 `owner_epoch`、Bot、`local_node` 和 `observation_targets`。列表内容与覆盖状态见下文；不能把这一响应当作完整会话历史。远端负责人状态只作显示，不写入本地调度；`scheduler.remote.reachable=false` 表示负责人暂不可达 |
+| `conversation_history` | `conversation_id`、`section`，可选 `cursor`、`limit` | 读取指定分区的一页完整记录，返回 `{conversation_id, section, history_authority, items, next_cursor, complete}`。默认 50 项，limit 为 1 至 100；游标不可跨网络、会话、分区或负责人复用。详见[会话历史分页](#会话历史分页) |
 | `open_works` | 无 | 全网仍要本人看的工作 `{works}`：没有结果或结果未知的工作；每个会话最新结束的工作失败或被拒、且还没跟进的那一项；以及本机发出、被拒且还没跟进的派发。跟进指之后又有工作结束、本人在它结束后发的消息有了完成的回复、它的汇报回合回复完成，或本人在待处理关掉它。只在 SQL 里选出这些工作，不读整段历史。派发项的 `state` 为 `dispatch_rejected`，没有 `outcome`。只有本人客户端能调用 |
 | `workspace_overview` | 可选 `conversation_id`、`limit`（1 至 256，默认 256）、`include_finished`（默认 `false`）、`include_sessions`（默认 `true`）；不支持 `cursor` | 本机所知事实的有界只读汇总，只给本人客户端：`{schema: 1, generated_at_ms, network_epoch, heads, consistency, truncated, conversations, bots, tasks, questions, checks, jobs, sessions, deliveries, relations, coverage}`。只含未删除 Bot 的会话。不带 `include_finished` 时 `tasks` 只取 `open_works` 那部分工作，已结束的只按 SQL 计数进 `coverage.omitted_finished`；本机还没被接收、被拒（仍未跟进）或结果未知的派发，以及已接收但工作还没同步来的派发（`accepted_waiting_sync`）也列进 `tasks` 和 `deliveries`。各列表超过 `limit` 时截断，`truncated` 为 `true`，`coverage.omitted_*` 给出截掉的条数。负责人是其他设备的会话不去问它，列进 `coverage.remote_owners`，此时 `consistency` 为 `partial` |
-| `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments`、`report_results` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
+| `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`report_results`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作；排队中的回合记为已停止并写一条 `stopped` 回复。本机不持有该回合时转给会话负责人，超时返回 `{cancel_requested: false, unconfirmed: true, owner}`，不重发，客户端重读会话对账 |
 | `reply_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，为其中仍未回复的消息排队回复，返回 `{receipts}`；重试不会再排 |
@@ -239,6 +240,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 | `ack` | `notification_id`、`client_id`、`attestation` | 写入 `NotificationAcked` |
 | `dismiss_work` | `conversation_id`、`work_id`、`attestation` | 本人从待处理关掉一个失败、被拒或未接收的工作：在该会话写 `NotificationAcked { notification_id: work_id, client_id: "inbox" }`（签名事件体 `{"type":"notification_acked", notification_id, client_id}`），不建表；已关掉时不写，重试只读回。工作没有失败时拒绝。返回 `{ dismissed: true }` |
 
+`create_bot` 的两个签名都使用新会话的 `conversation_id` 作为作用域。`attestation` 签署 `{type:"bot_created", bot_id, name, instructions, project?}`；`owner_attestation` 单独签署 `{type:"conversation_owner", scheduler_node, epoch:1}`。`scheduler_node` 是本人选择的首个负责人，不由接收请求的入口代选。
+
 `bot_id`、`message_id`、`conversation_id` 和 `call_ref` 标识业务写入。重试保留原身份和内容，同 ID 换内容会被拒绝。协调 Agent 的 token 只能调用 `nodes`。
 
 `read_artifact` 默认按 UTF-8 文本分页，返回 `{ blob_hash, text, offset, next_offset, size }`，`limit` 为 4 至 65536 字节，偏移必须位于字符边界。`binary: true` 时每页 512 KiB，只读取请求的区间，返回 `{ blob_hash, offset, size, next_offset, data }`，`data` 为 base64。`next_offset` 为 `null` 时结束。浏览器拼好全部字节后用 SHA-256 与 `blob_hash` 比对，一致才保存文件。附件随引用它的消息由同步按哈希拉到其他成员 Node，还没拉到的入口读取失败，稍后再试。
@@ -252,6 +255,30 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口。每轮发送提示前�
 Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 1。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
 
 `memory_sync_conflicts` 为 `{items, has_more}`，最多 50 项。每项为 `{memory_id, losing_revision, winning_revision, losing_event_hash, winning_event_hash, reason}`，reason 为 user_protected、concurrent_automatic 或 concurrent_user。该页从入口 effective 历史的逻辑 base 链计算，同一本人操作先去重，赢家正常祖先排除，不包含候选正文。它与 owner 的本轮 `memory_conflicts` 独立，owner 不可达不影响入口共享冲突。
+
+## 会话历史分页
+
+`conversation` 和 `conversation_history` 共享 [Rust wire 类型](../../crates/protocol/src/history.rs)。首页在每个分区读取有界窗口，`history_authority` 是客户端只比较、不解释的投影依据标识。`history` 为以下 19 个分区分别给出 `{next_cursor, complete}`：
+
+| section | 首页中的列表 |
+| --- | --- |
+| `messages`、`works`、`changes`、`questions`、`sessions`、`checks`、`deliveries`、`overwritten` | 同名顶层列表 |
+| `jobs`、`scope_jobs`、`unanswered` | `scheduler` 下的同名列表 |
+| `owner_jobs`、`owner_scope_jobs`、`owner_memory_conflicts` | `scheduler.remote.jobs`、`scheduler.remote.scope_jobs`、`scheduler.remote.memory_conflicts` |
+| `skills`、`schedules`、`memory`、`memory_conflicts` | `bot_settings` 下的同名列表 |
+| `memory_sync_conflicts` | `bot_settings.memory_sync_conflicts.items` |
+
+`conversation_history` 的 `cursor` 省略或为 `null` 时从该分区的首页开始；后续请求原样传回 `next_cursor`。使用服务端提供的稳定边界向较早记录读取，不发送 offset，不解析或自行拼接游标。不同分区有各自的稳定顺序，客户端按记录的稳定业务身份去重，不能用列表下标识别记录。`works` 历史页返回完整工作投影；协调观察从 `scope_jobs`、`owner_scope_jobs` 或详情接口读取，避免在一条大记录中重复嵌入。
+
+条数上限与字节预算同时生效。默认 limit 为 50，最大 100；单分区选取预算为 512 KiB，完整响应须小于 `3 MiB`，低于 4 MiB 的客户端应用消息上限。Noise 使用二进制分帧，不对整份响应做 Base64 扩展。单条大记录可以独占一页，但仍须满足响应上限，超限返回错误，不截断正文。首页合计过大时，服务端延后整个分区，并给出该分区的起始游标；空列表不表示分区没有记录。经过范围筛选的空页也可能带有继续游标。
+
+`complete=false` 必须有非空 `next_cursor`；`complete=true` 时游标为 `null`。完成只表示在当前读取依据下，该入口对这个分区没有更多可读记录，不表示全网已同步、远端负责人已在线、工作已完成或客户端取得写权限。负责人暂不可达时，其分区保留未完成覆盖状态和可重试的起始游标。
+
+游标绑定个人网络、会话、分区和读取依据，负责人分页还绑定 owner 与 owner_epoch。成员治理、分叉或负责人投影变化可能使依据和游标失效。遇到 `history changed; refresh the conversation` 或 `conversation owner changed; refresh the conversation` 时，重新读取 `conversation`，丢弃旧依据的覆盖状态，不把两套结果合并。页响应中的 `conversation_id`、`section` 和 `history_authority` 必须与当前请求相符；切换网络、身份、会话或连接代数后，晚到响应不能进入新视图。
+
+普通刷新和 `records` 推送不是“删除所有未出现记录”的指令。同一依据下，已加载的旧页应按稳定身份保留；推送没有提供的列表不能被当作空列表。较早页不能覆盖读取期间已经更新的同 ID 记录。完整的权威分区替换、依据失效或明确清空须阻止晚到旧请求把移除的记录重新加回。更早页的合并保持当前阅读位置；搜索当前已读取记录不能表示搜索了尚未读取的历史。
+
+`sent` 不在上述 19 个分页分区内。当前会话响应的 `sent` 为空，并以 `sent_coverage={scope:"main", omitted_unknown:<数量>}` 标明省略；不能据此宣称已读完 Bot 发往其他会话的消息。`workspace_overview` 和 `workspace_history` 也有各自的范围与覆盖契约，不与会话游标混用。
 
 ## 可靠调度回执
 
@@ -316,7 +343,11 @@ Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `reconc
 
 Provider 初始只收到 `tool_search`、`tool_describe`、`tool_call`、`context`、`read_skill` 和 `call_lookup`。`tool_search { query?, offset?, limit? }` 返回本轮有权发现的领域工具及 `more/next`；`tool_describe { tool }` 返回原始 schema 和 effect；`tool_call { tool, arguments, call_ref? }` 进入同一领域 router，先解析实际目标再执行权限检查。目录不授予权限，也不能包装私有内部工具或再次嵌套发现工具。稳定指纹覆盖完整目录，未初始展示的 schema 变化同样会失效会话。
 
-`conversation.scheduler.context` 是本机或可达 owner 报告的限长观测，只包含 stable/dynamic 指纹、session generation、各分段 coverage、字节数、Provider 和真实阶段。`compiled` 仅表示已编译，不表示已发送；实际 Provider 回合回调和终态才推进 `started/completed/failed/cancelled/interrupted/unknown`。owner 不可达时不以入口的 Provider 状态代替。`records.context` 更新本机观测，客户端保留远端 owner 的状态。`bot_settings.memory_conflicts` 和 `records.memory_conflicts` 仅含冲突 ID、epoch/revision 和原因，不含候选文本。
+`conversation.scheduler.context` 是本机或可达 owner 报告的限长观测，只包含 stable/dynamic 指纹、session generation、各分段 coverage、字节数、Provider 和真实阶段。`compiled` 仅表示已编译，不表示已发送；实际 Provider 回合回调和终态才推进 `started/completed/failed/cancelled/interrupted/unknown`。owner 不可达时不以入口的 Provider 状态代替。
+
+`records` 推送只包含 `type`、`conversation_id`、`messages`、`works`、`history_authority` 和 `refresh_metadata:true`。其中消息和工作是精确补丁，空数组不删除已加载历史。它不携带 jobs、context 或 Memory 冲突列表。客户端收到刷新标记后读取有界 `conversation`，需要完整分区时按 `history` 的游标继续读取，合并规则见[会话历史分页](#会话历史分页)。
+
+`scheduler.jobs`、`scheduler.scope_jobs`、`bot_settings.memory_staged_count` 和 `bot_settings.memory_conflicts` 属于入口本机。远端负责人的观察分别位于 `scheduler.remote.jobs`、`scheduler.remote.scope_jobs`、`scheduler.remote.memory_staged_count` 和 `scheduler.remote.memory_conflicts`，不能写进入口的本机列表。两类 Memory 冲突只公开身份、epoch/revision 和原因，不含候选文本。负责人不可达时保留空的远端观察及未完成覆盖状态，不用本机状态冒充负责人状态。
 
 队列的 `lane` 按触发来源区分 `main/task/schedule_routine/bot_message`；main 和 bot_message 共用主会话，task 按 work_id、routine 按 trigger 隔离 session 和 worker。`hold_reason` 来自实际 claim gate，可为 `active_turn`、`steering_settlement`、`provider_serial`、`task_limit`、`machine_slot`、`pending_check` 或 `backend_config_pending`。pending check 只阻止与该未知结果共享执行边界的回合；不会自动重放写操作。`context.session_status` 为可选的 `{resumable,pending_generation}`，无可验证配置观察时省略，配置从下一回合生效。
 
@@ -365,7 +396,7 @@ Event {
 | `bot_project_set` | `project`、`attestation` | 入口 Node，写在该 bot 的会话 |
 | `bot_avatar_set` | `version`、`avatar`、`attestation` | 入口 Node，写在该 bot 的会话；`version` 为 `null` 或 16 位十六进制，签名覆盖 `version`，投影只用 `avatar` |
 | `message_steered` | `message_id`、`reply` | steer 这条本人消息的 Node，在宿主回复 `reply` 完成且消息并入其中时写 |
-| `input_posted` | `message_id`、`target`、`intent`、`sequence`、`expected_revision?`、`text`、`attachments`（空时省略）、`report_results?`、`attestation?` | 入口 Node 封装本人签名的普通输入 |
+| `input_posted` | `message_id`、`target`、`intent`、`sequence`、`expected_revision?`、`text`、`attachments`（空时省略）、`report_results`、`attestation?` | 入口 Node 封装本人签名的普通输入 |
 | `workspace_commanded` | `command_id`、`command`、`acting_assignment?`、`attestation?`、`cause?` | 命令写入 Node；按具体命令核验本人签名、Bot 因果来源或执行 Node 身份 |
 | `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`failure?`、`answers?`、`attestation?` | 本人对原问题的答案（含普通问题与审批）由接收答案的 Node 写，`answers` 绑定原问题，`message_id` 为 `a-<question_id>`；assistant 回复由负责人写 |
 | `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（执行它的产品名，或 `task`）、`model?`、`resolved {provider, model}`、`cwd`、`title`、`prompt`、`continues?`、`parent?`、`thread?` | 目标 Node；`resolved` 必填，其 `model` 为 `null` 时跟随 Provider 默认 |
@@ -515,13 +546,19 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 | `configure` | `enabled`、`charity_enabled`、`paid_enabled` 三个布尔值，不接收钱包口令、链或 prover 路径。 |
 | `list`、`get` | 当前个人网络的订单列表，或精确 `order_id` 的详情。 |
 | `find_intent` | 当前网络下精确 `intent_id` 的订单，返回 `{order: ...}` 或 `{order: null}`。 |
-| `prepare` | UUID `intent_id`、双方及服务 PeerID、模式、验收条件、文件名、base64 内容、服务费和链费上限。固定订单与报价，尚未付款。 |
-| `confirm` | 原 `intent_id`，先持久化授权并返回，后台继续证明、付款和传输。 |
+| `prepare` | UUID `intent_id`、`receiver_peer`、`provider_peer`、`mode`、`acceptance`、`name`、`content_base64`、`max_service_amount`、`max_gas_amount`。paid 另需已选预付预算的 `budget_id`，只接受 `acceptance:"recoverable"`。准备订单不授权预算分配。 |
+| `confirm` | 原 `intent_id`，先持久化授权并返回，后台继续证明、预算分配和传输；返回不证明链上成功。 |
+| `confirm_batch` | `intent_ids`：两个不同的原 prepared UUID；仅授权同一预算、合计最多两个窗口的付费发送订单，返回 `{orders}`。 |
 | `accept` | 原 `order_id`，仅接收端接受，后台按已授权条款继续。 |
+| `accept_batch` | `order_ids`：两个不同的原订单 ID；仅接收端授权同一预算、合计最多两个窗口的有效付费接收订单，返回 `{orders}`。 |
 | `reconcile` | 原 `order_id`，核对原意图和原交易，不创建替代付款。 |
 | `read` | 已接受订单的完整文件，返回 `name`、`content_base64`、`sha256` 和 `bytes`，不是新的接收授权。 |
 
-订单按当前网络隔离。接收端和发送端的写授权在后台副作用前再次核对。撤销管理成员或配置变化会停止当前执行步骤；锁定钱包只能观察原交易。公共节点上的 P 没有私人网络，后台仅按已接受的服务订单和本机预算发布 E、提款或对账。
+批量请求仍发给加密客户端方法 `delivery`，其 `params` 分别为 `{"op":"confirm_batch","intent_ids":["<原 A UUID>","<原 B UUID>"]}` 和 `{"op":"accept_batch","order_ids":["<原 A order_id>","<原 B order_id>"]}`。必须使用原准备或接收记录中的身份，不能另造 ID 补齐批次。
+
+P 的 `ready_windows` 表示已耐久收到 Hold 请求，不表示已经揭钥或付款。本人通过 `wallet budget flush --budget-id <budget_id>` 显式授权选中的窗口，后台才继续已有授权的 holdBatch、publication claim 和累计提款。`prepared`、排队状态或确认 ACK 都不能代替原链上的预算分配、Earned 和实际提款证据，详见[受保护预算结算](paid-delivery.md#hold批次揭钥和提款)。
+
+订单按当前网络隔离。接收端和发送端的写授权在后台副作用前再次核对。撤销管理成员或配置变化会停止当前执行步骤；锁定钱包只能观察原交易。网络异常或结果未知时，按原 `intent_id`、`order_id` 和 `budget_id` 查询原记录与原链状态，不换 UUID、改价、重置 gas cap 或另建订单处理未知结果。改变业务内容须由本人明确创建新订单，不能通过重试切换原订单的公益/付费方式。公共节点上的 P 没有私人网络，后台仅按已接受的服务订单和本机预算发布 E、提款或对账。
 
 ### 服务传输
 
@@ -545,7 +582,7 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`，`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`。临时进度不写入事件日志。客户端读取 `conversation` 时，入口为该会话建立有界的只读观察，经 `progress_read` 从负责人和执行节点读取进度。回合状态变化时，该设备在进度环里放一条只在环内的 `job_changed` 提示，观察方收到后让客户端重读会话；它不进事件日志，也不推给本机客户端。
 
-`message.report_results` 默认 `true`，保存在签名的用户消息中。为 `false` 时，该消息引出的工作结束后不再入队汇报。
+客户端界面默认选择 `report_results=true`。签名输入和 `message` RPC 必须显式携带布尔值 `report_results`，该值保存在用户输入中；缺失、null 或非布尔值会被拒绝。为 `false` 时，该消息引出的工作结束后不再入队汇报。
 
 协调 Agent 总是完全权限，没有自主度设置和只读汇报轮。
 

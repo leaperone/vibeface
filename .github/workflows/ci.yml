@@ -117,9 +117,9 @@ jobs:
           node --check scripts/build-desktop.mjs
           node --check scripts/verify-desktop.mjs
           node --check scripts/e2e-desktop.mjs
-          node --check apps/desktop/electron-builder.cjs
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
+          python3 -B scripts/offline-docs.py --self-test
           node scripts/build-desktop.mjs --self-test
           node scripts/verify-desktop.mjs --self-test
       - run: cargo fmt --all -- --check
@@ -228,30 +228,21 @@ jobs:
           pnpm --filter vibeface-mobile run typecheck
 
   desktop-check:
-    name: Desktop host checks
+    name: Native desktop host checks
     needs: plan
     if: needs.plan.outputs.desktop == 'true'
     runs-on: ubuntu-24.04
-    env:
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter 'vibeface-desktop...'
-      - name: Check and bundle the desktop host without platform packaging
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/native-desktop
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with: {key: gpui-feature-check}
+      - name: Check and test the native desktop host
         run: |
-          pnpm --dir apps/desktop typecheck
-          pnpm --dir apps/desktop test
-          pnpm --dir apps/desktop build
+          cargo fmt --all -- --check
+          cargo test -p vibeface-desktop --locked
+          cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings
 
   rust-check:
     name: Rust lint and minimum version
@@ -565,9 +556,10 @@ jobs:
           path: .artifacts/ci-delivery/delivery-charity-*/report.json
           if-no-files-found: warn
           retention-days: 7
-      - name: Use official Ubuntu package mirror
+      - uses: ./.github/actions/ubuntu-apt
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: printf 'https://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+        with:
+          apply: 'true'
       - name: Cache Chromium binaries
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25

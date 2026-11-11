@@ -374,56 +374,71 @@ async fn prepare_turn_from(
         bail!("this Node has no configured management SDK")
     };
     if let SessionScope::WorkspaceTask { task_id } = scope {
-        let store = node.store.lock().await;
-        let task = store
-            .workspace_task(network, task_id)?
-            .context("task not found")?;
-        let assignment = task
-            .current_assignment
-            .as_ref()
-            .map(|id| store.workspace_assignment(network, id))
-            .transpose()?
-            .flatten()
-            .context("task has no execution assignment")?;
-        ensure!(
-            assignment.execution_node == node.identity.device_id()?,
-            "task assignment belongs to another Node"
-        );
-        Runtime::validate_assignment_roots(&assignment.resource_roots)
-            .map_err(ManagerError::not_started)?;
-        let mut allowed = local_settings.roots.clone();
-        allowed.push(settings.workspace.clone());
-        let allowed = allowed
-            .into_iter()
-            .map(|root| root.canonicalize().map_err(Into::into))
-            .collect::<Result<Vec<_>>>()?;
-        let roots = assignment
-            .resource_roots
-            .iter()
-            .map(|root| PathBuf::from(root).canonicalize().map_err(Into::into))
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            !roots.is_empty()
-                && roots
+        let network = network.to_owned();
+        let task_id = task_id.clone();
+        let local = node.identity.device_id()?;
+        let actor_settings = settings.clone();
+        let allowed_roots = local_settings.roots.clone();
+        local_settings.roots = node
+            .store
+            .call("scheduler.prepare_assignment", move |store| {
+                let settings = actor_settings;
+                let task = store
+                    .workspace_task(&network, &task_id)?
+                    .context("task not found")?;
+                let assignment = task
+                    .current_assignment
+                    .as_ref()
+                    .map(|id| store.workspace_assignment(&network, id))
+                    .transpose()?
+                    .flatten()
+                    .context("task has no execution assignment")?;
+                ensure!(
+                    assignment.execution_node == local,
+                    "task assignment belongs to another Node"
+                );
+                Runtime::validate_assignment_roots(&assignment.resource_roots)
+                    .map_err(ManagerError::not_started)?;
+                let mut allowed = allowed_roots;
+                allowed.push(settings.workspace.clone());
+                let allowed = allowed
+                    .into_iter()
+                    .map(|root| root.canonicalize().map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?;
+                let roots = assignment
+                    .resource_roots
                     .iter()
-                    .all(|root| allowed.iter().any(|allowed| root.starts_with(allowed))),
-            "task resource permission was revoked"
-        );
-        ensure!(
-            roots
-                .iter()
-                .any(|root| settings.workspace.starts_with(root)),
-            "task workspace is outside its assignment snapshot"
-        );
-        local_settings.roots = roots;
+                    .map(|root| PathBuf::from(root).canonicalize().map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    !roots.is_empty()
+                        && roots
+                            .iter()
+                            .all(|root| allowed.iter().any(|allowed| root.starts_with(allowed))),
+                    "task resource permission was revoked"
+                );
+                ensure!(
+                    roots
+                        .iter()
+                        .any(|root| settings.workspace.starts_with(root)),
+                    "task workspace is outside its assignment snapshot"
+                );
+                Ok(roots)
+            })
+            .await?;
     }
     let resolved = if let SessionScope::Task { work_id } = scope {
-        let store = node.store.lock().await;
+        let network = network.to_owned();
+        let work_id = work_id.clone();
         Some(
-            store
-                .work(network, work_id)?
-                .context("accepted task work missing")?
-                .resolved,
+            node.store
+                .call("scheduler.task_selection", move |store| {
+                    Ok(store
+                        .work(&network, &work_id)?
+                        .context("accepted task work missing")?
+                        .resolved)
+                })
+                .await?,
         )
     } else {
         None
@@ -440,20 +455,27 @@ async fn prepare_turn_from(
         }
         .into());
     }
-    let (stable_bot, stable_skills, bot_model) = {
-        let store = node.store.lock().await;
-        let bot = store.bot_for_conversation(network, conversation)?;
-        let bot_model = (!explicit && resolved.is_none())
-            .then(|| bot_model(&settings, bot.as_ref()))
-            .flatten();
-        if !explicit {
-            settings = turn_settings(settings, bot.as_ref(), resolved.as_ref());
-        }
-        (
-            configured_bot_value(bot.as_ref()),
-            skill_index(&store, network, bot.as_ref())?,
-            bot_model,
-        )
+    let (stable_bot, stable_skills, bot_model, settings) = {
+        let network = network.to_owned();
+        let conversation = conversation.clone();
+        let resolved = resolved.clone();
+        node.store
+            .call("scheduler.stable_context", move |store| {
+                let bot = store.bot_for_conversation(&network, &conversation)?;
+                let bot_model = (!explicit && resolved.is_none())
+                    .then(|| bot_model(&settings, bot.as_ref()))
+                    .flatten();
+                if !explicit {
+                    settings = turn_settings(settings, bot.as_ref(), resolved.as_ref());
+                }
+                Ok((
+                    configured_bot_value(bot.as_ref()),
+                    skill_index(store, &network, bot.as_ref())?,
+                    bot_model,
+                    settings,
+                ))
+            })
+            .await?
     };
     let provider = settings.provider;
     node.refresh_provider_login(provider).await?;
@@ -568,6 +590,7 @@ fn session_identity(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn session_configuration(
     node: &Runtime,
     network: &str,
@@ -635,23 +658,30 @@ async fn turn(
     if node.provider_configuration_pending(provider, &provider_local) {
         return Ok(None);
     }
-    let mut claimed = {
-        let mut store = node.store.lock().await;
-        store.authorize_node(&network, &node.identity.device_id()?)?;
-        match store.claim_next_in_session(
-            &node.identity,
-            &network,
-            &SessionKey {
-                conversation_id: conversation.clone(),
-                scope: scope.clone(),
-            },
-            boot_id(),
-            &session_config,
-            &node.config.scheduling,
-        )? {
-            Some(claimed) => claimed,
-            None => return Ok(None),
-        }
+    let Some(mut claimed) = ({
+        let identity = node.identity.clone();
+        let network = network.clone();
+        let session = SessionKey {
+            conversation_id: conversation.clone(),
+            scope: scope.clone(),
+        };
+        let session_config = session_config.clone();
+        let limits = node.config.scheduling;
+        node.store
+            .call("scheduler.claim", move |store| {
+                store.authorize_node(&network, &identity.device_id()?)?;
+                store.claim_next_in_session(
+                    &identity,
+                    &network,
+                    &session,
+                    boot_id(),
+                    &session_config,
+                    &limits,
+                )
+            })
+            .await?
+    }) else {
+        return Ok(None);
     };
     let mut job = claimed.job.clone();
     let trigger = job.trigger.clone();
@@ -685,24 +715,27 @@ async fn turn(
     let mut sdk_live = false;
     let mut budget = None;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
-        job = node.store.lock().await.record_turn_runtime(
-            &conversation,
-            &trigger,
-            &attempt.id,
-            &TurnRuntime {
-                provider,
-                model: (!config.model.is_empty()).then(|| config.model.clone()),
-                reasoning_effort: config.reasoning_effort.clone(),
-                generation: node.provider_generation(provider, &provider_local)?,
-                session_generation: claimed.session_generation,
-                delivery_id: attempt.id.clone(),
-                stage: ProviderStage::Validate,
-                execution: TurnExecution::NotStarted,
-                attempted_at_ms: crate::runtime::now_ms(),
-                switched_from: None,
-                switch_reason: None,
-            },
-        )?;
+        job = {
+            let conversation = (conversation).to_owned();
+            let trigger = (trigger).to_owned();
+            let attempt_id = (attempt.id).to_owned();
+            let runtime = (TurnRuntime {
+                    provider,
+                    model: (!config.model.is_empty()).then(|| config.model.clone()),
+                    reasoning_effort: config.reasoning_effort.clone(),
+                    generation: node.provider_generation(provider, &provider_local)?,
+                    session_generation: claimed.session_generation,
+                    delivery_id: attempt.id.clone(),
+                    stage: ProviderStage::Validate,
+                    execution: TurnExecution::NotStarted,
+                    attempted_at_ms: crate::runtime::now_ms(),
+                    switched_from: None,
+                    switch_reason: None,
+            }).to_owned();
+            node.store.call("scheduler.record_turn_runtime", move |store| {
+                store.record_turn_runtime(&conversation, &trigger, &attempt_id, &runtime)
+            }).await
+        }?;
         #[cfg(test)]
         if job.kind == TriggerKind::AgentTask {
             let barrier = node.claim_to_start_barrier.lock().expect("claim barrier").take();
@@ -718,14 +751,25 @@ async fn turn(
             // A resumed thread the backend no longer has is replaced by a new one, which needs it all.
             let wants_fresh = thread && claimed.previous_native_id.is_some();
             let (mut history, mut fresh_history) = {
-                let store = node.store.lock().await;
-                let resumed = claimed.covers.as_ref().map(|covers| (covers, local.as_str()));
-                (
-                    store.turn_history(&network, &conversation, &job, resumed)?,
-                    wants_fresh.then(|| store.turn_history(&network, &conversation, &job, None)).transpose()?,
-                )
+                let network = network.clone();
+                let conversation = conversation.clone();
+                let job = job.clone();
+                let covers = claimed.covers.clone();
+                node.store.call("scheduler.turn_history", move |store| {
+                    let resumed = covers.as_ref().map(|covers| (covers, local.as_str()));
+                    Ok((
+                            store.turn_history(&network, &conversation, &job, resumed)?,
+                            wants_fresh.then(|| store.turn_history(&network, &conversation, &job, None)).transpose()?,
+                    ))
+                }).await?
             };
-            let attachment_events=node.store.lock().await.input_attachment_events(&network,&job.reply_to)?;
+            let attachment_events={
+                let network = (network).to_owned();
+                let message_id = (job.reply_to).to_owned();
+                node.store.call("scheduler.input_attachment_events", move |store| {
+                    store.input_attachment_events(&network, &message_id)
+                }).await
+            }?;
             let pending = node
                 .fetch_turn_attachments(&network, history.shown_events().chain(fresh_history.iter().flat_map(|history| history.shown_events())).chain(attachment_events.iter()))
                 .await;
@@ -733,40 +777,55 @@ async fn turn(
             if let Some(fresh) = &mut fresh_history {
                 fresh.pending_blobs = pending;
             }
-            let ((prompt, shown_now), fresh) = {
-                let store = node.store.lock().await;
-                let works = store.works(&network, &conversation)?.into_iter().filter_map(|work| match store.scheduler_work_in_scope(&network,&job,&work.work_id) {
-                    Ok(true) => Some(Ok(work)), Ok(false) => None, Err(error) => Some(Err(error)),
-                }).collect::<Result<Vec<_>>>()?;
-                let dispatches = store.undelivered_dispatches(&network, &conversation)?.into_iter().filter_map(|dispatch| match store.scheduler_work_in_scope(&network,&job,&dispatch.spec.work_id) {
-                    Ok(true) => Some(Ok(dispatch)), Ok(false) => None, Err(error) => Some(Err(error)),
-                }).collect::<Result<Vec<_>>>()?;
-                let mut bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
-                if let Some(sessions)=bot["sessions"].as_array_mut() {
-                    let mut filtered=Vec::new();
-                    for session in sessions.drain(..) {
-                        if store.scheduler_native_in_scope(&network,&job,session["session_id"].as_str().unwrap_or(""))? { filtered.push(session); }
+            let (works, dispatches, mut bot, memories, schedule, pending_checks) = {
+                let network = network.clone();
+                let conversation = conversation.clone();
+                let job = job.clone();
+                let trigger = trigger.clone();
+                node.store.call("scheduler.context_snapshot", move |store| {
+                    let works = store.works(&network, &conversation)?.into_iter().filter_map(|work| match store.scheduler_work_in_scope(&network,&job,&work.work_id) {
+                        Ok(true) => Some(Ok(work)), Ok(false) => None, Err(error) => Some(Err(error)),
+                    }).collect::<Result<Vec<_>>>()?;
+                    let dispatches = store.undelivered_dispatches(&network, &conversation)?.into_iter().filter_map(|dispatch| match store.scheduler_work_in_scope(&network,&job,&dispatch.spec.work_id) {
+                        Ok(true) => Some(Ok(dispatch)), Ok(false) => None, Err(error) => Some(Err(error)),
+                    }).collect::<Result<Vec<_>>>()?;
+                    let mut bot = bot_value(store, &network, &conversation, crate::runtime::now_ms())?;
+                    if let Some(sessions)=bot["sessions"].as_array_mut() {
+                        let mut filtered=Vec::new();
+                        for session in sessions.drain(..) {
+                            if store.scheduler_native_in_scope(&network,&job,session["session_id"].as_str().unwrap_or(""))? { filtered.push(session); }
+                        }
+                        *sessions=filtered;
                     }
-                    *sessions=filtered;
-                }
-                if job.scope!=SessionScope::Main { bot["sent"]=json!([]); bot["sent_omitted"]=json!(0); }
-                bot["configured_bot"] = stable.bot.clone();
-                bot["skills"] = json!(stable.skills);
-                bot["skills_omitted"] = json!(0);
-                fit_bot(&mut bot, INDEX_BUDGET);
-                let memories: Vec<_> = store.memory_records(&network, &conversation)?
-                    .into_iter().filter(|record| record.essential)
-                    .map(|record| MemoryContextEntry { memory_id: record.entry.memory_id,
-                        text: record.entry.text, epoch: record.epoch, revision: record.revision })
+                    if job.scope!=SessionScope::Main { bot["sent"]=json!([]); bot["sent_omitted"]=json!(0); }
+                    let memories: Vec<_> = store.memory_records(&network, &conversation)?
+                        .into_iter().filter(|record| record.essential)
+                        .map(|record| MemoryContextEntry { memory_id: record.entry.memory_id,
+                            text: record.entry.text, epoch: record.epoch, revision: record.revision })
+                        .collect();
+                    let schedule = match job.kind {
+                        TriggerKind::Schedule => Some(
+                            store
+                                .schedule(&network, crate::scheduling::parse_schedule_trigger(&trigger).context("invalid schedule trigger")?.0)?
+                                .context("the schedule was deleted")?,
+                        ),
+                        _ => None,
+                    };
+                    let pending_checks: Vec<_> = store.pending_checks()?.into_iter()
+                    .filter(|check| check.conversation_id == conversation)
+                    .filter(|check| store.scheduler_job(&conversation,&check.trigger).ok().flatten().is_some_and(|source| source.scope == job.scope))
+                    .map(|check| json!({"check_id":check.check_id,"trigger":check.trigger,
+                        "detail":if crate::model::looks_secret(&check.detail) { "[redacted]" } else { prefix(&check.detail, 1_000) },
+                        "created_at_ms":check.created_at_ms}))
                     .collect();
-                let schedule = match job.kind {
-                    TriggerKind::Schedule => Some(
-                        store
-                            .schedule(&network, crate::scheduling::parse_schedule_trigger(&trigger).context("invalid schedule trigger")?.0)?
-                            .context("the schedule was deleted")?,
-                    ),
-                    _ => None,
-                };
+                    Ok((works, dispatches, bot, memories, schedule, pending_checks))
+                }).await?
+            };
+            bot["configured_bot"] = stable.bot.clone();
+            bot["skills"] = json!(stable.skills);
+            bot["skills_omitted"] = json!(0);
+            fit_bot(&mut bot, INDEX_BUDGET);
+            let ((prompt, shown_now), fresh) = {
                 let uses_handoff = node.compact_or_handoff(provider)? == crate::providers::CompactionMode::Handoff;
                 let handoff = claimed.invalidation.as_ref().filter(|value| uses_handoff && value.source_provider.is_some()).map(|invalidation| {
                     agent_context::ContextHandoff {
@@ -783,13 +842,6 @@ async fn turn(
                         reason: invalidation.reason.clone(),
                     }
                 });
-                let pending_checks: Vec<_> = store.pending_checks()?.into_iter()
-                    .filter(|check| check.conversation_id == conversation)
-                    .filter(|check| store.scheduler_job(&conversation,&check.trigger).ok().flatten().is_some_and(|source| source.scope == job.scope))
-                    .map(|check| json!({"check_id":check.check_id,"trigger":check.trigger,
-                        "detail":if crate::model::looks_secret(&check.detail) { "[redacted]" } else { prefix(&check.detail, 1_000) },
-                        "created_at_ms":check.created_at_ms}))
-                    .collect();
                 let unseen = Shown { session_generation: claimed.shown.session_generation, ..Shown::default() };
                 let adapter_prefix = match stable.provider.stable_prompt {
                     crate::providers::StablePromptPlacement::UserTurnPrefix => manager::bot_instructions(
@@ -832,10 +884,15 @@ async fn turn(
                     .map(|history| render(history, Some(&unseen))).transpose()?;
                 ((prompt, shown), fresh)
             };
-            node.store.lock().await.record_compiled_context(
-                &conversation, &trigger, &attempt.id,
-                shown_now.context.as_ref().context("compiled context projection missing")?,
-            )?;
+            {
+                let conversation = (conversation).to_owned();
+                let trigger = (trigger).to_owned();
+                let attempt_id = (attempt.id).to_owned();
+                let context = (shown_now.context.as_ref().context("compiled context projection missing")?).to_owned();
+                node.store.call("scheduler.record_compiled_context", move |store| {
+                    store.record_compiled_context(&conversation, &trigger, &attempt_id, &context)
+                }).await
+            }?;
             let (fresh_prompt, fresh_shown) = fresh.unzip();
             let shown = Arc::new(Mutex::new(shown_now));
             let confirmed_shown = shown.clone();
@@ -874,20 +931,37 @@ async fn turn(
                     job.kind,
                     TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::WorkspaceTask | TriggerKind::Schedule | TriggerKind::BotMessage
                 ) {
-                    budget = Some(node.store.lock().await.reserve_scheduler_budget(
-                        &network, &job, 1, node.config.daily_decision_limit, crate::runtime::now_ms(),
-                    )?);
+                        budget = Some({
+                            let network = (network).to_owned();
+                            let job = (job).to_owned();
+                            let limit = node.config.daily_decision_limit;
+                            node.store.call("scheduler.reserve_scheduler_budget", move |store| {
+                                store.reserve_scheduler_budget(&network, &job, 1, limit, crate::runtime::now_ms())
+                            }).await
+                            }?);
                 }
                 if !started && job.kind != TriggerKind::AgentTask {
-                    node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
+                        {
+                            let conversation = (conversation).to_owned();
+                            let trigger = (trigger).to_owned();
+                            let attempt_id = (attempt.id).to_owned();
+                            node.store.call("scheduler.mark_started", move |store| {
+                                store.mark_started(&conversation, &trigger, &attempt_id)
+                            }).await
+                        }?;
                 }
                 node.publish_changed(&network, &conversation, Changed::Job(&trigger));
                 started = true;
                 ensure!(node.local_permission_epoch.load(std::sync::atomic::Ordering::Acquire) == permission_epoch,"management permissions changed before native submission");
                 let _native_lease = node.manager_input_lease(&attempt.id,provider).await?;
-                node.store.lock().await.update_turn_runtime(
-                    &conversation, &trigger, &attempt.id, ProviderStage::TurnStart, TurnExecution::Unknown,
-                )?;
+                    {
+                        let conversation = (conversation).to_owned();
+                        let trigger = (trigger).to_owned();
+                        let attempt_id = (attempt.id).to_owned();
+                        node.store.call("scheduler.update_turn_runtime", move |store| {
+                            store.update_turn_runtime(&conversation, &trigger, &attempt_id, ProviderStage::TurnStart, TurnExecution::Unknown)
+                        }).await
+                    }?;
                 sdk_live = true;
                 manager::run_manager(
                 &config,
@@ -899,15 +973,18 @@ async fn turn(
                     {
                         *shown.lock().expect("shown") = fresh;
                     }
-                    persist_node.store.lock().await.save_scheduler_native_id(
-                        &persist_conversation,
-                        &persist_trigger,
-                        &persist_attempt,
-                        &id,
-                        &persist_token,
-                        // Cursor confirms delivered context only after a successful turn.
-                        !thread && provider != crate::providers::Provider::Cursor,
-                    )
+                        {
+                            let conversation = (persist_conversation).to_owned();
+                            let trigger = (persist_trigger).to_owned();
+                            let attempt_id = (persist_attempt).to_owned();
+                            let native_id = (id).to_owned();
+                            let token = (persist_token).to_owned();
+                            let sent = // Cursor confirms delivered context only after a successful turn.
+                            !thread && provider != crate::providers::Provider::Cursor;
+                            persist_node.store.call("scheduler.save_scheduler_native_id", move |store| {
+                                store.save_scheduler_native_id(&conversation, &trigger, &attempt_id, &native_id, &token, sent)
+                            }).await
+                        }
                 },
                 cancel,
                 move |progress| {
@@ -921,11 +998,14 @@ async fn turn(
                     let source = progress_source.clone();
                     async move {
                         if compacted {
-                            node.store.lock().await.record_context_compaction(
-                                &job.conversation_id,
-                                &job.trigger,
-                                &attempt,
-                            )?;
+                                {
+                                    let conversation = (job.conversation_id).to_owned();
+                                    let trigger = (job.trigger).to_owned();
+                                    let attempt_id = (attempt).to_owned();
+                                    node.store.call("scheduler.record_context_compaction", move |store| {
+                                        store.record_context_compaction(&conversation, &trigger, &attempt_id)
+                                    }).await
+                                }?;
                         }
                         node.publish_progress(
                             &network,
@@ -971,9 +1051,15 @@ async fn turn(
                     if node.provider_configuration_pending(next.session_config.provider, &provider_local) {
                         return Err(ManagerError::not_started(anyhow::anyhow!("backup provider is starting")));
                     }
-                    claimed = node.store.lock().await.switch_scheduler_session(
-                        &conversation, &trigger, &attempt.id, &next.session_config,
-                    )?;
+                    claimed = {
+                        let conversation = (conversation).to_owned();
+                        let trigger = (trigger).to_owned();
+                        let attempt_id = (attempt.id).to_owned();
+                        let config = (next.session_config).to_owned();
+                        node.store.call("scheduler.switch_scheduler_session", move |store| {
+                            store.switch_scheduler_session(&conversation, &trigger, &attempt_id, &config)
+                        }).await
+                    }?;
                     let runtime = TurnRuntime {
                         provider: next.session_config.provider,
                         model: (!next.config.model.is_empty()).then(|| next.config.model.clone()),
@@ -989,7 +1075,15 @@ async fn turn(
                         switch_reason: Some(reason),
                         ..previous
                     };
-                    job = node.store.lock().await.record_turn_runtime(&conversation, &trigger, &attempt.id, &runtime)?;
+                    job = {
+                        let conversation = (conversation).to_owned();
+                        let trigger = (trigger).to_owned();
+                        let attempt_id = (attempt.id).to_owned();
+                        let runtime = (runtime).to_owned();
+                        node.store.call("scheduler.record_turn_runtime", move |store| {
+                            store.record_turn_runtime(&conversation, &trigger, &attempt_id, &runtime)
+                        }).await
+                    }?;
                     settings = next.settings;
                     bot_model = next.bot_model;
                     stable = next.stable;
@@ -1001,9 +1095,14 @@ async fn turn(
                 }
             };
             sdk_live = false;
-            node.store.lock().await.update_turn_runtime(
-                &conversation, &trigger, &attempt.id, ProviderStage::Record, TurnExecution::Started,
-            )?;
+            {
+                let conversation = (conversation).to_owned();
+                let trigger = (trigger).to_owned();
+                let attempt_id = (attempt.id).to_owned();
+                node.store.call("scheduler.update_turn_runtime", move |store| {
+                    store.update_turn_runtime(&conversation, &trigger, &attempt_id, ProviderStage::Record, TurnExecution::Started)
+                }).await
+            }?;
             node.seal_manager_tools(&attempt.id).await?;
             tools_fenced = true;
             if provider == crate::providers::Provider::Cursor {
@@ -1011,16 +1110,17 @@ async fn turn(
                 confirm_cursor_seen(&node, &job, &shown, &result).await?;
             }
             let output = prefix(&result.output, REPLY_LIMIT).to_owned();
-            job = node.store.lock().await.finish_job(
-                &node.identity,
-                &network,
-                &conversation,
-                &trigger,
-                &attempt.id,
-                JobOutcome::Completed,
-                &output,
-                crate::runtime::now_ms(),
-            )?;
+            job = {
+                let identity = (node.identity).to_owned();
+                let network = (network).to_owned();
+                let conversation = (conversation).to_owned();
+                let trigger = (trigger).to_owned();
+                let attempt_id = (attempt.id).to_owned();
+                let text = (output).to_owned();
+                node.store.call("scheduler.finish_job", move |store| {
+                    store.finish_job(&identity, &network, &conversation, &trigger, &attempt_id, JobOutcome::Completed, &text, crate::runtime::now_ms())
+                }).await
+            }?;
             return Ok(invocation_value(&job, &network));
         }
     })
@@ -1066,24 +1166,33 @@ async fn turn(
             tools_fenced = node.fence_manager_attempt(&attempt.id).await.is_ok();
         }
         let (current, moved) = {
-            let store = node.store.lock().await;
-            let current = store
-                .scheduler_job(&conversation, &trigger)?
-                .context("scheduler job missing")?;
-            let owner = store
-                .conversation(&network, &conversation)?
-                .and_then(|c| c.owner);
-            let moved =
-                current.kind != TriggerKind::AgentTask && owner != Some(node.identity.device_id()?);
-            (current, moved)
+            let network = network.clone();
+            let conversation = conversation.clone();
+            let trigger = trigger.clone();
+            let local = node.identity.device_id()?;
+            node.store
+                .call("scheduler.current_attempt", move |store| {
+                    let current = store
+                        .scheduler_job(&conversation, &trigger)?
+                        .context("scheduler job missing")?;
+                    let owner = store
+                        .conversation(&network, &conversation)?
+                        .and_then(|c| c.owner);
+                    let moved = current.kind != TriggerKind::AgentTask && owner != Some(local);
+                    Ok((current, moved))
+                })
+                .await?
         };
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
-        let no_execution = node
-            .store
-            .lock()
-            .await
-            .scheduler_attempt_not_started(&current)?;
+        let no_execution = {
+            let job = (current).to_owned();
+            node.store
+                .call("scheduler.scheduler_attempt_not_started", move |store| {
+                    store.scheduler_attempt_not_started(&job)
+                })
+                .await
+        }?;
         let terminal = if (cancellation || (stopped && no_execution)) && tools_fenced {
             JobOutcome::Cancelled(
                 if moved {
@@ -1106,21 +1215,35 @@ async fn turn(
             && let Some(reservation) = budget.take()
         {
             node.store
-                .lock()
-                .await
-                .refund_scheduler_budget(reservation, boot_id())?;
+                .call("scheduler.refund_scheduler_budget", move |store| {
+                    store.refund_scheduler_budget(reservation, boot_id())
+                })
+                .await?;
         }
         let text = partial.lock().expect("partial text").text();
-        job = node.store.lock().await.finish_job(
-            &node.identity,
-            &network,
-            &conversation,
-            &trigger,
-            &attempt.id,
-            terminal,
-            prefix(&text, REPLY_LIMIT),
-            crate::runtime::now_ms(),
-        )?;
+        job = {
+            let identity = (node.identity).to_owned();
+            let network = (network).to_owned();
+            let conversation = (conversation).to_owned();
+            let trigger = (trigger).to_owned();
+            let attempt_id = (attempt.id).to_owned();
+            let outcome = terminal;
+            let text = (prefix(&text, REPLY_LIMIT)).to_owned();
+            node.store
+                .call("scheduler.finish_job", move |store| {
+                    store.finish_job(
+                        &identity,
+                        &network,
+                        &conversation,
+                        &trigger,
+                        &attempt_id,
+                        outcome,
+                        &text,
+                        crate::runtime::now_ms(),
+                    )
+                })
+                .await
+        }?;
         Ok(invocation_value(&job, &network))
     }
     .await;
@@ -1128,22 +1251,33 @@ async fn turn(
     if final_result.is_err()
         && !sdk_live
         && let Some(reservation) = budget.take()
-        && let Err(error) = node
-            .store
-            .lock()
-            .await
-            .refund_scheduler_budget(reservation, boot_id())
+        && let Err(error) = {
+            node.store
+                .call("scheduler.refund_scheduler_budget", move |store| {
+                    store.refund_scheduler_budget(reservation, boot_id())
+                })
+                .await
+        }
     {
         final_result = final_result.map_err(|failure| {
             failure.context(format!("scheduler budget refund failed: {error:#}"))
         });
     }
-    if let Err(error) = node.store.lock().await.settle_workspace_assignment(
-        &node.identity,
-        &network,
-        &job,
-        crate::runtime::now_ms(),
-    ) {
+    if let Err(error) = {
+        let identity = (node.identity).to_owned();
+        let network = (network).to_owned();
+        let job = (job).to_owned();
+        node.store
+            .call("scheduler.settle_workspace_assignment", move |store| {
+                store.settle_workspace_assignment(
+                    &identity,
+                    &network,
+                    &job,
+                    crate::runtime::now_ms(),
+                )
+            })
+            .await
+    } {
         tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment waits for lifecycle reconciliation");
     }
     node.publish_changed(&network, crate::workspace::WORKSPACE_SCOPE, Changed::Reload);
@@ -1178,11 +1312,13 @@ async fn record_failure(
     error: &anyhow::Error,
     otherwise: TurnExecution,
 ) -> Result<SchedulerJob> {
-    let attempt = job.state.attempt().context("manager attempt missing")?;
-    let mut store = node.store.lock().await;
-    let current = store
-        .scheduler_job(&job.conversation_id, &job.trigger)?
-        .context("scheduler job missing")?;
+    let attempt = job
+        .state
+        .attempt()
+        .context("manager attempt missing")?
+        .id
+        .clone();
+    let job = job.clone();
     let (stage, mut execution) = match error.downcast_ref::<ManagerError>() {
         Some(error) => (
             error.stage,
@@ -1194,30 +1330,37 @@ async fn record_failure(
         ),
         None => (ProviderStage::Record, otherwise),
     };
-    if execution == TurnExecution::NotStarted
-        && (current.tool_calls
-            || current.pending_check
-            || current.runtime.as_ref().is_some_and(|runtime| {
-                runtime.execution == TurnExecution::Started
-                    || otherwise == TurnExecution::NotStarted
-                        && runtime.execution == TurnExecution::Unknown
-            }))
-    {
-        execution = TurnExecution::Unknown;
-    }
-    if current.runtime.is_none()
-        && execution == TurnExecution::NotStarted
-        && store.scheduler_attempt_not_started(&current)?
-    {
-        return Ok(current);
-    }
-    store.update_turn_runtime(
-        &job.conversation_id,
-        &job.trigger,
-        &attempt.id,
-        stage,
-        execution,
-    )
+    node.store
+        .call("scheduler.record_failure", move |store| {
+            let current = store
+                .scheduler_job(&job.conversation_id, &job.trigger)?
+                .context("scheduler job missing")?;
+            if execution == TurnExecution::NotStarted
+                && (current.tool_calls
+                    || current.pending_check
+                    || current.runtime.as_ref().is_some_and(|runtime| {
+                        runtime.execution == TurnExecution::Started
+                            || otherwise == TurnExecution::NotStarted
+                                && runtime.execution == TurnExecution::Unknown
+                    }))
+            {
+                execution = TurnExecution::Unknown;
+            }
+            if current.runtime.is_none()
+                && execution == TurnExecution::NotStarted
+                && store.scheduler_attempt_not_started(&current)?
+            {
+                return Ok(current);
+            }
+            store.update_turn_runtime(
+                &job.conversation_id,
+                &job.trigger,
+                &attempt,
+                stage,
+                execution,
+            )
+        })
+        .await
 }
 
 /// What a turn streams. A reply streams into its chat; an agent task's turn is its work's progress,
@@ -1248,10 +1391,15 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
         let node = node.clone();
         let attempt = attempt.clone();
         Box::pin(async move {
-            node.store
-                .lock()
-                .await
-                .record_manager_process(&attempt, group)
+            {
+                let attempt_id = (attempt).to_owned();
+                let process_group = group;
+                node.store
+                    .call("scheduler.record_manager_process", move |store| {
+                        store.record_manager_process(&attempt_id, process_group)
+                    })
+                    .await
+            }
         })
     })
 }
@@ -1262,26 +1410,36 @@ pub(crate) async fn confirm_cursor_seen(
     shown: &Shown,
     result: &vibeface_bridge::agent::AgentResult,
 ) -> Result<()> {
-    let attempt = job.state.attempt().context("Cursor attempt missing")?;
-    let mut store = node.store.lock().await;
-    let locator = store
-        .manager_turn_record(&attempt.id)?
-        .context("completed Cursor locator missing")?;
-    ensure!(
-        result.session_id.as_deref() == Some(locator.thread.as_str()),
-        "completed Cursor agent does not match its locator"
-    );
-    let turn = locator
-        .turn
-        .as_deref()
-        .context("completed Cursor run missing")?;
-    store.record_manager_turn(
-        &attempt.id,
-        &locator.server,
-        &locator.thread,
-        Some(turn),
-        shown,
-    )
+    let attempt = job
+        .state
+        .attempt()
+        .context("Cursor attempt missing")?
+        .id
+        .clone();
+    let shown = shown.clone();
+    let session_id = result.session_id.clone();
+    node.store
+        .call("scheduler.confirm_cursor_seen", move |store| {
+            let locator = store
+                .manager_turn_record(&attempt)?
+                .context("completed Cursor locator missing")?;
+            ensure!(
+                session_id.as_deref() == Some(locator.thread.as_str()),
+                "completed Cursor agent does not match its locator"
+            );
+            let turn = locator
+                .turn
+                .as_deref()
+                .context("completed Cursor run missing")?;
+            store.record_manager_turn(
+                &attempt,
+                &locator.server,
+                &locator.thread,
+                Some(turn),
+                &shown,
+            )
+        })
+        .await
 }
 
 pub(crate) fn turn_recorder(
@@ -1322,22 +1480,29 @@ pub(crate) fn turn_recorder(
             );
             Box::pin(async move {
                 let workspace_started = {
-                    let mut store = node.store.lock().await;
-                    let started = store.update_turn_runtime(
-                        &conversation,
-                        &trigger,
-                        &attempt,
-                        ProviderStage::Run,
-                        TurnExecution::Started,
-                    )?;
-                    store.record_context_started(&attempt)?;
-                    store.settle_workspace_assignment(
-                        &node.identity,
-                        &network,
-                        &started,
-                        crate::runtime::now_ms(),
-                    )?;
-                    matches!(started.scope, SessionScope::WorkspaceTask { .. })
+                    let identity = node.identity.clone();
+                    let network = network.clone();
+                    let conversation = conversation.clone();
+                    let trigger = trigger.clone();
+                    node.store
+                        .call("scheduler.record_started", move |store| {
+                            let started = store.update_turn_runtime(
+                                &conversation,
+                                &trigger,
+                                &attempt,
+                                ProviderStage::Run,
+                                TurnExecution::Started,
+                            )?;
+                            store.record_context_started(&attempt)?;
+                            store.settle_workspace_assignment(
+                                &identity,
+                                &network,
+                                &started,
+                                crate::runtime::now_ms(),
+                            )?;
+                            Ok(matches!(started.scope, SessionScope::WorkspaceTask { .. }))
+                        })
+                        .await?
                 };
                 node.publish_changed(&network, &conversation, Changed::Job(&trigger));
                 if workspace_started {
@@ -1356,12 +1521,26 @@ pub(crate) fn turn_recorder(
             let server = server.clone();
             let shown = shown.lock().expect("shown").clone();
             Box::pin(async move {
-                let mut store = node.store.lock().await;
-                if cursor {
-                    store.record_manager_locator(&attempt, &server, &thread, turn.as_deref())
-                } else {
-                    store.record_manager_turn(&attempt, &server, &thread, turn.as_deref(), &shown)
-                }
+                node.store
+                    .call("scheduler.record_native_turn", move |store| {
+                        if cursor {
+                            store.record_manager_locator(
+                                &attempt,
+                                &server,
+                                &thread,
+                                turn.as_deref(),
+                            )
+                        } else {
+                            store.record_manager_turn(
+                                &attempt,
+                                &server,
+                                &thread,
+                                turn.as_deref(),
+                                &shown,
+                            )
+                        }
+                    })
+                    .await
             })
         }),
     }

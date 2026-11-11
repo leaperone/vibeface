@@ -17,7 +17,10 @@ TARGET = 'x86_64-pc-windows-msvc'
 ROOT = release.ROOT
 WEB_FILES = ('_shell.html', 'index.html', '_redirects', '_headers', '.vibeface-build.json',
              'vibeface_secure.js', 'vibeface_secure_bg.wasm')
-DOCS = ('node.md', 'releasing.md')
+import importlib.util
+spec = importlib.util.spec_from_file_location('offline_docs', ROOT / 'scripts/offline-docs.py')
+offline_docs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(offline_docs)
 REQUIREMENTS = """# Runtime requirements
 
 The archive contains the CLI, Core and static browser application for Windows. Install the provider
@@ -56,12 +59,9 @@ def stage(package, binaries, web):
     release.require(installer.is_file(), f'missing Windows service installer: scripts/{installer.name}')
     (package / 'scripts').mkdir()
     shutil.copy2(installer, package / 'scripts' / installer.name)
-    shutil.copy2(ROOT / 'README.md', package / 'README.md')
+    offline_docs.assemble(package)
     if (ROOT / 'LICENSE').is_file():
         shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
-    (package / 'docs').mkdir()
-    for name in DOCS:
-        shutil.copy2(ROOT / 'packages/docs' / name, package / 'docs' / name)
     (package / 'RUNTIME-REQUIREMENTS.md').write_text(REQUIREMENTS)
     return package
 
@@ -118,7 +118,7 @@ def self_test():
         package = stage(tmp / f'vibeface-{version}-{TARGET}', binaries, web)
         names = {path.relative_to(package).as_posix() for path in package.rglob('*') if path.is_file()}
         assert names == {'vibeface.exe', 'vibeface-core.exe', 'README.md', 'RUNTIME-REQUIREMENTS.md',
-                         'scripts/install-node-service.ps1', *(f'docs/{name}' for name in DOCS),
+                         'scripts/install-node-service.ps1', *offline_docs.sources().values(),
                          *(f'web/{name}' for name in WEB_FILES),
                          *(['LICENSE'] if (ROOT / 'LICENSE').is_file() else [])}, sorted(names)
         os.environ['PACKAGE_TARGET'] = TARGET

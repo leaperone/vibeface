@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use vibeface_bridge::failure::{ExecFailure, FailureKind, ProviderStage};
+pub use vibeface_protocol::workspace::TurnExecution;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -396,14 +397,6 @@ pub struct RuntimeSelection {
     pub provider: Provider,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnExecution {
-    NotStarted,
-    Started,
-    Unknown,
 }
 
 /// Safe submitted configuration and execution evidence. Native identifiers and credentials stay local.

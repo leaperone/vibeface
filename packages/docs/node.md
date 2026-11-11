@@ -140,7 +140,7 @@ printf '%s' '{"opencode_endpoint":{"protocol":"openai_compatible","base_url":"ht
 
 程序先使用保存的路径和 PATH，再查 Node 的 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。npm wrapper 的启动环境会补齐所需 Node；必要时只向登记登录 shell 查询 PATH。自定义安装仍无法发现时，在设置里填程序绝对路径和所需 PATH。
 
-模型留空时用各自的默认模型；opencode 写成 `provider/model`。Codex 和 pi 可在检查状态后提供模型列表，网页和手机保留手填模型。目录未取得或不完整时，不会清空已有配置。登录未确认时显示提醒并允许尝试，只有程序缺失、明确需要登录等已确认的问题才阻止发送。Claude Code 的进度按整条消息更新。
+模型留空时用各自的默认模型；opencode 写成 `provider/model`。Codex 和 pi 可在检查状态后提供模型列表，网页和手机保留手填模型。目录未取得或不完整时，不会清空已有配置。登录未确认时显示提醒并允许尝试，只有程序缺失、明确需要登录等已确认的问题才阻止发送。Claude Code 的进度按整条消息更新，活动回复中的补充输入走原生 steer，并区分接纳、归属和结果未知。
 
 `dispatch_work` 的 `thread` 只接受本机任务跑过的 Claude Code、pi 或 opencode 会话；本人自己开的会话不接任务。opencode 会话里还有未结束的工作（在跑、发送结果未知或待确认）时，新工作以 `writer_busy` 被拒，不发送；能确定是哪项工作占用时，错误里点名它。不给 `agent` 时沿用该会话里工作用过的产品。
 
@@ -488,7 +488,7 @@ S 是发送 Node，R 是接收 Node，P 是服务 Node。
 
 断线或进程重启后，保留原订单并点击**检查进度**。不要通过另建订单处理未知结果。公益收据不表示链上解密证明，也不表示真人阅读。
 
-付费实验还需按[proof 构建说明](../../crates/delivery/proof/README.md)配置 Linux prover，并按[合约说明](../../contracts/delivery/README.md)固定本机测试部署。仅切换网页开关不能创建这些配置。完整进程验收见[e2e 的付费模式](e2e.md#验证付费交付和实际结算)。
+付费实验还需按[proof 构建说明](../../crates/delivery/proof/README.md)配置 Linux prover，并按[合约说明](../../contracts/delivery/README.md)固定本机测试部署。仅切换网页开关不能创建这些配置。完整进程验收见[e2e 的受保护付费模式](e2e.md#验证受保护付费交付)。
 
 在已启用服务的本机 Node 上管理独立钱包，口令由 TTY 关闭回显输入。以下命令不接受网页远程口令。
 

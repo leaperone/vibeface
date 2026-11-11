@@ -18,6 +18,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
 | `ci-desktop-acceptance.yml` | CI / Desktop | 手动 | `desktop-only` 默认运行四平台真实窗口与 Windows Rust；`full-validation` 运行完整 Core，再验收同 SHA 包的 Mac、Windows 窗口与 Windows 进程 |
 | `ci-windows.yml` | CI / Windows native | 手动 | 只检查当前源码的 Windows Rust |
+| `ci-native-diagnostics.yml` | CI / Native diagnostics | 手动 | compiler 四包编译、可选受控回归/frame/bench 或明确来源的安装器诊断，不发布 |
 | `ci-mobile-device.yml` | CI / Mobile device builds | 手动 | `platforms=ios\|android\|both` 构建设备归档或 APK，不发布 |
 | `mobile.yml` | CI / Mobile acceptance | 手动、复用调用 | Android 原生构建与 iOS 模拟器 UI；不含 Android 模拟器 UI 验收 |
 | `delivery-small.yml` | Delivery / Small proof | 手动 | 四关系真实证明、公开分项续用与结算实验 |
@@ -54,21 +55,21 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
 | `apps/app/src/lib/*.test.ts`、`apps/app/src/features/*/*.test.ts`，限定单层目录 | 浏览器密码学互通和独立 `web-tests`，不组包或构建静态页面 |
 | 五个默认浏览器 E2E：chat-confidence、mesh、onboarding、transfers、workspace | Web 构建与真实 Linux 包 E2E，不额外选无关的 Rust workspace 测试或 proof |
-| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的桌面类型检查、单测和 main/preload 打包，不构建 Rust 或运行网页制品验收 |
-| `apps/desktop/src/shared/` | 桌面源码检查，以及直接导入这些文件的 Web 检查和网页制品验收 |
+| `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的原生 GPUI Rust 测试与 Clippy；真实窗口留在显式平台验收 |
 | `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
 | `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
 | 根 JS package、pnpm workspace 或 lockfile | Web、Mobile、桌面源码和门户检查 |
 | Node Rust、迁移、安装、打包或进程验收脚本 | Node 快速测试、Clippy、Web 和 Linux x64 制品启动验收 |
-| Bridge | Bridge、Control、CLI 和 Node 的核心检查 |
-| Protocol | Protocol、Bridge、Control、CLI 和 Node 的核心检查 |
-| Secure、密码学验收脚本 | Secure、Secure FFI、Node 和浏览器密码学互通 |
+| Bridge | Bridge、Rust Client、Control、CLI 和 Node 的核心检查 |
+| Protocol | Protocol、Bridge、Rust Client、Control、CLI 和 Node 的核心检查 |
+| Secure、密码学验收脚本 | Secure、Rust Client、Control、CLI、Node、Secure FFI 和浏览器密码学互通 |
+| `crates/client/` Rust Client | Rust Client、Core 和 CLI 的核心检查 |
 | Delivery 领域库、proof、合约和服务入口 | Delivery 与 Node 核心检查、新 guest 的公开证明验证和本地 EVM 验收 |
 | Cargo manifest、`Cargo.lock`、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的超出待补依赖上限的 4 万事件追平测试。
 
-`desktop-check` 在 Linux 上运行桌面 `typecheck`、`test` 和 `build`，不下载 Electron 程序、不启动窗口，也不替代手动平台验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
+`desktop-check` 在 Linux 上运行原生 Desktop 的 Cargo 测试与 Clippy，使用 Rust 1.98.1 和 hosted runner 系统库，不替代手动平台窗口验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
 
 `web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试、原生或付费 E2E、公共 fixture 和 E2E 配置保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
 
@@ -350,7 +351,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 ## 桌面专项验收
 
-在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
+在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 GPUI 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App。最终 `desktop-gate` 要求所有这些任务成功。
 
 ```sh
 	gh workflow run ci-desktop-acceptance.yml --repo leaperone/vibeface --ref <branch> -f intent=desktop-only
@@ -358,10 +359,44 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 需要完整 Core 与 Mac、Windows 包验收时，选择 `intent=full-validation`。它只运行一次完整标准 Core，再消费同一次运行、同 SHA 的 Mac 与 Windows 包，运行真实窗口与 Windows 进程验收。该模式不额外运行 Linux 桌面窗口。
 
-只定位 Windows Rust 问题时，运行 `ci-windows.yml`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。
+只定位 Windows Rust 问题时，运行 `ci-windows.yml`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。 Windows bridge 组包含 Protocol、Bridge、Secure、Rust Client 和 Control 的实际 Clippy 与测试；共享 SDK 不因已有窗口结果而跳过。
 
-桌面测试使用打包应用自身的 DevTools 页面，核对真实 Electron 版本、窗口隔离、内置包来源、自有 Core、退出和重启。测试预先用包内 CLI 建立不入全网（`--no-mesh`）的独立 Node，随后由真实启动器启动并持有 Core；首次初始化逻辑另由桌面会话测试覆盖。Windows 另外核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程回收和当前用户服务。Unix shell、Unix 权限位及 Linux 证明宿主夹具保留在 Unix 测试中；协调器的协议测试在两端使用各自的私有 IPC。所有 Provider 均为受控夹具，不调用真实模型。
+桌面测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
 
+离线文档使用 `scripts/offline-docs.json` 作为唯一清单；`offline-docs.py` 由 compose、POSIX 和 Windows 组包入口共同调用，复制所有已跟踪公开文档并改写相对链接。测试检查最终组装目录中的本地链接闭包，源码引用固定到本次完整提交。
+
+## 原生编译与安装诊断
+
+原生准备与安装器诊断使用独立的 `ci-native-diagnostics.yml`，不放回快速 `ci.yml`。该入口只生成诊断证据，不发布、部署或代表普通 CI 门禁通过；新增入口合入默认分支前不能派发，也不提供临时旧参数桥接。
+
+`installer_source_run` 默认为空，此时运行 compiler 准备任务。固定 Rust 1.98.1 的受控 Linux hosted runner 执行 `cargo update --workspace`、`cargo fmt --all` 和 Client、Desktop、CLI、Core 四包 all-targets 编译，尽量保留已有第三方锁。`native_tests` 默认 false；开启时执行受控 Rust 回归与原生 frame probe。`native_test_scope=all|desktop` 默认 all，只缩小测试范围，不缩小四包编译。
+
+```sh
+	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_tests=true -f native_test_scope=all
+	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_tests=true -f native_test_scope=desktop
+```
+
+`native_frames=true` 额外执行 frame 和受控冷启动 debugger 诊断；`native_benchmarks=none|small|ingest|full` 默认 none，选择既有签名追加、同步或完整规模矩阵探针。它们不是四平台窗口、用户消息延迟或整机性能验收。
+
+```sh
+	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_frames=true -f native_benchmarks=small
+```
+
+只有这个显式准备入口允许解析锁变更。无论编译成功或失败，都上传完整源码 SHA、步骤 outcome、Cargo.lock、格式与锁补丁、工具链和日志。上传成功不表示编译成功。维护者核对原 SHA、审核补丁并提交最终源码后，仍须执行普通 CI 的 `--locked` 与真实平台验收。准备任务不提交、推送、创建 Tag、发布或读取真实 Provider 认证。
+
+`installer_source_run` 非空时切换安装器诊断，必须同时给出其精确 40 位 `installer_source_sha`；`installer_source_attempt` 默认 1。来源只接受经核验的历史 `ci.yml` 或当前 `ci-desktop-acceptance.yml`，不放宽制品、SHA、权限或实际测试校验。`installer_rebuild=true` 重建正常 NSIS 安装器并执行完整 guarded 验收；默认 false 保留原 primary 与 diagnostic clone 路径。
+
+```sh
+	gh workflow run ci-native-diagnostics.yml --ref <branch> -f installer_source_run=<run-id> -f installer_source_sha=<40-character-SHA> -f installer_source_attempt=1 -F installer_rebuild=true
+```
+
+旧 payload 的诊断结果保留原 payload 与当前脚本的不同来源，不能记成最终匹配 App cohort 通过。诊断也不替代 `ci-windows.yml`、桌面平台组或发布验收。
+
+## 会话分页的交付检查
+
+修改会话分页时，至少核对 `crates/protocol/src/history.rs` 的 19 分区与所有客户端解析器一致，并执行 Core 的 `conversation_history`、`conversation_sections`、`conversation_settings`、`scheduler_history` 专项，原生 `native_ui_history` 和共享 Client 的 history 测试。需要覆盖空页继续游标、字节预算、稳定身份去重、同一连接刷新时保留已加载旧页、重连或连接代次变化后清空旧投影、完整替换后的删除、治理/分叉/owner 失效，以及网络或会话切换后的晚到响应。源码有测试不等于该 HEAD 已执行通过。
+
+最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性、Windows 当前用户安装与卸载、OS 窗口输入及 PNG。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
 
 ## 移动端专项验收
 

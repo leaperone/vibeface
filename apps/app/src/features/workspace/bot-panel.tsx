@@ -1,3 +1,4 @@
+import { HistoryControls } from '../chat/history-controls'
 "use client"
 
 import { useEffect, useRef, useState } from "react"
@@ -112,6 +113,7 @@ export function BotPanelButton() {
           </span>
         </SheetHeader>
         {view ? contextOpen && workspace.data ? <ContextPanel bot={bot} data={workspace.data} nodes={workspace.nodes} connected={workspace.connectionOnline} memory={workspace} onBack={() => { refocus.current = "context"; setContextOpen(false) }} /> : <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+          <HistoryControls key={`${workspace.generation}:${workspace.conversationId}`} workspace={workspace} sections={['skills', 'schedules', 'memory', 'memory_conflicts', 'memory_sync_conflicts']} />
           <SettingsGroup>
             <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>

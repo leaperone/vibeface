@@ -17,6 +17,74 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+pub(crate) mod test_metrics {
+    use std::cell::{Cell, RefCell};
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Metrics {
+        pub recomputes: usize,
+        pub rebuilds: usize,
+        pub assistant_tail_skips: usize,
+        pub ingest_ns: Vec<u128>,
+        pub validation_ns: Vec<u128>,
+        pub recompute_ns: Vec<u128>,
+        pub rebuild_ns: Vec<u128>,
+    }
+    thread_local! {
+        pub(super) static METRICS: RefCell<Metrics> = RefCell::new(Metrics::default());
+        static LEGACY: Cell<bool> = const { Cell::new(false) };
+        static FULL_WORKSPACE_AUTHORIZATION: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn reset() {
+        METRICS.with(|metrics| *metrics.borrow_mut() = Metrics::default());
+    }
+    pub(crate) fn snapshot() -> Metrics {
+        METRICS.with(|metrics| metrics.borrow().clone())
+    }
+    pub(crate) fn legacy() -> bool {
+        LEGACY.with(Cell::get)
+    }
+    pub(crate) fn with_legacy<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LEGACY.with(|value| value.set(self.0));
+            }
+        }
+        let _restore = Restore(LEGACY.with(|value| value.replace(enabled)));
+        f()
+    }
+    pub(crate) fn full_workspace_authorization() -> bool {
+        FULL_WORKSPACE_AUTHORIZATION.with(Cell::get)
+    }
+    pub(crate) fn with_full_workspace_authorization<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FULL_WORKSPACE_AUTHORIZATION.with(|value| value.set(self.0));
+            }
+        }
+        let _restore = Restore(FULL_WORKSPACE_AUTHORIZATION.with(|value| value.replace(true)));
+        f()
+    }
+    pub(super) struct IngestTimer(std::time::Instant);
+    impl IngestTimer {
+        pub(super) fn start() -> Self {
+            Self(std::time::Instant::now())
+        }
+    }
+    impl Drop for IngestTimer {
+        fn drop(&mut self) {
+            METRICS.with(|metrics| {
+                metrics
+                    .borrow_mut()
+                    .ingest_ns
+                    .push(self.0.elapsed().as_nanos())
+            });
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(super) struct CausalClock(BTreeMap<String, CausalPoint>);
@@ -236,6 +304,10 @@ pub(crate) fn ingest_from(
     seen_at_ms: i64,
     placed: &mut Placed,
 ) -> Result<IngestStatus> {
+    #[cfg(test)]
+    let _timer = test_metrics::IngestTimer::start();
+    #[cfg(test)]
+    let validation_started = std::time::Instant::now();
     let network = view.network_id.as_str();
     let event = match check_event(network, envelope) {
         Ok(event) => event,
@@ -258,6 +330,13 @@ pub(crate) fn ingest_from(
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| {
+        metrics
+            .borrow_mut()
+            .validation_ns
+            .push(validation_started.elapsed().as_nanos())
+    });
     let status = place(connection, view, envelope, &event, seen_at_ms, placed)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
         cascade(connection, view, &envelope.hash, seen_at_ms, placed)?;
@@ -389,18 +468,42 @@ fn place(
             return pending(connection, view, envelope, &event.author, dep);
         }
     }
-    let authorization = super::workspace::authorize_event(connection, network, event)
-        .and_then(|()| authorize_memory(connection, network, event))
-        .and_then(|()| authorize_cause(connection, view, event))
-        .and_then(|()| authorize_owner(connection, view, event));
-    if let Some(error) = input_rejection(authorization)? {
-        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
     let main = match &event.prev {
         Some(prev) => *prev == head_hash,
         None => max == 0,
     };
+    // Dependencies are present and signatures were checked at admission, including pending
+    // events. Keep authorization failures inside input_rejection so one bad row cannot abort
+    // an otherwise valid batch. SQL/decoding failures still propagate as storage failures.
+    let authorization = (|| {
+        let fresh_main_input = main
+            && event.seq == max + 1
+            && matches!(
+                &event.body,
+                EventBody::InputPosted {
+                    target: crate::workspace::InputTarget::BotMain { .. },
+                    ..
+                }
+            )
+            && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
+        #[cfg(test)]
+        let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+        if fresh_main_input
+            && super::workspace::authorize_fresh_bot_main(connection, network, event)?
+        {
+            Ok(())
+        } else {
+            super::workspace::authorize_event(connection, network, event)
+        }
+    })()
+    .and_then(|()| authorize_memory(connection, network, event))
+    .and_then(|()| authorize_cause(connection, view, event))
+    .and_then(|()| authorize_owner(connection, view, event));
+    if let Some(error) = input_rejection(authorization)? {
+        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     placed.stale |= !insert_event(connection, view, envelope, event, seen_at_ms, main)?;
     if !main {
         return Ok(IngestStatus::Conflict);
@@ -657,19 +760,16 @@ fn authorize_owner(connection: &Connection, view: &AuthorizationView, event: &Ev
     Ok(())
 }
 
-fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM events WHERE network_id=? AND author=? AND main=0 LIMIT 1",
-            params![network, author],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+fn first_fork(connection: &Connection, network: &str, author: &str) -> Result<Option<u64>> {
+    Ok(connection.query_row(
+        "SELECT min(seq) FROM events WHERE network_id=? AND author=? AND main=0",
+        params![network, author],
+        |row| row.get(0),
+    )?)
 }
 
-/// Stores the event and applies it at once when it plainly counts. Returns false when only a
-/// recompute can tell: it forks its log, or its log has forked.
+/// Stores the event and applies it when it plainly counts. Returns false when its effect
+/// requires recomputation. A proven ineffective assistant tail needs no recomputation.
 fn insert_event(
     connection: &Connection,
     view: &AuthorizationView,
@@ -679,7 +779,26 @@ fn insert_event(
     main: bool,
 ) -> Result<bool> {
     let network = view.network_id.as_str();
-    let settled = main && !has_forks(connection, network, &event.author)?;
+    let fork = first_fork(connection, network, &event.author)?;
+    let settled = main && fork.is_none();
+    // An existing unlimited fork makes this exact tail ineffective. Assistant messages
+    // supply neither owner nor dispatch evidence, and cannot move the earliest fork.
+    let ineffective_assistant_tail =
+        matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && fork.is_some_and(|seq| event.seq >= seq)
+            && matches!(
+                &event.body,
+                EventBody::MessagePosted {
+                    role: Role::Assistant,
+                    ..
+                }
+            );
+    #[cfg(test)]
+    let ineffective_assistant_tail = ineffective_assistant_tail && !test_metrics::legacy();
+    #[cfg(test)]
+    if ineffective_assistant_tail {
+        test_metrics::METRICS.with(|metrics| metrics.borrow_mut().assistant_tail_skips += 1);
+    }
     let effective = settled
         && attestation_authorized(view, event)
         && match view.write_bound(&event.author) {
@@ -754,7 +873,7 @@ fn insert_event(
             true,
         )?;
     }
-    Ok(settled)
+    Ok(settled || ineffective_assistant_tail)
 }
 
 /// The events that count for one author: a current member's log up to its first fork; a former
@@ -810,6 +929,10 @@ fn effective_set(
 /// one moves, projections are rebuilt in shared order; signed history and local ledgers remain.
 /// Returns whether the projections were rebuilt.
 pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Result<bool> {
+    #[cfg(test)]
+    let recompute_started = std::time::Instant::now();
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| metrics.borrow_mut().recomputes += 1);
     let network = view.network_id.as_str();
     let mut logs: BTreeMap<String, Vec<(u64, String, bool, bool)>> = BTreeMap::new();
     let mut unauthorized = BTreeSet::new();
@@ -848,8 +971,17 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
         }
     }
     if flips.is_empty() {
+        #[cfg(test)]
+        test_metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .recompute_ns
+                .push(recompute_started.elapsed().as_nanos())
+        });
         return Ok(false);
     }
+    #[cfg(test)]
+    let rebuild_started = std::time::Instant::now();
     for (hash, effective) in flips {
         connection.execute(
             "UPDATE events SET effective=? WHERE network_id=? AND hash=?",
@@ -876,6 +1008,17 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
             false,
         )?;
     }
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        metrics.rebuilds += 1;
+        metrics
+            .rebuild_ns
+            .push(rebuild_started.elapsed().as_nanos());
+        metrics
+            .recompute_ns
+            .push(recompute_started.elapsed().as_nanos());
+    });
     Ok(true)
 }
 
@@ -986,7 +1129,24 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
-    super::workspace::authorize_event(connection, network, &event)?;
+    // This branch is only for this transaction's freshly signed local head extension.
+    // Forked/cutoff authors retain causal authorization, as does full recomputation.
+    let fresh_main_input =
+        matches!(
+            &event.body,
+            EventBody::InputPosted {
+                target: crate::workspace::InputTarget::BotMain { .. },
+                ..
+            }
+        ) && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
+    #[cfg(test)]
+    let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+    let fresh_main_input = fresh_main_input
+        && super::workspace::authorize_fresh_bot_main(connection, network, &event)?;
+    if !fresh_main_input {
+        super::workspace::authorize_event(connection, network, &event)?;
+    }
     authorize_memory(connection, network, &event)?;
     authorize_cause(connection, &view, &event)?;
     authorize_owner(connection, &view, &event)?;

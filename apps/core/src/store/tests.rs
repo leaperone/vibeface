@@ -132,7 +132,8 @@ impl Store {
             },
             text,
             attachments,
-            report_results,
+            report_results: report_results
+                .context("signed input fixture requires report_results")?,
         };
         let stored = self.post_workspace_input(identity, network, input, attestation, at)?;
         let receipt =
@@ -5782,6 +5783,7 @@ fn replay(net: &Net, pieces: &[Piece], order: &[usize]) -> Result<Store> {
                 replica.ingest_events(&net.network, events)?;
             }
         }
+        performance_tests::assert_full_recompute_oracle(&replica, &net.network)?;
     }
     Ok(replica)
 }
@@ -6122,12 +6124,15 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
     store.post_input_fixture(&net.a, &net.network, signed_user(net, "m1", "hi", true)?, 2)?;
     write(&mut store, net, &fleet.x, "x1", 3)?;
     let ledgers = |store: &Store| -> Result<Vec<String>> {
-        let derived = [
+        let shared_or_query_cache = [
             "events",
             "event_blobs",
             "log_heads",
             "pending_events",
             "networks",
+            // Rebuilds advance this local read-cache epoch to invalidate old cursors.
+            // It is not an execution, scheduling, identity or side-effect ledger.
+            "conversation_history_revisions",
         ];
         let tables: Vec<String> = store
             .connection
@@ -6135,10 +6140,9 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut rows = Vec::new();
-        for table in tables
-            .iter()
-            .filter(|t| !reduce::TABLES.contains(&t.as_str()) && !derived.contains(&t.as_str()))
-        {
+        for table in tables.iter().filter(|t| {
+            !reduce::TABLES.contains(&t.as_str()) && !shared_or_query_cache.contains(&t.as_str())
+        }) {
             let mut statement = store
                 .connection
                 .prepare(&format!("SELECT * FROM {table}"))?;
@@ -6561,6 +6565,10 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
         origin.last_messages(&net.network)?["c"].text,
         "main visible"
     );
+    assert_eq!(
+        conversation_history_tests::paged(&origin, &net.network, 1)?,
+        origin.main_messages(&net.network, "c")?
+    );
     let notifications = origin.pending_notifications(&net.network, "web")?;
     assert_eq!(
         notifications
@@ -6926,6 +6934,10 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
                 .map(|message| message.message_id.as_str())
                 .collect::<Vec<_>>(),
             ["m1"]
+        );
+        assert_eq!(
+            conversation_history_tests::paged(node, &net.network, 1)?,
+            node.main_messages(&net.network, "c")?
         );
         assert_eq!(
             node.trigger_input_target(&net.network, "c", &message_trigger("a-q-scoped"))?,
@@ -13286,7 +13298,7 @@ fn workspace_input_fixture(
         },
         text: format!("input {id}"),
         attachments: vec![],
-        report_results: Some(true),
+        report_results: true,
     };
     workspace_signed_input_fixture(net, origin, &net.a, input, at)
 }
@@ -17076,7 +17088,7 @@ fn workspace_signed_input_fixture(
             expected_revision: input.route.expected_revision,
             text: input.text.clone(),
             attachments: input.attachments.clone(),
-            report_results: input.report_results,
+            report_results: Some(input.report_results),
             attestation: None,
         },
     )?;
@@ -17162,7 +17174,7 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
                 },
                 text: "perform the task".into(),
                 attachments: vec![],
-                report_results: Some(reports),
+                report_results: reports,
             },
             4,
         )?;
@@ -17696,7 +17708,7 @@ fn an_owner_freezes_a_partial_dag_followup_to_its_first_assignment() -> Result<(
             },
             text: "continue this task".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         7,
     )?;
@@ -17887,7 +17899,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
             },
             text: "full inbox".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         8,
     )?;
@@ -17939,7 +17951,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
                 },
                 text: message_id.into(),
                 attachments: vec![],
-                report_results: Some(true),
+                report_results: true,
             },
             9 + index as i64,
         )?;
@@ -18190,7 +18202,7 @@ fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Re
             },
             text: "replacement".into(),
             attachments: vec![],
-            report_results: Some(true),
+            report_results: true,
         },
         24,
     )?;
@@ -18471,3 +18483,9 @@ fn an_owner_rechecks_new_input_revisions_without_rewriting_existing_receipts() -
     );
     Ok(())
 }
+
+#[path = "performance_tests.rs"]
+mod performance_tests;
+
+#[path = "conversation_history_tests.rs"]
+mod conversation_history_tests;
