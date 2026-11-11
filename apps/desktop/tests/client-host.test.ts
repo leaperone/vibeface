@@ -9,6 +9,7 @@ import type { Duplex } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CLIENT_IPC, CLIENT_ORIGIN, CLIENT_URL } from '../src/shared/client-contract.js'
 import type { Inspect } from '../src/main/control-types.js'
+import { MAX_HTTP_BODY } from '../src/main/limits.js'
 
 const mocks = vi.hoisted(() => ({
   handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>(),
@@ -207,6 +208,24 @@ describe('Desktop client host', () => {
     await expect(invoke(CLIENT_IPC.localEntry, call, clientId, { token: localToken, deviceId: '9'.repeat(64), rejoin: false })).rejects.toThrow('another Node')
     const foreign = { sender: window.value, senderFrame: { url: 'https://remote.example/', parent: null } }
     await expect(invoke(CLIENT_IPC.localSetup, foreign)).rejects.toThrow('Untrusted client window')
+    host.dispose()
+  })
+
+  it('rejects a local Node HTTP body that exceeds the shared size cap', async () => {
+    const fixture = await localFixture((request, response) => {
+      if (request.path === '/api/local/exchange') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end('x'.repeat(MAX_HTTP_BODY + 1))
+      } else json(response, 404, {})
+    })
+    const window = contents()
+    const host = createClientHost({
+      runtimeRoot: '/unused', getClientContents: () => window.value as never, resolveSelectedNode: async () => inspected(fixture.origin),
+      showNodePanel: () => {}, clientBridgeProgram: () => '/unused/core',
+    })
+    host.installIpc()
+    const call = trustedEvent(window.value, window.frame)
+    await expect(invoke(CLIENT_IPC.localEntry, call, clientId, { token: localToken, deviceId: nodeId, rejoin: false })).rejects.toThrow('Local response too large')
     host.dispose()
   })
 

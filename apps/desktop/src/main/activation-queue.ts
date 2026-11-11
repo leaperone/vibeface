@@ -1,7 +1,7 @@
 import type { DeepLink } from './deeplink.js'
 
-export type JoinActivation = Extract<DeepLink, { kind: 'join' }>
-export type ActivationResult = 'handled' | 'defer'
+type JoinActivation = Extract<DeepLink, { kind: 'join' }>
+type ActivationResult = 'handled' | 'defer'
 
 const MAX_PENDING = 32
 

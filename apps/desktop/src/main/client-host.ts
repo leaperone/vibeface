@@ -10,6 +10,7 @@ import { CLIENT_HOST, CLIENT_IPC, CLIENT_ORIGIN, CLIENT_SCHEME, CLIENT_URL, type
 import { businessUrl, parsePrivateOrigin } from './business-url.js'
 import type { Access, Inspect } from './control-types.js'
 import { runControl } from './control-client.js'
+import { MAX_HTTP_BODY, MAX_LAN_FRAME, MAX_LAN_LINE } from './limits.js'
 import WebSocket from 'ws'
 
 export const CLIENT_SCHEME_DESCRIPTOR = {
@@ -32,9 +33,7 @@ export type ClientHostOptions = {
 
 const DEVICE_ID = /^[a-f0-9]{64}$/
 const HEX_TOKEN = /^[a-f0-9]{64}$/
-const MAX_HTTP_BODY = 1024 * 1024
 const MAX_WS_MESSAGE = 65535
-const MAX_LAN_FRAME = 1024 * 1024
 const MAX_QUEUED_FRAMES = 16
 const MAX_LAN_ADDRESSES = 16
 const MIME = new Map<string, string>([
@@ -365,7 +364,7 @@ class CoreLanBridge implements FrameCarrier {
   }
 
   private onLine(line: string): void {
-    if (line.length > 1_500_000) { this.fail(new Error('LAN bridge response too large')); return }
+    if (line.length > MAX_LAN_LINE) { this.fail(new Error('LAN bridge response too large')); return }
     let value: unknown
     try { value = JSON.parse(line) } catch { this.fail(new Error('Invalid LAN bridge response')); return }
     if (!isRecord(value) || typeof value.type !== 'string') { this.fail(new Error('Invalid LAN bridge response')); return }
@@ -410,7 +409,7 @@ class CoreLanBridge implements FrameCarrier {
   private write(value: Record<string, unknown>): Promise<void> {
     if (this.closed) return Promise.reject(this.failure ?? new Error('LAN stream closed'))
     const line = `${JSON.stringify(value)}\n`
-    if (Buffer.byteLength(line) > Math.ceil(MAX_LAN_FRAME * 4 / 3) + 4096) return Promise.reject(new Error('LAN frame too large'))
+    if (Buffer.byteLength(line) > MAX_LAN_LINE) return Promise.reject(new Error('LAN frame too large'))
     return new Promise((resolveWrite, rejectWrite) => {
       this.child.stdin.write(line, error => error ? rejectWrite(error) : resolveWrite())
     })
