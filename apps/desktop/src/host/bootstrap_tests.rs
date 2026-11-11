@@ -1,3 +1,6 @@
+#[path = "../../tests/fixtures/rustc.rs"]
+mod fixture_rustc;
+
 use super::*;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -120,13 +123,12 @@ impl Fixture {
         } else {
             "vibeface-core"
         });
-        let status =
-            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&core)
-                .status()?;
+        let status = fixture_rustc::command()
+            .args(["--edition=2024"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&core)
+            .status()?;
         ensure!(status.success(), "compile the controlled Core fixture");
         let fixture = Self {
             root,

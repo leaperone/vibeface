@@ -1,3 +1,6 @@
+#[path = "fixtures/rustc.rs"]
+mod fixture_rustc;
+
 #[allow(dead_code, unused_imports)]
 #[path = "../src/host/mod.rs"]
 mod host;
@@ -47,15 +50,13 @@ impl Fixture {
             let executable = directory.join(if cfg!(windows) { "child.exe" } else { "child" });
             let source =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_host_child.rs");
-            let status = std::process::Command::new(
-                std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-            )
-            .arg("--edition=2024")
-            .arg(source)
-            .arg("-o")
-            .arg(&executable)
-            .status()
-            .expect("compile isolated synthetic child with the existing toolchain");
+            let status = fixture_rustc::command()
+                .arg("--edition=2024")
+                .arg(source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("compile isolated synthetic child with the existing toolchain");
             assert!(status.success());
             let compiled = Arc::new(CompiledFixture { executable });
             *cache = Arc::downgrade(&compiled);

@@ -1,3 +1,6 @@
+#[path = "../../tests/fixtures/rustc.rs"]
+mod fixture_rustc;
+
 use super::*;
 use std::{
     collections::BTreeMap,
@@ -134,13 +137,12 @@ impl Fixture {
         } else {
             "vibeface-core"
         });
-        let status =
-            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .arg("--edition=2024")
-                .arg(&source)
-                .arg("-o")
-                .arg(core)
-                .status()?;
+        let status = fixture_rustc::command()
+            .arg("--edition=2024")
+            .arg(&source)
+            .arg("-o")
+            .arg(core)
+            .status()?;
         ensure!(status.success(), "compile the isolated inspector fixture");
         let socket_dir = ipc::runtime_dir(&format!("operatortest{key}"))?;
         privatefs::create_dir(&socket_dir)?;

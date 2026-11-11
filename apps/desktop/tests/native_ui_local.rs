@@ -1,4 +1,7 @@
 //! Actual local grants, Noise clients, profile storage, and exclusive SQLite leases.
+#[path = "fixtures/rustc.rs"]
+mod fixture_rustc;
+
 #[path = "../src/app.rs"]
 #[allow(dead_code, unused_imports)]
 mod app;
@@ -313,13 +316,12 @@ impl Fixture {
         } else {
             "vibeface-core"
         });
-        let status =
-            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(executable)
-                .status()?;
+        let status = fixture_rustc::command()
+            .args(["--edition=2024"])
+            .arg(&source)
+            .arg("-o")
+            .arg(executable)
+            .status()?;
         ensure!(
             status.success(),
             "compile the existing-toolchain controlled inspector"
