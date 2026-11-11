@@ -3344,6 +3344,7 @@ mod tests {
                 })
                 .await
         }?;
+        let mut changes = node.events.subscribe();
         node.reconcile_works(&network).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while aborts() < 2 {
@@ -3352,7 +3353,33 @@ mod tests {
         })
         .await
         .context("the stop retry sent another native abort")?;
-        let finished = work(&node, WorkState::finished).await?;
+        // The terminal work row commits before signal_work clears its stop request.
+        // Its published work change follows both commits; observe the complete settlement.
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let change = changes.recv().await.context("receive pi work settlement")?;
+                if change.network_id != network
+                    || change.payload["conversation_id"] != "c"
+                    || change.payload["work_id"] != "w-1"
+                {
+                    continue;
+                }
+                let (record, stop) = node
+                    .store
+                    .call("pi.settled_stop", |store| {
+                        Ok((
+                            store.work_record("w-1")?.context("work")?,
+                            store.stop_request("w-1")?,
+                        ))
+                    })
+                    .await?;
+                if record.state.finished() && stop.is_none() {
+                    break Ok::<_, anyhow::Error>(record);
+                }
+            }
+        })
+        .await
+        .context("pi terminal work and stop-request cleanup were not both published")??;
         assert_work_outcome(&finished, WorkOutcome::Interrupted);
         assert_eq!(
             node.pi.probe(&running).await?,
