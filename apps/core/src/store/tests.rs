@@ -5901,13 +5901,9 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut rows = Vec::new();
-        for table in tables
-            .iter()
-            .filter(|t| {
-                !reduce::TABLES.contains(&t.as_str())
-                    && !shared_or_query_cache.contains(&t.as_str())
-            })
-        {
+        for table in tables.iter().filter(|t| {
+            !reduce::TABLES.contains(&t.as_str()) && !shared_or_query_cache.contains(&t.as_str())
+        }) {
             let mut statement = store
                 .connection
                 .prepare(&format!("SELECT * FROM {table}"))?;

@@ -90,8 +90,8 @@ impl ActivationQueue {
 fn private_runtime_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error).context("无法创建桌面私有激活目录。"),
     }
     let metadata = std::fs::symlink_metadata(path)?;
@@ -115,7 +115,10 @@ fn activation_endpoint(profile: &Path) -> Result<Endpoint> {
         let endpoint = Endpoint::in_private_dir(&directory, &format!("{}.sock", &key[..32]))?;
         // A 128-bit profile hash leaves room even for Darwin's /private/tmp spelling.
         use std::os::unix::ffi::OsStrExt;
-        ensure!(endpoint.path().as_os_str().as_bytes().len() < 104, "桌面激活端点超过系统路径限制。");
+        ensure!(
+            endpoint.path().as_os_str().as_bytes().len() < 104,
+            "桌面激活端点超过系统路径限制。"
+        );
         Ok(endpoint)
     }
     #[cfg(windows)]
@@ -248,7 +251,8 @@ mod tests {
 
     #[test]
     fn activation_runtime_directory_refuses_links_and_permissive_permissions() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vf-activation-root-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("vf-activation-root-{}", uuid::Uuid::new_v4()));
         privatefs::create_dir_new(&root)?;
         let directory = root.join("private");
         private_runtime_directory(&directory)?;

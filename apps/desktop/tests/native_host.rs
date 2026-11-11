@@ -486,34 +486,70 @@ async fn single_instance_defers_busy_join_without_overwriting_or_losing_later_in
 }
 
 #[tokio::test]
-async fn long_profiles_keep_short_private_activation_endpoints_and_isolated_instances() -> Result<()> {
+async fn long_profiles_keep_short_private_activation_endpoints_and_isolated_instances() -> Result<()>
+{
     let fixture = Fixture::new()?;
-    let long_parent = fixture.root.join("long-profile-component".repeat(5)).join("second-profile-component".repeat(5));
+    let long_parent = fixture
+        .root
+        .join("long-profile-component".repeat(5))
+        .join("second-profile-component".repeat(5));
     let first_profile = long_parent.join("first");
     let second_profile = long_parent.join("second");
-    let first_profile = { privatefs::create_dir(&first_profile)?; std::fs::canonicalize(first_profile)? };
-    let second_profile = { privatefs::create_dir(&second_profile)?; std::fs::canonicalize(second_profile)? };
+    let first_profile = {
+        privatefs::create_dir(&first_profile)?;
+        std::fs::canonicalize(first_profile)?
+    };
+    let second_profile = {
+        privatefs::create_dir(&second_profile)?;
+        std::fs::canonicalize(second_profile)?
+    };
     assert!(first_profile.to_string_lossy().len() > 250);
-    let InstanceClaim::Primary(mut first) = SingleInstance::claim(&first_profile, &[]).await? else {
+    let InstanceClaim::Primary(mut first) = SingleInstance::claim(&first_profile, &[]).await?
+    else {
         panic!("first long profile must claim its own endpoint");
     };
-    let InstanceClaim::Primary(mut second) = SingleInstance::claim(&second_profile, &[]).await? else {
+    let InstanceClaim::Primary(mut second) = SingleInstance::claim(&second_profile, &[]).await?
+    else {
         panic!("another profile must not attach to the first profile");
     };
     assert_eq!(first.try_recv(), Some(Activation::Focus));
     assert_eq!(second.try_recv(), Some(Activation::Focus));
-    assert!(matches!(SingleInstance::claim(&first_profile, &["vibeface://join/vibeface1firstlong".into()]).await?, InstanceClaim::Forwarded));
-    assert!(matches!(SingleInstance::claim(&second_profile, &["vibeface://join/vibeface1secondlong".into()]).await?, InstanceClaim::Forwarded));
-    assert_eq!(first.try_recv(), Some(Activation::Join { ticket: "vibeface1firstlong".into() }));
-    assert_eq!(second.try_recv(), Some(Activation::Join { ticket: "vibeface1secondlong".into() }));
+    assert!(matches!(
+        SingleInstance::claim(
+            &first_profile,
+            &["vibeface://join/vibeface1firstlong".into()]
+        )
+        .await?,
+        InstanceClaim::Forwarded
+    ));
+    assert!(matches!(
+        SingleInstance::claim(
+            &second_profile,
+            &["vibeface://join/vibeface1secondlong".into()]
+        )
+        .await?,
+        InstanceClaim::Forwarded
+    ));
+    assert_eq!(
+        first.try_recv(),
+        Some(Activation::Join {
+            ticket: "vibeface1firstlong".into()
+        })
+    );
+    assert_eq!(
+        second.try_recv(),
+        Some(Activation::Join {
+            ticket: "vibeface1secondlong".into()
+        })
+    );
     assert_eq!(first.try_recv(), None);
     assert_eq!(second.try_recv(), None);
     assert!(first_profile.join("desktop-instance.lock").is_file());
     assert!(second_profile.join("desktop-instance.lock").is_file());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
         for profile in [&first_profile, &second_profile] {
             let uid = std::fs::metadata(profile)?.uid();
             let directory = PathBuf::from(format!("/tmp/vibeface-desktop-{uid}"));
@@ -521,8 +557,18 @@ async fn long_profiles_keep_short_private_activation_endpoints_and_isolated_inst
             let key = format!("{:x}", Sha256::digest(profile.to_string_lossy().as_bytes()));
             let endpoint = directory.join(format!("{}.sock", &key[..32]));
             use std::os::unix::ffi::OsStrExt;
-            assert!(endpoint.as_os_str().as_bytes().len() < 104, "Darwin SUN_LEN must not depend on profile length");
-            assert!(std::fs::canonicalize(&endpoint)?.as_os_str().as_bytes().len() < 104, "canonical /private/tmp spelling must also fit Darwin SUN_LEN");
+            assert!(
+                endpoint.as_os_str().as_bytes().len() < 104,
+                "Darwin SUN_LEN must not depend on profile length"
+            );
+            assert!(
+                std::fs::canonicalize(&endpoint)?
+                    .as_os_str()
+                    .as_bytes()
+                    .len()
+                    < 104,
+                "canonical /private/tmp spelling must also fit Darwin SUN_LEN"
+            );
             assert!(endpoint.exists());
             privatefs::ensure_private(&endpoint, "controlled long-profile socket")?;
         }

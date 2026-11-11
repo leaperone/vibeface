@@ -217,12 +217,25 @@ mod tests {
     use vibeface_bridge::platform::privatefs;
 
     #[tokio::test]
-    async fn cli_spawn_failure_retains_the_underlying_os_error_without_command_arguments() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vf-cli-spawn-error-{}", uuid::Uuid::new_v4()));
+    async fn cli_spawn_failure_retains_the_underlying_os_error_without_command_arguments()
+    -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("vf-cli-spawn-error-{}", uuid::Uuid::new_v4()));
         privatefs::create_dir_new(&root)?;
-        let binary = root.join(if cfg!(windows) { "missing-cli.exe" } else { "missing-cli" });
-        let error = invoke(&binary, &root, BackgroundAction::Status, None).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::NotFound));
+        let binary = root.join(if cfg!(windows) {
+            "missing-cli.exe"
+        } else {
+            "missing-cli"
+        });
+        let error = invoke(&binary, &root, BackgroundAction::Status, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
         assert!(error.to_string().contains("无法运行随包 CLI"));
         assert!(!format!("{error:#}").contains("--profile-dir"));
         assert!(!format!("{error:#}").contains(root.to_string_lossy().as_ref()));
