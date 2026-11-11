@@ -39,7 +39,7 @@ async function createNetwork({ screen, browser }: Page, { url, entry }: OwnerNod
   await browser.reload();
   await expect(screen.getByRole('switch', '文件传输实验', { exact: true })).toBeChecked();
   await screen.getByRole('link', '打开文件传输', { exact: true }).click();
-  await expect(screen.getByRole('switch', '付费传输')).not.toBeChecked();
+  await expect(screen.getByRole('switch', '受保护付费传输')).not.toBeChecked();
   await expect(screen.getByRole('heading', '发送文件')).toBeVisible();
 }
 
@@ -89,7 +89,7 @@ test('forwards an encrypted charity file between separate networks and survives 
   await screen.getByRole('link', '打开文件传输', { exact: true }).click();
   await expect(screen.getByRole('switch', '启用文件传输')).not.toBeChecked();
   expect(await screen.getByRole('heading', '发送文件', { exact: true }).count()).toBe(0);
-  expect(await browser.locator('button[aria-pressed]').count()).toBe(1);
+  expect(await browser.locator('[aria-labelledby="transfer-orders"] button[aria-pressed]').count()).toBe(1);
   await screen.getByRole('button', name, { exact: false }).click();
   await expect(screen.getByRole('button', '检查进度', { exact: true })).toBeDisabled();
   const download = await browser.waitForDownload(() => screen.getByRole('button', '保存文件').click(), { timeout: 30000 });
@@ -99,8 +99,8 @@ test('forwards an encrypted charity file between separate networks and survives 
   await screen.getByRole('switch', '启用文件传输').check();
   await expect(screen.getByRole('heading', '发送文件')).toBeVisible();
   await expect(screen.getByRole('switch', '免费传输')).toBeChecked();
-  await expect(screen.getByRole('switch', '付费传输')).not.toBeChecked();
-  expect(await browser.locator('button[aria-pressed]').count()).toBe(1);
+  await expect(screen.getByRole('switch', '受保护付费传输')).not.toBeChecked();
+  expect(await browser.locator('[aria-labelledby="transfer-orders"] button[aria-pressed]').count()).toBe(1);
   const state = await network.inspect();
   expect(state.wallet_files).toBe(0);
   expect(state.chain_rpc_calls).toBe(0);

@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
+use vibeface_protocol::valid_business_id;
 
 pub(crate) mod agent_tools;
 mod bots;
@@ -689,12 +690,7 @@ fn signed(v: &Value, key: &str) -> Result<Attestation> {
 }
 fn id(v: &Value, key: &str) -> Result<String> {
     let s = field(v, key)?;
-    ensure!(
-        s.len() <= 128
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c)),
-        "invalid {key}"
-    );
+    ensure!(valid_business_id(s), "invalid {key}");
     Ok(s.into())
 }
 impl Runtime {

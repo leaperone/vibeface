@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod chain;
 mod charity;
 mod keys;
@@ -43,6 +44,7 @@ pub struct DeliveryConfig {
     pub reservation_fee_per_window: String,
     pub priority_fee: String,
     pub provider_gas_cap: String,
+    pub publication_policy: Option<budget::PublicationPolicy>,
 }
 impl Default for DeliveryConfig {
     fn default() -> Self {
@@ -58,6 +60,7 @@ impl Default for DeliveryConfig {
             reservation_fee_per_window: "2".into(),
             priority_fee: "5".into(),
             provider_gas_cap: "0".into(),
+            publication_policy: None,
         }
     }
 }
@@ -81,6 +84,9 @@ impl DeliveryConfig {
         }
         if let Some(prover) = &self.prover {
             prover.validate()?;
+        }
+        if let Some(policy) = &self.publication_policy {
+            policy.validate()?;
         }
         if self.paid_enabled {
             let chain = self
@@ -185,10 +191,12 @@ pub struct Delivery {
     peer_slots: Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
     operations: tokio::sync::Mutex<()>,
     provider_operations: tokio::sync::Mutex<()>,
+    publication_operations: tokio::sync::Mutex<()>,
     runtime: std::sync::OnceLock<Weak<Runtime>>,
     wakeup: Arc<tokio::sync::Notify>,
     changes: tokio::sync::watch::Sender<u64>,
     executor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    publication_executor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Delivery {
     pub fn open(dir: &Path, identity: LocalIdentity) -> Result<Self> {
@@ -217,10 +225,12 @@ impl Delivery {
             peer_slots: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             provider_operations: tokio::sync::Mutex::new(()),
+            publication_operations: tokio::sync::Mutex::new(()),
             runtime: std::sync::OnceLock::new(),
             wakeup: Arc::new(tokio::sync::Notify::new()),
             changes: tokio::sync::watch::Sender::new(0),
             executor: Mutex::new(None),
+            publication_executor: Mutex::new(None),
         })
     }
     pub fn config(&self) -> DeliveryConfig {
@@ -268,6 +278,49 @@ impl Delivery {
             return;
         }
         let wakeup = self.wakeup.clone();
+        let publication_runtime = runtime.clone();
+        let mut publication_changes = self.changes.subscribe();
+        let publisher = tokio::spawn(async move {
+            loop {
+                let Some(node) = publication_runtime.upgrade() else {
+                    break;
+                };
+                let ready = node.delivery.availability() == DeliveryAvailability::Ready
+                    && node.delivery.config().paid_enabled;
+                drop(node);
+                if !ready {
+                    if publication_changes.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+                    changed = publication_changes.changed() => {
+                        if changed.is_err() { break; }
+                        continue;
+                    },
+                }
+                let Some(node) = publication_runtime.upgrade() else {
+                    break;
+                };
+                if node.delivery.availability() != DeliveryAvailability::Ready
+                    || !node.delivery.config().paid_enabled
+                {
+                    continue;
+                }
+                let Ok(_maintenance) = node.maintenance.enter() else {
+                    continue;
+                };
+                if let Err(error) = node.delivery.run_publications(true).await {
+                    tracing::debug!(error=%error, "protected publication reconciliation waits for availability");
+                }
+            }
+        });
+        *self
+            .publication_executor
+            .lock()
+            .expect("publication executor") = Some(publisher);
         let executor = tokio::spawn(async move {
             loop {
                 let Some(node) = runtime.upgrade() else {
@@ -387,6 +440,9 @@ impl Delivery {
             if let Some(mut order) = history {
                 if let Err(error) = self.update_paid_view(&mut order).await {
                     order.view.chain_unknown();
+                    if error.is::<ReceivingKeyUnavailable>() {
+                        order.view.phase = Phase::KeyUnavailable;
+                    }
                     order.resume_requested = true;
                     order.view.error = Some(error.to_string());
                 }
@@ -397,19 +453,34 @@ impl Delivery {
         Ok(())
     }
     pub(crate) async fn shutdown(&self) {
+        let publisher = self
+            .publication_executor
+            .lock()
+            .expect("publication executor")
+            .take();
+        if let Some(publisher) = publisher {
+            publisher.abort();
+            let _ = publisher.await;
+        }
         let executor = self.executor.lock().expect("delivery executor").take();
         if let Some(executor) = executor {
             executor.abort();
             let _ = executor.await;
         }
     }
-    pub(crate) async fn authorize_spend(&self, intent: &str) -> Result<()> {
+    pub(crate) async fn authorize_spend(
+        &self,
+        intent: &str,
+        chain: &chain::ChainConfig,
+    ) -> Result<()> {
         self.ensure_mode(Mode::Paid)?;
         let group = intent
             .split('/')
             .next()
             .context("spend intent has no order")?;
-        if let Some(serial) = group.strip_prefix("key-") {
+        if group.starts_with("budget-") {
+            self.authorize_budget_spend(intent, chain).await?;
+        } else if let Some(serial) = group.strip_prefix("key-") {
             ensure!(
                 !serial.is_empty()
                     && self
@@ -417,32 +488,52 @@ impl Delivery {
                         .is_some(),
                 "key registration requires a local owner intent"
             );
-            return Ok(());
+        } else {
+            let order = self.with_store(|store| store.order(group))?;
+            if order.view.role != Role::Provider || order.network_id.is_some() {
+                let actor = order
+                    .authorized_by
+                    .context("delivery spend has no managing member authorization")?;
+                self.authorize_effect(
+                    order
+                        .network_id
+                        .as_deref()
+                        .context("delivery spend has no network")?,
+                    &actor,
+                )
+                .await?;
+            }
         }
-        let order = self.with_store(|store| store.order(group))?;
-        if order.view.role == Role::Provider && order.network_id.is_none() {
-            return Ok(());
-        }
-        let actor = order
-            .authorized_by
-            .context("delivery spend has no managing member authorization")?;
-        self.authorize_effect(
-            order
-                .network_id
-                .as_deref()
-                .context("delivery spend has no network")?,
-            &actor,
-        )
-        .await
+        let current = self.config();
+        ensure!(
+            current.enabled && current.paid_enabled && current.chain.as_ref() == Some(chain),
+            "delivery configuration changed; preserve the original transaction for read-only reconciliation"
+        );
+        Ok(())
     }
-    pub(crate) async fn authorize_transaction(&self, intent: &store::SpendIntent) -> Result<()> {
-        self.authorize_spend(&intent.id).await?;
+    pub(crate) async fn authorize_transaction(
+        &self,
+        intent: &store::SpendIntent,
+        chain: &chain::ChainConfig,
+    ) -> Result<()> {
+        self.authorize_spend(&intent.id, chain).await?;
         let group = intent
             .id
             .split('/')
             .next()
             .context("spend intent has no order")?;
-        let cap = if group.starts_with("key-") {
+        let cap = if let Some(id) = group.strip_prefix("budget-") {
+            let record = self.budget_record(id)?;
+            if chain::address(&intent.wallet)? == chain::address(&record.terms.payer)? {
+                record.payer_gas_cap
+            } else {
+                ensure!(
+                    chain::address(&intent.wallet)? == chain::address(&record.terms.payee)?,
+                    "budget transaction wallet differs from its fixed payer and payee"
+                );
+                record.provider_gas_cap
+            }
+        } else if group.starts_with("key-") {
             String::from_utf8(
                 self.with_store(|store| store.value(&format!("local-spend:{group}")))?
                     .context("key registration has no local gas authorization")?,
@@ -629,6 +720,10 @@ impl Delivery {
         use crate::net::mesh::record::{Offer, Role, ServiceKind};
         let config = self.config();
         let quotable = config.paid_enabled
+            && config
+                .publication_policy
+                .as_ref()
+                .is_some_and(|policy| policy.validate().is_ok())
             && Amount::from_decimal_str(&config.provider_gas_cap)
                 .is_ok_and(|cap| cap != Amount::ZERO);
         let offer = config
@@ -729,6 +824,14 @@ impl Delivery {
             .context("delivery operation is required")?;
         match op {
             "status" => self.status(),
+            "budgets" => self.client_budgets(network).await,
+            "flush_budget" => {
+                self.authorize_effect(network, device).await?;
+                self.local_budget(budget::BudgetCommand::Flush {
+                    budget_id: text(&params, "budget_id")?.into(),
+                })
+                .await
+            }
             "providers" => self.providers(node),
             "receipt" => self.client_order_receipt(network, text(&params, "order_id")?),
             "find_intent" => {
@@ -807,6 +910,96 @@ impl Delivery {
                 }
                 Ok(serde_json::to_value(order.view)?)
             }
+            "confirm_batch" => {
+                self.ensure_mode(Mode::Paid)?;
+                self.authorize_effect(network, device).await?;
+                let _operation = self
+                    .operations
+                    .try_lock()
+                    .context("another delivery operation is in progress")?;
+                let intents: Vec<String> = serde_json::from_value(params["intent_ids"].clone())?;
+                ensure!(
+                    intents.len() == 2 && intents[0] != intents[1],
+                    "confirm_batch requires two distinct prepared intents"
+                );
+                let mut orders = Vec::new();
+                for intent in &intents {
+                    let order = self
+                        .with_store(|store| store.by_intent(network, intent))?
+                        .context("prepared batch order is missing")?;
+                    ensure!(
+                        order.view.role == Role::Sender && order.view.mode == Mode::Paid,
+                        "batch confirmation only authorizes prepared paid sender orders"
+                    );
+                    orders.push(order);
+                }
+                let budget_id = orders[0]
+                    .view
+                    .payment
+                    .budget_id
+                    .clone()
+                    .context("protected budget missing")?;
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
+                        && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
+                            <= budget::MAX_BATCH_WINDOWS,
+                    "a confirmed batch uses one budget and at most two windows"
+                );
+                let ids: Vec<_> = orders.iter().map(|o| o.view.order_id.clone()).collect();
+                if orders
+                    .iter()
+                    .all(|o| o.confirmed && o.allocation_batch == ids)
+                {
+                    return Ok(
+                        json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}),
+                    );
+                }
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| !o.confirmed && o.view.phase == Phase::Prepared),
+                    "batch confirmation requires the original prepared orders"
+                );
+                let active: usize = self
+                    .with_store(|store| store.progress_orders(Some(network)))?
+                    .iter()
+                    .filter(|other| {
+                        other.view.role == Role::Sender
+                            && other.confirmed
+                            && !other.historical()
+                            && !ids.contains(&other.view.order_id)
+                            && !matches!(
+                                other.view.phase,
+                                Phase::Paid | Phase::Refunded | Phase::Failed
+                            )
+                    })
+                    .map(|other| other.view.windows.len())
+                    .sum();
+                ensure!(
+                    active == 0,
+                    "finish the active protected sending batch before confirming another"
+                );
+                ensure!(
+                    matches!(
+                        self.wallet.lock().expect("delivery wallet").status(),
+                        wallet::WalletStatus::Unlocked { .. }
+                    ),
+                    "unlock the local wallet before confirming the batch"
+                );
+                for order in &mut orders {
+                    order.confirmed = true;
+                    order.resume_requested = true;
+                    order.authorized_by = Some(device.into());
+                    order.allocation_batch = ids.clone();
+                    order.view.phase = Phase::FundingPending;
+                    order.view.updated_at_ms = crate::runtime::now_ms();
+                }
+                self.with_store(|store| store.save_authorized_batch(&orders))?;
+                self.wakeup.notify_one();
+                Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
+            }
             "confirm" => {
                 let intent = text(&params, "intent_id")?;
                 let operation = self.operations.try_lock();
@@ -832,18 +1025,24 @@ impl Delivery {
                 };
                 self.ensure_mode(Mode::Paid)?;
                 if !order.confirmed {
-                    ensure!(
-                        !self
-                            .with_store(|store| store.orders(Some(network)))?
-                            .iter()
-                            .any(|other| other.view.order_id != order.view.order_id
+                    let active: usize = self
+                        .with_store(|store| store.progress_orders(Some(network)))?
+                        .iter()
+                        .filter(|other| {
+                            other.view.order_id != order.view.order_id
                                 && other.view.role == Role::Sender
                                 && other.confirmed
+                                && !other.historical()
                                 && !matches!(
                                     other.view.phase,
                                     Phase::Paid | Phase::Refunded | Phase::Failed
-                                )),
-                        "finish or refund the current paid order before confirming another"
+                                )
+                        })
+                        .map(|other| other.view.windows.len())
+                        .sum();
+                    ensure!(
+                        active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                        "protected sending permits at most two active windows"
                     );
                 }
                 order.authorized_by = Some(device.into());
@@ -855,6 +1054,9 @@ impl Delivery {
                     "unlock the independent delivery wallet locally before confirming payment"
                 );
                 order.confirmed = true;
+                if order.allocation_batch.is_empty() {
+                    order.allocation_batch = vec![order.view.order_id.clone()];
+                }
                 order.resume_requested = true;
                 if order.view.phase == Phase::Prepared {
                     order.view.phase = Phase::FundingPending;
@@ -862,6 +1064,77 @@ impl Delivery {
                 self.save(&mut order)?;
                 self.wakeup.notify_one();
                 Ok(serde_json::to_value(order.view)?)
+            }
+            "accept_batch" => {
+                self.ensure_mode(Mode::Paid)?;
+                self.authorize_effect(network, device).await?;
+                let _operation = self
+                    .operations
+                    .try_lock()
+                    .context("another delivery operation is in progress")?;
+                let ids: Vec<String> = serde_json::from_value(params["order_ids"].clone())?;
+                ensure!(
+                    ids.len() == 2 && ids[0] != ids[1],
+                    "accept_batch needs two distinct orders"
+                );
+                let mut orders = Vec::new();
+                for id in &ids {
+                    let order = self.scoped_order(network, id)?;
+                    ensure!(
+                        order.view.role == Role::Receiver
+                            && order.view.mode == Mode::Paid
+                            && !matches!(order.view.phase, Phase::Refunded | Phase::Failed),
+                        "batch acceptance requires live receiving orders"
+                    );
+                    if !order.accepted {
+                        ensure!(
+                            now() <= order.order.unsigned.terms.hold_deadline,
+                            "delivery acceptance deadline expired"
+                        );
+                        self.receiver_secret(order.order.unsigned.terms.binding.key_id)?;
+                    }
+                    orders.push(order);
+                }
+                let budget_id = orders[0]
+                    .view
+                    .payment
+                    .budget_id
+                    .clone()
+                    .context("protected budget missing")?;
+                ensure!(
+                    orders
+                        .iter()
+                        .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
+                        && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
+                            <= budget::MAX_BATCH_WINDOWS,
+                    "receiving batch uses one budget and at most two windows"
+                );
+                let active: usize = self
+                    .with_store(|store| store.progress_orders(Some(network)))?
+                    .iter()
+                    .filter(|o| {
+                        o.view.role == Role::Receiver
+                            && o.accepted
+                            && !o.historical()
+                            && !ids.contains(&o.view.order_id)
+                            && !matches!(
+                                o.view.phase,
+                                Phase::Paid | Phase::Refunded | Phase::Failed
+                            )
+                    })
+                    .map(|o| o.view.windows.len())
+                    .sum();
+                ensure!(active == 0, "finish the active receiving batch first");
+                for order in &mut orders {
+                    order.accepted = true;
+                    order.authorized_by = Some(device.into());
+                    order.resume_requested = true;
+                    order.view.error = None;
+                    order.view.updated_at_ms = crate::runtime::now_ms();
+                }
+                self.with_store(|store| store.save_authorized_batch(&orders))?;
+                self.wakeup.notify_one();
+                Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
             }
             "accept" | "reconcile" => {
                 let _operation = self
@@ -888,18 +1161,24 @@ impl Delivery {
                             "delivery acceptance deadline expired"
                         );
                         self.receiver_secret(order.order.unsigned.terms.binding.key_id)?;
-                        ensure!(
-                            !self
-                                .with_store(|store| store.orders(Some(network)))?
-                                .iter()
-                                .any(|other| other.view.order_id != order.view.order_id
+                        let active: usize = self
+                            .with_store(|store| store.progress_orders(Some(network)))?
+                            .iter()
+                            .filter(|other| {
+                                other.view.order_id != order.view.order_id
                                     && other.view.role == Role::Receiver
                                     && other.accepted
+                                    && !other.historical()
                                     && !matches!(
                                         other.view.phase,
                                         Phase::Paid | Phase::Refunded | Phase::Failed
-                                    )),
-                            "finish the accepted paid order before accepting another"
+                                    )
+                            })
+                            .map(|other| other.view.windows.len())
+                            .sum();
+                        ensure!(
+                            active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                            "protected receiving permits at most two active windows"
                         );
                     }
                     order.accepted = true;
@@ -1129,7 +1408,7 @@ mod isolation_tests {
             assert!(error.to_string().contains("repair"));
             assert!(
                 delivery
-                    .authorize_spend("synthetic/approval")
+                    .authorize_spend("synthetic/approval", &chain::tests::config())
                     .await
                     .is_err()
             );
@@ -1278,6 +1557,92 @@ mod isolation_tests {
         );
         assert_eq!(std::fs::read(&path)?, bytes);
         delivery.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::mesh::record::{Offer, Role, ServiceKind};
+
+    #[test]
+    fn paid_mesh_offer_requires_an_explicit_valid_publication_policy() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("delivery-mesh-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        assert_eq!(delivery.mesh_role(), None);
+        let chain = chain::tests::config();
+        *delivery.settings.lock().unwrap() = DeliverySettings {
+            config: Some(DeliveryConfig {
+                enabled: true,
+                paid_enabled: true,
+                chain: Some(chain.clone()),
+                delivery_fee_per_window: "5".into(),
+                provider_gas_cap: "1".into(),
+                ..Default::default()
+            }),
+            availability: DeliveryAvailability::Ready,
+        };
+        assert_eq!(
+            delivery.mesh_role(),
+            Some(Role::Service {
+                service: ServiceKind::Delivery,
+                offer: None,
+            })
+        );
+        delivery
+            .settings
+            .lock()
+            .unwrap()
+            .config
+            .as_mut()
+            .unwrap()
+            .charity_enabled = false;
+        assert_eq!(delivery.mesh_role(), None);
+        let policy = budget::PublicationPolicy {
+            watchdog_seconds: 60,
+            inclusion_seconds: 60,
+            finality_seconds: 10,
+            clock_skew_seconds: 5,
+            max_fee_per_gas: "3000000000".into(),
+            priority_fee_per_gas: "1000000000".into(),
+        };
+        let invalid_policy = budget::PublicationPolicy {
+            watchdog_seconds: 0,
+            ..policy.clone()
+        };
+        delivery
+            .settings
+            .lock()
+            .unwrap()
+            .config
+            .as_mut()
+            .unwrap()
+            .publication_policy = Some(invalid_policy);
+        assert_eq!(delivery.mesh_role(), None);
+        delivery
+            .settings
+            .lock()
+            .unwrap()
+            .config
+            .as_mut()
+            .unwrap()
+            .publication_policy = Some(policy);
+        assert_eq!(
+            delivery.mesh_role(),
+            Some(Role::Service {
+                service: ServiceKind::Delivery,
+                offer: Some(Offer {
+                    settlement: chain.settlement(),
+                    price: "5".into(),
+                }),
+            })
+        );
+        drop(delivery);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

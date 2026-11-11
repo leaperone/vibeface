@@ -10,8 +10,12 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+import time
 import urllib.request
+
+import release
 
 
 PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
@@ -37,14 +41,17 @@ CRATES = {
     "secure-ffi": "vibeface-secure-ffi",
     "delivery": "vibeface-delivery",
 }
+WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
+WEB_E2E_TESTS = tuple(f"tests/e2e/{name}.e2e.ts" for name in ("chat-confidence", "mesh", "onboarding", "transfers", "workspace"))
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
+    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
     ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
+    ("web", WEB_E2E_TESTS),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -69,7 +76,7 @@ PLATFORMS = (
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 # Only an explicit dispatch runs the hosted Windows and desktop application checks.
 DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
@@ -97,26 +104,33 @@ def local_process_modes(paths, full):
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
 
-def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, delivery_live=False):
     scopes = set()
     for path in paths:
-        scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
+        if WEB_UNIT_TEST.fullmatch(path):
+            scopes.add("web-tests")
+        elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
+            scopes.add("full")
+        else:
+            scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
             scopes.add("mobile")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
             scopes.add("desktop")
-    plan = scope_plan(scopes, event, ref_type, channel)
+    plan = scope_plan(scopes, event, ref_type, channel, delivery_live=delivery_live)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
-def scope_plan(scopes, event, ref_type, channel):
+def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
     if (
-        scopes - {"full", "docs", "web", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
+        or type(delivery_live) is not bool
+        or delivery_live and event != "workflow_dispatch"
     ):
         raise ValueError("Invalid CI scopes or scenario")
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
@@ -132,22 +146,27 @@ def scope_plan(scopes, event, ref_type, channel):
     packages = [package for crate, package in CRATES.items() if crate in affected]
     # Mobile behavior tests still live in the Web suite.
     web = full or bool(scopes & {"web", "mobile"}) or bool(affected & {"node", "cli", "control"})
+    web_tests = "web-tests" in scopes and not web
+    crypto = web or web_tests
     www = full or "www" in scopes
     mobile = full or "mobile" in scopes
     desktop = full or "desktop" in scopes or bool(affected & {"client"})
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
-    platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
+    platforms = PLATFORMS if "node" in affected and extended and not delivery_live else PLATFORMS[:1]
     plan = {
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
-        "docs_only": not web and not packages and not mobile and not desktop,
+        "docs_only": not crypto and not packages and not mobile and not desktop,
         "event": event,
+        "delivery_live": delivery_live,
         "ref_type": ref_type,
         "channel": channel,
         "scopes": sorted(scopes),
         "web": web,
+        "web_tests": web_tests,
+        "crypto": crypto,
         "www": www,
         "mobile": mobile,
         "desktop": desktop,
@@ -157,11 +176,15 @@ def scope_plan(scopes, event, ref_type, channel):
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
-        "npm": channel == "nightly" and "node" in affected and extended,
+        "npm": channel == "nightly" and "node" in affected and extended and not delivery_live,
     }
     required = {"quick-check"}
+    if crypto:
+        required.add("crypto-web")
     if web:
-        required.update(("crypto-web", "web", "package"))
+        required.update(("web", "package"))
+    if web_tests:
+        required.add("web-tests")
     if mobile:
         required.add("mobile-check")
     if desktop:
@@ -230,6 +253,27 @@ def successful_push_base(head):
     return None
 
 
+def delivery_live_selected(event, payload):
+    if event != "workflow_dispatch":
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("inputs", {}), dict):
+        raise ValueError("Invalid workflow_dispatch inputs")
+    inputs = payload.get("inputs", {})
+    flags = {}
+    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
+        value = inputs.get(name, False)
+        if type(value) is bool:
+            flags[name] = value
+        elif isinstance(value, str) and value in ("true", "false"):
+            flags[name] = value == "true"
+        else:
+            raise ValueError(f"Invalid workflow_dispatch boolean: {name}")
+    mobile = inputs.get("mobile_apps", "none")
+    if not isinstance(mobile, str) or mobile not in ("none", "ios", "android", "both"):
+        raise ValueError("Invalid mobile application selection")
+    return flags["delivery_live"] and not any(flags[name] for name in ("delivery_small", "windows_only", "desktop_only")) and mobile == "none"
+
+
 def event_plan(args):
     event = args.event or os.environ.get("GITHUB_EVENT_NAME", "pull_request")
     ref_type = os.environ.get("GITHUB_REF_TYPE", "branch")
@@ -262,7 +306,7 @@ def event_plan(args):
         base = git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    plan = make_plan(paths, event, ref_type, metadata["channel"])
+    plan = make_plan(paths, event, ref_type, metadata["channel"], delivery_live=delivery_live_selected(event, payload))
     plan.update(metadata)
     plan.update(coverage_base=base, coverage_head=head, coverage_reason=reason, baseline_run_id=baseline_run)
     return plan
@@ -283,7 +327,7 @@ def release_metadata(ref_type, ref_name):
     if ref_type == "tag":
         if ref_name != f"v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
-        git("merge-base", "--is-ancestor", "HEAD", "origin/main")
+        release.validate_source(git("rev-parse", "HEAD").decode().strip(), "product")
     return {"version": version, "msrv": package["rust_version"], "channel": channel, "prerelease": channel != "stable"}
 
 
@@ -294,12 +338,15 @@ def write_plan(plan, output=None):
         outputs = {
             "plan": encoded,
             "web": str(plan["web"]).lower(),
+            "web_tests": str(plan["web_tests"]).lower(),
+            "crypto": str(plan["crypto"]).lower(),
             "www": str(plan["www"]).lower(),
             "mobile": str(plan["mobile"]).lower(),
             "desktop": str(plan["desktop"]).lower(),
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
+            "delivery_live": str(plan["delivery_live"]).lower(),
             "package": str("package" in plan["required_jobs"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
@@ -324,6 +371,8 @@ def write_plan(plan, output=None):
                 f"- Rust packages: {', '.join(plan['rust_packages']) or 'none'}\n"
                 f"- Test tiers: {', '.join(plan['test_tiers']) or 'none'}\n"
                 f"- Package acceptance: {plan['package_mode'] if plan['web'] else 'none'}\n"
+                f"- Package targets: {', '.join(row['target'] for row in plan['package_matrix']['include']) or 'none'}\n"
+                f"- Native delivery experiment: {'native-only; non-Linux, npm and hosted desktop acceptance checks are not selected; delivery_live takes precedence over additive desktop' if plan['delivery_live'] else 'not selected'}\n"
                 f"- Required jobs: {', '.join(plan['required_jobs'])}\n"
                 "\nLocal process checks to run separately, using current CLI/Core and JS/WASM paths:\n\n"
             )
@@ -364,7 +413,9 @@ def frozen_plan(plan):
         paths = changed_paths(base, head, plan["event"])
     if automatic_main_push(plan["event"]) and reason not in {"successful-main-push", "no-trusted-main-push"}:
         raise ValueError("Main push coverage requires a successful ancestor or full fallback")
-    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"])
+    payload_path = os.environ.get("GITHUB_EVENT_PATH")
+    payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
+    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live_selected(plan["event"], payload))
 
 
 def gate(needs, plan=None, delivery_live=False, desktop=False):
@@ -378,9 +429,13 @@ def gate(needs, plan=None, delivery_live=False, desktop=False):
         except (KeyError, TypeError, subprocess.CalledProcessError) as error:
             raise ValueError("Invalid frozen CI coverage") from error
     else:
-        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
+        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"], delivery_live=delivery_live)
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
+    if plan["delivery_live"] is not delivery_live:
+        raise ValueError("Live delivery selection differs from the frozen plan")
+    if delivery_live and desktop:
+        raise ValueError("Native-only delivery does not select desktop acceptance")
     if delivery_live and plan["event"] != "workflow_dispatch":
         raise ValueError("Live delivery proofs require explicit workflow_dispatch")
     if desktop and plan["event"] != "workflow_dispatch":
@@ -411,23 +466,58 @@ def validate_slow_tests(names):
     return fast
 
 
-def run_test(packages, tier):
+def timed_cargo(command, phase, phases, **kwargs):
+    started = time.perf_counter()
+    code = None
+    try:
+        result = subprocess.run(command, check=True, **kwargs)
+        code = result.returncode
+        return result
+    except subprocess.CalledProcessError as error:
+        code = error.returncode
+        raise
+    finally:
+        phases.append({"phase": phase, "seconds": round(time.perf_counter() - started, 6), "exit_code": code})
+
+
+def run_test(packages, tier, timings_file=None):
     selected = package_args(packages)
     test_package = "vibeface-core" if "vibeface-core" in packages else None
-    if test_package:
-        listing_args = selected if tier == "fast" else ["-p", test_package, "--lib"]
-        listing = subprocess.check_output(["cargo", "test", "--locked", *listing_args, "--", "--list"], text=True)
-        names = [line[:-6] for line in listing.splitlines() if line.endswith(": test")]
-        fast = validate_slow_tests(names)
-        print(f"Partition: {len(fast)} fast test names, {len(SLOW_TESTS)} exact slow tests", flush=True)
+    if tier == "slow" and not test_package:
+        raise ValueError("Slow tier requires the Core crate")
+    compile_args = selected if tier == "fast" else ["-p", test_package, "--lib"]
     if tier == "slow":
-        if not test_package:
-            raise ValueError("Slow tier requires the Core crate")
         command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
         command = ["cargo", "test", "--locked", "--no-fail-fast", *selected, "--", *skips]
-    subprocess.run(command, check=True)
+    phases = []
+    try:
+        timed_cargo(["cargo", "test", "--locked", "--no-run", *compile_args], "compile", phases)
+        if test_package:
+            listing = timed_cargo(["cargo", "test", "--locked", *compile_args, "--", "--list"], "enumerate", phases, capture_output=True, text=True).stdout
+            names = [line[:-6] for line in listing.splitlines() if line.endswith(": test")]
+            fast = validate_slow_tests(names)
+            print(f"Partition: {len(fast)} fast test names, {len(SLOW_TESTS)} exact slow tests", flush=True)
+        timed_cargo(command, "execute", phases)
+    finally:
+        report = {"tier": tier, "packages": packages, "status": "failure" if sys.exc_info()[0] else "success", "phases": phases}
+        print("Rust test timing: " + json.dumps(report), flush=True)
+        if timings_file:
+            failed = sys.exc_info()[0] is not None
+            try:
+                timings_file.parent.mkdir(parents=True, exist_ok=True)
+                timings_file.write_text(json.dumps(report, indent=2) + "\n")
+                summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                if summary:
+                    with open(summary, "a") as destination:
+                        destination.write(f"\n### Rust {tier} timing\n\n| Phase | Seconds | Exit code |\n| --- | ---: | ---: |\n")
+                        for row in phases:
+                            destination.write(f"| {row['phase']} | {row['seconds']:.2f} | {row['exit_code']} |\n")
+            except OSError:
+                if not failed:
+                    raise
+                print("Could not write Rust timing report; preserving the test failure", file=sys.stderr)
 
 
 def run_check(packages, msrv=None):
@@ -440,6 +530,7 @@ def run_check(packages, msrv=None):
 
 def self_test():
     from unittest.mock import patch
+    focused_self_test()
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
@@ -452,6 +543,10 @@ def self_test():
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["apps/app/src/content.md"])["web"]
     assert web["local_process_modes"] == []
+    for path in ("scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"):
+        selected = make_plan([path])
+        assert "delivery" in selected["scopes"] and {"quick-check","delivery"}.issubset(selected["required_jobs"])
+        assert "delivery-charity" in selected["local_process_modes"]
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
     assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "mesh"]
@@ -479,7 +574,7 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py",
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py", "scripts/nightly_source.py",
                  "apps/desktop/build/installer.nsi", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
@@ -609,11 +704,30 @@ def self_test():
         expect_failure(lambda: gate(incomplete))
     expect_failure(lambda: gate(complete, delivery_live=True))
     complete["delivery-live"] = {"result": "success"}
-    gate(complete, delivery_live=True)
+    expect_failure(lambda: gate(complete, delivery_live=True))
+    native = make_plan([], "workflow_dispatch", delivery_live=True)
+    assert native["package_matrix"]["include"] == list(PLATFORMS[:1]) and native["package_mode"] == "node"
+    assert not native["npm"] and native["test_tiers"] == ready["test_tiers"] and native["check_msrv"]
+    assert native["required_jobs"] == [job for job in ready["required_jobs"] if job not in ("npm-package", "npm-smoke")]
+    native_needs = {job: {"result": "success" if job in native["required_jobs"] else "skipped"} for job in JOBS}
+    native_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(native)}}
+    native_needs["delivery-live"] = {"result": "success"}
+    gate(native_needs, delivery_live=True)
+    expect_failure(lambda: gate(native_needs))
+    expect_failure(lambda: gate(native_needs, delivery_live=True, desktop=True))
     for result in ("failure", "cancelled", "skipped", "missing"):
-        broken = json.loads(json.dumps(complete))
-        broken["delivery-live"] = {"result": result}
-        expect_failure(lambda: gate(broken, delivery_live=True))
+        for job in ("plan", "package", "crypto-web", "web", "delivery-live"):
+            broken = json.loads(json.dumps(native_needs))
+            if result == "missing":
+                del broken[job]
+            else:
+                broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, delivery_live=True))
+    for job in ("npm-package", "npm-smoke", *DESKTOP_JOBS):
+        for result in ("failure", "cancelled"):
+            broken = json.loads(json.dumps(native_needs))
+            broken[job] = {"result": result}
+            expect_failure(lambda: gate(broken, delivery_live=True))
     expect_failure(lambda: gate(needs, delivery_live=True))
     expect_failure(lambda: gate(complete, desktop=True))
     for job in DESKTOP_JOBS:
@@ -648,8 +762,9 @@ def self_test():
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS[:-1]]))
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS, SLOW_TESTS[0] + "_extra"]))
     expect_failure(lambda: package_args(["vibeface", "vibeface"]))
-    scratch = Path(__file__).resolve().parent.parent / ".artifacts/ci-self-test"
+    scratch = Path(os.environ.get("VIBEFACE_RELEASE_SCRATCH", Path(__file__).resolve().parent.parent / ".artifacts/ci-self-test"))
     scratch.mkdir(parents=True, exist_ok=True)
+    native_delivery_self_test(scratch)
     with tempfile.TemporaryDirectory(prefix="git-", dir=scratch) as directory:
         git("init", "--quiet", cwd=directory)
         source = Path(directory) / "apps/core/src/old.rs"
@@ -695,10 +810,10 @@ def self_test():
         coverage_self_test(directory, base, new_base)
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
-            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:
+            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release.validate_source") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
                 assert release_metadata("tag", f"v{version}")["prerelease"] == (channel != "stable")
-                ancestor.assert_called_once_with("merge-base", "--is-ancestor", "HEAD", "origin/main")
+                ancestor.assert_called_once_with("a" * 40, "product")
                 expect_failure(lambda: release_metadata("tag", "v0.0.0"))
         for version in ("01.2.3", "1.2.3-nightly.20260229.1", "1.2.3-nightly.20261019.0", "1.2.3+build"):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
@@ -741,6 +856,37 @@ def self_test():
     package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
     assert "    needs: [plan, crypto-web, web]\n" in package
     assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
+    live_input = workflow.split("      delivery_live:\n", 1)[1].split("      delivery_small:", 1)[0]
+    assert "type: boolean" in live_input and "default: false" in live_input
+    live = re.search(r"(?ms)^  delivery-live:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "github.event_name == 'workflow_dispatch' && inputs.delivery_live" in live
+    assert "needs: [plan, package, crypto-web, web]" in live
+    live_condition = re.search(r"^    if: (.+)$", live, re.M)[1]
+    assert "!cancelled()" in live_condition and "always()" not in live_condition
+    assert all(f"needs.{job}.result == 'success'" in live_condition for job in ("plan", "package", "crypto-web", "web"))
+    assert "needs.plan.outputs.delivery_live == 'true'" in live_condition
+    assert "!inputs.delivery_small" in live_condition and all(f"inputs.{name}" in live_condition for name in ("desktop_only", "windows_only", "mobile_apps"))
+    assert "delivery_live: ${{ steps.select.outputs.delivery_live }}" in workflow
+    gate_command = workflow.split("run: python3 scripts/ci.py gate --needs-env CI_NEEDS", 1)[1].split("\n", 1)[0]
+    assert "needs.plan.outputs.delivery_live == 'true' && '--delivery-live'" in gate_command
+    assert "inputs.desktop && needs.plan.outputs.delivery_live != 'true' && '--desktop'" in gate_command
+    small = re.search(r"(?ms)^  delivery-small-prepare:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert 'run: test "$DELIVERY_LIVE" = false' in small
+    assert re.search(r"^    if: (.+)$", small, re.M)[1] == "${{ !(github.event_name == 'workflow_dispatch' && inputs.native_prepare) && (github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}"
+    prepare_only = workflow.split("      delivery_small_prepare_only:\n", 1)[1].split("      delivery_small_resume_run:", 1)[0]
+    assert "type: boolean" in prepare_only and "default: false" in prepare_only
+    for job in ("delivery-small-proofs", "delivery-small-accept"):
+        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+        condition = re.search(r"^    if: (.+)$", block, re.M)[1]
+        assert "&& !inputs.delivery_small_prepare_only" in condition and "||" not in condition
+    assert "runs-on: ubuntu-24.04" in live and "timeout-minutes: 360" in live
+    assert 'test "$(uname -s)" = Linux' in live and 'test "$(uname -m)" = x86_64' in live
+    assert "run-delivery-live.py --protected-package" in live and '--source-commit "$SOURCE_COMMIT"' in live
+    assert all(retired not in live for retired in ("--package ", "--android ", "delivery-android", "ffmpeg", "/dev/kvm", "continue-on-error"))
+    assert "path: ${{ steps.protected.outputs.public-directory }}" in live and "if-no-files-found: error" in live
+    quick = re.search(r"(?ms)^  quick-check:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "python3 scripts/run-delivery-live.py --self-test" in quick
+    assert all(name in quick for name in ("scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"))
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
@@ -750,6 +896,154 @@ def self_test():
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
 
 
+def focused_self_test():
+    from unittest.mock import patch
+    root = Path(__file__).resolve().parent.parent
+    unit_jobs = ["quick-check", "crypto-web", "web-tests"]
+    for path in [*root.glob("apps/app/src/lib/*.test.ts"), *root.glob("apps/app/src/features/*/*.test.ts")]:
+        plan = make_plan([path.relative_to(root).as_posix()])
+        assert plan["required_jobs"] == unit_jobs and not plan["docs_only"]
+    for path in WEB_E2E_TESTS:
+        assert make_plan([path])["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
+    for path in ("tests/e2e/workspace.native.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.config.ts", "tests/e2e/paid-native-transfers.paid.ts", "apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
+        assert make_plan([path])["full"], path
+    assert make_plan(["apps/app/src/lib/markdown.test.ts", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
+    assert "web-tests" not in make_plan(["apps/app/src/lib/markdown.test.ts", "apps/app/src/lib/markdown.ts"])["required_jobs"]
+    plan = make_plan(["apps/app/src/lib/markdown.test.ts"])
+    needs = {job: {"result": "success" if job in unit_jobs else "skipped"} for job in JOBS}
+    needs["plan"] = {"result": "success"}
+    gate(needs, plan)
+    for result in ("skipped", "failure", "cancelled", "missing"):
+        broken = json.loads(json.dumps(needs))
+        if result == "missing":
+            del broken["web-tests"]
+        else:
+            broken["web-tests"]["result"] = result
+        expect_failure(lambda: gate(broken, plan))
+    expect_failure(lambda: gate(needs, dict(plan, crypto=False)))
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    block = re.search(r"(?ms)^  web-tests:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
+    assert "needs: [plan, crypto-web]" in block and "needs.plan.outputs.web_tests == 'true'" in block
+    for required in ("name: crypto-web-${{ github.sha }}", "check crypto", "'vibeface-mobile...'", "vibeface-web test", "@vibeface/client test"):
+        assert required in block, required
+    assert "web-tests" in workflow.split("\n  ci-gate:\n", 1)[1].split("runs-on:", 1)[0]
+    mobile = (root / ".github/workflows/mobile.yml").read_text().split("\n  ios:\n", 1)[1]
+    assert "key: native-targets-${{ hashFiles('scripts/release-rustflags.py') }}" in mobile
+    app_key = next(line for line in mobile.splitlines() if 'echo "key=ios-simulator-app-' in line)
+    assert "'scripts/release-rustflags.py'" in app_key
+    for mapping in (". -> target", ". -> .artifacts/native/target"):
+        assert mapping in mobile
+    package = re.search(r"(?ms)^  package:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
+    assert "key: package-with-probe-${{ matrix.target }}-${{ hashFiles('scripts/release-rustflags.py') }}" in package
+    assert "tests/fixtures/delivery-probe -> ../../../.artifacts/delivery-probe/target" in package
+    fixture = root / "tests/fixtures/delivery-probe"
+    assert (fixture / "../../../.artifacts/delivery-probe/target").resolve() == root / ".artifacts/delivery-probe/target"
+    listing = "other::test: test\n" + "\n".join(name + ": test" for name in SLOW_TESTS)
+    def cargo(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, listing if "--list" in command else "")
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+        output = Path(directory) / "timing.json"
+        with patch("subprocess.run", side_effect=cargo) as calls:
+            run_test(["vibeface-core"], "fast", output)
+        report = json.loads(output.read_text())
+        assert [row["phase"] for row in report["phases"]] == ["compile", "enumerate", "execute"]
+        assert report["status"] == "success" and all(row["exit_code"] == 0 and row["seconds"] >= 0 for row in report["phases"])
+        assert calls.call_args_list[0].args[0] == ["cargo", "test", "--locked", "--no-run", "-p", "vibeface-core"]
+        assert "--skip" in calls.call_args_list[-1].args[0] and "--no-fail-fast" in calls.call_args_list[-1].args[0]
+        with patch("subprocess.run", side_effect=cargo) as calls:
+            run_test(["vibeface-core"], "slow", output)
+        assert calls.call_args.args[0] == ["cargo", "test", "--locked", "-p", "vibeface-core", "--lib", "--", "--exact", "--include-ignored", "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello"]
+        def failure(command, **kwargs):
+            if "--no-fail-fast" in command:
+                raise subprocess.CalledProcessError(7, command)
+            return cargo(command, **kwargs)
+        with patch("subprocess.run", side_effect=failure):
+            try:
+                run_test(["vibeface-core"], "fast", output)
+            except subprocess.CalledProcessError as error:
+                assert error.returncode == 7
+            else:
+                raise AssertionError("test failure was hidden by timing collection")
+        failed = json.loads(output.read_text())
+        assert failed["status"] == "failure" and failed["phases"][-1]["exit_code"] == 7
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(8, ["cargo"])) as calls:
+            try:
+                run_test(["vibeface-core"], "fast", output)
+            except subprocess.CalledProcessError as error:
+                assert error.returncode == 8
+            else:
+                raise AssertionError("compile failure was hidden by timing collection")
+        failed = json.loads(output.read_text())
+        assert calls.call_count == 1 and failed["status"] == "failure" and [row["phase"] for row in failed["phases"]] == ["compile"]
+    print("Unit-only coverage, cache wiring and Rust timing failure checks passed")
+
+
+def native_delivery_self_test(scratch):
+    from unittest.mock import patch
+    for event in ("pull_request", "push", "schedule", "merge_group"):
+        assert not delivery_live_selected(event, {"inputs": {"delivery_live": True}})
+        expect_failure(lambda: make_plan([], event, delivery_live=True))
+    for name in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "desktop"):
+        for invalid in (0, 1, None, "", "True", "yes", [], {}):
+            expect_failure(lambda: delivery_live_selected("workflow_dispatch", {"inputs": {name: invalid}}))
+    for invalid in (None, [], {"inputs": []}, {"inputs": {"mobile_apps": "unknown"}}):
+        expect_failure(lambda: delivery_live_selected("workflow_dispatch", invalid))
+    for invalid in (0, 1, "true"):
+        expect_failure(lambda: make_plan([], "workflow_dispatch", delivery_live=invalid))
+    with tempfile.TemporaryDirectory(prefix="native-event-", dir=scratch) as directory:
+        directory = Path(directory)
+        event_file = directory / "event.json"
+        head = "1" * 40
+        environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF_TYPE": "branch",
+                       "GITHUB_EVENT_PATH": str(event_file), "GITHUB_SHA": head}
+        arguments = argparse.Namespace(event=None, base=None, head=None)
+        metadata = {"channel": "nightly", "version": "1.2.3-nightly.20261109.1", "msrv": "1.91", "prerelease": True}
+        def needs_for(selected):
+            needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
+            needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(selected)}}
+            if selected["delivery_live"]:
+                needs["delivery-live"] = {"result": "success"}
+            return needs
+        with patch.dict(os.environ, environment), patch(f"{__name__}.git", return_value=(head + "\n").encode()), \
+             patch(f"{__name__}.release_metadata", return_value=metadata):
+            for value in (False, "false", True, "true"):
+                event_file.write_text(json.dumps({"inputs": {"delivery_live": value}}))
+                selected = event_plan(arguments)
+                live = value is True or value == "true"
+                assert selected["delivery_live"] is live
+                gate(needs_for(selected), delivery_live=live)
+                expect_failure(lambda: gate(needs_for(selected), delivery_live=not live))
+                opposite = dict(make_plan([], "workflow_dispatch", delivery_live=not live), **metadata)
+                opposite.update({key: selected[key] for key in ("coverage_base", "coverage_head", "coverage_reason", "baseline_run_id")})
+                expect_failure(lambda: gate(needs_for(opposite), delivery_live=not live))
+                for key in ("delivery_live", "package_matrix", "npm", "required_jobs"):
+                    changed = dict(selected, **{key: opposite[key]})
+                    expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
+                changed = dict(selected, delivery_live=int(live))
+                expect_failure(lambda: gate(needs_for(changed), delivery_live=live))
+                if value is True:
+                    output, summary = directory / "output", directory / "summary"
+                    with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                        write_plan(selected, output)
+                    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    assert outputs["delivery_live"] == "true" and json.loads(outputs["plan"]) == selected
+                    assert "native-only; non-Linux, npm and hosted desktop acceptance checks are not selected" in summary.read_text()
+                    assert "delivery_live takes precedence over additive desktop" in summary.read_text()
+            for extra, expected in (({"desktop": True}, True), ({"delivery_small": True}, False),
+                                    ({"windows_only": True}, False), ({"desktop_only": True}, False),
+                                    *[({"mobile_apps": mobile}, False) for mobile in ("ios", "android", "both")]):
+                event_file.write_text(json.dumps({"inputs": {"delivery_live": "true", **extra}}))
+                selected = event_plan(arguments)
+                assert selected["delivery_live"] is expected
+                if expected:
+                    gate(needs_for(selected), delivery_live=True)
+                else:
+                    expect_failure(lambda: gate(needs_for(selected), delivery_live=True))
+            event_file.write_text(json.dumps({"inputs": {"delivery_live": "yes"}}))
+            expect_failure(lambda: event_plan(arguments))
+    print("Native-only CI controls passed; actual event, plan and gate agree; ordinary platforms, selector precedence and rejection cases covered")
+
+
 def coverage_self_test(directory, base, nonancestor):
     import io
     from unittest.mock import patch
@@ -757,8 +1051,8 @@ def coverage_self_test(directory, base, nonancestor):
     event_file = Path(directory) / "event.json"
     event_file.unlink(missing_ok=True)
 
-    def commit(message):
-        git("add", "-A", cwd=directory)
+    def commit(message, paths=(".",)):
+        git("add", "-A", "--", *paths, cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", message, cwd=directory)
         return git("rev-parse", "HEAD", cwd=directory).decode().strip()
 
@@ -813,6 +1107,22 @@ def coverage_self_test(directory, base, nonancestor):
                     assert selected["full"] and selected["coverage_reason"] == "full-event"
             explicit = event_plan(argparse.Namespace(event="push", base=rust_head, head=head))
             assert explicit["scopes"] == ["docs"] and explicit["coverage_reason"] == "event-range"
+        unit = Path(directory) / "apps/app/src/lib/example.test.ts"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("test-only change\n")
+        unit_head = commit("test-only change after unverified Rust", ("apps/app/src/lib/example.test.ts",))
+        event_file.write_text(json.dumps({"before": head, "after": unit_head}))
+        with patch.dict(os.environ, {"GITHUB_SHA": unit_head}):
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [successful]}).encode())):
+                accumulated = event_plan(args)
+                assert accumulated["rust_packages"] == ["vibeface-core"] and "package" in accumulated["required_jobs"]
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [dict(successful, head_sha=head)]}).encode())):
+                only_tests = event_plan(args)
+                assert only_tests["required_jobs"] == ["quick-check", "crypto-web", "web-tests"]
+                unit_needs = {job: {"result": "success" if job in only_tests["required_jobs"] else "skipped"} for job in JOBS}
+                unit_needs["plan"] = {"result": "success"}
+                gate(unit_needs, only_tests)
+                expect_failure(lambda: gate(unit_needs, dict(only_tests, web_tests=False)))
     print("Cumulative push coverage, API fallback and frozen gate self-tests passed")
 
 
@@ -1000,6 +1310,7 @@ def main():
         selection.add_argument("--plan-env")
         if name == "test":
             command.add_argument("--tier", choices=("fast", "slow"), required=True)
+            command.add_argument("--timings-file", type=Path, help="write compile, enumeration and execution durations")
         else:
             command.add_argument("--msrv", help="also check the declared minimum Rust version")
     args = parser.parse_args()
@@ -1016,7 +1327,7 @@ def main():
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":
-            run_test(packages, args.tier)
+            run_test(packages, args.tier, args.timings_file)
         else:
             plan = json.loads(os.environ[args.plan_env]) if args.plan_env else None
             if plan and plan["check_msrv"] and not args.msrv:

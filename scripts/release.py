@@ -19,6 +19,8 @@ import plistlib
 import zipfile
 
 sys.dont_write_bytecode = True
+if __name__ == '__main__':
+    sys.modules.setdefault('release', sys.modules[__name__])
 
 ROOT = Path(__file__).resolve().parent.parent
 APPS = ('www', 'app', 'core', 'cli', 'mobile', 'desktop')
@@ -125,6 +127,52 @@ def identity(release_app, root=None):
         value = read_version('www', root)
     return {'app': release_app, 'version': value, 'tag': release_tag_for(release_app, value),
             'source_commit': run('git', 'rev-parse', 'HEAD', cwd=root), 'channel': version(value)}
+
+
+def validate_source(source, release_app, root=None):
+    """Return the main CI source after proving the entire detached Nightly tree."""
+    import nightly_source
+    global ROOT
+    previous = ROOT
+    ROOT = root or ROOT
+    try:
+        return nightly_source.source_context(source, release_app)
+    finally:
+        ROOT = previous
+
+
+def require_ci(context):
+    """Main tags require push success; detached Nightlies require their original schedule gate."""
+    source, run_id = context['ci_source_commit'], context['ci_run_id']
+    def api(path):
+        return json.loads(run('gh', 'api', f'repos/{GITHUB_REPO}/' + path))
+    if run_id:
+        candidates = [api(f'actions/runs/{run_id}')]
+    else:
+        batches = json.loads(run('gh', 'api', '--paginate', '--slurp',
+            f'repos/{GITHUB_REPO}/actions/workflows/ci.yml/runs?head_sha={source}&branch=main&event=push&per_page=100'))
+        candidates = [item for page in batches for item in page['workflow_runs']]
+    for candidate in candidates:
+        if not (candidate['head_sha'] == source and candidate['head_branch'] == 'main'
+                and candidate['path'] == '.github/workflows/ci.yml'
+                and candidate['repository']['full_name'] == GITHUB_REPO
+                and candidate['head_repository']['full_name'] == GITHUB_REPO):
+            continue
+        if not run_id:
+            if candidate['event'] == 'push' and candidate['status'] == 'completed' and candidate['conclusion'] == 'success':
+                return candidate
+            continue
+        require(str(candidate['id']) == run_id and candidate['event'] == 'schedule', 'untrusted original Nightly CI run')
+        created = datetime.datetime.fromisoformat(candidate['created_at'].replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
+        batch = created.replace(hour=created.hour // 4 * 4).strftime('%Y%m%d%H')
+        require(batch == context['nightly_batch'], 'Nightly CI run does not match its original batch')
+        pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
+                              f'repos/{GITHUB_REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100'))
+        gates = [job for page in pages for job in page['jobs'] if job['name'] == 'ci-gate']
+        require(len(gates) == 1 and gates[0]['status'] == 'completed' and gates[0]['conclusion'] == 'success',
+                'original Nightly schedule ci-gate did not succeed')
+        return candidate
+    raise ValueError('release requires the exact trusted main push CI or original Nightly schedule ci-gate')
 
 
 def expected_release_kind_for_component(app):
@@ -667,7 +715,7 @@ def require_product_publishing():
     tag = expected['tag']
     require(run('git', 'rev-parse', tag + '^{commit}') == expected['source_commit'],
             'publishing requires the existing release tag at this source commit')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', expected['source_commit'], 'origin/main'], check=True)
+    validate_source(expected['source_commit'], 'product')
     return expected
 
 
@@ -1080,7 +1128,7 @@ def publish(release_app, directory, repo=GITHUB_REPO):
     info = verify_release(release_app, directory, expected)
     tag = info['tag']
     require(run('git', 'rev-parse', tag + '^{commit}') == info['source_commit'], 'release tag source mismatch')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', info['source_commit'], 'origin/main'], check=True)
+    validate_source(info['source_commit'], release_app)
     if release_app == 'product':
         return finalize_progressive_product(directory, expected, info, repo)
     view = subprocess.run(['gh', 'release', 'view', tag, f'--repo={repo}', '--json', 'isDraft,assets'],
@@ -1177,7 +1225,7 @@ def plan(release_app, tag=None, require_main=False, publishing=False, github_out
                 'tag does not match the declared version')
     if require_main or publishing:
         require(not run('git', 'status', '--porcelain'), 'release source must be clean')
-        subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
+        data.update(validate_source(data['source_commit'], release_app))
     if publishing:
         require(run('git', 'rev-parse', data['tag'] + '^{commit}') == data['source_commit'],
                 'publishing requires the existing release tag at this source commit')
@@ -1279,7 +1327,7 @@ def self_test():
             return json.dumps(dict(sha=public_view['source']))
         return real_run(*args, **kwargs)
 
-    scratch = ROOT / '.artifacts/release-tests'
+    scratch = Path(os.environ.get('VIBEFACE_RELEASE_SCRATCH', ROOT / '.artifacts/release-tests'))
     scratch.mkdir(parents=True, exist_ok=True)
     # The per-platform user service installers are repository files; the real compose job proves they
     # exist, so the self-test composes against fixtures instead of the checkout's scripts directory.

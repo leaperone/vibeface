@@ -96,7 +96,7 @@ acme.sh --issue --server letsencrypt -d <IP> --certificate-profile shortlived -w
 
 `tls-cert.pem` 是完整证书链，属 root、权限 0644；`tls-key.pem` 属 root:1001、权限 0640，容器用户只能读。`tls_dir` 属 root:1001、权限 0750。激活脚本在宿主上核对这些属主和权限，容器里的 guard 再核对两个文件来自只读挂载、属主是 root、组和其他用户不可写。两个文件按单文件 bind mount 挂进容器，挂载跟随 inode：续期必须原地改写文件内容。acme.sh 的 `--install-cert` 用 `cat >` 原地写，inode 不变，符合要求；不要用先写临时文件再 `mv` 替换的方式，否则容器继续看到旧文件，直到重新激活。Core 每次接受连接时检查这两个文件，内容变化后重新加载，不需要重启容器，也不需要 reloadcmd；证书与私钥暂时不配对（例如只写完一个）时继续用旧证书，5 秒后再试。
 
-**必做：阿里云安全组。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改安全组，首次激活前在控制台配好并核对。
+**必做：提供商安全组和宿主防火墙。** TCP 4792（浏览器接入，只讲 TLS）、UDP 4792（iroh 与全网）和 TCP 3340（relay）对公网开放；TCP 80 供 acme.sh 签证书。脚本不改提供商安全组或宿主防火墙，首次激活前按实际配置放行并核对。
 
 Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一致。`tls_dir` 按上文准备好，不在数据目录或 `deploy_dir` 里面。脚本使用只读挂载校验身份、配置、epoch、TLS 文件和制品信息。之后分两种情况：
 
@@ -107,7 +107,7 @@ Core 数据目录必须已经初始化，权限为 0700，UID/GID 与配置一�
 
 激活日志和 Compose 文件留在私有 `deploy_dir`。旧 Nginx 文件和离线备份只供激活中回滚；确认新容器后删除，同时删除其他旧 release 目录和上一版镜像，主机只保留当前版本。需要留档时在激活前把数据拷到本地。镜像健康需同时满足容器 running/healthy 与 Core inspect 的 running、版本和 device ID。失败时先停新容器，再恢复旧容器，并恢复 Nginx；全新安装没有旧服务，只停新容器；不会自动覆盖现有数据。中断后的非终态日志会先回滚并退出，检查旧服务后可重跑原命令。新容器无法确认停止时拒绝启动旧进程。确认后的同一请求会再次核对实际容器健康。
 
-`deploy-services` 部署 node 时，无论是否 `apply`，先在 runner 上按上文初始化一个 fixture 数据目录，用只改了 `public-bootstrap.json` 的同一镜像依次演练全新安装、交接和重复激活；演练失败则不触碰主机。
+`deploy-services` 部署 node 时，无论是否 `apply`，先选择候选发布时间之前最近的完整产品 Release，复用制品与摘要校验后构建旧 Core 镜像。旧 Core 初始化并启动 fixture，再在它运行时原子写入候选 Core 生成的完整配置，随后激活候选镜像并重复激活，核对原身份、bootstrap 文件、epoch 和数据库中的初始化记录保留。两个镜像只替换 fixture 的 `public-bootstrap.json`；数据格式和配置均按各自发布版实际生成，不做兼容迁移。fixture 只用回环地址、独立 mesh 和生成的数据。缺少历史完整产品 Release 时输出 `first_release`，验证首次安装和重复激活；其他查询、校验或升级错误一律停止。演练失败则不触碰主机。
 
 本地验证入口均不访问生产服务。
 
@@ -117,4 +117,4 @@ python3 deploy/static-config.py --self-test
 python3 scripts/deploy-activate.py --self-test
 ```
 
-镜像跨 Docker 存储后端传输时，接收端的不可变 ID 可能与构建端不同。导入流程应先校验传输归档的 SHA-256，再使用 Docker 返回的实际导入 ID 执行激活检查。
+导入流程先校验传输归档的 SHA-256，再核对 Docker 返回的唯一不可变 ID 与调用方指定的 `--image` 严格一致。ID 不一致时在停止服务或修改部署数据前拒绝激活，不改用导入结果。

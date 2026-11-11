@@ -83,84 +83,92 @@ python3 scripts/verify-node.py --delivery-charity \
 
 构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌全网记录代码（`apps/core/src/net/mesh/record.rs`）的 SHA-256，拒绝使用其他源码的旧 probe。
 
-## 验证付费交付和实际结算
+## 验证受保护付费交付
 
-完整付费模式必须在 Linux cgroup v2 环境中运行，使用固定产品 profile、真实 prover 和本机 31337 测试链。先安装合约依赖。
+当前 Node 只提供 Recoverable 预算付款。旧 `verify-node.py --delivery`、Strict/十三证明 `run-delivery-live.py` 和旧 JSONL mutation 控制器已明确拒绝原启动方式；不能用其旧命令或旧截图当作当前产品验收。默认公益进程验收沿用上节，不产生链或钱包副作用。
+
+受保护真实场景使用正常当前时钟、固定产品 profile、Linux cgroup v2 和真正的 S/P/R 进程。R 先注册新的 genuine KeyBinding；S 开一个精确预付预算，分别 prepare 两笔新的 paid/recoverable 单窗口订单，再经管理成员 `confirm_batch` 明确授权同批。后台按原证明锁产生两个 genuine Source，一笔 reserveBatch 分配到不同订单 slot。R 经 `accept_batch` 明确同批接收并串行产生两个 genuine Hold；P 的正式预算状态 `ready_windows` 同时出现两窗后，操作者在既有实验室页或 `wallet budget flush` 明确同批核验/揭钥。正常恢复不再自动要求 Open。
+
+最小样本为每单 delivery=5、reservation=bonus=0、预算10：一份 KeyBinding 加两份 Source、两份 Hold，共五份不同真实证明。必须核对真实 reserve/hold/reveal 三种方法各自含2slot、逐单 earned5、预算 withdrawn10，以及固定 P 钱包实际净增10。S 在传输必要对象后停止，不提供任何事后签名；R 读取并校验原文件、名称、字节和 SHA-256。样本不能把旧17证明改成5，也不能把一份证明充作第二个订单。
+
+公开 schema2 bundle 只包含已披露 capsule、公开证明、交易哈希和固定条款。官方 host 对每份 binary receipt 独立验真并拒绝错 journal；`observe-settlement.mjs` 只读同一原链的真实 runtime、canonical 条款/预算/窗口、逐窗 Source/Hold、批次 calldata、事件、余额与 gas。固定源码、CLI/Core 制品摘要、真实进程重启、钱包 lock/off 门禁、披露恢复故障和实际渲染分别留证，任何一层未执行均标未验证。
+
+本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。界面验收按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
+
+宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
 ```sh
-node contracts/delivery/install.mjs
+python3 scripts/run-delivery-live.py --protected-selfcheck
+
+python3 scripts/run-delivery-live.py \
+  --protected-package "$PWD/.artifacts/exact-head-linux-package" \
+  --source-commit "$(git rev-parse HEAD)"
 ```
 
-在同一任务目录创建权限为 `0600` 的配置文件，使用以下字段。`deployment_file` 指向当前 worktree 的 `.artifacts/` 下尚不存在的新文件。runner 自行启动并清理该次独立部署，拒绝复用旧输出或旧链。`prover` 必须含绝对路径 `program`、`r0vm`、`cgroup` 和与 `crates/delivery/proof/profile.json` 完全相同的 `profile`。金额均为十进制字符串，gas 上限以 wei 表示。
+该入口复用 `check-delivery.py` 的 canonical sandbox 构建配方，固定 Linux amd64、11GiB、zero swap、64 PIDs 和两个 Tokio workers。源码与任务缓存仍在本 worktree 的 `.artifacts/`；linked worktree 的 common Git metadata 和 `.git` 只读挂载，显式设置 `GIT_DIR`、`GIT_WORK_TREE` 和 `GIT_OPTIONAL_LOCKS=0`，始终核对 clean exact HEAD。容器以宿主 UID/GID 运行，配置在容器内以 `0600` 创建；不会改变既有缓存权限或复制工具链。
+
+canonical 入口监督 native 与 tracked restart observer 两个同级子进程，observer 不属于 native 的后代清理树。native 只先创建 fresh native/public，再在原 start 的任何进程前等待匿名 ready FD；observer 安装同一 inotify FD 的 host inode/目录 watch，并实际完成 official info exit0、ELF 匹配及同 inode open 正控后才放行。原120秒准备门不进入 KeyBinding 或订单期限。observer 失败会阻止或中断本任务 native，原 native 中断状态如实保留。
+
+独立 E1 窗口始终是原 `settlement-observation.json` 到 cleanup 后 `native-result.json`。要求同 inode host opens=0、无 inotify 队列/身份缺口、累计 RPC ready→stopped、前后 raw 广播数均至少7且所有写方法增量0，以及窗口内至少两份已完成的锚定账户样本相等、nonce 已结清。只容忍精确 stats 文件的预窗口 ENOENT 且不推进 baseline，终态缺失或坏数据仍失败。native 被 reap 后关闭 done FD，observer 先排空原事件队列，再对缺窗作 INCONCLUSIVE 判定。PID1 等 observer 保存并真实退出后才结束，不延长业务窗口或 key gate 凑样本。
+
+本机入口按原生驱动既有阶段和业务期限等待，不再套用旧 Strict/UI 的 20700 秒整轮截止。KeyBinding 观察上限仍为 7400 秒，Source、Hold 各为 16000 秒；每次证明的 7200 秒硬界、原 UUID、报价/持有/密钥截止、费用与 W/I/F/S 均不变。每份完成的证明仍立即独立验真并保存。同一个运行容器可以跨宿主工具轮次继续等待；停止容器后不支持恢复原链/订单，不能把已保存分项称为已支持跨容器续跑。
+
+`prepare`、`confirm_batch`、`accept_batch` 只有在结构化响应明确返回提交前的固定错误 `another delivery operation is in progress` 时，才沿既有 120 秒阶段上限等待重试，原 UUID 和参数不变。超时、网络异常、未知结果及其他拒绝直接失败，不自动重发。
+
+GitHub Actions `delivery-live` 使用 `ubuntu-24.04` 原生 x86 runner，核对宿主 Linux/x86_64，消费同 run 同 SHA 的 Linux/crypto/web 制品。job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表具体 prove 耗尽或完整实验通过。不能凭容器目标架构证明没有 emulation，也不能把已停止 CI 的链称为可恢复。健康的同一运行只能在原容器、原链与原业务期限内继续等待；停止后若重新验收，必须创建完整新链、钱包、预算、订单和五份新 proof，保留旧 FAIL，不通过新 UUID 或期限掩盖原失败。
+
+容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置，再由 native 子进程经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper。Web 资源进程检查不代表渲染验收。
+
+输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指安全目录，实际路径为本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+
+observer 只导出固定字段投影 `restart-observer-summary.json`，包含受控状态、计数、条件布尔、相对 run/配置内容绑定与 script/prover/native-result 摘要，以及 supervisor 实际 wait 得到的两个退出码。原 native 全通过、observer 完整窗口全通过、两者真实 exit0 才能整体 PASS。result 自称 PASS、observer 尚未退出、缺窗或 INCONCLUSIVE 均不够。账户原始快照、RPC payload、私有 observer result/诊断不能导出。原生 get 的 proof deadline 诊断保持中性，同一句 Core 错误也可能来自 info30秒或 verify120秒；`node_proof_timeout_seconds=7200` 是 prove 配置，不单独证明具体耗时。
+
+未登记、临时、私密或损坏材料不导出，也不妨碍其他已验真分项导出；整体仍为 FAIL，并写出安全摘要和 `public-directory`。任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能上传整个 run 或 `native/public/`。
+
+已准备好受限 sandbox 和全部精确制品时，也可以使用不构建、不下载或启动 Docker 的低层 `--protected-config`。配置 schema 为 `scripts/verify-delivery-protected.py` 的 `validate_config`；在本任务 `.artifacts/` 写入 `0600` 配置，所有摘要必须填实际值，不能沿用其他源码或旧 receipt：
 
 ```json
 {
   "schema_version": 1,
-  "deployment_file": "/absolute/task/.artifacts/delivery/deployment.json",
-  "prover": {
-    "program": "/absolute/path/to/vibeface-delivery-prover",
-    "r0vm": "/absolute/path/to/r0vm",
-    "cgroup": "/sys/fs/cgroup/task-proof",
-    "profile": {}
+  "source_commit": "<final 40-character commit>",
+  "paths": {
+    "repository": "/absolute/current/task/worktree",
+    "binary": "/absolute/artifacts/vibeface",
+    "core_binary": "/absolute/artifacts/vibeface-core",
+    "crypto_module": "/absolute/artifacts/vibeface_secure.js",
+    "prover": "/absolute/artifacts/vibeface-delivery-prover",
+    "r0vm": "/absolute/artifacts/r0vm"
   },
-  "max_service_amount": "1000000",
-  "source_gas_cap_wei": "1000000000000000000",
-  "provider_gas_cap_wei": "1000000000000000000",
-  "register_key_gas_cap_wei": "1000000000000000000",
-  "settlement_observer": "/absolute/repo/contracts/delivery/observe-settlement.mjs"
+  "sha256": {
+    "binary": "<actual sha256>", "core_binary": "<actual sha256>",
+    "crypto_module": "<actual sha256>", "crypto_wasm": "<actual sha256>",
+    "prover": "<actual sha256>", "r0vm": "<actual sha256>", "profile": "<actual sha256>"
+  },
+  "elf_sha256": "<actual guest ELF sha256>",
+  "caps": {
+    "deposit": "10", "max_service_amount": "5",
+    "source_gas_cap_wei": "100000000000000000",
+    "provider_gas_cap_wei": "100000000000000000",
+    "register_key_gas_cap_wei": "100000000000000000",
+    "native_funding_wei_each": "10000000000000000000"
+  },
+  "publication_policy": {
+    "watchdog_seconds": 60, "inclusion_seconds": 60,
+    "finality_seconds": 10, "clock_skew_seconds": 5,
+    "max_fee_per_gas": "3000000000", "priority_fee_per_gas": "1000000000"
+  }
 }
 ```
 
-用实际产品 profile 替换示例中的空对象，再执行以下命令。
-
 ```sh
-python3 scripts/verify-node.py --delivery \
-  --binary /absolute/path/to/vibeface \
-  --core-binary /absolute/path/to/vibeface-core \
-  --artifacts .artifacts/delivery \
-  --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe \
-  --delivery-config .artifacts/delivery/acceptance.json
+python3 scripts/run-delivery-live.py \
+  --protected-config "$PWD/.artifacts/protected/config.json" \
+  --protected-run-dir "$PWD/.artifacts/protected/run"
 ```
 
-该模式先验证公益路径，再创建独立测试钱包，通过受保护 FD 解锁。它只使用本机部署的公开测试资助账户，生成一份 key-binding 证明及两个窗口各自的 source、hold、open 证明，核对完整原文件和实际提现。独立观察器只读原链，复核七份证明、真实交易、余额和 gas。导出的 `settlement/` 只含公开证明、capsule 与交易哈希，不含 witness、私钥、密码或 raw transaction。
+每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。低层驱动在其 run 的 `public/` 保留逐份验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`，但它本身不核验 bare binary 构建来源，也不启动独立 observer 或认证 E1；完整验收使用 canonical `--protected-package`。`--protected-selfcheck` 检查真实 predicate、合成 observer 事件、FD 监督和安全投影，不产生实际 proof 或完整 E1 窗口证据。
 
-缺少配置、真实证明、部署或结算证据时，命令失败并报告 `UNVERIFIED` 或具体错误。公益模式通过不能代替付费验收。测试链的两次确认也不代表绝对最终性。
-
-## 验证完整付费分支与双端恢复
-
-`scripts/run-delivery-live.py` 监督同一临时链、sandbox 和宿主 UI。向 `verify-node.py --delivery` 追加 `--delivery-ui-control` 的专用路径后，runner 在原严格订单之后运行有限分支、真实密钥生命周期和普通单窗口订单。核心严格订单仍是 130816 字节、两窗和七份证明。
-
-扩展验收在实际付款前捕获 C0，并在两个 source 证明完成、原 Source 的 approve `eth_estimateGas` 返回前捕获 C0Prime。该请求保持阻断，停稳节点并备份完整私有目录后，以失败结束旧请求。后续操作复用原意图和已完成的证明。C1 对应真实 fund 已确认、接收方尚未接受的状态。链快照和完整 Node 数据快照必须配对恢复，不修改单表或删除签名交易。
-
-有限分支验证入金代币行为、退款、部分交付、截止、重组和固定收款地址。keeper 操作与真实 Source 自主退款分别记录。Source 自主退款恢复匹配的完整 C1 数据，只解锁 Source，完成后保存分支目录和实际交易，再停稳恢复。Node 专用 loopback RPC 转发器只计广播次数，不保存请求体或 raw。锁定观察期间广播必须为零。
-
-真实 Rotate、Revoke、Register 各新增一份 key-binding 证明。Rotate 在一个旧窗口已 Held、另一个尚未 Held 的分支执行。原签名交易恢复后保留同一 Rotate 和旧密钥，最后的新 Active key 接收普通订单。普通订单是 4096 字节的 `ordinary-paid-ui.bin`，新增 source、hold、open 各一份。全任务共十三份不同证明，普通公开 bundle 有四项，其中 key-binding 与最终 Register 共用。
-
-宿主通过 `tests/e2e/e2e.paid.config.ts` 运行两个平台过滤的测试，使用 `workers: 2` 和 `retries: 0`。测试扩展名是 `.paid.ts`，默认 e2e 测试不会发现这些需要控制器的用例。两个测试都通过真实邀请、安全码和管理权限入网。Web 选择实际文件、查看费用并确认原订单。Android release app 接受订单，实际后台、移除本任务的接收端口 reverse，并终止原 app 连接。只有前台实际出现离线状态才记录断线。后台 Node 完成结算后，恢复同一 reverse，手机回到原订单并保存文件。root AVD 仅读取该 app 的 transfers 文件核对大小与 SHA。
-
-宿主必须提供以下环境变量。APK、serial 和 controller 都由本轮 CI 明确指定。
-
-```sh
-VIBEFACE_DELIVERY_UI_CONTROL=/absolute/task/tests/e2e/.artifacts/vdp/live-ui/control.json
-VIBEFACE_DELIVERY_UI_TIMEOUT_MS=3600000
-VIBEFACE_E2E_ANDROID_APK=/absolute/task/.artifacts/native/app-release.apk
-VIBEFACE_E2E_ANDROID_SERIAL=emulator-5554
-```
-
-容器保持原 root 证明环境，通过 `VIBEFACE_DELIVERY_UI_UID` 和 `VIBEFACE_DELIVERY_UI_GID` 把专用控制目录、原文件和 `0600` 控制描述交给宿主用户。邀请码只经过认证 API，不落公开文件。Node 目录、钱包、密钥和 witness 不改变所有者或权限。
-
-严格和普通 observer 的当次公开 JSON 分别保存在各自 bundle 目录的 `settlement-observation.json`，不读取一个可被覆盖的 latest 报告。有限分支只接受 helper ready 事件给出的本次 `publicIndex`。密钥生命周期公开文件位于 `key-lifecycle/`，完整私有数据快照与分支 raw 永不上传。
-
-普通双端操作保留三个配对后的视频片段，内置整段录像保持关闭。CI 以 `--headed --video off` 在任务独立 Xvfb 的 1440×1000 显示中运行。Web 在费用报价可见后启动 ffmpeg，确认付款并刷新原意图后用 `q` 结束。Android 通过现有 adb screenrecord 分别录制接受至实际离线、恢复连接至实际保存，只向本次录像的匹配 PID 发 SIGINT。两端都检查录像实际开始、一直存活至片段结束，并用 ffprobe 核对真实 MP4 视频流与时长。提前自行结束，即使退出码为零，也失败。
-
-公开目录只增加 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4`，以及各自独立写入的 `web-video.json` 和 `android-video.json`。收据包含原订单与意图、实际退出码和 signal、视频 SHA 与大小。宿主独立复核后合并视频清单。邀请码、钱包密码、恢复文件、完整 attempt 视频和 trace 均不上传。
-
-只检查控制器和阻断规则时运行以下纯自检。它不启动 Node、UI、链或证明，不能替代实际验收。
-
-```sh
-python3 scripts/verify-node.py --delivery-ui-selfcheck \
-  --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
-```
+该运行只证明新的 4096 字节双单场景。它核对 S 离线后 nonce 不增、P 自动累计提款、R 实际读取，以及 S/R/P 真正重启、locked/off 后拒写与历史读取；不覆盖 UI 渲染、旧 fee5 同字节或最大容量、强制 reorg、nonce-consuming revert、临近截止和异常代币矩阵。这些仍需独立证据。
 
 ## 使用 Device Hub 验收本机 Apple 设备
 

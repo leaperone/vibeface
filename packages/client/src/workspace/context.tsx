@@ -30,7 +30,7 @@ import type {
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
   InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
-import { isMainNotification, isSessionNotification } from "./types.ts"
+import { isMainNotification, isReplyEnded, isSessionNotification, isTerminalJobState } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
@@ -322,7 +322,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       await outboxChanged()
     }
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
-    const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && ["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
+    const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && isReplyEnded(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
     const kept = readStorage<InterruptedReply[]>(scoped("interrupted"), []).filter((item) => item.conversation_id !== id || next.scheduler?.jobs.some((job) => job.trigger === item.trigger && ended(job)))
     for (const progress of liveRef.current) {
       if (progress.kind !== "manager" || !progress.text || progress.conversation_id !== id || kept.some((item) => item.trigger === progress.trigger)) continue
@@ -334,7 +334,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "native") return next.works.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.state !== "finished")
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
-      return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state))
+      return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !isReplyEnded(job.state))
     }))
     if (joined && current() && sameRead() && viewRef.current === "chat" && platform.foreground()) {
       const seen = notificationsRef.current.filter((item) => notificationForMain(item, id) && !isSessionNotification(item))
@@ -1095,7 +1095,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     if (target.kind === 'channel_member') throw new Error('先选择频道中的具体任务，再请求停止。')
     const context = parseConversation(await connection.rpc('conversation', { conversation_id: id }), id)
-    const triggers = target.kind === 'routine' ? [target.trigger] : context.scheduler?.jobs.filter((job) => !['completed', 'failed', 'cancelled', 'interrupted', 'rejected', 'steered'].includes(job.state) && job.scope.kind === 'main').map((job) => job.trigger) ?? []
+    const triggers = target.kind === 'routine' ? [target.trigger] : context.scheduler?.jobs.filter((job) => !isTerminalJobState(job.state) && job.scope.kind === 'main').map((job) => job.trigger) ?? []
     if (!triggers.length) throw new Error('这个目标当前没有可停止的回复。')
     const receipts = await Promise.all(triggers.map((trigger) => connection.rpc('cancel_manager', { conversation_id: id, trigger }).then(record)))
     requireCurrent()

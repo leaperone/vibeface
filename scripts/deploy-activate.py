@@ -628,6 +628,36 @@ def self_test():
             with patch(__name__ + '.docker', return_value=result):
                 with TestCase().assertRaises(ValueError, msg='accepted an ambiguous imported image'):
                     import_image(str(archive), digest)
+        settings = Path(temporary).resolve() / 'config.json'
+        settings.write_text(json.dumps({'project': 'official-app', 'role': 'app',
+                                       'deploy_dir': '/srv/service-control/app', 'listen': '127.0.0.1:8088',
+                                       'nginx_config': '/etc/nginx/conf.d/app.conf',
+                                       'server_name': 'app.example.invalid'}))
+        arguments = ['deploy-activate.py', '--config', str(settings), '--tag', 'v0.0.1',
+                     '--version', '0.0.1', '--source-sha', 'a' * 40, '--archive', str(archive)]
+        for pin, checksum, loaded, accepted in (
+                (imported, digest, 'Loaded image ID: ' + imported, True),
+                ('sha256:' + 'b' * 64, digest, 'Loaded image ID: ' + imported, False),
+                (imported, '0' * 64, 'Loaded image ID: ' + imported, False),
+                (imported, digest, 'Loaded image: moving:tag', False),
+                (imported, digest, 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported, False)):
+            with patch.object(sys, 'argv', arguments + ['--image', pin, '--archive-sha256', checksum]), \
+                    patch(__name__ + '.docker', return_value=loaded) as load, \
+                    patch(__name__ + '.activate', return_value={}) as activation, \
+                    patch('builtins.print'):
+                try:
+                    main()
+                except ValueError:
+                    assert not accepted, 'matching pinned archive was refused'
+                else:
+                    assert accepted, 'CLI activated an archive that differs from its pins'
+                if accepted:
+                    activation.assert_called_once_with(json.loads(settings.read_text()), pin,
+                                                       'v0.0.1', 'a' * 40, '0.0.1')
+                else:
+                    activation.assert_not_called()
+                if checksum != digest:
+                    load.assert_not_called()
     config = {'project': 'official-node', 'role': 'node', 'deploy_dir': '/srv/service-control/node',
               'listen': '0.0.0.0:4792', 'data_dir': '/var/lib/official-node', 'tls_dir': '/etc/official-node/tls',
               'device_id': 'a' * 64,
@@ -828,7 +858,8 @@ def main():
     require(args.tag == ('www-v' if config['role'] == 'www' else 'v') + args.version, 'tag and version differ')
     require(bool(args.archive) == bool(args.archive_sha256), 'archive and its digest must be supplied together')
     if args.archive:
-        args.image = import_image(args.archive, args.archive_sha256)
+        require(import_image(args.archive, args.archive_sha256) == args.image,
+                'imported image differs from the pinned image ID')
     print(json.dumps(activate(config, args.image, args.tag, args.source_sha, args.version)))
 
 

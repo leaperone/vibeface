@@ -81,7 +81,7 @@ Compare the six-digit code on both devices before approving. Join the existing n
 Every Node joins one public mesh by default: it announces a signed record with its device ID, direct addresses, home relay and the roles it offers, and keeps every other Node's record. The official public node is an ordinary Node outside every personal network and the default bootstrap node. It also runs an open relay and browser access, each with small limits. Its device ID, UDP address and relay are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
 
 ```text
-vibeface://node/<issuer>?addr=8.217.72.118:4792&relay=http://node.vibeface.dev:3340
+vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:3340
 ```
 
 New personal Nodes join the mesh through it, and pick verified open relays from the mesh when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url` (`https://node.vibeface.dev:4792`), and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards ciphertext and sees addresses, device IDs and traffic volume, not content. Use `--no-mesh` during first initialization to stay off the mesh, or `--bootstrap <node link>` to join through the first Node you know (`vibeface mesh share` prints a running Node's link). See [The mesh](packages/docs/node.md#全网) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.

@@ -93,6 +93,7 @@ pub enum MaintenanceCommand {
     },
     DeliveryWallet(WalletCommand),
     DeliveryConfig(Value),
+    DeliveryBudget(Value),
     DeliveryKeyOperation {
         action: Value,
         intent_id: String,

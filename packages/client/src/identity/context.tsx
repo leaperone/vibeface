@@ -19,6 +19,7 @@ import { candidates, defaultGateway, gatewaysOf, markReached, mergeEntrances, op
 import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
+import { storageOf } from '../workspace/storage.ts'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'erasing' | 'erase_failed' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
@@ -138,8 +139,9 @@ const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padS
 const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(32)))
 /** Saved connections, pins and pending joins in this device's storage. */
 function deviceStore(storage: KeyValue, self: string) {
-  function load(key: string): unknown { try { const value = storage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
-  function store(key: string, value: unknown) { try { storage.setItem(`vibeface.${key}`, JSON.stringify(value)) } catch { throw new Error(`${self}无法保存设备记录。允许保存本地数据后重试。`) } }
+  const { readStorage, writeStorage } = storageOf(storage)
+  const load = (key: string) => readStorage<unknown>(key, null)
+  function store(key: string, value: unknown) { try { writeStorage(key, value, true) } catch { throw new Error(`${self}无法保存设备记录。允许保存本地数据后重试。`) } }
   function savedEntries(): ConnectionEntry[] {
     const value = load('connections')
     if (!Array.isArray(value)) return []

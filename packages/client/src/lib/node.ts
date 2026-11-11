@@ -110,15 +110,17 @@ export function record(value: unknown, label = '设备响应'): Record<string, u
   if (!isRecord(value)) throw new Error(`${label}格式无效。`)
   return value
 }
-function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
+export function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
+export function isText(value: unknown): value is string { return typeof value === 'string' }
+export function isSafeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) }
 export function text(value: unknown, label = '文本'): string {
-  if (typeof value !== 'string' || !value) throw new Error(`${label}缺失或格式无效。`)
+  if (!isText(value) || !value) throw new Error(`${label}缺失或格式无效。`)
   return value
 }
-export function boolean(value: unknown): boolean { if (typeof value !== 'boolean') throw new Error('设备返回的状态格式无效。'); return value }
-function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
-function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
-export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
+export function boolean(value: unknown, error = '设备返回的状态格式无效。'): boolean { if (typeof value !== 'boolean') throw new Error(error); return value }
+function integer(value: unknown): number { if (!isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
+function strings(value: unknown): string[] { return array(value).map(item => text(item)) }
+export function array(value: unknown, error = '设备返回的列表格式无效。'): unknown[] { if (!Array.isArray(value)) throw new Error(error); return value }
 /** An entry as Nodes send it and this device stores it: `{address, device_id}`, plus `local: true` for a local page, or `{device_id, addrs}` on the LAN. */
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')

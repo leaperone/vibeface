@@ -120,19 +120,7 @@ impl ServiceStore {
         &self.root
     }
     pub fn check_limits(&self, capacity: u64, max_orders: u32) -> Result<()> {
-        let usage = self.usage()?;
-        ensure!(
-            usage.iter().map(|usage| usage.0).sum::<u32>() <= max_orders
-                && usage.iter().map(|usage| usage.1).sum::<u64>() <= capacity,
-            "delivery limits cannot discard existing reservations or recovery data"
-        );
-        for class in [1, 2] {
-            ensure!(
-                usage[class].0 <= max_orders / 4 && usage[class].1 <= capacity / 4,
-                "delivery limits cannot discard existing public commitments"
-            );
-        }
-        check_physical_capacity(&self.db, capacity)
+        check_capacity_limits(&self.db, capacity, max_orders)
     }
     fn atomic<T>(&mut self, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.db.execute_batch("SAVEPOINT delivery_write")?;
@@ -168,58 +156,7 @@ impl ServiceStore {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn usage(&self) -> Result<[(u32, u64); 3]> {
-        let mut usage = [(0, 0); 3];
-        let mut owners = std::collections::HashMap::new();
-        for (id, body) in self.records()? {
-            let owner: CapacityOwner = serde_json::from_str(&body)?;
-            let class = owner.class();
-            owners.insert(id.clone(), class);
-            let historical = if owner.view.mode == Mode::Paid {
-                self.decode_order(&body)?.historical()
-            } else {
-                owner.view.evidence == Evidence::CharityReceipt
-                    && (owner.view.role != Role::Receiver || owner.notified)
-            };
-            usage[class].0 += u32::from(!historical);
-            usage[class].1 += body.len() as u64 + id.len() as u64 + 256;
-        }
-        let mut query = self.db.prepare("SELECT order_id,size FROM objects")?;
-        for row in query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-        })? {
-            let (id, bytes) = row?;
-            usage[*owners.get(&id).unwrap_or(&0)].1 += bytes + 256;
-        }
-        let mut query = self
-            .db
-            .prepare("SELECT id,length(id)+length(body)+128 FROM private_values")?;
-        for row in query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-        })? {
-            let (id, bytes) = row?;
-            let class = id
-                .strip_prefix("order-observation:")
-                .and_then(|order| owners.get(order))
-                .copied()
-                .unwrap_or(0);
-            usage[class].1 += bytes;
-        }
-        let proofs: u64 = self.db.query_row(
-            "SELECT coalesce(sum(length(digest)+length(path)+size+128),0) FROM proof_jobs",
-            [],
-            |row| row.get(0),
-        )?;
-        usage[0].1 += proofs;
-        let mut query = self.db.prepare("SELECT id,length(intent)+coalesce(length(raw),0)+coalesce(length(error),0)+512 FROM transactions")?;
-        for row in query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-        })? {
-            let (id, bytes) = row?;
-            usage[*owners.get(id.split('/').next().unwrap_or("")).unwrap_or(&0)].1 += bytes;
-        }
-        let budgets: u64 = self.db.query_row("SELECT coalesce(sum(length(wallet)+length(budget_group)+length(cap)+128),0) FROM gas_budgets", [], |row| row.get(0))?;
-        usage[0].1 += budgets;
-        Ok(usage)
+        capacity_usage(&self.db)
     }
     fn check_capacity(&self) -> Result<()> {
         self.check_limits(self.capacity, self.max_orders)
@@ -255,7 +192,24 @@ impl ServiceStore {
         Ok(())
     }
     fn has_effect_references(&self, id: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/') OR EXISTS(SELECT 1 FROM private_values WHERE instr(id,?1)>0 AND id!='order-observation:'||?1)", [id], |row| row.get(0))?)
+        let direct = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/') OR EXISTS(SELECT 1 FROM private_values WHERE instr(id,?1)>0 AND id!='order-observation:'||?1)", [id], |row| row.get::<_, bool>(0))?;
+        if direct {
+            return Ok(true);
+        }
+        if super::budget::publication_has_order_reference(self, id)? {
+            return Ok(true);
+        }
+        let Some(order) = self.find_order(id)? else {
+            return Ok(false);
+        };
+        let Some(budget) = order.view.payment.budget_id else {
+            return Ok(false);
+        };
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/' AND (raw IS NULL OR phase NOT IN ('confirmed','failed','reverted','conflicted')))",
+            [format!("budget-{budget}")],
+            |row| row.get(0),
+        )?)
     }
     pub(super) fn reclaim_unfunded_quote(&mut self, expected: &StoredOrder) -> Result<()> {
         let Some(current) = self.find_order(&expected.view.order_id)? else {
@@ -301,8 +255,14 @@ impl ServiceStore {
         {
             return Ok(());
         }
-        let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/' AND (raw IS NULL OR phase NOT IN ('confirmed','failed','reverted','conflicted')))", [id], |row| row.get(0))?;
-        if !pending {
+        let budget = order
+            .view
+            .payment
+            .budget_id
+            .as_ref()
+            .map(|id| format!("budget-{id}"));
+        let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE (substr(id,1,length(?1)+1)=?1||'/' OR substr(id,1,length(?2)+1)=?2||'/') AND (raw IS NULL OR phase NOT IN ('confirmed','failed','reverted','conflicted')))", params![id,budget], |row| row.get(0))?;
+        if !pending && !super::budget::publication_retains_objects(self, id)? {
             self.remove_objects(id, true)?;
         }
         Ok(())
@@ -389,13 +349,7 @@ impl ServiceStore {
         self.decode_order(&body)
     }
     fn decode_order(&self, body: &str) -> Result<StoredOrder> {
-        let mut order: StoredOrder = serde_json::from_str(body)?;
-        if let Some(bytes) = self.value(&format!("order-observation:{}", order.view.order_id))? {
-            let (observed, complete): (i64, bool) = serde_json::from_slice(&bytes)?;
-            order.chain_observed_at_ms = observed;
-            order.settlement_complete = complete;
-        }
-        Ok(order)
+        decode_order(&self.db, body)
     }
     pub fn find_order(&self, id: &str) -> Result<Option<StoredOrder>> {
         parse_word(id)?;
@@ -458,6 +412,34 @@ impl ServiceStore {
             )
             .optional()?;
         body.map(|body| self.decode_order(&body)).transpose()
+    }
+    pub(super) fn save_authorized_batch(&mut self, orders: &[StoredOrder]) -> Result<()> {
+        ensure!(
+            (1..=2).contains(&orders.len()),
+            "invalid confirmed delivery batch"
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for order in orders {
+            ensure!(
+                (order.confirmed && order.view.role == super::types::Role::Sender)
+                    || (order.accepted && order.view.role == super::types::Role::Receiver),
+                "batch contains no explicit sender/receiver authorization"
+            );
+            let changed = tx.execute(
+                "UPDATE orders SET body=?1 WHERE id=?2 AND network IS ?3 AND role=?4",
+                params![
+                    serde_json::to_string(order)?,
+                    order.view.order_id,
+                    order.network_id,
+                    serde_json::to_string(&order.view.role)?
+                ],
+            )?;
+            ensure!(changed == 1, "confirmed batch order owner changed");
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn orders(&self, network: Option<&str>) -> Result<Vec<StoredOrder>> {
         let mut statement = self
@@ -593,30 +575,14 @@ impl ServiceStore {
         );
         let mut seen = std::collections::BTreeSet::new();
         let tx = self.db.unchecked_transaction()?;
-        let mut used = self.usage()?.iter().map(|usage| usage.1).sum::<u64>();
         for (id, value) in values {
             ensure!(
                 id.len() <= 160 && value.len() <= 1024 * 1024 && seen.insert(*id),
                 "invalid or duplicate private delivery value"
             );
-            let old: u64 = tx.query_row(
-                "SELECT coalesce((SELECT length(id)+length(body)+128 FROM private_values WHERE id=?1),0)",
-                [*id],
-                |r| r.get(0),
-            )?;
-            used = used
-                .checked_sub(old)
-                .and_then(|used| used.checked_add((id.len() + value.len() + 128) as u64))
-                .context("private delivery capacity overflow")?;
-        }
-        ensure!(
-            used <= self.capacity,
-            "private delivery storage quota exceeded"
-        );
-        for (id, value) in values {
             tx.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,value])?;
         }
-        check_physical_capacity(&tx, self.capacity)?;
+        check_capacity_limits(&tx, self.capacity, self.max_orders)?;
         tx.commit()?;
         Ok(())
     }
@@ -627,6 +593,14 @@ impl ServiceStore {
                 r.get(0)
             })
             .optional()?)
+    }
+    pub fn values_with_prefix(&self, prefix: &str) -> Result<Vec<Vec<u8>>> {
+        let mut query = self.db.prepare(
+            "SELECT body FROM private_values WHERE substr(id,1,length(?1))=?1 ORDER BY id",
+        )?;
+        Ok(query
+            .query_map([prefix], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     fn object_path(&self, order: &str, index: u16, kind: &str, partial: bool) -> Result<PathBuf> {
         parse_word(order)?;
@@ -819,10 +793,10 @@ impl ServiceStore {
         intent: &SpendIntent,
         pending_nonce: u64,
     ) -> Result<SignedTransaction> {
-        self.reserve_transaction_inner(intent, pending_nonce, None, |_, _| Ok(None))
+        self.reserve_transaction_inner(intent, pending_nonce, None, None, |_, _| Ok(None))
     }
     #[cfg(test)]
-    fn reserve_budget_transaction(
+    pub(super) fn reserve_budget_transaction(
         &mut self,
         intent: &SpendIntent,
         pending_nonce: u64,
@@ -833,6 +807,7 @@ impl ServiceStore {
             intent,
             pending_nonce,
             Some((budget_group, total_gas_cap)),
+            None,
             |_, _| Ok(None),
         )
     }
@@ -848,6 +823,29 @@ impl ServiceStore {
             intent,
             pending_nonce,
             Some((budget_group, total_gas_cap)),
+            None,
+            |intent, nonce| sign(intent, nonce).map(Some),
+        )
+    }
+    pub(super) fn signed_publication_transaction(
+        &mut self,
+        intent: &SpendIntent,
+        pending_nonce: u64,
+        budget_group: &str,
+        total_gas_cap: &str,
+        claim: (&str, &[u8]),
+        sign: impl FnOnce(&SpendIntent, u64) -> Result<(String, String)>,
+    ) -> Result<SignedTransaction> {
+        ensure!(
+            budget_group.starts_with("budget-")
+                && intent.id.starts_with(&format!("{budget_group}/reveal-")),
+            "publication attempt has no protected budget"
+        );
+        self.reserve_transaction_inner(
+            intent,
+            pending_nonce,
+            Some((budget_group, total_gas_cap)),
+            Some(claim),
             |intent, nonce| sign(intent, nonce).map(Some),
         )
     }
@@ -856,6 +854,7 @@ impl ServiceStore {
         intent: &SpendIntent,
         pending_nonce: u64,
         budget: Option<(&str, &str)>,
+        claim: Option<(&str, &[u8])>,
         sign: impl FnOnce(&SpendIntent, u64) -> Result<Option<(String, String)>>,
     ) -> Result<SignedTransaction> {
         ensure!(
@@ -866,28 +865,17 @@ impl ServiceStore {
             "invalid transaction identity"
         );
         let encoded = serde_json::to_string(intent)?;
-        let usage = self.usage()?;
-        let used = usage.iter().map(|usage| usage.1).sum::<u64>();
-        let body: Option<String> = self
+        let tx = self
             .db
-            .query_row(
-                "SELECT body FROM orders WHERE id=?1",
-                [intent.id.split('/').next().unwrap_or("")],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let class = body
-            .map(|body| serde_json::from_str::<CapacityOwner>(&body))
-            .transpose()?
-            .map_or(0, |owner| owner.class());
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let usage = capacity_usage(&tx)?;
+        let used = usage.iter().map(|usage| usage.1).sum::<u64>();
+        let class = transaction_class(&tx, &intent.id)?;
         let class_room = if class == 0 {
             self.capacity
         } else {
             self.capacity / 4
         };
-        let tx = self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let prior:Option<TxRow>=tx.query_row("SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",[&intent.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
         let hole: Option<String> = tx.query_row("SELECT id FROM transactions WHERE chain=?1 AND wallet=?2 AND raw IS NULL ORDER BY nonce LIMIT 1",params![intent.chain_id,intent.wallet],|row|row.get(0)).optional()?;
         if let Some((old, nonce, raw_tx, tx_hash, phase, block_number, block_hash, error)) = prior {
@@ -921,7 +909,10 @@ impl ServiceStore {
                     transaction.error = None;
                 }
             }
-            check_physical_capacity(&tx, self.capacity)?;
+            if let Some(claim) = claim {
+                bind_publication_attempt(&tx, intent, claim)?;
+            }
+            check_capacity_limits(&tx, self.capacity, self.max_orders)?;
             tx.commit()?;
             return Ok(transaction);
         }
@@ -1004,7 +995,10 @@ impl ServiceStore {
             "public transaction storage quota exceeded"
         );
         tx.execute("INSERT INTO transactions(id,chain,wallet,nonce,intent,raw,hash,phase) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![intent.id,intent.chain_id,intent.wallet,nonce,encoded,raw_tx,tx_hash,phase])?;
-        check_physical_capacity(&tx, self.capacity)?;
+        if let Some(claim) = claim {
+            bind_publication_attempt(&tx, intent, claim)?;
+        }
+        check_capacity_limits(&tx, self.capacity, self.max_orders)?;
         tx.commit()?;
         Ok(SignedTransaction {
             intent: intent.clone(),
@@ -1018,11 +1012,15 @@ impl ServiceStore {
         })
     }
     #[cfg(test)]
-    fn sign_transaction(&mut self, id: &str, raw: &str, hash: &str) -> Result<()> {
+    pub(super) fn sign_transaction(&mut self, id: &str, raw: &str, hash: &str) -> Result<()> {
         let transaction = self.transaction(id)?;
-        self.reserve_transaction_inner(&transaction.intent, transaction.nonce, None, |_, _| {
-            Ok(Some((raw.to_owned(), hash.to_owned())))
-        })?;
+        self.reserve_transaction_inner(
+            &transaction.intent,
+            transaction.nonce,
+            None,
+            None,
+            |_, _| Ok(Some((raw.to_owned(), hash.to_owned()))),
+        )?;
         Ok(())
     }
     pub fn observe_transaction(
@@ -1082,8 +1080,21 @@ impl ServiceStore {
         }
     }
     pub fn next_transaction_for_reconcile(&self) -> Result<Option<SignedTransaction>> {
-        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE phase NOT IN ('failed','reverted','conflicted') AND (phase!='confirmed' OR checked_at<?1) ORDER BY phase='confirmed',checked_at,nonce LIMIT 1",[crate::runtime::now_ms().saturating_sub(60_000)],|r|r.get(0)).optional()?;
+        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE id NOT LIKE 'budget-%/reveal-%' AND phase NOT IN ('failed','reverted','conflicted') AND (phase!='confirmed' OR checked_at<?1) ORDER BY phase='confirmed',checked_at,nonce LIMIT 1",[crate::runtime::now_ms().saturating_sub(60_000)],|r|r.get(0)).optional()?;
         id.map(|id| self.transaction(&id)).transpose()
+    }
+    pub(super) fn next_nonce_is_contiguous(
+        &self,
+        chain: u64,
+        wallet: &str,
+        nonce: u64,
+    ) -> Result<bool> {
+        let last: Option<u64> = self.db.query_row(
+            "SELECT max(nonce) FROM transactions WHERE chain=?1 AND wallet=?2",
+            params![chain, wallet],
+            |row| row.get(0),
+        )?;
+        Ok(last.is_none_or(|last| last < nonce))
     }
     pub fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
         let mut query = self
@@ -1094,6 +1105,226 @@ impl ServiceStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ids.iter().map(|id| self.transaction(id)).collect()
     }
+}
+fn decode_order(db: &Connection, body: &str) -> Result<StoredOrder> {
+    let mut order: StoredOrder = serde_json::from_str(body)?;
+    let observation: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT body FROM private_values WHERE id=?1",
+            [format!("order-observation:{}", order.view.order_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(bytes) = observation {
+        let (observed, complete): (i64, bool) = serde_json::from_slice(&bytes)?;
+        order.chain_observed_at_ms = observed;
+        order.settlement_complete = complete;
+    }
+    Ok(order)
+}
+fn order_class(db: &Connection, id: &str) -> Result<Option<usize>> {
+    let body: Option<String> = db.query_row(
+        "SELECT body FROM orders WHERE id=?1 UNION ALL SELECT body FROM charity_orders WHERE id=?1",
+        [id], |row| row.get(0),
+    ).optional()?;
+    body.map(|body| Ok(serde_json::from_str::<CapacityOwner>(&body)?.class()))
+        .transpose()
+}
+fn budget_class(db: &Connection, id: &str) -> Result<usize> {
+    parse_word(id)?;
+    let body: Vec<u8> = db
+        .query_row(
+            "SELECT body FROM private_values WHERE id=?1",
+            [format!("protected-budget:{id}")],
+            |row| row.get(0),
+        )
+        .context("protected budget has no capacity owner")?;
+    let record: super::budget::BudgetRecord = serde_json::from_slice(&body)?;
+    ensure!(
+        record.terms.budget_id == id,
+        "protected budget capacity identity changed"
+    );
+    match record.role {
+        Role::Sender => Ok(0),
+        Role::Provider => Ok(2),
+        Role::Receiver => {
+            let mut query = db.prepare(
+                "SELECT body FROM orders WHERE json_extract(body,'$.view.payment.budget_id')=?1",
+            )?;
+            let mut class = None;
+            for body in query.query_map([id], |row| row.get::<_, String>(0))? {
+                let owner: CapacityOwner = serde_json::from_str(&body?)?;
+                ensure!(
+                    owner.view.role == Role::Receiver,
+                    "budget capacity role differs from its orders"
+                );
+                class = Some(class.unwrap_or(0).max(owner.class()));
+            }
+            Ok(class.unwrap_or(1))
+        }
+    }
+}
+fn transaction_class(db: &Connection, id: &str) -> Result<usize> {
+    let group = id.split('/').next().unwrap_or("");
+    if let Some(budget) = group.strip_prefix("budget-") {
+        budget_class(db, budget)
+    } else {
+        Ok(order_class(db, group)?.unwrap_or(0))
+    }
+}
+fn private_class(db: &Connection, id: &str, body: &[u8]) -> Result<usize> {
+    if let Some(order) = id.strip_prefix("order-observation:") {
+        return Ok(order_class(db, order)?.unwrap_or(0));
+    }
+    for prefix in ["protected-budget:", "protected-flush:"] {
+        if let Some(budget) = id.strip_prefix(prefix) {
+            return budget_class(db, budget);
+        }
+    }
+    for prefix in ["protected-hold:", "protected-claim-window:"] {
+        if let Some(window) = id.strip_prefix(prefix) {
+            let order = window
+                .split_once(':')
+                .context("protected window has no order")?
+                .0;
+            return order_class(db, order)?.context("protected window has no capacity owner");
+        }
+    }
+    if id.starts_with("protected-claim:") {
+        let claim: serde_json::Value = serde_json::from_slice(body)?;
+        return budget_class(
+            db,
+            claim
+                .pointer("/terms/budget_id")
+                .and_then(serde_json::Value::as_str)
+                .context("publication claim has no budget capacity owner")?,
+        );
+    }
+    if let Some(intent) = id.strip_prefix("local-spend:budget-") {
+        return budget_class(db, intent.split('/').next().unwrap_or(""));
+    }
+    Ok(0)
+}
+fn capacity_usage(db: &Connection) -> Result<[(u32, u64); 3]> {
+    let mut usage = [(0, 0); 3];
+    let mut owners = std::collections::HashMap::new();
+    let mut query =
+        db.prepare("SELECT id,body FROM orders UNION ALL SELECT id,body FROM charity_orders")?;
+    for row in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, body) = row?;
+        let owner: CapacityOwner = serde_json::from_str(&body)?;
+        let class = owner.class();
+        let historical = if owner.view.mode == Mode::Paid {
+            decode_order(db, &body)?.historical()
+        } else {
+            owner.view.evidence == Evidence::CharityReceipt
+                && (owner.view.role != Role::Receiver || owner.notified)
+        };
+        usage[class].0 += u32::from(!historical);
+        usage[class].1 += body.len() as u64 + id.len() as u64 + 256;
+        owners.insert(id, class);
+    }
+    let mut query = db.prepare("SELECT order_id,size FROM objects")?;
+    for row in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })? {
+        let (id, bytes) = row?;
+        usage[*owners.get(&id).unwrap_or(&0)].1 += bytes + 256;
+    }
+    let mut query = db.prepare("SELECT id,body,length(id)+length(body)+128 FROM private_values")?;
+    for row in query.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, u64>(2)?,
+        ))
+    })? {
+        let (id, body, bytes) = row?;
+        usage[private_class(db, &id, &body)?].1 += bytes;
+    }
+    let proofs: u64 = db.query_row(
+        "SELECT coalesce(sum(length(digest)+length(path)+size+128),0) FROM proof_jobs",
+        [],
+        |row| row.get(0),
+    )?;
+    usage[0].1 += proofs;
+    let mut query = db.prepare("SELECT id,length(intent)+coalesce(length(raw),0)+coalesce(length(error),0)+512 FROM transactions")?;
+    for row in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })? {
+        let (id, bytes) = row?;
+        usage[transaction_class(db, &id)?].1 += bytes;
+    }
+    let mut query = db.prepare(
+        "SELECT budget_group,length(wallet)+length(budget_group)+length(cap)+128 FROM gas_budgets",
+    )?;
+    for row in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })? {
+        let (group, bytes) = row?;
+        usage[transaction_class(db, &group)?].1 += bytes;
+    }
+    Ok(usage)
+}
+fn check_capacity_limits(db: &Connection, capacity: u64, max_orders: u32) -> Result<()> {
+    let usage = capacity_usage(db)?;
+    ensure!(
+        usage.iter().map(|usage| usage.0).sum::<u32>() <= max_orders
+            && usage.iter().map(|usage| usage.1).sum::<u64>() <= capacity,
+        "delivery limits cannot discard existing reservations or recovery data"
+    );
+    for class in [1, 2] {
+        ensure!(
+            usage[class].0 <= max_orders / 4 && usage[class].1 <= capacity / 4,
+            "delivery limits cannot discard existing public commitments"
+        );
+    }
+    check_physical_capacity(db, capacity)
+}
+fn bind_publication_attempt(
+    db: &Connection,
+    intent: &SpendIntent,
+    (key, body): (&str, &[u8]),
+) -> Result<()> {
+    ensure!(
+        key.starts_with("protected-claim:") && key.len() <= 160 && body.len() <= 1024 * 1024,
+        "invalid publication claim"
+    );
+    let old: Vec<u8> = db
+        .query_row(
+            "SELECT body FROM private_values WHERE id=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .context("publication signing requires its existing durable logical claim")?;
+    let mut expected: serde_json::Value = serde_json::from_slice(&old)?;
+    let updated: serde_json::Value = serde_json::from_slice(body)?;
+    let mut attempts = expected["attempts"]
+        .as_array()
+        .context("invalid publication attempt ledger")?
+        .clone();
+    if !attempts.iter().any(|id| id.as_str() == Some(&intent.id)) {
+        attempts.push(serde_json::Value::String(intent.id.clone()));
+    }
+    expected["attempts"] = serde_json::Value::Array(attempts);
+    ensure!(
+        expected == updated
+            && updated["id"]
+                .as_str()
+                .is_some_and(|id| key == format!("protected-claim:{id}"))
+            && updated
+                .pointer("/terms/budget_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| intent.id.starts_with(&format!("budget-{id}/reveal-"))),
+        "publication signing changed its logical claim or prior attempts"
+    );
+    db.execute(
+        "UPDATE private_values SET body=?2 WHERE id=?1",
+        params![key, body],
+    )?;
+    Ok(())
 }
 fn check_physical_capacity(db: &Connection, capacity: u64) -> Result<()> {
     let pages: u64 = db.pragma_query_value(None, "page_count", |row| row.get(0))?;
@@ -1110,7 +1341,7 @@ fn check_physical_capacity(db: &Connection, capacity: u64) -> Result<()> {
 }
 const MAX_ORDER_BYTES: usize = 64 * 1024;
 const HISTORICAL_ORDER: &str = "coalesce(json_extract((SELECT CAST(body AS TEXT) FROM private_values WHERE id='order-observation:'||orders.id),'$[1]'),0)=1
-    AND json_extract(body,'$.view.payment.earned')=json_extract(body,'$.view.payment.withdrawn')
+    AND coalesce(json_extract(body,'$.view.payment.settlement.earned')=json_extract(body,'$.view.payment.settlement.withdrawn'),0)
     AND NOT EXISTS(SELECT 1 FROM json_each(body,'$.view.windows') WHERE json_extract(value,'$.state') NOT IN ('earned','refunded'))
     AND json_extract(body,'$.resume_requested')=0 AND json_extract(body,'$.view.error') IS NULL
     AND json_extract(body,'$.view.phase') NOT IN ('reconciling','key_unavailable','failed')
@@ -1118,7 +1349,7 @@ const HISTORICAL_ORDER: &str = "coalesce(json_extract((SELECT CAST(body AS TEXT)
     AND (json_extract(body,'$.view.role')!='receiver'
         OR NOT EXISTS(SELECT 1 FROM json_each(body,'$.view.windows') WHERE json_extract(value,'$.state')!='refunded')
         OR (json_extract(body,'$.view.name') IS NOT NULL AND json_extract(body,'$.view.sha256') IS NOT NULL
-            AND NOT EXISTS(SELECT 1 FROM json_each(body,'$.view.windows') WHERE json_extract(value,'$.decryption_proven')=0 AND json_extract(value,'$.state')!='refunded')))";
+            AND json_extract(body,'$.view.evidence') IN ('recoverable','decryption_proven')))";
 
 #[derive(Deserialize)]
 struct CapacityOwner {
@@ -1196,6 +1427,7 @@ pub(super) mod tests {
             grants: Vec::new(),
             accepted: false,
             notified: false,
+            allocation_batch: Vec::new(),
             chain_observed_at_ms: 0,
             settlement_complete: false,
         }
@@ -1460,6 +1692,8 @@ pub(super) mod tests {
     fn historical_orders_do_not_hide_active_work_or_consume_active_slots() {
         let (mut store, dir) = store();
         store.set_limits(4_000_000, 4);
+        let active = paid_order(Role::Sender);
+        store.save_order(&active).unwrap();
         for index in 0..32 {
             let mut order = paid_order(Role::Sender);
             order.confirmed = true;
@@ -1467,7 +1701,13 @@ pub(super) mod tests {
             order.view.phase = Phase::Paid;
             order.view.payment.state = PaymentState::Withdrawn;
             order.view.payment.earned = "7".into();
-            order.view.payment.withdrawn = "7".into();
+            order.view.payment.withdrawn = "0".into();
+            order.view.payment.settlement = Some(BudgetSettlement {
+                earned: "7".into(),
+                withdrawn: "7".into(),
+                refunded: "0".into(),
+                publication: None,
+            });
             order.view.updated_at_ms = index;
             for window in &mut order.view.windows {
                 window.state = WindowState::Earned;
@@ -1475,8 +1715,6 @@ pub(super) mod tests {
             }
             store.save_order(&order).unwrap();
         }
-        let active = paid_order(Role::Sender);
-        store.save_order(&active).unwrap();
         let work = store.progress_orders(Some("owner-network")).unwrap();
         assert_eq!(work.len(), 2);
         assert_eq!(work.iter().filter(|order| order.historical()).count(), 1);
@@ -1485,6 +1723,24 @@ pub(super) mod tests {
                 .any(|order| order.view.order_id == active.view.order_id)
         );
         assert_eq!(store.usage().unwrap()[0].0, 1);
+        let mut incomplete = paid_order(Role::Sender);
+        incomplete.settlement_complete = true;
+        incomplete.confirmed = true;
+        incomplete.view.phase = Phase::Paid;
+        for window in &mut incomplete.view.windows {
+            window.state = WindowState::Earned;
+        }
+        store.save_order(&incomplete).unwrap();
+        assert!(!incomplete.historical());
+        assert!(
+            store
+                .progress_orders(Some("owner-network"))
+                .unwrap()
+                .iter()
+                .any(|order| order.view.order_id == incomplete.view.order_id),
+            "a missing budget settlement must remain active rather than fall through SQL NULL"
+        );
+        assert_eq!(store.usage().unwrap()[0].0, 2);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1660,6 +1916,515 @@ pub(super) mod tests {
         );
         assert!(store.find_transaction("order/hold").unwrap().is_none());
         assert_eq!(store.recent_transactions().unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn budget_record(order: &StoredOrder, id: &str) -> super::super::budget::BudgetRecord {
+        super::super::budget::BudgetRecord {
+            terms: super::super::budget::BudgetTerms {
+                budget_id: id.into(),
+                chain_id: 31337,
+                escrow: format!("0x{}", "11".repeat(20)),
+                payer: format!("0x{}", "22".repeat(20)),
+                payee: format!("0x{}", "33".repeat(20)),
+                provider_peer: order.view.provider_peer.clone(),
+                asset: format!("0x{}", "44".repeat(20)),
+                deposit: "7".into(),
+            },
+            payer_gas_cap: "600000".into(),
+            provider_gas_cap: "600000".into(),
+            network_id: order.network_id.clone(),
+            authorized_by: order.authorized_by.clone(),
+            role: order.view.role,
+        }
+    }
+    fn logical_claim(order: &StoredOrder, budget: &str, id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id":id,"terms":{"budget_id":budget,"payee":format!("0x{}","33".repeat(20)),
+                "items":[{"window":{"order_id":order.view.order_id,"index":0},"capsule":vec![0;80]}],
+                "economic_cutoff":super::super::now()+1000,"total_amount":"7","gas_cap":"600000",
+                "policy":{"watchdog_seconds":32,"inclusion_seconds":5,"finality_seconds":5,"clock_skew_seconds":2,
+                    "max_fee_per_gas":"3","priority_fee_per_gas":"1"},"expected_earned":{order.view.order_id.clone():"7"}},
+            "state":{"state":"private_ready"},"attempts":[],"risk":null,"checked_at_ms":0
+        })
+    }
+    #[test]
+    fn protected_budget_capacity_follows_provider_and_receiver_ownership_on_every_surface() {
+        for (role, class) in [(Role::Provider, 2), (Role::Receiver, 1)] {
+            let (mut store, dir) = store();
+            let budget_id = "ab".repeat(32);
+            let group = format!("budget-{budget_id}");
+            let mut order = paid_order(role);
+            order.view.payment.budget_id = Some(budget_id.clone());
+            store.save_order(&order).unwrap();
+            store
+                .put_value(
+                    &format!("protected-budget:{budget_id}"),
+                    &serde_json::to_vec(&budget_record(&order, &budget_id)).unwrap(),
+                )
+                .unwrap();
+            let hold = format!("protected-hold:{}:0", order.view.order_id);
+            store.put_value(&hold, b"original hold").unwrap();
+            let claim_id = "cd".repeat(32);
+            store
+                .put_value(
+                    &format!("protected-claim:{claim_id}"),
+                    &serde_json::to_vec(&logical_claim(&order, &budget_id, &claim_id)).unwrap(),
+                )
+                .unwrap();
+            store
+                .put_value(
+                    &format!("protected-claim-window:{}:0", order.view.order_id),
+                    claim_id.as_bytes(),
+                )
+                .unwrap();
+            store
+                .put_value(
+                    &format!("protected-flush:{budget_id}"),
+                    &serde_json::to_vec(&vec![super::super::budget::WindowRef {
+                        order_id: order.view.order_id.clone(),
+                        index: 0,
+                    }])
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut intent = SpendIntent {
+                id: format!("{group}/hold-0"),
+                chain_id: 31337,
+                wallet: "wallet".into(),
+                to: "escrow".into(),
+                calldata: "0x1234".into(),
+                value: "0".into(),
+                gas_limit: 100_000,
+                gas_cap: "600000".into(),
+                max_fee_per_gas: "3".into(),
+                max_priority_fee_per_gas: "1".into(),
+            };
+            store
+                .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
+                    Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                })
+                .unwrap();
+            store
+                .put_value(&format!("local-spend:{}", intent.id), b"owner")
+                .unwrap();
+            let usage = store.usage().unwrap();
+            assert_eq!(
+                usage[0],
+                (0, 0),
+                "public budget, hold, claim, claim-window, raw, owner marker and gas ledger cannot become local capacity"
+            );
+            assert!(usage[class].1 > 0);
+            assert_eq!(usage[3 - class], (0, 0));
+            assert!(
+                store.put_value(&hold, &vec![1; 50_000]).is_err(),
+                "public private values share the same quarter cap"
+            );
+            assert_eq!(store.value(&hold).unwrap().unwrap(), b"original hold");
+            intent.id = format!("{group}/hold-1");
+            assert!(
+                store
+                    .signed_budget_transaction(&intent, 1, &group, "600000", |_, _| Ok((
+                        format!("0x{}", "01".repeat(30_000)),
+                        format!("0x{}", "bb".repeat(32))
+                    )))
+                    .is_err(),
+                "budget signing uses its public quarter cap"
+            );
+            assert!(store.find_transaction(&intent.id).unwrap().is_none());
+            assert_eq!(store.usage().unwrap(), usage);
+            if role == Role::Receiver {
+                order.accepted = true;
+                store.save_order(&order).unwrap();
+                let accepted = store.usage().unwrap();
+                assert_eq!(accepted[1], (0, 0));
+                assert!(
+                    accepted[0].1 > 0,
+                    "explicit receiver acceptance moves all related budget usage together"
+                );
+            }
+            let missing = format!("budget-{}/hold-0", "ef".repeat(32));
+            intent.id = missing.clone();
+            assert!(
+                store
+                    .signed_budget_transaction(
+                        &intent,
+                        1,
+                        missing.split('/').next().unwrap(),
+                        "600000",
+                        |_, _| panic!("a budget without an owner cannot sign")
+                    )
+                    .is_err()
+            );
+            assert!(store.find_transaction(&missing).unwrap().is_none());
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn an_unfunded_quote_keeps_uncertain_budget_effects_and_preserves_their_ledger_after_cleanup() {
+        let (mut store, dir) = store();
+        let budget_id = "ab".repeat(32);
+        let group = format!("budget-{budget_id}");
+        let mut quote = paid_order_at(Role::Provider, super::super::now() - 1_000);
+        quote.view.payment.budget_id = Some(budget_id.clone());
+        store.save_order(&quote).unwrap();
+        store
+            .put_value(
+                &format!("protected-budget:{budget_id}"),
+                &serde_json::to_vec(&budget_record(&quote, &budget_id)).unwrap(),
+            )
+            .unwrap();
+        let intent = SpendIntent {
+            id: format!("{group}/withdraw-other-orders"),
+            chain_id: 31337,
+            wallet: "wallet".into(),
+            to: "escrow".into(),
+            calldata: "0x1234".into(),
+            value: "0".into(),
+            gas_limit: 100_000,
+            gas_cap: "600000".into(),
+            max_fee_per_gas: "3".into(),
+            max_priority_fee_per_gas: "1".into(),
+        };
+        store
+            .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
+                Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+            })
+            .unwrap();
+        store
+            .observe_transaction(&intent.id, "unknown", None, None, None)
+            .unwrap();
+        store.reclaim_unfunded_quote(&quote).unwrap();
+        assert!(
+            store.find_order(&quote.view.order_id).unwrap().is_some(),
+            "uncertain budget effects retain the quote"
+        );
+        store
+            .observe_transaction(&intent.id, "confirmed", Some(1), Some("canonical"), None)
+            .unwrap();
+        // Only the production caller's canonical unfunded_after evidence permits this operation.
+        store.reclaim_unfunded_quote(&quote).unwrap();
+        assert!(
+            store.find_order(&quote.view.order_id).unwrap().is_none(),
+            "other orders' terminal budget transactions do not pin an unfunded quote forever"
+        );
+        assert_eq!(
+            store.transaction(&intent.id).unwrap().raw_tx.as_deref(),
+            Some("0x0201")
+        );
+        assert!(
+            store
+                .value(&format!("protected-budget:{budget_id}"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.usage().unwrap()[0],
+            (0, 0),
+            "retained public ledger still belongs to the public budget"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn provider_retention_keeps_budget_unknowns_claim_candidates_and_dangling_window_references() {
+        let (mut store, dir) = store();
+        let budget_id = "ab".repeat(32);
+        let group = format!("budget-{budget_id}");
+        let mut order = paid_order_at(Role::Provider, super::super::now() - 1_000);
+        order.accepted = true;
+        order.settlement_complete = true;
+        order.view.phase = Phase::Paid;
+        order.view.payment.state = PaymentState::Withdrawn;
+        order.view.payment.budget_id = Some(budget_id.clone());
+        order.view.payment.settlement = Some(BudgetSettlement {
+            earned: "7".into(),
+            withdrawn: "7".into(),
+            refunded: "0".into(),
+            publication: None,
+        });
+        for window in &mut order.view.windows {
+            window.state = WindowState::Earned;
+        }
+        store.save_order(&order).unwrap();
+        store
+            .put_value(
+                &format!("protected-budget:{budget_id}"),
+                &serde_json::to_vec(&budget_record(&order, &budget_id)).unwrap(),
+            )
+            .unwrap();
+        let intent = SpendIntent {
+            id: format!("{group}/reveal-claim-0"),
+            chain_id: 31337,
+            wallet: "wallet".into(),
+            to: "escrow".into(),
+            calldata: "0x1234".into(),
+            value: "0".into(),
+            gas_limit: 100_000,
+            gas_cap: "600000".into(),
+            max_fee_per_gas: "3".into(),
+            max_priority_fee_per_gas: "1".into(),
+        };
+        store
+            .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
+                Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+            })
+            .unwrap();
+        store
+            .observe_transaction(&intent.id, "unknown", None, None, None)
+            .unwrap();
+        let remaining = |store: &ServiceStore| {
+            store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM objects WHERE order_id=?1 AND kind='ciphertext'",
+                    [&order.view.order_id],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap()
+        };
+        store
+            .release_provider_objects(&order.view.order_id)
+            .unwrap();
+        assert_eq!(
+            remaining(&store),
+            2,
+            "unknown budget raw protects its orders"
+        );
+        store
+            .observe_transaction(&intent.id, "confirmed", Some(1), Some("canonical"), None)
+            .unwrap();
+        let claim_id = "cd".repeat(32);
+        let key = format!("protected-claim:{claim_id}");
+        let mut claim = logical_claim(&order, &budget_id, &claim_id);
+        claim["attempts"] = serde_json::json!([intent.id]);
+        claim["state"] = serde_json::json!({"state":"disclosed_outstanding","first_possible_at":1,"settlement_candidate":null});
+        store
+            .put_value(&key, &serde_json::to_vec(&claim).unwrap())
+            .unwrap();
+        store
+            .release_provider_objects(&order.view.order_id)
+            .unwrap();
+        assert_eq!(
+            remaining(&store),
+            2,
+            "a claim awaiting a final candidate retains objects"
+        );
+        claim["state"] = serde_json::json!({"state":"final_earned","first_possible_at":null});
+        store
+            .put_value(&key, &serde_json::to_vec(&claim).unwrap())
+            .unwrap();
+        let dangling = format!("protected-claim-window:{}:1", order.view.order_id);
+        store
+            .put_value(&dangling, "ef".repeat(32).as_bytes())
+            .unwrap();
+        store
+            .release_provider_objects(&order.view.order_id)
+            .unwrap();
+        assert_eq!(
+            remaining(&store),
+            2,
+            "missing claim ledger is an unresolved reference"
+        );
+        store.put_value(&dangling, claim_id.as_bytes()).unwrap();
+        store
+            .release_provider_objects(&order.view.order_id)
+            .unwrap();
+        assert_eq!(
+            remaining(&store),
+            0,
+            "confirmed terminal references permit retention cleanup"
+        );
+        assert_eq!(
+            store.transaction(&intent.id).unwrap().raw_tx.as_deref(),
+            Some("0x0201")
+        );
+        assert!(store.value(&key).unwrap().is_some());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn claim_raw_association_is_atomic_and_reverted_attempts_keep_the_original_total_cap() {
+        let (mut store, dir) = store();
+        let budget_id = "ab".repeat(32);
+        let group = format!("budget-{budget_id}");
+        let mut order = paid_order(Role::Provider);
+        order.view.payment.budget_id = Some(budget_id.clone());
+        store.save_order(&order).unwrap();
+        store
+            .put_value(
+                &format!("protected-budget:{budget_id}"),
+                &serde_json::to_vec(&budget_record(&order, &budget_id)).unwrap(),
+            )
+            .unwrap();
+        let claim_id = "cd".repeat(32);
+        let key = format!("protected-claim:{claim_id}");
+        let original = logical_claim(&order, &budget_id, &claim_id);
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        store.put_value(&key, &original_bytes).unwrap();
+        let mut intent = SpendIntent {
+            id: format!("{group}/reveal-claim-0"),
+            chain_id: 31337,
+            wallet: "wallet".into(),
+            to: "escrow".into(),
+            calldata: "0x1234".into(),
+            value: "0".into(),
+            gas_limit: 100_000,
+            gas_cap: "600000".into(),
+            max_fee_per_gas: "3".into(),
+            max_priority_fee_per_gas: "1".into(),
+        };
+        let mut attempted = original.clone();
+        attempted["attempts"] = serde_json::json!([intent.id]);
+        let mut body = serde_json::to_vec(&attempted).unwrap();
+        assert!(
+            store
+                .signed_publication_transaction(
+                    &intent,
+                    0,
+                    &group,
+                    "600000",
+                    (&key, &body),
+                    |_, _| anyhow::bail!("locked signer")
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&intent.id).unwrap().is_none());
+        assert_eq!(store.value(&key).unwrap().unwrap(), original_bytes);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM gas_budgets", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .signed_publication_transaction(
+                    &intent,
+                    0,
+                    &group,
+                    "600000",
+                    (&key, &body),
+                    |_, _| Ok((
+                        format!("0x{}", "01".repeat(30_000)),
+                        format!("0x{}", "aa".repeat(32))
+                    ))
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&intent.id).unwrap().is_none());
+        assert_eq!(store.value(&key).unwrap().unwrap(), original_bytes);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM gas_budgets", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        store
+            .signed_publication_transaction(
+                &intent,
+                0,
+                &group,
+                "600000",
+                (&key, &body),
+                |_, nonce| {
+                    assert_eq!(nonce, 0);
+                    Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                },
+            )
+            .unwrap();
+        let first = store.transaction(&intent.id).unwrap();
+        store
+            .observe_transaction(&intent.id, "unknown", None, None, Some("broadcast unknown"))
+            .unwrap();
+        intent.id = format!("{group}/reveal-claim-1");
+        attempted["attempts"] = serde_json::json!([first.intent.id, intent.id]);
+        body = serde_json::to_vec(&attempted).unwrap();
+        assert!(
+            store
+                .signed_publication_transaction(
+                    &intent,
+                    1,
+                    &group,
+                    "600000",
+                    (&key, &body),
+                    |_, _| anyhow::bail!("signer failed")
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&intent.id).unwrap().is_none());
+        assert_eq!(
+            store.transaction(&first.intent.id).unwrap().raw_tx,
+            first.raw_tx
+        );
+        assert_eq!(
+            store.transaction(&first.intent.id).unwrap().phase,
+            "unknown"
+        );
+        store
+            .observe_transaction(
+                &first.intent.id,
+                "reverted",
+                Some(1),
+                Some("canonical-block"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .signed_publication_transaction(
+                    &intent,
+                    1,
+                    &group,
+                    "600000",
+                    (&key, &body),
+                    |_, _| Ok(("0x0202".into(), format!("0x{}", "bb".repeat(32))))
+                )
+                .unwrap()
+                .nonce,
+            1
+        );
+        intent.id = format!("{group}/reveal-claim-2");
+        let mut capped = attempted.clone();
+        capped["attempts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(intent.id));
+        assert!(
+            store
+                .signed_publication_transaction(
+                    &intent,
+                    2,
+                    &group,
+                    "600000",
+                    (&key, &serde_json::to_vec(&capped).unwrap()),
+                    |_, _| panic!("original cumulative cap blocks before signing")
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&intent.id).unwrap().is_none());
+        assert_eq!(store.value(&key).unwrap().unwrap(), body);
+        drop(store);
+        let store = ServiceStore::open(&dir, 200_000, 4).unwrap();
+        assert_eq!(store.value(&key).unwrap().unwrap(), body);
+        assert_eq!(
+            store
+                .transaction(&first.intent.id)
+                .unwrap()
+                .raw_tx
+                .as_deref(),
+            Some("0x0201")
+        );
+        assert!(
+            store.next_transaction_for_reconcile().unwrap().is_none(),
+            "generic reconciliation must never broadcast an E-bearing claim attempt"
+        );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
