@@ -51,7 +51,7 @@ jobs:
           SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
         run: |
           python -B scripts/native-desktop/diagnostic-inputs.py --source-run $env:SOURCE_RUN --source-sha $env:SOURCE_SHA --source-attempt $env:SOURCE_ATTEMPT --output .artifacts/installer-diagnostic-inputs --evidence .artifacts/native-installer-diagnostic/verified-inputs.json
-      - name: Check config security replacement using the verified CLI
+      - name: Check protected config updates using the verified CLI
         shell: bash
         env:
           RUNTIME: ${{ steps.inputs.outputs.runtime }}
@@ -66,18 +66,6 @@ jobs:
           spec = importlib.util.spec_from_file_location('windows_node_fixture', 'scripts/verify-windows-node.py')
           fixture = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(fixture)
-          execute = fixture.run
-
-          def observe_acl_command(arguments, **kwargs):
-              result = execute(arguments, **kwargs)
-              if str(arguments[0]).casefold() == 'powershell.exe' and result.returncode:
-                  # Only this generated fixture's ACL command is observed; no config content is read.
-                  print('CONTROLLED_ACL_STDOUT_PREFIX_HEX ' + result.stdout[:96].hex())
-                  error = result.stderr.decode(errors='replace').replace(str(workspace), '[generated fixture workspace]')
-                  print('CONTROLLED_ACL_ERROR ' + error[:6000])
-              return result
-
-          fixture.run = observe_acl_command
           with tempfile.TemporaryDirectory(prefix='vibeface-config-security-') as directory:
               workspace = Path(directory) / fixture.WORKSPACE_NAME
               workspace.mkdir()
@@ -85,12 +73,15 @@ jobs:
               node = fixture.Node(Path(os.environ['RUNTIME']), workspace, fixture.NODE_NAME, provider)
               fixture.check_private_paths(node)
               before = json.loads((node.directory / 'config.json').read_text(encoding='utf-8'))
+              original_file = (node.directory / 'config.json').stat()
               node.configure(network=dict(before['network']))
               fixture.check_private_paths(node)
               after = json.loads((node.directory / 'config.json').read_text(encoding='utf-8'))
-              fixture.require(before == after, 'a second protected replacement preserves all config fields')
+              current_file = (node.directory / 'config.json').stat()
+              fixture.require((original_file.st_dev, original_file.st_ino) == (current_file.st_dev, current_file.st_ino), 'the original private config file is retained')
+              fixture.require(before == after, 'a second protected update preserves all config fields')
               fixture.require(after['network']['bind'] == '127.0.0.1:0', 'the fixture retains ephemeral real UDP allocation')
-          print('Verified CLI config security replacement and unchanged content passed; no Node daemon or Provider was started')
+          print('Verified CLI protected config updates and unchanged content passed; no Node daemon or Provider was started')
           PY
       - name: Locate the existing hosted installer compiler
         shell: pwsh
