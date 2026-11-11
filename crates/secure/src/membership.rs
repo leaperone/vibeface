@@ -2437,15 +2437,22 @@ mod tests {
             )?)?;
         }
         let view = state.project()?;
-        state.append(GovernanceEvent::revoke(&a, &view, cut(&node, 0))?)?;
-        state.append(GovernanceEvent::revoke(&b, &view, cut(&a, 0))?)?;
-        state.append(GovernanceEvent::grant(
+        let mut private = state.clone();
+        private.append(GovernanceEvent::grant(
             &d,
-            &state.project()?,
+            &view,
             Member::client(&c, "private-manager", true)?,
         )?)?;
+        state.append(GovernanceEvent::revoke(&a, &view, cut(&node, 0))?)?;
+        state.append(GovernanceEvent::revoke(&b, &view, cut(&a, 0))?)?;
+        state = state.merge(&private)?;
         let known = state.clone();
-        state.append(GovernanceEvent::revoke(&c, &state.project()?, cut(&b, 0))?)?;
+        assert!(known.project_at(T)?.node(&id(&node)).is_ok());
+        state.append(GovernanceEvent::revoke(
+            &c,
+            &private.project()?,
+            cut(&b, 0),
+        )?)?;
         assert!(state.project_at(T)?.removed_node(&id(&node)));
         assert!(state.removal_state_at(&id(&node), None, T).is_err());
         let proof = state.removal_state_at(&id(&node), Some(&known), T)?;
