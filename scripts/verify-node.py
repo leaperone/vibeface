@@ -4793,6 +4793,9 @@ def npm_service_acceptance(options):
                 "refused npm service operations preserve existing data and service files")
 
     def idle_guards():
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
         rejected("install-updater", "npm installations are updated with npm")
         with (node.directory / "update.lock").open("r+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4801,9 +4804,6 @@ def npm_service_acceptance(options):
         rejected("install", "recover the pending update")
         (node.directory / "update-pending.json").unlink()
         before = persistent()
-        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
-        require(update["distribution"] == "npm" and update["automatic"] is False,
-                "npm owns updates and disables the built-in updater")
         command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
         require(persistent() == before, "npm automatic update exits without changing persistent data")
 
@@ -4929,6 +4929,7 @@ def npm_service_acceptance(options):
         require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
                 "npm replacement preserves the immutable input and installed service definition")
         stopped()
+        database_sha256 = file_sha256(node.directory / "node.sqlite3")
         access = command([binary, "access", "--json", "--data-dir", node.directory], check=False)
         if access.returncode != 0 and "data_schema_mismatch" in access.stderr:
             schema_digests = []
@@ -4938,7 +4939,6 @@ def npm_service_acceptance(options):
                 require(fingerprint is not None, "both reviewed sources declare their data schema fingerprint")
                 schema_digests.append(fingerprint[1])
             require(schema_digests[0] != schema_digests[1], "schema rejection corresponds to a declared format change")
-            database_sha256 = file_sha256(node.directory / "node.sqlite3")
             refused = command([binary, "serve", "--data-dir", node.directory], check=False)
             require(refused.returncode != 0 and "data_schema_mismatch" in refused.stderr,
                     "the candidate refuses to start an incompatible baseline schema")
@@ -4955,6 +4955,7 @@ def npm_service_acceptance(options):
             node.client.close()
             node.stop()
             stopped()
+            idle_guards()
             saved_files, saved_events = persistent()
             service("install")
             running()
