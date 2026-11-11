@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+import time
 import urllib.request
 
 import release
@@ -37,6 +39,8 @@ CRATES = {
     "secure-ffi": "vibeface-secure-ffi",
     "delivery": "vibeface-delivery",
 }
+WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
+WEB_E2E_TESTS = tuple(f"tests/e2e/{name}.e2e.ts" for name in ("chat-confidence", "mesh", "onboarding", "transfers", "workspace"))
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
@@ -45,6 +49,7 @@ PATH_RULES = (
     ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
+    ("web", WEB_E2E_TESTS),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -68,7 +73,7 @@ PLATFORMS = (
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 # Only an explicit dispatch runs the hosted Windows and desktop application checks.
 DESKTOP_JOBS = ["windows-native", "desktop-macos", "desktop-windows"]
 LOCAL_PROCESS_RULES = (
@@ -99,7 +104,12 @@ def local_process_modes(paths, full):
 def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, delivery_live=False):
     scopes = set()
     for path in paths:
-        scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
+        if WEB_UNIT_TEST.fullmatch(path):
+            scopes.add("web-tests")
+        elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
+            scopes.add("full")
+        else:
+            scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
@@ -114,7 +124,7 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly",
 
 def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
     if (
-        scopes - {"full", "docs", "web", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
@@ -135,6 +145,8 @@ def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
     packages = [package for crate, package in CRATES.items() if crate in affected]
     # Mobile behavior tests still live in the Web suite.
     web = full or bool(scopes & {"web", "mobile"}) or bool(affected & {"node", "cli", "control"})
+    web_tests = "web-tests" in scopes and not web
+    crypto = web or web_tests
     www = full or "www" in scopes
     mobile = full or "mobile" in scopes
     desktop = full or "desktop" in scopes
@@ -145,13 +157,15 @@ def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
-        "docs_only": not web and not packages and not mobile and not desktop,
+        "docs_only": not crypto and not packages and not mobile and not desktop,
         "event": event,
         "delivery_live": delivery_live,
         "ref_type": ref_type,
         "channel": channel,
         "scopes": sorted(scopes),
         "web": web,
+        "web_tests": web_tests,
+        "crypto": crypto,
         "www": www,
         "mobile": mobile,
         "desktop": desktop,
@@ -164,8 +178,12 @@ def scope_plan(scopes, event, ref_type, channel, *, delivery_live=False):
         "npm": channel == "nightly" and "node" in affected and extended and not delivery_live,
     }
     required = {"quick-check"}
+    if crypto:
+        required.add("crypto-web")
     if web:
-        required.update(("crypto-web", "web", "package"))
+        required.update(("web", "package"))
+    if web_tests:
+        required.add("web-tests")
     if mobile:
         required.add("mobile-check")
     if desktop:
@@ -319,6 +337,8 @@ def write_plan(plan, output=None):
         outputs = {
             "plan": encoded,
             "web": str(plan["web"]).lower(),
+            "web_tests": str(plan["web_tests"]).lower(),
+            "crypto": str(plan["crypto"]).lower(),
             "www": str(plan["www"]).lower(),
             "mobile": str(plan["mobile"]).lower(),
             "desktop": str(plan["desktop"]).lower(),
@@ -445,23 +465,58 @@ def validate_slow_tests(names):
     return fast
 
 
-def run_test(packages, tier):
+def timed_cargo(command, phase, phases, **kwargs):
+    started = time.perf_counter()
+    code = None
+    try:
+        result = subprocess.run(command, check=True, **kwargs)
+        code = result.returncode
+        return result
+    except subprocess.CalledProcessError as error:
+        code = error.returncode
+        raise
+    finally:
+        phases.append({"phase": phase, "seconds": round(time.perf_counter() - started, 6), "exit_code": code})
+
+
+def run_test(packages, tier, timings_file=None):
     selected = package_args(packages)
     test_package = "vibeface-core" if "vibeface-core" in packages else None
-    if test_package:
-        listing_args = selected if tier == "fast" else ["-p", test_package, "--lib"]
-        listing = subprocess.check_output(["cargo", "test", "--locked", *listing_args, "--", "--list"], text=True)
-        names = [line[:-6] for line in listing.splitlines() if line.endswith(": test")]
-        fast = validate_slow_tests(names)
-        print(f"Partition: {len(fast)} fast test names, {len(SLOW_TESTS)} exact slow tests", flush=True)
+    if tier == "slow" and not test_package:
+        raise ValueError("Slow tier requires the Core crate")
+    compile_args = selected if tier == "fast" else ["-p", test_package, "--lib"]
     if tier == "slow":
-        if not test_package:
-            raise ValueError("Slow tier requires the Core crate")
         command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
         command = ["cargo", "test", "--locked", "--no-fail-fast", *selected, "--", *skips]
-    subprocess.run(command, check=True)
+    phases = []
+    try:
+        timed_cargo(["cargo", "test", "--locked", "--no-run", *compile_args], "compile", phases)
+        if test_package:
+            listing = timed_cargo(["cargo", "test", "--locked", *compile_args, "--", "--list"], "enumerate", phases, capture_output=True, text=True).stdout
+            names = [line[:-6] for line in listing.splitlines() if line.endswith(": test")]
+            fast = validate_slow_tests(names)
+            print(f"Partition: {len(fast)} fast test names, {len(SLOW_TESTS)} exact slow tests", flush=True)
+        timed_cargo(command, "execute", phases)
+    finally:
+        report = {"tier": tier, "packages": packages, "status": "failure" if sys.exc_info()[0] else "success", "phases": phases}
+        print("Rust test timing: " + json.dumps(report), flush=True)
+        if timings_file:
+            failed = sys.exc_info()[0] is not None
+            try:
+                timings_file.parent.mkdir(parents=True, exist_ok=True)
+                timings_file.write_text(json.dumps(report, indent=2) + "\n")
+                summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                if summary:
+                    with open(summary, "a") as destination:
+                        destination.write(f"\n### Rust {tier} timing\n\n| Phase | Seconds | Exit code |\n| --- | ---: | ---: |\n")
+                        for row in phases:
+                            destination.write(f"| {row['phase']} | {row['seconds']:.2f} | {row['exit_code']} |\n")
+            except OSError:
+                if not failed:
+                    raise
+                print("Could not write Rust timing report; preserving the test failure", file=sys.stderr)
 
 
 def run_check(packages, msrv=None):
@@ -474,6 +529,7 @@ def run_check(packages, msrv=None):
 
 def self_test():
     from unittest.mock import patch
+    focused_self_test()
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
@@ -842,6 +898,88 @@ def self_test():
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
 
 
+def focused_self_test():
+    from unittest.mock import patch
+    root = Path(__file__).resolve().parent.parent
+    unit_jobs = ["quick-check", "crypto-web", "web-tests"]
+    for path in [*root.glob("apps/app/src/lib/*.test.ts"), *root.glob("apps/app/src/features/*/*.test.ts")]:
+        plan = make_plan([path.relative_to(root).as_posix()])
+        assert plan["required_jobs"] == unit_jobs and not plan["docs_only"]
+    for path in WEB_E2E_TESTS:
+        assert make_plan([path])["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
+    for path in ("tests/e2e/workspace.native.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.config.ts", "tests/e2e/paid-native-transfers.paid.ts", "apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
+        assert make_plan([path])["full"], path
+    assert make_plan(["apps/app/src/lib/markdown.test.ts", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
+    assert "web-tests" not in make_plan(["apps/app/src/lib/markdown.test.ts", "apps/app/src/lib/markdown.ts"])["required_jobs"]
+    plan = make_plan(["apps/app/src/lib/markdown.test.ts"])
+    needs = {job: {"result": "success" if job in unit_jobs else "skipped"} for job in JOBS}
+    needs["plan"] = {"result": "success"}
+    gate(needs, plan)
+    for result in ("skipped", "failure", "cancelled", "missing"):
+        broken = json.loads(json.dumps(needs))
+        if result == "missing":
+            del broken["web-tests"]
+        else:
+            broken["web-tests"]["result"] = result
+        expect_failure(lambda: gate(broken, plan))
+    expect_failure(lambda: gate(needs, dict(plan, crypto=False)))
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    block = re.search(r"(?ms)^  web-tests:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
+    assert "needs: [plan, crypto-web]" in block and "needs.plan.outputs.web_tests == 'true'" in block
+    for required in ("name: crypto-web-${{ github.sha }}", "check crypto", "'vibeface-mobile...'", "vibeface-web test", "@vibeface/client test"):
+        assert required in block, required
+    assert "web-tests" in workflow.split("\n  ci-gate:\n", 1)[1].split("runs-on:", 1)[0]
+    mobile = (root / ".github/workflows/mobile.yml").read_text().split("\n  ios:\n", 1)[1]
+    assert "key: native-targets-${{ hashFiles('scripts/release-rustflags.py') }}" in mobile
+    app_key = next(line for line in mobile.splitlines() if 'echo "key=ios-simulator-app-' in line)
+    assert "'scripts/release-rustflags.py'" in app_key
+    for mapping in (". -> target", ". -> .artifacts/native/target"):
+        assert mapping in mobile
+    package = re.search(r"(?ms)^  package:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
+    assert "key: package-with-probe-${{ matrix.target }}-${{ hashFiles('scripts/release-rustflags.py') }}" in package
+    assert "tests/fixtures/delivery-probe -> ../../../.artifacts/delivery-probe/target" in package
+    fixture = root / "tests/fixtures/delivery-probe"
+    assert (fixture / "../../../.artifacts/delivery-probe/target").resolve() == root / ".artifacts/delivery-probe/target"
+    listing = "other::test: test\n" + "\n".join(name + ": test" for name in SLOW_TESTS)
+    def cargo(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, listing if "--list" in command else "")
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+        output = Path(directory) / "timing.json"
+        with patch("subprocess.run", side_effect=cargo) as calls:
+            run_test(["vibeface-core"], "fast", output)
+        report = json.loads(output.read_text())
+        assert [row["phase"] for row in report["phases"]] == ["compile", "enumerate", "execute"]
+        assert report["status"] == "success" and all(row["exit_code"] == 0 and row["seconds"] >= 0 for row in report["phases"])
+        assert calls.call_args_list[0].args[0] == ["cargo", "test", "--locked", "--no-run", "-p", "vibeface-core"]
+        assert "--skip" in calls.call_args_list[-1].args[0] and "--no-fail-fast" in calls.call_args_list[-1].args[0]
+        with patch("subprocess.run", side_effect=cargo) as calls:
+            run_test(["vibeface-core"], "slow", output)
+        assert calls.call_args.args[0] == ["cargo", "test", "--locked", "-p", "vibeface-core", "--lib", "--", "--exact", "--include-ignored", "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello"]
+        def failure(command, **kwargs):
+            if "--no-fail-fast" in command:
+                raise subprocess.CalledProcessError(7, command)
+            return cargo(command, **kwargs)
+        with patch("subprocess.run", side_effect=failure):
+            try:
+                run_test(["vibeface-core"], "fast", output)
+            except subprocess.CalledProcessError as error:
+                assert error.returncode == 7
+            else:
+                raise AssertionError("test failure was hidden by timing collection")
+        failed = json.loads(output.read_text())
+        assert failed["status"] == "failure" and failed["phases"][-1]["exit_code"] == 7
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(8, ["cargo"])) as calls:
+            try:
+                run_test(["vibeface-core"], "fast", output)
+            except subprocess.CalledProcessError as error:
+                assert error.returncode == 8
+            else:
+                raise AssertionError("compile failure was hidden by timing collection")
+        failed = json.loads(output.read_text())
+        assert calls.call_count == 1 and failed["status"] == "failure" and [row["phase"] for row in failed["phases"]] == ["compile"]
+    print("Unit-only coverage, cache wiring and Rust timing failure checks passed")
+
+
 def native_delivery_self_test(scratch):
     from unittest.mock import patch
     for event in ("pull_request", "push", "schedule", "merge_group"):
@@ -915,8 +1053,8 @@ def coverage_self_test(directory, base, nonancestor):
     event_file = Path(directory) / "event.json"
     event_file.unlink(missing_ok=True)
 
-    def commit(message):
-        git("add", "-A", cwd=directory)
+    def commit(message, paths=(".",)):
+        git("add", "-A", "--", *paths, cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", message, cwd=directory)
         return git("rev-parse", "HEAD", cwd=directory).decode().strip()
 
@@ -971,6 +1109,22 @@ def coverage_self_test(directory, base, nonancestor):
                     assert selected["full"] and selected["coverage_reason"] == "full-event"
             explicit = event_plan(argparse.Namespace(event="push", base=rust_head, head=head))
             assert explicit["scopes"] == ["docs"] and explicit["coverage_reason"] == "event-range"
+        unit = Path(directory) / "apps/app/src/lib/example.test.ts"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("test-only change\n")
+        unit_head = commit("test-only change after unverified Rust", ("apps/app/src/lib/example.test.ts",))
+        event_file.write_text(json.dumps({"before": head, "after": unit_head}))
+        with patch.dict(os.environ, {"GITHUB_SHA": unit_head}):
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [successful]}).encode())):
+                accumulated = event_plan(args)
+                assert accumulated["rust_packages"] == ["vibeface-core"] and "package" in accumulated["required_jobs"]
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [dict(successful, head_sha=head)]}).encode())):
+                only_tests = event_plan(args)
+                assert only_tests["required_jobs"] == ["quick-check", "crypto-web", "web-tests"]
+                unit_needs = {job: {"result": "success" if job in only_tests["required_jobs"] else "skipped"} for job in JOBS}
+                unit_needs["plan"] = {"result": "success"}
+                gate(unit_needs, only_tests)
+                expect_failure(lambda: gate(unit_needs, dict(only_tests, web_tests=False)))
     print("Cumulative push coverage, API fallback and frozen gate self-tests passed")
 
 
@@ -1158,6 +1312,7 @@ def main():
         selection.add_argument("--plan-env")
         if name == "test":
             command.add_argument("--tier", choices=("fast", "slow"), required=True)
+            command.add_argument("--timings-file", type=Path, help="write compile, enumeration and execution durations")
         else:
             command.add_argument("--msrv", help="also check the declared minimum Rust version")
     args = parser.parse_args()
@@ -1174,7 +1329,7 @@ def main():
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":
-            run_test(packages, args.tier)
+            run_test(packages, args.tier, args.timings_file)
         else:
             plan = json.loads(os.environ[args.plan_env]) if args.plan_env else None
             if plan and plan["check_msrv"] and not args.msrv:

@@ -87,6 +87,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-on-failure: true
+          key: native-targets-${{ hashFiles('scripts/release-rustflags.py') }}
+          workspaces: |
+            . -> target
+            . -> .artifacts/native/target
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.9.0
