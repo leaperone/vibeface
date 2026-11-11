@@ -1,6 +1,6 @@
 # 原生 GPUI 桌面迁移
 
-本设计将 macOS、Windows 和 Linux 桌面改为 GPUI 原生界面，移除 Electron、preload、Chromium 和桌面 WebView。Web 与 Mobile 继续作为独立客户端存在。本文规定目标与验收范围，不代表这些步骤已经完成。
+本设计是当前 macOS、Windows 和 Linux 桌面的归属说明：原生 GPUI 界面，没有 Electron、preload、Chromium 或桌面 WebView。Web 与 Mobile 继续作为独立客户端存在。下文的功能表是验收范围，不是未完成的迁移步骤。
 
 ## 模块归属
 
