@@ -4,13 +4,14 @@ import { cn } from "@/lib/utils"
 import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { authenticationSourceLabels, canSetProviderEnvironment, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { authenticationSourceLabels, canSetProviderEnvironment, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderEndpoint, type EndpointProtocol, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -528,6 +529,9 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
           <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
             busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} />
         </Details> : null}
+        {item.provider === "opencode" ? <Details label="自定义模型服务">
+          <EndpointDetails key={JSON.stringify(item.endpoint)} endpoint={item.endpoint} working={working} busy={busy} save={change} />
+        </Details> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
 
         {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}
@@ -669,6 +673,47 @@ function ExecutionDetails({ model, models, working, busy, save }: { model: strin
         onClick={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : "") }}><List aria-hidden="true" /></Button> : null}
     </div>}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+  </form>
+}
+
+const protocolLabels: Record<EndpointProtocol, string> = { openai_compatible: "OpenAI 兼容", anthropic: "Anthropic", openai: "OpenAI" }
+
+/** opencode's custom model service. The token is write-only: left empty, the stored one stays. Keyed by the saved endpoint; a saved token clears its draft. */
+function EndpointDetails({ endpoint, working, busy, save }: { endpoint: ProviderEndpoint | null; working: boolean; busy: string; save(key: string, value: Omit<Change, "provider">): Promise<boolean> }) {
+  const [protocol, setProtocol] = useState<EndpointProtocol>(endpoint?.protocol ?? "openai_compatible")
+  const [baseUrl, setBaseUrl] = useState(endpoint?.base_url ?? "")
+  const [modelText, setModelText] = useState(endpoint?.models.join("\n") ?? "")
+  const [token, setToken] = useState("")
+  const [deleting, setDeleting] = useState(false)
+  const models = [...new Set(modelText.split(/[,，\n]/).map((model) => model.trim()).filter(Boolean))]
+  const dirty = Boolean(token.trim()) || protocol !== (endpoint?.protocol ?? "openai_compatible") || baseUrl.trim() !== (endpoint?.base_url ?? "") || models.join("\n") !== (endpoint?.models.join("\n") ?? "")
+  return <form className="grid gap-2" onSubmit={(event) => {
+    event.preventDefault()
+    void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token.trim() ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
+  }}>
+    <label className="grid gap-1 text-meta">协议
+      <NativeSelect className="w-full" value={protocol} disabled={working} onChange={(event) => setProtocol(event.target.value as EndpointProtocol)}>
+        {Object.entries(protocolLabels).map(([value, label]) => <NativeSelectOption key={value} value={value}>{label}</NativeSelectOption>)}
+      </NativeSelect>
+    </label>
+    <label className="grid gap-1 text-meta">Base URL
+      <Input type="url" required spellCheck={false} maxLength={2048} value={baseUrl} disabled={working} onChange={(event) => setBaseUrl(event.target.value)} />
+    </label>
+    <label className="grid gap-1 text-meta">API Token
+      <Input type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} maxLength={4096} placeholder={endpoint?.has_api_key ? "已保存，留空不改" : "可留空"}
+        value={token} disabled={working} onChange={(event) => setToken(event.target.value)} />
+    </label>
+    <label className="grid gap-1 text-meta">模型
+      <Textarea required spellCheck={false} value={modelText} disabled={working} onChange={(event) => setModelText(event.target.value)} />
+    </label>
+    <p className="text-meta text-muted-foreground">模型写成 custom/{models[0] ?? "<模型名>"}</p>
+    {dirty || endpoint ? <div className="flex flex-wrap gap-2">
+      {dirty ? <Button type="submit" variant="outline" disabled={working || !baseUrl.trim() || !models.length}><BusyIcon busy={busy === "opencode:endpoint"} />保存</Button> : null}
+      {!endpoint ? null : deleting ? <>
+        <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
+        <Button type="button" variant="destructive" disabled={working} onClick={() => { setDeleting(false); void save("endpoint_delete", { opencode_endpoint: null }) }}><BusyIcon busy={busy === "opencode:endpoint_delete"} />删除</Button>
+      </> : <Button type="button" variant="ghost" disabled={working} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除</Button>}
+    </div> : null}
   </form>
 }
 

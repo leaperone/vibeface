@@ -1614,7 +1614,7 @@ test('opening AI settings connects only Cursor and retains focus until it can re
     const unreadable = outcome === 'unreadable' || outcome === 'same-device-reconnected'
     const provider: ProviderStatus = {
       provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/cursor-sdk-bridge', app_server: null,
-      execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
+      endpoint: null, execution_model: '', execution_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, setup: null, installed: false, home: null, sessions: null, env: [],
       state: 'off', issues: [], readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } },
       probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1731,7 +1731,7 @@ test("automatic connection checks the three local services without changing uses
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
     const provider: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
-      execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
+      endpoint: null, execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
       state: 'starting', issues: [], readiness: { state: 'starting' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'starting' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'app_server_starting' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1810,7 +1810,7 @@ test("compact system provider cards use external service evidence without local 
     const item: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
       app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
-      execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
+      endpoint: null, execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
       env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'launchable' }, authentication, catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' }, authenticated: { status: 'confirmed', evidence: 'provider_probe' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -1863,7 +1863,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
   for (const platform of ['web', 'mobile']) for (const example of cases) await t.test(`${platform} ${example.name}`, () => {
     const item: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
-      execution_model: 'saved-model', execution_readiness: example.execution_readiness,
+      endpoint: null, execution_model: 'saved-model', execution_readiness: example.execution_readiness,
       setup: { directory: '/private/provider', command: 'codex --home /private/provider login' }, installed: true,
       home: null, sessions: null, env: [], state: example.readiness.state, issues: [], readiness: example.readiness,
       observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },

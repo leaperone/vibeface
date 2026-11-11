@@ -261,7 +261,7 @@ test('a provider catalog keeps model effort and distinguishes unavailable from a
 test('node settings keep a neutral unchecked provider and parse explicit probe evidence', async () => {
   const { parseNodeSettings, availability, summaryReadiness, parseProvider } = await import('@vibeface/client/lib/node.ts')
   const readiness = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }
-  const provider = { provider: 'claude', roles: ['agent'], supports: ['agent', 'execution'], bin: 'claude', app_server: null, setup: null, authentication_source: 'private_login', installed: true, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, execution_model: '', execution_readiness: readiness, probe: { provider: 'claude', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } } }
+  const provider = { provider: 'claude', roles: ['agent'], supports: ['agent', 'execution'], bin: 'claude', app_server: null, setup: null, authentication_source: 'private_login', installed: true, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, endpoint: null, execution_model: '', execution_readiness: readiness, probe: { provider: 'claude', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } } }
   const manager = { provider: 'claude', workspace: '/work', model: 'my-manual-model', reasoning_effort: null, backup: { automatic: false, candidates: [] } }
   const parsed = parseNodeSettings({ settings: { roots: [], manager }, defaults: { workspace: '/work' }, readiness: { manager: readiness }, providers: [provider], display_paths: {}, suggested_roots: [] })
   assert.equal(availability(parsed.providers[0]), 'unverified')
@@ -282,4 +282,12 @@ test('node settings keep a neutral unchecked provider and parse explicit probe e
   assert.equal(availability(split), 'unverified')
   assert.equal(availability(parseProvider({ ...provider, roles: ['execution'], execution_readiness: { state: 'ready' } })), 'ready')
   assert.equal(availability(parseProvider({ ...provider, roles: ['agent', 'execution'], readiness: { state: 'ready' }, execution_readiness: execution })), 'ready')
+  const opencode = { ...provider, provider: 'opencode', probe: { ...provider.probe, provider: 'opencode' } }
+  const endpoint = { protocol: 'openai_compatible', base_url: 'http://127.0.0.1:11434/v1', models: ['qwen3', 'llama3'], has_api_key: false }
+  assert.deepEqual(parseProvider({ ...opencode, endpoint }).endpoint, endpoint)
+  assert.throws(() => parseProvider({ ...opencode, endpoint: undefined }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, protocol: 'gemini' } }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, models: 'qwen3' } }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, has_api_key: undefined } }))
+  assert.throws(() => parseProvider({ ...provider, endpoint }))
 })
